@@ -67,6 +67,7 @@ from ..artifacts import pipeline
 from ..artifacts import tables
 from ..artifacts import types as T
 from ..artifacts import db as adb
+from ..artifacts import describe as _describe
 from ..artifacts import intent as intent_rules
 from ..artifacts.intent import ArtifactIntent
 
@@ -954,6 +955,206 @@ async def _forward_progress(job_id: str, emit: Emit) -> Optional[dict]:
     return await pipeline.wait_for(job_id)
 
 
+# ----------------------------------------- answering ABOUT an existing file --
+#
+# A QUESTION IS NOT AN EDIT. Production (the transcript this track was opened
+# on): a workbook was created, the person asked what was inside it, and the
+# turn published a second version of the workbook; asked again — "i want to
+# Know ?? please tell me Only Not create d??" — it published a third. Nothing
+# in the platform could READ a file it had made back to the person.
+#
+# The intent gate decides that a turn asks ABOUT an artifact rather than for
+# one (artifacts/describe.is_artifact_question reads the verdict it records),
+# and such a turn lands here, above every path that can open a job:
+#
+#   * the artifact is chosen by the SAME pick_artifact every follow-up uses,
+#     so "what does the deck have?" and "make the deck shorter" resolve to
+#     one file;
+#   * that version's stored spec.json is read back by artifacts/describe —
+#     the spec the renderer was given, never the produced .xlsx;
+#   * a FACT question (sheets, columns, rows, sections, slides, charts, pages,
+#     formats, sizes) is answered by CODE, with no model call, so the numbers
+#     cannot be wrong;
+#   * a JUDGEMENT question ("is this any good?") gets ONE streamed call over
+#     the fenced digest, which is the same one call a chat turn would have
+#     spent — Fast gains no extra call;
+#   * nothing is rendered and NO VERSION IS WRITTEN. That is the defect.
+
+
+def _answer_metric(outcome: str, *, kind: str = "") -> None:
+    """How the question was answered: `fact`, `judgement`, `judgement_fallback`,
+    `spec_unreadable`, `ambiguous`, `no_artifact`, `no_such_version`.
+
+    The label is `answered`, not `result`: metrics._ALLOWED holds ONE closed
+    vocabulary for `result` shared by every counter that reports an outcome,
+    and a value outside it folds to "other" (measured: result="fact" rendered
+    as result="other"), so these six words would all collapse into one series
+    unless app/metrics.py gained a per-metric entry. `kind` is the artifact's
+    kind — three values — and the topics are deliberately NOT a label: the
+    eight of them combine into 256 series."""
+    try:
+        from .. import metrics
+
+        labels = {"kind": kind} if kind else {}
+        metrics.inc("artifact_answers_total", "turns that ASKED about an artifact, by how they were answered",
+                    answered=outcome, **labels)
+    except Exception:  # noqa: BLE001 — a metric never costs an answer
+        pass
+
+
+def _clean_title(row: dict) -> str:
+    """An artifact's title, cleaned for a sentence. A title comes from the
+    person's own words by way of the spec, so it is DATA: newlines, control
+    characters and bracket runs are removed (artifacts/describe) before it is
+    put inside `**...**`, where a newline would break the emphasis."""
+    return _describe.of_row(row).title or "that file"
+
+
+def _which_one(candidates: Sequence[dict], intent: ArtifactIntent) -> str:
+    """The clarifying question for a QUESTION turn. pick_artifact's own words
+    ("Which one should I change") promise a change; this turn changes
+    nothing, so the two titles are asked about instead."""
+    hint = (intent.reference_hint or "").lower().strip()
+    named = [c for c in candidates if hint and hint in str(c.get("title") or "").lower()]
+    if len(named) < 2:
+        return ""
+    return "Which one do you mean — " + " or ".join(f"**{_clean_title(c)}**" for c in named[:2]) + "?"
+
+
+async def _model_answer_from_digest(question: str, answer: Any, emit: Emit, *, effort: str) -> str:
+    """The JUDGEMENT path: one streamed call whose only material is the
+    fenced digest. Returns what was streamed, or "" when the call could not
+    be made — the caller then falls back to the deterministic read-back, so
+    an unavailable model costs detail, never the turn."""
+    from .. import continuation, llm
+
+    shown: List[str] = []
+
+    async def _out(kind: str, delta: str) -> None:
+        if kind != "token":
+            return
+        shown.append(delta)
+        await emit("token", {"text": delta})
+
+    messages = [
+        {"role": "system", "content": _describe.system_prompt()},
+        {"role": "user", "content": _describe.question_prompt(answer.material, question)},
+    ]
+    try:
+        await continuation.stream_long_completion(
+            messages,
+            on_delta=_out,
+            model_choice="smart",
+            effort=llm.normalize_effort(effort),
+            # The per-call ceiling the dataset engine uses for the same shape
+            # of turn; `max_segments=1` is what keeps this to ONE call, not a
+            # small token cap (the Fast output-ceiling regression of
+            # 2026-09-15 was exactly such a cap).
+            segment_max_tokens=16000 if effort in ("think", "max") else 8000,
+            total_max_tokens=continuation.budget_for(effort),
+            max_segments=1,
+        )
+    except Exception as exc:  # noqa: BLE001 — the deterministic answer is the fallback
+        log.info("artifact: the judgement answer could not be streamed: %s", type(exc).__name__)
+        return ""
+    return "".join(shown)
+
+
+async def answer_about_artifact(
+    *,
+    text: str,
+    instruction: str,
+    history: Sequence[dict],
+    candidates: Sequence[dict],
+    intent: ArtifactIntent,
+    emit: Emit,
+    user_id: int,
+    effort: str,
+    artifact_id: Optional[str] = None,
+) -> str:
+    """Answer a question ABOUT one of this conversation's artifacts, from its
+    stored spec. Emits the tokens and the ONE meta, and returns the answer.
+
+    NO JOB IS ACCEPTED HERE, so the artifact's version count cannot change —
+    the test asserts exactly that.
+    """
+    question = instruction or text
+    if not candidates:
+        line = "There is no file in this conversation yet for me to read back."
+        await emit("token", {"text": line})
+        await emit("meta", {"route": "artifact", "effort": effort})
+        _answer_metric("no_artifact")
+        return line
+    # The second value is pick_artifact's own clarification, which reads
+    # "Which one should I change" — deliberately NOT reused here: this turn
+    # changes nothing and must promise nothing.
+    parent_row, _change_wording = pick_artifact(candidates, intent, artifact_id=artifact_id, history=history, instruction=instruction)
+    if parent_row is None:
+        line = _which_one(candidates, intent) or "Which file do you mean?"
+        await emit("token", {"text": line})
+        await emit("meta", {"route": "artifact", "effort": effort})
+        _answer_metric("ambiguous")
+        return line
+    artifact = str(parent_row.get("id") or "")
+    current = parent_row.get("current") or {}
+    version = int(intent.version or current.get("version") or parent_row.get("current_version") or 1)
+    files = list(current.get("files") or [])
+    if version != int(current.get("version") or 0):
+        # "what was in version 1?" — that version's own files and sizes.
+        row = await db.run_in_thread(adb.get_version, artifact, version, int(user_id))
+        if row is None:
+            # A version this artifact does not have. Answering from the
+            # CURRENT version's files under the asked-for version number
+            # would state a falsehood about a file that does not exist.
+            highest = int(current.get("version") or parent_row.get("current_version") or 1)
+            line = f"**{_clean_title(parent_row)}** has no version {version} — it is at v{highest}."
+            await emit("token", {"text": line})
+            await emit("meta", {"route": "artifact", "effort": effort})
+            _answer_metric("no_such_version", kind=str(parent_row.get("kind") or ""))
+            return line
+        files = list(row.get("files") or [])
+    desc = await db.run_in_thread(_describe.read_version, int(user_id), artifact, version, files=files)
+    if desc is None:
+        # The spec could not be read (a version from a newer build, a file
+        # gone from the volume). The row still knows the formats; saying
+        # "it has no sheets" would be a fabricated fact.
+        desc = _describe.of_row(parent_row, version=version, files=files)
+        _answer_metric("spec_unreadable", kind=str(parent_row.get("kind") or ""))
+    answer = _describe.answer(question, desc)
+    line = answer.text
+    model_used = False
+    if answer.needs_model:
+        line = await _model_answer_from_digest(question, answer, emit, effort=effort)
+        model_used = bool(line)
+        if model_used:
+            _answer_metric("judgement", kind=desc.kind)
+        else:
+            # The model could not be reached: the facts are still true, and
+            # `model_used` stays False — the meta says what actually answered.
+            line = _describe.facts_text(question, desc)
+            await emit("token", {"text": line})
+            _answer_metric("judgement_fallback", kind=desc.kind)
+    else:
+        await emit("token", {"text": line})
+        _answer_metric("fact", kind=desc.kind)
+    await emit("meta", {
+        "route": "artifact",
+        "effort": effort,
+        # NOT `artifacts`: no version was published, and re-sending the ref
+        # would put the file card back in the transcript, which is what the
+        # person read as "it made the file again".
+        "artifact_answer": {
+            "artifact_id": artifact,
+            "version": version,
+            "kind": desc.kind,
+            "topics": list(answer.topics),
+            "grounded": bool(desc.spec_read),
+            "model_used": model_used,
+        },
+    })
+    return line
+
+
 async def run_artifact_engine(
     text: str,
     history: Sequence[dict],
@@ -986,6 +1187,16 @@ async def run_artifact_engine(
     #    whatever the later sentences say.
     existing = await db.run_in_thread(adb.list_artifacts, int(user_id), conversation_id)
     candidates = [a for a in existing if (a.get("current") or {}).get("status") in ("completed", "completed_with_warnings")]
+    # 1a. A QUESTION about one of them is answered from its stored spec and
+    #     opens no job (see "answering ABOUT an existing file", above). This
+    #     sits above every branch that can publish, including the conversion
+    #     refusal: "what does this sheet have?" is neither a conversion nor
+    #     an edit.
+    if _describe.is_artifact_question(intent):
+        return await answer_about_artifact(
+            text=text, instruction=instruction, history=history, candidates=candidates, intent=intent,
+            emit=emit, user_id=int(user_id), effort=effort, artifact_id=artifact_id,
+        )
     # A CONVERSION whose target this platform cannot make is refused by
     # name, never answered with a second file. Measured 2026-09-16: "convert
     # it to a .txt file", "to SVG", "to a Google Slides file" and "an

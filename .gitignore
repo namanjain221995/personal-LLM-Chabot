@@ -168,3 +168,14 @@ benchmarks/asr/corpus/*.m4a
 benchmarks/asr/corpus/*.mp4
 benchmarks/asr/corpus/*.flac
 benchmarks/asr/corpus/*.aac
+
+# ---------------------------------------------------------------------------
+# CI scratch reports: the gitleaks JSON the `security` job writes and the
+# per-arm outcome files the `db-rehearsal` job writes. Produced by a job, read
+# by the next step, never committed.
+#
+# ANCHORED with a leading slash on purpose. An unanchored directory pattern in
+# this file matches at EVERY depth, which is how a `.gitignore` line once
+# swallowed a source directory of the same name.
+# ---------------------------------------------------------------------------
+/.ci-reports/

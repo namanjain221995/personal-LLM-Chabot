@@ -25,7 +25,7 @@ import time
 from collections import OrderedDict
 from typing import List, Optional, Tuple
 
-from . import db, llm
+from . import db, llm, metrics
 from .config import settings
 from .memory_recall import format_recall_block, keywords
 from .recall import cosine_many, pack_vector
@@ -129,6 +129,14 @@ def _env_float(name: str, default: float) -> float:
     return float(raw)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """config._bool semantics (unset or blank -> default), same truthy set."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 #: How long one user's candidate rows are reused (2026-09-13, plan item 3e).
 #: Every assistant turn re-read the newest 500 message_embeddings rows WITH
 #: their full message content — 754 kB of content plus 2 MB of vectors for
@@ -141,6 +149,68 @@ CROSS_CHAT_EMBEDDINGS_CACHE_S = _env_float("CROSS_CHAT_EMBEDDINGS_CACHE_S", 60.0
 #: Entries are per (user, model, excluded conversation, limit) because the
 #: exclusion changes WHICH 500 rows come back. Worst case ~3 MB each.
 _CANDIDATE_CACHE_MAX = 16
+
+#: CROSS_CHAT_SPECULATIVE_EMBED — run the query embedding BESIDE the candidate
+#: load instead of after it, on the one turn shape where the load is certain to
+#: return rows (`_cached_candidates_nonempty` below, and `semantic_hits`).
+#:
+#: OFF BY DEFAULT, AND THE DEFAULT IS WHAT PRODUCTION RUNS. What this buys is
+#: the wait it overlaps — the whole `await db.run_in_thread(_load_candidates,
+#: ...)` below — and nothing else, because that is the only wait it covers. On
+#: this box that wait is about a millisecond, so the saving is about a
+#: millisecond, and the 5 ms bar this change was required to clear is out of
+#: reach here.
+#:
+#: MEASURED 2026-09-27 on the one shape it acts on (a second turn of the same
+#: conversation, with a question the embedding LRU has not seen): one process,
+#: one toggle, real `_load_candidates` including its fingerprint SELECT, real
+#: `db.run_in_thread` hop, real `_rank_candidates`, a 1,280-message account over
+#: 40 conversations at 1024 dimensions, a PostgreSQL container on this host
+#: (production's topology), arms alternating within each pair, the gate counted
+#: (yes on every speculating turn, no misses), and the engine gauge
+#: `vllm:num_requests_running` read 0.0 before each pass:
+#:
+#:   pairs  embedding double   overlapped await   saving p50   paired median
+#:     31   socket (fd event)      1.214 ms         +1.146 ms     +1.108 ms
+#:     41   socket (fd event)      1.259 ms         +1.165 ms     +1.235 ms
+#:     31   asyncio.sleep timer    1.318 ms         -0.076 ms     +0.045 ms
+#:
+#: Three further socket passes gave +1.350 / +1.197 / +1.132 ms and three
+#: further timer passes +0.070 / -0.014 / -0.110 ms, so the split above is the
+#: instrument's, not one pass's luck.
+#:
+#: MEASURE THIS WITH A DOUBLE THAT ARRIVES ON AN FD, NOT A TIMER. The earlier
+#: round of this work reported 0.01 ms p50 here from a harness whose embedding
+#: double was `await asyncio.sleep(27 ms)`, and that number was an artefact of
+#: the instrument: an asyncio timer is armed through `epoll_wait`, whose timeout
+#: is rounded UP to a whole millisecond, so a wake mid-sleep — the load's thread
+#: hop completing, which happens in the speculating arm and not in the serial
+#: one — re-arms it late and swallows a sub-millisecond saving whole. Measured
+#: directly, 400 samples each: `asyncio.sleep(27 ms)` alone returns at
+#: 27.130 ms and with a concurrent 1.0 ms `run_in_executor` hop at 28.349 ms,
+#: while a socket wake returns at 27.173 ms and 27.176 ms — unmoved. The same
+#: thing shows in the legs of the A/B above: with the timer double the embed leg
+#: grows from 27.216 ms (serial) to 28.460 ms (speculating), while with the
+#: socket double it is 27.263 ms against 27.261 ms. So the embedding leg does
+#: NOT lengthen through event-loop contention; only the timer's own granularity
+#: does.
+#:
+#: The mechanism is not broken and is not being hidden: forced to a genuinely
+#: expensive load leg it saves the whole leg — +9.434 ms over 31 pairs with the
+#: socket double, where `_load_candidates`' own body measured 9.144 ms, and the
+#: timer double reads +7.987 ms at a 8.925 ms body, short by the same
+#: millisecond — which is exactly what it claims to do.
+#: It stays here, behind a flag, so the A/B is one toggle in one process on a
+#: deployment whose load leg is larger — rather than being deleted and
+#: re-derived from scratch when somebody wants the answer again.
+#:
+#: Two things must be true before it is turned on: something has to watch
+#: `cross_chat_speculative_embed_wasted_total` (it is the kill switch and
+#: nothing currently reads it), and `_CANDIDATE_CACHE_MAX` above has to be
+#: larger than the number of conversations active at once, because the cache
+#: key holds the EXCLUDED conversation — past 16 concurrent conversations the
+#: entry is evicted before the second turn arrives and this gate never fires.
+CROSS_CHAT_SPECULATIVE_EMBED = _env_bool("CROSS_CHAT_SPECULATIVE_EMBED", False)
 
 #: key -> (monotonic stamp, fingerprint, rows). Filled and read from worker
 #: threads, hence the lock.
@@ -236,6 +306,104 @@ def _load_candidates(
         while len(_candidate_cache) > _CANDIDATE_CACHE_MAX:
             _candidate_cache.popitem(last=False)
     return rows
+
+
+def _cached_candidates_nonempty(
+    user_id: int, model_id: str, exclude_conversation_id: Optional[str], limit: int
+) -> bool:
+    """True when THIS module's own in-process candidate cache already holds a
+    non-empty, unexpired entry for exactly the key `_load_candidates` will read.
+
+    A pure local dict lookup — no database, no sidecar, no change anywhere
+    else. It is the gate on starting the query embedding early (see
+    `semantic_hits`), and it is deliberately conservative: it answers the one
+    question that decides whether HEAD would have embedded at all, because
+    `semantic_hits` returns before it ever embeds when the candidate list
+    comes back empty. A miss means HEAD's order stands.
+
+    It does NOT check the fingerprint (that is a database round trip, which is
+    the very wait being overlapped), so a "yes" can still be followed by an
+    invalidated refetch that returns nothing — and the load it precedes can
+    also raise, or be cancelled. Those three residuals are counted, one reason
+    each, by `_count_speculative_embed_waste`, and the embedding is cancelled;
+    a cancelled caller releases its EMBED_MAX_INFLIGHT slot at once, exactly as
+    an abandoned flight does on HEAD (llm.py:2167-2175). By then the request is
+    normally already on the sidecar's wire, which is why it is counted rather
+    than called free. There is ONE shape where `load_failed` over-counts: if
+    `db.run_in_thread` raises before its own first suspension, the embedding
+    coroutine has not run at all and nothing was spent, yet the reason is still
+    recorded (measured 2026-09-27 on this exact shape, on Python 3.11 as the CI
+    shards run and on 3.12 as the local venv does: the coroutine body starts 0
+    times). That is NOT the documented failure — an exhausted connection pool
+    raises inside the worker thread, after `anyio.to_thread.run_sync` has
+    suspended and the embedding has started, and there the count is exact. Both
+    shapes are pinned in tests/test_cross_chat_wait.py. A kill switch that errs
+    towards firing early is the right way round, so the over-count stays.
+
+    Whether the gate is consulted at all is `_speculative_embed_enabled()`.
+    """
+    ttl = float(getattr(settings, "cross_chat_embeddings_cache_s", CROSS_CHAT_EMBEDDINGS_CACHE_S))
+    if ttl <= 0:
+        return False
+    key = (user_id, model_id, exclude_conversation_id or "", int(limit))
+    now = time.monotonic()
+    with _candidate_lock:
+        hit = _candidate_cache.get(key)
+        if hit is None:
+            return False
+        stamp, _fingerprint, rows = hit
+        return bool(rows) and (now - stamp) < ttl
+
+
+def _speculative_embed_enabled() -> bool:
+    """Whether the query embedding may start beside the candidate load at all.
+
+    Read per call, not at import, so an operator can turn it on without a
+    rebuild and a test can exercise both paths in one process. Default false:
+    see CROSS_CHAT_SPECULATIVE_EMBED above for the measurements that put it
+    there.
+    """
+    return bool(
+        getattr(settings, "cross_chat_speculative_embed", CROSS_CHAT_SPECULATIVE_EMBED)
+    )
+
+
+def _count_speculative_embed_waste(reason: str) -> None:
+    """Count one query embedding that was started early and that HEAD would not
+    have started at all.
+
+    THIS IS THE KILL SWITCH, so it has to see every such case, not the tidiest
+    one. The first version counted only `refetch_empty` and said in a comment
+    that this was "the only case in which this branch does work HEAD does not";
+    that was wrong. When the candidate load RAISES, or the turn is cancelled
+    while the load is still running, the request is already on the shared
+    embedding sidecar's wire and HEAD sent none — and the documented failure
+    mode, Postgres out of connection slots, makes the load raise on EVERY turn,
+    which is precisely when a blind counter is worst (QA, 2026-09-23).
+
+    `reason` is closed in metrics.SPECULATIVE_EMBED_WASTE_REASONS, so each
+    label keeps one meaning and the series stays bounded.
+    """
+    metrics.inc(
+        "cross_chat_speculative_embed_wasted_total",
+        "query embeddings started beside the candidate load that HEAD would "
+        "not have started at all",
+        reason=reason,
+    )
+
+
+async def _discard(task: "asyncio.Task") -> None:
+    """Cancel a sibling task and WAIT for it, so no path leaves one running.
+
+    `asyncio.wait` is used rather than `await task` so that an outer
+    cancellation arriving here still propagates (it is this coroutine that is
+    being cancelled, not the child), and the child's exception is retrieved so
+    it is never reported as "never retrieved".
+    """
+    task.cancel()
+    await asyncio.wait({task})
+    if not task.cancelled():
+        task.exception()
 
 
 def _rank_candidates(query: str, query_vec: List[float], candidates: List[dict]) -> List[tuple]:
@@ -526,17 +694,92 @@ async def semantic_hits(
     ):
         return []
     try:
-        candidates = await db.run_in_thread(
-            _load_candidates,
-            user_id,
-            settings.embed_model,
-            exclude_conversation_id,
-            _CANDIDATE_LIMIT,
-        )
+        # THE ONE READ THE TURN WAITS FOR (2026-09-22). Eleven of the twelve
+        # `_ContextReads` collect in 0.00-0.02 ms; this one cost 8.2 ms on an
+        # empty conversation and 51.9 ms p50 on a compacted 40-turn thread.
+        # Nothing below shrinks what is read, drops a hit or changes a vector:
+        # the only change is that work which was already going to happen, and
+        # which does not depend on the step before it, now happens beside it.
+        #
+        # THE EMBEDDING, ONLY WHEN IT IS CERTAIN. `semantic_hits` returns
+        # before it embeds anything when the candidate list is empty (below),
+        # so on a new or single-conversation account HEAD spends NO embedding
+        # at all. Speculating there would put avoidable load on an embedding
+        # sidecar shared with every other user, and llm.py:2125-2130 records
+        # what abandoned flights did to EMBED_MAX_INFLIGHT ("the next question
+        # failed 'busy' after 1.0 s"). So the query embedding starts beside the
+        # candidate load ONLY when this module's own in-process cache already
+        # holds a non-empty, unexpired entry for this key — i.e. only when
+        # HEAD would almost certainly have embedded too.
+        #
+        # ALMOST, not certainly: THREE paths reach here having started an
+        # embedding HEAD would not have started — the fingerprint invalidates
+        # the entry and the refetch returns nothing, the load raises, or the
+        # turn is cancelled mid-load. All three are counted, each under its own
+        # reason (`_count_speculative_embed_waste`). "The work is moved, never
+        # created" was this change's original claim and it is not true; what IS
+        # true is that the work is moved on the normal path and every exception
+        # to that is visible in one counter. That counter is the kill switch,
+        # and this whole path is off by default until something watches it
+        # (CROSS_CHAT_SPECULATIVE_EMBED).
+        embed_task: Optional[asyncio.Task] = None
+        if _speculative_embed_enabled() and _cached_candidates_nonempty(
+            user_id, settings.embed_model, exclude_conversation_id, _CANDIDATE_LIMIT
+        ):
+            embed_task = asyncio.ensure_future(llm.embed_query(query))
+        try:
+            candidates = await db.run_in_thread(
+                _load_candidates,
+                user_id,
+                settings.embed_model,
+                exclude_conversation_id,
+                _CANDIDATE_LIMIT,
+            )
+        except BaseException as exc:
+            # THE LOAD FAILED, OR THE TURN WAS CANCELLED (a newer message
+            # replaced it, or main.py's `reads.close()` closed this read).
+            # HEAD starts no embedding here, so the one this turn started IS
+            # work HEAD does not do, and it is counted — under its own reason,
+            # because it is not the same event as a stale cache entry. The
+            # first version of this branch left it uncounted and claimed the
+            # refetch case was the only one; when Postgres runs out of
+            # connection slots the load raises on EVERY turn, so that choice
+            # made the kill switch read zero during exactly the incident the
+            # cache was built for (QA, 2026-09-23).
+            if embed_task is not None:
+                _count_speculative_embed_waste(
+                    "cancelled"
+                    if isinstance(exc, asyncio.CancelledError)
+                    else "load_failed"
+                )
+                await _discard(embed_task)
+            raise
         if not candidates:
+            if embed_task is not None:
+                # THE GATE WAS WRONG: the cache said this key had rows, the
+                # fingerprint disagreed and the refetch came back empty, so
+                # HEAD would have embedded nothing and this turn embedded
+                # once. One of THREE reasons the same counter carries — see
+                # `_count_speculative_embed_waste`; the other two are on the
+                # failure path above. Measured zero over 200 turns across five
+                # account shapes (2026-09-22).
+                _count_speculative_embed_waste("refetch_empty")
+                await _discard(embed_task)
             return []
-        query_vec = await llm.embed_query(query)
+        if embed_task is not None:
+            query_vec = await embed_task
+        else:
+            query_vec = await llm.embed_query(query)
         scored = await db.run_in_thread(_rank_candidates, query, query_vec, candidates)
+        # `_answer_index` is a pure function of `candidates` too, so it COULD
+        # run beside the ranking. Measured, it earns nothing: over three paired
+        # passes on a 2,000-row account (2026-09-22; no main-model call is
+        # involved, load average 6.6-7.0) the serial pair cost
+        # rank 1.20-1.38 ms plus answers 0.55-0.58 ms, and running them side by
+        # side cost rank 1.79-1.96 ms and answers 1.13-1.26 ms — the same wall
+        # clock, because each leg then waits on the other for a worker. It also
+        # holds a second slot of a bounded pool in front of a Postgres server
+        # that has run out of connection slots before. So it stays serial.
         answers = await db.run_in_thread(_answer_index, candidates) if pair_answers else {}
         score_of = {c["message_id"]: s for s, c in scored} if pair_answers else {}
         hits: List[dict] = []

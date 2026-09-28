@@ -110,6 +110,26 @@ _MIN_CLIPPED_CHARS = 2000
 
 # base_url -> max_model_len, learned once per process.
 _window_cache: dict = {}
+
+#: The base URLs whose cached window a REAL /tokenize reported.
+#:
+#: `_window_cache` alone does not establish that. `model_window` ends with
+#: `resolved = window or settings.model_max_context` and caches THAT, so one
+#: failed /tokenize during an engine recovery (172-188 s, 2026-09-12) poisons
+#: the cache with a configured constant (MAIN_MODEL_MAX_LEN, else
+#: MODEL_MAX_CONTEXT) for the life of the process, and nothing invalidates it.
+#: Anything that decides to send BEFORE it has counted is betting the window
+#: is real, so it may only read a window this set vouches for: written in
+#: `count_tokens`'s success branch beside the cache write, discarded the
+#: moment a count fails.
+_window_from_server: set = set()
+
+
+def window_is_server_reported(base_url: str) -> bool:
+    """Did a real /tokenize report the cached window for this endpoint?"""
+    return base_url in _window_from_server
+
+
 #: One lock per event loop. A module-level asyncio.Lock binds to the first loop
 #: that ever WAITS on it, and a later loop that contends it raises "is bound to
 #: a different event loop" - which is what failed PR #79's CI: two generations
@@ -359,6 +379,310 @@ def measured_prompt_tokens(messages: Sequence[dict], base_url: str) -> Optional[
     return found[2]
 
 
+# --------------------------------------------------------------------------
+# Sending while the exact count is still in flight
+# --------------------------------------------------------------------------
+#
+# WHAT THIS BUYS. Every `fit_request` blocks on a /tokenize round trip before
+# a single byte of the request reaches the engine: 9.5-11.6 ms per main-model
+# call, 28.0 ms of critical path on the harness's plain shape and 41.5 ms on
+# its docs shape, in front of an engine whose own first token costs 49.8 ms.
+# The count is not needed to BUILD the request — it is needed to prove the
+# request fits and to size `max_tokens`. When a bound the prompt cannot game
+# already proves both, the count can run beside the send instead of in front
+# of it.
+#
+# WHAT IT MUST NOT COST. The body on the wire, to the byte. So the fast path
+# fires only where the trim loop provably breaks on its first iteration and
+# `max_tokens` provably lands on the same number the slow path would compute;
+# see `_may_send_first` for the five conditions and why each one is there.
+# The count itself is NOT skipped: it still happens, once, per turn, and its
+# result still reaches `_measured`, `_last_count_exact` and the meter through
+# `settle_pending_count`.
+
+#: The exact count `fit_request` started but did not wait for, handed to the
+#: caller that will settle it. A ContextVar, never a module global: one
+#: shared slot is clobbered by the next concurrent turn.
+_pending_count: ContextVar[Optional["_PendingCount"]] = ContextVar("_pending_count", default=None)
+
+#: May THIS caller ask for a send-first fit? Only a caller that settles the
+#: count it leaves running may, and `llm._fit` is the one place that does
+#: (`settles_pending_count`). A direct `fit_request` — a test, a future
+#: caller — gets today's blocking behaviour and can leak nothing.
+_settles_count: ContextVar[bool] = ContextVar("_settles_count", default=False)
+
+#: Strong references to counts in flight, so nothing is collected between the
+#: send and its settlement even after the ContextVar has been cleared.
+_INFLIGHT_COUNTS: set = set()
+
+
+class _PendingCount:
+    """An exact count running beside the request it describes."""
+
+    __slots__ = ("task", "messages", "base_url", "window")
+
+    def __init__(self, task, messages: list, base_url: str, window: int) -> None:
+        self.task = task
+        self.messages = messages
+        self.base_url = base_url
+        self.window = int(window)
+
+
+@contextlib.contextmanager
+def settles_pending_count():
+    """Mark this call site as one that settles (or cancels) a pending count.
+
+    `fit_request` refuses to send first outside this mark, which is what
+    makes "the task never outlives the request" structural rather than a
+    convention every future caller has to remember.
+    """
+    token = _settles_count.set(True)
+    try:
+        yield
+    finally:
+        _settles_count.reset(token)
+
+
+def _swallow_count_result(task) -> None:
+    _INFLIGHT_COUNTS.discard(task)
+    if task.cancelled():
+        return
+    # Retrieve any exception so a cancelled or abandoned count can never
+    # surface as "Task exception was never retrieved" on the event loop.
+    task.exception()
+
+
+def _discard_count(task) -> None:
+    if not task.done():
+        task.cancel()
+
+
+async def _count_beside_the_send(base_url: str, model: str, msgs: list):
+    """The exact count, run as its own task.
+
+    It runs in a COPY of the caller's context, so the `_last_count_exact` and
+    `_measured` it writes are invisible to the caller — which is why the
+    verdict is returned here and written back by `settle_pending_count` in
+    the caller's own context instead.
+    """
+    # Redundant today, and deliberately kept: `count_tokens` sets this var on
+    # BOTH of its exits (True after a successful parse, False in its except
+    # branch), so measured 2026-09-28 removing this line leaves the suite
+    # green. It makes the returned verdict describe THIS call even if a future
+    # count path ever returns without setting it.
+    _last_count_exact.set(False)
+    count, served_window = await count_tokens(base_url, model, msgs)
+    return int(count), served_window, bool(_last_count_exact.get())
+
+
+def _may_send_first(
+    msgs: Sequence[dict], *, base_url: str, window: int, margin: int, ceiling: int
+) -> bool:
+    """May this request go on the wire before its exact count comes back?
+
+    Only when the answer is provably the same either way:
+
+    1. A caller that settles the count (`settles_pending_count`).
+    2. A window a real /tokenize reported (`_window_from_server`), never one
+       `model_window` resolved from configuration after a failed count.
+    3. `window - upper_bound_messages(msgs) - margin >= max(ceiling,
+       MIN_OUTPUT_TOKENS)`. The BOUND, not `estimate_messages`: the estimate
+       is len/3 for ASCII and a bytes-per-token average otherwise, and any
+       non-Latin script defeats it (N013). `max(ceiling, MIN_OUTPUT_TOKENS)`,
+       not `ceiling`: a bounded classifier call asks for `ceiling = 4`, and a
+       budget of 4 does not prove the trim loop breaks at `budget >= 256`.
+       With this, the loop provably breaks on its FIRST iteration — `sized`
+       is the input list unchanged and `max_tokens` is `ceiling` exactly.
+    4. `upper_bound_messages(msgs) < admission_long_threshold_tokens // 2`,
+       and the origin is not the /v1 surface. This is the ordering with
+       admission: `admission.prompt_tokens` runs INSIDE the send, i.e. after
+       this returns, so it will not find `_measured` yet. Below half the
+       threshold it takes its own sanctioned no-round-trip branch and
+       `lane_for` returns NORMAL by prompt on the estimate exactly as it does
+       on the exact count — and a chat-origin NORMAL ticket charges no KV and
+       arms no closure timer, so the count is the ONLY thing the lane would
+       have used it for. The /v1 surface is excluded because its NORMAL lane
+       does charge KV from the count, and an estimate is not a count.
+    5. Every message is a plain `{role, content}` text turn. Neither
+       `estimate_messages` nor `upper_bound_messages` counts `tool_calls`
+       arguments at all — an assistant message with `content=None` and
+       120,000 characters of tool arguments bounds at 26, estimate 12
+       (measured 2026-09-28 and asserted in the tests, so the figure cannot
+       drift), against a real prompt of ~30,000 tokens — and image parts,
+       `role: "tool"` turns and any other key the chat template renders are
+       outside what the bound covers.
+       `compaction._certainly_no_compaction` refuses the same shapes for the
+       same reason.
+    6. The ceiling is within the chat surface's LONG_OUTPUT threshold, which
+       is what makes condition 4's "a chat-origin NORMAL ticket charges no
+       KV" true rather than merely true today. `lane_for` returns LONG_OUTPUT
+       on a planned output ABOVE that threshold, and `_admit`'s LONG_OUTPUT
+       branch DOES charge KV from `tokens` — the estimate on this path, which
+       under-counts the real tokenizer by up to 2.3x on control characters.
+       Nothing reaches it from chat today (the chat send passes no
+       `max_tokens`, and the `_planned_max_tokens` that stands in for it is
+       set only by app/publicapi, whose origin condition 4 already excludes),
+       so this changes no live call: `settings.max_output_tokens` is 65,536
+       and the unbounded-thinking entry points floor their ceiling AT it,
+       which is why the test is `<=`, matching `lane_for`'s own `>`. Measured
+       2026-09-28: the largest `max_tokens` any caller in app/ asks for is
+       16,000. The gate tests the property instead of resting on a call site
+       two modules away.
+
+    A continuation never reaches here at all: `llm._fit` dispatches to
+    `_fit_continuation` before `fit_request` is called.
+    """
+    if not _settles_count.get():
+        return False
+    if base_url not in _window_from_server:
+        return False
+    for m in msgs:
+        if not isinstance(m, dict):
+            return False
+        if set(m.keys()) - {"role", "content"}:
+            return False
+        if m.get("role") not in ("system", "user", "assistant"):
+            return False
+        if not isinstance(m.get("content"), str):
+            return False
+    bound = upper_bound_messages(msgs)
+    if int(window) - bound - int(margin) < max(int(ceiling), MIN_OUTPUT_TOKENS):
+        return False
+    threshold = max(1, int(settings.admission_long_threshold_tokens))
+    if bound >= threshold // 2:
+        return False
+    from . import admission  # local: admission imports this module
+
+    if admission.current_origin() == admission.ORIGIN_V1:
+        return False
+    if int(ceiling) > admission.chat_long_output_threshold_tokens():
+        return False
+    return True
+
+
+async def settle_pending_count(messages: Sequence[dict], base_url: str) -> None:
+    """Wait for the count `fit_request` left running and write it back HERE.
+
+    Called once the send has been dispatched. It writes `_measured` and
+    `_last_count_exact` in the CALLER's context (the task that did the count
+    wrote them only in its own copy), so the meter and the admission lanes
+    read exactly what they read on the blocking path.
+
+    A no-op when nothing is pending, which is every call that took the slow
+    path and every caller whose `fit_request` was replaced by a test double.
+    """
+    pending = _pending_count.get()
+    if pending is None:
+        return
+    _pending_count.set(None)
+    if pending.messages is not messages or pending.base_url != base_url:
+        # Not the request this count describes: nothing may be written back.
+        _discard_count(pending.task)
+        return
+    try:
+        count, served_window, exact = await pending.task
+    except asyncio.CancelledError:
+        _discard_count(pending.task)
+        raise
+    except Exception:
+        # `count_tokens` swallows its own failures and returns an estimate, so
+        # nothing here should raise — which is exactly why a bare `return` was
+        # wrong: a genuine bug inside `_count_beside_the_send` would leave
+        # `_measured` None and `_last_count_exact` False for the rest of the
+        # turn with no log, no metric and no way to notice. Logged once, at
+        # WARNING, with the traceback.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "the exact count running beside the send failed; this turn reports "
+            "'not measured' and the next one waits for its count",
+            exc_info=True,
+        )
+        return
+
+    if served_window and int(served_window) != pending.window:
+        # THE WINDOW SHRANK UNDER US. On the blocking path every fit re-reads
+        # the served window from the very /tokenize it is about to use, so a
+        # window that shrank self-heals on the call that would otherwise
+        # overflow. Having sent first, this call cannot. So the mark is
+        # withdrawn: every later call takes the slow path and re-reads the
+        # window there, until a fresh successful count vouches for it again.
+        #
+        # The cache write below is BELT AND BRACES, not the thing that heals
+        # the cache: `count_tokens` already wrote this value into the same
+        # module-global dict from inside the count task. Measured 2026-09-28
+        # — removing this line leaves the suite green, including the
+        # assertion that the cache holds 8,192 afterwards — so it is here to
+        # keep the withdrawal self-contained if that write ever becomes
+        # context-local, and NOT because it is untested behaviour.
+        _window_cache[base_url] = int(served_window)
+        _window_from_server.discard(base_url)
+        from . import metrics  # local: keeps this module import-light
+
+        metrics.inc(
+            "context_window_changed_under_send_total",
+            "Times the served context window differed from the one a send-first "
+            "request was sized against; send-first is withdrawn until a fresh count.",
+        )
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "served context window is %s, not the %s this request was sized against; "
+            "sizing will wait for its count again",
+            served_window,
+            pending.window,
+        )
+
+    _last_count_exact.set(bool(exact))
+    _measured.set((pending.messages, base_url, int(count)) if exact else None)
+
+
+def has_pending_count() -> bool:
+    """Was the request in this context sized BEFORE its count came back?
+
+    True only between a send-first `fit_request` and its settlement, which is
+    exactly the window in which a refusal from the engine says something about
+    the window the request was sized against (`forget_server_window`).
+    """
+    return _pending_count.get() is not None
+
+
+def forget_server_window(base_url: str) -> None:
+    """Stop vouching for this endpoint's cached window.
+
+    `settle_pending_count` withdraws the mark when the served window turns out
+    not to be the one a request was sized against — but it only runs when the
+    send SUCCEEDED. When the engine REFUSES the oversized request instead, the
+    count that would have reported the real window is cancelled with the
+    request, nothing is written back, and the endpoint keeps its mark: every
+    later turn is sized send-first against the same stale window and is
+    refused again. Measured 2026-09-27 (QA): 4 of 4 `llm.chat_completion`
+    turns refused, for the life of the process, whenever the refusal arrived
+    before the /tokenize answer, where the blocking path served all four.
+
+    So `llm` calls this on a size refusal of a send-first request. The cache
+    itself is left alone — the next call takes the slow path and re-reads the
+    served window from the very count it is about to use, exactly as the
+    blocking path always did.
+    """
+    _window_from_server.discard(base_url)
+
+
+def cancel_pending_count() -> None:
+    """Drop a pending count without waiting for it.
+
+    Every exit that is not a dispatched send — a refusal, a cancellation, a
+    Stop — comes here. A Stop used to end 2.94 s after the click because a
+    3 s count was still owed (main.py, 2026-09-18); nothing this request
+    started may outlive it.
+    """
+    pending = _pending_count.get()
+    if pending is None:
+        return
+    _pending_count.set(None)
+    _discard_count(pending.task)
+
+
 #: /tokenize answers with the whole token-id list beside the count, so its
 #: body grows with the prompt: ~6 bytes a token, ~600 KB for a 100K-token
 #: prompt, and `json.loads` of that ran on the event loop, stalling every
@@ -405,10 +729,17 @@ async def count_tokens(
         window = int(window) if window else None
         if window:
             _window_cache[base_url] = window
+            # The server itself named this window on this call: only now may
+            # a caller trust it without counting first (`_window_from_server`).
+            _window_from_server.add(base_url)
         _last_count_exact.set(True)
         return count, window
     except Exception:
         # Multimodal payloads and transient failures land here; estimate.
+        # The endpoint did not answer, so whatever window is cached is no
+        # longer vouched for — `model_window` may now resolve it from
+        # configuration, and a send-first caller must not build on that.
+        _window_from_server.discard(base_url)
         _last_count_exact.set(False)
         return estimate_messages(messages), _window_cache.get(base_url)
 
@@ -510,12 +841,48 @@ async def fit_request(
     turns first, then the longest message clipped — until `_overflow_room`
     exists; the pinned system block and the current user message are never
     dropped.
+
+    A request that a bound the prompt cannot game already proves will fit
+    does not wait for its count: it returns at once with the same messages
+    and the same `max_tokens`, and the count runs beside the send (see
+    `_may_send_first`). The caller settles it with `settle_pending_count` as
+    soon as the request has been dispatched, or drops it with
+    `cancel_pending_count` if it never was.
     """
     window = await model_window(base_url, model)
     margin = settings.context_safety_margin
     ceiling = requested_max_tokens or settings.model_max_output
 
     msgs = list(messages)
+
+    if _may_send_first(msgs, base_url=base_url, window=window, margin=margin, ceiling=ceiling):
+        # PROVEN IDENTICAL, NOT ASSUMED. The gate holds
+        # `window - upper_bound - margin >= max(ceiling, MIN_OUTPUT_TOKENS)`,
+        # and the real count can only be SMALLER than the upper bound, so the
+        # loop below would break on its first iteration with `msgs` untouched
+        # and `budget >= ceiling`. `floor` is that guaranteed lower bound on
+        # the budget; the same arithmetic the slow path ends with therefore
+        # lands on the same number, and the body on the wire is byte-for-byte
+        # what it would have been.
+        floor = int(window) - upper_bound_messages(msgs) - int(margin)
+        # Nothing in llm.py awaits between a fit and its send, so this cannot
+        # fire today; it makes "one pending count per context, and it never
+        # outlives its request" true by construction rather than by reading
+        # every call site again.
+        cancel_pending_count()
+        task = asyncio.get_running_loop().create_task(
+            _count_beside_the_send(base_url, model, msgs)
+        )
+        _INFLIGHT_COUNTS.add(task)
+        task.add_done_callback(_swallow_count_result)
+        _pending_count.set(_PendingCount(task, msgs, base_url, int(window)))
+        # Not measured YET. `settle_pending_count` writes both the moment the
+        # request has been dispatched; until then the lanes read what they
+        # read for any uncounted prompt.
+        _last_count_exact.set(False)
+        _measured.set(None)
+        return msgs, max(1, min(int(ceiling), floor))
+
     _last_count_exact.set(False)
     prompt_tokens, served_window = await count_tokens(base_url, model, msgs)
     if served_window:

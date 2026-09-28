@@ -15,7 +15,7 @@ commits 02b509f and 82265d5 carry the same tree):
        "$BASE/orchestrator/tests/fixtures/context_assembly_golden/"
     cd "$BASE/orchestrator"
     CONTEXT_GOLDEN_CAPTURE_DIR=/some/scratch/dir \
-    TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/test_golden_capture \
+    TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/golden_capture_test \
       python -m pytest -q -p no:cacheprovider \
       tests/fixtures/context_assembly_golden/capture_from_baseline.py
 
@@ -51,6 +51,17 @@ def test_capture_the_scenario_from_this_tree(scenario, offline_turn, monkeypatch
     # A pre-change tree ignores the flag; a later reference tree reads the
     # default. Either way the capture is of the tree's own default path.
     monkeypatch.delenv("CONTEXT_CONCURRENT_READS", raising=False)
+    # THE SMALL-TALK LANE MUST BE OFF, exactly as the comparison test turns it
+    # off (tests/test_context_assembly_golden.py). These goldens pin the FULL
+    # path's prompt; with the lane enabled, `first_message` ("hello there")
+    # takes app/fast_lane.py instead and this script captures a 3-line system
+    # prompt over the 24-line one. Measured 2026-09-27 during the
+    # DIAGRAM_INSTRUCTION recapture: without this line first_message.messages
+    # .json came back as the small-talk prompt and first_message.meta.json
+    # moved with it, and the golden would then have compared a different code
+    # path to itself and passed. A capture the comparison cannot reproduce is
+    # worse than no capture.
+    monkeypatch.setenv("FAST_LANE_ENABLED", "false")
     prompt, meta = golden_turn(monkeypatch, offline_turn, scenario, "capture")
     assert_markers(scenario, prompt)
     (target / f"{scenario}.messages.json").write_text(prompt + "\n", encoding="utf-8")

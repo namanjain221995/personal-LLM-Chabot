@@ -20,6 +20,7 @@ What is checked here:
 from __future__ import annotations
 
 import asyncio
+import re
 
 import pytest
 
@@ -108,7 +109,12 @@ def test_every_nearest_view_offered_is_itself_drawable():
     ("make a choropleth of records by state", "choropleth"),
     ("draw a sankey of the funnel stages", "sankey"),
     ("make a word cloud of the feedback", "wordcloud"),
-    ("draw a network diagram of how the services talk", "network"),
+    # A network laid out FROM DATA, which is the limit the `why` names. The
+    # ask that names no data moved to
+    # test_a_network_diagram_of_named_parts_is_no_longer_refused below.
+    ("make a network graph of this data", "network"),
+    ("draw a node-link view of the co-authorship table", "network"),
+    ("draw a network diagram from this CSV", "network"),
     ("show me a venn diagram of the two lists", "venn"),
 ])
 def test_named_visuals_this_platform_cannot_draw(text, token):
@@ -306,3 +312,164 @@ def test_an_honest_refusal_about_a_visual_is_not_a_denial_of_making_files(answer
 ])
 def test_a_real_denial_of_a_file_is_still_caught(answer):
     assert cap.denial_in(answer) is True
+
+
+# ---------------------------------------------------------------------------
+# feat/document-vocabulary, 2026-09-27: the refusals this platform outgrew.
+#
+# WHY THESE ARE HERE. The commit that added `render/diagrams.py` also changed
+# two of the sentences above, and nothing pinned either change — the claim and
+# regression verifiers both measured the behaviour by hand and found no test
+# covering it (`grep -rn "flow diagram" tests/` returned nothing on either
+# tree). A refusal is a sentence a person reads, so a change to one is a
+# behaviour change and belongs in a test.
+#
+# WHAT CHANGED, measured on both trees:
+#   * `\bflow\s+diagrams?\b` was dropped from the sankey pattern. On
+#     origin/dev at 593af55, `named_unsupported("can you draw a flow diagram
+#     of the pipeline")` returned the sankey Visual; here it returns None,
+#     because a flow diagram IS now drawn — boxes and named arrows, laid out
+#     by render/diagrams.py, on the document route, and by the interface's
+#     mermaid renderer in chat.
+#   * The sankey `why` no longer claims "this platform draws no flow
+#     diagrams", which became false in the same commit, and the network `why`
+#     now says what the real limit is: a diagram is laid out from boxes and
+#     arrows that are NAMED, never from the rows of a table.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text", [
+    "can you draw a flow diagram of the pipeline",
+    "draw a flow diagram of the onboarding process",
+    "I'd like a flow diagram showing how a ticket moves through triage",
+    # Plural, and mid-sentence, because the dropped pattern was `diagrams?`.
+    "add one or two flow diagrams to the report",
+])
+def test_a_flow_diagram_is_no_longer_refused(text):
+    """The renderer ships in the same commit that stopped saying no.
+
+    This is the owner's literal complaint ("our AI should attach diagrams or
+    flows to that document"), so the refusal going away is the feature, not
+    an accident: if a later edit puts `flow diagram` back on the unsupported
+    list while render/diagrams.py still draws one, this fails.
+    """
+    assert V.named_unsupported(text) is None
+    assert V.asked_for(text) is None
+
+
+@pytest.mark.parametrize("text", [
+    "draw a sankey of the funnel stages",
+    "show me a sankey diagram of where the volume goes",
+])
+def test_a_sankey_is_still_refused_because_no_chart_type_moves_a_quantity(text):
+    """Dropping `flow diagram` must not drop the sankey with it. A sankey is
+    a CHART over a table — a quantity moving between stages, with the ribbon
+    width carrying the value — and no chart type here does that. A drawn
+    diagram is not a substitute: it has no scale."""
+    visual = V.named_unsupported(text)
+    assert visual is not None and visual.token == "sankey"
+    assert V.asked_for(text) is visual
+
+
+def test_the_sankey_reason_no_longer_claims_this_platform_draws_no_flow_diagrams():
+    """The old sentence was "this platform draws no flow diagrams, so there is
+    no type that shows a quantity moving from one stage to the next". The
+    first clause became false when render/diagrams.py landed; the second is
+    the real reason and is what is said now."""
+    sankey = V.by_token("sankey")
+    assert sankey is not None and not sankey.supported
+    assert "flow diagram" not in sankey.why
+    assert sankey.why == (
+        "this platform has no chart type that shows a quantity moving from "
+        "one stage to the next"
+    )
+    said = V.refusal_sentence(sankey)
+    assert "draws no flow diagrams" not in said
+    assert said.startswith("I can't draw a Sankey diagram — this platform has no chart type")
+
+
+def test_the_network_reason_names_the_table_as_the_limit_not_the_drawing():
+    """"this platform draws no node-and-edge diagrams" was true on dev and is
+    false here — render/diagrams.py draws exactly that. What is still true is
+    that it draws one from boxes and arrows the model NAMES, never from the
+    rows of a table, which is what the network ask supplies."""
+    network = V.by_token("network")
+    assert network is not None and not network.supported
+    assert "draws no node-and-edge diagrams" not in network.why
+    assert "never from the rows of a table" in network.why
+    assert "boxes and arrows that are named" in network.why
+
+
+def test_no_unsupported_reason_still_claims_a_diagram_cannot_be_drawn():
+    """A guard over the whole list rather than two tokens: render/diagrams.py
+    draws boxes-and-arrows now, so no refusal may tell a person otherwise.
+    `venn` and the nested-area types are unaffected — a set diagram and a
+    treemap are still genuinely absent, and they say so in their own words."""
+    for visual in V.unsupported():
+        assert "draws no flow diagrams" not in visual.why, visual.token
+        assert "draws no node-and-edge diagrams" not in visual.why, visual.token
+
+
+def test_a_network_diagram_of_named_parts_is_no_longer_refused():
+    """The refusal that outlived its reason, and the second half of the
+    correction this file's sankey tests are the first half of.
+
+    feat/document-vocabulary dropped `flow diagram` from the sankey pattern
+    because render/diagrams.py draws one, and reworded the network `why` from
+    "this platform draws no node-and-edge diagrams" to "never from the rows of
+    a table" — but left the PATTERN matching every network ask, so the
+    sentence and the gate disagreed. Measured before this edit: "draw a
+    network diagram of how the services talk" was REFUSED while "draw an
+    architecture diagram of the platform" and "can you draw a flow diagram of
+    the pipeline" were ANSWERED. Same picture, different noun.
+
+    It matters more on this branch than it did on r2: the composer can now ask
+    a section for a diagram, so a technical report draws these, and a person
+    who names the thing the report contains was the only one told no.
+    """
+    for text in (
+        "draw a network diagram of how the services talk",
+        "show me a network diagram of the request path",
+        "can you show me a network diagram of how these services talk to each other",
+        "a network diagram of the services",
+        "network diagram of the orchestrator and the two models please",
+    ):
+        assert V.named_unsupported(text) is None, text
+        assert V.asked_for(text) is None, text
+        assert I.decide(text).unsupported_visual == "", text
+
+
+@pytest.mark.parametrize("text", [
+    # The layout-algorithm names mean nothing except over rows.
+    "draw a node-link view of the co-authorship table",
+    "give me a force-directed layout of these rows",
+    "make a network graph of this data",
+    "show a network chart of the citations",
+    # ... and the diagram ask that points at its data, either way round.
+    "draw a network diagram from this CSV",
+    "build a network diagram from these rows",
+    "from the dataset, draw a network diagram",
+    "draw a network diagram of the adjacency matrix",
+    "show me a network diagram of this table",
+])
+def test_a_network_laid_out_from_data_is_still_refused(text):
+    """Dropping the bare noun must not drop the real limit with it. Nothing
+    here lays a graph out from an edge list, a matrix or a column of rows, and
+    the boxes-and-arrows renderer cannot: it draws what the model NAMES."""
+    visual = V.asked_for(text)
+    assert visual is not None and visual.token == "network", text
+
+
+def test_the_network_refusal_and_its_reason_cannot_drift_apart_again():
+    """The gate is held against the SENTENCE, so neither can move alone.
+
+    The `why` says the limit is the rows of a table. This asserts the pattern
+    agrees: an ask naming no data is not matched, and an ask naming data is.
+    A future edit that re-broadens the pattern without rewriting the reason
+    fails here rather than in production.
+    """
+    network = V.by_token("network")
+    assert network is not None
+    assert "never from the rows of a table" in network.why
+    assert re.search(network.pattern, "a network diagram of this table", re.I)
+    assert not re.search(network.pattern, "a network diagram of the services", re.I)

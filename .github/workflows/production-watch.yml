@@ -1,0 +1,345 @@
+# LANE C -- THE STANDING WATCH: is the box still true BETWEEN releases?
+#
+# `engine_bind.py check` -- the proof that the unauthenticated vLLM port is
+# unreachable from the LAN and from the tailnet -- is invoked from exactly one
+# place in this repository: the last step of pipeline.yml's `verify` job, whose
+# `if:` requires `needs.deploy.result == 'success' && github.ref ==
+# 'refs/heads/main'`. Deploys to main are days apart. Between them nothing
+# looks at the property at all, so the check is a RELEASE GATE standing in for
+# a MONITOR. On 2026-09-21 that difference had a price: the engine port was
+# found with a wildcard IPv4 listener and non-cluster addresses ACCEPTING the
+# connection, because the guard had been lost in a reboot -- and it was found
+# only because a release happened to be deployed that afternoon.
+#
+# This workflow OBSERVES that property on a schedule. It does not re-fix it:
+# `feat/host-guard-at-boot` installs the systemd unit that survives a reboot,
+# and this file does not retire, replace or weaken `verify`'s exposure
+# assertion, which stays exactly where it is. No PR, comment or summary may
+# say that assertion is now continuously monitored or can be removed.
+#
+# ======================================================================
+# WHY THIS IS A SECOND FILE AND NOT `schedule:` IN pipeline.yml
+# ======================================================================
+# Four reasons, each one a review finding rather than a preference:
+#
+#   1. `on: schedule` has no per-job scoping. A cron added to pipeline.yml
+#      runs EVERY job whose `if:` is satisfied -- policy, launcher x2, three
+#      orchestrator shards, sync-worker, frontend, schema, security, images,
+#      api-contract, and the two image-building jobs -- plus `box-readiness`,
+#      whose ref guard is TRUE on a schedule, which would put a SECOND job on
+#      the production box's single runner every tick.
+#
+#   2. On a schedule event `github.ref` is `refs/heads/main`, so every tick
+#      would join pipeline.yml's `concurrency: pipeline-${{ github.ref }}`
+#      with cancel-in-progress OFF. GitHub cancels the previously PENDING run
+#      in a group when a newer one queues, so a merge to main queued behind an
+#      in-flight run would be cancelled by the next tick: no deploy, no
+#      failure, no mail, one `cancelled` row. That is the failure class that
+#      once cost three green pushes to main.
+#
+#   3. It would defeat the deploy freshness guard: a run left queued past 90
+#      minutes is refused outright.
+#
+#   4. The no-alert-mail exception below is written for ONE job. Any of the
+#      other thirteen going red on a tick mails identically, turning one flaky
+#      test into up to 48 red runs a day.
+#
+# A second file has none of those properties and costs nothing in coverage:
+# `.github/workflows/scripts/workflow_policy.py` globs `.github/workflows/
+# *.yml` and `*.yaml`, so P1-P8 cover this file automatically; the policy
+# job's YAML step already says "Every workflow file"; and its actionlint
+# container runs over the whole repository.
+#
+# THIS IS NOT `workflow_run` CHAINING. Nothing here chains off another
+# workflow, no gate is added, no second required-check name is created, and
+# `CI passed` in pipeline.yml is untouched -- this file adds no job to it and
+# does not edit it. Please do not "consolidate" this back into pipeline.yml
+# without re-reading the four reasons above.
+#
+# ======================================================================
+# SHIPPED IN TWO COMMITS, WITH AN OWNER GATE BETWEEN THEM
+# ======================================================================
+# COMMIT ONE (this one) carries `workflow_dispatch` ONLY -- there is no cron
+# below, deliberately. It therefore cannot mail, cannot be mistaken for a live
+# monitor, and is provable by hand on the box with:
+#
+#     python3 .github/workflows/scripts/production_truth.py --dry-run
+#
+# COMMIT TWO is a ONE-LINE commit adding a `schedule:` trigger (every 30-60
+# minutes). THREE things must be true before it is merged, and none of them is
+# work this file can do:
+#
+#   1. `box_probes.py` must expose the four probes REQUIRED_PROBES names, AND
+#      expose them with a signature this watch can call. Two separate pieces of
+#      work, and the second one is the larger:
+#
+#      NAMES. Measured 2026-09-27, re-measured 2026-09-28: the module is not on
+#      dev at all; on `ci/box-readiness` (1642fa5) and on
+#      `fix/box-readiness-r3` (3b6a15c) it has probe_deploy_root, probe_disk,
+#      probe_deploy_lock, probe_engine_exposure, probe_engine_controller,
+#      probe_completion and probe_migrations -- so probe_real_completion,
+#      probe_container_states and probe_host_guard_unit are all missing.
+#
+#      SIGNATURES. All seven probes it DOES expose are `def probe_x(env:
+#      Environment) -> ProbeResult`, one required positional parameter, and
+#      `call_probe` here offers a context of exactly `deploy_root` and
+#      `timeout`. So adding the three missing NAMES is not enough: even
+#      probe_engine_exposure, the one name that already matches, cannot be
+#      called. Measured 2026-09-28 against the real module with all four names
+#      present: `box_probes.probe_engine_exposure() requires a parameter this
+#      watch cannot supply: 'env'. It offers deploy_root, timeout.` ->
+#      `verdict unavailable / channel not reached / RED`, exit 1, nothing
+#      written. It fails CLOSED and it names the parameter, which is the point
+#      of refusing rather than guessing -- calling a probe with a default that
+#      happens to parse would read the answer as if it meant something.
+#
+#      Either side can close it: `box_probes.py` grows probes whose required
+#      arguments this watch can supply, or `call_probe`'s context here learns
+#      to build that track's `Environment`. The second is not a change this
+#      file may make unilaterally -- `Environment` is theirs, and this watch
+#      imports their module rather than copying or editing it.
+#
+#      Until the reconciliation lands, every run of this workflow is
+#      `verdict unavailable / channel not reached / RED`, exit 1.
+#
+#   2. The node-exporter textfile sink must EXIST, be WRITABLE BY THE RUNNER
+#      ACCOUNT, and be read by node-exporter. TWO OWNER ACTIONS, 2a and 2b
+#      below, and NEITHER of them is work any CI job, agent or script in this
+#      repository may do for itself. They are listed separately because doing
+#      only 2a is worse than doing neither: the directory would exist, the
+#      write would land, and nothing would read it -- "wrote a file nobody
+#      reads", which is the exact display this design exists to refuse.
+#
+#      Measured 2026-09-27, re-measured 2026-09-28: `ls -ld
+#      /var/lib/node_exporter` says "No such file or directory", and
+#      `docker inspect --format '{{json .Config.Cmd}}'
+#      sf-local-ai-node-exporter-1` lists --path.rootfs, --path.procfs,
+#      --path.sysfs, --web.listen-address, the netdev/netclass collectors, five
+#      --no-collector flags and a filesystem mount-point exclusion, and NO
+#      --collector.textfile.directory.
+#
+#      2a. THE DIRECTORY -- needs root, and needs the right group. The writer
+#      here is the self-hosted runner's own account, NOT root (the deploy root
+#      is under /home/techsphere), so a root-only directory is not enough: with
+#      the directory present but unwritable by that account, write_textfile
+#      raises "the textfile write failed (PermissionError)" -> ChannelError,
+#      which makes EVERY fault verdict RED -- and once the cron lands, a red
+#      scheduled run mails, the one outcome the owner forbade. Measured
+#      2026-09-27 against the real writer on a directory with mode 0555, which
+#      is how `-o root -g root -m 0755` looks to this account. Group-writable
+#      and setgid keeps the root host-guard timer's writes and the runner's in
+#      one place:
+#
+#        sudo install -d -o root -g techsphere -m 2775 \
+#          /var/lib/node_exporter/textfile_collector
+#
+#      2b. THE EXPORTER RECREATE -- does NOT need root on this box (the
+#      techsphere account is in the `docker` group, gid 988, verified
+#      2026-09-28), and it is the owner's anyway: it recreates a running
+#      container in the live production stack, and a partial `-f` chain is how
+#      this repository has downgraded services to stale images before. Add one
+#      line to the head's node-exporter `command:` in
+#      compose/compose.monitoring.yaml (the `node-exporter:` service, beside
+#      the other collector flags) and bring the monitoring profile back up
+#      through the script that owns the full chain:
+#
+#        # compose/compose.monitoring.yaml, node-exporter `command:`
+#        - --collector.textfile.directory=/host/var/lib/node_exporter/textfile_collector
+#        # then, from the deploy root:
+#        scripts/monitoring.sh up
+#
+#      The host root is already mounted at /host read-only, which is all a
+#      textfile collector needs -- see monitoring/developer-api/README.md,
+#      "host packet filter", which asks for the same recreate for
+#      techsara_host_guard_* and is still waiting for it. `scripts/monitoring.sh
+#      up` touches no model service: the monitoring profile is not a dependency
+#      of vLLM, the orchestrator or the frontend.
+#
+#      `python3 .github/workflows/scripts/production_truth.py --dry-run` writes
+#      nothing and names whichever half is still missing, so run it BEFORE
+#      spending the owner action and again after.
+#
+#   3. A Prometheus ALERT RULE for `techsara_production_truth_*` under
+#      monitoring/prometheus/rules/, plus its entry in
+#      monitoring/developer-api/metrics-contract.json. Measured 2026-09-27:
+#      `grep -rn techsara_production_truth monitoring/` returns NOTHING, while
+#      the precedent `techsara_host_guard_*` has both
+#      (monitoring/prometheus/rules/developer-api.yml:541 and :558, contract
+#      lines 43-45). This one is not paperwork: the readback below proves only
+#      that Prometheus SCRAPED the file, so "hands the fault to Prometheus,
+#      which owns alerting" -- the sole justification for this job being green
+#      over a real fault -- is unbacked at the alert layer until the rule
+#      exists. The rule also needs `absent()`, not staleness alone: a run whose
+#      write never lands leaves no series at all, and a staleness comparison
+#      against
+#      `techsara_production_truth_check_timestamp_seconds` is silent over an
+#      absent series (the host-guard rule at developer-api.yml:558 has that
+#      same gap).
+#
+# ======================================================================
+# GREEN OVER A REAL FAULT -- THE DELIBERATE EXCEPTION
+# ======================================================================
+# Every other gate in this repository goes red when the thing it measures is
+# bad. This job does not, and the reasoning is here rather than implied.
+#
+# The owner's standing instruction after the 2026-09-15 uptime work is NO
+# ALERT MAIL, and a red scheduled run mails. So when this watch finds a real
+# fault it HANDS THE FAULT TO PROMETHEUS, which owns alerting, and stays
+# green. That is only honest if the handover actually happened, so the script
+# writes the verdict as a node-exporter textfile and then READS IT BACK out of
+# Prometheus before it is allowed to be green:
+#
+#     verdict `ok`                                      -> GREEN, and the
+#                                                          textfile is
+#                                                          REWRITTEN so a
+#                                                          cleared fault clears
+#     verdict `deferred` (a rollout is in flight)       -> GREEN, nothing
+#                                                          probed, nothing
+#                                                          written
+#     a fault verdict, the textfile was written, AND a
+#       Prometheus readback shows the metric present
+#       with a FRESH timestamp                          -> GREEN, verdict carried
+#     a fault verdict, but the textfile directory is
+#       missing, the write failed, or the metric is
+#       absent or stale on readback                     -> RED
+#     a probe could not be PERFORMED                    -> RED
+#
+# The readback is what makes the green honest: without it, "wrote a file" is
+# indistinguishable from "wrote a file nobody reads".
+#
+# AND THE READBACK IS SCOPED to this run's own writer -- `{job="node",
+# node="..."}`, the same shape every host-guard rule in this repository uses --
+# because a series of the right NAME is not the same thing as this run's series.
+# Unscoped, the query took the highest value it could find: measured 2026-09-28,
+# one foreign series of the same metric name from another instance, an hour
+# ahead, turned a live engine exposure into `result GREEN`, exit 0, printing
+# "the verdict reached a sink that reads it". `--readback-node` names the node
+# whose exporter reads this run's file; getting it wrong fails CLOSED (the
+# metric reads ABSENT and the run goes red), and the default is pinned against
+# monitoring/prometheus/prometheus.yml by the test suite.
+#
+# A CLEAN run writes that file too, and does NOT read it back. The metric is one
+# series per verdict and the file is replaced whole, so the only thing that turns
+# `verdict{verdict="exposed"} 1` back into 0 -- and the only thing that moves the
+# check timestamp forward -- is a LATER run rewriting it. A watch whose clean
+# runs wrote nothing would latch its first fault in Prometheus for good: the
+# alert would fire forever after the box had been fixed, only a root `rm` would
+# clear it, and every run would stay green while it did. The readback itself
+# stays fault-only -- it buys the right to be green OVER A FAULT, and a clean run
+# has no fault to justify, so it must never spend the Prometheus deadline or turn
+# a healthy box red.
+#
+# A run that OBSERVED NOTHING writes nothing: `deferred` (a rollout held the
+# deploy lock) and a probe that could not be performed both leave the file
+# exactly as it was, because zeroing a fault on the strength of a reading that
+# was never taken would clear a live alert.
+name: Production watch
+
+# NO `schedule:` HERE. It arrives in its own one-line commit once the
+# textfile exporter exists on the box -- see "SHIPPED IN TWO COMMITS" above.
+#
+# The acceptance test for the no-mail promise at merge time is
+# `test_commit_one_carries_no_schedule_trigger`, which parses this file and
+# asserts `schedule` is not among its TRIGGERS. A plain `grep -n schedule` over
+# this file is NOT that test and never was: the word appears a dozen times in
+# the prose above, explaining why the cron is not here yet.
+on:
+  workflow_dispatch:
+
+# The watch's own group, at workflow level. It never queues behind, and can
+# never evict, anything on the release path.
+concurrency:
+  group: production-watch
+  cancel-in-progress: false
+
+# The token starts with nothing; the one job adds back `contents: read` for
+# its checkout and nothing else.
+permissions: {}
+
+jobs:
+  production-truth:
+    # The name says `main only` because the `if:` below is the only thing that
+    # answers a dispatcher, and it answers by saying nothing. See the guard.
+    name: Production truth (main only; any other ref is SKIPPED)
+    runs-on: [self-hosted, dgx-spark]
+    permissions:
+      contents: read
+    # Eight minutes. The probes are read-only and take seconds; the only slow
+    # path is the Prometheus readback, which is bounded by
+    # --readback-deadline-seconds well inside this ceiling. A watch that can
+    # hold the production box's single runner for longer than a rollout takes
+    # is not a watch, it is an outage.
+    timeout-minutes: 8
+    # ITS OWN GROUP -- never `deploy-dgx-spark`. An Actions concurrency group
+    # holds one RUNNING and one PENDING entry, and a newly queued entry
+    # cancels the pending one. If this watch shared the release path's group,
+    # a tick could cancel a pending release-path job and the deploy would be
+    # SKIPPED with no reason given -- the failure class that once cost three
+    # green pushes to main. Inside the watch's own group the same behaviour is
+    # CORRECT: a newer tick replacing a pending older tick means the freshest
+    # observation wins.
+    #
+    # SINGLE-RUNNER INVARIANT: there is ONE self-hosted runner on the head and
+    # it runs one job at a time. That, not this group, is what physically
+    # prevents this job from interleaving with a rollout. If a second runner
+    # is ever added to that label, this job must take a read lock instead of
+    # relying on the invariant -- and the script's first probe (the deploy
+    # flock) is already the right place for it.
+    concurrency:
+      group: production-truth-watch
+      cancel-in-progress: false
+    # A scheduled run executes on the default branch, so this guard holds
+    # honestly rather than by exemption. workflow_policy.py P4 fullmatches
+    # this exact literal on a self-hosted job; do not reword it.
+    #
+    # AND IT IS SILENT, on the only trigger that exists today. `schedule:` is
+    # not here yet (see "SHIPPED IN TWO COMMITS"), so every run of this workflow
+    # is a `workflow_dispatch` -- and dispatching it from any ref other than
+    # main satisfies nothing, runs no step, and produces a `skipped` job with NO
+    # reason given. That is this repository's own documented failure class: a
+    # skipped job reports no reason, and it once cost three green pushes to main
+    # before anybody noticed. The reason cannot be printed from inside the job,
+    # because a job whose `if:` is false runs none of its steps and writes no
+    # step summary, and P4 forbids moving the guard into a step. So it is in the
+    # one string the run's UI shows beside the skip: the job's `name:` above.
+    # If you dispatched this and got one skipped job, that is why -- re-dispatch
+    # it on main.
+    if: github.ref == 'refs/heads/main'
+    env:
+      TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
+    steps:
+      # The script comes from a checkout of the commit being run, the same way
+      # `deploy` and `verify` run theirs: the production checkout may be on
+      # another commit, and a watch that is missing there must not be a watch
+      # that silently does not run.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+
+      # READ-ONLY apart from ONE write -- the node-exporter textfile that
+      # carries the verdict, rewritten on every run that actually observed the
+      # box, `ok` included, because rewriting it is the only thing that turns a
+      # previous run's fault back off. It takes no lock, restarts nothing and
+      # never touches the engine. And it yields to a release: its first probe
+      # is the deploy flock, and a held lock means `deferred`, exit 0, nothing
+      # probed and nothing written.
+      #
+      # Every line it prints goes through its own scrubber first -- this
+      # repository is PUBLIC and a scheduled run's log is public with it. What
+      # the scrubber actually covers, and all it covers: IPv4, IPv6 including
+      # the compressed form this cluster's tailnet uses, anything carrying
+      # `://`, any path naming generated.env, and the VALUES of environment
+      # variables whose key ends in IP/ADDR/ADDRESS/HOST/SSH/IFNAME.
+      #
+      # A bare hostname, a tailnet DNS name and a `user@host` ssh target are
+      # NOT matched by those patterns. Nothing feeds them today -- probe detail
+      # comes from box_probes.py, which sanitizes the same classes -- so this is
+      # a limit to respect when writing a probe, not a live leak: report ROLES
+      # and interface CLASSES, and never put a name in `detail`.
+      #
+      # It opens no environment file of its own; the probes it imports own that.
+      - name: Is the box still true?
+        run: |
+          set -euo pipefail
+          python3 .github/workflows/scripts/production_truth.py \
+            --deploy-root "$TECHSARA_DEPLOY_ROOT"

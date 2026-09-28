@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Post-rollout invariants: the questions "is it up?" does not ask.
 #
-#   scripts/deploy-smoke.sh [--manifest FILE] [--baseline RECORD] [--with-model]
+#   scripts/deploy-smoke.sh [--manifest FILE] [--baseline RECORD]
+#                           [--expect-model-restart] [--with-model]
 #
 # The existing verify stage checks that things ANSWER — /health returns 200, the
 # frontend serves /login, Prometheus is alive. Those are necessary and they are
@@ -26,6 +27,16 @@
 #               it is 15-25 minutes of the product answering nothing. With
 #               --baseline <a record.json from before the deploy> this is an
 #               assertion rather than an observation.
+#               --expect-model-restart turns that assertion AROUND for a
+#               `--full` deploy, which reloads the models on purpose: the check
+#               then requires the clock to have MOVED, and fails when it did
+#               not, because a --full that left the engine running did not do
+#               what it was asked. Without the flag a moved clock is still a
+#               failure. Getting this wrong in the other direction is what made
+#               a deliberate, successful --full deploy print "the main model
+#               RESTARTED ... a routine deploy must not reset this clock" and
+#               turn the verify job red the first time anything called this
+#               script (the verify job, 2026-09-27).
 #   MODEL       Optional (--with-model), because it costs a real generation:
 #               a completion that actually returns text. /v1/models answers
 #               while the engine behind it is dead, so it proves nothing.
@@ -38,11 +49,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/deploy-common.sh
 . "$HERE/lib/deploy-common.sh"
 
-MANIFEST=""; BASELINE=""; WITH_MODEL=0
+MANIFEST=""; BASELINE=""; WITH_MODEL=0; EXPECT_MODEL_RESTART=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --manifest) MANIFEST="${2:?}"; shift ;;
     --baseline) BASELINE="${2:?}"; shift ;;
+    --expect-model-restart) EXPECT_MODEL_RESTART=1 ;;
     --with-model) WITH_MODEL=1 ;;
     -h|--help) awk 'NR==1{next} /^#/{print; next} {exit}' "$0"; exit 0 ;;
     *) dr_die "unknown option: $1" ;;
@@ -133,8 +145,24 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 print(((d.get("containers") or {}).get(sys.argv[2]) or {}).get("started_at", ""))' "$BASELINE" "$vllm")"
   if [ -z "$was" ]; then skip "the baseline record does not mention $vllm"
-  elif [ "$was" = "$started" ]; then ok "the main model was NOT restarted (started $started, unchanged)"
-  else bad "the main model RESTARTED: $was -> $started. A routine deploy must not reset this clock."; fi
+  else
+    # One shared decision (dr_model_clock_verdict), so this script and the
+    # verify job's own rolling-deploy step cannot disagree about what --full
+    # means. The verdict word decides; the sentence is this script's to write.
+    verdict="$(dr_model_clock_verdict "$was" "$started" "$EXPECT_MODEL_RESTART" || true)"
+    case "$verdict" in
+      preserved)
+        ok "the main model was NOT restarted (started $started, unchanged)" ;;
+      reloaded)
+        ok "the main model reloaded, which is what --full asked for ($was -> $started)" ;;
+      restarted)
+        bad "the main model RESTARTED: $was -> $started. A routine deploy must not reset this clock." ;;
+      not-reloaded)
+        bad "a model reload was asked for (--expect-model-restart) and the clock did not move: still $started. The reload that was requested did not happen." ;;
+      *)
+        bad "the model clock could not be compared (recorded=${was:-?}, observed=${started:-?})" ;;
+    esac
+  fi
 else
   skip "no --baseline record; $vllm started at $started (nothing to compare it to)"
 fi

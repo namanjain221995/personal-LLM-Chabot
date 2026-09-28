@@ -205,11 +205,82 @@ _ROLE = (
     "'TBD' or 'TODO'."
 )
 
+#: THE ONE SENTENCE THAT TELLS A COMPOSER A DIAGRAM EXISTS, used verbatim
+#: wherever a block vocabulary is listed. It was missing, and the omission
+#: was the whole reason a model-composed technical report held no picture:
+#: `spec.DocumentBlock` gained a `diagram` member and `_schema_with_defs`
+#: has accepted one since, but `_OUTLINE_SCHEMA.elements` is a CLOSED enum
+#: and the comment at `_write_one_section` records what that costs — "the
+#: model follows it literally: fifteen scoped calls produced fifteen
+#: headings and no sub-heading at all, twice measured". A block the
+#: vocabulary does not name is a block the model does not write.
+#:
+#: THE ROLE NAMES ARE READ OFF `spec.DIAGRAM_ROLES` RATHER THAN SPELLED
+#: AGAIN. Three copies of this vocabulary already exist in this module and
+#: they have drifted apart in wording; a fourth copy of the ROLE list would
+#: drift into teaching a role `spec.DiagramNode` refuses. The earlier note
+#: here said such a role "is silently re-coloured rather than reported",
+#: and that is FALSE on this path: `spec.DiagramNode.kind` is a closed
+#: Literal, so `DiagramNode(id='n', label='n', kind='database')` raises a
+#: pydantic ValidationError (measured 2026-09-28; so do 'Store', 'STORE'
+#: and ''). The folding lives at render/diagrams.py:832 and :867, which
+#: the spec Literal makes unreachable from the composer. The guard is worth
+#: more than the old reason claimed, not less: an invented role does not
+#: cost one box its hue, it costs the whole draft, because
+#: `_validate_or_repair` answers any ValidationError with ONE
+#: whole-document rewrite that REPLACES the sectioned draft. Measured on
+#: the owner's route before `_salvage_diagrams` was added below: one wrong
+#: role word in section 3 of 8 turned 8 level-1 headings and 3,378 words
+#: into 6 words, with no warning naming a diagram. Roles are also what
+#: render/diagrams.py colours by, so a name that misses the set loses its
+#: hue as well as its meaning.
+#:
+#: WHAT THIS COSTS, IN THE UNIT IT IS NAMED IN. Re-measured 2026-09-28 by
+#: assembling the real prompts and removing the clause from them in memory,
+#: so both columns are the same tree (`tests/test_diagram_clause_budget.py`
+#: pins every number below and fails if one moves):
+#:
+#:     the clause itself              251 CHARACTERS, 253 UTF-8 bytes
+#:                                    (one em dash, U+2014, at index 78)
+#:     whole-document system prompt   +253 characters, every template
+#:     named-sections user message    +253 characters
+#:     per-section system prompt      +506 characters — the clause is
+#:                                    said TWICE there, see below
+#:     a 15-section report            15 x 506 = 7,590 characters, and
+#:                                    up to 9,108 with the three
+#:                                    SECTION_EXTEND_MAX extension calls
+#:
+#: THE COMMIT THAT ADDED THIS RECORDED THE FIGURE AS A BYTE COUNT, and as
+#: paid once per call. Both halves were wrong. 251 is the CHARACTER count —
+#: the byte count is 253 — and "once per call" holds only on the
+#: whole-document route: the sectioned route, which is the route a long
+#: technical report takes, pays 506 per section. This subsystem has made
+#: the character/byte mistake once before, one commit earlier, and the test
+#: file written to correct it is right that a guard naming the wrong unit
+#: is a guard that will mislead the next person to raise it. So these are
+#: pinned by tests/test_diagram_clause_budget.py rather than only written
+#: down here.
+#:
+#: WHY THE PER-SECTION PROMPT SAYS IT TWICE, ON PURPOSE. The sectioned
+#: route's system message is `_material_messages` — which carries
+#: `_KIND_GUIDE['document']` and so the clause — plus the scoped append in
+#: `_write_one_section`. That is the same shape the sub-heading sentence
+#: already has, and for the same recorded reason (see the comment there):
+#: the model writes the list it is given LAST. The duplication is the
+#: design, not a slip, and the 506 above is what it costs.
+DIAGRAM_CLAUSE = (
+    "a diagram when the point is how parts CONNECT rather than how numbers compare — an architecture, a "
+    "pipeline, a request path as boxes and arrows, each box given its role ("
+    + ", ".join(S.DIAGRAM_ROLES)
+    + "), never a picture of numbers and never decoration"
+)
+
 _KIND_GUIDE = {
     "document": (
         "Write a document: a title, then blocks in reading order. Use heading "
         "levels for structure, short paragraphs, bullet lists for enumerations, "
-        "a table when the material has rows, a chart when numbers compare, a "
+        "a table when the material has rows, a chart when numbers compare, "
+        + DIAGRAM_CLAUSE + ", a "
         "callout for a warning or key takeaway, a kpis row for a brief's "
         "headline numbers. Put an assumptions list where you had to infer. "
         "Do not repeat the same content in two blocks."
@@ -242,7 +313,7 @@ _TEMPLATE_GUIDE = {
     "executive_report": "Executive report: cover on, an executive summary first (five sentences at most), then findings, then recommendations clearly separated from findings, then appendix material.",
     "brief": "One-page executive brief: no cover, a kpis row at the top, three to five tight sections, no section longer than 120 words. It must fit one page.",
     "sop": "Standard operating procedure: purpose, scope, roles, then NUMBERED steps with a warning callout where a step can go wrong, then a checklist.",
-    "technical_report": "Technical report: context, approach, findings with tables, limitations, next steps. Precise, no marketing language.",
+    "technical_report": "Technical report: context, approach, findings with tables, limitations, next steps. A diagram where the architecture, the data path or the process is the point — that is what a technical reader opens it for. Precise, no marketing language.",
     "research_report": "Research report: question, method, findings with citations on every claim that came from a source, discussion, sources.",
     "proposal": "Proposal: the need, the proposed approach, scope, timeline (a table), pricing or effort if given, next steps.",
     "meeting_summary": "Meeting summary: attendees if known, decisions, action items with owners as a table, open questions.",
@@ -254,6 +325,40 @@ _TEMPLATE_GUIDE = {
     "dashboard": "Dashboard workbook: a Dashboard sheet of headline figures and charts, then the data sheets behind it.",
     "data": "Data workbook: the rows as given, typed columns, filters on.",
 }
+
+
+def _template_guide(kind: str, template_id: str) -> str:
+    """The template's guide, but only when the template belongs to the kind.
+
+    `_TEMPLATE_GUIDE` is ONE FLAT DICT holding document ids
+    (executive_report, brief, sop, technical_report, research_report,
+    proposal, meeting_summary), deck ids (ceo, training, quarterly_review)
+    and workbook ids (tracker, dashboard, data) together, and it used to be
+    read with a bare `.get(req.template_id, ...)` and no kind gate. That is
+    a third place a kind can be told about a block its own schema refuses,
+    beside `_KIND_GUIDE` and `_requested_line` — and it was leaking:
+    measured 2026-09-28 over all 42 kind x template_id pairs through the
+    real `_material_messages`, `presentation|technical_report` and
+    `workbook|technical_report` each carried the technical report's
+    sentence "A diagram where the architecture, the data path or the
+    process is the point", +124 characters, teaching a deck and a workbook
+    a `Slide` and a `Sheet` cannot hold.
+
+    LATENT, NOT LIVE, and it is fixed here rather than argued about because
+    the reason it is latent is not a rule anywhere: `formats.template_for`
+    is kind-scoped, every edit and restore path reads `kind` and
+    `template_id` off the same row, and the public API exposes no
+    `template_id` — so the pairing holds today only because the three id
+    namespaces happen to be disjoint. `spec.templates_for(kind)` is the
+    Literal the validator itself uses, so this gate cannot drift from the
+    schema; a stranger id falls back to the generic guide, which is what a
+    `.get` miss already did.
+    """
+    allowed = S.templates_for(kind)
+    if allowed and template_id not in allowed:
+        return _TEMPLATE_GUIDE["generic"]
+    return _TEMPLATE_GUIDE.get(template_id, _TEMPLATE_GUIDE["generic"])
+
 
 #: The prefix of the version warning that names figures the material never gave.
 FIGURES_WARNING = "figures not in the material (derived or assumed): "
@@ -472,7 +577,7 @@ def _size_line(target: Optional[LengthTarget]) -> str:
             "wherever the data supports one. Do not stop early and do not summarise what you have already written.")
 
 
-def _requested_line(requested: Sequence[str]) -> str:
+def _requested_line(requested: Sequence[str], *, kind: str = "document") -> str:
     """The sections the person named, in their words and their order.
 
     Until 2026-09-22 they reached the model only as the integer inside
@@ -498,7 +603,13 @@ def _requested_line(requested: Sequence[str]) -> str:
         "heading at LEVEL 1; the parts inside a section are sub-headings at LEVEL 2, and a section of several "
         "hundred words needs two or three of them. Write real prose under every heading rather than a heading "
         "followed by a single line. Use the block the request's own words ask for: a bullets block for an "
-        "enumeration, a numbered block for a sequence of steps, a table where things are compared, a callout "
+        "enumeration, a numbered block for a sequence of steps, a table where things are compared, "
+        # A DIAGRAM IS A DOCUMENT BLOCK AND ONLY A DOCUMENT BLOCK. This line
+        # is built for every kind — the caller passes `req.kind` — and
+        # `Slide` has no diagram field, so naming one to a deck or a workbook
+        # would teach a block its schema refuses.
+        + (DIAGRAM_CLAUSE + ", " if kind == "document" else "")
+        + "a callout "
         "with kind \"warning\" and a title for a caution or a risk, a callout with kind \"note\" and a title "
         "for an aside or a note, and recommendations written as recommendations where the request asks for them."
     )
@@ -552,7 +663,7 @@ def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget, target: O
     size = _size_line(target)
     tone = size or _TONE.get(req.effort, "")
     system = (
-        f"{_ROLE}\n\n{_KIND_GUIDE[req.kind]}{caps}{guide}\n\n{_TEMPLATE_GUIDE.get(req.template_id, _TEMPLATE_GUIDE['generic'])}\n\n"
+        f"{_ROLE}\n\n{_KIND_GUIDE[req.kind]}{caps}{guide}\n\n{_template_guide(req.kind, req.template_id)}\n\n"
         f"{tone} Limits: at most {max_sections} top-level sections, "
         f"{max_slides} slides, {budget.max_sheets} sheets. "
         f"Set template_id to \"{req.template_id}\"."
@@ -577,7 +688,7 @@ def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget, target: O
     # what the user message is for. Pinned by
     # test_artifact_length.py::test_the_requested_sections_never_enter_the_system_message.
     user = "\n\n".join(
-        parts + [f"Request: {req.instruction or m.instruction}" + _requested_line(requested)]
+        parts + [f"Request: {req.instruction or m.instruction}" + _requested_line(requested, kind=req.kind)]
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -634,7 +745,7 @@ _OUTLINE_SCHEMA = {
                 "properties": {
                     "heading": {"type": "string", "maxLength": 120},
                     "purpose": {"type": "string", "maxLength": 200},
-                    "elements": {"type": "array", "maxItems": 6, "items": {"type": "string", "enum": ["paragraphs", "bullets", "table", "chart", "callout", "kpis", "numbered"]}},
+                    "elements": {"type": "array", "maxItems": 6, "items": {"type": "string", "enum": ["paragraphs", "bullets", "table", "chart", "diagram", "callout", "kpis", "numbered"]}},
                 },
                 "required": ["heading", "purpose", "elements"],
             },
@@ -692,17 +803,40 @@ def _outline_schema(max_sections: int) -> dict:
 
 
 async def outline(req: ComposeRequest, budget: T.EffortBudget, *, target: Optional[LengthTarget] = None,
-                  max_tokens: int = 2500) -> dict:
-    messages = _material_messages(req, budget=budget, target=target)
+                  max_tokens: int = 2500, requested: Sequence[str] = ()) -> dict:
+    """The plan. `requested` is NOT optional in practice: it is what tells
+    this call how many sections the person asked for, and the plan it
+    returns is what `compose_sectioned` then writes one call at a time.
+
+    Measured in sf-local-ai-orchestrator-1 on the owner's request
+    ("a detailed technical report" + 15 numbered sections, Fast, target
+    3,000 words, explicit): without it `caps_for` returned (8, 12) where
+    with it it returns (17, 12), so the outline was told "Limits: at most 8
+    top-level sections" AND "Plan 8 sections (at most 8)" for a request
+    that named fifteen. The fifteen names themselves were in the call — they
+    are inside the raw request text this prompt carries — but
+    `_requested_line`, which is the sentence that says "none skipped, none
+    merged into another, none renamed" and the block vocabulary that goes
+    with it, was not. The model obeyed the eight, and the document came back
+    with 8 of the 15 sections."""
+    messages = _material_messages(req, budget=budget, target=target, requested=requested)
     messages[0]["content"] += (
         "\n\nFIRST, plan only: return the outline — title, audience, purpose, "
         "the sections in order with what each is for and which elements it "
         "uses, whether the request needs current external facts you were not "
         "given, and the assumptions you will make."
     )
-    sections, _slides = caps_for(budget, target)
+    sections, _slides = caps_for(budget, target, requested)
     if target is not None and target.words:
-        want = _length.sections_for(target.words)
+        # THE REAL NUMBER, NOT THE ARITHMETIC. `sections_for` divides the
+        # word target by WORDS_PER_SECTION, which on the owner's 3,000-word
+        # request is 8 — a number he never said, for a request that numbered
+        # fifteen sections. When the request names its sections, the count it
+        # names is the plan; `caps_for` already guarantees it fits (it never
+        # falls below len(requested) + 2), and `section_words` then divides
+        # the words across the sections that were actually asked for
+        # (3,000 / 15 = 200, against the 375 the eight-section plan used).
+        want = min(max(_length.sections_for(target.words), len(requested)), sections)
         messages[0]["content"] += (
             f"\n\nPlan {want} sections (at most {sections}), each worth about "
             f"{_length.section_words(target.words, want):,} words, so the whole file comes to about "
@@ -750,6 +884,28 @@ def body_json_for_prompt(spec: S.ArtifactSpec) -> str:
     return json.dumps(dump, ensure_ascii=False)
 
 
+#: HOW MANY FIGURES ONE COMPOSED DOCUMENT MAY HOLD. The chat path's diagram
+#: instruction (app/engines/__init__.py) caps an ANSWER at one diagram and
+#: says ordinary questions get none — tests/test_diagram_instruction_budget.py
+#: calls those two rules "what stop an eager model decorating every answer" —
+#: and the comment beside it states that "the three-diagram allowance for a
+#: DOCUMENT lives on the artifact path". It did not: nothing in this module
+#: capped figures at all, and `DIAGRAM_CLAUSE` names no limit while being
+#: repeated in EVERY per-section prompt, so a fifteen-section report invited
+#: up to fifteen rendered PNGs. Three is the number the chat side was
+#: already told, so it is the number here rather than a new one.
+#:
+#: WHY A TRIM AND NOT A WARNING, unlike the section cap just above. The
+#: section cap only warns because cutting a section throws away the
+#: person's prose; a figure past the third is server-side matplotlib CPU on
+#: the box that is also answering live chat, and dropping it costs the
+#: document no words. It is the same trade the slide, sheet and row caps
+#: make. The FIRST three are kept, in reading order: an architecture
+#: diagram belongs near the front, and a model that draws four has spent
+#: the fourth on decoration.
+MAX_DIAGRAMS_PER_DOCUMENT = 3
+
+
 def _enforce_caps(spec: S.ArtifactSpec, budget: T.EffortBudget, requested: Sequence[str] = (),
                   *, target: Optional[LengthTarget] = None) -> List[str]:
     """Trim what the effort level allows rather than refuse: a deck with 14
@@ -778,6 +934,11 @@ def _enforce_caps(spec: S.ArtifactSpec, budget: T.EffortBudget, requested: Seque
         top = sum(1 for b in body.blocks if isinstance(b, S.Heading) and b.level == 1)
         if top > max_sections:
             warnings.append(f"the document has {top} top-level sections; this effort level asked for at most {max_sections}")
+        figures = [i for i, b in enumerate(body.blocks) if isinstance(b, S.DiagramBlock)]
+        if len(figures) > MAX_DIAGRAMS_PER_DOCUMENT:
+            cut = set(figures[MAX_DIAGRAMS_PER_DOCUMENT:])
+            warnings.append(f"the document was trimmed from {len(figures)} diagrams to {MAX_DIAGRAMS_PER_DOCUMENT}")
+            body.blocks = [b for i, b in enumerate(body.blocks) if i not in cut]
     return warnings
 
 
@@ -1123,6 +1284,87 @@ LONG_DOCUMENT_NOTE = "written as a long document"
 #: asked for. _worse()'s own floor is half; half of a nine-call document is
 #: still four pages lost in one call (QA B-1, 2026-09-18).
 CORRECTION_KEEP_FRACTION = 0.9
+#: How many blocks a document may carry: `S.DocumentSpec.blocks`' own
+#: max_length, named once here because two places in this module have to stop
+#: BEFORE validation would refuse the document rather than after.
+DOCUMENT_BLOCK_CEILING = 400
+#: How many citations a document's manifest may carry: `S.DocumentSpec.sources`'
+#: own max_length. The coverage repair adds to that manifest, so it is the same
+#: unvalidated-assignment class as the block ceiling and stops at the same kind
+#: of number.
+DOCUMENT_SOURCE_CEILING = 60
+
+
+def _top_sections(blocks: Sequence[Any]) -> int:
+    """How many level-1 headings a block list carries — raw model JSON and
+    validated block models alike, so the same count serves the draft the
+    sectioned writer returns and the spec the repair splices into."""
+    n = 0
+    for b in blocks:
+        if isinstance(b, dict):
+            if b.get("type") == "heading":
+                try:
+                    level = int(b.get("level") or 1)
+                except (TypeError, ValueError):
+                    level = 1
+                if level == 1:
+                    n += 1
+        elif isinstance(b, S.Heading) and int(b.level) == 1:
+            n += 1
+    return n
+
+
+def _document_shape(blocks: Sequence[Any]) -> Tuple[int, int]:
+    """(blocks, prose characters) counted the way `S.DocumentSpec._shape`
+    counts them, over validated block models."""
+    prose = sum(len(getattr(b, "text", "") or "") for b in blocks)
+    prose += sum(sum(len(i) for i in b.items) for b in blocks if isinstance(b, S.Bullets))
+    return len(blocks), prose
+
+
+def _over_document_limits(blocks: Sequence[Any], sources: int) -> str:
+    """Why `S.DocumentSpec` would REFUSE a document of these blocks and this
+    many citations, or "" when it would not. Every number is one of that
+    model's own: `blocks`' max_length, `_shape`'s prose sum against
+    `T.MAX_TEXT_CHARS`, and `sources`' max_length.
+
+    It has to be answerable BEFORE the document is assigned, because
+    `body.blocks = ...` is not re-validated by pydantic — `_Strict` sets only
+    extra="forbid" and str_strip_whitespace. A document over a limit therefore
+    fails nowhere near here: it fails in `render/worker.py`'s
+    `S.load(job["spec"])` as "The render job could not be read.", and the
+    person gets no file at all. Measured 2026-09-28 on a 20-section request
+    with a 390-block draft behind it: the repair spliced 420 blocks and
+    `S.load` refused it with "List should have at most 400 items after
+    validation, not 420".
+    """
+    held, prose = _document_shape(blocks)
+    if held > DOCUMENT_BLOCK_CEILING:
+        return f"{held} blocks, the ceiling is {DOCUMENT_BLOCK_CEILING}"
+    if prose > T.MAX_TEXT_CHARS:
+        return f"{prose} characters of prose, the ceiling is {T.MAX_TEXT_CHARS}"
+    if sources > DOCUMENT_SOURCE_CEILING:
+        return f"{sources} citations, the ceiling is {DOCUMENT_SOURCE_CEILING}"
+    return ""
+
+
+def _long_document_note(target: LengthTarget, sections: int, calls: int) -> str:
+    """What the card says when the sectioned writer was chosen.
+
+    `sections` is how many sections the person will COUNT in the file and
+    `calls` what was really spent writing them — both read from the finished
+    work, never from the plan. Measured on the owner's fifteen-section
+    request 2026-09-27, after the coverage repair below was added: an
+    8-section plan, 15 sections delivered, 19 model calls, and this line
+    still read "written in 8 sections over 12 model calls". The whole
+    complaint of 2026-09-22 was our own arithmetic quoted back at him as if
+    it were his request; a count of the delivered file cannot drift from it.
+
+    The tail shape is `types._MODEL_CALLS_RE`'s, which strips it for the
+    reply, so it stays "written in N sections over M model calls".
+    """
+    return (f"{LONG_DOCUMENT_NOTE}: “{target.phrase or 'the request'}” was read as about "
+            f"{target.words:,} words, written in {max(1, sections)} sections over {calls} model calls")
 
 
 def _stage_budget_s() -> float:
@@ -1233,13 +1475,20 @@ async def _write_one_section(
     words: int,
     position: Tuple[int, int],
     current: Optional[Sequence[Any]] = None,
+    requested: Sequence[str] = (),
 ) -> List[dict]:
     """One scoped call: the blocks of ONE section. Thinking off at every
     effort. `current` makes it an extension of a section already written
-    rather than a first draft of it."""
+    rather than a first draft of it.
+
+    `requested` goes to `_material_messages` for the same reason `outline`
+    needs it: without it the shared limits line read "Limits: at most 8
+    top-level sections" on the owner's fifteen-section request (measured in
+    sf-local-ai-orchestrator-1 today), which is `caps_for`'s Fast floor
+    quoted into a prompt whose whole job is to write ONE section."""
     index, total = position
     heading = str(item.get("heading") or "").strip()
-    messages = _material_messages(req, budget=budget, target=target)
+    messages = _material_messages(req, budget=budget, target=target, requested=requested)
     messages[0]["content"] += (
         "\n\nYOU ARE WRITING ONE SECTION of this file, not the whole file. Return JSON with `blocks` only: that "
         "section's own blocks, the first of them its heading (type heading, level 1, the heading you are given). "
@@ -1252,12 +1501,19 @@ async def _write_one_section(
         # back with fifteen headings and not one sub-heading (measured,
         # Think, file route: 0 of 15). The vocabulary sentence is the same
         # one the whole-document prompt carries, said once per section
-        # instead of once per document — the fifteen section NAMES are
-        # deliberately not repeated here, because this call writes one.
+        # instead of once per document.
+        #
+        # The section names DO travel now, in the user message that
+        # `_material_messages` builds from `requested` — they are the
+        # document's contract and this call has to know which of the
+        # fifteen is its own. They are not repeated again in this block:
+        # what follows says, twice and last, that this call writes one
+        # section, and `_as_section` is the code that holds it to that.
         " Break the section into its parts and head each part at LEVEL 2 under your level-1 heading — two or "
         "three of them, unless the section really is one single idea. Use the "
         "block the request's own words ask for: a bullets block for an enumeration, a numbered block for a "
-        "sequence of steps, a table where things are compared, a callout with kind \"warning\" and a title for a "
+        "sequence of steps, a table where things are compared, " + DIAGRAM_CLAUSE + ", a callout with kind "
+        "\"warning\" and a title for a "
         "caution or a risk, a callout with kind \"note\" and a title for an aside, and a recommendation written "
         "plainly as a recommendation where the request asks for them."
     )
@@ -1294,6 +1550,253 @@ async def _write_one_section(
     return _as_section(heading, blocks)
 
 
+# ------------------------------------ the coverage repair, section by section --
+
+
+def _section_runs(blocks: Sequence[Any]) -> List[List[Any]]:
+    """A document's blocks split into one run per level-1 heading, with
+    anything before the first heading kept as the opening run. The block
+    objects are carried over, never copied or rebuilt."""
+    runs: List[List[Any]] = []
+    for b in blocks:
+        if not runs or (isinstance(b, S.Heading) and int(b.level) == 1):
+            runs.append([b])
+        else:
+            runs[-1].append(b)
+    return runs
+
+
+def _run_head(run: Sequence[Any]) -> Optional[Any]:
+    return next((b for b in run if isinstance(b, S.Heading) and int(b.level) == 1), None)
+
+
+def _place_sections(blocks: Sequence[Any], requested: Sequence[str],
+                    new: Dict[int, List[Any]]) -> List[Any]:
+    """`blocks` with each newly written section put where the request asked
+    for it: straight after the last requested section that IS present, or
+    before the first headed section when none of the earlier ones are.
+
+    EVERY EXISTING BLOCK IS CARRIED OVER AS THE SAME OBJECT, in its original
+    relative order. That is the whole point of this function: a coverage
+    repair may add, never rewrite. `new` maps a requested index to that
+    section's validated blocks.
+    """
+    runs = _section_runs(list(blocks))
+    covers: Dict[int, int] = {}                       # requested index -> run index
+    for ri, run in enumerate(runs):
+        head = _run_head(run)
+        if head is None:
+            continue
+        hw = _content_words(head.text)
+        for qi, phrase in enumerate(requested):
+            words = _content_words(phrase)
+            # 0.6 is `_missing_sections`' own overlap rule (CONTRACT-2 §11),
+            # read the same way here so "present" means one thing.
+            if qi not in covers and words and len(words & hw) / len(words) >= 0.6:
+                covers[qi] = ri
+                break
+    after: Dict[int, List[List[Any]]] = {}
+    front: List[List[Any]] = []
+    for qi in sorted(new):
+        prev = max((covers[j] for j in covers if j < qi), default=-1)
+        (after.setdefault(prev, []) if prev >= 0 else front).append(new[qi])
+    headed = [ri for ri, run in enumerate(runs) if _run_head(run) is not None]
+    first_headed = headed[0] if headed else len(runs)
+    out: List[Any] = []
+    for ri, run in enumerate(runs):
+        if ri == first_headed:
+            for r in front:
+                out.extend(r)
+        out.extend(run)
+        for r in after.get(ri, ()):
+            out.extend(r)
+    if first_headed >= len(runs):
+        for r in front:
+            out.extend(r)
+    return out
+
+
+def _section_blocks_for_spec(req: ComposeRequest, body: S.DocumentSpec,
+                             blocks: Sequence[Any]) -> Optional[Tuple[List[Any], List[Any]]]:
+    """One section's raw blocks as validated block models, ready to splice
+    into `body`, WITH the citations the document's manifest would have to
+    grow by to keep them legal — or None when they do not validate.
+
+    It returns those citations rather than appending them itself. Appending
+    is a decision about the WHOLE document (`DocumentSpec.sources` has a
+    max_length of its own, and a section that is refused for length must not
+    leave its references behind in the manifest), and the caller is the only
+    place that can see the whole document.
+
+    The citations go through `_reconcile_sources` like every other model
+    answer — a section may not invent a reference either — so that
+    `_check_source_refs` still holds for the spliced document.
+    """
+    raw_blocks = [b for b in blocks if isinstance(b, dict)]
+    if not raw_blocks:
+        return None
+    # `title: ""` on purpose. `_tidy_document`'s title-repeat drop is for the
+    # FIRST heading of a WHOLE document (the renderer prints the title);
+    # this is one section from the middle of one, and its heading is the
+    # requested name that `_as_section` just pinned. The numeric-column
+    # inference is what this call is for.
+    _tidy_document({"title": "", "blocks": raw_blocks}, req)
+    mini: Dict[str, Any] = {"title": body.title, "template_id": body.template_id,
+                            "blocks": raw_blocks, "sources": []}
+    _reconcile_sources(mini, req.material, None)
+    try:
+        parsed = S.DocumentSpec.model_validate(mini)
+    except ValidationError as exc:
+        log.info("artifact compose: a repaired section did not validate: %s",
+                 S.validation_summary(exc).replace("\n", " | ")[:300])
+        return None
+    known = {c.id for c in body.sources}
+    fresh: List[Any] = []
+    for c in parsed.sources:
+        if c.id not in known:
+            fresh.append(c)
+            known.add(c.id)
+    return list(parsed.blocks), fresh
+
+
+async def _write_missing_sections(
+    req: ComposeRequest, budget: T.EffortBudget, target: LengthTarget, spec: S.ArtifactSpec,
+    outline_json: Optional[dict], missing: Sequence[str], requested: Sequence[str],
+    *, say: Progress, deadline: float,
+) -> Tuple[int, List[str]]:
+    """The requested sections a SECTIONED draft does not cover, written ONE
+    CALL EACH and spliced in where the request asked for them. Mutates
+    `spec`; returns (model calls, warnings).
+
+    WHY THIS IS NOT ONE WHOLE-DOCUMENT CORRECTION. The correction it
+    replaces is `_compose_once`, and for `operation == "create"` that call
+    carries the material, the outline and the sentence "keep everything
+    else" — but NOT the draft: the current-content block is added only for
+    an edit (`req.operation == "edit" and req.parent_spec is not None`). So
+    the model was asked to keep content it could not see, in one call, at
+    `_max_tokens_for`'s ceiling.
+
+    Measured in sf-local-ai-orchestrator-1 today, on the owner's request
+    (3,000 words, 15 named sections, Fast) with an 8-section 1,621-word
+    sectioned draft behind it: the repair call's ceiling was 12,000 tokens
+    where the 3,000-word target alone costs about 9,000 tokens of JSON, the
+    draft was absent from its prompt, and `_worse()` then refused what came
+    back — "a correction dropped most of the content and was not applied".
+    Thirteen model calls, and not one section added.
+
+    One call per missing section costs the same order and cannot lose the
+    draft: the blocks already in `spec` are never regenerated, they are
+    carried over as the same objects by `_place_sections`.
+    """
+    body = spec.body
+    if not isinstance(body, S.DocumentSpec):
+        return 0, []
+    # What the person already has. A coverage repair may only ADD, so the
+    # draft is worth more than the sections it lacks: if the repaired
+    # document turns out to be one `S.DocumentSpec` refuses, this is what
+    # goes back (see the re-validation after the loop).
+    kept_blocks, kept_sources = list(body.blocks), list(body.sources)
+    plan = outline_json if isinstance(outline_json, dict) else {}
+    planned = {str(s.get("heading") or "").strip().casefold(): s
+               for s in (plan.get("sections") or []) if isinstance(s, dict)}
+    # The same per-section word share the sectioned writer used, taken over
+    # the sections the REQUEST named rather than the ones the plan managed.
+    words = (_length.section_words(target.words, max(1, len(requested)))
+             if target.words else _length.WORDS_PER_SECTION)
+    index = {phrase: i for i, phrase in enumerate(requested)}
+    written = [b.text for b in body.blocks if isinstance(b, S.Heading) and int(b.level) == 1]
+    new: Dict[int, List[Any]] = {}
+    calls = 0
+    paced = 0.0
+    warnings: List[str] = []
+    total = len(requested) or len(missing)
+    for n, phrase in enumerate(missing):
+        if time.monotonic() + SECTION_RESERVE_S >= deadline:
+            warnings.append(f"{len(missing) - n} of the requested sections could not be added: "
+                            "the time this job is allowed ran out")
+            break
+        # A MODEL CALL NOT WORTH MAKING, not the guard. The document is
+        # already AT one of the renderer's ceilings, so nothing this call
+        # could return would fit; the guard that decides what is admitted is
+        # `_over_document_limits` below, AFTER the section exists, because a
+        # section is many blocks and this test cannot know how many.
+        held, prose = _document_shape(list(body.blocks)
+                                      + [b for run in new.values() for b in run])
+        if held >= DOCUMENT_BLOCK_CEILING or prose >= T.MAX_TEXT_CHARS:
+            warnings.append(f"{len(missing) - n} of the requested sections could not be added: "
+                            "the document is already as long as the file format allows")
+            break
+        await say(62.0 + 3.0 * n / max(1, len(missing)), f"writing the section \u201c{phrase}\u201d")
+        # Let live chat through between two section calls, exactly as
+        # `compose_sectioned` does: this loop is the same back-to-back run of
+        # engine calls on the same TP=2 engine somebody is chatting to, and
+        # prefix caching is off on the pinned build, so each one re-prefills
+        # the whole material (memory: gdn-mtp-remediation-2026-09-11).
+        paced += await _pace()
+        item = dict(planned.get(phrase.strip().casefold()) or {}, heading=phrase)
+        item.setdefault("purpose", "")
+        item.setdefault("elements", [])
+        try:
+            async with asyncio.timeout(max(5.0, deadline - time.monotonic())):
+                blocks = await _write_one_section(
+                    req, budget, target, plan, item, written=written, words=words,
+                    position=(index.get(phrase, n) + 1, total), requested=requested,
+                )
+            calls += 1
+        except TimeoutError:
+            calls += 1
+            warnings.append(f"{len(missing) - n} of the requested sections could not be added: "
+                            "the time this job is allowed ran out")
+            break
+        except ComposeError as exc:
+            calls += 1
+            log.info("artifact compose: the missing section %r could not be written: %s", phrase[:60], exc)
+            continue
+        placed = _section_blocks_for_spec(req, body, blocks)
+        if placed is None:
+            warnings.append(f"the section \u201c{phrase}\u201d could not be added to the document")
+            continue
+        section_blocks, section_sources = placed
+        # THE GUARD, WITH THIS SECTION COUNTED IN. A section is many blocks
+        # and several citations; testing the document without it can only be
+        # an optimisation (above). `S.DocumentSpec` is not re-validated when
+        # `body.blocks` is assigned, so a section admitted past a ceiling
+        # here is a document the renderer refuses and a person with no file —
+        # strictly worse than the truncated one they would have had.
+        over = _over_document_limits(
+            list(body.blocks) + [b for run in new.values() for b in run] + section_blocks,
+            len(body.sources) + len(section_sources))
+        if over:
+            log.info("artifact compose: the coverage repair stopped before \u201c%s\u201d: the document "
+                     "would have had %s", phrase[:60], over)
+            warnings.append(f"{len(missing) - n} of the requested sections could not be added: "
+                            "the document is already as long as the file format allows")
+            break
+        body.sources.extend(section_sources)
+        new[index.get(phrase, len(requested) + n)] = section_blocks
+        written.append(phrase)
+    if new:
+        body.blocks = _place_sections(body.blocks, requested, new)
+        # THE MODEL ITSELF, ONCE PER JOB, not this module's reading of it.
+        # Everything above is arithmetic over `S.DocumentSpec`'s numbers, and
+        # arithmetic drifts from a schema; `render/worker.py` line 71 runs
+        # `S.load(job["spec"])` and there is no warning left to give by then.
+        # A repair that costs the person their file is undone instead.
+        try:
+            S.DocumentSpec.model_validate(body.model_dump(mode="json"))
+        except ValidationError as exc:
+            log.warning("artifact compose: the coverage repair was undone, the repaired document did "
+                        "not validate: %s", S.validation_summary(exc).replace("\n", " | ")[:300])
+            body.blocks, body.sources = kept_blocks, kept_sources
+            warnings.append("the requested sections could not be added to the document")
+    if paced:
+        # Accounting, not a decision: `compose_sectioned` already puts the
+        # wait on the card, and a second "waited Ns" line would only crowd
+        # out the two warnings the answer can carry.
+        log.info("artifact compose: the coverage repair waited %.0fs between sections so chat could answer", paced)
+    return calls, warnings
+
+
 async def compose_sectioned(
     req: ComposeRequest,
     budget: T.EffortBudget,
@@ -1310,7 +1813,7 @@ async def compose_sectioned(
     paced = 0.0
 
     await say(10.0, "planning the sections")
-    plan = await outline(req, budget, target=target, max_tokens=4_000)
+    plan = await outline(req, budget, target=target, max_tokens=4_000, requested=requested)
     calls += 1
     cap, _slides = caps_for(budget, target, requested)
     items = _outline_items(plan, cap)
@@ -1339,7 +1842,7 @@ async def compose_sectioned(
             async with asyncio.timeout(max(5.0, deadline - time.monotonic())):
                 blocks = await _write_one_section(
                     req, budget, target, plan, item, written=headings, words=per_section,
-                    position=(i + 1, len(items)),
+                    position=(i + 1, len(items)), requested=requested,
                 )
             calls += 1
         except TimeoutError:
@@ -1375,7 +1878,7 @@ async def compose_sectioned(
                 async with asyncio.timeout(max(5.0, deadline - time.monotonic())):
                     grown = await _write_one_section(
                         req, budget, target, plan, items[i], written=headings, words=per_section,
-                        position=(i + 1, len(items)), current=sections[i],
+                        position=(i + 1, len(items)), current=sections[i], requested=requested,
                     )
                 calls += 1
             except (TimeoutError, ComposeError) as exc:
@@ -1388,7 +1891,8 @@ async def compose_sectioned(
     blocks: List[dict] = [b for sec in sections for b in sec]
     # The renderer's own ceilings, applied by dropping whole sections from
     # the end rather than letting validation refuse the document.
-    while len(sections) > 1 and (len(blocks) > 400 or _chars_in_blocks(blocks) > T.MAX_TEXT_CHARS):
+    while len(sections) > 1 and (len(blocks) > DOCUMENT_BLOCK_CEILING
+                                 or _chars_in_blocks(blocks) > T.MAX_TEXT_CHARS):
         sections.pop()
         blocks = [b for sec in sections for b in sec]
         warnings.append("the document was cut to the last section that fits the file's page limit")
@@ -1413,6 +1917,11 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     result_warnings: List[str] = []
     calls = 0
     corrections = 0
+    # The compose stage's wall-clock, started here because compose() IS the
+    # compose stage. The coverage repair below spends one model call per
+    # missing section and has to leave the stage time to validate and answer,
+    # exactly as compose_sectioned does inside its own share of it.
+    job_deadline = time.monotonic() + max(0.0, _stage_budget_s())
 
     async def say(pct: Optional[float], detail: str) -> None:
         if progress is not None:
@@ -1439,6 +1948,15 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
                  and target.words > SECTIONED_WRITER_WORDS
                  and (target.explicit or budget.outline_pass))
     ran_out_of_time = False
+    # What the sectioned writer spent. The coverage repair below adds
+    # sections and model calls AFTER the long-document note is written, and
+    # the note has to end up describing the file that was DELIVERED
+    # (`_long_document_note`), so it is rewritten in place down there.
+    # It is found by its own prefix rather than by the index it was appended
+    # at: an index would be a standing bet that nothing ever inserts ahead of
+    # it, and the cost of losing that bet is somebody else's warning
+    # overwritten with this one. There is exactly one note per job.
+    sect_calls = 0
     if sectioned:
         raw, outline_json, sect_calls, sect_warnings, ran_out_of_time = await compose_sectioned(
             req, budget, target, say=say, requested=requested)
@@ -1450,14 +1968,13 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
         # so the answer's two-warning clause carries it (engines/
         # artifact.py::_warning_clause).
         result_warnings.append(
-            f"{LONG_DOCUMENT_NOTE}: “{target.phrase or 'the request'}” was read as about {target.words:,} words, "
-            f"written in {len((outline_json or {}).get('sections') or []) or 1} sections over {sect_calls} model calls")
+            _long_document_note(target, _top_sections(raw.get("blocks") or ()), sect_calls))
         result_warnings.extend(sect_warnings)
     else:
         if budget.outline_pass and req.operation != "edit":
             await say(10.0, "outlining")
             try:
-                outline_json = await outline(req, budget, target=target)
+                outline_json = await outline(req, budget, target=target, requested=requested)
                 calls += 1
             except ComposeError:
                 outline_json = None  # a missing outline is a smaller loss than a missing document
@@ -1569,7 +2086,30 @@ async def compose(req: ComposeRequest, *, progress: Optional[Progress] = None) -
     # request itself), then a warning if the model still cannot.
     # Skipped for edits (AS3): an edit's words name changes, not chapters.
     missing = _missing_sections(spec, requested)
-    if missing:
+    if missing and sectioned:
+        # A SECTIONED DRAFT IS REPAIRED SECTION BY SECTION, not by one
+        # whole-document call. `correct()` below is `_compose_once`, which on
+        # a create does not carry the draft at all — see
+        # `_write_missing_sections` for what that measured out as today. A
+        # writer that already ran out of time is not asked for more, which
+        # is the rule the short-draft pass below follows too.
+        if not ran_out_of_time:
+            repair_calls, repair_notes = await _write_missing_sections(
+                req, budget, target, spec, outline_json, missing, requested,
+                say=say, deadline=job_deadline)
+            calls += repair_calls
+            if repair_calls:
+                corrections += 1
+                # The card now describes the repaired file, not the plan.
+                sect_calls += repair_calls
+                note_at = next((i for i, w in enumerate(result_warnings)
+                                if w.startswith(LONG_DOCUMENT_NOTE)), -1)
+                if note_at >= 0:
+                    result_warnings[note_at] = _long_document_note(
+                        target, _top_sections(getattr(spec.body, "blocks", ())), sect_calls)
+            result_warnings.extend(n for n in repair_notes if n not in result_warnings)
+            missing = _missing_sections(spec, requested)
+    elif missing:
         await correct(
             62.0, "adding the requested sections",
             f"The request asked for these sections, which your draft does not have: {', '.join(missing)}. "
@@ -1772,15 +2312,80 @@ def _promote_headings(blocks: List[Any], requested: Sequence[str]) -> None:
         b["level"] = max(1, int(b.get("level") or 1) - 1)
 
 
-def _tidy_document(raw: dict, req: ComposeRequest, requested: Sequence[str] = ()) -> None:
+#: What a section gets instead of a diagram that will not validate. The
+#: wording is `md_import`'s, deliberately: a person who exports an answer
+#: whose mermaid fence could not be read and a person whose composed report
+#: asked for a picture the model mis-declared are being told the same thing,
+#: and it should not read as two different failures.
+DIAGRAM_OMITTED_TITLE = "Diagram omitted"
+DIAGRAM_OMITTED_TEXT = "A diagram for this section could not be drawn, so it was left out."
+#: The warning the person sees when it happens. It names the block, because
+#: the only thing they were told before was that the document came back
+#: short — see `_salvage_diagrams`.
+DIAGRAM_OMITTED_WARNING = "diagram(s) the model declared could not be drawn and were left out of the document"
+
+
+def _salvage_diagrams(blocks: List[Any]) -> int:
+    """Replace every diagram block that will not validate with a callout,
+    and return how many. Mutates `blocks`.
+
+    WHY THIS EXISTS, MEASURED RATHER THAN FEARED. `spec.DiagramNode.kind`
+    is a closed four-word Literal that REFUSES an unknown role — it does
+    not fold one to the default — and `_validate_or_repair` answers ANY
+    ValidationError with ONE whole-document `_compose_once` whose reply
+    REPLACES the sectioned draft. So a single wrong word inside one figure
+    discards every other section's prose. Driven end to end through the
+    real `compose()` on the owner's route (6,000-word technical report,
+    8 named sections, sectioned because target.words > SECTIONED_WRITER_WORDS)
+    on 2026-09-28:
+
+        every role correct        8 level-1 headings, 3,378 words, 1 diagram
+        section 3 writes
+        kind='database'           0 headings, 6 words, 0 diagrams
+        with this function        8 headings, 3,378 words, 0 diagrams,
+                                  1 "Diagram omitted" callout, and a
+                                  warning that says so
+
+    'Store', 'STORE' and '' collapse the document the same way, and so do
+    the other eight shapes a model plausibly emits: no nodes, one node and
+    no edges, duplicate ids, an edge naming a node that does not exist, a
+    self-loop, 10,000 nodes, an empty label, a 4kB label.
+
+    The COLLAPSE is pre-existing — any invalid block of any type does it —
+    but only the diagram is newly invited into every technical report by
+    this branch, and it is the strictest sub-schema in `DocumentBlock`. The
+    repair pass is not removed: it still runs for everything else. This
+    only takes the figure out of its way, which is the trade `md_import`
+    already makes for a mermaid fence it cannot read.
+    """
+    dropped = 0
+    for i, b in enumerate(blocks):
+        if not isinstance(b, dict) or b.get("type") != "diagram":
+            continue
+        try:
+            S.DiagramBlock.model_validate(b)
+        except ValidationError as exc:
+            # Rule names and field paths only, never the block's content:
+            # a composed document carries the person's material.
+            log.info("artifact compose: a declared diagram did not validate and was left out: %s",
+                     S.validation_summary(exc).replace("\n", " | ")[:200])
+            blocks[i] = {"type": "callout", "kind": "note", "title": DIAGRAM_OMITTED_TITLE,
+                         "text": DIAGRAM_OMITTED_TEXT}
+            dropped += 1
+    return dropped
+
+
+def _tidy_document(raw: dict, req: ComposeRequest, requested: Sequence[str] = ()) -> List[str]:
     """AS3 (e), code not model: a document's first heading that repeats
     its title is dropped (the renderer already prints the title block),
     the heading levels are shifted up when a draft headed every requested
-    section at level 2, and every table's `numeric_columns` is inferred
-    from its cells — a column is numeric when all its non-blank cells
-    parse as numbers. Mutates."""
+    section at level 2, a diagram that will not validate becomes a callout
+    rather than costing the whole draft (`_salvage_diagrams`), and every
+    table's `numeric_columns` is inferred from its cells — a column is
+    numeric when all its non-blank cells parse as numbers. Mutates, and
+    returns the warnings the person should see."""
     if req.kind != "document" or not isinstance(raw, dict) or not isinstance(raw.get("blocks"), list):
-        return
+        return []
     blocks = raw["blocks"]
     title = " ".join(str(raw.get("title") or "").split()).casefold()
     first = blocks[0] if blocks and isinstance(blocks[0], dict) else None
@@ -1788,6 +2393,7 @@ def _tidy_document(raw: dict, req: ComposeRequest, requested: Sequence[str] = ()
             and " ".join(str(first.get("text") or "").split()).casefold() == title and int(first.get("level") or 1) == 1):
         blocks.pop(0)
     _promote_headings(blocks, requested)
+    dropped = _salvage_diagrams(blocks)
     for b in blocks:
         t = b.get("table") if isinstance(b, dict) and b.get("type") == "table" else None
         if not isinstance(t, dict) or not isinstance(t.get("columns"), list) or not isinstance(t.get("rows"), list):
@@ -1799,6 +2405,7 @@ def _tidy_document(raw: dict, req: ComposeRequest, requested: Sequence[str] = ()
             if cells and all(not isinstance(c, bool) and (isinstance(c, (int, float)) or tables.parse_number(c) is not None) for c in cells):
                 numeric.append(j)
         t["numeric_columns"] = numeric
+    return [f"{dropped} {DIAGRAM_OMITTED_WARNING}"] if dropped else []
 
 
 def _reconcile_sources(raw: dict, material: Optional[Material], parent: Optional[S.ArtifactSpec] = None) -> List[str]:
@@ -2146,7 +2753,7 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
     code-made rows are filled (CONTRACT-2 §4), so the Sheet that validates
     is the one that renders."""
     notes = _reconcile_sources(raw, req.material, req.parent_spec if req.operation == "edit" else None)
-    _tidy_document(raw, req, requested)
+    notes.extend(_tidy_document(raw, req, requested))
     _pin_template(raw, req)
     # In a thread: a 10,000-row generator or copy is CPU the event loop
     # must not spend (#11); the fill mutates `raw` and `notes` in place.
@@ -2167,7 +2774,7 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
         target=target, requested=requested,
     )
     notes = _reconcile_sources(fixed, req.material, req.parent_spec if req.operation == "edit" else None)
-    _tidy_document(fixed, req, requested)
+    notes.extend(_tidy_document(fixed, req, requested))
     _pin_template(fixed, req)
     problems = await asyncio.to_thread(_fill_code_made_rows, fixed, req, notes)
     if problems:

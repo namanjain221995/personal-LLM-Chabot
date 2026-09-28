@@ -149,19 +149,90 @@ up() {
   rm -f "$ROOT/.runtime/e2e.env"
   touch "$ROOT/.runtime/e2e.env"; chmod 600 "$ROOT/.runtime/e2e.env"
 
-  # The production container's environment IS the contract with the model
-  # engines (base URLs, model ids, capability flags, secrets). Copying it and
-  # then overriding only what must differ keeps this stack honest: it is the
-  # same application, not a lookalike with different settings.
-  docker inspect "$PROD_ORCH" --format '{{range .Config.Env}}{{println .}}{{end}}' \
-    | grep -vE '^(APP_DATABASE_URL|WORKSPACE_DIR|VIDEO_DATA_DIR|LANCEDB_DIR|LANCEDB_WEB_DIR|LANCEDB_VIDEO_DIR|REPORTS_DIR|PATH|HOSTNAME|HOME)=' \
-    >> "$ROOT/.runtime/e2e.env"
+  # THE ENGINE CONTRACT, AND ONLY THE ENGINE CONTRACT (allowlist, 2026-09-23).
+  #
+  # Until this change the production container's WHOLE environment was copied
+  # through a DENYLIST of nine path-shaped variables. Everything not on that
+  # list came with it -- the session signing key, the model and third-party
+  # API keys, the tunnel token -- into .runtime/e2e.env, and from there into a
+  # container seeded with test accounts and published on 127.0.0.1:8081 on a
+  # box several sessions share. A denylist fails OPEN the day production gains
+  # a new secret; an allowlist fails closed, and the cost of it being too
+  # narrow is a feature that is off in QA and says so.
+  #
+  # What is copied is what makes this stack the same APPLICATION as
+  # production: where the model engines are, which models they serve, and
+  # which capabilities are switched on (`*_ENABLED` is a boolean flag by
+  # convention throughout this repository). Everything else -- the database
+  # URL, the session signing key, the API key pepper, the data paths -- is
+  # generated or set fresh for this stack, just below.
+  #
+  # Genuinely need one more? Put it in a file of your own with mode 600 and
+  # name it in E2E_EXTRA_ENV_FILE. That is a decision somebody makes in
+  # writing, rather than a default nobody reviewed.
+  #
+  # AND IT IS NOT OVERRIDABLE FROM OUTSIDE THIS FILE (2026-09-27). It used to be
+  # `${E2E_ENV_ALLOWLIST:-...}`, so `E2E_ENV_ALLOWLIST='.*'` in the environment
+  # restored the wholesale copy this change removed -- production's session
+  # signing key, its API key pepper, the tunnel token and every model and
+  # third-party key -- into .runtime/e2e.env on a box several sessions share.
+  # That is the exact fail-open the allowlist exists to close, and it earned
+  # nothing: E2E_EXTRA_ENV_FILE is already the reviewed way to add one variable.
+  #
+  # NO TRAILING BRACE. Removing the `${E2E_ENV_ALLOWLIST:-` wrapper above left
+  # its closing `}` inside the pattern, which made the last alternative
+  # `[A-Z0-9_]+_ENABLED}` -- grep then wanted a literal `}` before the `=`, so
+  # `RERANK_ENABLED=true` did NOT match and `RERANK_ENABLED}=true` did. Measured
+  # 2026-09-28 on a 26-name sample: 3 variables matched instead of 26, i.e.
+  # EVERY `*_ENABLED` flag was dropped, and three of them then fell back to an
+  # app default that disagrees with production (ASR_ENABLED, SEARCH_ENABLED and
+  # VIDEO_ANALYSIS_ENABLED are all `_bool(..., False)` at config.py:223, :951
+  # and :325). test_the_enabled_flags_are_really_matched runs the regex.
+  ENV_ALLOWLIST="OPENAI_BASE_URL|OPENAI_API_KEY|ROUTER_BASE_URL|AGENT_BASE_URL|VISION_BASE_URL|EMBED_BASE_URL|RERANK_BASE_URL|OCR_BASE_URL|ASR_BASE_URL|ASR_BASE_URLS|MAIN_MODEL|LLM_MODEL|ROUTER_MODEL|AGENT_MODEL|VISION_MODEL|EMBED_MODEL|OCR_MODEL|ASR_MODEL|ASR_BACKEND|ASR_LANGUAGE|ASR_TIMEOUT_S|RERANK_MODEL|RERANKER_MODEL|RERANK_BACKEND|[A-Z0-9_]+_ENABLED"
+  # An empty match is a hard error rather than an empty file: `grep` exiting 1
+  # under `set -o pipefail` would otherwise take the whole script down with no
+  # explanation, and a silently empty engine contract would start a stack that
+  # points at nothing.
+  if ! docker inspect "$PROD_ORCH" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+       | grep -E "^($ENV_ALLOWLIST)=" >> "$ROOT/.runtime/e2e.env"; then
+    die "could not read the engine contract from $PROD_ORCH (is it running?)"
+  fi
+  # Generated FRESH for this stack, never inherited: a QA stack signing its
+  # cookies with production's key, or peppering its API keys with production's
+  # pepper, is the same credential in two places for no benefit.
+  for secret_name in session_secret api_key_pepper; do
+    secret_file="$ROOT/.runtime/${PROJECT}-${secret_name}"
+    if [ ! -s "$secret_file" ]; then
+      ( umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$secret_file" )
+    fi
+  done
   {
     printf 'APP_DATABASE_URL=%s\n' "$(db_url)"
+    printf 'SESSION_SECRET=%s\n' "$(cat "$ROOT/.runtime/${PROJECT}-session_secret")"
+    printf 'API_KEY_PEPPER=%s\n' "$(cat "$ROOT/.runtime/${PROJECT}-api_key_pepper")"
     printf 'WORKSPACE_DIR=/data/workspace\nVIDEO_DATA_DIR=/data/video\n'
     printf 'LANCEDB_DIR=/data/lancedb\nLANCEDB_WEB_DIR=/data/lancedb-web\nLANCEDB_VIDEO_DIR=/data/lancedb-video\n'
     printf 'REPORTS_DIR=/reports\n'
+    # compose.yaml sets these on the production service, so they were arriving
+    # through the old wholesale copy. They are paths, not settings.
+    printf 'DUCKDB_PATH=/data/warehouse.duckdb\nPARQUET_DIR=/data/parquet\n'
+    printf 'MPLCONFIGDIR=/tmp/matplotlib\nXDG_CACHE_HOME=/tmp/cache\n'
   } >> "$ROOT/.runtime/e2e.env"
+  # The deliberate extras, if the operator named a file of them.
+  if [ -n "${E2E_EXTRA_ENV_FILE:-}" ]; then
+    [ -r "$E2E_EXTRA_ENV_FILE" ] || die "E2E_EXTRA_ENV_FILE is set but not readable: $E2E_EXTRA_ENV_FILE"
+    say "adding the extra environment from $E2E_EXTRA_ENV_FILE"
+    # SAME PROTECTION AS THE ALLOWLIST GREP ABOVE (2026-09-28). `grep` exits 1
+    # when nothing matches, and under `set -euo pipefail` that ends up() mid-way
+    # with NO message at all: measured, an extra env file holding only comments
+    # aborted the function after "adding the extra environment from ..." and
+    # before the container was created, rc 1, nothing printed. An operator who
+    # named a file deliberately gets told it contributed nothing, rather than
+    # watching `up` die silently.
+    if ! grep -E '^[A-Z][A-Z0-9_]*=' "$E2E_EXTRA_ENV_FILE" >> "$ROOT/.runtime/e2e.env"; then
+      die "E2E_EXTRA_ENV_FILE ($E2E_EXTRA_ENV_FILE) has no KEY=VALUE line; remove it or fix it"
+    fi
+  fi
 
   docker rm -f "$ORCH" "$FRONT" >/dev/null 2>&1 || true
   say "starting $ORCH on 127.0.0.1:$ORCH_PORT"
@@ -207,14 +278,35 @@ up() {
   say "schema: $(docker exec "$ORCH" python3 -c 'from app import db; print(db.LATEST_SCHEMA_VERSION)' 2>/dev/null || echo '?')"
 }
 
-seed() { # seed <username> <password> — a member with attachments + video on
-  local name="${1:?username}" pw="${2:?password}"
-  docker exec -i "$ORCH" python3 - "$name" "$pw" <<'PYSEED'
+seed() { # seed <username> [password|-] — a member with attachments + video on
+  #
+  # THE PASSWORD NEVER GOES IN ARGV OF THE `docker exec` (2026-09-23).
+  # It used to: `docker exec -i "$ORCH" python3 - "$name" "$pw"` put the
+  # password in the docker CLIENT's /proc/<pid>/cmdline, which is
+  # world-readable for the length of the exec, on a box several sessions
+  # share. `-e PASSWORD=...` would be no better -- it only moves the value
+  # from `ps` into `docker inspect`. So the program text goes through `-c`
+  # (it holds no secret) and the password goes on STDIN, which is the pattern
+  # db_up() already uses one function earlier for the Postgres password.
+  #
+  # `seed <name> -` reads the password from THIS script's stdin, which is how
+  # a caller keeps it out of its own argv too.
+  local name="${1:?username}" pw="${2:--}"
+  if [ "$pw" = "-" ]; then
+    IFS= read -r pw || true
+  fi
+  [ -n "$pw" ] || die "seed: no password (give one, or '-' and send it on stdin)"
+  local program
+  program="$(cat <<'PYSEED'
 import sys
 from app import db
 from app.authn import passwords, store
 from app.config import settings
-name, pw = sys.argv[1], sys.argv[2]
+name = sys.argv[1]
+# stdin, not argv and not the environment: see the comment above the heredoc.
+pw = sys.stdin.readline().rstrip("\n")
+if not pw:
+    raise SystemExit("seed: no password arrived on stdin")
 row = db.get_user_by_username(name)
 if row is None:
     try:
@@ -232,6 +324,8 @@ store.upsert_membership(ws, uid, "member")
 store.set_member_feature_overrides(ws, uid, {"attachments": True, "video_analysis": True})
 print(f"user {uid} {name}@test.local ready")
 PYSEED
+)"
+  printf '%s\n' "$pw" | docker exec -i "$ORCH" python3 -c "$program" "$name"
 }
 
 down() {
@@ -275,5 +369,5 @@ case "${1:-status}" in
   seed) shift; seed "$@" ;;
   status) status ;;
   logs) shift; docker logs "${1:-$ORCH}" --tail "${2:-60}" ;;
-  *) die "usage: $0 up|down|purge|build|db|psql <sql>|seed <email> <password>|status|logs [container] [lines]" ;;
+  *) die "usage: $0 up|down|purge|build|db|psql <sql>|seed <username> [password|-]|status|logs [container] [lines]" ;;
 esac

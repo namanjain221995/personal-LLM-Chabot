@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from app.publicapi import blobs, capacity, durable, durable_store, liveness
+from app.publicapi import blobs, capacity, durable, durable_store, events, liveness
 from tests.publicapi_fake_engine import (
     FakeController,
     FakeMainEngine,
@@ -24,6 +24,7 @@ from tests.publicapi_fake_engine import (
     fast_durable_settings,
     make_tenant,
     spec as make_spec,
+    word,
 )
 
 
@@ -325,11 +326,43 @@ def test_connect_failures_are_retried_with_growing_backoff_and_never_count_as_st
 
 
 def test_a_sidecar_that_refuses_connections_for_the_whole_grace_fails_retryably(monkeypatch, tmp_path):
+    """A sidecar that refuses every connection is retried for the WHOLE grace
+    and then fails retryably.
+
+    What the grace promises, from `_after_interrupt`: the first refused
+    connection stamps `run.sidecar_down_since`, and a later refusal fails the
+    run once `now - sidecar_down_since >= engine_down_grace_s()`. Only the
+    failure DECISION is guaranteed to be a full grace past the first refusal.
+    The dispatch that triggers that decision happens EARLIER than it, by one
+    dispatch-to-check latency: the fake engine's generator raises, and only
+    then does `_after_interrupt` read the clock and compare. So the last
+    dispatch sits BELOW the boundary by that latency, which nothing in the
+    backoff bounds -- it is scheduling and GC, and it grows with load.
+    Asserting on the last dispatch's time (`calls[-1] - calls[0] >= 0.4`)
+    therefore measured something the code never promised, and reddened CI run
+    #259 by 0.33 ms -- 0.082% of the grace -- on a tree that passed the same
+    shard twice. Re-created here by busy-waiting inside `ConnectError`, that
+    old assertion is red 21/50 at 2 ms of latency (shortfall 0.03-3.30 ms) and
+    12/12 at 60 ms (shortfall 26.4-49.8 ms, load ~26): the shortfall tracks
+    the injected latency, not the ladder. So measure the failure, not the last
+    dispatch. Both lower bounds below are one-sided by construction, so load
+    can only widen them.
+
+    What they do NOT catch, measured rather than assumed: the lower bounds
+    settle only that the decision was not EARLY, and their slack is one
+    backoff step of quantisation (the check runs only on a refusal, so the
+    decision lands 30.9-44.3 ms past the boundary here) plus 3.6-12.5 ms of
+    observation lag. A regression that fires the grace up to ~one
+    CONNECT_BACKOFF_MAX_S early therefore still passes. Closing that needs a
+    deterministic clock (`durable.Runtime.configure(clock=...)` with
+    `tests.publicapi_fake_engine.VirtualClock`), not a tighter constant.
+    """
     from app.publicapi import engines
 
+    grace_s = 0.4
     monkeypatch.setattr(durable, "CONNECT_BACKOFF_S", 0.02)
     monkeypatch.setattr(durable, "CONNECT_BACKOFF_MAX_S", 0.05)
-    monkeypatch.setattr(liveness, "engine_down_grace_s", lambda: 0.4)
+    monkeypatch.setattr(liveness, "engine_down_grace_s", lambda: grace_s)
     calls = []
 
     def refusing(resolved, messages, **kwargs):
@@ -347,20 +380,160 @@ def test_a_sidecar_that_refuses_connections_for_the_whole_grace_fails_retryably(
     tenant = make_tenant()
     router_spec = make_spec(model="techsara-8b-vision", engine="router", gate_engine="router",
                             max_tokens=64, planned_max_output_tokens=64, context_window=24_576)
+    seen = {}
 
     async def scenario():
         runtime = _runtime(tmp_path, view)
         runtime.witnesses_enabled = False
         await runtime.start()
         try:
-            return await collect(await runtime.launch(router_spec, caller=tenant.caller(), streamed=True), limit_s=20)
+            handle = await runtime.launch(router_spec, caller=tenant.caller(), streamed=True)
+            # Held for the whole scenario: `_settle` drops the run from
+            # `runtime.runs`, and only the Run carries `sidecar_down_since`.
+            seen["run"] = runtime.runs[router_spec.response_id]
+            records = []
+            # Inlined `collect` so the failure can be timestamped where it is
+            # seen. `asyncio.timeout`, not `wait_for`: on CI's Python 3.11 a
+            # `wait_for` swallows a same-pass cancellation (see the suite's
+            # other timeouts).
+            async with asyncio.timeout(20):
+                async for item in handle.follow(0, heartbeat=0.05):
+                    if item is durable.HEARTBEAT:
+                        continue
+                    records.append(item)
+                    if item[1] == events.RESPONSE_FAILED:
+                        seen["failed_at"] = time.monotonic()
+            return records
         finally:
             await runtime.stop()
 
     records = asyncio.run(scenario())
     assert records[-1][1] == "response.failed"
     assert records[-1][2]["response"]["error"]["code"] == "model_unavailable"
-    assert calls[-1] - calls[0] >= 0.4
+    # The decision itself, against the instant the sidecar was first seen
+    # down: this is exactly the bound `_after_interrupt` enforces.
+    assert seen["failed_at"] - seen["run"].sidecar_down_since >= grace_s
+    # And from outside, with no reach into the Run: nothing can fail before
+    # the first dispatch plus a grace, because `sidecar_down_since` is stamped
+    # only after that dispatch has been refused.
+    assert seen["failed_at"] - calls[0] >= grace_s
+    # Weaker than it reads: the if/elif in `_after_interrupt` stamps on the
+    # first refusal and can only decide on a later one, so this cannot fail
+    # while the grace is reached at all. Kept as documentation of intent.
+    assert len(calls) >= 2  # retried; not failed on the first refusal
+    # The OTHER side, which nothing asserted before this test: a grace that
+    # regressed LONGER would still satisfy every bound above. Counted, not
+    # timed, because the count's error direction under load is the safe one --
+    # a stalled process gets FEWER dispatches in before the boundary, never
+    # more. Measured on this ladder (0.02 -> 0.05 cap, 0.4 s grace): exactly
+    # 10 dispatches in 40/40 runs at load 10.9-14.9, 9-10 with 2 ms of
+    # dispatch-to-check latency, 5 with 60 ms. A doubled grace gives 15-17
+    # (12/12), so 13 separates them and no wall clock is involved. A time
+    # bound here would not: `failed_at - calls[0]` already reaches 0.49 s
+    # unmutated against a 0.8 s mutation, and a full GC pass over this suite's
+    # heap paused CI for ~0.5 s (see `_no_gc_pause` in test_ocr_classify.py),
+    # so any constant that catches the regression also flakes. That same pause
+    # is why none of these bounds needs `gc.freeze`: it can only widen the two
+    # lower bounds and shrink the count.
+    assert len(calls) <= 13
+    row = durable_store.get_run(router_spec.response_id)
+    assert row["status"] == "failed" and row["error_code"] == "model_unavailable"
+    # "retryably", which the name claimed and nothing checked: the sidecar
+    # grace settles without `should_retry`, so the caller may try again.
+    assert (row["metadata"] or {}).get("should_retry") is None
+    assert "_should_retry" not in records[-1][2]
+
+
+def test_a_sidecar_that_answers_between_two_outages_gets_a_fresh_grace_for_the_second(monkeypatch, tmp_path):
+    """The sidecar grace is CONTINUOUS down time, not a cumulative budget.
+
+    `durable.py` clears `sidecar_down_since` on an attempt's first token,
+    beside `connect_failures`. Nothing covered that reset, and without it
+    refusals either side of a working answer would add up: a run could be
+    failed with less than one grace of actual outage behind it. Three refused
+    connections, then an attempt that streams two tokens and has its stream
+    broken, then refusals for good -- the failure must still be a WHOLE grace
+    after the SECOND outage began, and the partial output must survive.
+    """
+    from app.publicapi import engines
+
+    grace_s = 0.4
+    monkeypatch.setattr(durable, "CONNECT_BACKOFF_S", 0.02)
+    monkeypatch.setattr(durable, "CONNECT_BACKOFF_MAX_S", 0.05)
+    monkeypatch.setattr(liveness, "engine_down_grace_s", lambda: grace_s)
+    dispatches = []  # (kind, monotonic) per call the runner made
+
+    def flaky(resolved, messages, *, on_dispatch=None, **kwargs):
+        kind = "answers" if len(dispatches) == 3 else "refused"
+        dispatches.append((kind, time.monotonic()))
+
+        async def refused():
+            raise ConnectError("connection refused")
+            yield  # pragma: no cover
+
+        async def broken_after_two_tokens():
+            if on_dispatch is not None:
+                on_dispatch()
+            yield ("token", word(0))
+            yield ("token", word(1))
+            raise RemoteProtocolError("peer closed connection")
+
+        return broken_after_two_tokens() if kind == "answers" else refused()
+
+    monkeypatch.setattr(engines, "stream_chat", flaky)
+    monkeypatch.setattr(engines, "target", lambda key: engines.EngineTarget(key=key, base_url="http://r:1/v1", model="m"))
+    view = FakeController(time.monotonic, state="READY")
+    tenant = make_tenant()
+    router_spec = make_spec(model="techsara-8b-vision", engine="router", gate_engine="router",
+                            max_tokens=64, planned_max_output_tokens=64, context_window=24_576)
+    seen = {}
+
+    async def scenario():
+        runtime = _runtime(tmp_path, view)
+        runtime.witnesses_enabled = False
+        await runtime.start()
+        try:
+            handle = await runtime.launch(router_spec, caller=tenant.caller(), streamed=True)
+            seen["run"] = runtime.runs[router_spec.response_id]
+            records = []
+            async with asyncio.timeout(20):
+                async for item in handle.follow(0, heartbeat=0.05):
+                    if item is durable.HEARTBEAT:
+                        continue
+                    records.append(item)
+                    if item[1] == events.RESPONSE_FAILED:
+                        seen["failed_at"] = time.monotonic()
+            return records
+        finally:
+            await runtime.stop()
+
+    records = asyncio.run(scenario())
+    kinds = [kind for kind, _ in dispatches]
+    # Both of these are fixed by `flaky`'s own `len(dispatches) == 3`, so on
+    # correct code they assert only "at least 4" and "at least 5 dispatches
+    # happened". They are here to name the shape of the scenario, not to
+    # detect a regression in it.
+    assert kinds[:4] == ["refused", "refused", "refused", "answers"]
+    assert kinds[4:] and set(kinds[4:]) == {"refused"}  # the second outage
+    assert records[-1][1] == "response.failed"
+    assert records[-1][2]["response"]["error"]["code"] == "model_unavailable"
+    assert _text(records) == expected_text(2)  # the two tokens are kept
+    # The reset itself, as an ordering and with no clock in it: the stamp that
+    # timed the failure was taken AFTER the attempt that answered.
+    assert seen["run"].sidecar_down_since > dispatches[3][1]
+    # And the second outage got a grace of its own. Were the clock cumulative,
+    # the failure would land about (grace - the first outage) after the second
+    # one began, which is well short of this.
+    assert seen["failed_at"] - dispatches[4][1] >= grace_s
+    # And the same counted upper bound as the single-outage test, for the same
+    # reason: measured 14 dispatches in 25/25 runs at load 13.1-15.2, against
+    # 21 (10/10) with the grace doubled. Timing it would be worse here than
+    # there -- the second outage's span already reaches 0.639 s unmutated
+    # against a 0.808 s mutation.
+    assert len(dispatches) <= 17
+    row = durable_store.get_run(router_spec.response_id)
+    assert row["status"] == "failed" and row["error_code"] == "model_unavailable"
+    assert (row["metadata"] or {}).get("should_retry") is None  # retryable
 
 
 # ---------------------------------------- adversarial review fixes (2026-09-14) --

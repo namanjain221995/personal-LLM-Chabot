@@ -29,6 +29,15 @@
 #     scripts/deploy-rollback.sh.
 #   * the deployed PostgreSQL version, read from the running server. Not from
 #     the image tag: the tag is a sha256 and says nothing.
+#   * --reversibility LINE: the verdict deploy.sh computed at its forward
+#     schema gate, BEFORE anything was touched and while /health still
+#     answered. It is recorded verbatim in `reversibility` beside record.json
+#     and parsed into record.json's `reversibility` object. This is the only
+#     reading of "can this deploy be undone" that was taken from a healthy
+#     box; the automatic rollback consults it instead of re-deriving the
+#     answer from a stack that is, by then, the thing that is broken. A record
+#     written without it makes the rollback REFUSE, which is the intended
+#     direction for a missing fact.
 #
 # --dump additionally takes a `pg_dump -Fc` of the application database, using
 # the pg_dump INSIDE the database container so the client can never be older
@@ -42,12 +51,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/deploy-common.sh
 . "$HERE/lib/deploy-common.sh"
 
-OUT=""; DUMP=0; NOTE=""
+OUT=""; DUMP=0; NOTE=""; REVERSIBILITY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --out) OUT="${2:?--out needs a directory}"; shift ;;
     --dump) DUMP=1 ;;
     --note) NOTE="${2:-}"; shift ;;
+    --reversibility) REVERSIBILITY="${2:-}"; shift ;;
     -h|--help) awk 'NR==1{next} /^#/{print; next} {exit}' "$0"; exit 0 ;;
     *) dr_die "unknown option: $1" ;;
   esac
@@ -187,6 +197,7 @@ DR_CONTAINERS="$CONTAINERS" DR_RENDERED_SHA="$RENDERED_SHA" \
 DR_LIVE_SCHEMA="$LIVE_SCHEMA" DR_CODE_SCHEMA="$CODE_SCHEMA" \
 DR_PG_MAJOR="$PG_MAJOR" DR_PG_FULL="$PG_FULL" DR_MIGRATIONS="$MIGRATIONS" \
 DR_DUMP="$DUMP_FILE" DR_PREFIX="$PREFIX" DR_PROJECT="$DR_PROJECT" DR_ROOT="$DR_ROOT" \
+DR_REVERSIBILITY="$REVERSIBILITY" \
 python3 - <<'PY'
 import hashlib, json, os, subprocess
 from pathlib import Path
@@ -271,6 +282,21 @@ def git(*args):
     return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True).stdout.strip()
 
 dump = os.environ["DR_DUMP"]
+
+# The verdict line verbatim, plus its fields split out so a reader does not
+# have to re-implement the parser. `raw` is what the rollback gate actually
+# consults (from the sibling `reversibility` file); everything else here is
+# for the human reading the record afterwards.
+reversibility = None
+raw_verdict = os.environ.get("DR_REVERSIBILITY", "").strip()
+if raw_verdict:
+    fields = {}
+    for token in raw_verdict.split():
+        key, sep, value = token.partition("=")
+        if sep and key:
+            fields[key] = value
+    reversibility = {"raw": raw_verdict, **fields}
+
 record = {
     "kind": "techsara.recovery-record",
     "version": 1,
@@ -293,6 +319,9 @@ record = {
     },
     "containers": containers,
     "env_files": env_files,
+    # Taken at the forward gate, while the stack was still healthy. null means
+    # no verdict was recorded, and the rollback gate treats that as a refusal.
+    "reversibility": reversibility,
     "database": {
         "postgres_version": os.environ["DR_PG_FULL"] or None,
         "postgres_major": int(os.environ["DR_PG_MAJOR"]) if os.environ["DR_PG_MAJOR"] else None,
@@ -320,6 +349,18 @@ path = Path(os.environ["DR_DIR"], "record.json")
 path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
 path.chmod(0o600)
 PY
+
+# Beside record.json, and deliberately not only inside it. The rollback gate
+# reads this file at the worst moment this box ever has - orchestrator down,
+# compose mid-recreate - and one line of `key=value` needs no JSON parser, no
+# Python start-up and no 40 KB read to answer the one question it asks.
+if [ -n "$REVERSIBILITY" ]; then
+  printf '%s\n' "$REVERSIBILITY" >"$DIR/reversibility"
+  chmod 600 "$DIR/reversibility"
+  dr_say "record: reversibility verdict recorded: $REVERSIBILITY"
+else
+  dr_warn "record: no reversibility verdict was supplied (--reversibility); an automatic rollback from this release will REFUSE rather than guess"
+fi
 
 dr_say "record: written to $DIR/record.json"
 dr_say "record: $(python3 - "$DIR/record.json" <<'PY'

@@ -20,7 +20,12 @@
  * categorical palette that pie/timeline/gitGraph/mindmap/xychart paint from,
  * the source sanitiser that enforces the colour ban PER STATEMENT (a
  * line-anchored one was not enforcement: `C-->D; style A fill:#ff0000` walked
- * straight past it), and the zoom floor. This file only applies them.
+ * straight past it) and PER PREAMBLE (a YAML frontmatter `config: themeCSS`
+ * block was covered by neither the statement filter nor mermaid's own `secure`
+ * list, and repainted every node, edge, pie slice and sequence actor it was
+ * pointed at), and the zoom floor. This file only applies them — plus the one
+ * decision that belongs to the component: a source the guard REFUSES is never
+ * handed to mermaid at all, and the reader is told so.
  *
  * The inline block is sized in real layout pixels, never with a CSS
  * transform: a transformed ancestor becomes the containing block for
@@ -40,10 +45,12 @@ import {
   svgNaturalSize,
 } from '@/lib/mermaid';
 import {
+  diagramRefusal,
   diagramScale,
   mermaidTheme,
   prepareDiagramSource,
   smallestLabelPx,
+  withoutRoleApplications,
 } from '@/lib/mermaidTheme';
 import { CopyButton } from './CopyButton';
 import { useTheme } from './Providers';
@@ -83,6 +90,16 @@ export function MermaidBlock({ code }: { code: string }) {
   const { theme } = useTheme();
   const dark = theme === 'dark';
   const [svg, setSvg] = useState<string>('');
+  /**
+   * The source that actually DREW the diagram on screen.
+   *
+   * Normally identical to `source`; it differs only when the first render threw
+   * and the role-free retry below drew instead. The Code tab, the copy button
+   * and the PNG name all read this, because showing a source that was not the
+   * one drawn is a lie about the diagram — the same reason the sanitised
+   * source, not the model's raw text, has always been what they show.
+   */
+  const [drawn, setDrawn] = useState<string>('');
   const [error, setError] = useState<string>('');
   const [view, setView] = useState<View>('preview');
   const [userPicked, setUserPicked] = useState(false);
@@ -102,9 +119,32 @@ export function MermaidBlock({ code }: { code: string }) {
    */
   const source = prepareDiagramSource(code, dark ? 'dark' : 'light');
 
+  /**
+   * Why this source is not rendered AT ALL, or `''`.
+   *
+   * `guardDiagramSource` strips both of mermaid's in-source config channels,
+   * which is safe because neither changes what is drawn. It refuses instead —
+   * and this is that refusal — only where stripping would have to guess: a
+   * directive with `}%%` inside its own string value leaves a fragment in the
+   * middle of a statement, and both ways out (drop the line, keep the
+   * fragment) can put a DIFFERENT graph on screen than the one the source
+   * describes. Refusing shows the source instead, which is the same trade the
+   * document exporter already makes with its "Diagram omitted" callout.
+   */
+  const refusal = diagramRefusal(code);
+
   // Render (or re-render on theme change) once the source looks complete.
   useEffect(() => {
     let cancelled = false;
+    if (refusal) {
+      setSvg('');
+      setDrawn('');
+      // Any non-empty string closes the "Rendering the diagram…" line and
+      // disables Preview; the notice itself is rendered from `refusal`, so the
+      // reader is told the diagram was REFUSED and not that it failed.
+      setError(refusal);
+      return;
+    }
     // The streaming guard judges the MODEL's own output, never the prepared
     // source: `prepareDiagramSource` appends four classDef lines, and
     // `looksRenderable` only asks for a known head plus one body line, so a
@@ -112,20 +152,53 @@ export function MermaidBlock({ code }: { code: string }) {
     // finished and be rendered as an empty diagram.
     if (!looksRenderable(code)) {
       setSvg('');
+      setDrawn('');
+      // A refusal notice from the PREVIOUS source must not sit over a diagram
+      // that is merely still streaming.
+      setError('');
       return;
     }
+    // A source or theme change invalidates what the previous one drew, so the
+    // Code tab never shows a string that is no longer on screen. A functional
+    // update keeps the no-op case from costing a render.
+    setDrawn((prev) => (prev === source ? prev : ''));
     (async () => {
+      /**
+       * The source, then the same source with every role application removed.
+       *
+       * A role outside the flowchart family is FATAL, not inert: measured
+       * today in Chromium 153 / mermaid 11.17, `U:::external` in a
+       * sequenceDiagram is a parse error and the whole diagram is replaced by
+       * the error card. The prompt tells the model roles are for
+       * `flowchart`/`graph` only; this attempt is what happens when it puts one
+       * somewhere else anyway. It runs only AFTER a throw, so a diagram that
+       * renders is never rewritten.
+       */
+      const attempts = [source];
+      const roleFree = withoutRoleApplications(source);
+      if (roleFree !== source && roleFree.trim()) attempts.push(roleFree);
+      let last: unknown = null;
       try {
         const mermaid = await getMermaid(dark);
-        const id = `mmd-${(renderSeq += 1)}`;
-        const { svg: out } = await mermaid.render(id, source);
-        if (!cancelled) {
-          setSvg(out);
-          setError('');
+        for (const attempt of attempts) {
+          try {
+            const id = `mmd-${(renderSeq += 1)}`;
+            const { svg: out } = await mermaid.render(id, attempt);
+            if (!cancelled) {
+              setSvg(out);
+              setDrawn(attempt);
+              setError('');
+            }
+            return;
+          } catch (err) {
+            last = err;
+          }
         }
+        throw last;
       } catch (err) {
         if (!cancelled) {
           setSvg('');
+          setDrawn('');
           setError(err instanceof Error ? err.message : 'Diagram failed to render.');
         }
       }
@@ -133,7 +206,7 @@ export function MermaidBlock({ code }: { code: string }) {
     return () => {
       cancelled = true;
     };
-  }, [code, source, dark]);
+  }, [code, source, dark, refusal]);
 
   /**
    * Size the inline SVG in real layout pixels.
@@ -216,6 +289,21 @@ export function MermaidBlock({ code }: { code: string }) {
     return () => document.removeEventListener('keydown', onKey);
   }, [full]);
 
+  /**
+   * What the Code tab shows and the copy button copies: what was drawn.
+   *
+   * On a REFUSAL nothing was drawn and `source` is not a fallback — it is the
+   * half-stripped residue, which is nobody's text. Measured on the commit
+   * before this one: for `%%{init: {"themeCSS": "a}%% …"}}%%` the Code tab held
+   * ` .node rect { fill: #ff0000 !important }"}}%%` with the author's first
+   * line half-eaten, and for a label containing `}%%` it held a two-line
+   * `flowchart LR\n  A["` that no one wrote. The notice under it says "Showing
+   * the source.", the copy button hands that string on, and it names the
+   * downloaded file. A refusal is the one place this component promises the
+   * SOURCE instead of a picture, so it has to be the author's.
+   */
+  const shown = drawn || (refusal ? code : source);
+
   const downloadPng = useCallback(async () => {
     const host = (full ? fullRef.current : hostRef.current) ?? hostRef.current;
     const el = host?.querySelector('svg');
@@ -259,7 +347,7 @@ export function MermaidBlock({ code }: { code: string }) {
               if (!png) return reject(new Error('export failed'));
               // The anchor MUST be in the document for Chromium to honour the
               // click, and the object URL must outlive the download start.
-              save(png, diagramFileName(source, 'png'));
+              save(png, diagramFileName(shown, 'png'));
               resolve();
             }, 'image/png');
           } catch (err) {
@@ -274,11 +362,11 @@ export function MermaidBlock({ code }: { code: string }) {
       // PNG rasterization can fail (tainted canvas, blocked image). Always
       // give the user a file: the SVG is vector, opens anywhere, and never
       // taints anything.
-      save(blob, diagramFileName(source, 'svg'));
+      save(blob, diagramFileName(shown, 'svg'));
     } finally {
       URL.revokeObjectURL(url);
     }
-  }, [source, dark, full]);
+  }, [shown, dark, full]);
 
   const pick = (v: View) => {
     setUserPicked(true);
@@ -345,7 +433,7 @@ export function MermaidBlock({ code }: { code: string }) {
       >
         <IconDownload size={15} />
       </button>
-      <CopyButton text={source} label="Copy diagram source" />
+      <CopyButton text={shown} label="Copy diagram source" />
     </>
   );
 
@@ -387,11 +475,13 @@ export function MermaidBlock({ code }: { code: string }) {
             )}
             {error && (
               <p className="border-b border-border px-3 py-1.5 text-[11px] text-danger">
-                Couldn&apos;t render this diagram — showing the source.
+                {refusal
+                  ? `This diagram was not drawn — ${refusal}. Showing the source.`
+                  : "Couldn't render this diagram — showing the source."}
               </p>
             )}
             <pre tabIndex={0}>
-              <code>{source}</code>
+              <code>{shown}</code>
             </pre>
           </div>
         )}

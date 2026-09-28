@@ -365,7 +365,31 @@ def test_csv_with_styling_also_delivers_a_styled_xlsx(tmp_path):
 #: 2026-09-16: +1826 for the six advanced chart types (their names in the
 #: `type` enum and the bullet chart's `target` column). The number is pinned
 #: so that anything ELSE creeping into guided decoding is caught here.
-BASE_SCHEMA_LENGTHS = {"document": 14972, "presentation": 12872, "workbook": 21356}
+#: 2026-09-22 (feat/document-vocabulary): document +2547 for the two block
+#: types that make a code block and a drawn diagram possible in a file —
+#: Code, DiagramBlock, Diagram, DiagramNode, DiagramEdge. This IS the
+#: mechanism: the composer learns that a diagram exists from this schema and
+#: from nothing else (app/artifacts/compose.py never imports the chat
+#: prompt's DIAGRAM_INSTRUCTION), so the cost is the feature. Measured on
+#: the pinned engine: 4,673 → 5,463 tokens, +790 per document composition,
+#: on the artifact path only — no chat effort pays it. Class docstrings
+#: become schema `description`, so the reasoning for these models lives in
+#: comments above them rather than in their docstrings.
+#: signed off at integration 2026-09-27 with feat/document-vocabulary
+#: 2026-09-27 (integ/diagram-group-r2): document +263, and only document —
+#: `DiagramNode.kind` became `Optional[DiagramRole]` with a description. The
+#: vocabulary is still CLOSED at four names; what is new is that a node the
+#: author did not classify can SAY so (`null`) instead of being recorded as
+#: a service it was never called, which is what the chat prompt promises
+#: ("Tag only the nodes one fits; an invented name paints nothing") and what
+#: the browser's mermaid already did. The description is there to keep the
+#: composer tagging: without it a model that omits the field gets a diagram
+#: of neutral boxes, which is the owner's "no colour" complaint from the
+#: other side. Measured on the pinned engine's tokenizer, on CPU, no GPU
+#: touched: 5,463 -> 5,534 tokens, +71 per document composition, on the
+#: artifact path only — app/artifacts/compose.py never imports the chat
+#: prompt, so no chat effort pays for it.
+BASE_SCHEMA_LENGTHS = {"document": 17782, "presentation": 12872, "workbook": 21356}
 
 
 @pytest.mark.parametrize("kind", sorted(BASE_SCHEMA_LENGTHS))

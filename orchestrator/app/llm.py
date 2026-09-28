@@ -412,12 +412,19 @@ async def _fit(
     if _is_primary(base_url) and not _breaker.main_allows():
         await wait_admitted(what=what, base_url=base_url, recovery_s=recovery_s)
     if continuation:
+        # A continuation is never sized send-first: it goes to
+        # `_fit_continuation`, which does its own arithmetic and starts no
+        # count of its own. `context.fit_request` is not reached.
         return await _fit_continuation(
             messages, base_url=base_url, model=model, requested_max_tokens=requested_max_tokens,
         )
-    return await context.fit_request(
-        messages, base_url=base_url, model=model, requested_max_tokens=requested_max_tokens,
-    )
+    # THIS is the call site that settles a count left running, inside
+    # `_settling` below — so sizing here may hand the request to the wire
+    # before the count comes back. Nowhere else may.
+    with context.settles_pending_count():
+        return await context.fit_request(
+            messages, base_url=base_url, model=model, requested_max_tokens=requested_max_tokens,
+        )
 
 
 class ContinuationRoomExhausted(RuntimeError):
@@ -675,6 +682,100 @@ async def _open_stream(client, request: dict, **send: Any):
                 type(exc).__name__, exc, _USAGE_RETRY_S,
             )
         return opened
+
+
+def _withdraw_window_on_size_refusal(exc: BaseException, base_url: str) -> None:
+    """A send-first request the engine refused ON SIZE proves the cached window
+    is not the one being served, so stop vouching for it.
+
+    `context.settle_pending_count` withdraws the mark when the served window
+    differs from the one a request was sized against — but it only runs on a
+    send that SUCCEEDED. A refusal takes `cancel_pending_count` instead, which
+    kills the count that would have reported the real window, so without this
+    the mark survives and every later turn is sized send-first against the same
+    stale window and refused again (QA 2026-09-27: 4 of 4 turns refused, for
+    the life of the process, whenever the refusal beat the /tokenize answer;
+    the blocking path served all four).
+
+    ALL THREE DISPATCH SITES NEED IT. b2ac0a5's commit message recorded that
+    `stream_chat_events` "self-heals by luck" because its `stream_options`
+    re-send gives the count time to land. That is WRONG, and it is why the two
+    streaming sites shipped with no test: measured 2026-09-27 and again
+    2026-09-28 on a tree with this call removed from `stream_chat_events`,
+    four consecutive streamed turns against a shrunken window went
+    BadRequestError x4 with 8 engine calls, 0 /tokenize answers landed and the
+    window still vouched for. The re-send happens on a REFUSED
+    `stream_options`, not on a size refusal, and a size refusal never reaches
+    it. The test that holds this is parametrised over all three sites.
+
+    Only for a request that WAS sized send-first (`has_pending_count`): a size
+    refusal of a request that counted first says nothing about the window's
+    provenance, and must not cost every other endpoint user a round trip.
+
+    COUNTED AND LOGGED HERE, not in `context.forget_server_window`: this is the
+    one place that knows the withdrawal followed a REFUSED turn. The refusal is
+    the only user-visible failure send-first sizing introduces — the blocking
+    path served the same turn — and until 2026-09-28 it was invisible:
+    `context_window_changed_under_send_total` is incremented by
+    `settle_pending_count`, i.e. only when the send SUCCEEDED, so the shrink
+    that costs nobody a turn was counted and the shrink that costs one was not
+    (measured: served window 500,000 -> counter 1; served window 8,192, the
+    turn refused -> counter dict empty). Every turn already dispatched against
+    the same stale window is refused too, so the count is per refused request,
+    not per withdrawal.
+
+    It is NOT rate-limited: the mark is withdrawn on the first refusal, so
+    later turns count first and cannot reach this branch until a fresh
+    successful count vouches for the window again.
+    """
+    if not context.has_pending_count():
+        return
+    if isinstance(exc, _bad_request_error()) and _is_size_refusal(exc):
+        metrics.inc(
+            "llm_send_first_refused_on_size_total",
+            "Turns the engine refused on size after being sized send-first against a "
+            "cached window it no longer serves; send-first is withdrawn until a fresh count.",
+        )
+        log.warning(
+            "the engine refused this turn on size (%s: %s) against the window a real count "
+            "had vouched for on %s; sizing will wait for its count again",
+            type(exc).__name__, str(exc)[:200], base_url,
+        )
+        context.forget_server_window(base_url)
+
+
+@contextlib.asynccontextmanager
+async def _settling(sized: Sequence[dict], base_url: str):
+    """Settle the exact prompt count `_fit` may have left running.
+
+    `context.fit_request` returns before its /tokenize answers whenever a
+    bound already proves the request fits (context.py, "Sending while the
+    exact count is still in flight"), so the body reaches the engine a round
+    trip earlier. Wrap the DISPATCH in this: on the way out the count is
+    awaited and written back into this task's context, so `_measured`, the
+    meter and the admission lanes see exactly what they see on the blocking
+    path; on any other exit — a refusal, a Stop, a cancelled turn — it is
+    dropped, so nothing this request started outlives it.
+
+    A no-op when nothing is pending: every slow-path call, every non-vLLM
+    endpoint, and every test that replaces `context.fit_request` with a
+    passthrough.
+
+    FOR NON-STREAMING CALLS ONLY. A streamed call must not settle between
+    `_open_stream` returning and `_consume` taking the stream: a Stop landing
+    on that await would strand an open stream holding an admission lane. The
+    two streaming sites settle INSIDE `_consume` instead, with a synchronous
+    `cancel_pending_count` guarding the dispatch (no await, so nothing can
+    land in the gap).
+    """
+    try:
+        yield
+    except BaseException as exc:
+        _withdraw_window_on_size_refusal(exc, base_url)
+        context.cancel_pending_count()
+        raise
+    else:
+        await context.settle_pending_count(sized, base_url)
 
 
 @contextlib.asynccontextmanager
@@ -968,7 +1069,8 @@ async def chat_completion(
     if extra_body is not None:
         request["extra_body"] = extra_body
     reset_finish_reason()
-    resp = await _primary_send(client, request, what="chat_completion", base_url=settings.openai_base_url)
+    async with _settling(sized, settings.openai_base_url):
+        resp = await _primary_send(client, request, what="chat_completion", base_url=settings.openai_base_url)
     _capture_usage(resp)
     _capture_finish(resp)
     _, content = split_reasoning(resp.choices[0].message, settings.main_capabilities)
@@ -1022,11 +1124,12 @@ async def chat_completion_with_reasoning(
         # The hang guard for the non-streaming collector: a candidate stuck
         # in a repetition loop dies at the wall clock instead of holding the
         # whole best-of-N gather hostage.
-        resp = await _asyncio.wait_for(
-            _primary_send(client, request, what="chat_completion_with_reasoning",
-                          base_url=settings.openai_base_url),
-            timeout=settings.gen_wall_clock_s,
-        )
+        async with _settling(sized, settings.openai_base_url):
+            resp = await _asyncio.wait_for(
+                _primary_send(client, request, what="chat_completion_with_reasoning",
+                              base_url=settings.openai_base_url),
+                timeout=settings.gen_wall_clock_s,
+            )
     except _asyncio.TimeoutError:
         log.error(
             "GENERATION WALL CLOCK EXCEEDED (non-streaming collector): "
@@ -1076,7 +1179,21 @@ async def stream_chat_completion(
     if extra_body is not None:
         request["extra_body"] = extra_body
     reset_finish_reason()
-    async with _consume(await _open_stream(client, request)) as stream:
+    dispatched = False
+    try:
+        opened = await _open_stream(client, request)
+        dispatched = True
+    except BaseException as exc:
+        _withdraw_window_on_size_refusal(exc, settings.openai_base_url)
+        raise
+    finally:
+        # Synchronous, so nothing can be cancelled between the dispatch and
+        # the stream being taken below.
+        if not dispatched:
+            context.cancel_pending_count()
+    async with _consume(opened) as stream:
+        # Settled with the stream already held: a Stop here closes it.
+        await context.settle_pending_count(sized, settings.openai_base_url)
         async for chunk in stream:
             _capture_usage(chunk)
             _capture_finish(chunk)
@@ -1135,15 +1252,31 @@ def assert_answer_engine(base_url: str) -> None:
 
 
 def wants_thinking(model_choice: str = "smart", effort: str = "medium") -> bool:
-    """Should this call run the model's reasoning pass?
+    """Should this call run the model's reasoning pass? EFFORT decides, alone.
 
     One set of weights now serves both picker choices, so "Fast" is not a
     smaller model — it is the SAME model with thinking switched off. That is
     what actually makes it fast: the reasoning pass, not the parameter count,
     is where the seconds go. Effort "low" means the same thing.
+
+    `model_choice` names WEIGHTS and `resolve_model_choice` is the one place
+    that reads it. It is not an effort dial, and until 2026-09-27 this
+    function made it one: it returned False for every choice but "smart", so
+    a client holding the legacy `model: "fast"` preference and choosing Max
+    was served thinking-off — and, through the best-of-N gate in
+    engines/chat.py, no best-of-N either — on the SAME weights "smart" gets.
+    Measured on origin/dev (4164bb8) today with the real engine functions:
+    model="fast", effort="max" produced 0 candidates, wants_thinking False and
+    meta {"route": "chat"}. The choice selects nothing, so it may not veto the
+    level the person chose; `chat_completion_with_reasoning` — best-of-N's own
+    call — has always hardcoded wants_thinking("smart", effort) for exactly
+    this reason.
+
+    The parameter stays: every caller passes it positionally, and it is where
+    the weights axis would be read from if a choice ever splits again. Should
+    that happen, it belongs in `resolve_model_choice`, not here.
     """
-    if model_choice != "smart":
-        return False
+    del model_choice  # weights, not effort — see above
     # Fast answers directly; Think and Max reason first.
     return normalize_effort(effort) in ("think", "max")
 
@@ -1400,7 +1533,12 @@ async def stream_chat_events(
     thinking_on = wants_thinking(model_choice, effort)
     plan_thinking = getattr(answer_plan, "enable_thinking", None) if answer_plan is not None else None
     if plan_thinking is not None:
-        thinking_on = bool(plan_thinking) and model_choice == "smart"
+        # `and model_choice == "smart"` stood here until 2026-09-27: the same
+        # entanglement `wants_thinking` carried, one line further on. A plan
+        # that DECIDES thinking is decided by the caller's plan, not by a
+        # legacy weights value that resolves to the same model. `fast_turn()`
+        # below remains the last word, so a Fast turn still never thinks.
+        thinking_on = bool(plan_thinking)
     # Only a plan that DECIDES thinking sizes the call itself; a sampling-only
     # plan must not disturb a thinking decision made elsewhere.
     plan_sizes_call = plan_thinking is not None
@@ -1520,22 +1658,36 @@ async def stream_chat_events(
     # answer. Applies in BOTH modes.
     started = _generation_clock()
     reset_finish_reason()
+    dispatched = False
     try:
-        opened = await _open_stream(client, request, **send)
-    except _bad_request_error() as exc:
-        if not (continue_final_message and _continuation_estimated.get() and _is_size_refusal(exc)):
-            raise
-        # ONLY AN EXACT COUNT MAY END A RUN (_fit_continuation): the max_tokens
-        # guessed without a count was refused, so ask once more with none and
-        # let the engine size the answer to the room it really has. A prompt
-        # that has no room is refused again, and that refusal propagates.
-        log.warning("continuation refused at max_tokens=%s without an exact count (%s); retrying with the "
-                    "engine sizing it", request.get("max_tokens"), type(exc).__name__)
-        request = dict(request)
-        request["max_tokens"] = None
-        budget = None
-        opened = await _open_stream(client, request, **send)
+        try:
+            opened = await _open_stream(client, request, **send)
+        except _bad_request_error() as exc:
+            if not (continue_final_message and _continuation_estimated.get() and _is_size_refusal(exc)):
+                raise
+            # ONLY AN EXACT COUNT MAY END A RUN (_fit_continuation): the
+            # max_tokens guessed without a count was refused, so ask once more
+            # with none and let the engine size the answer to the room it
+            # really has. A prompt with no room is refused again, and that
+            # refusal propagates.
+            log.warning("continuation refused at max_tokens=%s without an exact count (%s); retrying with the "
+                        "engine sizing it", request.get("max_tokens"), type(exc).__name__)
+            request = dict(request)
+            request["max_tokens"] = None
+            budget = None
+            opened = await _open_stream(client, request, **send)
+        dispatched = True
+    except BaseException as exc:
+        _withdraw_window_on_size_refusal(exc, base_url)
+        raise
+    finally:
+        # Synchronous, so nothing can be cancelled between the dispatch and
+        # the stream being taken below.
+        if not dispatched:
+            context.cancel_pending_count()
     async with _consume(opened) as stream:
+        # Settled with the stream already held: a Stop here closes it.
+        await context.settle_pending_count(sized, base_url)
         async for chunk in stream:
             engine_state.note_chunk()
             _capture_finish(chunk)
@@ -1769,7 +1921,8 @@ async def chat_with_tools(
     if extra_body is not None:
         request["extra_body"] = extra_body
     reset_finish_reason()
-    resp = await _primary_send(client, request, what="chat_with_tools", base_url=settings.openai_base_url)
+    async with _settling(sized, settings.openai_base_url):
+        resp = await _primary_send(client, request, what="chat_with_tools", base_url=settings.openai_base_url)
     _capture_usage(resp)
     _capture_finish(resp)
     message = resp.choices[0].message
@@ -1836,35 +1989,40 @@ async def json_completion(
     if extra_body is not None:
         base["extra_body"] = extra_body
 
-    if json_schema is not None:
-        guided = dict(base)
-        guided["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {
-                "name": schema_name,
-                "schema": json_schema,
-                "strict": False,
-            },
-        }
-        try:
-            resp = await _primary_send(client, guided, what="json_completion", base_url=settings.openai_base_url)
-            _capture_usage(resp)
-            _note_truncation(resp, schema_name, budget)
-            return resp.choices[0].message.content or ""
-        except _bad_request_error() as exc:
-            # A 400 is the documented "this backend has no guided decoding"
-            # shape and the ONLY one that should downgrade. This used to
-            # catch every exception, so during an engine outage each call
-            # logged a misleading "guided JSON unavailable" and immediately
-            # re-sent an unconstrained request into the same dead port.
-            log.info(
-                "guided JSON unavailable on this backend (%s: %s); retrying "
-                "unconstrained",
-                type(exc).__name__,
-                str(exc)[:160],
-            )
+    # ONE settlement for BOTH sends. The guided-JSON downgrade is a caught
+    # 400, not a failed turn: the request did reach the engine, so its count
+    # is still owed to the lanes and the meter. Settling inside the `try`
+    # would have cancelled it on the way to the re-send.
+    async with _settling(sized, settings.openai_base_url):
+        if json_schema is not None:
+            guided = dict(base)
+            guided["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "schema": json_schema,
+                    "strict": False,
+                },
+            }
+            try:
+                resp = await _primary_send(client, guided, what="json_completion", base_url=settings.openai_base_url)
+                _capture_usage(resp)
+                _note_truncation(resp, schema_name, budget)
+                return resp.choices[0].message.content or ""
+            except _bad_request_error() as exc:
+                # A 400 is the documented "this backend has no guided decoding"
+                # shape and the ONLY one that should downgrade. This used to
+                # catch every exception, so during an engine outage each call
+                # logged a misleading "guided JSON unavailable" and immediately
+                # re-sent an unconstrained request into the same dead port.
+                log.info(
+                    "guided JSON unavailable on this backend (%s: %s); retrying "
+                    "unconstrained",
+                    type(exc).__name__,
+                    str(exc)[:160],
+                )
 
-    resp = await _primary_send(client, base, what="json_completion", base_url=settings.openai_base_url)
+        resp = await _primary_send(client, base, what="json_completion", base_url=settings.openai_base_url)
     # Until 2026-09-13 neither json_completion branch recorded usage (F045):
     # every Deep Research step, sf_intel plan, artifact compose and video
     # fusion spent main-model tokens the ledger and the per-key quotas never
@@ -1939,11 +2097,12 @@ async def router_chat_completion(
         request["extra_body"] = extra_body
     # A sidecar: on an interactive turn it gets one attempt and the caller's
     # fallback (every caller has one); a job with a recovery window waits.
-    resp = await resilient(
-        lambda: client.chat.completions.create(**request),
-        what="router_chat_completion", base_url=settings.router_base_url,
-        recovery_s=sidecar_recovery_s(),
-    )
+    async with _settling(sized, settings.router_base_url):
+        resp = await resilient(
+            lambda: client.chat.completions.create(**request),
+            what="router_chat_completion", base_url=settings.router_base_url,
+            recovery_s=sidecar_recovery_s(),
+        )
     return resp.choices[0].message.content or ""
 
 
