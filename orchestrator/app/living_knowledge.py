@@ -1520,6 +1520,13 @@ async def _fast_lookup(
         return None
     deadline = float(getattr(settings, "freshness_fast_deadline_s", FAST_DEADLINE_S) or FAST_DEADLINE_S)
     sources = int(getattr(settings, "freshness_fast_sources", FAST_SOURCES) or FAST_SOURCES)
+    # TIMED, BOTH STAGES (2026-09-28). This function had no histogram of its
+    # own while being the most expensive thing in front of the first token on a
+    # turn that needs sources: the fetch measured p50 3,014 ms / p95 6,267 ms,
+    # and the readback a further p50 341 ms. The readback is deliberately a
+    # SEPARATE stage because it sits OUTSIDE the fetch deadline below, so the
+    # two must never be read as one bounded step.
+    fetch_started = time.perf_counter()
     try:
         async with asyncio.timeout(deadline):
             stored = await fetch_for_freshness(
@@ -1529,20 +1536,45 @@ async def _fast_lookup(
                 user_id=user_id,
                 conversation_id=conversation_id,
             )
-    except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+    except asyncio.TimeoutError:
+        metrics.knowledge_fast_lookup(
+            time.perf_counter() - fetch_started, stage="fetch", outcome="deadline"
+        )
         log.debug("fast freshness lookup did not complete", exc_info=True)
         return None
+    except Exception:  # noqa: BLE001
+        metrics.knowledge_fast_lookup(
+            time.perf_counter() - fetch_started, stage="fetch", outcome="error"
+        )
+        log.debug("fast freshness lookup did not complete", exc_info=True)
+        return None
+    metrics.knowledge_fast_lookup(
+        time.perf_counter() - fetch_started,
+        stage="fetch",
+        outcome="ok" if stored else "skipped",
+    )
 
     if not stored:
         return None
     # Read back through the SAME ranking the local path uses, so a freshly
     # fetched page is judged on authority and recency like any other —
     # bypassing the evidence cache, which still holds the pre-fetch result.
-    return await retrieve(
-        question,
-        level=verdict.requirement,
-        top_k=5,
-        use_cache=False,
-        effort="fast",
-        verdict=verdict,
+    readback_started = time.perf_counter()
+    try:
+        out = await retrieve(
+            question,
+            level=verdict.requirement,
+            top_k=5,
+            use_cache=False,
+            effort="fast",
+            verdict=verdict,
+        )
+    except Exception:
+        metrics.knowledge_fast_lookup(
+            time.perf_counter() - readback_started, stage="readback", outcome="error"
+        )
+        raise
+    metrics.knowledge_fast_lookup(
+        time.perf_counter() - readback_started, stage="readback", outcome="ok"
     )
+    return out

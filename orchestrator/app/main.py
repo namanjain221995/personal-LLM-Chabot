@@ -5061,6 +5061,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not deep_research_on
                 and not lane.entered
             ):
+                knowledge_started_at = time.perf_counter()
                 knowledge_task = asyncio.ensure_future(
                     _prepare_knowledge(
                         request,
@@ -5810,6 +5811,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from . import metrics as _metrics
                 from .living_knowledge import Prepared
 
+                knowledge_outcome = "ok"
                 try:
                     prepared_early = await _await_knowledge(
                         knowledge_task,
@@ -5821,10 +5823,31 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     knowledge_task.cancel()
                     knowledge_task = None
                     prepared_early = Prepared()
+                    knowledge_outcome = "deadline"
                     _metrics.inc("knowledge_degraded_total", reason="prepare_timeout")
                 except Exception:  # noqa: BLE001 — grounding is an enhancement
                     knowledge_task = None
                     prepared_early = Prepared()
+                    knowledge_outcome = "error"
+                # THE STAGE THE USER ACTUALLY WAITS AT, TIMED (2026-09-28).
+                # `knowledge_prepare_seconds` existed and was observed in ONE
+                # place: the small-talk lane, with a hardcoded 0.0 and
+                # outcome="skipped". So the histogram recorded nothing but
+                # zeros for a lane that does no pre-pass at all, while the real
+                # pre-pass — measured at p50 4,072 ms and p95 7,740 ms on a
+                # turn that goes to the network, and the single most expensive
+                # stage in front of the first token — was never recorded.
+                #
+                # It is observed HERE because this is the await: the task is
+                # dispatched much earlier and overlaps memory recall and
+                # compaction, so the time that matters is the time the answer
+                # path could not proceed, not the task's own duration.
+                _latency_metrics.knowledge_prepare(
+                    max(0.0, time.perf_counter() - knowledge_started_at),
+                    effort=str(request.effort or ""),
+                    decision=str(getattr(prepared_early, "decision", "") or "none"),
+                    outcome=knowledge_outcome,
+                )
                 if prepared_early.local_first and want_search and request.web_search != "on":
                     want_search = False
                     orchestration_state["search"] = False
