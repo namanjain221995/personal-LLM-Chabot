@@ -114,6 +114,18 @@ _PIC_NO_MAP = (r"(?:diagram(?:me)?s?|charts?|graphs?|plots?|views?|boards?|pictu
 _J = r"[\s\-_]*"
 
 
+#: WHAT MAKES "flow" A QUANTITY RATHER THAN A SEQUENCE OF STEPS. A cash flow, a
+#: fund flow, a money flow and a capital flow are measured amounts, so "cash
+#: flow chart for the year" is a real chart of real numbers and belongs in the
+#: data lane. Credit where it is due: this case was found by the parallel
+#: `fix/flow-chart-is-a-diagram` branch, which names the authored fixture rows
+#: behind it (c01 "Waterfall chart of the cash flow items." and hi05, the same
+#: request in Hindi). Measured here before the guard existed, "cash flow chart
+#: for the year" was read as a flow chart.
+_NOT_A_PROCESS = (r"(?<!cash )(?<!cash-)(?<!cash)(?<!fund )(?<!funds )(?<!money )"
+                  r"(?<!capital )(?<!net )(?<!free )(?<!नकदी )")
+
+
 def _with_pic(subject: str, pic: str = _PIC) -> str:
     """`<subject>` followed by a picture word. The shape the class lives in."""
     return rf"\b(?:{subject}){_J}{pic}"
@@ -155,9 +167,25 @@ SUBJECTS: Tuple[Diagram, ...] = (
     Diagram("value_stream", "flowchart", "a value stream map",
             r"\bvalue\s+streams?\b", in_file=True),
     Diagram("flow_chart", "flowchart", "a flow chart",
-            # A flow needs a picture word — "cash flow" and "the flow of
-            # funds" are not pictures — except in the one-word spelling.
-            _with_pic(r"flo?w+|फ्लो|ફ્લો") + r"|\bflow{J}charts?\b".format(J=_J),
+            # A flow needs a picture word — "the flow of funds" is not a
+            # picture — except in the one-word spellings, which are.
+            #
+            # `cash`, `fund`, `money` and `capital` make "flow" a MEASURED
+            # QUANTITY rather than a sequence of steps, so "cash flow chart for
+            # the year" is a real chart of real numbers and must stay in the
+            # data lane. Credit where it is due: this case was found by the
+            # parallel `fix/flow-chart-is-a-diagram` branch, which names the
+            # fixture rows behind it (c01 and hi05, the cash-flow waterfall in
+            # English and Hindi); measured here before the lookbehind,
+            # "cash flow chart for the year" was read as a flow chart.
+            #
+            # A WORKFLOW, by contrast, is exactly a sequence of steps, and
+            # "workflow" has no word boundary before its "flow" — so it needs
+            # its own arm or it stays a chart.
+            _with_pic(rf"{_NOT_A_PROCESS}flo?w+|फ्लो|ફ્લો")
+            + rf"|\b{_NOT_A_PROCESS}flow{_J}charts?\b"
+            + r"|" + _with_pic(r"work{J}flows?".format(J=_J))
+            + r"|\bwork{J}flows?\b".format(J=_J),
             in_file=True),
     Diagram("fishbone", "flowchart", "a fishbone diagram",
             r"\b(?:fish{J}bones?|ishikawas?)\b".format(J=_J), in_file=True),

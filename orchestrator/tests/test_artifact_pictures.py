@@ -427,3 +427,32 @@ def test_sankey_and_map_are_refusals_and_not_diagrams():
                  "plot these records on a map"):
         assert PIC.diagram_ask(text) is None, text
         assert VIS.asked_for(text) is not None, text
+
+
+def test_a_flow_that_is_a_QUANTITY_stays_in_the_data_lane():
+    """A cash flow, a fund flow and a capital flow are measured amounts, not
+    sequences of steps, so "cash flow chart for the year" is a real chart of
+    real numbers. Found by the parallel `fix/flow-chart-is-a-diagram` branch,
+    which names the authored fixture rows behind it (c01 "Waterfall chart of the
+    cash flow items." and hi05, the same request in Hindi). Measured here before
+    the guard: "cash flow chart for the year" was read as a flow chart.
+
+    A WORKFLOW is the opposite case and is exactly a sequence of steps — and
+    "workflow" has no word boundary before its "flow", so it needs its own arm.
+    """
+    for quantity in ("cash flow chart for the year", "cash flow graph of Q1", "fund flow chart",
+                     "money flow chart of the accounts", "capital flow chart",
+                     "net flow chart of the warehouse"):
+        assert PIC.diagram_ask(_rules_view(quantity)) is None, quantity
+        assert LX.chart_signal(_rules_view(quantity)) is True, (
+            f"{quantity!r} lost its chart reading; it IS a chart of numbers"
+        )
+    for process in ("workflow chart of the approval", "workflow diagram of the approval",
+                    "draw our workflow", "work flow chart of onboarding"):
+        got = PIC.diagram_ask(_rules_view(process))
+        assert got is not None and got.token == "flow_chart", process
+
+    # …and the two fixture rows themselves still plot.
+    for row in ("Waterfall chart of the cash flow items.", "नकदी प्रवाह का वॉटरफॉल चार्ट बनाइए"):
+        i = I.decide(row, has_dataset=True, upload_formats=("xlsx",))
+        assert i.action == "create" and i.chart_request, f"{row!r} -> {i.action}/{i.rule}"
