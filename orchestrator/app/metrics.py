@@ -293,6 +293,36 @@ TOPICAL_PRECHECK_RESULTS = frozenset({"hit", "miss", "fail"})
 #:     metrics.inc("recall_block_dropped_total", reason="embed_busy")
 RECALL_DROP_REASONS = frozenset({"embed_busy", "embed_timeout", "embed_error"})
 
+#: Why a query embedding that `memory_semantic.semantic_hits` started BESIDE
+#: the candidate load turned out to be work HEAD would never have done. This
+#: counter is the kill switch on that speculation (CROSS_CHAT_SPECULATIVE_EMBED,
+#: off by default), and a kill switch is only worth having if it sees every
+#: such case, so the reasons are enumerated here rather than left to the call
+#: site:
+#:   refetch_empty  the in-process candidate cache said this key had rows, the
+#:                  fingerprint disagreed and the refetch returned none, so
+#:                  HEAD would have returned before embedding anything;
+#:   load_failed    the candidate load raised. The documented case is Postgres
+#:                  out of connection slots, which makes it raise on EVERY
+#:                  turn, so this is the reason that can climb fast;
+#:   cancelled      the turn was cancelled while the load was still running (a
+#:                  newer message replaced it, or main.py's `reads.close()`).
+#: In all three the request is normally already on the shared embedding
+#: sidecar's wire when the guess is found out, so cancelling it does not
+#: un-spend it. `load_failed` over-counts in one shape: if `db.run_in_thread`
+#: raises before its own first suspension, the embedding's coroutine has not
+#: started and nothing was spent, but the reason is recorded anyway (measured
+#: 2026-09-27, Python 3.11 and 3.12). The connection-slot exhaustion above is
+#: not that shape — it raises inside the worker thread, after the embedding has
+#: started — so the reason that can climb fast is counted exactly. A kill switch
+#: that errs towards firing early is the right way round, so this is left as it
+#: is and written down instead.
+#: Call site contract:
+#:     metrics.inc("cross_chat_speculative_embed_wasted_total", reason="load_failed")
+SPECULATIVE_EMBED_WASTE_REASONS = frozenset(
+    {"refetch_empty", "load_failed", "cancelled"}
+)
+
 _ROUTE_EFFORT = {"route": set(CHAT_ROUTES), "effort": set(CHAT_EFFORTS)}
 
 #: metric -> {label name: closed value set}. Only these label NAMES survive.
@@ -320,6 +350,9 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
     # Counters of the same programme, closed the same way (names AND values).
     "knowledge_topical_precheck_total": {"result": set(TOPICAL_PRECHECK_RESULTS)},
     "recall_block_dropped_total": {"reason": set(RECALL_DROP_REASONS)},
+    "cross_chat_speculative_embed_wasted_total": {
+        "reason": set(SPECULATIVE_EMBED_WASTE_REASONS)
+    },
     "fast_lane_total": {
         "result": set(FAST_LANE_RESULTS),
         "category": set(FAST_LANE_CATEGORIES),
