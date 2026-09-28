@@ -507,19 +507,61 @@ jobs:
     # one, so the number kept being raised instead of the suite being split.
     # That commit (40bd49d) wrote the sharding requirement down; this is it.
     #
-    # The measurement, from the two runs the 90 was sized on — 35646527143 and
-    # 35653694304, step "Run the orchestrator suite": 3985 s and 3861 s of
-    # pytest inside 67- and 65-minute jobs. Everything that is NOT pytest cost
-    # 51 s and 49 s: container 11 s, checkout 3 s, setup-python 4 s, apt 9 s,
-    # pip 23 s. pytest itself then spends ~60 s before its first test on
-    # imports, CREATE DATABASE and the migrations. A third of 3985 s is 22.1
-    # min, so a shard is ~24 min and three of them replace ~66 with ~24.
+    # THE MEASUREMENT. Runs 36311316007 and 36311424006 (numbers 259 and 260,
+    # 2026-09-27) on hosted runners. Both are at tree 6e986cf — the trees are
+    # byte-identical, so the pair is a repeat of one measurement and not two
+    # different suites. Job wall clock, and pytest's own reported time inside
+    # it:
     #
-    # 40 leaves ~65% headroom over that, which is wider than the 1.2-1.35x the
-    # old ceiling ran at, on purpose: a hosted runner has been measured 4%
-    # apart run-to-run on identical work and the point of a ceiling is to kill
-    # a WEDGED job, not to be the thing a slow morning trips over. A shard that
-    # needs 40 minutes is a regression worth a red build.
+    #     shard   run 259 job   run 260 job   run 259 pytest   run 260 pytest
+    #       1       24m50s        16m55s         1423.41 s         960.00 s
+    #       2       28m00s        28m13s         1613.41 s        1631.58 s
+    #       3       19m10s        20m52s         1085.84 s        1188.98 s
+    #
+    # Everything that is NOT pytest cost 55-63 s per job on run 260: container
+    # 11 s, checkout 2 s, setup-python 3 s, the shard guard under 1 s, apt
+    # 10 s, pip 17-27 s, the two psql proofs under 1 s, the renderer import
+    # 1 s. pytest then spends a further 20-28 s before its first test on
+    # imports, CREATE DATABASE and the migrations. Measured end to end — job log
+    # start to the first `pytest -q` progress line — the fixed cost of a shard
+    # was 85.2 / 92.3 / 88.2 s on run 260 and 109.8 / 97.2 / 83.0 s on run 259:
+    # 1.4 to 1.8 minutes, mean 1.5, against the ~1.8 (50 s + 60 s) the first
+    # sizing assumed. The test's FIXED_MINUTES uses the worst of the six, since
+    # it is added to a ceiling projection.
+    #
+    # An EARLIER VERSION OF THIS COMMENT claimed a shard is ~24 min and that 40
+    # leaves ~65% headroom. Neither was true. The real spread was 16m55s to
+    # 28m13s, and against the worst shard measured — 28m13s — 40 minutes left
+    # 42%. The numbers came from the two UNSHARDED runs the old 90-minute
+    # ceiling was sized on (35646527143 and 35653694304: 3985 s and 3861 s of
+    # pytest in 67- and 65-minute jobs) divided by three, and a third of the
+    # suite's seconds was never a third of its FILES.
+    #
+    # THE CAUSE was the balance, not the ceiling. shard_tests.py packs by a
+    # committed map of measured seconds per file, and that map had been derived
+    # from those unsharded runs; it was wrong file by file by as much as 37 s,
+    # which is enough for longest-processing-time packing to fill a shard on
+    # paper and leave it idle in fact. `--plan` predicted 21.8 minutes for all
+    # three shards while shard 2 ran 28. The map is now measured from runs 259
+    # and 260 — the sharded job — and predicts 19.98 minutes of tests for each
+    # shard, so ~21.5 minutes of job at the mean fixed cost and ~21.8 at the
+    # worst. That figure is a PREDICTION COMPUTED FROM RECORDED TIMINGS, not a
+    # measurement of a real CI run; the module docstring in shard_tests.py says
+    # what bounds it. It is also, unlike the map it replaces, RECONCILABLE: the
+    # per-shard file lists of the measured runs and their observed pytest totals
+    # are both recorded in shard_weights.json's `_source`, and a test asserts
+    # the map still sums to what those runs took.
+    #
+    # Raising this number was never the fix and is not one now: a ceiling is
+    # not a balance, and a higher ceiling would have let shard 2's extra work
+    # keep growing out of sight. 40 STAYS. Against a predicted ~21.8 minutes it
+    # leaves ~84%, and the reason it is that wide is the runner, not the suite:
+    # shard 1 took 1423.41 s of pytest on run 259 and 960.00 s on run 260 over
+    # the SAME 141 files — 48% apart, not the 4% the old comment assumed. A
+    # 20-minute shard on a runner that contended is ~30 minutes of tests plus
+    # the 1.8-minute worst-case setup, 31.8 all told, which still fits. The point of a ceiling is
+    # to kill a WEDGED job, not to be the thing a slow morning trips over. A
+    # shard that needs 40 minutes is a regression worth a red build.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
