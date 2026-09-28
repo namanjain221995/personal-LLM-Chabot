@@ -523,6 +523,44 @@ class TheTimeoutCapOnlyEverLowersADeadline(unittest.TestCase):
         self.assertNotIn('TIMEOUTS["', body)
 
 
+class TheTokenCounterIsReadFromTheSameFieldAsVerify(unittest.TestCase):
+    """The Prometheus text format allows an optional trailing timestamp:
+
+        vllm:generation_tokens_total{engine="0",model_name="m"} 1000 1759000000000
+
+    Reading the LAST whitespace field takes the TIMESTAMP as the counter, so a
+    frozen counter scraped twice looks like a rising one and this probe passes a
+    wedged engine -- the single thing it exists to catch, and the opposite of
+    verify's `awk /^vllm:generation_tokens_total/ {s+=$2}`.
+
+    Latent on the pinned build, whose prometheus_client emits two fields, so
+    nothing but this test holds the two readers together.
+    """
+
+    FROZEN = 1000.0
+
+    def _sum(self, body: str):
+        return box_probes._generation_tokens(body)
+
+    def test_a_timestamped_sample_reads_its_value_not_its_timestamp(self) -> None:
+        body = 'vllm:generation_tokens_total{engine="0",model_name="m"} 1000 1759000000000\n'
+        self.assertEqual(self._sum(body), self.FROZEN)
+
+    def test_a_frozen_counter_stays_frozen_when_the_timestamp_moves(self) -> None:
+        before = self._sum('vllm:generation_tokens_total{engine="0"} 1000 1759000000000\n')
+        after = self._sum('vllm:generation_tokens_total{engine="0"} 1000 1759000030000\n')
+        self.assertEqual(before, after, "a moving timestamp must not look like generation")
+        self.assertFalse(after > before, "this is the wedge assertion; it must not pass")
+
+    def test_it_agrees_with_verifys_awk_on_both_shapes(self) -> None:
+        for body in (
+            'vllm:generation_tokens_total{engine="0"} 1000\n',
+            'vllm:generation_tokens_total{engine="0"} 1000 1759000000000\n',
+        ):
+            awk = sum(float(line.split()[1]) for line in body.splitlines() if line.strip())
+            self.assertEqual(self._sum(body), awk, body)
+
+
 class TheCompletionProbeReadsTheWholeReply(unittest.TestCase):
     """A chat template that ignores `enable_thinking` must not fail a healthy box.
 

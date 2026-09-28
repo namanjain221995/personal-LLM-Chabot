@@ -1083,7 +1083,13 @@ def _generation_tokens(text: str) -> float | None:
         if len(parts) < 2:
             continue
         try:
-            value = float(parts[-1])
+            # $2, exactly as verify's awk reads it. The Prometheus text format
+            # permits an optional trailing timestamp ("metric{labels} value ts"),
+            # and parts[-1] reads THAT as the value -- so a frozen counter scraped
+            # twice looks like a rising one and this probe passes a wedged engine,
+            # which is the single thing it exists to catch. The len(parts) < 2
+            # guard above already covers a short line.
+            value = float(parts[1])
         except ValueError:
             continue
         if value != value or value in (float("inf"), float("-inf")):
