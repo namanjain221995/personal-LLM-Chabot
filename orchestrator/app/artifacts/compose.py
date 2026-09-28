@@ -1202,8 +1202,18 @@ _MEASURE_WORDS = frozenset(_stem(w) for w in (
     "characters chars minutes hours days weeks months years quarters"
 ).split() + list(_NUMBER_WORDS))
 #: A token that is a number in a word's clothing: "3000", "3,000", "2-page"
-#: (stemmed to "2page"), "10k", "12pt", "Q3", "FY26", "H1".
-_MEASURE_TOKEN_RE = re.compile(r"^(?:\d[\d,.]*[a-z]{0,6}|q[1-4]|fy\d{2,4}|h[12])$")
+#: (stemmed to "2page"), "10k", "12pt".
+_MEASURE_TOKEN_RE = re.compile(r"^(?:\d[\d,.]*[a-z]{0,6})$")
+#: A PERIOD, which is a number in a word's clothing AND a name: "Q3", "FY26",
+#: "H1". It counts as a measure beside a unit ("Q3 pages" is a count) and as a
+#: naming word on its own -- "Q1", "Q2", "Q3", "Q4" and "H1 2026" are the
+#: section names of every plan written to a calendar, and ea895477 kept them
+#: while the flat token rule dropped them (measured 2026-09-28).
+_PERIOD_TOKEN_RE = re.compile(r"^(?:q[1-4]|fy\d{2,4}|h[12])$")
+
+#: `_NOT_SECTION_WORDS` stemmed, read by `_names_something_after_the_verb` and
+#: by `eligible`. One home, so the two cannot drift.
+_NOT_SECTION_STEMS = frozenset(_stem(w) for w in _NOT_SECTION_WORDS)
 
 #: A numbered item that is an INSTRUCTION, not a name: an instruction verb
 #: first, then a lowercase word — "Use professional Markdown", "Include at
@@ -1217,10 +1227,112 @@ _IMPERATIVE_ITEM_RE = re.compile(
     r"remember|cite|put|give)\s+(?!(?:or|and|vs|versus|of|&)\b)[a-z]")
 
 
+_PHRASAL_PARTICLES = frozenset(_stem(w) for w in
+                               "up to back out in on off over through down away".split())
+
+
+def _names_something_after_the_verb(phrase: str, at: int) -> bool:
+    """Does the word after an instruction verb NAME something?
+
+    `_IMPERATIVE_ITEM_RE` reads "verb then lowercase word" as an instruction,
+    and on its own that is too wide: under "Requirements:" the items "Use
+    cases", "Keep warm strategy", "Provide feedback", "Give back program",
+    "Write once run anywhere" and "Follow up actions" all vanished from the
+    outline (measured 2026-09-28 against both ea895477 and main, which keep
+    every one). A person who writes a list in sentence case still writes
+    names.
+
+    The evidence is the word itself. "professional", "at", "not", "the",
+    "every" and "a" are stop words, units or quantifiers -- nothing is being
+    named. "cases", "warm", "feedback", "back" and "once" are none of those.
+    """
+    rest = phrase[at:].split()
+    #: A PHRASAL PARTICLE is part of the verb, not the evidence. "Follow up
+    #: actions" and "Add to cart flow" are headings whose second word is a
+    #: particle, so the word AFTER the particle is what decides. "Do not skip
+    #: any section" is unaffected: "not" is a stop word, not a particle.
+    while rest and _stem(rest[0]) in _PHRASAL_PARTICLES:
+        rest = rest[1:]
+    if not rest:
+        return False
+    after = _stem(rest[0])
+    if not after:
+        return False
+    return not (after in _STOP_WORDS or after in _MEASURE_WORDS
+                or after in _NOT_SECTION_STEMS or _MEASURE_TOKEN_RE.match(after))
+
+
+#: The unit words among `_MEASURE_WORDS`: the ones that are a measurement only
+#: when something is being measured. The quantifiers ("about", "at least") and
+#: the number words are not here -- those are never a name on their own.
+_UNIT_WORDS = frozenset(_stem(w) for w in (
+    "words pages paragraphs paras lines sentences slides sections diagrams figures charts tables items bullets "
+    "characters chars minutes hours days weeks months years quarters numbers"
+).split())
+#: The quantifiers and number words alone: `_MEASURE_WORDS` less the units.
+#: Hoisted, because `_naming_words` runs once per list item and a set
+#: difference per phrase is an allocation the event loop does not need.
+_QUANTIFIER_WORDS = frozenset(_MEASURE_WORDS) - _UNIT_WORDS
+
+
 def _naming_words(phrase: str) -> set:
     """The content words of a phrase that could NAME a part of the document:
-    `_content_words` less the numbers, quantifiers and units."""
-    return {w for w in _content_words(phrase) if not (w in _MEASURE_WORDS or _MEASURE_TOKEN_RE.match(w))}
+    `_content_words` less the numbers, quantifiers and units.
+
+    A UNIT IS A MEASUREMENT ONLY WHEN SOMETHING IS MEASURED (2026-09-28). The
+    flat set threw away real sections whose only content word is a unit --
+    "Characters" in a novel outline (1. Premise 2. Characters 3. Setting 4.
+    Plot), "Minutes" in a meeting agenda (1. Attendees 2. Minutes 3. Action
+    Items), "Figures and Tables" -- and every itinerary shape: "Day 1", "Week
+    2", "Year 1", "Q1", "H1 2026". Those are regressions against ea895477 and
+    against main. A unit counts as a measure when a number, a number word or a
+    quantifier comes BEFORE it in the phrase ("3000 words", "three diagrams",
+    "about 4 pages"); a bare unit, or a unit followed by a number, is a label.
+    """
+    words = [w for w in re.split(r"\s+", phrase.strip()) if w]
+    stems = [_stem(w) for w in words]
+    quantified: set = set()
+    for i, st in enumerate(stems):
+        if st not in _UNIT_WORDS:
+            continue
+        for before in stems[:i]:
+            if before and (before in _QUANTIFIER_WORDS
+                           or _MEASURE_TOKEN_RE.match(before) or _PERIOD_TOKEN_RE.match(before)):
+                quantified.add(st)
+                break
+    # A period NAMES a section on its own ("Q1", "H1 2026") but is the QUANTITY
+    # when the phrase also carries a unit -- "Q3 2026 numbers only" counts
+    # numbers, it does not name a quarter.
+    has_unit = any(st in _UNIT_WORDS for st in stems)
+    out = set()
+    for w in _content_words(phrase):
+        if _PERIOD_TOKEN_RE.match(w):
+            if not has_unit:
+                out.add(w)
+            continue
+        if _MEASURE_TOKEN_RE.match(w):
+            continue
+        if w in _UNIT_WORDS:
+            if w in quantified:
+                continue
+            out.add(w)
+            continue
+        if w in _MEASURE_WORDS:
+            continue
+        out.add(w)
+    return out
+
+
+def _reads_as_a_name(phrase: str) -> bool:
+    """Does this phrase NAME a part of the document? `eligible`'s core, without
+    the word-count bound, so the run-over trim can ask the same question."""
+    if not phrase:
+        return False
+    imperative = _IMPERATIVE_ITEM_RE.match(phrase)
+    if imperative and not _names_something_after_the_verb(phrase, imperative.end() - 1):
+        return False
+    naming = _naming_words(phrase)
+    return bool(naming) and not naming <= _NOT_SECTION_STEMS
 
 
 def _section_phrase(raw: str) -> str:
@@ -1319,13 +1431,29 @@ _ITEM_CLAUSE_RE = re.compile(
 #: spend a correction call and warn "requested sections not found". A list
 #: under a heading word ("Requirements:") is the person's own and is not
 #: guarded here, so "a report from the attached notes covering:" still reads.
+#: NARROWED 2026-09-28. The bare words were far too wide, and they took the
+#: person's OWN bare numbered list away from them: "Write a report with the
+#: structure below. 1. Executive Summary 2. Architecture 3. Security 4.
+#: Conclusion" read 0 sections, and so did "Write the document for our
+#: client. 1. ...", "Start with a summary of the findings. 1. ...", "Write up
+#: the notes from today's call as a report: 1. ..." and "Write the paper on
+#: the topic. 1. Abstract 2. Introduction 3. Method 4. Results" -- all of
+#: which ea895477 read in full. A pointer at material needs the MATERIAL NOUN
+#: beside it AND a pointer word ("the document below", "the text above",
+#: "attached notes", "pasted content"); a bare "the document", "the notes" or
+#: "the paper" is what the person is asking FOR, not pointing AT, which is how
+#: "Write the document for our client" lost its four sections. The two pinned
+#: unfenced-TOC cases still match, through "summari[sz]e" and "turn ... into".
+_MATERIAL_NOUN = (r"document|text|doc|article|paper|passage|draft|notes?|transcript|email|posting|jd|"
+                  r"material|content|copy|extract|excerpt")
 _MATERIAL_AHEAD_RE = re.compile(
-    r"\b(?:below|above|attached|pasted|enclosed|"
-    r"(?:this|that|the)\s+(?:document|text|doc|article|paper|passage|draft|notes?|transcript|email|posting|jd|"
-    r"material)|"
-    r"summari[sz]e|summary\s+of|brief\s+of|condense|shorten|rewrite|reword|rephrase|paraphrase|proofread|"
-    r"translate|tidy|polish|restructure|reformat|"
-    r"turn\s+(?:it|this|that|these|them|the\s+\w+)\s+into)\b", re.I)
+    rf"\b(?:(?:this|that|the|these|those|my|our|your)\s+(?:{_MATERIAL_NOUN})\s+"
+    rf"(?:below|above|attached|pasted|enclosed|here)\b"
+    rf"|(?:{_MATERIAL_NOUN})\s+(?:below|above|attached|pasted|enclosed)\b"
+    rf"|(?:attached|pasted|enclosed)\s+(?:{_MATERIAL_NOUN})\b"
+    rf"|summari[sz]e|condense|shorten|rewrite|reword|rephrase|paraphrase|proofread|"
+    rf"translate|tidy|polish|restructure|reformat|"
+    rf"turn\s+(?:it|this|that|these|them|the\s+\w+)\s+into)\b", re.I)
 
 
 def _title_cased(items: Sequence[str]) -> bool:
@@ -1372,7 +1500,17 @@ def _trim_runover(items: List[str], *, ran_over: bool) -> List[str]:
     words = last.split()
     sibling_words = max((len(x.split()) for x in items[:-1]), default=0)
     if len(items) >= 4 and sibling_words >= 2 and len(words) > sibling_words + 1:
-        items[-1] = _TRAILING_JOIN_RE.sub("", " ".join(words[:sibling_words])) or items[-1]
+        # THE CUT IS FOR AN ITEM THAT RAN INTO A SENTENCE, NEVER FOR AN ITEM THAT
+        # IS ONE. "Keep the tone formal" cut to the siblings' two words is
+        # "Keep", and "Q3 2026 numbers only" is "Q3 2026": both fragments read
+        # as section names although the item was an instruction and a quantity
+        # (measured 2026-09-28). So the WHOLE item has to read as a name before
+        # anything is cut off it -- left whole, each of those is refused by
+        # `eligible`, which is the right answer -- and the cut has to still read
+        # as one afterwards.
+        cut = _TRAILING_JOIN_RE.sub("", " ".join(words[:sibling_words]))
+        if cut and _reads_as_a_name(last) and _reads_as_a_name(cut):
+            items[-1] = cut
     return items
 
 
@@ -1471,7 +1609,7 @@ def requested_sections(instruction: str) -> List[str]:
     found: List[str] = []
     seen: set = set()
 
-    not_sections = {_stem(w) for w in _NOT_SECTION_WORDS}
+    not_sections = _NOT_SECTION_STEMS
 
     def eligible(ph: str, limit: int) -> bool:
         # A SECTION NAME IS A NOUN PHRASE NAMING A PART OF THE DOCUMENT
@@ -1489,10 +1627,7 @@ def requested_sections(instruction: str) -> List[str]:
         words = ph.split()
         if not ph or not 1 <= len(words) <= limit or re.search(r"\d\s*pt\b", ph, re.I):
             return False
-        if _IMPERATIVE_ITEM_RE.match(ph):
-            return False
-        naming = _naming_words(ph)
-        return bool(naming) and not naming <= not_sections
+        return _reads_as_a_name(ph)
 
     def add(phrases: Sequence[str], minimum: int, limit: int = INLINE_SECTION_WORDS) -> None:
         keep = [ph for ph in phrases if eligible(ph, limit)]

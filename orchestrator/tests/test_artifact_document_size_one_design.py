@@ -466,3 +466,118 @@ def test_the_owners_prompt_is_written_in_fifteen_sections_through_the_real_compo
 
 async def _no_pace():
     return 0.0
+
+
+# ---- the four over-reaches the narrower rules brought, 2026-09-28 ---------
+#
+# Every rule in this file was measured against ea895477 and main before it
+# landed, and four of them then took real section names away that BOTH of those
+# trees kept. Each case below was driven through `requested_sections` on all
+# three trees; the comment names which tree kept what.
+
+SENTENCE_CASE_LIST = (
+    "Write a spec. Requirements: 1. Use cases 2. Keep warm strategy "
+    "3. Provide feedback 4. Give back program 5. Write once run anywhere "
+    "6. Follow up actions 7. Add to cart flow"
+)
+
+
+def test_a_sentence_case_list_is_still_a_list_of_names():
+    """`_IMPERATIVE_ITEM_RE` reads "verb then lowercase word" as an
+    instruction, which is too wide on its own: a person who writes their list
+    in sentence case still writes names. All seven vanished on cb3753f5;
+    ea895477 and main keep every one.
+
+    "Follow up actions" and "Add to cart flow" need the particle rule as well
+    -- "up" and "to" are stop words, so the word after the particle decides."""
+    assert C.requested_sections(SENTENCE_CASE_LIST) == [
+        "Use cases", "Keep warm strategy", "Provide feedback", "Give back program",
+        "Write once run anywhere", "Follow up actions", "Add to cart flow",
+    ]
+
+
+@pytest.mark.parametrize("item", [
+    "Use professional Markdown",
+    "Include at least three diagrams",
+    "Do not skip any section",
+    "Keep the tone formal",
+    "Write about 3000 words",
+])
+def test_an_instruction_is_still_not_a_section(item):
+    """The other side of the same rule. The word after the verb is a stop word,
+    a quantifier or a unit, so nothing is being named."""
+    req = ("Write a report. 1. Executive Summary 2. Architecture 3. Security "
+           "4. Conclusion 5. " + item)
+    assert C.requested_sections(req) == ["Executive Summary", "Architecture", "Security", "Conclusion"]
+
+
+@pytest.mark.parametrize("prompt,want", [
+    # A unit word is a section name when nothing is being measured.
+    ("Write an outline. 1. Premise 2. Characters 3. Setting 4. Plot",
+     ["Premise", "Characters", "Setting", "Plot"]),
+    ("Write the agenda. 1. Attendees 2. Minutes 3. Action Items",
+     ["Attendees", "Minutes", "Action Items"]),
+    ("Write the itinerary. 1. Day 1 2. Day 2 3. Day 3",
+     ["Day 1", "Day 2", "Day 3"]),
+    ("Write the plan. 1. Q1 2. Q2 3. Q3 4. Q4", ["Q1", "Q2", "Q3", "Q4"]),
+    ("Write the review. 1. H1 2026 2. H2 2026 3. Outlook",
+     ["H1 2026", "H2 2026", "Outlook"]),
+])
+def test_a_bare_unit_or_a_period_names_a_section(prompt, want):
+    """"Characters" in a novel outline, "Minutes" in an agenda, "Day 1" in an
+    itinerary and "Q1" in a plan are names, not measurements. The flat measure
+    set dropped all of them on cb3753f5 while ea895477 and main kept them; a
+    unit is a measurement only when a quantity comes BEFORE it."""
+    assert C.requested_sections(prompt) == want
+
+
+@pytest.mark.parametrize("item", [
+    "About 3000 words", "At least 3 diagrams", "Around 4 pages long",
+    "3 charts per section", "Q3 2026 numbers only",
+])
+def test_a_quantity_is_still_not_a_section_after_the_unit_rule(item):
+    """And the quantities the unit rule must not let back in. "Q3 2026 numbers
+    only" is the one that needs the pair of rules together: a period names a
+    section on its own, but beside a unit it IS the quantity."""
+    req = ("Write a report. 1. Executive Summary 2. Architecture 3. Security "
+           "4. Conclusion 5. " + item)
+    assert C.requested_sections(req) == ["Executive Summary", "Architecture", "Security", "Conclusion"]
+
+
+OWN_LIST_SHAPES = [
+    "Write a report with the structure below. 1. Executive Summary 2. Architecture 3. Security 4. Conclusion",
+    "Write the document for our client. 1. Executive Summary 2. Architecture 3. Security 4. Conclusion",
+    "Start with a summary of the findings. 1. Executive Summary 2. Architecture 3. Security 4. Conclusion",
+    "Write up the notes from today's call as a report: 1. Executive Summary 2. Architecture 3. Security 4. Conclusion",
+]
+
+
+@pytest.mark.parametrize("prompt", OWN_LIST_SHAPES)
+def test_the_persons_own_bare_list_is_read_even_when_the_words_before_it_sound_like_material(prompt):
+    """`_MATERIAL_AHEAD_RE` matched a bare "below", "the document", "the
+    notes", "summary of" and "the paper", so five requests that carry the
+    person's OWN table of contents read ZERO sections on cb3753f5 -- and with
+    them went the size, the names in the prompt, the coverage check and the
+    repair pass. ea895477 read every one.
+
+    A pointer at material needs the material NOUN and a pointer WORD beside
+    it: "the document below", "the text above", "attached notes"."""
+    assert C.requested_sections(prompt) == ["Executive Summary", "Architecture", "Security", "Conclusion"]
+
+
+def test_the_persons_own_bare_list_after_a_topic_sentence():
+    assert C.requested_sections(
+        "Write the paper on the topic. 1. Abstract 2. Introduction 3. Method 4. Results"
+    ) == ["Abstract", "Introduction", "Method", "Results"]
+
+
+@pytest.mark.parametrize("prompt", [
+    "Summarise this. 1. Background 2. Findings 3. Recommendations 4. Appendix",
+    "Turn it into a brief. 1. Background 2. Findings 3. Recommendations 4. Appendix",
+    "Rewrite the document below. 1. Background 2. Findings 3. Recommendations 4. Appendix",
+    "A report from the attached notes. 1. Background 2. Findings 3. Recommendations 4. Appendix",
+])
+def test_a_pasted_documents_own_contents_are_still_not_the_request(prompt):
+    """The rule the narrowing must not lose: when the words before a bare list
+    point at MATERIAL, the list is the material's table of contents."""
+    assert C.requested_sections(prompt) == []
