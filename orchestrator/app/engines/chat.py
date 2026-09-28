@@ -18,6 +18,7 @@ effort are merged in centrally by the /chat endpoint).
 """
 from __future__ import annotations
 
+import time
 from typing import Awaitable, Callable, List, Optional, Sequence
 
 from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, FORMAT_INSTRUCTION, recent_turns
@@ -429,6 +430,12 @@ def _messages(
     )
 
 
+#: Step titles for the best-of-N branch (V2 §4e: rendered as the timeline
+#: the person watches). `{n}` is the configured EXTRA_HIGH_SAMPLES.
+STEP_DRAFTS = "Drafting {n} answers in parallel"
+STEP_JUDGE = "Choosing the best draft"
+
+
 def _effort_degraded(
     reason: str,
     detail: str,
@@ -667,81 +674,134 @@ async def run_chat_engine(
     # paid for Max and was told nothing. `degraded` below is that silence's fix:
     # anything Max asked for and did not get is named in the answer's metadata.
     degraded: Optional[dict] = None
+    # MAX SHOWS ITS WORK (2026-09-28). Three drafts and a judge ran with no
+    # frame on the wire until the winner was replayed: measured today with
+    # this function against the real engine (n=5, load 3.9-5.2), the first
+    # visible frame of a Max turn arrived at 11,228-17,415 ms (median
+    # 14,166) and in every run it was also the LAST frame. The person had
+    # chosen the slowest effort and got a blank bubble for the whole of it.
+    # The candidates are not streamed live on purpose: in the same 5 runs
+    # the judge kept draft 1 in 0 of 5 (it kept 3, 2, 2, 2, 3), so a draft
+    # streamed live would have been replaced under the person's eyes every
+    # time, after they had read 7-14 s of it. What streams instead is the
+    # WORK, as the same step rows the Max loop and the agent use: one row
+    # while the drafts generate, its detail counting them in as each lands,
+    # one row for the judge, its detail naming the draft kept and why. The
+    # first row is on the wire before the first engine call is made (same
+    # harness, after: 0-56 ms). core/steps.py; every number in a detail is
+    # counted or clocked by this code, never by the model.
+    best_of_steps: List[dict] = []
     if effort == "max" and settings.extra_high_samples > 1:
+        from ..core.steps import Steps
+
         prompt = _messages(message, history, mode, grounding)
-        candidates = await best_of.generate_candidates(
-            prompt,
-            n=settings.extra_high_samples,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        if any(c.usable for c in candidates):
-            winner, reason = await best_of.select_best(message, candidates)
-            best_of.log_losers(candidates, winner)
-            for start in range(0, len(winner.reasoning), 1000):
-                await emit(
-                    "reasoning", {"text": winner.reasoning[start : start + 1000]}
-                )
-            answer = rewrite_shape.shape(message, winner.answer)
-            for start in range(0, len(answer), 200):
-                await emit("token", {"text": answer[start : start + 200]})
-            # ASKED vs COMPARED. `best_of` is the N the operator configured
-            # and asked for; it is NOT how many drafts the judge got to see.
-            # A candidate that fails comes back unusable rather than fatal
-            # (core/best_of.generate_candidates), and select_best judges only
-            # the usable ones — down to "only one candidate produced an
-            # answer", which is no comparison at all. Reporting the asked
-            # count alone made that case claim a best-of-3 it never ran
-            # (2026-09-27): the same silence as the two branches below, one
-            # `if` earlier, so it is named the same way.
+        n = settings.extra_high_samples
+        steps = Steps(emit)
+        drafting_since = time.monotonic()
+
+        def _drafts(done: int, failed: int) -> str:
+            line = f"{done} of {n} drafts done"
+            if failed:
+                line += f" ({failed} failed)"
+            return f"{line}, {time.monotonic() - drafting_since:.1f} s"
+
+        failed_so_far = 0
+
+        async def _landed(candidate: best_of.Candidate, done: int, total: int) -> None:
+            nonlocal failed_so_far
+            if not candidate.usable:
+                failed_so_far += 1
+            if done < total:
+                await steps.progress(_drafts(done, failed_so_far))
+
+        try:
+            await steps.open(STEP_DRAFTS.format(n=n), f"0 of {n} drafts done")
+            candidates = await best_of.generate_candidates(
+                prompt,
+                n=n,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                on_candidate=_landed,
+            )
             compared = sum(1 for c in candidates if c.usable)
-            meta = {
-                "route": "chat",
-                "best_of": settings.extra_high_samples,
-                "best_of_compared": compared,
-                "best_of_winner": winner.index,
-                "best_of_reason": reason,
-            }
-            if compared < settings.extra_high_samples:
-                failed = settings.extra_high_samples - compared
-                meta["effort_degraded"] = _effort_degraded(
-                    "candidates_partially_failed",
-                    f"{failed} of {settings.extra_high_samples} Max drafts "
-                    + (
-                        "failed; the one that survived was used without a "
-                        "comparison"
-                        if compared == 1
-                        else f"failed; the best of {compared} was kept"
-                    ),
-                    delivered=(
-                        "single_generation"
-                        if compared == 1
-                        else f"best_of_{compared}"
-                    ),
+            if compared:
+                await steps.done(_drafts(n, n - compared))
+                if compared > 1:
+                    await steps.open(STEP_JUDGE)
+                winner, reason = await best_of.select_best(message, candidates)
+                best_of.log_losers(candidates, winner)
+                if compared > 1:
+                    await steps.done(f"kept draft {winner.index}: {reason}")
+                for start in range(0, len(winner.reasoning), 1000):
+                    await emit(
+                        "reasoning", {"text": winner.reasoning[start : start + 1000]}
+                    )
+                answer = rewrite_shape.shape(message, winner.answer)
+                for start in range(0, len(answer), 200):
+                    await emit("token", {"text": answer[start : start + 200]})
+                # ASKED vs COMPARED. `best_of` is the N the operator configured
+                # and asked for; it is NOT how many drafts the judge got to see.
+                # A candidate that fails comes back unusable rather than fatal
+                # (core/best_of.generate_candidates), and select_best judges only
+                # the usable ones — down to "only one candidate produced an
+                # answer", which is no comparison at all. Reporting the asked
+                # count alone made that case claim a best-of-3 it never ran
+                # (2026-09-27): the same silence as the two branches below, one
+                # `if` earlier, so it is named the same way.
+                meta = {
+                    "route": "chat",
+                    "best_of": settings.extra_high_samples,
+                    "best_of_compared": compared,
+                    "best_of_winner": winner.index,
+                    "best_of_reason": reason,
+                    # The rows the person watched, so a reload shows them too.
+                    "steps": list(steps.finished),
+                }
+                if compared < settings.extra_high_samples:
+                    failed = settings.extra_high_samples - compared
+                    meta["effort_degraded"] = _effort_degraded(
+                        "candidates_partially_failed",
+                        f"{failed} of {settings.extra_high_samples} Max drafts "
+                        + (
+                            "failed; the one that survived was used without a "
+                            "comparison"
+                            if compared == 1
+                            else f"failed; the best of {compared} was kept"
+                        ),
+                        delivered=(
+                            "single_generation"
+                            if compared == 1
+                            else f"best_of_{compared}"
+                        ),
+                        also=(loop_degraded,) if loop_degraded else (),
+                    )
+                elif loop_degraded is not None:
+                    # Every draft the operator asked for was compared, so
+                    # best-of-N ran exactly as configured — and this ask was still
+                    # the loop's shape, and the loop was off. `delivered` names
+                    # what really ran; the reason names what it replaced.
+                    meta["effort_degraded"] = _effort_degraded(
+                        loop_degraded["reason"],
+                        loop_degraded["detail"],
+                        delivered=f"best_of_{compared}",
+                    )
+                answer = await _say_what_was_left_out(message, answer, emit, meta)
+                await emit("meta", meta)
+                return answer
+            else:
+                # Every candidate failed. The single stream below is still the right
+                # answer — best-of-N may never make Max WORSE than Think — but N
+                # drafts were asked for and one was delivered, so it is recorded.
+                degraded = _effort_degraded(
+                    "candidates_failed",
+                    f"all {settings.extra_high_samples} Max drafts failed; "
+                    "answered with a single generation",
                     also=(loop_degraded,) if loop_degraded else (),
                 )
-            elif loop_degraded is not None:
-                # Every draft the operator asked for was compared, so
-                # best-of-N ran exactly as configured — and this ask was still
-                # the loop's shape, and the loop was off. `delivered` names
-                # what really ran; the reason names what it replaced.
-                meta["effort_degraded"] = _effort_degraded(
-                    loop_degraded["reason"],
-                    loop_degraded["detail"],
-                    delivered=f"best_of_{compared}",
-                )
-            answer = await _say_what_was_left_out(message, answer, emit, meta)
-            await emit("meta", meta)
-            return answer
-        # Every candidate failed. The single stream below is still the right
-        # answer — best-of-N may never make Max WORSE than Think — but N
-        # drafts were asked for and one was delivered, so it is recorded.
-        degraded = _effort_degraded(
-            "candidates_failed",
-            f"all {settings.extra_high_samples} Max drafts failed; "
-            "answered with a single generation",
-            also=(loop_degraded,) if loop_degraded else (),
-        )
+                await steps.failed(_drafts(n, n) + "; answering with a single generation")
+        finally:
+            await steps.close_open("the turn ended before this step finished")
+            best_of_steps = list(steps.finished)
     elif effort == "max":
         # EXTRA_HIGH_SAMPLES <= 1: the operator has best-of-N switched off, so
         # Max is Think with a longer leash. A deployment choice, not a bug —
@@ -832,6 +892,8 @@ async def run_chat_engine(
     meta = {"route": "chat"}
     if degraded is not None:
         meta["effort_degraded"] = degraded
+    if best_of_steps:
+        meta["steps"] = best_of_steps
     if long.segment_count > 1 or long.truncated:
         meta["continuation"] = long.as_meta()
     if guard.verdict is not None:

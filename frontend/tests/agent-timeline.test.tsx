@@ -59,6 +59,28 @@ describe('AgentTimeline', () => {
     const { container } = render(<AgentTimeline steps={[]} />);
     expect(container.firstChild).toBeNull();
   });
+  it('shows a running step\'s detail without a click, a finished one\'s behind the toggle', () => {
+    cleanup();
+    // Max best-of-N (2026-09-28): the running row's detail is the progress
+    // the person is waiting on ("2 of 3 drafts done, 9.4 s"). Measured on
+    // the real engine that day the first draft landed 6.7-13.6 s after the
+    // row opened, so a count that needs a click is a count nobody sees.
+    const live: AgentStep[] = [
+      { id: 1, title: 'Drafting 3 answers in parallel', status: 'running', detail: '2 of 3 drafts done, 9.4 s' },
+    ];
+    render(<AgentTimeline steps={live} />);
+    expect(screen.getByText('2 of 3 drafts done, 9.4 s')).toBeTruthy();
+    cleanup();
+    const done: AgentStep[] = [
+      { id: 1, title: 'Drafting 3 answers in parallel', status: 'done', detail: '3 of 3 drafts done, 13.7 s' },
+      { id: 2, title: 'Choosing the best draft', status: 'done', detail: 'kept draft 2: clearest' },
+    ];
+    render(<AgentTimeline steps={done} />);
+    expect(screen.queryByText('kept draft 2: clearest')).toBeNull();
+    fireEvent.click(screen.getByText('Choosing the best draft'));
+    expect(screen.getByText('kept draft 2: clearest')).toBeTruthy();
+  });
+
   it('counts every step on a reloaded transcript, failed ones included', () => {
     cleanup();
     // Review round 2026-08-30: the label counted only 'done', so a plan with
