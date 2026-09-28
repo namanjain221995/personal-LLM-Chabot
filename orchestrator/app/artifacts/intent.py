@@ -821,6 +821,10 @@ _FOLLOWUP_VERB_RE = re.compile(
 )
 #: Verbs that keep what exists: the answer is the content.
 _KEEP_VERB_RE = re.compile(r"\b(?:save|download|export|convert|_convert_)\b", re.I)
+#: A keeping verb with the object dropped, as Hindi and Gujarati say it:
+#: "export karo", "save kar do", "download karo" normalise to
+#: "<verb> _give_". See `_export_shape`.
+_PRO_DROP_KEEP_RE = re.compile(r"\b(?:save|download|export)\s+_give_\b", re.I)
 #: "as a file", "into a nice looking document", "in a doc".
 _AS_FILE_RE = re.compile(rf"\b(?:as|in|into|to)\s+(?:an?\s+)?(?:{_ADJ}\s+){{0,2}}(?:file|document|doc|downloadable)\b", re.I)
 #: The words a person types the moment the product missed: "no, I meant
@@ -1807,7 +1811,7 @@ def _content_words(low: str) -> bool:
     return bool(_FUNCTION_WORDS_RE.sub(" ", _INDIC_FUNCTION_WORDS_RE.sub(" ", low)).split())
 
 
-def _export_shape(low: str, explicit: Sequence[str]) -> Optional[str]:
+def _export_shape(low: str, explicit: Sequence[str], *, has_upload: bool = True) -> Optional[str]:
     """The follow-up that hands the previous answer over in a format (AS3
     (b)). Returns the rule name, or None."""
     if _NEW_TOPIC_RE.search(low):
@@ -1862,8 +1866,32 @@ def _export_shape(low: str, explicit: Sequence[str]) -> Optional[str]:
     # "download this table", "save that": a KEEPING verb on a bare
     # reference, with the format left to the policy (a table becomes a
     # workbook). `reads_source` keeps "download the pdf I attached" a read.
-    if ref and not explicit and _KEEP_VERB_RE.search(low) and not LX.reads_source(low) and not _UPLOAD_SOURCE_RE.search(low):
+    #
+    # THE UPLOAD VETO NEEDS AN UPLOAD (2026-09-28). `_UPLOAD_SOURCE_RE` names
+    # "the upload named as the source" and it includes `_this_ data` — "this
+    # data" — so that "download the data I attached" stays a read of the
+    # upload. With no upload in the conversation there is nothing for "this
+    # data" to be but the answer, and the veto turned "aapo ye data export
+    # karo" (give this data, export it) into no request at all. `has_upload`
+    # defaults to True, so a caller that does not pass it keeps the old rule.
+    upload_named = has_upload and bool(_UPLOAD_SOURCE_RE.search(low))
+    if ref and not explicit and _KEEP_VERB_RE.search(low) and not LX.reads_source(low) and not upload_named:
         return "export-keep-verb"
+    # THE PRONOUN THAT IS NOT THERE (2026-09-28). Hindi and Gujarati drop the
+    # object pronoun: "export karo" MEANS "export it", where English has to
+    # say "export this". So a keeping verb followed by the normaliser's Indic
+    # verb marker carries its object with it, and `ref` — which looks for a
+    # pronoun that the language does not use — cannot be the gate.
+    # "shu report che, export karo" (what report is it — export it) read as a
+    # brand-new file because nothing in it matched `ref`.
+    #
+    # Narrow on purpose: `_give_` is emitted ONLY by lexicon.normalize from
+    # Indic or romanised-Indic input, so no English sentence reaches this arm;
+    # the caller still requires an answer in the room; and an upload named as
+    # the source keeps its veto.
+    if (not ref and not explicit and _PRO_DROP_KEEP_RE.search(low)
+            and not LX.reads_source(low) and not upload_named):
+        return "export-pro-drop"
     # "pdf of the second summary", "a word file of the above audit": a named
     # format whose OBJECT is the reference. `_FORMAT_ONLY_RE` reads only the
     # pronoun objects ("pdf of this"), so a named answer was made from the
@@ -3444,7 +3472,7 @@ def decide(
         if has_assistant_answer and not last_turn_is_artifact and not chart and not style and not (
             _EDIT_VERBS_RE.search(low) or _MORE_EDIT_VERBS_RE.search(low)
         ):
-            rule = _export_shape(low, explicit)
+            rule = _export_shape(low, explicit, has_upload=bool(upload_formats))
             if rule and not re.search(r"\b(?:also|too|as well|same|version|copy)\b", low):
                 return made("export", reference="previous_answer", rule=rule)
         # A REMARK about the file is not an instruction: "I opened the docx
@@ -3536,7 +3564,7 @@ def decide(
     #     "isko docx me dedo", "इसे पीडीएफ में बदल दो". A chart is made, not
     #     exported. After a FILE CARD the same words convert that artifact.
     if not chart:
-        rule = _export_shape(low, explicit)
+        rule = _export_shape(low, explicit, has_upload=bool(upload_formats))
         if rule and last_turn_is_artifact and explicit:
             return made("convert", reference="latest", rule="convert-artifact-turn")
         if rule and has_assistant_answer:
