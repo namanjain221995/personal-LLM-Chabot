@@ -668,6 +668,11 @@ _STATE_DECL_RE = re.compile(
 #: mermaid only when a bracket follows it (`root((Roadmap))`, `a[Feature A]`),
 #: so that is its own branch now and a line without brackets is a plain label,
 #: whole.
+#: MERMAID'S MINDMAP DECORATIONS, which are syntax and not label text:
+#: `::icon(fa fa-book)` names an icon font this renderer does not carry, and
+#: `:::className` names a CSS class the prompt forbids the model from writing.
+#: Both may trail a plain (bracketless) mindmap line.
+_MIND_DECOR_RE = re.compile(r"\s*(?:::icon\([^)]*\)|:::[A-Za-z_][\w-]*)\s*$")
 _MIND_RE = re.compile(
     # `root((Roadmap))`, `a[Feature A]`, `x{Decision}` — an id THEN a bracket.
     r"^(?P<indent>[ \t]*)(?:"
@@ -823,11 +828,23 @@ def _mindmap_as_flowchart(body: List[str]) -> Optional[Tuple[str, str]]:
     out: List[str] = ["flowchart LR"]
     stack: List[Tuple[int, str]] = []          # (indent, node id)
     used = 0
+    decorated = 0
+    root_indent: Optional[int] = None
     for raw in body:
         m = _MIND_RE.match(raw)
         if not m:
             return None
-        label = _q(m.group("label") or m.group("plain") or m.group("id") or "")
+        raw_label = m.group("label") or m.group("plain") or m.group("id") or ""
+        # MERMAID'S NODE DECORATIONS ARE NOT PART OF THE LABEL. A plain line
+        # may carry `::icon(fa fa-book)` or `:::className`, and until
+        # 2026-09-28 both were printed INSIDE the box: the picture read
+        # "b::icon fa fa-book". The decoration is dropped and counted, and the
+        # note says how many, because an icon this renderer has no font for is
+        # a decoration, never a word the reader was meant to see.
+        stripped = _MIND_DECOR_RE.sub("", raw_label).strip()
+        if stripped != raw_label.strip():
+            decorated += 1
+        label = _q(stripped)
         if not label:
             # A bracket on a line of its own is not a node and not something
             # this reader understands.
@@ -838,14 +855,25 @@ def _mindmap_as_flowchart(body: List[str]) -> Optional[Tuple[str, str]]:
         while stack and stack[-1][0] >= indent:
             stack.pop()
         if stack:
-            out.append(f'{stack[-1][1]}["{stack[-1][1]}"] --> {nid}["{label}"]'
-                       if False else f'{stack[-1][1]} --> {nid}["{label}"]')
+            out.append(f'{stack[-1][1]} --> {nid}["{label}"]')
         else:
+            # A MINDMAP HAS EXACTLY ONE ROOT. A second line at the outermost
+            # indent is a second tree, which mermaid itself refuses; drawing it
+            # produced a box with no edge, sitting beside the map as though it
+            # belonged to it. A picture with an orphan box is worse than the
+            # callout, so the whole source refuses.
+            if root_indent is not None:
+                return None
+            root_indent = indent
             out.append(f'{nid}["{label}"]')
         stack.append((indent, nid))
     if used < 2:
         return None
-    return "\n".join(out), ""
+    note = ""
+    if decorated:
+        note = (f"A mind map was drawn as boxes and arrows; the icon or style on "
+                f"{decorated} of its nodes is not shown.")
+    return "\n".join(out), note
 
 
 def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> Optional[Dict[str, Any]]:

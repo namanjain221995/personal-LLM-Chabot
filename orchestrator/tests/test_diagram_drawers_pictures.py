@@ -97,13 +97,43 @@ def test_a_node_that_spells_a_keyword_draws_when_declared_on_its_own_line(source
     "flowchart TD\n  A --> B\n  info",
     "flowchart TD\n  A --> B\n  sequenceDiagram",
 ])
-def test_a_bare_keyword_line_inside_a_flowchart_still_refuses(source):
-    assert D.parse_mermaid(source) is None
+def test_a_bare_keyword_line_inside_a_flowchart_is_a_NODE(source):
+    """MEASURED AGAINST MAIN, 2026-09-28, and main won.
+
+    This was a refusal until the branch's own verifier drove it: main
+    (ae25da28) DRAWS `flowchart TD / requirement / design / requirement -->
+    design` and the same shape with `block`, `kanban`, `pie` and `info`,
+    because mermaid's flowchart lexer reserves no words. The refusal cost five
+    pictures the product already made, and declaring nodes on their own lines
+    before the edges is a common habit of the model that writes them.
+
+    The spelling can only mean a GRAMMAR at the head of the source, and
+    `parse_mermaid`'s header dispatch already sends such a source to that
+    keyword's own reader before this loop sees a line."""
+    fields = D.parse_mermaid(source)
+    assert fields is not None, source
+    ids = [n["id"] for n in fields["nodes"]]
+    last = source.strip().splitlines()[-1].strip()
+    assert last in ids, (last, ids)
 
 
-def test_the_bare_keyword_rule_is_case_sensitive_like_mermaid():
-    assert D.parse_mermaid("flowchart TD\n  A --> B\n  Info") is not None
-    assert D.parse_mermaid("flowchart TD\n  A --> B\n  info") is None
+def test_a_keyword_at_the_HEAD_of_the_source_is_still_a_grammar():
+    """The other half of the same rule: the refusal is not needed because the
+    header decides first. A source that STARTS with `classDiagram` is read by
+    the class reader, never by the flowchart loop, so nothing has to guard
+    against a box labelled "classDiagram"."""
+    assert D.parse_mermaid("classDiagram\n  class Order\n  class Customer\n  Order --> Customer") is not None
+    drawn = D.parse_mermaid("flowchart TD\n  A --> B\n  classDiagram")
+    assert drawn is not None and "classDiagram" in [n["id"] for n in drawn["nodes"]]
+
+
+def test_a_keyword_spelled_node_draws_in_either_case():
+    """`Info` and `info` are both nodes. The refusal it replaces was
+    case-sensitive, which meant the same picture drew or vanished on a capital
+    letter -- a distinction mermaid does not make in a flowchart."""
+    for src in ("flowchart TD\n  A --> B\n  Info", "flowchart TD\n  A --> B\n  info",
+                'flowchart TD\n  info["Info page"]\n  info --> B["Next"]'):
+        assert D.parse_mermaid(src) is not None, src
 
 
 # ----------------------------------------------------------------- D2 --

@@ -157,13 +157,20 @@ def test_a_keyword_line_is_never_drawn_as_a_box(source, family):
     assert "classDiagram" not in ids and "stateDiagram-v2" not in ids
 
 
-@pytest.mark.parametrize("source", [
-    # a keyword in the middle of a flowchart, which used to be a node
-    'flowchart TD\n  A["a"] --> B["b"]\n  gantt\n  B --> C["c"]',
-    'flowchart TD\n  A --> B\n  sequenceDiagram',
+@pytest.mark.parametrize("source,node", [
+    ('flowchart TD\n  A["a"] --> B["b"]\n  gantt\n  B --> C["c"]', "gantt"),
+    ('flowchart TD\n  A --> B\n  sequenceDiagram', "sequenceDiagram"),
 ])
-def test_a_keyword_inside_a_flowchart_refuses_the_source(source):
-    assert D.parse_mermaid(source) is None
+def test_a_keyword_inside_a_flowchart_is_a_NODE(source, node):
+    """Mermaid's flowchart lexer reserves NO words, and main (ae25da28) draws
+    every one of these. This was a refusal for one day; its own branch's
+    verifier measured five flowcharts main drew and the branch refused, so the
+    refusal went. The spelling can only mean a grammar at the HEAD of the
+    source, and `test_a_keyword_line_is_never_drawn_as_a_box` above is where
+    that is proved."""
+    fields = D.parse_mermaid(source)
+    assert fields is not None, source
+    assert node in [x["id"] for x in fields["nodes"]]
 
 
 @pytest.mark.parametrize("source", [
@@ -175,8 +182,6 @@ def test_a_keyword_inside_a_flowchart_refuses_the_source(source):
     "sequenceDiagram\n  A->>B: hi\n  alt x\n  A->>B: y",        # unclosed frame
     "sequenceDiagram\n  participant A\n  participant B",       # no message
     # er
-    "erDiagram\n  A ||--o{ B : has\n  A {\n    int id PK",     # unclosed entity
-    "erDiagram\n  A ||--o{ gantt : has",                        # keyword as entity
     # class
     "classDiagram\n  namespace X {\n    class A\n  }",
     "classDiagram\n  A --> B\n  note for A \"x\"",
@@ -187,7 +192,6 @@ def test_a_keyword_inside_a_flowchart_refuses_the_source(source):
     "stateDiagram-v2\n  [*] --> A\n  note right of A : x",
     # mindmap
     "mindmap\n  root((a))\n    b\n  second((root))",            # two roots
-    "mindmap\n  root((a))\n    b::icon(fa fa-book)",
     "mindmap\n  root)cloud(",
     # timeline / journey / kanban / packet
     "timeline\n  2002 : <i>x</i>",
@@ -204,8 +208,44 @@ def test_a_keyword_inside_a_flowchart_refuses_the_source(source):
 ])
 def test_a_construct_the_drawer_cannot_carry_refuses_the_whole_source(source):
     """Refuse whole, never drop: a picture missing a construct the author
-    wrote is a wrong picture, and the callout is the honest answer."""
+    wrote is a wrong picture, and the callout is the honest answer.
+
+    THE THREE EXCEPTIONS live in the test below. A family reader that refuses
+    hands the source to `as_flowchart`, which production has translated since
+    2026-09-13; where THAT reads the source completely, the picture is drawn as
+    boxes and arrows with a note saying what the shape cost. Refusing where
+    production drew is the defect this suite caught once already."""
     assert D.parse_mermaid(source) is None, source
+
+
+@pytest.mark.parametrize("source,drawn,note_words", [
+    # An ER whose attribute block never closes: the RELATIONS are complete, and
+    # the flowchart translation drops every column list by design anyway.
+    ("erDiagram\n  A ||--o{ B : has\n  A {\n    int id PK", ["A", "B"], "column lists"),
+    # An entity spelled like a keyword. The ER reader refuses it; nothing in a
+    # mermaid ER body makes `gantt` a grammar, and main drew this.
+    ("erDiagram\n  A ||--o{ gantt : has", ["A", "gantt"], ""),
+    # `::icon(...)` is a decoration this renderer has no font for. It is
+    # stripped from the label and counted in the note -- until 2026-09-28 the
+    # translation printed "b::icon fa fa-book" inside the box.
+    ("mindmap\n  root((a))\n    b::icon(fa fa-book)", ["m1", "m2"], "icon or style"),
+])
+def test_a_family_reader_that_refuses_falls_back_to_the_translation(source, drawn, note_words):
+    fields = D.parse_mermaid(source)
+    assert fields is not None, source
+    assert [n["id"] for n in fields["nodes"]] == drawn
+    note = D.rewrite_note(source)
+    if note_words:
+        assert note_words in note, note
+        assert note.endswith("."), note
+
+
+def test_the_translation_refuses_a_mindmap_with_two_roots():
+    """A mindmap has exactly one root; mermaid itself refuses a second. The
+    translation drew the second root as a box with no edge, sitting beside the
+    map as though it belonged to it, so it refuses instead -- an orphan box is
+    worse than the callout."""
+    assert D.parse_mermaid("mindmap\n  root((a))\n    b\n  second((root))") is None
 
 
 def test_what_is_read_is_what_is_drawn_in_the_sequence_family():
@@ -297,10 +337,28 @@ def test_a_chart_written_as_a_diagram_becomes_the_chart_callout_not_a_picture():
     assert not any(b.type == "diagram" for b in doc.blocks)
 
 
-def test_an_excluded_grammar_keeps_the_plain_callout():
+def test_an_excluded_grammar_keeps_a_callout_that_names_the_picture():
+    """Still a callout -- a source this document cannot hold is never
+    half-drawn -- but it SAYS WHICH PICTURE AND WHY. "Diagram omitted / A
+    diagram in the answer was not reproduced in this document" was true and
+    useless: a reader could not tell whether the model had failed, the document
+    had, or the platform simply cannot put a Gantt chart in a file."""
     doc, notes = md_import.markdown_to_document("# T\n\n```mermaid\ngantt\n  title x\n```\n")
     callouts = [b for b in doc.blocks if b.type == "callout"]
-    assert len(callouts) == 1 and callouts[0].title == "Diagram omitted"
+    assert len(callouts) == 1
+    assert callouts[0].title == "Gantt chart not included"
+    assert "needs dates on a scale" in callouts[0].text
+    assert "drawn in the answer above" in callouts[0].text
+
+
+def test_a_mermaid_CHART_says_the_numbers_were_typed():
+    """A pie/xychart/radar/sankey/quadrant/treemap draws numbers the model
+    typed. A document's charts are computed from data, so the callout points at
+    that path instead of drawing the typed numbers."""
+    doc, notes = md_import.markdown_to_document('# T\n\n```mermaid\npie\n  "a" : 10\n  "b" : 20\n```\n')
+    callouts = [b for b in doc.blocks if b.type == "callout"]
+    assert len(callouts) == 1 and callouts[0].title == md_import.CHART_NOT_A_DIAGRAM_TITLE
+    assert "drawn from data" in callouts[0].text
 
 
 FAMILY_FENCES = {
