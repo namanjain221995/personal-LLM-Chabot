@@ -146,7 +146,11 @@ describe('an empty draft is never called silence unless silence was measured', (
     });
     const message = (result as { error: { message: string } }).error.message;
     expect(message).toBe(
-      'The first 30 seconds of that recording sounded silent, so the rest of it was not transcribed. Start speaking right away, or attach long recordings as a file.',
+      // 2026-09-29 (backend verifier item K): 'unclear' is also what the
+      // server says when it judged the heard words invented, or the decoder
+      // returned nothing with the gate open, so the sentence claims only what
+      // is true of all three.
+      'No words came back for that recording, and the server could not tell whether anything was said. A recording this long is judged by its first 30 seconds, so a quiet start can empty all of it: start speaking right away, or attach long recordings as a file.',
     );
     expect(message).not.toContain('microphone');
   });

@@ -30,6 +30,7 @@ import {
   VOICE_MESSAGES,
   VoiceSession,
   createMemoryOutbox,
+  describeOutcome,
   flushTombstones,
   mergeEdits,
   openOutbox,
@@ -544,6 +545,22 @@ describe('defect 4: a re-transcribed recording goes where the first one went', (
 // ---------------------------------------------------------------------------
 // what the person is told
 // ---------------------------------------------------------------------------
+
+describe('outcomes the server may add', () => {
+  it("a 'partial' transcript (the decoder died part-way) is treated like one with gaps: the words, and a Retry", () => {
+    const state = parseSessionState({
+      session_id: 'a'.repeat(32),
+      status: 'done',
+      outcome: 'partial',
+      text: 'what was heard',
+      audio_ms: 60_000,
+      gaps: [{ start_ms: 40_000, end_ms: 60_000, reason: 'engine_unavailable' }],
+    })!;
+    const result = describeOutcome(state);
+    expect(result.kind).toBe('text');
+    expect(result.kind === 'text' && result.offer?.kind).toBe('retranscribe');
+  });
+});
 
 describe('the server’s capacity, in words', () => {
   it('an engine that cannot be reached is not called busy with other recordings', () => {

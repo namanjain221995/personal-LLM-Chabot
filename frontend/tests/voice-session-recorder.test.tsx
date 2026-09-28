@@ -345,10 +345,12 @@ describe('what the recorder tells the person', () => {
     }) as unknown as Response);
     const ctx = await startRecording();
     expect(ctx.view.result.current.mode).toBe('legacy');
-    expect(ctx.view.result.current.limitMs).toBe(600_000);
+    // 5 s before the ceiling since 2026-09-29: stopping AT it posted 600,002
+    // ms and the server's 413 threw the recording away (item J).
+    expect(ctx.view.result.current.limitMs).toBe(595_000);
     expect(ctx.rec.timeslice).toBe(1000);
     expect(ctx.view.result.current.hint).toBe(
-      "Long recordings aren't enabled here, so this one stops at 10 minutes.",
+      "Long recordings aren't enabled here, so this one stops just before 10 minutes.",
     );
   });
 });
@@ -477,7 +479,8 @@ describe('the composer on the session road', () => {
       });
       await until(() => server.appendedSlices.length >= i + 1, `slice ${i} on the server`);
     }
-    expect(screen.getByText('Saved to your account')).toBeTruthy();
+    // It says how much, once the server has it (2026-09-29, item H).
+    expect(screen.getByText(/^Saved to your account: 0:\d\d$/)).toBeTruthy();
     expect(screen.getByText(/w0 w1 w2 w3/)).toBeTruthy();
 
     await act(async () => {

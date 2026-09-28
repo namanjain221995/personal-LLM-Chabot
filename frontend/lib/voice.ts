@@ -99,6 +99,13 @@ export const MIN_RECORDING_MS = 350;
  * refuses anything over 600 s; the session road has no ceiling at all.
  */
 export const LEGACY_MAX_MS = 10 * 60 * 1000;
+/**
+ * The legacy recorder stops this long before its ceiling. Stopping AT 10:00
+ * posted duration_ms=600002 (the stop lands a few ms late) and the server's
+ * 413 "longer than 10 minutes" threw the recording away (backend verifier
+ * afadf78ca3614dad5, item J).
+ */
+export const LEGACY_STOP_EARLY_MS = 5000;
 
 /**
  * Capture constraints.
@@ -341,8 +348,14 @@ export const LEGACY_EMPTY_MESSAGES = {
   // microphone sentence (2026-09-29): it got it until then.
   low: 'No words came back, and the server did not say why.',
   unknown: 'No words came back, and the server did not say why.',
+  // 'unclear' over two minutes (2026-09-29, backend verifier item K): the
+  // server says it for three different things — the gate on the first 30 s
+  // emptied the clip, the engine heard speech and its words were judged
+  // invented, or the decoder returned nothing with the gate open. Only what
+  // is true of all three is stated; the first-30-seconds rule is given as
+  // what CAN happen, with what to do about it.
   gatedLong:
-    'The first 30 seconds of that recording sounded silent, so the rest of it was not transcribed. Start speaking right away, or attach long recordings as a file.',
+    'No words came back for that recording, and the server could not tell whether anything was said. A recording this long is judged by its first 30 seconds, so a quiet start can empty all of it: start speaking right away, or attach long recordings as a file.',
 } as const;
 
 /**
@@ -435,7 +448,9 @@ export async function transcribe(
   },
 ): Promise<TranscriptionResult | TranscribeFailure> {
   const query = new URLSearchParams({
-    duration_ms: String(Math.round(options.durationMs)),
+    // Never over the ceiling the server refuses at: the recorder's own clock
+    // runs a few ms past its stop.
+    duration_ms: String(Math.round(Math.min(options.durationMs, LEGACY_MAX_MS))),
     language: 'auto',
   });
 
@@ -546,7 +561,7 @@ export const VOICE_MESSAGES = {
     `You were signed out. Everything up to ${t} is saved on the server.`,
   voiceOff: 'Voice input is turned off for your account. Ask an administrator.',
   voiceUnavailable: "Voice input isn't available on this server right now.",
-  legacyHint: "Long recordings aren't enabled here, so this one stops at 10 minutes.",
+  legacyHint: "Long recordings aren't enabled here, so this one stops just before 10 minutes.",
   notFound: 'This recording is no longer on the server. It was discarded or has expired.',
   sessionActive:
     "You're already recording in another tab or on another device. End that recording first.",
@@ -601,6 +616,17 @@ export const VOICE_MESSAGES = {
     retentionDays && retentionDays > 0
       ? `Saved to your account · kept ${retentionDays} days`
       : 'Saved to your account',
+  // Said only once the server has acknowledged audio (2026-09-29): it was
+  // drawn whenever progress existed, under "Connection lost…" with 0 bytes on
+  // the server (backend verifier afadf78ca3614dad5, item H).
+  savedSoFar: (saved: string, onDevice: string | null, retentionDays: number | null) =>
+    `Saved to your account: ${saved}${onDevice ? ` · ${onDevice} still on this device` : ''}${
+      retentionDays && retentionDays > 0 ? ` · kept ${retentionDays} days` : ''
+    }`,
+  // J: the legacy road keeps a refused recording.
+  legacyKept: 'The recording is kept here: try again, or save it as a file.',
+  legacyRetry: 'Try again',
+  legacySave: 'Save it',
   // 'engine' is the server saying the engine is BUSY; 'engine_unavailable'
   // (fix/voice-server-hardening) that it cannot be reached. Until the server
   // told them apart, an outage read as other people's recordings.
@@ -673,7 +699,7 @@ export const VOICE_MESSAGES = {
   heldQuota: (saved: string, held: string) =>
     `Your recordings have used all the space your account has, so recording stopped at ${saved}. Everything up to then is saved; the last ${held} is kept on this device. Delete some on the Recordings page (/recordings), then press Upload the rest.`,
   capacityLegacyHint:
-    "Too many people are recording right now, so this recording isn't saved to your account and stops at 10 minutes.",
+    "Too many people are recording right now, so this recording isn't saved to your account and stops just before 10 minutes.",
   engineUnavailableLive:
     'The speech service is unavailable right now; your audio is saved and will be transcribed when it is back.',
   retryConfirm: (t: string) =>
@@ -2056,6 +2082,8 @@ export interface SessionProgress {
   pendingParts: number;
   /** Recording time not yet acknowledged. */
   pendingMs: number;
+  /** Recording time the server has acknowledged (stored); what "Saved to your account" may claim. */
+  savedMs?: number;
   offline: boolean;
   /**
    * Offline for longer than the server waits (idle_close_s): the server has
@@ -2306,6 +2334,7 @@ export class VoiceSession {
       waitingOn: 'none',
       pendingParts: 0,
       pendingMs: 0,
+      savedMs: 0,
       offline: false,
       offlineLong: false,
       idleCloseS: this.config.idleCloseS,
@@ -2752,6 +2781,7 @@ export class VoiceSession {
       ...this.progress,
       pendingParts: this.pendingSlices() - this.writing.size,
       pendingMs: Math.max(0, this.durationMs - this.ackedMs),
+      savedMs: this.ackedMs,
       offlineLong:
         this.progress.offline &&
         this.offlineSince !== null &&

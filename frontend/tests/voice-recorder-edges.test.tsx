@@ -542,9 +542,66 @@ describe('the recording bar', () => {
     expect(screen.getByText(VOICE_MESSAGES.engineUnavailableLive)).toBeTruthy();
   });
 
+  it('does not say "Saved to your account" while the server holds nothing, and says how much once it does', () => {
+    // Before 2026-09-29 the line was drawn whenever there was progress: after
+    // a minute offline with 0 bytes on the server, right under "Connection
+    // lost…" (backend verifier afadf78ca3614dad5, item H).
+    const view = bar(progress({ offline: true, savedMs: 0, pendingMs: 60_000 }));
+    expect(screen.queryByText(/Saved to your account/)).toBeNull();
+    view.unmount();
+    bar(progress({ savedMs: 65_000, pendingMs: 20_000 }));
+    expect(screen.getByText('Saved to your account: 1:05 · 0:20 still on this device')).toBeTruthy();
+  });
+
   it('stops promising an upload "when the connection is back" once the server has stopped waiting', () => {
     bar(progress({ offline: true, offlineLong: true, idleCloseS: 600 }));
     expect(screen.getByText(VOICE_MESSAGES.offlineLong('10 minutes'))).toBeTruthy();
     expect(screen.queryByText(VOICE_MESSAGES.offlineRecording)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the legacy road (item J): used when the session road is off or refused
+// ---------------------------------------------------------------------------
+
+describe('the ten-minute road', () => {
+  it('stops before the ten minutes the server refuses at, so the recording is not refused for being 2 ms too long', async () => {
+    server.sessionsOff = true;
+    const ctx = await startRecording();
+    expect(ctx.view.result.current.mode).toBe('legacy');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(594_000);
+    });
+    expect(ctx.view.result.current.state).toBe('recording');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    await until(() => server.transcribePosts.length === 1, 'posted');
+    // Before 2026-09-29 it stopped AT 600,000 ms; in a browser that posted
+    // duration_ms=600002 and got 413 "longer than 10 minutes".
+    expect(server.transcribePosts[0]!.durationMs).toBeLessThanOrEqual(595_000);
+  });
+
+  it('keeps a refused recording, and "Try again" sends the same recording again', async () => {
+    server.sessionsOff = true;
+    server.transcribeReplies = [{ status: 503, body: { detail: 'The speech engine is busy.' } }];
+    const ctx = await startRecording();
+    for (let i = 0; i < 3; i += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+        FakeRecorder.last!.emit();
+      });
+    }
+    await act(async () => ctx.view.result.current.stop());
+    await until(() => ctx.view.result.current.followUp !== null, 'the recording offered back');
+    const line = ctx.view.result.current.followUp!;
+    // Before 2026-09-29: the blob was dropped, and "retryable" meant speaking again.
+    expect(line.message).toBe(VOICE_MESSAGES.legacyKept);
+    expect([line.actionLabel, line.secondaryLabel]).toEqual(['Try again', 'Save it']);
+    await act(async () => line.run());
+    await until(() => ctx.onTranscript.mock.calls.length === 1, 'transcribed on the second try');
+    expect(ctx.onTranscript).toHaveBeenCalledWith('legacy words', null);
+    expect(server.transcribePosts).toHaveLength(2);
+    expect(server.transcribePosts[1]!.bytes).toBe(server.transcribePosts[0]!.bytes);
   });
 });

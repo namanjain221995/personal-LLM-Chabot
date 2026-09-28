@@ -44,6 +44,7 @@ import {
   AUDIO_CONSTRAINTS,
   DISCARD_CONFIRM_AFTER_MS,
   LEGACY_MAX_MS,
+  LEGACY_STOP_EARLY_MS,
   LEVEL_BARS,
   MIN_RECORDING_MS,
   OUTBOX_STALE_MS,
@@ -93,6 +94,9 @@ export interface VoiceFollowUp {
   busy: boolean;
   run: () => void;
   dismiss: () => void;
+  /** A second, quieter action (e.g. "Save it"), or none. */
+  secondaryLabel?: string | null;
+  runSecondary?: () => void;
 }
 
 export interface VoiceRecorder {
@@ -799,6 +803,55 @@ export function useVoiceRecorder({
     [move, offerLine, setFollowUp],
   );
 
+  /**
+   * A legacy recording the server refused is KEPT, with "Try again" and
+   * "Save it" (2026-09-29). It used to be thrown away with a "Please try
+   * again" that could not be acted on: at 10:00 the 413 discarded ten minutes
+   * of speech (backend verifier afadf78ca3614dad5, item J).
+   */
+  const keepLegacy = useCallback(
+    (blob: Blob, durationMs: number, mimeType: string) => {
+      const save = () => {
+        try {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          const ext = /mp4/.test(mimeType) ? 'm4a' : /ogg/.test(mimeType) ? 'ogg' : 'webm';
+          a.href = url;
+          a.download = `recording-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '')}.${ext}`;
+          a.click();
+          setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        } catch {
+          /* a browser that cannot save a file still keeps the Try again */
+        }
+      };
+      const line: VoiceFollowUp = {
+        message: VOICE_MESSAGES.legacyKept,
+        tone: 'error',
+        actionLabel: VOICE_MESSAGES.legacyRetry,
+        busy: false,
+        secondaryLabel: VOICE_MESSAGES.legacySave,
+        runSecondary: save,
+        dismiss: () => setFollowUp(null),
+        run: () => {
+          setFollowUp({ ...line, busy: true, run: () => undefined });
+          void transcribe(blob, { durationMs, mimeType }).then((result) => {
+            if (!alive.current) return;
+            if ('error' in result) {
+              setFollowUp(
+                result.error.message ? { ...line, message: `${result.error.message} ${VOICE_MESSAGES.legacyKept}` } : line,
+              );
+              return;
+            }
+            setFollowUp(null);
+            onTranscriptRef.current(result.text, result.notice);
+          });
+        },
+      };
+      setFollowUp(line);
+    },
+    [setFollowUp],
+  );
+
   /** LEGACY ROAD: one blob, one POST. */
   const finishLegacy = useCallback(
     async (blob: Blob, durationMs: number, mimeType: string) => {
@@ -821,12 +874,13 @@ export function useVoiceRecorder({
         }
         setError(result.error);
         move('error');
+        keepLegacy(blob, durationMs, mimeType);
         return;
       }
       move('idle');
       onTranscriptRef.current(result.text, result.notice);
     },
-    [move],
+    [keepLegacy, move],
   );
 
   /** SESSION ROAD: upload what is left, finish, wait for the words. */
@@ -1527,15 +1581,18 @@ export function useVoiceRecorder({
   // The legacy road's ceiling. Enforced here rather than only on the server
   // so the person sees a finished recording instead of a rejected upload.
   // The session road has none: nothing is armed, however long they talk.
+  // It stops LEGACY_STOP_EARLY_MS before the ceiling: stopping at it posted
+  // 600,002 ms and got the server's 413.
+  const legacyStopMs = maxMs > 2 * LEGACY_STOP_EARLY_MS ? maxMs - LEGACY_STOP_EARLY_MS : maxMs;
   useEffect(() => {
     if (state !== 'recording' || mode !== 'legacy') return;
-    const remaining = Math.max(0, maxMs - elapsedMs);
+    const remaining = Math.max(0, legacyStopMs - elapsedMs);
     const timer = setTimeout(() => stop(), remaining);
     return () => clearTimeout(timer);
     // Only re-armed when recording starts: `elapsedMs` changes every frame
     // and is read once, at arm time, on purpose.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state, mode, maxMs, stop]);
+  }, [state, mode, legacyStopMs, stop]);
 
   // A phone that turns its screen off may stop capturing. Coming back, the
   // wake lock is taken again and the person is told about any stretch that
@@ -1578,7 +1635,7 @@ export function useVoiceRecorder({
     cancel,
     dismissError,
     mode,
-    limitMs: mode === 'session' ? null : maxMs,
+    limitMs: mode === 'session' ? null : legacyStopMs,
     progress,
     hint,
     warning,

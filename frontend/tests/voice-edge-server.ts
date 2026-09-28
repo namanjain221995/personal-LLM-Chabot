@@ -105,6 +105,11 @@ export class EdgeServer {
   refuseContinuation: { status: number; reason: string } | null = null;
   keepBytes = false;
   frontBytes = 0;
+  /** The session road is off (sessions_off): the recorder takes the legacy road. */
+  sessionsOff = false;
+  /** Answers for POST /api/audio/transcribe, in order; then 200 with 'legacy words'. */
+  transcribeReplies: Array<{ status: number; body: Record<string, unknown> }> = [];
+  transcribePosts: Array<{ durationMs: number; bytes: number }> = [];
   /** Outcome overrides, per session id. */
   finalState: (s: EdgeSession) => Record<string, unknown> = () => ({});
   sessions = new Map<string, EdgeSession>();
@@ -212,6 +217,15 @@ export class EdgeServer {
       return reply(200, { username: `person${id}`, user: { id, name: `Person ${id}`, email: `p${id}@example.test` } });
     }
     if (!this.signedIn) return reply(401, { detail: 'Not authenticated' });
+    if (method === 'POST' && path === '/api/audio/transcribe') {
+      const body = init.body as Blob;
+      this.transcribePosts.push({ durationMs: Number(url.searchParams.get('duration_ms')), bytes: body?.size ?? 0 });
+      const next = this.transcribeReplies.shift();
+      return next ? reply(next.status, next.body) : reply(200, { text: 'legacy words', language: 'en' });
+    }
+    if (method === 'POST' && path === '/api/audio/sessions' && this.sessionsOff) {
+      return reply(404, { detail: 'Long recordings are not enabled.', reason: 'sessions_off' });
+    }
     if (method === 'POST' && path === '/api/audio/sessions') {
       const body = JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>;
       const same = [...this.sessions.values()].find(

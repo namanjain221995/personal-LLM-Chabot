@@ -135,7 +135,8 @@ describe('opening a recording', () => {
       reason: 'capacity_full',
     });
     expect(VOICE_MESSAGES.capacityLegacyHint).toBe(
-      "Too many people are recording right now, so this recording isn't saved to your account and stops at 10 minutes.",
+      // "just before": it stops 5 s early since 2026-09-29 (item J).
+      "Too many people are recording right now, so this recording isn't saved to your account and stops just before 10 minutes.",
     );
   });
 
@@ -145,7 +146,8 @@ describe('opening a recording', () => {
     });
     // An orchestrator older than the contract answers FastAPI's own 404.
     expect(await open(404, { detail: 'Not Found' })).toEqual({ kind: 'legacy' });
-    expect(VOICE_MESSAGES.legacyHint).toBe("Long recordings aren't enabled here, so this one stops at 10 minutes.");
+    // "just before": it stops 5 s early since 2026-09-29 (item J).
+    expect(VOICE_MESSAGES.legacyHint).toBe("Long recordings aren't enabled here, so this one stops just before 10 minutes.");
   });
 
   it('offers to end a recording running elsewhere instead of opening a second', async () => {
@@ -551,7 +553,11 @@ describe('"closer to the microphone" is kept only where the server judged the au
       fetchImpl: vi.fn(async () => answer(200, { text: '', confidence: 'unclear' })) as unknown as typeof fetch,
     });
     expect('error' in result && result.error.message).toBe(
-      'The first 30 seconds of that recording sounded silent, so the rest of it was not transcribed. Start speaking right away, or attach long recordings as a file.',
+      // 2026-09-29 (backend verifier item K): 'unclear' is also what the
+      // server says when it judged the heard words invented, or the decoder
+      // returned nothing with the gate open, so the sentence claims only what
+      // is true of all three.
+      'No words came back for that recording, and the server could not tell whether anything was said. A recording this long is judged by its first 30 seconds, so a quiet start can empty all of it: start speaking right away, or attach long recordings as a file.',
     );
   });
 
