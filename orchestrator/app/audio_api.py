@@ -1,10 +1,29 @@
-"""POST /audio/transcribe — the composer's microphone, server side.
+"""The composer's microphone, server side: two paths.
 
-THE CONTRACT. Audio in, text out, nothing kept. The bytes are read under a
-size cap, sent to the local engine, and dropped when the request ends. No
-temporary file is written, no row records what was said, and the transcript
-goes back to the browser as a DRAFT: it becomes a message only if the person
-presses Send, through the ordinary chat path, exactly as if they had typed it.
+RECORDING SESSIONS (/audio/sessions/*, since 2026-09-29) are what the
+composer uses: the recording arrives in parts while it is made, is STORED per
+user (the owner asked for that), has no length limit, and is transcribed in
+voice-activity windows as it arrives. The routes are at the end of this file;
+the work is in app/dictation.py, whose docstring has the design and the
+measurements behind it.
+
+POST /audio/transcribe is the LEGACY one-request path, kept exactly as it was
+for stale tabs, direct callers and deployments with VOICE_SESSIONS_ENABLED
+off. Its defects stay with it on purpose: the engine judges a clip by its
+first 30 s, so a long recording that opens with a pause comes back empty, and
+it refuses anything over ASR_MAX_AUDIO_SECONDS. The rest of this docstring is
+about that path.
+
+THE CONTRACT. Audio in, text out, nothing kept here. The bytes are read under
+a size cap, sent to the local engine, and dropped when the request ends. This
+process writes no temporary file and no row records what was said. The ENGINE
+does write one, briefly: it takes the clip as a multipart field and Starlette
+spools any part over 1,048,576 bytes to the engine container's /tmp while it
+decodes (measured 2026-09-28 on starlette 1.6.0), so the promise that the
+audio exists "in memory on both ends and nowhere else" was never true for a
+dictation over about a minute. The transcript goes back to the browser as a
+DRAFT: it becomes a message only if the person presses Send, through the
+ordinary chat path, exactly as if they had typed it.
 
 WHY THE RECORDING IS THE BODY AND NOT A MULTIPART FIELD. Because "no temporary
 file is written" has to be TRUE, and with `UploadFile` it is not: Starlette
@@ -129,6 +148,9 @@ def reset_for_tests() -> None:
     _IN_FLIGHT.clear()
     asr.POOL.reset_for_tests()
     asr.BATCH_POOL.reset_for_tests()
+    from . import dictation
+
+    dictation.reset_for_tests()
 
 
 async def require_voice(request: Request) -> None:
@@ -523,3 +545,406 @@ async def _record(
         log.debug("voice transcription not recorded", exc_info=True)
     if status != "ok":
         metrics.inc("asr_errors_total", "transcriptions that did not return text")
+
+
+# ===========================================================================
+# Recording sessions (/audio/sessions/*, 2026-09-29)
+#
+# Thin routes over app/dictation.py. Every refusal is a FLAT body,
+# {"detail": sentence, "reason": code, ...}, returned as a JSONResponse so it
+# is not nested under FastAPI's own "detail"; a signed-out caller still gets
+# require_user's 401. The browser owns the wording; the reason is a closed
+# vocabulary it maps (frontend/lib/voice.ts).
+# ===========================================================================
+
+import hashlib  # noqa: E402
+from datetime import datetime as _datetime  # noqa: E402
+
+from fastapi.responses import FileResponse, JSONResponse, Response  # noqa: E402
+from starlette.requests import ClientDisconnect  # noqa: E402
+
+from . import dictation  # noqa: E402
+
+
+def _flat(status: int, reason: str, detail: str, **extra: Any) -> JSONResponse:
+    return JSONResponse(status_code=status, content={"detail": detail, "reason": reason, **extra})
+
+
+def _refused(exc: "dictation.SessionError") -> JSONResponse:
+    return JSONResponse(status_code=exc.status, content=exc.body())
+
+
+async def _voice_refusal(request: Request) -> Optional[JSONResponse]:
+    """require_voice's rule with the flat body: 403 voice_off."""
+    try:
+        await require_voice(request)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            return _flat(403, "voice_off", str(exc.detail))
+        raise
+    return None
+
+
+def _int_param(value: Any, *, minimum: int = 0) -> Optional[int]:
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number >= minimum else None
+
+
+async def _json_body(request: Request) -> Optional[dict]:
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 — any unreadable body is a bad request
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+@router.post("/sessions")
+async def create_session(request: Request, user: UserRow = Depends(require_user)) -> Any:
+    """Open a recording session: 201 with the session state and the recorder's
+    config, or 200 with the same session for a retried client_key."""
+    refusal = await _voice_refusal(request)
+    if refusal is not None:
+        return refusal
+    if not settings.asr_enabled:
+        return _flat(404, "voice_unavailable", "Voice input isn't available on this server right now.")
+    if not settings.voice_sessions_enabled:
+        return _flat(404, "sessions_off", "Long recordings aren't enabled on this server.")
+    payload = await _json_body(request)
+    if payload is None:
+        return _flat(400, "bad_request", "The body must be a JSON object.")
+    try:
+        row, created = await db.run_in_thread(
+            dictation.create, int(user["id"]), payload.get("client_key"), str(payload.get("mime_type") or "")
+        )
+    except dictation.SessionError as exc:
+        return _refused(exc)
+    if created or row["status"] in dictation.LIVE_STATUSES:
+        dictation.start_worker(row["id"])
+    body = dictation.state(row)
+    body["config"] = dictation.config()
+    return JSONResponse(status_code=201 if created else 200, content=body)
+
+
+@router.put("/sessions/{session_id}/parts/{seq}")
+async def put_part(
+    session_id: str,
+    seq: str,
+    request: Request,
+    cursor: str = Query("0"),
+    user: UserRow = Depends(require_user),
+) -> Any:
+    """Store one part of the recording. 200 means its bytes are fsynced into
+    the stored recording and the browser may forget them; nothing short of a
+    200 gives that permission."""
+    refusal = await _voice_refusal(request)
+    if refusal is not None:
+        return refusal
+    number = _int_param(seq)
+    since = _int_param(cursor)
+    sha = (request.headers.get("x-part-sha256") or "").strip().lower()
+    if number is None or since is None:
+        return _flat(400, "bad_request", "seq and cursor must be non-negative integers.")
+    if not dictation._SHA256.match(sha):
+        return _flat(400, "bad_request", "X-Part-SHA256 must be the part's lowercase hex SHA-256.")
+    user_id = int(user["id"])
+    try:
+        await db.run_in_thread(dictation._owned_row, session_id, user_id)
+    except dictation.SessionError as exc:
+        return _refused(exc)
+    if not dictation._rate_ok("part", user_id, settings.voice_part_per_min):
+        return _flat(429, "rate_limited", "Too many parts in a minute. Send this one again shortly.")
+    limit = dictation.part_limit_bytes()
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > limit:
+                return _flat(
+                    413, "part_too_large", f"A part may be at most {limit} bytes.", part_limit_bytes=limit
+                )
+            chunks.append(chunk)
+    except ClientDisconnect:
+        return _flat(408, "part_incomplete", "The part was cut off before it all arrived.")
+    body = b"".join(chunks)
+    if not body:
+        return _flat(400, "bad_request", "The part is empty.")
+    if hashlib.sha256(body).hexdigest() != sha:
+        return _flat(422, "part_corrupt", "The part's bytes do not match its SHA-256.")
+    try:
+        row, duplicate = await db.run_in_thread(dictation.append_part, user_id, session_id, number, body, sha)
+    except dictation.SessionError as exc:
+        if exc.reason == "storage_full":
+            dictation.RUNNER.notify(session_id, status=dictation.STATUS_FINISHING)
+        return _refused(exc)
+    dictation.RUNNER.notify(
+        session_id, bytes_stored=row["bytes_stored"], next_part=row["next_part"], rev=row["rev"]
+    )
+    return {"accepted": number, "duplicate": duplicate, **dictation.state(row, cursor=since)}
+
+
+@router.post("/sessions/{session_id}/finish")
+async def finish_session(session_id: str, request: Request, user: UserRow = Depends(require_user)) -> Any:
+    """The person pressed Stop (or the recorder did): 202 while the rest is
+    transcribed, 200 for a finish that already happened."""
+    refusal = await _voice_refusal(request)
+    if refusal is not None:
+        return refusal
+    payload = await _json_body(request)
+    if payload is None:
+        payload = {}
+    last_part = payload.get("last_part")
+    if last_part is not None and (isinstance(last_part, bool) or not isinstance(last_part, int)):
+        return _flat(400, "bad_request", "last_part must be an integer or null.")
+    ended_by = str(payload.get("ended_by") or "person")
+    try:
+        row, started = await db.run_in_thread(
+            lambda: dictation.finish(int(user["id"]), session_id, last_part=last_part, ended_by=ended_by)
+        )
+    except dictation.SessionError as exc:
+        return _refused(exc)
+    return JSONResponse(status_code=202 if started else 200, content=dictation.state(row))
+
+
+@router.get("/sessions")
+async def list_sessions(
+    request: Request,
+    limit: str = Query("50"),
+    before: Optional[str] = Query(None),
+    user: UserRow = Depends(require_user),
+) -> Any:
+    """The caller's own recordings, newest first. A stored recording its owner
+    cannot find or delete would be retention without consent."""
+    refusal = await _voice_refusal(request)
+    if refusal is not None:
+        return refusal
+    count = _int_param(limit, minimum=1)
+    if count is None or count > 100:
+        return _flat(400, "bad_request", "limit must be 1 to 100.")
+    cutoff = None
+    if before:
+        try:
+            cutoff = _datetime.fromisoformat(before.replace("Z", "+00:00"))
+        except ValueError:
+            return _flat(400, "bad_request", "before must be an ISO 8601 time.")
+    return await db.run_in_thread(
+        lambda: dictation.list_sessions(int(user["id"]), limit=count, before=cutoff)
+    )
+
+
+@router.get("/sessions/{session_id}")
+async def session_state(
+    session_id: str,
+    request: Request,
+    cursor: str = Query("0"),
+    since_rev: str = Query("-1"),
+    wait_s: str = Query("0"),
+    user: UserRow = Depends(require_user),
+) -> Any:
+    """The session state, as a long-poll: answered as soon as `rev` moves past
+    `since_rev`, or after `wait_s` (at most 25 s) unchanged."""
+    refusal = await _voice_refusal(request)
+    if refusal is not None:
+        return refusal
+    since = _int_param(cursor)
+    try:
+        rev_seen = int(since_rev)
+        wait = float(wait_s)
+    except (TypeError, ValueError):
+        return _flat(400, "bad_request", "since_rev and wait_s must be numbers.")
+    if since is None:
+        return _flat(400, "bad_request", "cursor must be a non-negative integer.")
+    wait = max(0.0, min(float(dictation.LONG_POLL_MAX_S), wait))
+    user_id = int(user["id"])
+    try:
+        row = await db.run_in_thread(dictation._owned_row, session_id, user_id)
+    except dictation.SessionError as exc:
+        return _refused(exc)
+    if row.get("audio_deleted_at") is not None:
+        return _refused(dictation._not_found())
+    if row["status"] in dictation.LIVE_STATUSES and dictation.RUNNER.get(session_id) is None:
+        # Nobody in this process runs it: adopt it if its lease has lapsed.
+        dictation.RUNNER.ensure(session_id)
+    deadline = time.monotonic() + wait
+    while dictation.current_rev(row) <= rev_seen and time.monotonic() < deadline:
+        if dictation.RUNNER.get(session_id) is not None:
+            # Run here: its rev is in memory, and cheap to look at.
+            await asyncio.sleep(0.25)
+            continue
+        # Run elsewhere, or just finished here: the row is the only source.
+        fresh = await db.run_in_thread(dictation._row, session_id)
+        if fresh is None:
+            break
+        row = fresh
+        if dictation.current_rev(row) > rev_seen:
+            break
+        await asyncio.sleep(1.0)
+    try:
+        row = await db.run_in_thread(dictation._owned_row, session_id, user_id)
+    except dictation.SessionError as exc:
+        return _refused(exc)
+    return dictation.state(row, cursor=since)
+
+
+@router.delete("/sessions/{session_id}", response_class=Response)
+async def discard_session(session_id: str, request: Request, user: UserRow = Depends(require_user)) -> Any:
+    """The person's discard: the recording and its transcript are deleted."""
+    refusal = await _voice_refusal(request)
+    if refusal is not None:
+        return refusal
+    try:
+        await db.run_in_thread(dictation.discard, int(user["id"]), session_id)
+    except dictation.SessionError as exc:
+        return _refused(exc)
+    return Response(status_code=204)
+
+
+@router.post("/sessions/{session_id}/retranscribe")
+async def retranscribe_session(session_id: str, request: Request, user: UserRow = Depends(require_user)) -> Any:
+    """Transcribe the STORED audio again (the failed windows, or all of it):
+    'Try again' no longer means 'say it all again'."""
+    refusal = await _voice_refusal(request)
+    if refusal is not None:
+        return refusal
+    payload = await _json_body(request) or {}
+    scope = str(payload.get("scope") or "gaps")
+    try:
+        row, started = await db.run_in_thread(dictation.retranscribe, int(user["id"]), session_id, scope)
+    except dictation.SessionError as exc:
+        return _refused(exc)
+    return JSONResponse(status_code=202 if started else 200, content=dictation.state(row))
+
+
+def _recording_response(row: dict) -> FileResponse:
+    path = dictation.audio_file(row)
+    stamp = row["created_at"].strftime("%Y%m%d-%H%M") if row.get("created_at") else "recording"
+    return FileResponse(
+        path,
+        media_type=row["mime_type"],
+        filename=f"recording-{stamp}.{row['ext']}",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Recording-Complete": "false" if row["status"] == dictation.STATUS_RECORDING else "true",
+        },
+    )
+
+
+@router.get("/sessions/{session_id}/audio")
+async def session_audio(session_id: str, request: Request, user: UserRow = Depends(require_user)) -> Any:
+    """The stored recording, exactly as the browser encoded it. Its owner
+    only; a super admin uses the audited admin route."""
+    refusal = await _voice_refusal(request)
+    if refusal is not None:
+        return refusal
+    try:
+        row = await db.run_in_thread(dictation._owned_row, session_id, int(user["id"]))
+        return _recording_response(row)
+    except dictation.SessionError as exc:
+        return _refused(exc)
+
+
+# ---------------------------------------------------------------------------
+# A super admin reading a member's recordings (audited)
+#
+# SUPER ADMIN ONLY, because the owner said "super admin": stricter than
+# rbac.may_inspect alone, under which an admin may also read a member's
+# conversations. The role is checked here because this change does not touch
+# rbac.py (a dedicated Cap.VOICE_RECORDINGS_READ is the cleaner home, left to
+# whoever owns that file). Every refusal is 404, as on the rest of the admin
+# surface. Ownership is re-derived from the row, so a session id in the URL
+# cannot reach another member's recording. main.py mounts only this module's
+# `router`, so these routes ride on it with their own full paths.
+# ---------------------------------------------------------------------------
+
+_admin = APIRouter(tags=["admin"])
+
+
+async def _admin_member(principal: Principal, user_id: int) -> None:
+    from .authn.admin_api import _inspectable_member
+    from .authn.rbac import Role
+
+    if Role(principal.role) is not Role.SUPER_ADMIN:
+        raise HTTPException(status_code=404, detail="No such member.")
+    await _inspectable_member(principal, user_id)
+
+
+async def _admin_session(principal: Principal, user_id: int, session_id: str) -> dict:
+    await _admin_member(principal, user_id)
+    row = await db.run_in_thread(dictation._row, session_id)
+    if row is None or int(row["user_id"]) != int(user_id) or row["status"] == dictation.STATUS_CANCELLED:
+        raise HTTPException(status_code=404, detail="No such recording.")
+    return row
+
+
+async def _admin_audit(principal: Principal, request: Request, action: str, user_id: int, **kwargs: Any) -> None:
+    if int(user_id) == int(principal.user_id):
+        return  # reading your own is not oversight
+    from .authn.principal import audit
+
+    await db.run_in_thread(lambda: audit(principal, request, action, target_user_id=user_id, **kwargs))
+
+
+@_admin.get("/admin/api/members/{user_id}/voice")
+async def admin_member_recordings(
+    user_id: int,
+    request: Request,
+    limit: int = Query(50, ge=1, le=100),
+    principal: Principal = Depends(require_capability(Cap.WORKSPACE_CONTENT_READ)),
+) -> dict:
+    await _admin_member(principal, user_id)
+    listing = await db.run_in_thread(
+        lambda: dictation.list_sessions(user_id, limit=limit, before=None, preview=False)
+    )
+    from .authn.admin_api import READ_AUDIT_COALESCE_S
+
+    await _admin_audit(
+        principal, request, "admin_listed_voice_recordings", user_id,
+        meta={"limit": limit, "count": len(listing["sessions"])},
+        coalesce_seconds=READ_AUDIT_COALESCE_S,
+    )
+    return listing
+
+
+@_admin.get("/admin/api/members/{user_id}/voice/{session_id}/audio")
+async def admin_member_recording_audio(
+    user_id: int,
+    session_id: str,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.WORKSPACE_CONTENT_READ)),
+) -> Any:
+    row = await _admin_session(principal, user_id, session_id)
+    try:
+        response = _recording_response(row)
+    except dictation.SessionError as exc:
+        return _refused(exc)
+    await _admin_audit(
+        principal, request, "admin_downloaded_voice_recording", user_id,
+        resource_type="voice_session", resource_id=session_id,
+    )
+    return response
+
+
+@_admin.get("/admin/api/members/{user_id}/voice/{session_id}/transcript")
+async def admin_member_recording_transcript(
+    user_id: int,
+    session_id: str,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.WORKSPACE_CONTENT_READ)),
+) -> Any:
+    row = await _admin_session(principal, user_id, session_id)
+    if row.get("audio_deleted_at") is not None:
+        return _flat(410, "audio_deleted", "This recording has been deleted.")
+    transcript = await db.run_in_thread(dictation.transcript_of, row)
+    await _admin_audit(
+        principal, request, "admin_read_voice_transcript", user_id,
+        resource_type="voice_session", resource_id=session_id,
+    )
+    return transcript
+
+
+router.routes.extend(_admin.routes)
