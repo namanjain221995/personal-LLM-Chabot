@@ -2121,7 +2121,7 @@ def _q_wh_content(clause: str, marked: bool) -> bool:
 #: person's own upload.
 _Q_SOV_RE = re.compile(
     rf"{_Q_WH}(?:\W+\w+){{0,6}}?\W+_in_\b"
-    rf"|(?:{_Q_THIS_FILE}|{_Q_CONTENT_NOUN}|{_Q_FILE_WORD})(?:\W+\w+){{0,4}}?\W+_in_\b(?:\W+\w+){{0,4}}?\W+{_Q_WH}",
+    rf"|(?:{_Q_THIS_FILE}|{_Q_CONTENT_NOUN}|{_Q_OUR_FILE_NOUN})(?:\W+\w+){{0,4}}?\W+_in_\b(?:\W+\w+){{0,4}}?\W+{_Q_WH}",
     re.I,
 )
 #: A question about WHAT WAS DONE: "what did you put in the second sheet",

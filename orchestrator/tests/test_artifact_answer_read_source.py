@@ -1057,8 +1057,24 @@ HELD_OUT_THE_SOV_SHAPE_WITH_A_BARE_FILE_WORD = (
     "deck me kitne slides hai ??",
     "deliverable me kya hai ??",
     "spreadsheet me kitne rows hai ??",
-    "document me kya hai ??",
 )
+
+#: `document` is deliberately NOT here. It is in `_Q_NOT_OURS_ALONE_WORDS`, so it
+#: is absent from `_Q_OUR_FILE_NOUN`, and the SOV arm reads that set rather than
+#: every file word -- because `_in_` is what the normaliser writes for a
+#: CONVERSION TARGET, and `<format> me convert karo aur batao ...` was being read
+#: as a question about our file. Nine real conversions stopped producing a file.
+#: The route for this one string does not move either way: `action` is "none" and
+#: `wants_file` is False with and without the arm, so nothing a person sees
+#: changes; only the internal `answer_about_artifact` flag does.
+HELD_OUT_A_BARE_GENERIC_NOUN_IS_NOT_OUR_FILE = ("document me kya hai ??",)
+
+
+@pytest.mark.parametrize("text", HELD_OUT_A_BARE_GENERIC_NOUN_IS_NOT_OUR_FILE)
+def test_a_bare_generic_noun_does_not_claim_our_file_but_builds_nothing(text):
+    decided = _intent_that_asks_about(text)
+    assert decided.action == "none", (text, decided.action, decided.rule)
+    assert decided.wants_file is False, (text, decided.rule)
 
 
 @pytest.mark.parametrize("text", HELD_OUT_THE_SOV_SHAPE_WITH_A_BARE_FILE_WORD)
