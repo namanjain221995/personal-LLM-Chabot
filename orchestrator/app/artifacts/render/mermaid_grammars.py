@@ -669,6 +669,18 @@ def _mind_node(text: str) -> Optional[Tuple[str, str, str]]:
     return None
 
 
+_MIND_ID_BAD_RE = re.compile(r"[^\w-]+")
+
+
+def _safe_mind_id(text: str) -> str:
+    """An identifier `spec.MindNode` accepts, from any line of text. Only the
+    shape of the id changes; the label it came from is kept as written."""
+    out = _MIND_ID_BAD_RE.sub("_", text).strip("_")
+    if not out or not out[0].isalpha():
+        out = "n" + out
+    return out[:36] or "n"
+
+
 def parse_mindmap(lines: List[str]) -> Optional[Dict[str, Any]]:
     nodes: List[Dict[str, Any]] = []
     stack: List[Tuple[int, str]] = []
@@ -681,13 +693,15 @@ def parse_mindmap(lines: List[str]) -> Optional[Dict[str, Any]]:
         if got is None:
             return None
         nid, label, shape = got
-        if len(nid) > 36:
-            # A plain line's id IS its text, and spec.MindNode caps an id at
-            # 40 while a label may be 48: a 41-48 character line refused the
-            # whole map (until 2026-09-28 it raised out of validation). The
-            # id is internal — a parent reference — so it is shortened here
-            # and kept unique by the suffix below; the label is untouched.
-            nid = nid[:36]
+        # A PLAIN LINE'S ID IS ITS TEXT, and spec.MindNode wants an identifier:
+        # it must start with a letter and hold only letters, digits, `_` and
+        # `-`, and it caps at 40 while a label may be 48. The engine writes
+        # sentences ("Create social media teasers to build anticipation."), so
+        # a 17-node mindmap of plain lines refused as a whole -- 59 validation
+        # errors, one per space and full stop. The id is INTERNAL, a parent
+        # reference nobody reads, so it is made safe here and kept unique by
+        # the suffix below; THE LABEL IS NEVER TOUCHED.
+        nid = _safe_mind_id(nid)
         if nid in ids_seen:
             ids_seen[nid] += 1
             nid = f"{nid}__{ids_seen[nid]}"

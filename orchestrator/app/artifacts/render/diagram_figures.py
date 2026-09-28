@@ -257,7 +257,8 @@ def _anchor(cx: float, cy: float, w: float, h: float, toward: Tuple[float, float
 
 def _place_boxes(sizes: Dict[str, Tuple[float, float]], links: Sequence[Tuple[str, str]], direction: str,
                  *, layer_gap: float = 0.62, node_gap: float = 0.42,
-                 across_extra: Optional[Dict[str, float]] = None) -> Tuple[Dict[str, Tuple[float, float]], float, float, Set[int]]:
+                 across_extra: Optional[Dict[str, float]] = None,
+                 link_labels: Sequence[str] = ()) -> Tuple[Dict[str, Tuple[float, float]], float, float, Set[int]]:
     """Centres for boxes of the given sizes, layered along `direction`.
 
     A small Sugiyama: back edges found by depth-first search are reversed
@@ -268,6 +269,14 @@ def _place_boxes(sizes: Dict[str, Tuple[float, float]], links: Sequence[Tuple[st
     own across-size on the across side (a self-loop and its label); it is
     part of the layer's across extent, so the next box in the layer and the
     figure's edge both clear it.
+
+    `link_labels` sizes EACH GAP SEPARATELY in LR, where a relation label sits
+    IN the gap and otherwise prints over the borders of the boxes on both
+    sides. One widest-label-in-the-diagram gap for every gap took the engine's
+    6-state LR lifecycle from 7.30 in to 11.16 in wide, and the chooser then
+    fell back to TD in a 6.3 in portrait box although the source declared
+    `direction LR` -- the fix for one bad picture broke a second one. A gap is
+    now as wide as the widest label of the links that CROSS it.
     """
     ids = list(sizes)
     extra = across_extra or {}
@@ -352,8 +361,26 @@ def _place_boxes(sizes: Dict[str, Tuple[float, float]], links: Sequence[Tuple[st
     layer_extent = {li: max(along(k) for k in row) for li, row in layers.items()}
     row_extent = {li: sum(across(k) + extra.get(k, 0.0) for k in row) + node_gap * (len(row) - 1) for li, row in layers.items()}
     total_across = max(row_extent.values()) if row_extent else 0.0
+    def gap_after(li: int) -> float:
+        """The gap between layer `li` and the next one: `layer_gap`, or in LR
+        wide enough for the widest label of the links that cross THIS gap."""
+        if direction != "LR" or not link_labels:
+            return layer_gap
+        widest = 0.0
+        for i, (a, b) in enumerate(links):
+            if a == b or a not in layer or b not in layer:
+                continue
+            label = link_labels[i] if i < len(link_labels) else ""
+            if not label:
+                continue
+            lo, hi = sorted((layer[a], layer[b]))
+            if lo <= li < hi:
+                widest = max(widest, _tw(label, SMALL_PT))
+        return max(layer_gap, widest + 0.24) if widest else layer_gap
+
     centres: Dict[str, Tuple[float, float]] = {}
     cursor = PAD
+    last_gap = 0.0
     for li in range(depth):
         row = layers[li]
         start = PAD + (total_across - row_extent[li]) / 2
@@ -362,8 +389,9 @@ def _place_boxes(sizes: Dict[str, Tuple[float, float]], links: Sequence[Tuple[st
             c_across = start + across(k) / 2
             centres[k] = (c_across, mid) if direction == "TD" else (mid, c_across)
             start += across(k) + extra.get(k, 0.0) + node_gap
-        cursor += layer_extent[li] + layer_gap
-    total_along = cursor - layer_gap + PAD
+        last_gap = gap_after(li)
+        cursor += layer_extent[li] + last_gap
+    total_along = cursor - last_gap + PAD
     w, h = (total_across + 2 * PAD, total_along) if direction == "TD" else (total_along, total_across + 2 * PAD)
     return centres, w, h, back
 
@@ -372,11 +400,29 @@ def _place_boxes(sizes: Dict[str, Tuple[float, float]], links: Sequence[Tuple[st
 _CLEAR_IN = 0.10
 #: Bows tried, smallest first, either side, when a straight line would cross
 #: a box. arc3's `rad` is a fraction of the chord length.
-_BOW_RADS: Tuple[float, ...] = (0.3, -0.3, 0.45, -0.45, 0.65, -0.65, 0.9, -0.9, 1.2, -1.2, 1.6, -1.6)
-#: The bows a twin pair may take: one sign only, because the same `rad` on
-#: the reversed chord bows to the OTHER side of the page, which is what puts
-#: A -> B and B -> A on opposite sides of each other.
-_TWIN_RADS: Tuple[float, ...] = (0.3, 0.45, 0.65, 0.9, 1.2, 1.6)
+#:
+#: WIDENED 2026-09-28 past 1.6, to 3.4. On the engine's own 7-state job
+#: lifecycle, Queued -> Cancelled found no candidate clear of Paused inside
+#: 1.6 and the least-crossing fallback cut Paused's corner; measured, +-2.0 /
+#: 2.6 / 3.4 clears it. A 3.4 bow is a wide detour and it is the LAST thing
+#: tried, after every tighter one on both sides.
+_BOW_RADS: Tuple[float, ...] = (0.3, -0.3, 0.45, -0.45, 0.65, -0.65, 0.9, -0.9,
+                                1.2, -1.2, 1.6, -1.6, 2.0, -2.0, 2.6, -2.6, 3.4, -3.4)
+#: The bows a twin pair may take, as MAGNITUDES. The pair is decided together
+#: (`_route_twins`): both halves take the same signed `rad`, and because the
+#: reversed chord bows to the other side of the page that puts A -> B and
+#: B -> A on opposite sides of each other.
+#:
+#: BOTH SIGNS ARE TRIED, and the honest reason is a small one: flipping the
+#: sign only SWAPS which half goes to which side, so it cannot clear an
+#: obstacle (whatever the sign, one half bows left and one bows right). It
+#: matters when the two halves' labels differ in width, where one assignment
+#: ranks better than the other. What actually closed the engine's
+#: Paused <-> Running bowing through Retrying is in `_route_twins`: when both
+#: halves can be straight, the second one is re-routed over `_BOW_RADS`
+#: instead of taking the best PAIR candidate, which had no partner left to
+#: satisfy.
+_TWIN_RADS: Tuple[float, ...] = (0.3, 0.45, 0.65, 0.9, 1.2, 1.6, 2.0, 2.6)
 
 
 @dataclass
@@ -436,29 +482,76 @@ def _rects_overlap(a: Tuple[float, float, float, float], b: Tuple[float, float, 
     return not (a[0] + a[2] < b[0] - clear or b[0] + b[2] + clear < a[0] or a[1] + a[3] < b[1] - clear or b[1] + b[3] + clear < a[1])
 
 
+def _candidate(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float],
+               others: Sequence[Tuple[float, float, float, float]], label_wh: Tuple[float, float],
+               rad: float) -> Tuple[Tuple[int, int, int], _Route]:
+    """One candidate path from box a to box b at this `rad`, with the key that
+    ranks it. Lower is better, in this order:
+
+    1. ENDS. Samples inside another box in the first or last tenth of the
+       curve. A line that leaves its own border straight into a neighbour is
+       the worst picture of all: the arrow head or the crow's foot is then
+       drawn ON that neighbour's border and reads as a relation to IT.
+    2. DISTINCT BOXES crossed. Crossing one box once is better than crossing
+       two, whatever the sample counts say.
+    3. SAMPLES. The tie-break, and THE ONLY TERM THE OLD RANKING HAD. That is
+       what put the composition diamond of the engine's 8-class shop diagram
+       on the User box: no candidate was clear, a rad of -1.6 had the fewest
+       samples inside anything, and its four were all inside User right where
+       the diamond is drawn. Reverting terms 1 and 2 turns
+       `test_no_route_in_the_engines_second_set_crosses_a_box_it_does_not_join
+       [class_shop]` red.
+
+    The body is sampled from 1 to -1 rather than the old 2 to -2, so the tenth
+    nearest each end is not skipped. On its own that changes no picture in this
+    suite -- `_CLEAR_IN` is 0.10 in and a sample step is about 0.07 in, so a box
+    the curve enters at its start is caught by the third sample anyway -- and it
+    is here because sampling only part of a curve is not something to leave in
+    the code, not because it fixed anything.
+    """
+    ca, cb = (a[0], a[1]), (b[0], b[1])
+    c = _control(ca, cb, rad) if rad else None
+    p = _anchor(a[0], a[1], a[2], a[3], c or cb)
+    q = _anchor(b[0], b[1], b[2], b[3], c or ca)
+    n = 48
+    pts = bezier_points(p, q, rad, n)
+    # From 1 to -1, not 2 to -2: the endpoints themselves sit ON a's and b's
+    # borders, and `others` holds neither, so only float noise needs trimming.
+    body = pts[1:-1]
+    end_span = max(1, n // 10)
+    ends = 0
+    crossed: Set[int] = set()
+    hits = 0
+    for k, pt in enumerate(body, start=1):
+        for ri, r in enumerate(others):
+            if _in_rect(pt, r, _CLEAR_IN):
+                hits += 1
+                crossed.add(ri)
+                if k <= end_span or k >= n - end_span:
+                    ends += 1
+    lx, ly = _label_xy(p, q, rad)
+    lw, lh = label_wh
+    if lw:
+        for ri, r in enumerate(others):
+            if _rects_overlap((lx - lw / 2, ly - lh / 2, lw, lh), r, _CLEAR_IN):
+                hits += 1
+                crossed.add(ri)
+    return (ends, len(crossed), hits), _Route(rad, p, q, (lx, ly))
+
+
 def _route(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float],
            others: Sequence[Tuple[float, float, float, float]], label_wh: Tuple[float, float],
            rads: Sequence[float]) -> _Route:
     """The path from box a to box b (cx, cy, w, h): the first of `rads`
     (0 for straight) whose curve and label clear every rectangle in
-    `others`, else the one that crosses the least."""
-    ca, cb = (a[0], a[1]), (b[0], b[1])
-    best: Optional[Tuple[int, _Route]] = None
+    `others`, else the best-ranked one (see `_candidate`)."""
+    best: Optional[Tuple[Tuple[int, int, int], _Route]] = None
     for rad in rads:
-        c = _control(ca, cb, rad) if rad else None
-        p = _anchor(a[0], a[1], a[2], a[3], c or cb)
-        q = _anchor(b[0], b[1], b[2], b[3], c or ca)
-        pts = bezier_points(p, q, rad, 48)
-        hits = sum(1 for pt in pts[2:-2] for r in others if _in_rect(pt, r, _CLEAR_IN))
-        lx, ly = _label_xy(p, q, rad)
-        lw, lh = label_wh
-        if lw:
-            hits += sum(1 for r in others if _rects_overlap((lx - lw / 2, ly - lh / 2, lw, lh), r, _CLEAR_IN))
-        route = _Route(rad, p, q, (lx, ly))
-        if hits == 0:
+        key, route = _candidate(a, b, others, label_wh, rad)
+        if key == (0, 0, 0):
             return route
-        if best is None or hits < best[0]:
-            best = (hits, route)
+        if best is None or key < best[0]:
+            best = (key, route)
     assert best is not None
     return best[1]
 
@@ -477,51 +570,191 @@ def _route_links(centres: Dict[str, Tuple[float, float]], sizes: Dict[str, Tuple
     pairs = set(links)
     rects = {k: (centres[k][0] - sizes[k][0] / 2, centres[k][1] - sizes[k][1] / 2, sizes[k][0], sizes[k][1]) for k in sizes}
     routes: Dict[int, _Route] = {}
+
+    def box(k: str) -> Tuple[float, float, float, float]:
+        return (*centres[k], *sizes[k])
+
+    def others_for(a: str, b: str) -> List[Tuple[float, float, float, float]]:
+        return [r for k, r in rects.items() if k not in (a, b)] + list(obstacles)
+
+    def label_wh_of(i: int) -> Tuple[float, float]:
+        label = labels[i] if i < len(labels) else ""
+        return (_tw(label, label_pt) + 0.12, _lh(label_pt)) if label else (0.0, 0.0)
+
+    #: Each half of a twin pair, by index, so the pair is decided ONCE.
+    twin_of: Dict[int, int] = {}
+    seen: Dict[Tuple[str, str], int] = {}
     for i, (a, b) in enumerate(links):
         if a == b or a not in sizes or b not in sizes:
             continue
-        others = [r for k, r in rects.items() if k not in (a, b)] + list(obstacles)
-        label = labels[i] if i < len(labels) else ""
-        label_wh = (_tw(label, label_pt) + 0.12, _lh(label_pt)) if label else (0.0, 0.0)
-        if (b, a) in pairs:
-            rads: Sequence[float] = _TWIN_RADS
-        elif i in back:
-            rads = _BOW_RADS
-        else:
-            rads = (0.0,) + _BOW_RADS
-        routes[i] = _route((*centres[a], *sizes[a]), (*centres[b], *sizes[b]), others, label_wh, rads)
+        j = seen.get((b, a))
+        if j is not None and j not in twin_of and i not in twin_of:
+            twin_of[i] = j
+            twin_of[j] = i
+        seen.setdefault((a, b), i)
+
+    done: Set[int] = set()
+    for i, (a, b) in enumerate(links):
+        if i in done or a == b or a not in sizes or b not in sizes:
+            continue
+        j = twin_of.get(i)
+        if j is not None and (b, a) in pairs:
+            ri, rj = _route_twins(box(a), box(b), others_for(a, b), label_wh_of(i), label_wh_of(j))
+            routes[i], routes[j] = ri, rj
+            done.add(i)
+            done.add(j)
+            continue
+        rads: Sequence[float] = _BOW_RADS if i in back else (0.0,) + _BOW_RADS
+        routes[i] = _route(box(a), box(b), others_for(a, b), label_wh_of(i), rads)
+        done.add(i)
     _spread_labels(routes, labels, label_pt)
     return routes
 
 
+def _route_twins(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float],
+                 others: Sequence[Tuple[float, float, float, float]],
+                 label_a: Tuple[float, float], label_b: Tuple[float, float]) -> Tuple[_Route, _Route]:
+    """Both halves of a twin pair (a -> b and b -> a), decided TOGETHER.
+
+    Both take the same signed `rad`; because the reversed chord bows to the
+    other side of the page, that is what puts the two on opposite sides of each
+    other. Both signs are tried, which chooses the better ASSIGNMENT of the two
+    halves to the two sides when their labels differ in width -- it cannot
+    clear an obstacle, since either sign puts one half on each side.
+
+    When no signed magnitude clears for BOTH halves, the halves are routed
+    independently over the full rad list with a straight line allowed: two
+    lines that overlap along the chord are a worse picture than one straight
+    and one bowed, and `_spread_labels` keeps their labels apart.
+    """
+    best: Optional[Tuple[Tuple[int, int, int], _Route, _Route]] = None
+    for mag in _TWIN_RADS:
+        for sign in (1.0, -1.0):
+            rad = mag * sign
+            ka, ra = _candidate(a, b, others, label_a, rad)
+            kb, rb = _candidate(b, a, others, label_b, rad)
+            if ka == (0, 0, 0) and kb == (0, 0, 0):
+                return ra, rb
+            worst = max(ka, kb)
+            if best is None or worst < best[0]:
+                best = (worst, ra, rb)
+    # Nothing clears as a pair. Route each half on its own, straight allowed.
+    rads = (0.0,) + _BOW_RADS
+    ra = _route(a, b, others, label_a, rads)
+    rb = _route(b, a, others, label_b, rads)
+    if ra.rad == 0.0 and rb.rad == 0.0:
+        # Two straight lines between the same pair of boxes lie on top of each
+        # other. Keep one straight and bow the other -- over `_BOW_RADS`, so
+        # the bow is CHOSEN and clears what it can. Taking the best pair
+        # candidate here instead put Paused -> Running through Retrying on the
+        # engine's job lifecycle although every negative rad was clear: the
+        # pair loop only ever compares pairs, and this half has no partner to
+        # satisfy any more.
+        rb = _route(b, a, others, label_b, _BOW_RADS)
+    return ra, rb
+
+
 def _spread_labels(routes: Dict[int, _Route], labels: Sequence[str], label_pt: float) -> None:
-    def rect(i: int) -> Optional[Tuple[float, float, float, float]]:
+    """Move relation labels that would print on top of each other.
+
+    THREE DEFECTS THIS CLOSES, all measured on the engine's own state diagrams
+    on 2026-09-28.
+
+    It skipped every BOWED route, and compared the apexes rather than the label
+    rectangles. A twin pair's two apexes are only about 0.48 in apart while a
+    25-character transition label is 1.3-1.6 in wide, so "Request additional
+    details", "Customer provides information" and "Solution applied
+    successfully" printed on top of each other under InProgress.
+
+    It RESET a label it had already moved: with three transitions fanning out
+    of one state, the pair (Left, Mid) put Left at 0.30 and Mid at 0.70, then
+    the pair (Mid, Right) wrote Mid back to 0.30 beside Left.
+
+    And ONE MOVE PER LABEL was not enough. Three labels can overlap each other
+    in a ring, and the first move only has to clear the first pair. This is a
+    bounded relaxation: while any two rectangles overlap, the label with the
+    fewest moves so far takes its next position, until every pair is clear or
+    no label has a position left. The bound is what makes it terminate; the
+    picture keeps whatever the last pass reached, which is never worse than
+    where it started.
+
+    A straight route's label slides ALONG its own line; a bowed route's is
+    pushed further out along the chord normal, since sliding a bow's label
+    leaves the curve.
+    """
+    #: Where a straight label may sit along its line, in order. 0.30 / 0.70
+    #: first: on the 0.46 in layer gap that is 0.18 in apart, one 7.5 pt line
+    #: height plus clearance.
+    _SLIDES = (0.30, 0.70, 0.20, 0.80, 0.50)
+    #: How far out a bowed label may be pushed, in label heights.
+    _PUSHES = (1.0, 2.0, 3.0)
+
+    def size(i: int) -> Optional[Tuple[float, float]]:
         label = labels[i] if i < len(labels) else ""
         if not label:
             return None
-        lw, lh = _tw(label, label_pt) + 0.12, _lh(label_pt)
+        return _tw(label, label_pt) + 0.12, _lh(label_pt)
+
+    def rect(i: int) -> Optional[Tuple[float, float, float, float]]:
+        wh = size(i)
+        if wh is None:
+            return None
+        lw, lh = wh
         x, y = routes[i].label_xy
         return (x - lw / 2, y - lh / 2, lw, lh)
 
-    def at(i: int, t: float) -> Tuple[float, float]:
+    def slide(i: int, t: float) -> Tuple[float, float]:
         pts = bezier_points(routes[i].p, routes[i].q, routes[i].rad, 50)
         return pts[int(round(t * 50))]
 
-    idx = sorted(routes)
-    for n, i in enumerate(idx):
-        ri = rect(i)
-        if ri is None or routes[i].rad:
-            continue
-        for j in idx[n + 1:]:
-            rj = rect(j)
-            if rj is None or routes[j].rad or not _rects_overlap(ri, rj, 0.0):
-                continue
-            # 0.30 / 0.70 along their lines: on the 0.46 in layer gap that
-            # is 0.18 in apart, one 7.5 pt line height plus clearance.
-            routes[i].label_xy = at(i, 0.30)
-            routes[j].label_xy = at(j, 0.70)
+    def push(i: int, heights: float) -> Tuple[float, float]:
+        r = routes[i]
+        ux, uy, _d = _unit(r.p, r.q)
+        side = 1.0 if r.rad > 0 else -1.0
+        wh = size(i)
+        extra = ((wh[1] if wh else 0.0) + 0.06) * heights
+        bx, by = _label_xy(r.p, r.q, r.rad)
+        return bx - uy * extra * side, by + ux * extra * side
+
+    def advance(i: int, n: int) -> bool:
+        """Put label `i` in its `n`-th alternative position. False when it has
+        none left."""
+        if routes[i].rad:
+            if n >= len(_PUSHES):
+                return False
+            routes[i].label_xy = push(i, _PUSHES[n])
+        else:
+            if n >= len(_SLIDES):
+                return False
+            routes[i].label_xy = slide(i, _SLIDES[n])
+        return True
+
+    idx = [i for i in sorted(routes) if size(i) is not None]
+    tries: Dict[int, int] = {i: 0 for i in idx}
+    for _pass in range(4 * len(idx) + 16):
+        clash: Optional[Tuple[int, int]] = None
+        for n, i in enumerate(idx):
             ri = rect(i)
-            assert ri is not None
+            for j in idx[n + 1:]:
+                rj = rect(j)
+                if ri is not None and rj is not None and _rects_overlap(ri, rj, 0.0):
+                    clash = (i, j)
+                    break
+            if clash:
+                break
+        if clash is None:
+            return
+        i, j = clash
+        # The one that has moved least goes next, so a label is not dragged
+        # across the page while its partner sits still.
+        first, second = (i, j) if tries[i] <= tries[j] else (j, i)
+        for k in (first, second):
+            if advance(k, tries[k]):
+                tries[k] += 1
+                break
+            tries[k] += 1
+        else:
+            return
 
 
 def _fit_routes(centres: Dict[str, Tuple[float, float]], routes: Dict[int, _Route], labels: Sequence[str],
@@ -875,7 +1108,7 @@ def plan_er(d: Any, direction: Optional[str] = None) -> FigureLayout:
     rel_labels = [r.label for r in d.relations]
     loops = {r.source: r.label for r in d.relations if r.source == r.target}
     extra = {k: _self_loop_extent(l, direction) for k, l in loops.items()}
-    centres, W, H, back = _place_boxes(sizes, links, direction, layer_gap=_layer_gap(0.75, rel_labels, direction), across_extra=extra)
+    centres, W, H, back = _place_boxes(sizes, links, direction, layer_gap=0.75, across_extra=extra, link_labels=rel_labels)
     loop_rects = [_loop_rect((*centres[k], *sizes[k]), l, direction) for k, l in loops.items()]
     routes = _route_links(centres, sizes, links, rel_labels, back, obstacles=loop_rects)
     centres, routes, W, H = _fit_routes(centres, routes, rel_labels, W, H)
@@ -973,7 +1206,7 @@ def plan_class(d: Any, direction: Optional[str] = None) -> FigureLayout:
     rel_labels = [r.label for r in d.relations]
     loops = {r.source: r.label for r in d.relations if r.source == r.target}
     extra = {k: _self_loop_extent(l, direction) for k, l in loops.items()}
-    centres, W, H, back = _place_boxes(sizes, links, direction, layer_gap=_layer_gap(0.8, rel_labels, direction), across_extra=extra)
+    centres, W, H, back = _place_boxes(sizes, links, direction, layer_gap=0.8, across_extra=extra, link_labels=rel_labels)
     loop_rects = [_loop_rect((*centres[k], *sizes[k]), l, direction) for k, l in loops.items()]
     routes = _route_links(centres, sizes, links, rel_labels, back, obstacles=loop_rects)
     centres, routes, W, H = _fit_routes(centres, routes, rel_labels, W, H)
@@ -1052,7 +1285,7 @@ def plan_state(d: Any, direction: Optional[str] = None) -> FigureLayout:
     # 0.46 in between layers, as diagrams.GAP_MAJOR_IN: a 7.5 pt transition
     # label sits in it, and an eight-state chain (ten layers with the two
     # pseudo-states) stays inside the portrait box at 8 pt.
-    centres, W, H, back = _place_boxes(sizes, links, direction, layer_gap=_layer_gap(0.46, tr_labels, direction), across_extra=extra)
+    centres, W, H, back = _place_boxes(sizes, links, direction, layer_gap=0.46, across_extra=extra, link_labels=tr_labels)
     loop_rects = [_loop_rect((*centres[k], *sizes[k]), l, direction) for k, l in loops.items()]
     routes = _route_links(centres, sizes, links, tr_labels, back, obstacles=loop_rects)
     centres, routes, W, H = _fit_routes(centres, routes, tr_labels, W, H)

@@ -296,8 +296,30 @@ def test_the_section_bands_survive_the_fold():
 # --------------------------------------------- the reader refuses caps --
 
 
-def test_an_over_cap_source_is_refused_by_the_reader_not_raised(caplog):
+def test_an_over_cap_source_never_raises_out_of_the_reader(caplog):
+    """THE INVARIANT IS THAT NOTHING RAISES, not that nothing draws.
+
+    Until 2026-09-28 a pydantic ValidationError escaped `diagram_from_fields`
+    and md_import logged a "parsed but did not build" bug line once per fence
+    for what is a size refusal. `_within_caps` catches it in the reader.
+
+    An 18-entity ER is over the ER model's cap and under the flowchart's
+    (24 nodes, 40 edges), so it reaches the translation and DRAWS -- which is
+    what production (ae25da28) does with it, since production translates every
+    ER. The picture is right; only the raise was wrong."""
     src = "erDiagram\n" + "".join(f"  E{i} ||--o{{ E{i + 1} : has\n" for i in range(17))
+    fields = D.parse_mermaid(src)
+    assert fields is not None and len(fields["nodes"]) == 18
+    with caplog.at_level(logging.INFO, logger="app.artifacts.md_import"):
+        doc, notes = md_import.markdown_to_document(f"# T\n\n```mermaid\n{src}\n```\n")
+    assert [b.type for b in doc.blocks if b.type == "diagram"] == ["diagram"]
+    assert not any("did not build" in r.getMessage() for r in caplog.records)
+
+
+def test_a_source_over_the_flowchart_cap_too_is_refused_cleanly(caplog):
+    """Past 24 nodes there is no reader left, so the callout is the answer --
+    and still no raise and no bug line."""
+    src = "erDiagram\n" + "".join(f"  E{i} ||--o{{ E{i + 1} : has\n" for i in range(30))
     assert D.parse_mermaid(src) is None
     with caplog.at_level(logging.INFO, logger="app.artifacts.md_import"):
         doc, notes = md_import.markdown_to_document(f"# T\n\n```mermaid\n{src}\n```\n")
@@ -320,3 +342,175 @@ def test_the_engine_sources_reach_a_docx_and_a_pdf_without_a_warning(tmp_path):
                             title_slug="engine", version=1, effort="think")
     assert report.warnings == [], report.warnings
     assert len(report.chart_files) == len(ENGINE)
+
+
+# ------------------- the engine's SECOND set, 2026-09-28 (N1-N4) -----------
+#
+# Ten more sources from the same engine and the same prompt, rendered and
+# looked at after the first four defects were closed. Four of the ten were
+# still wrong, and every statement below was FALSE on a41da581:
+#
+#   N1  the least-crossing fallback picked an arc whose first 4% was never
+#       sampled, so on the 8-class shop diagram a rad of -1.6 won with its
+#       composition diamond drawn on the User box and the line running behind
+#       User to OrderLine. Main drew this straight, with the diamond on Order.
+#   N2  a twin pair only ever tried POSITIVE rads, so Paused <-> Running bowed
+#       through Retrying although rad 0.0 and every negative rad were clear.
+#   N3  `_spread_labels` skipped every bowed route and compared apexes, not
+#       label rectangles: three 25-30 character transition labels printed on
+#       top of each other under InProgress.
+#   N4  it also RESET a label it had already moved, so the middle of a
+#       three-way fan landed back beside the first one.
+
+#: The sources are the ENGINE'S OWN, verbatim from the run that found
+#: N1-N4 (Qwen/Qwen3.6-35B-A3B-NVFP4, thinking off, 2026-09-28). Hand-written
+#: look-alikes were tried first and every one of these tests passed with the
+#: fixes reverted: a plausible source does not reproduce a measured defect.
+ENGINE2 = {
+    'class_shop': 'classDiagram\n    class User {\n        +String id\n        +String name\n        +String email\n        +login()\n        +logout()\n    }\n\n    class Customer {\n        +String address\n        +String phone\n        +placeOrder()\n    }\n\n    class Guest {\n        +String sessionId\n        +browse()\n    }\n\n    class Category {\n        +String id\n        +String name\n        +String description\n        +getParentCategory()\n        +setParentCategory()\n    }\n\n    class Product {\n        +String id\n        +String name\n        +Decimal price\n        +String sku\n    }\n\n    class Order {\n        +String orderId\n        +Date orderDate\n        +Status status\n        +calculateTotal()\n        +place()\n    }\n\n    class OrderLine {\n        +String lineId\n        +Integer quantity\n        +Decimal subtotal\n    }\n\n    class Payment {\n        +String paymentId\n        +String method\n        +Decimal amount\n        +Boolean status\n        +process()\n    }\n\n    User <|-- Customer\n    User <|-- Guest\n    Order "1" *-- "1..*" OrderLine\n    Order "1" -- "1" Payment\n    Category "1" o-- "0..1" Category\n    Category "1" -- "*" Product\n    Product "1" -- "*" OrderLine\n\n    %% Notes on Cardinalities and Relationships:\n    %% 1. User <|-- Customer : Inheritance (Generalization). A Customer IS-A User.\n    %% 2. User <|-- Guest : Inheritance (Generalization). A Guest IS-A User.\n    %% 3. Order "1" *-- "1..*" OrderLine : Composition. An Order owns its OrderLines.\n    %%    One Order must have at least one OrderLine, and a single OrderLine belongs to only one Order.\n    %% 4. Order "1" -- "1" Payment : Association. An Order has one Payment.\n    %% 5. Category "1" o-- "0..1" Category : Aggregation/Composition for self-reference (Parent Category).\n    %%    A Category can optionally have one parent Category.\n    %% 6. Category "1" -- "*" Product : Association. One Category contains many Products.\n    %% 7. Product "1" -- "*" OrderLine : Association. One Product appears in many OrderLines.',
+    'state_td_retries': 'stateDiagram-v2\n    [*] --> Queued\n    Queued --> Running\n    Running --> Succeeded\n    Running --> Retrying\n    Retrying --> Running\n    Retrying --> Failed\n    Running --> Paused\n    Paused --> Running\n    Queued --> Cancelled\n    Running --> Cancelled\n    Retrying --> Cancelled\n    Paused --> Cancelled',
+    'state_lr_long': 'stateDiagram-v2\n    direction LR\n    [*] --> New\n    New --> Triaged: Agent reviews and categorizes\n    Triaged --> InProgress: Assign to specific engineer\n    InProgress --> WaitingOnCustomer: Request additional details\n    WaitingOnCustomer --> InProgress: Customer provides information\n    InProgress --> Resolved: Solution applied successfully\n    Resolved --> Closed: Verify resolution with stakeholder\n    Closed --> Triaged: Reopen due to recurring issue\n    Closed --> [*]',
+    # The one synthetic source here, and it is named as one: the three-way fan
+    # the verifier drove by hand (advtip_state_fan3) to isolate N4 from the
+    # engine's own diagrams, which happen never to fan three labelled
+    # transitions out of one state.
+    "state_fan3": (
+        "stateDiagram-v2\n    [*] --> Hub\n    Hub --> Left: A long label for the left branch\n"
+        "    Hub --> Mid: Another long label for the middle\n"
+        "    Hub --> Right: And a third long label here\n"
+    ),
+}
+
+
+def _figure(src: str, box_in=D.PORTRAIT_BOX_IN):
+    fields = D.parse_mermaid(src)
+    assert fields is not None, src[:40]
+    return D.layout_for(S.diagram_from_fields(fields), box_in=box_in)
+
+
+def _full_crossings(layout) -> list:
+    """Every (link, box) pair where a relation's curve lands inside a box that
+    is not one of its two ends — sampled over the WHOLE curve.
+
+    `_crossings` above trims `[2:-2]`, which is the very blindness N1 was: the
+    first and last 4% of a long arc are exactly where a curve leaving its own
+    border cuts the neighbour, and that is where the arrow head or the crow's
+    foot is drawn."""
+    boxes = layout.detail["boxes"]
+    bad = []
+    for i, (a, b, rad, p, q, label_xy) in layout.detail["routes"].items():
+        pts = F.bezier_points(p, q, rad, 48)[1:-1]
+        for k, rect in boxes.items():
+            if k in (a, b):
+                continue
+            if any(F._in_rect(pt, rect, 0.0) for pt in pts):
+                bad.append((i, a, b, k))
+    return bad
+
+
+def _label_overlaps(layout, diagram) -> list:
+    seq = list(getattr(diagram, "relations", None) or getattr(diagram, "transitions", None) or [])
+    rects = []
+    for i, (a, b, rad, p, q, xy) in layout.detail["routes"].items():
+        label = (getattr(seq[i], "label", "") or "") if i < len(seq) else ""
+        if not label:
+            continue
+        w, h = F._tw(label, F.SMALL_PT) + 0.12, F._lh(F.SMALL_PT)
+        rects.append((label, (xy[0] - w / 2, xy[1] - h / 2, w, h)))
+    out = []
+    for n, (li, ri) in enumerate(rects):
+        for lj, rj in rects[n + 1:]:
+            if F._rects_overlap(ri, rj, 0.0):
+                out.append((li, lj))
+    return out
+
+
+@pytest.mark.parametrize("key", sorted(ENGINE2))
+def test_no_route_in_the_engines_second_set_crosses_a_box_it_does_not_join(key):
+    assert _full_crossings(_figure(ENGINE2[key])) == []
+
+
+@pytest.mark.parametrize("key", sorted(ENGINE2))
+def test_no_two_relation_labels_in_the_engines_second_set_overprint(key):
+    src = ENGINE2[key]
+    diagram = S.diagram_from_fields(D.parse_mermaid(src))
+    assert _label_overlaps(_figure(src), diagram) == []
+
+
+def test_the_composition_on_the_shop_diagram_leaves_order_not_user():
+    """N1 in one statement. The diamond is drawn at the route's START point,
+    so a candidate whose first samples are inside another box puts the diamond
+    on THAT box's border and the relation reads as one to it."""
+    layout = _figure(ENGINE2["class_shop"])
+    boxes = layout.detail["boxes"]
+    route = next(r for r in layout.detail["routes"].values() if (r[0], r[1]) == ("Order", "OrderLine"))
+    p = route[3]
+    for name, rect in boxes.items():
+        if name in ("Order", "OrderLine"):
+            continue
+        assert not F._in_rect(p, rect, 0.0), f"the composition diamond is drawn on {name}"
+
+
+def test_a_twin_pair_may_bow_to_the_negative_side():
+    """N2. Paused <-> Running with Retrying beside Paused: every positive rad
+    crosses Retrying and rad 0.0 does not, so the pair must not take one."""
+    layout = _figure(ENGINE2["state_td_retries"])
+    routes = {(a, b): rad for a, b, rad, _p, _q, _xy in layout.detail["routes"].values()}
+    assert ("Paused", "Running") in routes and ("Running", "Paused") in routes
+    retrying = layout.detail["boxes"]["Retrying"]
+    for (a, b), _rad in routes.items():
+        if {a, b} != {"Paused", "Running"}:
+            continue
+        r = next(x for x in layout.detail["routes"].values() if (x[0], x[1]) == (a, b))
+        pts = F.bezier_points(r[3], r[4], r[2], 48)[1:-1]
+        assert not any(F._in_rect(pt, retrying, 0.0) for pt in pts), f"{a} -> {b} crosses Retrying"
+
+
+def test_a_three_way_fan_gives_each_label_its_own_slot():
+    """N4. The middle label of a three-way fan was written back to the first
+    one's slot by the second pair, so two of the three printed together."""
+    src = ENGINE2["state_fan3"]
+    diagram = S.diagram_from_fields(D.parse_mermaid(src))
+    layout = _figure(src)
+    assert _label_overlaps(layout, diagram) == []
+    xs = sorted(xy for _a, _b, _rad, _p, _q, xy in layout.detail["routes"].values())
+    assert len({(round(x, 2), round(y, 2)) for x, y in xs}) == len(xs), "two labels share a position"
+
+
+def test_every_gap_is_sized_by_the_labels_that_cross_IT():
+    """One widest-label-in-the-diagram gap for EVERY gap made the LR figure
+    wider than it had to be, and the chooser then dropped the declared LR.
+
+    Measured 2026-09-28 on the engine's own two LR state diagrams:
+
+      support ticket, 8 labelled transitions   20.06 in -> 15.65 in  (-22%)
+      order lifecycle, 5 labelled transitions  11.16 in ->  9.58 in  (-14%)
+
+    NEITHER fits a 6.3 in portrait box at the 8 pt floor, so both still lay
+    out TD there, at 9.5 pt — and that is the right picture: a declared LR
+    squeezed to 3.82 pt is not a picture anyone can read. The alternative on
+    the parent (1db966b6) was an LR that fitted only because its labels
+    printed over the borders of the boxes on both sides. What this test pins
+    is that a gap costs only what crosses IT."""
+    d = S.diagram_from_fields(D.parse_mermaid(ENGINE2["state_lr_long"]))
+    per_gap = F.PLANNERS["state"](d, "LR").fig_in[0]
+
+    real = F._place_boxes
+
+    def one_gap_for_all(sizes, links, direction, *, layer_gap=0.62, node_gap=0.42,
+                        across_extra=None, link_labels=()):
+        return real(sizes, links, direction, layer_gap=F._layer_gap(layer_gap, link_labels, direction),
+                    node_gap=node_gap, across_extra=across_extra, link_labels=())
+
+    F._place_boxes = one_gap_for_all
+    try:
+        one_gap = F.PLANNERS["state"](d, "LR").fig_in[0]
+    finally:
+        F._place_boxes = real
+    assert per_gap < one_gap - 3.0, f"per-gap {per_gap:.2f} in vs one-gap {one_gap:.2f} in"
+
+    # And an unlabelled gap costs nothing at all.
+    bare = S.diagram_from_fields(D.parse_mermaid(
+        "stateDiagram-v2\n    direction LR\n    [*] --> New\n    New --> Triaged\n"
+        "    Triaged --> InProgress\n    InProgress --> Resolved\n    Resolved --> [*]\n"))
+    assert F.PLANNERS["state"](bare, "LR").fig_in[0] < per_gap

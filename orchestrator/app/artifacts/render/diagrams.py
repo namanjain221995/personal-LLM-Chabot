@@ -935,8 +935,15 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
             family = G.FAMILY_OF_KEYWORD.get(keyword)
             fields = None
             if family is not None and first.lower() == keyword:
-                fields = G.read_family(family, src_lines[first_index + 1:])
+                fields = _within_caps(G.read_family(family, src_lines[first_index + 1:]))
             if fields is None:
+                # `_within_caps` runs BEFORE this branch, not after it, so a
+                # source the family reader read but the typed model refuses --
+                # a label past its cap, an id it cannot hold -- reaches the
+                # translation too instead of losing the picture at the last
+                # step. Measured: the engine's 17-node mindmap of plain
+                # sentences.
+                #
                 # TRANSLATION IS THE SAFETY NET, never the first choice. A
                 # family with its own reader is drawn in its own shapes (ER
                 # crow's feet, state bullseyes, sequence lifelines); only when
@@ -958,7 +965,7 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
                 return None
             if title and not fields.get("title"):
                 fields["title"] = title
-            return _within_caps(fields)
+            return fields
     source = "\n".join(src_lines)
 
     direction = "TD"
