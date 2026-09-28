@@ -140,7 +140,16 @@ def test_a_diagram_gets_no_image_only_version(text: str) -> None:
 
 def test_the_owner_s_sentence_cannot_reach_the_refusal() -> None:
     intent = decide(OWNER_SENTENCE)
-    assert (intent.action, intent.rule) == ("none", "no-request")
+    # The INVARIANT, not one rule's name: the sentence makes no file and asks
+    # for no chart of data. Two branches name this turn two different ways --
+    # "no-request" (no rule claimed it) and "diagram-in-chat:<subject>" (the
+    # picture rule claimed it and sent it to chat) -- and both are correct
+    # answers to the owner's sentence. Pinning the spelling would fail the
+    # merge of the branch that reads it better.
+    assert intent.action == "none", (intent.action, intent.rule)
+    assert intent.rule != "create-chart"
+    assert intent.chart_request is False
+    assert intent.wants_file is False
     # No file signal either, so `_should_consult` does not even offer the turn
     # to the classifier -- which is the path the live refusal came down.
     assert LX.file_signal(OWNER_SENTENCE) is False

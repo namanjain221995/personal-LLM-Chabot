@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import chart_spec as CS
+from . import pictures as PIC
 
 
 @dataclass(frozen=True)
@@ -66,7 +67,32 @@ _GEO_WHY = "this platform has no geographic chart type, so nothing here can plac
 #: map, mind map, heat map, roadmap) are kept out by the lookbehind. A bare
 #: leading "map" is NOT one of the shapes: "map the columns to the schema and
 #: create a PDF" is a mapping verb and a real document request.
-_NOT_A_MAP = r"(?<!heat )(?<!heat)(?<!road )(?<!road)(?<!site )(?<!site)(?<!mind )(?<!mind)(?<!bit)"
+#: EVERY WORD THAT QUALIFIES "map" INTO SOMETHING ELSE. `tree`, `stream`,
+#: `journey` and `value` joined the list on 2026-09-28. The first is a
+#: PRE-EXISTING bug, measured on ae25da28 before any change here:
+#:
+#:   "draw a tree map of revenue by product" -> unsupported-visual:map
+#:
+#: A treemap has been a real chart type since 2026-09-16 (it is in
+#: `chart_spec.CHART_TYPES`, and `Visual("treemap", …)` below is therefore
+#: SUPPORTED and never refused) — but the `map` entry is tested first and its
+#: lookbehind had no `tree`, so the person was told this platform has no
+#: geographic chart type for a chart it draws. `value stream map` and `user
+#: journey map` are the same shape on the diagram side.
+_NOT_A_MAP = (r"(?<!heat )(?<!heat)(?<!road )(?<!road)(?<!site )(?<!site)(?<!mind )(?<!mind)(?<!bit)"
+              r"(?<!tree )(?<!tree)(?<!stream )(?<!stream)(?<!journey )(?<!journey)(?<!value )(?<!sun)")
+#: The same idea in Devanagari and Gujarati. Each head is spelled both with and
+#: without the separating space, and the Latin heads are here too because one
+#: sentence often mixes scripts.
+_NOT_A_MAP_DEV = (
+    r"(?<!माइंड )(?<!माइंड)(?<!माइन्ड )(?<!माइन्ड)(?<!माईंड )(?<!माईंड)"
+    r"(?<!હીટ )(?<!હીટ)(?<!હિટ )(?<!હિટ)"
+    r"(?<!हीट )(?<!हीट)(?<!हिट )(?<!हिट)"
+    r"(?<!रोड )(?<!रोड)(?<!રોડ )(?<!રોડ)"
+    r"(?<!साइट )(?<!साइट)(?<!સાઇટ )(?<!સાઇટ)"
+    r"(?<!માઇન્ડ )(?<!માઇન્ડ)(?<!માઈન્ડ )(?<!માઈન્ડ)"
+    r"(?<!mind )(?<!mind)(?<!heat )(?<!heat)(?<!road )(?<!road)(?<!site )(?<!site)"
+)
 _MAP_PATTERN = (
     rf"\b(?:on|onto|in|over|across|upon)\s+(?:an?\s+|the\s+)?{_NOT_A_MAP}maps?\b"
     rf"|\b(?:an?|the)\s+{_NOT_A_MAP}maps?\b"
@@ -76,7 +102,16 @@ _MAP_PATTERN = (
     # postposition is what makes it "on a map"; "map parameters" keeps its
     # word boundary and is not touched (verifier gap, 2026-09-16).
     rf"|{_NOT_A_MAP}\bmaps?\s+(?:pe|par|pr)\b"
-    rf"|नक्शा|नक्शे|मैप|નકશો|નકશા|મેપ"
+    # The LATIN compounds are kept out by `_NOT_A_MAP`; these had no guard at
+    # all, so a Devanagari or Gujarati compound was read as a geographic map.
+    # Measured 2026-09-28: "माइंड मैप बनाओ रोडमैप का" — Hindi for "make a mind
+    # map of the roadmap" — was answered "I can't draw a map: this platform has
+    # no geographic chart type", while the identical English sentence drew a
+    # real `mindmap`. The same trap was waiting for हीट मैप, रोड मैप, साइट मैप
+    # and માઇન્ડ મેપ. `_NOT_A_MAP_DEV` is the same lookbehind idea in the two
+    # scripts, and the Latin heads are included because people mix scripts
+    # inside one sentence ("mind मैप").
+    rf"|{_NOT_A_MAP_DEV}(?:नक्शा|नक्शे|नक्शो|मैप|मेप|નકશો|નકશા|નકશું|મેપ|મૅપ)"
 )
 
 #: THE NETWORK ASK, SPLIT ON WHERE THE BOXES COME FROM — the second half of
@@ -139,6 +174,86 @@ _NAMED: Tuple[Visual, ...] = (
     Visual("venn", "a Venn diagram", "this platform draws no set diagrams", "", r"\bvenn\b"),
     Visual("network", "a network diagram", "this platform lays a diagram out from boxes and arrows that are named, never from the rows of a table, so there is no chart type that draws a network out of this data", "",
            _NETWORK_PATTERN),
+
+    # ------------------------------------------------------------------------
+    # THE PICTURES NOBODY HAD WRITTEN A NO FOR (2026-09-28). Fourteen phrasings
+    # in the 206-phrasing survey asked for something this platform genuinely
+    # cannot draw and got no sentence saying so, because no word for any of
+    # them appeared anywhere in the product. What the model improvised instead,
+    # measured live in the running container:
+    #
+    #   "draw a wireframe of the chat screen"        -> a `flowchart TD`
+    #                                                  presented as a wireframe
+    #   "draw me a picture of a cat wearing
+    #    sunglasses"                                 -> ASCII art, which
+    #                                                  DIAGRAM_INSTRUCTION
+    #                                                  itself forbids
+    #   "floor plan of a 2bhk with the kitchen east" -> a table of room
+    #                                                  dimensions that never
+    #                                                  said it could not draw
+    #                                                  the plan
+    #   "draw me a calendar for October with the
+    #    sprints marked"                             -> a markdown table headed
+    #                                                  "October 2024" (it is
+    #                                                  2026)
+    #
+    # A person who asks for something this product cannot draw is owed a plain
+    # sentence saying so and what it CAN do instead. These are added HERE, with
+    # the map and the sankey, rather than invented somewhere else: the sentence
+    # is written by `refusal_sentence` from the fields, every `nearest` is
+    # checked against CHART_TYPES, and the day a renderer for one of them lands
+    # its word stops being a refusal on the same import.
+    Visual("chord", "a chord diagram",
+           "this platform has no chart type that draws a circular flow between categories", "heatmap",
+           r"\bchords?\s+(?:diagram(?:me)?s?|charts?|plots?)\b|\bchord\s+diagram(?:me)?s?\b",
+           offer_without_table=False),
+    Visual("calendar", "a calendar",
+           "this platform has no calendar type, so nothing here can lay dates out on a month grid", "gantt",
+           # "add it to my calendar" is not a drawing ask, so the name counts
+           # only when a picture word or a data relation follows it.
+           r"\bcalendars?\s+(?:views?|charts?|grids?|layouts?|diagram(?:me)?s?)\b"
+           r"|\bcalendars?\s+(?:of|for|with|showing)\b",
+           offer_without_table=False),
+    Visual("wireframe", "a wireframe",
+           "this platform draws no interface mock-ups: there is no renderer here that lays out screens, controls and blocks of copy", "",
+           r"\bwire[\s-]?frames?\b|\bmock[\s-]?ups?\b|\blo-?fi\s+designs?\b"),
+    Visual("floor_plan", "a floor plan",
+           "this platform draws nothing to scale, so nothing here can lay out rooms, walls or seats", "",
+           r"\bfloor\s*plans?\b|\bseating\s*(?:plans?|charts?|arrangements?)\b"
+           r"|\bsite\s+plans?\b|\belevations?\s+drawings?\b|\bblue\s?prints?\b"),
+    Visual("circuit", "a circuit diagram",
+           "this platform has no symbol library for electronics, so nothing here can draw a resistor, a capacitor or a gate", "",
+           r"\bcircuits?\s+(?:diagram(?:me)?s?|schematics?)\b|\bwiring\s+diagram(?:me)?s?\b"
+           r"|\bbreadboards?\b|\bpcb\s+layouts?\b"),
+    Visual("image", "a picture of something real",
+           "there is no image model on this platform, so nothing here can paint a scene, a logo or a photograph", "",
+           # THE ARTICLE IS THE SIGNAL, and it is what keeps this entry off the
+           # diagrams. "a picture of A cat" asks for a scene to be painted;
+           # "a picture of THE deploy pipeline" asks for the thing this
+           # conversation owns, which the model draws as a flowchart. So the
+           # bare-noun words need an indefinite article, while `image`, `photo`
+           # and `logo` — which name a raster picture outright — do not.
+           r"\b(?:pictures?|drawings?|illustrations?|sketch(?:es)?|paintings?|artworks?)\s+of\s+(?:a|an)\b"
+           r"|\b(?:images?|photos?|photographs?|logos?|posters?|banners?|avatars?|thumbnails?)\s+of\b"
+           r"|\btext[\s-]to[\s-]image\b|\bimage\s+generation\b|\bai[\s-]generated\s+(?:image|picture|art)s?\b"),
+    Visual("infographic", "an infographic",
+           "an infographic is hand-composed artwork rather than a chart type, and this platform has no illustration renderer", "bar",
+           r"\binfo\s?graphics?\b", offer_without_table=False),
+    Visual("isometric_3d", "a 3D drawing",
+           "this platform renders nothing in three dimensions: every chart and diagram here is flat", "",
+           r"\bisometric\b|\b3\s?-?\s?d\s+(?:diagram(?:me)?s?|render(?:ing)?s?|models?|views?|illustrations?|drawings?|pictures?|scenes?)\b"),
+    # A DECISION TREE IS TWO DIFFERENT ASKS, and the word is not the meaning
+    # here either. "decision tree for choosing an effort level" is a diagram of
+    # a structure and `pictures` draws it. "fit a decision tree on this dataset
+    # and show it" asks for a model to be TRAINED and its splits drawn, which
+    # is not a chart type and not a diagram: there is no training step here.
+    Visual("decision_tree_model", "a fitted decision tree",
+           "this platform has no model-training step, so nothing here can fit a tree to a dataset and draw the splits it learned", "bar",
+           r"\b(?:fit|fits|fitting|fitted|train|trains|training|trained|learn|learns|grow)\b"
+           r"[^.;!?\n]{0,40}?\bdecision\s+trees?\b"
+           r"|\bdecision\s+trees?\b[^.;!?\n]{0,40}?\b(?:on|from|over|against|using)\s+"
+           r"(?:this|that|the|my|our)\s+(?:data\s?set|data|table|sheet|csv|rows|records|file)\b",
+           offer_without_table=False),
 )
 
 #: The verbs and shapes that ask to SEE something. A name on its own ("the
@@ -298,6 +413,37 @@ def by_token(token: str) -> Optional[Visual]:
     return next((v for v in _NAMED if v.token == token), None)
 
 
+#: A PICTURE ASKED FOR AS A NOUN PHRASE, which is how people actually type it.
+#: `_ASK_RE` needs a verb, so the honest refusal was lost exactly where the
+#: sentence was shortest. Measured pairs in the running container, 2026-09-28:
+#:
+#:   "venn diagram of the three plans and what they share"  -> no refusal
+#:   "draw a VENN of python vs sql skills on the team"       -> refused, well
+#:   "sankey diagram of how users move between stages"       -> no refusal
+#:   "draw a sankey of the energy flow"                      -> refused, well
+#:   "choropleth of revenue by state"                        -> no refusal
+#:   "draw a choropleth of revenue by state"                 -> refused, well
+#:
+#: In the verb-less cases the model happened to refuse well on its own — but
+#: that is the model's judgement, not this product's guarantee, and the same
+#: turn on a loaded box or a different model is the 2026-09-16 incident again.
+#:
+#: The shape is: the visual's name, optionally then the picture noun, then a
+#: RELATION that says what the picture is of. "floor plan OF a 2bhk", "circuit
+#: diagram FOR an LED", "chord diagram OF who emails whom", "network diagram
+#: FROM this edge list". A bare mention keeps no relation — "the wireframe in
+#: that doc is unreadable" — and stays a remark.
+_NOUN_PHRASE_ASK_RE = re.compile(
+    r"^(?:\s*(?:diagram(?:me)?|chart|graph|plot|map|view|board|picture|visual|visuali[sz]ation)s?)?"
+    r"\s+(?:of|for|from|showing|shows|between|across|by|per|with)\b",
+    re.I,
+)
+#: The same relation words, looked for INSIDE the match. `_NETWORK_PATTERN`'s
+#: data arm swallows its own relation ("network diagram FROM this edge list"),
+#: so there is nothing left after the match to read.
+_RELATION_INSIDE_RE = re.compile(r"\b(?:of|for|from|showing|between|across|by|per|with)\b", re.I)
+
+
 def named_unsupported(text: str) -> Optional[Visual]:
     """The first visual named in `text` that this platform cannot draw.
 
@@ -316,14 +462,23 @@ def named_unsupported(text: str) -> Optional[Visual]:
 def asked_for(text: str) -> Optional[Visual]:
     """The visual this text ASKS for and this platform cannot draw.
 
-    The name plus a word that asks to see it. "Plot this on a map", "show it
-    on a map", "can you draw a choropleth" are requests; "the treemap in that
-    paper is unreadable" is not.
+    The name plus either a word that asks to see it — "plot this on a map",
+    "can you draw a choropleth" — or the noun-phrase shape people type instead
+    of a verb: "choropleth of revenue by state" (`_NOUN_PHRASE_ASK_RE`). "The
+    treemap in that paper is unreadable" is neither, and stays a remark.
     """
-    v = named_unsupported(text)
+    t = (text or "")[:4000]
+    v = named_unsupported(t)
     if v is None:
         return None
-    return v if _ASK_RE.search((text or "")[:4000]) else None
+    if _ASK_RE.search(t):
+        return v
+    m = re.search(v.pattern, t, re.I)
+    if m is None:
+        return None
+    if _NOUN_PHRASE_ASK_RE.match(t[m.end():]) or _RELATION_INSIDE_RE.search(m.group(0)):
+        return v
+    return None
 
 
 # ------------------------------------------------------------- the answer --

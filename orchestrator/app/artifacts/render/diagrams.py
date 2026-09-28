@@ -122,7 +122,26 @@ from . import theme
 #: exactly four slots wide and has no fifth that passes.
 DIAGRAM_ROLES: Tuple[str, ...] = ("service", "store", "model", "external")
 
-#: chart_spec.DEFAULT_PALETTE slots 1-4, in that fixed order. Validated above.
+#: chart_spec.DEFAULT_PALETTE slots 1-4, in that fixed order. Validated above,
+#: and RE-VALIDATED 2026-09-28 because feat/understand-every-picture-ask routes
+#: many more requests down this path — every flow chart, org chart, dependency
+#: graph, state diagram and mind map that used to be answered "attach a CSV"
+#: now arrives here. `scripts/validate_palette.js "#2F6FB2,#E07B00,#0E9D9A,#C0566B"
+#: --mode light`, surface #fcfcfb: ALL CHECKS PASS, with the same two warnings
+#: the design already answers —
+#:
+#:   CVD separation  #C0566B <-> #0E9D9A  ΔE 7.1 deutan (tritan 28.4), inside
+#:                   the 6-8 floor band, legal only with secondary encoding;
+#:   contrast        #E07B00 at 2.92:1, under 3:1, relief required.
+#:
+#: Both obligations are met by construction and not by luck: `spec.DiagramNode
+#: .label` is min_length=1 so every box carries its own text, `_legend_for`
+#: names each role a diagram declares, and the fills are blended 0.78 toward
+#: white so the label's contrast does not move with the role.
+#:
+#: `--mode dark` FAILS the lightness band on #E07B00 and is NOT APPLICABLE: this
+#: module is paper-only (see the module docstring) and never draws on a dark
+#: surface. The browser's mermaid is a separate renderer with its own classDefs.
 ROLE_COLOURS: Dict[str, str] = {
     "service": "#2F6FB2",
     "store": "#E07B00",
@@ -545,6 +564,290 @@ def _arrowhead_became_the_target(m: "re.Match[str]", *arrow_groups: str) -> bool
 _DECL_RE = re.compile(rf"^{_node_part('a')}$")
 
 
+# ------------------------------------------- other heads, same picture --
+#
+# ELEVEN OF THE TWELVE KINDS THE BROWSER DRAWS BECAME "Diagram omitted"
+# (2026-09-28). `_DIR_RE` accepts `flowchart`/`graph`, so a source opening
+# `erDiagram`, `stateDiagram-v2` or `mindmap` refused at its first line and
+# `md_import` substituted a callout. Measured that day by calling
+# `parse_mermaid` on twelve real sources: `flowchart` parsed; the other eleven
+# were all refused. So "a docx of the schema with an ER diagram" and "export
+# the roadmap as a pdf with a mind map" routed perfectly — 7/7 on the
+# diagram-in-file label — and then shipped an apology where the picture goes.
+#
+# THREE OF THEM ARE THE SAME PICTURE IN DIFFERENT WORDS. An `erDiagram`, a
+# `stateDiagram` and a `mindmap` are each literally a set of named nodes and
+# labelled edges between them, which is exactly what the flowchart layout in
+# this module draws. Rewriting one into the flowchart grammar loses the shape of
+# the boxes and nothing else — no arrow moves, no label changes, no edge is
+# invented — so the picture a reader sees is the picture the model drew.
+#
+# THE OTHER EIGHT ARE NOT, AND ARE NOT TRANSLATED. A `sequenceDiagram` has a
+# time axis, activations and loops; a `gantt` has dates on a scale; a `journey`
+# has a rating per step; `classDiagram`, `gitGraph`, `kanban`, `timeline` and
+# `quadrantChart` each carry something a box-and-arrow layout cannot hold.
+# Drawing them as flowcharts would be drawing a DIFFERENT picture, which this
+# module's promise forbids — so they keep the callout, and `md_import` now names
+# the kind in it instead of apologising anonymously.
+
+#: The heads this module can rewrite, and what each one is.
+TRANSLATABLE = ("erdiagram", "statediagram", "statediagram-v2", "mindmap")
+
+#: The heads it cannot, with the reason a reader is given. Read by md_import.
+UNTRANSLATABLE_REASON: Dict[str, str] = {
+    "sequencediagram": "a sequence diagram carries a time axis that a page of boxes and arrows cannot hold",
+    "classdiagram": "a class diagram carries fields and methods inside each box",
+    "gantt": "a Gantt chart needs dates on a scale",
+    "journey": "a user journey carries a rating for every step",
+    "timeline": "a timeline needs dates on a scale",
+    "gitgraph": "a git graph carries branch positions",
+    "kanban": "a kanban board carries cards in columns",
+    "quadrantchart": "a quadrant chart needs two axes",
+    "pie": "a pie chart needs its slice values",
+    "radar": "a radar chart needs an axis per score",
+    "sankey": "a Sankey diagram needs its flow volumes",
+    "treemap": "a treemap needs nested areas",
+    "block": "a block diagram carries its own stacking",
+    "packet": "a packet diagram carries bit offsets",
+    "c4context": "a C4 context diagram carries its own notation",
+    "requirementdiagram": "a requirement diagram carries the type of each link",
+    "xychart": "an xy chart needs plotted values",
+    "architecture": "an architecture-beta diagram carries its own notation",
+}
+
+
+def head_of(source: str) -> str:
+    """The mermaid head of a source, lowercased, or "".
+
+    Reads past a `%%{…}%%` directive and a `---`-fenced frontmatter block the
+    same way `frontend/lib/mermaid.ts withoutPreamble` does, so this module and
+    the browser agree on what the first line IS.
+    """
+    text = re.sub(r"%%\{[\s\S]*?\}%%", "", source or "")
+    text = re.sub(r"^\s*---[ \t]*\r?\n[\s\S]*?\r?\n[ \t]*---[ \t]*(\r?\n|$)", "", text)
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("%%"):
+            continue
+        return re.split(r"[\s]", line, 1)[0].strip().lower()
+    return ""
+
+
+#: An erDiagram relationship: `USERS ||--o{ SESSIONS : has`. The cardinality
+#: glyphs are a closed set in mermaid and are read as one token; the label after
+#: the colon is the relationship's own name and is kept verbatim.
+_ER_REL_RE = re.compile(
+    r"^(?P<a>[A-Za-z_][\w-]{0,39})\s+"
+    r"(?P<card>[|{}o<>\-.]{2,8})\s+"
+    r"(?P<b>[A-Za-z_][\w-]{0,39})\s*(?::\s*(?P<label>[^\n]{0,120}?))?\s*$"
+)
+#: A state transition: `Queued --> Running : picked up`, `[*] --> Queued`.
+_STATE_RE = re.compile(
+    r"^(?P<a>\[\*\]|[A-Za-z_][\w-]{0,39})\s*(?P<arrow>-->|-\.->)\s*"
+    r"(?P<b>\[\*\]|[A-Za-z_][\w-]{0,39})\s*(?::\s*(?P<label>[^\n]{0,120}?))?\s*$"
+)
+#: `state Queued as "Waiting to run"` / `state "Waiting to run" as Queued`.
+_STATE_DECL_RE = re.compile(
+    r'^state\s+(?:"(?P<qlabel>[^"]{0,120})"\s+as\s+(?P<qid>[A-Za-z_][\w-]{0,39})'
+    r'|(?P<id>[A-Za-z_][\w-]{0,39})\s+as\s+"?(?P<label>[^"\n]{0,120}?)"?)\s*$'
+)
+#: A mindmap node: the indentation is the tree, and the label may wear any of
+#: mermaid's shape brackets.
+#:
+#: TWO ALTERNATIVES, NOT ONE OPTIONAL ID, and the reason is a bug the rendered
+#: PNG showed that no assertion in this file would have. Written as one branch
+#: with an OPTIONAL id in front of an OPTIONAL bracket, the id group happily
+#: matched the first WORD of a bracket-less label and the rest became the label:
+#:
+#:     "Upload reliability"  -> id="Upload"    label="reliability"
+#:     "Fast lane"           -> id="Fast"      label="lane"
+#:     "Diagrams in files"   -> id="Diagrams"  label="in files"
+#:
+#: Every multi-word branch of the mind map was drawn under its LAST word, and
+#: the picture was wrong in a way only looking at it could show. An id exists in
+#: mermaid only when a bracket follows it (`root((Roadmap))`, `a[Feature A]`),
+#: so that is its own branch now and a line without brackets is a plain label,
+#: whole.
+_MIND_RE = re.compile(
+    # `root((Roadmap))`, `a[Feature A]`, `x{Decision}` — an id THEN a bracket.
+    r"^(?P<indent>[ \t]*)(?:"
+    r"(?P<id>[A-Za-z_][\w-]{0,39})\s*(?:\(\(|\[\[|\[|\(|\{\{|\{)\s*"
+    r"(?P<label>[^\n]*?)\s*(?:\)\)|\]\]|\]|\)|\}\}|\})\s*"
+    # …or the whole line, brackets and all absent.
+    r"|(?P<plain>[^\n]+?)\s*"
+    r")$"
+)
+
+
+#: `spec.DiagramNode.label` is `max_length=48` and `spec.DiagramEdge.label`
+#: `max_length=24`. A rewrite that hands either a longer string gets the whole
+#: diagram rejected by pydantic and the picture is lost to the callout it was
+#: rewritten to avoid, so the two ceilings are enforced HERE, where the text is
+#: still in hand and can be cut with an ellipsis a reader understands.
+_NODE_LABEL_CHARS = 48
+_EDGE_LABEL_CHARS = 24
+
+
+def _q(text: str, limit: int = _NODE_LABEL_CHARS) -> str:
+    """A label safe inside the flowchart grammar this module reads back: no
+    quote, pipe, bracket or arrow punctuation, and short enough for `spec`."""
+    out = re.sub(r'["|\[\]{}()<>]', " ", (text or "").replace("-->", " ").replace("--", " "))
+    out = " ".join(out.split())
+    return out if len(out) <= limit else out[: limit - 1].rstrip() + "\u2026"
+
+
+def as_flowchart(source: str) -> Optional[Tuple[str, str]]:
+    """An `erDiagram`, `stateDiagram` or `mindmap` rewritten as a `flowchart`.
+
+    Returns `(flowchart_source, note)` — the note naming anything the rewrite
+    left behind, for `md_import` to put in the document's notes — or None when
+    the head is not one of the three or the body cannot be read completely.
+
+    NOTHING IS GUESSED. A line this function does not recognise makes it return
+    None, exactly as `parse_mermaid` does, so the callout is still what a source
+    this module cannot read becomes.
+    """
+    head = head_of(source)
+    if head not in TRANSLATABLE or not source or len(source) > 20_000:
+        return None
+    lines = [l.rstrip() for l in source.splitlines()]
+    body = [l for l in lines[1:] if l.strip() and not l.strip().startswith("%%")]
+    if head == "mindmap":
+        return _mindmap_as_flowchart(body)
+    if head == "erdiagram":
+        return _er_as_flowchart(body)
+    return _state_as_flowchart(body)
+
+
+def rewrite_note(source: str) -> str:
+    """What `as_flowchart` left behind for this source, as a sentence, or "".
+
+    `md_import` appends it to the document's notes after a successful read, so a
+    reader who gets the picture is also told what the picture does not carry.
+    """
+    out = as_flowchart(source)
+    return out[1] if out else ""
+
+
+def _er_as_flowchart(body: List[str]) -> Optional[Tuple[str, str]]:
+    # TD, NOT LR, and the rendered PNG is why. Four entities in a chain laid out
+    # left to right filled the 6.3-inch box edge to edge: the boxes butted
+    # together, two arrowheads disappeared between them, and the "contains" and
+    # "produces" edge labels were painted over the box borders. The same graph
+    # downward has room for every label — compare `_state_as_flowchart`, which
+    # was TD from the start and reads cleanly at six nodes.
+    out: List[str] = ["flowchart TD"]
+    dropped = 0
+    depth = 0
+    for raw in body:
+        line = raw.strip().rstrip(";")
+        if depth:
+            # Inside an attribute block. Mermaid puts a table's COLUMNS here,
+            # which a flowchart box has nowhere to show, so they are counted
+            # and reported rather than silently lost.
+            if line == "}":
+                depth = 0
+            continue
+        if line.endswith("{"):
+            depth = 1
+            dropped += 1
+            continue
+        m = _ER_REL_RE.match(line)
+        if not m:
+            return None
+        label = _q(m.group("label") or "", _EDGE_LABEL_CHARS)
+        a, b = m.group("a"), m.group("b")
+        out.append(f'{a}["{_q(a)}"] -->|"{label}"| {b}["{_q(b)}"]' if label
+                   else f'{a}["{_q(a)}"] --> {b}["{_q(b)}"]')
+    if len(out) < 2:
+        return None
+    note = ("An ER diagram was drawn as boxes and arrows; the column lists inside "
+            f"{dropped} of its tables are not shown." if dropped else "")
+    return "\n".join(out), note
+
+
+def _state_as_flowchart(body: List[str]) -> Optional[Tuple[str, str]]:
+    out: List[str] = ["flowchart TD"]
+    labels: Dict[str, str] = {}
+    seen_terminal = False
+    for raw in body:
+        line = raw.strip().rstrip(";")
+        if line in ("}", "{") or line.startswith(("note ", "end note", "direction ")):
+            # `direction LR` is a hint the flowchart head already carries; a
+            # composite state's braces and a note are structure this layout has
+            # nowhere to put, so a source using them is refused rather than
+            # flattened.
+            if line.startswith("direction "):
+                continue
+            return None
+        d = _STATE_DECL_RE.match(line)
+        if d:
+            nid = d.group("qid") or d.group("id")
+            labels[nid] = _q(d.group("qlabel") or d.group("label") or nid)
+            continue
+        m = _STATE_RE.match(line)
+        if not m:
+            return None
+        ids = []
+        for side in ("a", "b"):
+            val = m.group(side)
+            if val == "[*]":
+                # mermaid's start/end marker. Which one it is depends on the
+                # side it sits on, and both get a box a reader can name.
+                nid = "START" if side == "a" else "DONE"
+                labels.setdefault(nid, "start" if side == "a" else "end")
+                seen_terminal = True
+            else:
+                nid = val
+                labels.setdefault(nid, _q(val))
+            ids.append(nid)
+        label = _q(m.group("label") or "", _EDGE_LABEL_CHARS)
+        arrow = "-.->" if m.group("arrow") == "-.->" else "-->"
+        a, b = ids
+        out.append(f'{a}["{labels[a]}"] {arrow}|"{label}"| {b}["{labels[b]}"]' if label
+                   else f'{a}["{labels[a]}"] {arrow} {b}["{labels[b]}"]')
+    if len(out) < 2:
+        return None
+    note = ("A state diagram was drawn as boxes and arrows; its start and end markers "
+            "are shown as boxes." if seen_terminal else "")
+    return "\n".join(out), note
+
+
+def _mindmap_as_flowchart(body: List[str]) -> Optional[Tuple[str, str]]:
+    """A mindmap's INDENTATION is its tree, so the rewrite is a stack.
+
+    Each line is a node; its parent is the nearest line above it with less
+    indentation. mermaid draws this as a radial map and the flowchart layout
+    draws it left to right, which is the same tree read the same way.
+    """
+    out: List[str] = ["flowchart LR"]
+    stack: List[Tuple[int, str]] = []          # (indent, node id)
+    used = 0
+    for raw in body:
+        m = _MIND_RE.match(raw)
+        if not m:
+            return None
+        label = _q(m.group("label") or m.group("plain") or m.group("id") or "")
+        if not label:
+            # A bracket on a line of its own is not a node and not something
+            # this reader understands.
+            return None
+        indent = len(m.group("indent").replace("\t", "    "))
+        used += 1
+        nid = f"m{used}"
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        if stack:
+            out.append(f'{stack[-1][1]}["{stack[-1][1]}"] --> {nid}["{label}"]'
+                       if False else f'{stack[-1][1]} --> {nid}["{label}"]')
+        else:
+            out.append(f'{nid}["{label}"]')
+        stack.append((indent, nid))
+    if used < 2:
+        return None
+    return "\n".join(out), ""
+
+
 def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> Optional[Dict[str, Any]]:
     """A ```mermaid fence → the fields of a `spec.Diagram`, or None.
 
@@ -561,6 +864,19 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
     """
     if not source or len(source) > 20_000:
         return None
+    if head_of(source) in TRANSLATABLE:
+        # An `erDiagram`, `stateDiagram` or `mindmap` IS a node-and-edge graph;
+        # `as_flowchart` restates it in the grammar below without moving an
+        # arrow or changing a label. A source it cannot read completely returns
+        # None here, and the caller keeps its callout.
+        rewritten = as_flowchart(source)
+        if rewritten is None:
+            return None
+        # The note does NOT travel in this dict: `spec.Diagram` is a strict
+        # model and an extra key makes it raise, which would lose the very
+        # picture the rewrite exists to keep. `rewrite_note` is how the caller
+        # asks for it.
+        return parse_mermaid(rewritten[0], max_nodes=max_nodes, max_edges=max_edges)
     direction = "TD"
     order: List[str] = []
     labels: Dict[str, str] = {}
