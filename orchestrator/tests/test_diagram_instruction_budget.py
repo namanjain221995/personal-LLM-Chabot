@@ -175,6 +175,41 @@ from pathlib import Path
 
 from app.engines import DIAGRAM_INSTRUCTION
 
+# WIDENED 2026-09-28: THE PROMPT TEACHES WHAT THE FILE PATH ACCEPTS.
+#
+# render/diagrams.parse_mermaid read ONE grammar (the flowchart) while this
+# string named seven types, so a sequenceDiagram the model wrote on request
+# drew in the chat and became a "Diagram omitted" callout in the PDF —
+# measured in the running container that morning: of 31 mermaid 11.17.0
+# grammars, 1 reached a file. The reader now accepts ten (flowchart/graph,
+# sequenceDiagram, classDiagram, stateDiagram-v2, erDiagram, mindmap,
+# timeline, journey, kanban, packet-beta), and this string names exactly
+# those ten, because a parser that accepts what the prompt never teaches
+# changes nothing for a person. It also names the six chart types (pie,
+# xychart, radar, sankey, quadrantChart, treemap) as NOT diagrams, since
+# they draw numbers the model typed and a document's charts come from data.
+#
+# THE COST, measured 2026-09-28 in the running orchestrator container on CPU
+# (tokenizers 0.22.2 over /models/repos/nvidia--Qwen3.6-35B-A3B-NVFP4--
+# 491c2f1ea524/tokenizer.json, load average 2.97, no GPU touched):
+#
+#     production (ae25da28, the 2026-09-27 wording)   365 tokens   1,602 chars   1,606 bytes
+#     THIS TREE                                       415 tokens   1,786 chars   1,790 bytes
+#
+# +50 tokens per prompt over production; +183 over origin/dev's 232, which is
+# EXACTLY the +183 / 5.29%-of-a-3,458-token-mean-prompt budget the
+# 2026-09-27 integration accepted (it accepted fix/diagram-roles' 415-token
+# wording; this tree spends the same 415 on ten type names instead of prose).
+# The first draft measured 431 and was trimmed to the budget: "zoomable,
+# downloadable", "system"/"multi-step" in the examples, and "and the diagram
+# fails to draw" after "syntax error" went, with no rule lost (every rule
+# test in this file still holds). The em-dash count is unchanged at two, so
+# UTF-8 bytes stay four over the character count.
+#
+# The 2026-09-27 constants below are kept under their own names because
+# the arithmetic they pin (+53 of restored fragments, -220 against the naive
+# merge) is the record of THAT edit and is still true of it.
+
 
 def _flat(path: Path) -> str:
     """A file's text with every run of whitespace collapsed to one space.
@@ -210,7 +245,21 @@ RECONCILED_2026_09_27_CHARS = 1602
 #: and "under ~20 nodes" — the two caps a release note had reported removed,
 #: and had not removed.
 #:
-#: This wording names TWENTY-TWO of the twenty-three and drops both caps.
+#: WIDENED AGAIN on 2026-09-28 when the ten native family drawers landed. The
+#: every-picture wording named twenty-two heads and promised nothing about
+#: WHERE each one draws, so the model could not know that a `gantt` renders in
+#: chat and never reaches a downloaded document. This wording splits the list:
+#: the ten that draw everywhere (flowchart/graph, sequenceDiagram, erDiagram,
+#: classDiagram, stateDiagram-v2, mindmap, timeline, journey, kanban, packet),
+#: the seven that render in chat only, and the six that are NUMBERS and belong
+#: in the chart lane where the app computes them from data.
+#:
+#: BOTH CAPS STAY GONE. "at most ONE diagram per answer" and "under ~20 nodes"
+#: were removed on 2026-09-28 and the ten-drawer branch put them back; the
+#: owner has ruled out caps three times, so the merge drops them again. The
+#: file path enforces its own limits in code (`_within_caps`), where a limit
+#: belongs -- a prompt that lies about the size of the answer costs a picture
+#: on every ask, not just the one over the cap.
 #: `architecture` is deliberately the one left out: mermaid's
 #: `architecture-beta` is experimental and `flowchart` draws a system
 #: architecture better, so naming it would spend tokens to make the model
@@ -223,15 +272,15 @@ RECONCILED_2026_09_27_CHARS = 1602
 #: load average 7.49 on 2026-09-28:
 #:
 #:   1,602 chars / 1,606 UTF-8 bytes / 365 tokens   (origin/main, ae25da28)
-#:   2,082 chars / 2,086 UTF-8 bytes / 497 tokens   (this tree)
+#:   2,044 chars / 2,048 UTF-8 bytes / 489 tokens   (this tree)
 #:
-#: +132 tokens per prompt, at every effort, at all eleven chat call sites —
-#: 3.82% of the 3,458-token mean golden prompt, and 1 token BELOW the +133
+#: +124 tokens per prompt, at every effort, at all eleven chat call sites —
+#: 3.59% of the 3,458-token mean golden prompt, and 9 tokens BELOW the +133
 #: the 2026-09-27 raise was accepted at. A first draft of this wording glossed
 #: every type and measured +312; it was compressed to a bare list for exactly
 #: this reason, and the gloss survives only where the type name alone does not
 #: say when to use it (gantt, quadrantChart, the flowchart family).
-CHARS_CEILING = 2082
+CHARS_CEILING = 2044
 
 #: The same string in UTF-8, measured on the same commit: 1,086. The
 #: document-vocabulary edit took it to 1,088 — two bytes, one extra em dash —
@@ -243,13 +292,13 @@ PRE_EDIT_UTF8_BYTES = 1086
 #: The same string in UTF-8 on this tree: 2,086. Two em dashes (U+2014, three
 #: UTF-8 bytes each) account for the four bytes over the character count — the
 #: count is still two, so the two units still differ by exactly 4.
-UTF8_BYTES_CEILING = 2086
+UTF8_BYTES_CEILING = 2048
 
 #: The measured token counts above, so the arithmetic in the prose is
 #: arithmetic this file performs. Re-measure both with the pinned tokenizer
 #: before moving the ceiling again; a character count is not a token count.
 TOKENS_MAIN = 365
-TOKENS_THIS_TREE = 497
+TOKENS_THIS_TREE = 489
 TOKENS_ACCEPTED_RAISE_2026_09_27 = 133
 
 #: The reconciliation this tree restored three fragments ON TOP OF, measured
@@ -280,7 +329,7 @@ RESTORED_FRAGMENT_CHARS = {
 def test_the_instruction_did_not_grow_in_characters():
     assert len(DIAGRAM_INSTRUCTION) <= CHARS_CEILING, (
         f"DIAGRAM_INSTRUCTION is {len(DIAGRAM_INSTRUCTION)} characters, {len(DIAGRAM_INSTRUCTION) - CHARS_CEILING} "
-        f"over the {CHARS_CEILING} measured for the every-picture wording "
+        f"over the {CHARS_CEILING} measured for the every-picture-and-which-reach-a-file wording "
         f"({len(DIAGRAM_INSTRUCTION) - PRE_EDIT_CHARS} over origin/dev's {PRE_EDIT_CHARS}); "
         "it reaches eleven chat call sites at every effort"
     )
@@ -318,20 +367,20 @@ def test_the_instruction_is_measured_in_the_unit_it_names():
     chars = len(DIAGRAM_INSTRUCTION)
     encoded = len(DIAGRAM_INSTRUCTION.encode("utf-8"))
     assert chars == CHARS_CEILING, (
-        f"{chars} characters; the every-picture wording measured {CHARS_CEILING} on 2026-09-28"
+        f"{chars} characters; the every-picture-and-which-reach-a-file wording measured {CHARS_CEILING} on 2026-09-28"
     )
     assert encoded <= UTF8_BYTES_CEILING, (
         f"DIAGRAM_INSTRUCTION is {encoded} UTF-8 bytes, over the {UTF8_BYTES_CEILING} measured for this edit"
     )
     assert encoded > chars, "this string carries non-ASCII, so the two units are not interchangeable"
     assert encoded - chars == 4, (
-        f"the reconciled wording spends two em dashes, so UTF-8 is 4 bytes over the "
+        f"the wording spends two em dashes, so UTF-8 is 4 bytes over the "
         f"character count; it is now {encoded - chars}"
     )
-    assert encoded - PRE_EDIT_UTF8_BYTES == 1000, (
-        f"the raise over origin/dev was measured at +1000 UTF-8 bytes; it is now "
+    assert encoded - PRE_EDIT_UTF8_BYTES == 962, (
+        f"the raise over origin/dev was measured at +962 UTF-8 bytes; it is now "
         f"{encoded - PRE_EDIT_UTF8_BYTES}. Re-measure the Fast cost before moving this "
-        f"(the measurement of record is +132 tokens per prompt over ae25da28, 3.82% of "
+        f"(the measurement of record is +124 tokens per prompt over ae25da28, 3.59% of "
         f"the 3,458-token mean golden prompt, 2026-09-28)."
     )
 
@@ -573,6 +622,57 @@ def test_the_role_clause_teaches_the_closed_list_and_bans_colour():
     # rule did not.
     assert "never write a colour of your own" in DIAGRAM_INSTRUCTION
     assert "no rgb()" in DIAGRAM_INSTRUCTION
+
+
+def test_the_prompt_teaches_exactly_the_types_the_file_path_accepts():
+    """1b of the 2026-09-28 widening: the two lists must match. Every family
+    render/mermaid_grammars.py reads is named in the string, every chart
+    type it refuses as a chart is named as NOT a diagram, and no excluded
+    grammar (gantt, gitGraph, C4, ...) is offered — offering one would send
+    the model to a type the file path turns into a callout. RED on the
+    2026-09-27 wording, which offered gitGraph and pie and never named
+    classDiagram, stateDiagram-v2, kanban or packet-beta."""
+    from app.artifacts.render import mermaid_grammars as G
+
+    taught = {"sequencediagram": "sequence", "classdiagram": "class", "statediagram-v2": "state",
+              "erdiagram": "er", "mindmap": "mindmap", "timeline": "timeline", "journey": "journey",
+              "kanban": "kanban", "packet-beta": "packet"}
+    assert set(taught.values()) == set(G.READERS), "a reader without a prompt line, or the reverse"
+    for header in taught:
+        assert G.header_keyword(header) == header
+    # THE LIST IS ORDERED, AND THE ORDER IS THE PROMISE. Every type the app
+    # draws is named, in one list; the ten with a reader come FIRST, and the
+    # sentence after the list says that the ten before `gantt` also draw inside
+    # a downloaded file. A type the file path refuses is therefore still
+    # offered -- the browser draws it -- but never promised in a file.
+    # Two branches met here: one listed only the ten and told the model to use
+    # ONLY those, which loses eleven pictures the browser draws; the other
+    # listed twenty-two and promised nothing about files, which loses the
+    # picture silently at import. The order carries both facts for the price of
+    # one list.
+    listed = DIAGRAM_INSTRUCTION.split("the app draws all of these: ", 1)[1].split(". The ten before", 1)[0]
+    ten = ("flowchart/graph", "sequenceDiagram", "erDiagram", "classDiagram", "stateDiagram-v2",
+           "mindmap", "timeline", "journey", "kanban", "packet")
+    for name in ten:
+        assert name in listed, name
+    gantt_at = listed.index("gantt")
+    for name in ten:
+        assert listed.index(name) < gantt_at, f"{name} has a reader, so it must be named before `gantt`"
+    for chat_only in ("gantt", "quadrantChart", "gitGraph", "block", "radar", "treemap",
+                      "sankey", "xychart", "pie", "requirementDiagram", "C4Context"):
+        assert chat_only in listed, f"{chat_only}: the browser draws it, so the model should know it exists"
+        assert listed.index(chat_only) >= gantt_at, f"{chat_only} has no reader, so it must come from `gantt` on"
+    assert "before `gantt` also draw inside a downloaded file" in DIAGRAM_INSTRUCTION
+
+    # The six that are numbers are sent to the chart lane by name.
+    numbers_clause = DIAGRAM_INSTRUCTION.split("give NUMBERS to a chart", 1)[1]
+    for name in ("pie", "xychart"):
+        assert name in numbers_clause, name
+    assert set(G.CHART_KEYWORDS.values()) == {"pie", "xychart", "radar", "sankey", "quadrant-chart", "treemap"}
+    assert "architecture" not in DIAGRAM_INSTRUCTION, (
+        "`architecture-beta` is experimental and `flowchart` draws a system architecture "
+        "better; naming it spends tokens to send the model to the worse renderer"
+    )
 
 
 def test_the_composer_does_not_import_it():

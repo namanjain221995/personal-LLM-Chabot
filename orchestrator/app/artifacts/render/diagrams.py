@@ -864,19 +864,75 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
     """
     if not source or len(source) > 20_000:
         return None
-    if head_of(source) in TRANSLATABLE:
-        # An `erDiagram`, `stateDiagram` or `mindmap` IS a node-and-edge graph;
-        # `as_flowchart` restates it in the grammar below without moving an
-        # arrow or changing a label. A source it cannot read completely returns
-        # None here, and the caller keeps its callout.
-        rewritten = as_flowchart(source)
-        if rewritten is None:
+    from . import mermaid_grammars as G
+
+    # FRONTMATTER: `---\ntitle: X\n---` at the very top is mermaid's way of
+    # titling any diagram. Only `title:` is read; a `config:` block or
+    # anything else there is a directive by another name and refuses.
+    src_lines = source.splitlines()
+    title = ""
+    if src_lines and src_lines[0].strip() == "---":
+        end = next((i for i in range(1, len(src_lines)) if src_lines[i].strip() == "---"), None)
+        if end is None:
             return None
-        # The note does NOT travel in this dict: `spec.Diagram` is a strict
-        # model and an extra key makes it raise, which would lose the very
-        # picture the rewrite exists to keep. `rewrite_note` is how the caller
-        # asks for it.
-        return parse_mermaid(rewritten[0], max_nodes=max_nodes, max_edges=max_edges)
+        for fm in src_lines[1:end]:
+            fm = fm.strip()
+            if not fm:
+                continue
+            if not fm.startswith("title:"):
+                return None
+            title = fm[6:].strip().strip('"').strip("'")
+        src_lines = src_lines[end + 1:]
+
+    # THE HEADER DECIDES THE GRAMMAR. A source whose first statement is a
+    # family this module reads goes to that family's reader; a keyword it
+    # does not read (gantt, pie, journey, gitGraph, ...) refuses HERE, at the
+    # header, rather than falling through to `_DECL_RE` below and becoming a
+    # box labelled "gantt" — which is what it did until 2026-09-28 (measured
+    # in the running container: `classDiagram\nA --> B\nB --> C` drew a
+    # fourth box called "classDiagram"). A headerless source stays a
+    # flowchart, as it always was.
+    if any(l.strip().startswith("%%{") for l in src_lines):
+        # `%%{init: ...}%%` is a directive wherever it sits. The flowchart
+        # loop below refuses it line by line; a family reader only sees the
+        # lines AFTER its header, so a directive placed before the header
+        # walked past both until this check (found by
+        # tests/test_mermaid_grammars.py on 2026-09-28).
+        return None
+    first_index = next((i for i, l in enumerate(src_lines) if l.strip() and not l.strip().startswith("%%")), None)
+    if first_index is not None:
+        first = src_lines[first_index].strip().rstrip(";")
+        keyword = G.header_keyword(first)
+        if keyword is not None and keyword not in ("flowchart", "graph"):
+            family = G.FAMILY_OF_KEYWORD.get(keyword)
+            fields = None
+            if family is not None and first.lower() == keyword:
+                fields = G.read_family(family, src_lines[first_index + 1:])
+            if fields is None:
+                # TRANSLATION IS THE SAFETY NET, never the first choice. A
+                # family with its own reader is drawn in its own shapes (ER
+                # crow's feet, state bullseyes, sequence lifelines); only when
+                # that reader cannot read this instance does `as_flowchart`
+                # restate an `erDiagram`, `stateDiagram` or `mindmap` in the
+                # flowchart grammar below, without moving an arrow or changing
+                # a label. Two designs for one job landed on parallel branches
+                # and the picture, not the branch, decides: a native drawing
+                # beats a translation, and a translation beats the plain
+                # callout a refusal leaves behind.
+                if head_of(source) in TRANSLATABLE:
+                    rewritten = as_flowchart(source)
+                    if rewritten is not None:
+                        # The note does NOT travel in this dict: `spec.Diagram`
+                        # is strict and an extra key makes it raise, which
+                        # would lose the very picture the rewrite exists to
+                        # keep. `rewrite_note` is how the caller asks for it.
+                        return parse_mermaid(rewritten[0], max_nodes=max_nodes, max_edges=max_edges)
+                return None
+            if title and not fields.get("title"):
+                fields["title"] = title
+            return _within_caps(fields)
+    source = "\n".join(src_lines)
+
     direction = "TD"
     order: List[str] = []
     labels: Dict[str, str] = {}
@@ -961,6 +1017,18 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
             g = m.groupdict()
             if not _ids_are_names(g["aid"]):
                 return None
+            # NO KEYWORD CHECK HERE, deliberately. Mermaid's flowchart lexer
+            # reserves no words, so `requirement`, `block`, `kanban`, `pie`,
+            # `info` and `Info` declared on their own line are all NODES in the
+            # browser, and main (ae25da28) drew every one of them. The header
+            # dispatch above already sends a source whose FIRST statement is a
+            # keyword to that keyword's own reader, which is the only place the
+            # spelling can mean a grammar. A bare-keyword refusal was tried on
+            # 2026-09-28 and measured against main: it refused five flowcharts
+            # main drew (`flowchart TD / requirement / design / requirement -->
+            # design`, `block`, `kanban`, `pie`, `info`), and declaring nodes on
+            # their own lines first is a common habit of the model that writes
+            # them. A lost picture is worse than a box named after a keyword.
             touch(g["aid"], g["alabel"], g["arole"])
             continue
         return None
@@ -969,7 +1037,8 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
         return None
     if len(order) > max_nodes or len(edges) > max_edges:
         return None
-    return {
+    return _within_caps({
+        "title": title,
         "direction": direction,
         # `roles` holds only the names the closed vocabulary knows, so a node
         # nobody tagged — and a node tagged with a name nobody defined —
@@ -981,7 +1050,28 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
         # and the figure's legend named a role the model never wrote.
         "nodes": [{"id": nid, "label": labels[nid], "kind": roles.get(nid)} for nid in order],
         "edges": edges,
-    }
+    })
+
+
+def _within_caps(fields: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """`fields`, or None when the typed model refuses them: a label past its
+    cap, more entities or steps than spec.py allows. The READER refuses an
+    over-cap source, like any other it cannot carry, so the caller sees the
+    ordinary None and keeps its callout. Until 2026-09-28 the pydantic
+    ValidationError escaped `diagram_from_fields`, md_import caught it and
+    logged a "parsed but did not build" bug line for what is a size refusal.
+    """
+    if fields is None:
+        return None
+    from pydantic import ValidationError
+
+    from ..spec import diagram_from_fields
+
+    try:
+        diagram_from_fields(fields)
+    except ValidationError:
+        return None
+    return fields
 
 
 # ---------------------------------------------------------------- layout --
@@ -1467,7 +1557,17 @@ def layout_diagram(diagram: Any, *, box_in: Tuple[float, float] = PORTRAIT_BOX_I
     that gets closest does, with `fits` False so the caller can give the
     figure more room. The declared direction is tried first, so a model that
     says LR gets LR whenever LR fits.
+
+    A diagram of another family (`spec.MermaidFigure`: a sequence, ER,
+    class, state, mindmap, timeline, journey, kanban or packet diagram) is
+    not a graph of boxes and is laid out by render/diagram_figures.py; what
+    comes back exposes the same `fits` / `effective_pt` / `fig_in` /
+    `display_in` the callers read.
     """
+    if getattr(diagram, "family", None):
+        from . import diagram_figures as F
+
+        return F.layout_figure(diagram, box_in=box_in)  # type: ignore[return-value]
     declared = "LR" if getattr(diagram, "direction", "TD") == "LR" else "TD"
     other = "TD" if declared == "LR" else "LR"
     roles = _legend_for(diagram)
@@ -1651,7 +1751,12 @@ def render_diagram_png(diagram: Any, out_path: str | Path, *,
         "path.simplify": True,
     }
     with matplotlib.rc_context(rc):
-        fig = _draw(layout)
+        if getattr(diagram, "family", None):
+            from . import diagram_figures as F
+
+            fig = F.draw_figure(layout)  # type: ignore[arg-type]
+        else:
+            fig = _draw(layout)
         try:
             buf = io.BytesIO()
             fig.savefig(buf, dpi=DPI, format="png", facecolor=PAPER, metadata={"Software": None})
@@ -1677,8 +1782,13 @@ def fonts_for(diagram: Any) -> Tuple[str, ...]:
     every text object, which on a 15-node diagram is hundreds of lines in the
     render worker's log for nothing.
     """
-    text = " ".join([getattr(diagram, "title", "") or ""] + [n.label for n in diagram.nodes]
-                    + [e.label for e in diagram.edges])
+    if getattr(diagram, "family", None):
+        from . import diagram_figures as F
+
+        text = F.figure_text(diagram)
+    else:
+        text = " ".join([getattr(diagram, "title", "") or ""] + [n.label for n in diagram.nodes]
+                        + [e.label for e in diagram.edges])
     families: List[str] = []
     for script in theme.unsupported_scripts(text):
         families.extend(theme.SCRIPT_FONTS.get(script, ()))
