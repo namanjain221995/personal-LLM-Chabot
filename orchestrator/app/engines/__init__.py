@@ -104,27 +104,137 @@ FORMAT_INSTRUCTION = (
     "of a summary."
 )
 
+#: The CLOSED role vocabulary a diagram may attach to a node.
+#:
+#: Shared verbatim with the frontend: `DIAGRAM_ROLES` in
+#: frontend/lib/mermaidTheme.ts turns each name into the `classDef` that paints
+#: it, and frontend/app/globals.css holds the paints as `--ts-diagram-<role>-*`
+#: for both themes. A diagram names a ROLE and never a colour, which is the
+#: whole reason a role can be allowed where a hex cannot: a name is a
+#: vocabulary we can validate on both sides, a hex is not.
+#:
+#: Adding a fifth name here without a paint on the other side would render as
+#: an uncoloured node, so tests/test_diagram_role_vocabulary.py asserts this
+#: tuple against the frontend's list and its CSS tokens.
+DIAGRAM_ROLES = ("service", "store", "model", "external")
+
 # Diagrams: the UI renders ```mermaid blocks as real, zoomable, downloadable
-# diagrams. The instruction is deliberately conservative — an earlier, more
-# eager version made the model decorate ordinary answers with diagrams and
-# invent giant, syntax-error-prone graphs with unreadable custom colors.
+# diagrams, and the document renderer now draws the same source as a coloured
+# figure inside a .docx and a .pdf (artifacts/render/diagrams.py). The
+# instruction stays deliberately conservative — an earlier, more eager version
+# made the model decorate ordinary answers with diagrams and invent giant,
+# syntax-error-prone graphs with unreadable custom colors.
+#
+# WHAT THE BAN ON style/classDef BECAME: a ROLE. The model names what a node
+# IS, from the closed list above, and the renderers pick the colour — which is
+# what makes a coloured diagram possible without letting a model choose an
+# unreadable pair. Both halves of that colour were already built and could not
+# meet: the frontend has carried the four-colour palette since 2026-09-22 and
+# this block banned `classDef` while never mentioning the `:::` form, so every
+# chat diagram painted on one default node fill, which is the owner's report.
+#
+# THE SIZE IS A TEST, AND IT WAS RAISED ONCE, DELIBERATELY. This string is
+# concatenated at ELEVEN call sites in EIGHT modules (chat.py x2, rag.py,
+# repo.py x2, agent.py, url.py x2, dataset.py, document.py, search.py), on the
+# chat path, at EVERY effort, with no gate — so a character added here is
+# prefill on every Fast turn in all eight of them. (A count of NINE engines,
+# which this comment and the budget test both used to give, was inherited from
+# an older header and is neither of the two real numbers; counted 2026-09-28,
+# on this tree and on origin/dev ff1a5d7c, by the last test in
+# tests/test_diagram_instruction_budget.py.) The
+# one-diagram cap, the "ordinary questions get none" rule and the ~20-node
+# legibility cap are therefore all kept; the three-diagram allowance for a
+# DOCUMENT lives on the artifact path, which never imports this string.
+#
+# Measured 2026-09-27 by importing the string on each tree:
+#
+#   origin/dev (1f80aa3, 4164bb8)          1,082 CHARACTERS, 1,086 UTF-8 bytes
+#   fix/document-vocabulary-r2             1,082 characters, 1,088 bytes
+#   fix/diagram-roles                      1,848 characters, 1,858 bytes
+#   naive merge, diagram-roles' wording    1,822 characters, 1,832 bytes
+#   integ/diagram-group (7f16f4b7)         1,549 characters, 1,553 bytes
+#   THIS FILE                              1,602 characters, 1,606 bytes
+#
+# The two branches wrote the same fix twice. This is ONE wording carrying every
+# rule from both: fix/diagram-roles' ban on a role outside `flowchart`/`graph`
+# (outside them `:::` is a parse error and the reader gets NO diagram, measured
+# by its author in mermaid 11.17 — strictly worse than grey, which is why that
+# wording was chosen over the shorter one), its colour-value ban and its two
+# accessibility rules, plus fix/document-vocabulary-r2's compression of the
+# surrounding prose. +520 characters over origin/dev is what could not be
+# removed while keeping the type ban: 71 of them are the seven diagram-type
+# names the ban has to name to be concrete, and the rest is the role list, its
+# glosses, the "do not invent a name" rule and the two accessibility rules.
+# tests/test_diagram_instruction_budget.py pins both units at the numbers
+# above and reads this comment, so neither can drift back.
+#
+# THE LAST 53 CHARACTERS ARE origin/dev's OWN PROSE, PUT BACK. The 1,549
+# reconciliation dropped three fragments that no test held, which is why the
+# loss was silent. Each changes what the model is told, so each is back and
+# pinned: "inside labels" (+14), without which the ban on brackets and pipes
+# reads globally and forbids the `A["Payments API"]` this very string then
+# requires; "custom colours break dark mode" (+36), the REASON the directive
+# ban exists, which the compression had replaced with what happens next;
+# and "prefer" over "use" for `flowchart TD`/`LR` (+3), because "use" makes
+# the flowchart mandatory four sentences before this string explains what to
+# do inside seven other diagram types. Two further fragments stay dropped and
+# are listed in the budget test so the account is complete: the second worked
+# example `(e.g. A["Login page"])`, and the adjective in "plain, SIMPLE".
+#
+# THE TOKEN COST, MEASURED 2026-09-27 — this is the unit prefill is charged
+# in. Pinned engine tokenizer, on CPU, no GPU touched (tokenizers 0.23.2 over
+# Model/repos/nvidia--Qwen3.6-35B-A3B-NVFP4--491c2f1ea524/tokenizer.json):
+#
+#   origin/dev 232 tokens; document-vocabulary-r2 240; diagram-roles 415;
+#   integ/diagram-group 356; THIS FILE 365.
+#
+# So +133 tokens per prompt over origin/dev, at every effort, in all eight
+# modules. Against the twelve context_assembly_golden fixtures — 41,496 tokens
+# on origin/dev, mean 3,458 per prompt, 43,092 here, exactly +133 on each of
+# the twelve — that is 3.846% of the mean prompt. The +183 / 5.29% figure the
+# integration accepted as the budget is fix/diagram-roles' 1,848-character
+# wording (415 tokens), NOT this one, which is 365 and lands 50 tokens under
+# it. Re-measured 2026-09-28 at load average 4.18, including origin/dev at
+# ff1a5d7c (still 232 tokens, still 41,496 over the twelve: neither
+# fix/deploy-honesty-r2 nor integ/max-gates touches this string or those
+# fixtures). The old note here claimed "+8 tokens per prompt / 30,832 -> 30,928
+# across the twelve golden fixtures"; that claim stays withdrawn, and the
+# numbers above replace it with first-hand ones.
+#
+# THE CHAT UI IS UNAFFECTED, CHECKED RATHER THAN ASSUMED. `A["x"]:::role`
+# reaches the browser's mermaid, which has no `classDef` for these names.
+# mermaid 11.17.0 `setClass` (dist/chunks/mermaid.core/chunk-RHFEMEQ7.mjs:423)
+# only pushes the name onto the node's class list; it never looks the class
+# up and never raises, so an undefined class is a CSS class nothing styles.
+# The frontend's own classDefs (fix/diagram-roles) are what paint them.
 DIAGRAM_INSTRUCTION = (
-    "\n\nDIAGRAMS: the interface renders ```mermaid code blocks as real "
-    "diagrams the user can zoom and download. Include one ONLY when the user "
-    "explicitly asks for a diagram/flowchart/visualization, or when you are "
-    "explaining something genuinely complex (a system architecture, a "
-    "multi-step process, entity relationships) where a picture is clearly "
-    "easier to understand than prose. Ordinary questions, short answers and "
-    "conversation must NOT contain a diagram. When you do draw one, follow "
-    "ALL of these rules: at most ONE diagram per answer; keep it SMALL "
-    "(under ~20 nodes — summarize, don't enumerate); prefer `flowchart TD` or "
-    "`flowchart LR`; one statement per line; every label in double quotes "
-    '(e.g. A["Login page"]) and short, with no parentheses, brackets, pipes '
-    "or markdown inside labels; NEVER use style, classDef, linkStyle, click "
-    "or %%{init}%% directives — the app applies its own theme and custom "
-    "colors break dark mode. Never draw ASCII-art boxes. Right after the "
-    "diagram, add one or two plain, simple sentences explaining what it "
-    "shows so a non-technical reader can follow it."
+    "\n\n"
+    "DIAGRAMS: ```mermaid blocks render as zoomable, downloadable "
+    "diagrams. Include one ONLY when the user explicitly asks for a "
+    "diagram/flowchart/visualization, or when a picture is easier to "
+    "follow than prose for something genuinely complex (a system "
+    "architecture, a multi-step process, entity relationships). "
+    "Ordinary questions, short answers and conversation must NOT "
+    "contain a diagram. When you do, follow ALL of these rules: at most "
+    "ONE diagram per answer; keep it SMALL (under ~20 nodes — "
+    "summarize, don't enumerate); prefer `flowchart TD` or `flowchart "
+    "LR`; one statement per line; every label in double quotes and "
+    "short, with no parentheses, brackets, pipes or markdown inside "
+    "labels; NEVER use style, classDef, linkStyle, click or %%{init}%% "
+    "directives and never write a colour of your own (no hex, no rgb(), "
+    "no colour name): custom colours break dark mode, and the app "
+    "paints a ROLE instead. In a `flowchart`/`graph` you MAY give a "
+    "node ONE role from this CLOSED list, written with `:::`: service "
+    "(code), store (data), model (an AI model), external (a person or "
+    'outside system) — A["Payments API"]:::service. Tag only the nodes '
+    "one fits; an invented name paints nothing. Put NO role in any "
+    "other type (sequenceDiagram, erDiagram, pie, journey, timeline, "
+    "mindmap, gitGraph): there `:::` is a syntax error and the diagram "
+    "fails to draw. The LABEL carries the meaning: two nodes must never "
+    "differ by colour alone, so it reads for someone who cannot see "
+    "colour. Never draw ASCII-art boxes. Right after it, add one or two "
+    "plain sentences saying what it shows so a non-technical reader can "
+    "follow it."
 )
 
 # Code: the UI renders fenced blocks with syntax highlighting and a copy

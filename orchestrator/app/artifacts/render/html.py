@@ -243,6 +243,24 @@ def chart_filename(ordinal: int) -> str:
     return f"chart-{int(ordinal)}.png"
 
 
+def spec_diagrams(spec: S.ArtifactSpec) -> List[S.Diagram]:
+    """Every diagram in the spec, in document order; the 1-based position is
+    the picture's file number. Diagrams are a document block only — a slide
+    has no diagram field — so a deck contributes none."""
+    body = spec.body
+    if isinstance(body, S.DocumentSpec):
+        return [b.diagram for b in body.blocks if isinstance(b, S.DiagramBlock)]
+    return []
+
+
+def diagram_filename(ordinal: int) -> str:
+    """Minted from an INTEGER, exactly as `chart_filename` is. No string the
+    model wrote ever reaches a filename: pdf.py's fetcher will serve only a
+    bare name inside the assets directory, and that guarantee holds only
+    while the name is ordinal-derived."""
+    return f"diagram-{int(ordinal)}.png"
+
+
 # -------------------------------------------------------- document plan --
 
 
@@ -345,7 +363,7 @@ def plan_document(spec: S.DocumentSpec) -> DocumentPlan:
             if isinstance(b, S.Paragraph):
                 lede_index = i
                 break
-            if isinstance(b, (S.TableBlock, S.ChartBlock)):
+            if isinstance(b, (S.TableBlock, S.ChartBlock, S.DiagramBlock, S.Code)):
                 break  # the first prose is not an opening statement
 
     return DocumentPlan(
@@ -664,6 +682,69 @@ def _chart_html(chart: S.Chart, ordinal: int, index: Dict[str, int]) -> str:
     return f'<figure class="chart"><img src="{chart_filename(ordinal)}" alt="{e(chart.title)}">{cap}</figure>'
 
 
+#: A code fence's language, re-checked HERE before it becomes a class name.
+#: spec.py already refuses anything else, but this is the module whose
+#: docstring promises that no model string reaches markup unchecked, and a
+#: class attribute is markup.
+_LANGUAGE_RE = re.compile(r"^[A-Za-z0-9+#._-]{0,20}$")
+
+#: What print.css does not carry, because assets/print.css belongs to another
+#: track: the figure rules for a diagram and the shaded block for code. Both
+#: are constants — no model string, no computed colour beyond the style
+#: module's own validated tokens.
+_BLOCK_CSS = (
+    "figure.diagram{margin:10pt 0 12pt 0;page-break-inside:avoid;text-align:center}"
+    "figure.diagram img{height:auto;max-width:100%}"
+    "figure.diagram figcaption{font-size:var(--caption-pt);color:var(--ink-faint);font-style:italic;"
+    "text-align:left;margin-top:3pt}"
+    "figure.diagram figcaption .fig-title{font-style:normal;font-weight:700;color:var(--ink-muted)}"
+    "figure.codeblock{margin:8pt 0 12pt 0;page-break-inside:avoid}"
+    "figure.codeblock pre{font-family:var(--font-mono);font-size:8.5pt;line-height:1.35;"
+    "background:var(--surface);border:0.5pt solid var(--border);border-left:3pt solid var(--primary);"
+    "border-radius:2pt;padding:6pt 8pt;margin:0;white-space:pre-wrap;word-wrap:break-word;overflow-wrap:break-word}"
+    "figure.codeblock pre code{font-family:var(--font-mono);color:var(--ink)}"
+    "figure.codeblock figcaption{font-size:var(--caption-pt);color:var(--ink-faint);font-style:italic;margin-top:3pt}"
+)
+
+
+def _code_html(block: S.Code) -> str:
+    """A fenced block. The text is kept verbatim and ESCAPED — it is either
+    model-authored or lifted out of an uploaded Markdown file, and this is
+    the only place it is turned into markup. The language becomes a class
+    name and is checked against a closed pattern first."""
+    lang = block.language if _LANGUAGE_RE.match(block.language or "") else ""
+    cls = f" class=\"lang-{e(lang)}\"" if lang else ""
+    cap = ""
+    if block.caption:
+        cap = f"<figcaption>{e(block.caption)}</figcaption>"
+    return f'<figure class="codeblock"><pre{cls}><code>{e(block.text)}</code></pre>{cap}</figure>'
+
+
+def _diagram_html(diagram: S.Diagram, ordinal: int, orientation: str = "portrait") -> str:
+    """A drawn diagram. The src is a bare filename minted from the ordinal;
+    the width is the size render/diagrams.py laid the figure out at, so the
+    picture is placed at the size its labels were measured for instead of
+    being scaled to the column and shrinking its text with it."""
+    from . import diagrams as D
+
+    box = D.LANDSCAPE_BOX_IN if orientation == "landscape" else D.PORTRAIT_BOX_IN
+    try:
+        layout = D.layout_for(diagram, box_in=box)
+        w, _h = layout.display_in
+    except Exception:  # pragma: no cover - the PNG step reports the real error
+        w = box[0]
+    bits = []
+    if diagram.title:
+        bits.append(f'<span class="fig-title">{e(diagram.title)}</span>')
+    if diagram.caption:
+        bits.append(e(diagram.caption))
+    cap = f"<figcaption>{' — '.join(bits)}</figcaption>" if bits else ""
+    return (
+        f'<figure class="diagram"><img src="{diagram_filename(ordinal)}" alt="{e(diagram.title) or "Diagram"}" '
+        f'style="width:{w:.2f}in">{cap}</figure>'
+    )
+
+
 def _kpis_html(row: S.KPIRow) -> str:
     items = "".join(
         f'<div class="kpi"><div class="kpi-value{_kpi_size_class(k.value)}">{e(k.value)}</div><div class="kpi-label">{e(k.label)}</div>'
@@ -902,6 +983,11 @@ def document_html(spec: S.DocumentSpec, plan: Optional[DocumentPlan] = None, res
         elif isinstance(b, S.ChartBlock):
             ordinal = sum(1 for x in plan.blocks[: i + 1] if isinstance(x, S.ChartBlock))
             main.append(_chart_html(b.chart, ordinal, index))
+        elif isinstance(b, S.Code):
+            main.append(_code_html(b))
+        elif isinstance(b, S.DiagramBlock):
+            ordinal = sum(1 for x in plan.blocks[: i + 1] if isinstance(x, S.DiagramBlock))
+            main.append(_diagram_html(b.diagram, ordinal, orientation))
         elif isinstance(b, S.Callout):
             main.append(_callout_html(b, R))
         elif isinstance(b, S.KPIRow):
@@ -917,7 +1003,7 @@ def document_html(spec: S.DocumentSpec, plan: Optional[DocumentPlan] = None, res
         body_classes.append("landscape")
     return (
         '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
-        f"<title>{e(spec.title)}</title><style>{_root_vars(plan.type, R=R)}{print_css()}{_generic_css(R)}{''.join(extra_css)}{_page_rules(plan, R, orientation)}</style></head>"
+        f"<title>{e(spec.title)}</title><style>{_root_vars(plan.type, R=R)}{print_css()}{_BLOCK_CSS}{_generic_css(R)}{''.join(extra_css)}{_page_rules(plan, R, orientation)}</style></head>"
         f'<body class="{" ".join(body_classes)}">{"".join(parts)}</body></html>'
     )
 
@@ -1392,6 +1478,7 @@ def workbook_document_html(spec: S.WorkbookSpec, transform: Optional[dict] = Non
 
 __all__ = [
     "print_css", "format_number", "cell_text", "spec_charts", "chart_filename",
+    "spec_diagrams", "diagram_filename",
     "PlannedHeading", "DocumentPlan", "plan_document", "PlannedSlide", "DeckPlan", "plan_deck", "fit_bullets",
     "fit_table", "BULLET_BOXES", "TABLE_MAX_ROWS", "TABLE_MAX_COLS",
     "citation_numbers", "document_html", "deck_html", "workbook_summary_html",

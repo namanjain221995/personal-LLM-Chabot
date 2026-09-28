@@ -19,8 +19,12 @@ WHAT MAPS TO WHAT.
                                  levels: a nested item is prefixed "– ")
     GFM pipe table               Table; numeric columns inferred by code;
                                  > 12 columns or > 200 rows split into parts
-    ``` fenced code              Callout "Code" (text kept verbatim)
-    ```mermaid                   Callout "Diagram omitted" — never executed
+    ``` fenced code              Code block (text kept verbatim, monospaced)
+    ```mermaid                   DiagramBlock, read by render/diagrams.py's
+                                 closed-grammar reader and DRAWN by code —
+                                 never executed, never fetched; a source it
+                                 cannot read keeps the old "Diagram omitted"
+                                 callout
     > quote                      Callout quote
     **bold**, _italic_, `code`   plain text (the spec has no inline runs)
     [text](url)                  "text (url)" for http/https/mailto only;
@@ -37,11 +41,14 @@ altChunk, OLE object or external image of the upload reaches the new file.
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, List, Optional, Sequence, Tuple
 
 from . import spec as S
 from . import types as T
+
+log = logging.getLogger(__name__)
 
 #: Validator ceilings from spec.py, mirrored so the importer splits instead of
 #: letting pydantic clip (a clipped list item is lost text).
@@ -49,6 +56,7 @@ _PARA_MAX = 6000
 _ITEM_MAX = 600
 _ITEMS_PER_LIST = 40
 _CALLOUT_MAX = 2000
+_CODE_MAX = 6000
 _HEADING_MAX = 200
 _TITLE_MAX = 120
 _COL_NAME_MAX = 80
@@ -133,6 +141,36 @@ def _split_text(text: str, limit: int) -> List[str]:
     if rest:
         out.append(rest)
     return out
+
+
+def _split_code(text: str, limit: int) -> List[str]:
+    """Chunks of at most `limit` characters, cut at LINE boundaries.
+
+    `_split_text` cuts prose at sentence and word boundaries, which is right
+    for prose and wrong for code: it would break a statement in the middle
+    and the second half would read as a different line. A single line longer
+    than the limit is cut hard, because there is nowhere better."""
+    text = (text or "").strip("\n")
+    if len(text) <= limit:
+        return [text] if text.strip() else []
+    out: List[str] = []
+    current: List[str] = []
+    size = 0
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if current:
+                out.append("\n".join(current))
+                current, size = [], 0
+            out.append(line[:limit])
+            line = line[limit:]
+        if current and size + len(line) + 1 > limit:
+            out.append("\n".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += len(line) + 1
+    if current:
+        out.append("\n".join(current))
+    return [c for c in out if c.strip()]
 
 
 def _cells(line: str) -> List[str]:
@@ -235,6 +273,45 @@ class _Builder:
         for chunk in _split_text(text, _CALLOUT_MAX):
             self.blocks.append(S.Callout(kind=kind, title=title[:120], text=chunk))
 
+    def code(self, language: str, text: str) -> None:
+        """A fenced block, kept VERBATIM as a real code block.
+
+        It used to become a note callout, which lost the monospacing, the
+        line breaks a reader needs and the `code_blocks` check the parity
+        eval scores. Nothing here interprets the text: it is carried to the
+        renderers as a string and escaped there."""
+        for chunk in _split_code(text, _CODE_MAX):
+            self.blocks.append(S.Code(language=language[:20], text=chunk))
+
+    def diagram(self, source: str) -> bool:
+        """A ```mermaid fence read into a typed diagram, or False.
+
+        NEVER EXECUTED AND NEVER FETCHED, exactly as before: the source is
+        read by a regular expression over a closed grammar in
+        render/diagrams.py, which refuses the whole fence on the first line
+        it does not recognise. What changed is only what happens when the
+        read SUCCEEDS — the document now gets the picture instead of a
+        callout apologising for its absence."""
+        from .render import diagrams as D
+
+        try:
+            fields = D.parse_mermaid(source)
+            if not fields:
+                return False
+            self.blocks.append(S.DiagramBlock(diagram=S.Diagram(**fields)))
+            return True
+        except Exception:
+            # A LINE, because silence here is indistinguishable from a fence
+            # the grammar refused. `parse_mermaid` returning None is the
+            # ordinary, expected path and stays quiet; an EXCEPTION is a bug
+            # in this module or in spec.Diagram's validation, and it reached
+            # the person as "Diagram omitted" with nothing in the log to say
+            # a diagram had been read and then lost. Not `log.exception`: this
+            # runs per fence on a user-supplied document, so a hostile upload
+            # must not be able to fill the log with tracebacks.
+            log.info("md_import: a mermaid fence parsed but did not build a DiagramBlock", exc_info=False)
+            return False
+
     def compact(self) -> None:
         """Past the block ceiling, adjacent paragraphs under one heading are
         joined (text kept), then adjacent lists of the same kind."""
@@ -264,7 +341,7 @@ class _Builder:
 def _block_text(b: Any) -> str:
     if isinstance(b, S.Heading):
         return b.text
-    if isinstance(b, (S.Paragraph, S.Callout)):
+    if isinstance(b, (S.Paragraph, S.Callout, S.Code)):
         return b.text
     if isinstance(b, S.Bullets):
         return "\n".join(b.items)
@@ -327,10 +404,14 @@ def markdown_to_document(md: str, *, title_hint: str = "") -> Tuple[S.DocumentSp
             i += 1
             code = "\n".join(body).strip("\n")
             if lang == "mermaid":
-                b.callout("note", "Diagram omitted", "A diagram in the answer was not reproduced in this document.")
-                b.notes.append("A mermaid diagram was omitted (diagrams are never executed while importing).")
+                if not b.diagram(code):
+                    # The fallback is exactly what every mermaid fence used to
+                    # get: a callout, because a source this reader could not
+                    # understand must never become a half-drawn picture.
+                    b.callout("note", "Diagram omitted", "A diagram in the answer was not reproduced in this document.")
+                    b.notes.append("A diagram in the answer could not be read, so it was left out (diagrams are never executed while importing).")
             elif code.strip():
-                b.callout("note", f"Code ({lang})" if lang else "Code", code)
+                b.code(lang, code)
             continue
         if not stripped:
             flush_para(); flush_list()

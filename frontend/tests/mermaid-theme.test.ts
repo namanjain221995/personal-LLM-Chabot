@@ -20,6 +20,8 @@
  * browser and looking at it; these tests pin the values the browser was given.
  */
 
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CATEGORICAL_SLOTS,
@@ -37,6 +39,7 @@ import {
   roleClassDefs,
   sanitizeDiagramSource,
   smallestLabelPx,
+  withoutRoleApplications,
   type ThemeMode,
 } from '../lib/mermaidTheme';
 import { diagramFileName, looksRenderable } from '../lib/mermaid';
@@ -213,6 +216,35 @@ describe('DIAG-05…10 · the role palette is legible and distinguishable', () =
       expect(
         contrast(paints[role].stroke, SURFACE[mode]),
         `${mode}/${role} stroke on card`,
+      ).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it.each(MODES)("DIAG-07b · %s · …and 3:1 on the role's OWN fill", (mode) => {
+    /**
+     * The other side of the same line.
+     *
+     * DIAG-07 above checks the stroke against the CARD, which is the boundary
+     * a person sees from outside the box. A stroke is drawn BETWEEN two
+     * colours, and the one on the inside is the role's own fill — a rule the
+     * card check cannot see at all, because the fill is a tint of the stroke's
+     * own hue and therefore the neighbour most likely to swallow it.
+     *
+     * Measured with the dataviz skill's validator, 2026-09-27: dark `service`
+     * #2f6fb2 on its own #22303f fill was 2.58:1 and light `store` #b7791f on
+     * #eae0d2 was 2.79:1 — outlines that passed DIAG-07 and then vanished
+     * into the box. Both are moved; this test is what stops them coming back.
+     *
+     * Not a stricter floor than DIAG-07 on purpose: 3:1 is the non-text
+     * contrast minimum, and the fill deliberately sits close to the card, so
+     * a stroke that clears 3:1 on both sides is the most a tint-plus-outline
+     * node can be asked for.
+     */
+    const paints = resolveRolePaints(mode);
+    for (const role of DIAGRAM_ROLES) {
+      expect(
+        contrast(paints[role].stroke, paints[role].fill),
+        `${mode}/${role} stroke on its own fill`,
       ).toBeGreaterThanOrEqual(3);
     }
   });
@@ -783,6 +815,46 @@ describe('DIAG-25 · the tokens are the source of truth', () => {
     expect(paints.service.stroke).toMatch(/^#[0-9a-f]{6}$/i);
   });
 
+  it('DIAG-25b · the literals equal the tokens they mirror, value for value', () => {
+    /**
+     * The runtime reads globals.css; every test in this file reads the
+     * literals. So a drift between them is invisible in BOTH directions: the
+     * suite would keep proving contrast on values the browser never paints.
+     *
+     * That is not hypothetical — this file's three stroke moves had to be made
+     * twice, once in each place, and the ONLY thing that would have caught a
+     * half-done edit is this test. It parses the two token blocks out of the
+     * stylesheet by the `--ts-diagram-ink` that opens each (dark first, then
+     * the `html.light` override) rather than by line number.
+     */
+    const css = readFileSync(
+      fileURLToPath(new URL('../app/globals.css', import.meta.url)),
+      'utf8',
+    );
+    const blocks = css.split('--ts-diagram-ink:').slice(1);
+    expect(blocks, 'one --ts-diagram-ink block per theme').toHaveLength(2);
+    const modes: ThemeMode[] = ['dark', 'light'];
+    modes.forEach((mode, i) => {
+      const block = blocks[i];
+      const ink = /^\s*(#[0-9a-f]{6})\s*;/i.exec(block)?.[1];
+      const paints = resolveRolePaints(mode);
+      expect(ink?.toLowerCase(), `${mode} --ts-diagram-ink`).toBe(
+        paints.service.ink.toLowerCase(),
+      );
+      for (const role of DIAGRAM_ROLES) {
+        for (const channel of ['fill', 'stroke'] as const) {
+          const token = new RegExp(
+            `--ts-diagram-${role}-${channel}:\\s*(#[0-9a-f]{6})\\s*;`,
+            'i',
+          ).exec(block)?.[1];
+          expect(token?.toLowerCase(), `${mode} --ts-diagram-${role}-${channel}`).toBe(
+            paints[role][channel].toLowerCase(),
+          );
+        }
+      }
+    });
+  });
+
   it('resolves to the literals with no DOM at all', () => {
     const paints = resolveRolePaints('light', null);
     for (const role of DIAGRAM_ROLES) {
@@ -976,5 +1048,93 @@ describe('DIAG-26…32 · the categorical palette', () => {
       for (const hex of set) expect(hex).toMatch(/^#[0-9a-f]{6}$/i);
       expect(categoricalInk(mode, null)).toMatch(/^#[0-9a-f]{6}$/i);
     }
+  });
+});
+
+// ------------------------------------------------------------- DIAG-33…33f
+
+/**
+ * DIAG-33 — a misplaced role costs the colour, never the diagram.
+ *
+ * The orchestrator's prompt now teaches the `:::role` form (2026-09-27,
+ * `DIAGRAM_ROLES` in orchestrator/app/engines/__init__.py), which is what makes
+ * this reachable at all: a model that reaches for a role in the WRONG diagram
+ * type used to lose the whole picture. Measured today, Chromium 153 /
+ * mermaid 11.17, against an esbuild bundle of the real <MermaidBlock>:
+ * `U:::external` in a sequenceDiagram threw "Parse error on line 6 … got
+ * 'TXT'" and the block showed "Couldn't render this diagram — showing the
+ * source"; `class U external` threw the same error with "got 'NEWLINE'". With
+ * the retry the same two sources draw a 450x267 sequence diagram.
+ *
+ * `withoutRoleApplications` is the RETRY source, not a filter: MermaidBlock
+ * only asks for it after a render has thrown, so none of these removals can
+ * touch a diagram that works.
+ */
+describe('DIAG-33 · a misplaced role costs the colour, never the diagram', () => {
+  it('DIAG-33 · a role application in a sequenceDiagram goes, statement and all', () => {
+    // Stripping only the `:::external` would leave a bare `U`, which is the
+    // SAME parse error — measured: "got 'NEWLINE'" instead of "got 'TXT'".
+    const src = [
+      'sequenceDiagram',
+      '  participant U as Browser',
+      '  participant A as Orchestrator',
+      '  U->>A: ask',
+      '  A-->>U: answer',
+      '  U:::external',
+    ].join('\n');
+    const out = withoutRoleApplications(src);
+    expect(out).not.toContain(':::');
+    expect(out.split('\n')).toEqual([
+      'sequenceDiagram',
+      '  participant U as Browser',
+      '  participant A as Orchestrator',
+      '  U->>A: ask',
+      '  A-->>U: answer',
+    ]);
+  });
+
+  it('DIAG-33b · a `class X <role>` statement goes; an unknown name stays', () => {
+    // Narrow on purpose. Outside the flowchart family a line is only a
+    // STATEMENT in some grammars: in a mindmap or a timeline the words are
+    // content, and a node labelled "class diagram" must survive a retry.
+    expect(withoutRoleApplications('sequenceDiagram\n  A->>B: hi\n  class A external'))
+      .toBe('sequenceDiagram\n  A->>B: hi');
+    const mine = 'sequenceDiagram\n  A->>B: hi\n  class A mine';
+    expect(withoutRoleApplications(mine)).toBe(mine);
+  });
+
+  it('DIAG-33c · a `:::` inside a quoted label is content, not syntax', () => {
+    const src = 'pie title Latency\n  "p99 :::slow" : 40\n  "p50" : 60';
+    expect(withoutRoleApplications(src)).toBe(src);
+  });
+
+  it('DIAG-33d · a role riding a semicolon goes with its own statement only', () => {
+    const out = withoutRoleApplications('erDiagram\n  A ||--o{ B : has; A:::store');
+    expect(out).toBe('erDiagram\n  A ||--o{ B : has');
+  });
+
+  it('DIAG-33e · a mindmap keeps a node whose label reads like a statement', () => {
+    const src = 'mindmap\n  root((Docs))\n    class diagram\n    sequence diagram';
+    expect(withoutRoleApplications(src)).toBe(src);
+  });
+
+  it('DIAG-33f · a source with no roles at all comes back byte-for-byte', () => {
+    for (const src of [
+      'sequenceDiagram\n  A->>B: hi',
+      'flowchart LR\n  A[One] --> B[Two]',
+      'timeline\n  title Rollout\n  2026 : first',
+      '',
+    ]) {
+      expect(withoutRoleApplications(src)).toBe(src);
+    }
+  });
+
+  it('DIAG-33g · the flowchart family never reaches the retry in the first place', () => {
+    // The colour lives where classDefs are legal; prepareDiagramSource is
+    // unchanged there, and the block only asks for the retry after a throw.
+    const flow = 'flowchart LR\n  A["Gateway"]:::service --> B["Queue"]:::store';
+    expect(prepareDiagramSource(flow, 'dark')).toContain(':::service');
+    expect(prepareDiagramSource(flow, 'dark')).toContain('classDef service');
+    expect(acceptsClassDefs(flow)).toBe(true);
   });
 });

@@ -88,8 +88,8 @@ _NAMED: Tuple[Visual, ...] = (
     Visual("geo", "a geographic chart", _GEO_WHY, "bar",
            r"\bgeo(?:graphic(?:al)?|[- ]?spatial)?\s+(?:charts?|plots?|graphs?|visuali[sz]ations?)\b|\bgeo\s?charts?\b"),
     Visual("map", "a map", _GEO_WHY, "bar", _MAP_PATTERN),
-    Visual("sankey", "a Sankey diagram", "this platform draws no flow diagrams, so there is no type that shows a quantity moving from one stage to the next", "bar",
-           r"\bsankeys?\b|\bflow\s+diagrams?\b", offer_without_table=False),
+    Visual("sankey", "a Sankey diagram", "this platform has no chart type that shows a quantity moving from one stage to the next", "bar",
+           r"\bsankeys?\b", offer_without_table=False),
     Visual("treemap", "a treemap", "this platform has no nested-area chart type", "pie", r"\btree\s?maps?\b"),
     Visual("sunburst", "a sunburst", "this platform has no nested-area chart type", "pie", r"\bsun\s?bursts?\b"),
     Visual("wordcloud", "a word cloud", "this platform has no word-cloud type", "bar", r"\bword\s?clouds?\b|\btag\s?clouds?\b"),
@@ -97,7 +97,7 @@ _NAMED: Tuple[Visual, ...] = (
     Visual("candlestick", "a candlestick chart", "this platform has no candlestick (open/high/low/close) type", "line",
            r"\bcandle\s?sticks?\b|\bohlc\b"),
     Visual("venn", "a Venn diagram", "this platform draws no set diagrams", "", r"\bvenn\b"),
-    Visual("network", "a network diagram", "this platform draws no node-and-edge diagrams", "",
+    Visual("network", "a network diagram", "this platform lays a diagram out from boxes and arrows that are named, never from the rows of a table, so there is no chart type that draws a network out of this data", "",
            r"\bnetwork\s+(?:diagrams?|graphs?|charts?)\b|\bnode[- ]link\b|\bforce[- ]directed\b"),
 )
 

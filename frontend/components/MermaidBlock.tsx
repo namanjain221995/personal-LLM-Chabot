@@ -44,6 +44,7 @@ import {
   mermaidTheme,
   prepareDiagramSource,
   smallestLabelPx,
+  withoutRoleApplications,
 } from '@/lib/mermaidTheme';
 import { CopyButton } from './CopyButton';
 import { useTheme } from './Providers';
@@ -83,6 +84,16 @@ export function MermaidBlock({ code }: { code: string }) {
   const { theme } = useTheme();
   const dark = theme === 'dark';
   const [svg, setSvg] = useState<string>('');
+  /**
+   * The source that actually DREW the diagram on screen.
+   *
+   * Normally identical to `source`; it differs only when the first render threw
+   * and the role-free retry below drew instead. The Code tab, the copy button
+   * and the PNG name all read this, because showing a source that was not the
+   * one drawn is a lie about the diagram — the same reason the sanitised
+   * source, not the model's raw text, has always been what they show.
+   */
+  const [drawn, setDrawn] = useState<string>('');
   const [error, setError] = useState<string>('');
   const [view, setView] = useState<View>('preview');
   const [userPicked, setUserPicked] = useState(false);
@@ -112,20 +123,50 @@ export function MermaidBlock({ code }: { code: string }) {
     // finished and be rendered as an empty diagram.
     if (!looksRenderable(code)) {
       setSvg('');
+      setDrawn('');
       return;
     }
+    // A source or theme change invalidates what the previous one drew, so the
+    // Code tab never shows a string that is no longer on screen. A functional
+    // update keeps the no-op case from costing a render.
+    setDrawn((prev) => (prev === source ? prev : ''));
     (async () => {
+      /**
+       * The source, then the same source with every role application removed.
+       *
+       * A role outside the flowchart family is FATAL, not inert: measured
+       * today in Chromium 153 / mermaid 11.17, `U:::external` in a
+       * sequenceDiagram is a parse error and the whole diagram is replaced by
+       * the error card. The prompt tells the model roles are for
+       * `flowchart`/`graph` only; this attempt is what happens when it puts one
+       * somewhere else anyway. It runs only AFTER a throw, so a diagram that
+       * renders is never rewritten.
+       */
+      const attempts = [source];
+      const roleFree = withoutRoleApplications(source);
+      if (roleFree !== source && roleFree.trim()) attempts.push(roleFree);
+      let last: unknown = null;
       try {
         const mermaid = await getMermaid(dark);
-        const id = `mmd-${(renderSeq += 1)}`;
-        const { svg: out } = await mermaid.render(id, source);
-        if (!cancelled) {
-          setSvg(out);
-          setError('');
+        for (const attempt of attempts) {
+          try {
+            const id = `mmd-${(renderSeq += 1)}`;
+            const { svg: out } = await mermaid.render(id, attempt);
+            if (!cancelled) {
+              setSvg(out);
+              setDrawn(attempt);
+              setError('');
+            }
+            return;
+          } catch (err) {
+            last = err;
+          }
         }
+        throw last;
       } catch (err) {
         if (!cancelled) {
           setSvg('');
+          setDrawn('');
           setError(err instanceof Error ? err.message : 'Diagram failed to render.');
         }
       }
@@ -216,6 +257,9 @@ export function MermaidBlock({ code }: { code: string }) {
     return () => document.removeEventListener('keydown', onKey);
   }, [full]);
 
+  /** What the Code tab shows and the copy button copies: what was drawn. */
+  const shown = drawn || source;
+
   const downloadPng = useCallback(async () => {
     const host = (full ? fullRef.current : hostRef.current) ?? hostRef.current;
     const el = host?.querySelector('svg');
@@ -259,7 +303,7 @@ export function MermaidBlock({ code }: { code: string }) {
               if (!png) return reject(new Error('export failed'));
               // The anchor MUST be in the document for Chromium to honour the
               // click, and the object URL must outlive the download start.
-              save(png, diagramFileName(source, 'png'));
+              save(png, diagramFileName(shown, 'png'));
               resolve();
             }, 'image/png');
           } catch (err) {
@@ -274,11 +318,11 @@ export function MermaidBlock({ code }: { code: string }) {
       // PNG rasterization can fail (tainted canvas, blocked image). Always
       // give the user a file: the SVG is vector, opens anywhere, and never
       // taints anything.
-      save(blob, diagramFileName(source, 'svg'));
+      save(blob, diagramFileName(shown, 'svg'));
     } finally {
       URL.revokeObjectURL(url);
     }
-  }, [source, dark, full]);
+  }, [shown, dark, full]);
 
   const pick = (v: View) => {
     setUserPicked(true);
@@ -345,7 +389,7 @@ export function MermaidBlock({ code }: { code: string }) {
       >
         <IconDownload size={15} />
       </button>
-      <CopyButton text={source} label="Copy diagram source" />
+      <CopyButton text={shown} label="Copy diagram source" />
     </>
   );
 
@@ -391,7 +435,7 @@ export function MermaidBlock({ code }: { code: string }) {
               </p>
             )}
             <pre tabIndex={0}>
-              <code>{source}</code>
+              <code>{shown}</code>
             </pre>
           </div>
         )}

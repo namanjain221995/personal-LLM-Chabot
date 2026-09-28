@@ -55,12 +55,12 @@ from __future__ import annotations
 
 import datetime as _dt
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import spec as S
 from .. import style as ST
 from . import theme
-from .html import DocumentPlan, cell_text, chart_filename, document_orientation, plan_document
+from .html import DocumentPlan, cell_text, chart_filename, diagram_filename, document_orientation, plan_document
 
 _OXML = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _INDIC = ("Devanagari", "Gujarati", "Bengali", "Gurmukhi", "Odia", "Tamil", "Telugu", "Kannada", "Malayalam")
@@ -624,6 +624,61 @@ def _chart(document, chart: S.Chart, image: Optional[str], cite: str, missing: L
         document.add_paragraph((chart.caption + cite).strip(), style="Caption")
 
 
+def _diagram(document, diagram: S.Diagram, image: Optional[str], missing: List[str], box_in: Tuple[float, float]) -> None:
+    """A drawn diagram, placed at the size it was laid out for.
+
+    The chart twin above pins every picture to the content width, which
+    scales a tall figure down and takes its labels with it — a 9.5 pt node
+    label reached the page at 6.2 pt on the 15-node architecture graph. Here
+    the picture is placed at its own size, capped by the page box in BOTH
+    directions, so a figure that fits keeps its labels at full size and one
+    that does not is at least never stretched past the page.
+    """
+    from docx.shared import Inches
+    from . import diagrams as D
+
+    if image and Path(image).is_file():
+        try:
+            w_in, h_in = D.png_size_in(image)
+        except Exception:  # pragma: no cover - a PNG this process just wrote
+            w_in, h_in = box_in[0], box_in[1]
+        scale = min(1.0, box_in[0] / w_in if w_in else 1.0, box_in[1] / h_in if h_in else 1.0)
+        document.add_picture(str(image), width=Inches(round(w_in * scale, 3)))
+    else:
+        missing.append(diagram.title or "diagram")
+        document.add_paragraph(f"[Diagram not available: {diagram.title or 'untitled'}]", style="Caption")
+    bits = [b for b in (diagram.title, diagram.caption) if b]
+    if bits:
+        document.add_paragraph(" — ".join(bits), style="Caption")
+
+
+def _code(document, block: S.Code, R: Optional[ST.ResolvedStyle] = None) -> None:
+    """A fenced block: monospaced, shaded, with the text kept verbatim.
+
+    Word has no code style in the template, so the run carries the mono face
+    directly. The text is added as TEXT through python-docx, which escapes it
+    into the XML — nothing here writes markup.
+    """
+    from docx.shared import Pt
+
+    R = R or ST.resolve(None)
+    table = document.add_table(rows=1, cols=1)
+    cell = table.rows[0].cells[0]
+    _shade(cell, R.tokens.band)
+    _cell_border(cell, left=(18, R.tokens.primary), top=(0, ""), right=(0, ""), bottom=(0, ""))
+    p = cell.paragraphs[0]
+    p.style = document.styles["Body"]
+    mono = ST.font_face("Courier New")
+    for i, line in enumerate((block.text or "").split("\n")):
+        run = p.add_run(("\n" if i else "") + line)
+        run.font.name = mono.office_name if mono else theme.FONT_MONO
+        run.font.size = Pt(8.5)
+    if block.caption:
+        document.add_paragraph(block.caption, style="Caption")
+    else:
+        document.add_paragraph(style="Body")
+
+
 _CALLOUT_STATUS = {"note": "info", "tip": "success", "warning": "warning", "quote": "neutral"}
 
 
@@ -780,6 +835,12 @@ def render_docx(spec: S.DocumentSpec, out_path: str | Path, chart_dir: str | Pat
     sections: List[str] = ["", "", ""]  # the current heading text per level
     first_paragraph_done = False
     chart_width = 9.7 if orientation == "landscape" else 6.3
+    diagram_ordinal = 0
+    # The usable box for a figure, BOTH directions. Height matters as much as
+    # width: an eight-layer graph is tall, and a figure taller than the page
+    # is what Word scales down until its labels stop being readable.
+    from . import diagrams as _D
+    diagram_box = _D.LANDSCAPE_BOX_IN if orientation == "landscape" else _D.PORTRAIT_BOX_IN
     for i, b in enumerate(plan.blocks):
         if isinstance(b, S.Heading):
             h = heading_by_index[i]
@@ -815,6 +876,11 @@ def render_docx(spec: S.DocumentSpec, out_path: str | Path, chart_dir: str | Pat
         elif isinstance(b, S.ChartBlock):
             chart_ordinal += 1
             _chart(document, b.chart, str(chart_dir / chart_filename(chart_ordinal)), _cite_text(b.chart.sources, index), missing, chart_width)
+        elif isinstance(b, S.Code):
+            _code(document, b, R)
+        elif isinstance(b, S.DiagramBlock):
+            diagram_ordinal += 1
+            _diagram(document, b.diagram, str(chart_dir / diagram_filename(diagram_ordinal)), missing, diagram_box)
         elif isinstance(b, S.Callout):
             _callout(document, b, R, cs_font)
         elif isinstance(b, S.KPIRow):

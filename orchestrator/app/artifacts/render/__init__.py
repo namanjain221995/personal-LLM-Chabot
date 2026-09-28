@@ -288,6 +288,64 @@ def render_version(spec: S.ArtifactSpec, formats: Sequence[str], out_dir: str, *
                 raise _safe("chart", f"chart {ordinal} ({chart.title or chart.type}) could not be drawn") from exc
             report.chart_files.append(name)
 
+        # 1b. Diagrams: a second asset loop beside the charts one, writing
+        # `diagram-<n>.png` into the SAME directory under the same naming
+        # rule — so the picture rides the path that already exists. pdf.py's
+        # fetcher allows a bare `.png` from the assets directory and needs no
+        # change, and the DOCX embeds the file from disk. The name is
+        # appended to `chart_files`, which is what the pipeline passes to
+        # `store.publish(scratch=...)`: an embedded picture is scratch and is
+        # removed with the chart PNGs rather than left in the published
+        # version. It is timed as part of "charts" rather than under a key of its
+        # own, because `timings` keys are the FORMAT keys the pipeline reads
+        # for artifact_render_seconds{format} plus "charts" and "preview",
+        # and a new key is a change to that contract.
+        from . import diagrams as DG
+
+        spec_diagrams = H.spec_diagrams(spec)
+        doc_body = spec.body if isinstance(spec.body, S.DocumentSpec) else None
+        landscape = bool(spec_diagrams) and doc_body is not None and H.document_orientation(doc_body, ST.resolve(spec)) == "landscape"
+        box = DG.LANDSCAPE_BOX_IN if landscape else DG.PORTRAIT_BOX_IN
+        for ordinal, diagram in enumerate(spec_diagrams, start=1):
+            name = H.diagram_filename(ordinal)
+            try:
+                layout = DG.render_diagram_png(diagram, out / name, box_in=box)
+            except ImportError as exc:
+                raise RenderError("dependency_unavailable", "The chart library is not installed on this server.") from exc
+            except Exception as exc:
+                log.exception("diagram %d failed", ordinal)
+                raise _safe("diagram", f"diagram {ordinal} ({diagram.title or 'untitled'}) could not be drawn") from exc
+            report.chart_files.append(name)
+            if not layout.fits:
+                # Said plainly rather than shipped as an unreadable picture.
+                #
+                # ONE DECIMAL, not zero. `:.0f` printed "about 8 pt" for a
+                # 7.53 pt label — the floor the figure had just failed — so
+                # the sentence understated the very problem it exists to
+                # report. Measured on plain TD chains: 7.53 pt read "about
+                # 8 pt", 5.64 pt read "about 6 pt".
+                #
+                # THE ADVICE IS SHAPE-AWARE because landscape only helps the
+                # wide shape. Every diagram that reaches this branch is the
+                # TALL shape — `_split_wide_layers` folds a wide layer, so
+                # width stays inside the box and only depth overflows — and
+                # for a tall figure landscape is measurably worse: a 12-step
+                # chain goes 7.53 -> 5.02 pt and a 24-step chain 3.76 ->
+                # 2.51 pt on the 9.7 x 5.6 in landscape box. Telling the
+                # person to turn the page would send them the wrong way.
+                taller_than_wide = layout.fig_in[1] > layout.fig_in[0]
+                remedy = (
+                    "Splitting it into two diagrams, or describing some of these steps in prose instead, would make it "
+                    "readable — turning the page landscape would make it smaller still, because it is already taller "
+                    "than it is wide."
+                    if taller_than_wide else
+                    "Splitting it into two diagrams, or turning the page landscape, would make it readable."
+                )
+                report.warnings.append(
+                    f"The diagram “{diagram.title or 'untitled'}” has more in it than fits one page at a readable "
+                    f"size, so its labels print at about {layout.effective_pt:.1f} pt. " + remedy
+                )
+
     # 2. Formats, then 3. preview.pdf. `paths` is keyed role:format:slug
     # (CONTRACT-2 §11) and `entries` remembers, per key, the role, format,
     # title and sheet the FileRef needs; the order is the requested order.
