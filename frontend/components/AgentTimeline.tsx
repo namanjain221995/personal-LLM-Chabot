@@ -111,6 +111,11 @@ export function AgentTimeline({ steps }: { steps: AgentStep[] }) {
             const isLast = i === steps.length - 1;
             const stepOpen = openIds.has(step.id);
             const expandable = Boolean(step.detail);
+            // A running step's detail is live progress ("2 of 3 drafts done,
+            // 9.4 s" — the Max best-of rows since 2026-09-28), not a record
+            // to file away, so it shows without a click. A finished step's
+            // detail stays behind the toggle as before.
+            const showDetail = expandable && (stepOpen || step.status === 'running');
             return (
               <li key={step.id} className="relative flex gap-2.5 pb-2 last:pb-0">
                 {/* The rail: a hairline from this step's marker to the next. */}
@@ -159,7 +164,7 @@ export function AgentTimeline({ steps }: { steps: AgentStep[] }) {
                       {step.title}
                     </span>
                   )}
-                  {expandable && stepOpen && (
+                  {showDetail && (
                     <p
                       id={`${idBase}-step-${step.id}`}
                       className="mt-1.5 whitespace-pre-wrap rounded-md bg-surface-2/60 px-3 py-2 font-mono text-[12.5px] leading-relaxed text-muted"

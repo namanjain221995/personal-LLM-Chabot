@@ -390,7 +390,12 @@ def segment_ceiling(monkeypatch, message: str, mode: str, effort: str) -> int:
 
     monkeypatch.setattr(chat_engine.continuation, "stream_long_completion", spy)
 
-    async def emit(kind, payload):  # pragma: no cover - the spy raises first
+    async def emit(kind, payload):
+        # A Max turn narrates its best-of-N work as step frames BEFORE its
+        # drafts are asked for (2026-09-28); progress is not an answer. Any
+        # text, reasoning or meta before the model call is still a defect.
+        if kind == "step":
+            return
         raise AssertionError("the engine emitted before the model call")
 
     with pytest.raises(_Stop):

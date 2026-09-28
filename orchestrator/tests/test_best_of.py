@@ -149,7 +149,7 @@ def _collect_emit():
 def test_extra_high_streams_the_winner_and_stamps_meta(monkeypatch, caplog):
     monkeypatch.setattr(settings, "extra_high_samples", 3)
 
-    async def fake_generate(prompt, *, n, temperature, max_tokens):
+    async def fake_generate(prompt, *, n, temperature, max_tokens, **_):
         assert n == 3
         return _candidates("loser one", "the winning answer", "loser two")
 
@@ -181,7 +181,7 @@ def test_extra_high_streams_the_winner_and_stamps_meta(monkeypatch, caplog):
 def test_no_usable_candidates_falls_through_to_single_stream(monkeypatch):
     monkeypatch.setattr(settings, "extra_high_samples", 2)
 
-    async def all_dead(prompt, *, n, temperature, max_tokens):
+    async def all_dead(prompt, *, n, temperature, max_tokens, **_):
         return [best_of.Candidate(index=1, error="x"), best_of.Candidate(index=2, error="y")]
 
     async def fake_stream(messages, *, model_choice, effort, temperature, max_tokens):
@@ -230,7 +230,7 @@ def test_max_gets_best_of_n_whatever_the_model_value_says(monkeypatch, model_cho
     monkeypatch.setattr(settings, "extra_high_samples", 3)
     seen = {}
 
-    async def fake_generate(prompt, *, n, temperature, max_tokens):
+    async def fake_generate(prompt, *, n, temperature, max_tokens, **_):
         seen["n"] = n
         return _candidates("loser one", "the winning answer", "loser two")
 
@@ -330,7 +330,7 @@ def test_meta_reports_how_many_drafts_were_actually_compared(monkeypatch):
     """
     monkeypatch.setattr(settings, "extra_high_samples", 3)
 
-    async def two_dead(prompt, *, n, temperature, max_tokens):
+    async def two_dead(prompt, *, n, temperature, max_tokens, **_):
         return _mixed(None, "the only survivor", None)
 
     async def must_not_stream(messages, **kwargs):  # pragma: no cover
@@ -367,7 +367,7 @@ def test_a_narrower_comparison_is_named_as_one_not_as_a_single_generation(monkey
     understates what ran."""
     monkeypatch.setattr(settings, "extra_high_samples", 3)
 
-    async def one_dead(prompt, *, n, temperature, max_tokens):
+    async def one_dead(prompt, *, n, temperature, max_tokens, **_):
         return _mixed("first draft", None, "second draft")
 
     async def fake_select(question, candidates):
@@ -395,7 +395,7 @@ def test_a_full_house_of_drafts_claims_no_downgrade(monkeypatch):
     for was compared, nothing was lost and nothing says it was."""
     monkeypatch.setattr(settings, "extra_high_samples", 3)
 
-    async def all_good(prompt, *, n, temperature, max_tokens):
+    async def all_good(prompt, *, n, temperature, max_tokens, **_):
         return _candidates("one", "two", "three")
 
     async def fake_select(question, candidates):
@@ -446,3 +446,171 @@ def test_samples_of_one_disables_best_of(monkeypatch):
         "q", [], emit, mode="assistant", effort="extra_high",
     ))
     assert answer == "single"
+
+
+# ---------------------------------------------------------------------------
+# Max shows its work (2026-09-28). Measured on the real engine before this
+# (run_chat_engine in-process, n=5, load 3.9-5.2): first visible frame at
+# 11,228-17,415 ms (median 14,166) and it was always the LAST frame — the
+# drafts and the judge ran with nothing on the wire. After: 0-56 ms. The step
+# timeline (core/steps.py) is what a person now sees, and the FIRST frame of
+# the turn is a running step.
+# ---------------------------------------------------------------------------
+
+
+def _step_frames(events):
+    return [(d["id"], d["status"], d.get("detail", "")) for k, d in events if k == "step"]
+
+
+def test_generate_candidates_reports_each_landing_in_the_order_they_land(monkeypatch):
+    delays = {"1": 0.03, "2": 0.01, "3": 0.02}
+    calls = {"n": 0}
+
+    async def staggered(messages, *, effort, temperature, max_tokens):
+        calls["n"] += 1
+        me = str(calls["n"])
+        await asyncio.sleep(delays[me])
+        if me == "3":
+            raise RuntimeError("draft three died")
+        return "r", f"answer {me}"
+
+    monkeypatch.setattr(llm, "chat_completion_with_reasoning", staggered)
+    seen = []
+
+    async def on_candidate(candidate, done, total):
+        seen.append((candidate.index, candidate.usable, done, total))
+
+    candidates = asyncio.run(
+        best_of.generate_candidates(
+            [{"role": "user", "content": "q"}],
+            n=3, temperature=0.3, max_tokens=100, on_candidate=on_candidate,
+        )
+    )
+    # Completion order, not index order; the dead draft still counts.
+    assert seen == [(2, True, 1, 3), (3, False, 2, 3), (1, True, 3, 3)]
+    # The returned list is still in index order.
+    assert [c.index for c in candidates] == [1, 2, 3]
+
+
+def test_max_shows_its_work_before_the_first_draft_lands(monkeypatch):
+    monkeypatch.setattr(settings, "extra_high_samples", 3)
+    events, emit = _collect_emit()
+    frames_before_generation = []
+
+    async def fake_generate(prompt, *, n, temperature, max_tokens, on_candidate=None):
+        frames_before_generation.extend(events)
+        cands = _candidates("loser one", "the winning answer", "loser two")
+        for done, c in enumerate((cands[2], cands[0], cands[1]), start=1):
+            await asyncio.sleep(0.005)
+            await on_candidate(c, done, n)
+        return cands
+
+    async def fake_select(question, candidates):
+        return candidates[1], "clearest"
+
+    monkeypatch.setattr(best_of, "generate_candidates", fake_generate)
+    monkeypatch.setattr(best_of, "select_best", fake_select)
+
+    answer = asyncio.run(chat.run_chat_engine("hard question", [], emit, mode="assistant", effort="max"))
+    assert answer == "the winning answer"
+
+    # The FIRST frame of the turn is a running step, on the wire before the
+    # first engine call is made.
+    assert events[0][0] == "step"
+    assert frames_before_generation == [
+        ("step", {"id": 1, "title": "Drafting 3 answers in parallel", "status": "running", "detail": "0 of 3 drafts done"})
+    ]
+    steps = _step_frames(events)
+    assert steps[0] == (1, "running", "0 of 3 drafts done")
+    # Each landing draft updates the SAME row (mergeStep by id), never opens one.
+    assert steps[1][:2] == (1, "running") and steps[1][2].startswith("1 of 3 drafts done, ")
+    assert steps[2][:2] == (1, "running") and steps[2][2].startswith("2 of 3 drafts done, ")
+    assert steps[3][:2] == (1, "done") and steps[3][2].startswith("3 of 3 drafts done, ")
+    assert steps[3][2].endswith(" s")
+    assert steps[4] == (2, "running", "")
+    assert steps[5] == (2, "done", "kept draft 2: clearest")
+    assert [s[0] for s in steps] == [1, 1, 1, 1, 2, 2]
+    # The answer still streams after the work, and nothing streamed before it.
+    kinds = [k for k, _ in events]
+    assert kinds.index("reasoning") > kinds.index("step")
+    assert "".join(d["text"] for k, d in events if k == "token") == "the winning answer"
+    # The rows persist with the turn, so a reload shows them too.
+    meta = [d for k, d in events if k == "meta"][0]
+    assert [s["id"] for s in meta["steps"]] == [1, 2]
+    assert meta["steps"][1]["detail"] == "kept draft 2: clearest"
+    assert meta["best_of_winner"] == 2 and "effort_degraded" not in meta
+
+
+def test_a_single_survivor_is_not_called_a_comparison_in_the_timeline(monkeypatch):
+    monkeypatch.setattr(settings, "extra_high_samples", 3)
+
+    async def two_dead(prompt, *, n, temperature, max_tokens, on_candidate=None):
+        cands = [
+            best_of.Candidate(index=1, error="x"),
+            best_of.Candidate(index=2, reasoning="r", answer="the one that lived"),
+            best_of.Candidate(index=3, error="y"),
+        ]
+        for done, c in enumerate(cands, start=1):
+            await on_candidate(c, done, n)
+        return cands
+
+    async def must_not_stream(*a, **k):  # pragma: no cover
+        raise AssertionError("single stream must not run")
+        yield  # noqa
+
+    monkeypatch.setattr(best_of, "generate_candidates", two_dead)
+    monkeypatch.setattr(llm, "stream_chat_events", must_not_stream)
+    events, emit = _collect_emit()
+    asyncio.run(chat.run_chat_engine("q", [], emit, mode="assistant", effort="max"))
+
+    steps = _step_frames(events)
+    assert steps[1][2].startswith("1 of 3 drafts done (1 failed), ")
+    assert steps[-1][:2] == (1, "done") and steps[-1][2].startswith("3 of 3 drafts done (2 failed), ")
+    # No "Choosing the best draft" row: there was nothing to compare.
+    assert {s[0] for s in steps} == {1}
+    meta = [d for k, d in events if k == "meta"][0]
+    assert meta["effort_degraded"]["reason"] == "candidates_partially_failed"
+    assert meta["effort_degraded"]["delivered"] == "single_generation"
+    assert [s["status"] for s in meta["steps"]] == ["done"]
+
+
+def test_all_drafts_failed_closes_the_row_and_keeps_effort_degraded(monkeypatch):
+    monkeypatch.setattr(settings, "extra_high_samples", 2)
+
+    async def all_dead(prompt, *, n, temperature, max_tokens, on_candidate=None):
+        return [best_of.Candidate(index=1, error="x"), best_of.Candidate(index=2, error="y")]
+
+    async def fake_stream(messages, *, model_choice, effort, temperature, max_tokens):
+        yield "token", "plain answer"
+
+    monkeypatch.setattr(best_of, "generate_candidates", all_dead)
+    monkeypatch.setattr(llm, "stream_chat_events", fake_stream)
+    events, emit = _collect_emit()
+    answer = asyncio.run(chat.run_chat_engine("q", [], emit, mode="assistant", effort="max"))
+    assert answer == "plain answer"
+    steps = _step_frames(events)
+    assert steps[0] == (1, "running", "0 of 2 drafts done")
+    assert steps[-1][:2] == (1, "failed")
+    assert steps[-1][2].startswith("2 of 2 drafts done (2 failed), ")
+    assert steps[-1][2].endswith(" s; answering with a single generation")
+    # The row is closed BEFORE the single stream starts: no spinner over the answer.
+    kinds = [k for k, _ in events]
+    assert kinds.index("token") > max(i for i, k in enumerate(kinds) if k == "step")
+    meta = [d for k, d in events if k == "meta"][0]
+    assert meta["effort_degraded"]["reason"] == "candidates_failed"
+    assert [s["status"] for s in meta["steps"]] == ["failed"]
+
+
+def test_a_turn_that_dies_mid_draft_leaves_no_spinner(monkeypatch):
+    monkeypatch.setattr(settings, "extra_high_samples", 3)
+
+    async def parked(prompt, *, n, temperature, max_tokens, on_candidate=None):
+        raise RuntimeError("engine went away")
+
+    monkeypatch.setattr(best_of, "generate_candidates", parked)
+    events, emit = _collect_emit()
+    with pytest.raises(RuntimeError, match="engine went away"):
+        asyncio.run(chat.run_chat_engine("q", [], emit, mode="assistant", effort="max"))
+    steps = _step_frames(events)
+    assert steps[0][:2] == (1, "running")
+    assert steps[-1] == (1, "failed", "the turn ended before this step finished")

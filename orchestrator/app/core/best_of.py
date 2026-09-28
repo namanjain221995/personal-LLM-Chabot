@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Awaitable, Callable, List, Optional, Sequence, Tuple
 
 from .. import llm
 from ..continuity import LeaseLost, QueuedForRecovery
@@ -125,27 +125,42 @@ def _fold_usage(candidates: Sequence[Candidate]) -> None:
     )
 
 
+OnCandidate = Callable[[Candidate, int, int], Awaitable[None]]
+
+
 async def generate_candidates(
     messages: Sequence[dict],
     *,
     n: int,
     temperature: float,
     max_tokens: Optional[int],
+    on_candidate: Optional[OnCandidate] = None,
 ) -> List[Candidate]:
     """N full candidates, generated concurrently — never sequentially.
     Raises QueuedForRecovery when the turn was parked for the main model
     while a candidate waited: the caller must not fall through to a
-    single stream (which would only park again)."""
-    candidates = list(
-        await asyncio.gather(
-            *(
-                _generate_one(
-                    i + 1, messages, temperature=temperature, max_tokens=max_tokens
-                )
-                for i in range(n)
-            )
+    single stream (which would only park again).
+
+    `on_candidate(candidate, done, n)` is awaited as EACH candidate ends,
+    in the order they end, with `done` counting 1..n — the caller's chance
+    to tell the person "2 of 3 drafts done" while the third is still
+    generating. Every ending counts, a failed one too, so the count reaches
+    n whatever happened. The hook runs on the event loop between the
+    candidates' awaits and must be cheap; an exception in it is the
+    caller's own and ends the gather like any other."""
+    landed = 0
+
+    async def _one(index: int) -> Candidate:
+        nonlocal landed
+        candidate = await _generate_one(
+            index, messages, temperature=temperature, max_tokens=max_tokens
         )
-    )
+        landed += 1
+        if on_candidate is not None:
+            await on_candidate(candidate, landed, n)
+        return candidate
+
+    candidates = list(await asyncio.gather(*(_one(i + 1) for i in range(n))))
     # Before the parked re-raise: tokens spent before the park are spent.
     _fold_usage(candidates)
     for candidate in candidates:
