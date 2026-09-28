@@ -181,6 +181,13 @@ def fast_concurrent_retrieve() -> bool:
     return bool(getattr(settings, "knowledge_fast_concurrent_retrieve", _FAST_CONCURRENT_RETRIEVE))
 
 
+def speculate_static() -> bool:
+    """KNOWLEDGE_FAST_SPECULATE_STATIC (default on): guess STATIC, not RECENT,
+    for the question the deterministic pass could not classify. See the
+    comment at the speculative retrieval in `prepare`."""
+    return bool(getattr(settings, "knowledge_fast_speculate_static", True))
+
+
 def fast_speculative_salvage() -> bool:
     """KNOWLEDGE_FAST_SPECULATIVE_SALVAGE (default on): see `_salvage`."""
     return bool(getattr(settings, "knowledge_fast_speculative_salvage", True))
@@ -803,7 +810,14 @@ def _topical_precheck(question: str) -> Optional[bool]:
         return None
 
 
-async def _fast_topical_retrieval(question: str, out: Prepared) -> Optional[Retrieval]:
+async def _fast_topical_retrieval(
+    question: str,
+    out: Prepared,
+    *,
+    inflight: Optional["asyncio.Future"] = None,
+    inflight_started: Optional[float] = None,
+    verdict: Optional[Verdict] = None,
+) -> Optional[Retrieval]:
     """The STATIC retrieval under Fast's budget, or None when it was skipped.
 
     The pre-check runs BESIDE the retrieval, not ahead of it, so a question
@@ -828,8 +842,23 @@ async def _fast_topical_retrieval(question: str, out: Prepared) -> Optional[Retr
     """
     short = fast_topical_deadline_s()
     loop = asyncio.get_running_loop()
-    start = loop.time()
-    task = asyncio.ensure_future(retrieve(question, level=Freshness.STATIC, top_k=4))
+    start = loop.time() if inflight_started is None else inflight_started
+    # THE RETRIEVAL THIS BRANCH NEEDS MAY ALREADY BE RUNNING (2026-09-28).
+    # `prepare` starts a speculative STATIC retrieval before it asks the
+    # freshness router, and for a timeless question the router's answer is the
+    # level that retrieval already ran at. HEAD cancelled it and started this
+    # one from scratch, so the router's round trip (165-265 ms measured, 15 of
+    # 20 live Fast turns ask it) was spent in SERIES with a retrieval that had
+    # already begun. Reusing it is the same evidence, not merely similar:
+    # everything in `retrieve` up to and including the rerank ignores the
+    # verdict, and at STATIC `_partition` is a no-op
+    # (`web_memory.supersession_allowed` returns False for STATIC whatever the
+    # verdict), so the judged head sliced to top_k is what a second call
+    # computes. The speculative run is issued at top_k=4 for exactly this
+    # reason, so its over-fetch (`want`) matches too.
+    task = inflight if inflight is not None else asyncio.ensure_future(
+        retrieve(question, level=Freshness.STATIC, top_k=4)
+    )
     pre: Optional[asyncio.Future] = None
     if fast_topical_precheck():
         pre = _quiet(asyncio.ensure_future(db.run_in_thread(_topical_precheck, question)))
@@ -842,7 +871,10 @@ async def _fast_topical_retrieval(question: str, out: Prepared) -> Optional[Retr
             timeout = None if ends is None else max(0.0, ends - loop.time())
             done, _ = await asyncio.wait(waiting, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
             if task in done:
-                return task.result()
+                result = task.result()
+                if inflight is None:
+                    return result
+                return _reuse_static(question, result, verdict)
             if pre is not None and pre in done:
                 try:
                     could = pre.result()
@@ -872,7 +904,38 @@ async def _fast_topical_retrieval(question: str, out: Prepared) -> Optional[Retr
                 pending.cancel()
 
 
-async def _topical(question: str, out: Prepared, *, effort: str = "") -> Prepared:
+def _reuse_static(
+    question: str, result: Optional[Retrieval], verdict: Optional[Verdict]
+) -> Optional[Retrieval]:
+    """A speculative STATIC retrieval as the timeless branch's own.
+
+    `retrieve` with `cache_store=False` hands back the judged candidates on
+    `_judged` and never writes the cache, so the result is re-partitioned
+    under the real verdict and cached by the rule `retrieve` applies to its
+    own (non-empty, not degraded, not rerank-limited). A speculative run that
+    was served FROM the cache carries no `_judged` — it is already exactly
+    what a second call to the same key would return, so it is used as it is.
+    """
+    if not isinstance(result, Retrieval) or result.freshness is not Freshness.STATIC:
+        metrics.inc("knowledge_salvage_total", how="topical_unusable")
+        return result
+    if not hasattr(result, "_judged"):
+        metrics.inc("knowledge_salvage_total", how="topical_cache_hit")
+        return result
+    out = _web_memory.repartition(result, Freshness.STATIC, verdict, top_k=4)
+    cache_result(question, level=Freshness.STATIC, top_k=4, result=out)
+    metrics.inc("knowledge_salvage_total", how="topical_reused")
+    return out
+
+
+async def _topical(
+    question: str,
+    out: Prepared,
+    *,
+    effort: str = "",
+    inflight: Optional["asyncio.Future"] = None,
+    inflight_started: Optional[float] = None,
+) -> Prepared:
     """A timeless question answered from a STRONG local match, or nothing.
 
     This is what makes an indexed site a knowledge base: "how do I enable X"
@@ -886,7 +949,10 @@ async def _topical(question: str, out: Prepared, *, effort: str = "") -> Prepare
     """
     started = time.perf_counter()
     if effort == "fast":
-        fetched = await _fast_topical_retrieval(question, out)
+        fetched = await _fast_topical_retrieval(
+            question, out, inflight=inflight, inflight_started=inflight_started,
+            verdict=out.verdict,
+        )
         if fetched is None:
             _decided(out, "static_model")
             return out
@@ -988,6 +1054,8 @@ async def prepare(
     # A time-sensitive retrieval started while the router decides (Fast only).
     speculative: Optional[asyncio.Future] = None
     speculative_verdict: Optional[Verdict] = None
+    speculative_top_k = 5
+    speculative_started: Optional[float] = None
     started = time.perf_counter()
     try:
         if fast and router_on and router_would_be_asked(question, now_year=now.year):
@@ -1000,25 +1068,57 @@ async def prepare(
                 verdict = static_timeless_task()
             else:
                 if fast_concurrent_retrieve():
-                    # The router answers RECENT for a question that carries a
-                    # recency word far more often than anything else, so the
-                    # retrieval that answer needs starts NOW, from the offline
-                    # verdict re-labelled as the router's. It is used only if
-                    # the real verdict reads it identically (below).
+                    # WHICH LEVEL TO GUESS (revised 2026-09-28). The router is
+                    # asked only when the deterministic pass could not decide
+                    # (`router_would_be_asked` is `_deterministic(...) is
+                    # None`), and for that population `classify_offline` is
+                    # always the bare RECENT/'default'. So the old guess was
+                    # RECENT every time, while the router answers STATIC for
+                    # most of it: 13 of 15 on a graded corpus through the live
+                    # router, and 15 of 19 pre-passes on the live process
+                    # (knowledge_decision_total static_model 10 +
+                    # static_topical 5, against fast_lookup 2 + local 2). A
+                    # STATIC guess is therefore reused far more often; when
+                    # the router says RECENT or REALTIME the levels differ and
+                    # the full retrieval runs exactly as it does today, so the
+                    # EVIDENCE is the same either way and only the overlap
+                    # moves. KNOWLEDGE_FAST_SPECULATE_STATIC=false restores
+                    # the RECENT guess.
+                    # It is used only if the real verdict reads it identically
+                    # (below).
                     # It never WRITES the evidence cache (2026-09-13, second
                     # prover pass): the key carries no verdict, so a partition
                     # computed under a guessed 'router' reason that HEAD would
                     # never have computed could otherwise be served to a later
                     # turn whose router timed out ('default', no supersession).
                     # A reused result is cached below, under the real verdict.
-                    speculative_verdict = replace(
-                        classify_offline(question, now_year=now.year), reason="router"
+                    _offline = classify_offline(question, now_year=now.year)
+                    speculative_verdict = (
+                        replace(
+                            _offline,
+                            requirement=Freshness.STATIC,
+                            max_age_seconds=_MAX_AGE[Freshness.STATIC],
+                            reason="router",
+                        )
+                        if (speculate_static() and _offline.reason == "default")
+                        else replace(_offline, reason="router")
                     )
+                    # top_k 4 for a STATIC guess, 5 otherwise: the ONLY
+                    # consumer of a STATIC speculative run is the timeless
+                    # branch below (`_topical`, which asks for 4), and
+                    # `retrieve` derives its over-fetch from top_k, so the
+                    # numbers have to agree for the reuse to be the same
+                    # retrieval rather than a wider one. A time-sensitive
+                    # guess is unchanged: `reusable`/`_salvage` want 5.
+                    speculative_top_k = (
+                        4 if speculative_verdict.requirement is Freshness.STATIC else 5
+                    )
+                    speculative_started = asyncio.get_running_loop().time()
                     speculative = _quiet(asyncio.ensure_future(
                         retrieve(
                             question,
                             level=speculative_verdict.requirement,
-                            top_k=5,
+                            top_k=speculative_top_k,
                             effort=effort,
                             verdict=speculative_verdict,
                             cache_store=False,
@@ -1053,7 +1153,27 @@ async def prepare(
             # Timeless. The model's own knowledge is the right source — unless
             # this platform has already read something that answers it closely.
             if settings.living_knowledge_topical:
-                return await _topical(question, out, effort=effort)
+                # The speculative run IS this branch's retrieval when it was
+                # issued at STATIC/top_k=4 (see `_fast_topical_retrieval`).
+                handoff = (
+                    speculative
+                    if (
+                        speculative is not None
+                        and speculative_verdict is not None
+                        and speculative_verdict.requirement is Freshness.STATIC
+                        and speculative_top_k == 4
+                    )
+                    else None
+                )
+                if handoff is not None:
+                    # It is awaited inside `_topical` now, so the `finally`
+                    # below must not cancel it out from under that await.
+                    speculative = None
+                return await _topical(
+                    question, out, effort=effort,
+                    inflight=handoff,
+                    inflight_started=speculative_started if handoff is not None else None,
+                )
             return out
 
         if reusable:

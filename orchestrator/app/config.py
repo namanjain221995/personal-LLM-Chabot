@@ -1138,6 +1138,19 @@ class Settings:
         # rerank) a second time. Partition is the only verdict-dependent step
         # after the rerank, so the result equals the recomputation.
         self.knowledge_fast_speculative_salvage: bool = _bool("KNOWLEDGE_FAST_SPECULATIVE_SALVAGE", True)
+        # --- Pre-pass latency round (2026-09-28) ----------------------------
+        # KNOWLEDGE_FAST_SPECULATE_STATIC — which level the speculative Fast
+        # retrieval guesses for a question the deterministic pass could not
+        # classify. The router is asked ONLY for that population, and for it
+        # `classify_offline` is always the bare RECENT/'default', so the old
+        # guess was RECENT every time while the router answers STATIC for most
+        # of it (13 of 15 on a graded corpus through the live router; 15 of 19
+        # pre-passes on the live process). On: guess STATIC, so the timeless
+        # branch reuses the run instead of cancelling it and retrieving again
+        # after the round trip (measured 522 -> 356 ms, load 3.8-5.4). Off:
+        # the pre-2026-09-28 RECENT guess. Either way a verdict that does not
+        # match the guess runs the full retrieval, so the EVIDENCE is the same.
+        self.knowledge_fast_speculate_static: bool = _bool("KNOWLEDGE_FAST_SPECULATE_STATIC", True)
         # KNOWLEDGE_FAST_RERANK_WEAK_GATE — OPT-IN, default off. At Fast, skip
         # the cross-encoder for a time-sensitive question when no candidate has
         # dense >= 0.35 or lexical >= 0.34. Off: only the shadow counter
