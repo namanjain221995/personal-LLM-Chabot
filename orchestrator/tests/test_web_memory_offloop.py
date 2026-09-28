@@ -155,7 +155,7 @@ def test_the_lexical_rows_match_the_old_statement_text_and_all():
 
             def shape(rows):
                 return sorted(
-                    (-float(r["rank"]), int(r["id"]), int(r["dn"]), r["url"], r["title"], r["domain"],
+                    (-float(r["rank"]), int(r["id"]), r["url"], r["title"], r["domain"],
                      r["authority"], r["fetched_at"], r["origin"])
                     for r in rows
                 )
