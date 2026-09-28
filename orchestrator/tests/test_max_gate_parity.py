@@ -183,8 +183,21 @@ def _stub_every_model_call(monkeypatch, recorded, *, candidates=None):
         return continuation.LongResult(text=DRAFT, stop_reason="complete")
 
     async def fake_stream(messages, **kwargs):
-        recorded.append("single_stream")
-        yield "token", DRAFT
+        """Two callers share `llm.stream_chat_events` since 2026-09-28.
+
+        The Max loop's PLANNER streams now — before that it was a
+        non-streaming `llm.chat_completion`, and Max showed a step line and
+        then nothing at all for 15.5 seconds while it ran. The single-stream
+        path (no loop) uses the same API, so this stub names them apart by the
+        planner's own system prompt; recording both as "single_stream" would
+        make a turn that DID take the loop look as though it had skipped it.
+        """
+        planner = any(
+            "plan" in str(m.get("content", "")).lower() and m.get("role") == "system"
+            for m in messages
+        )
+        recorded.append("planner" if planner else "single_stream")
+        yield "token", "1. Executive Summary" if planner else DRAFT
 
     monkeypatch.setattr(llm, "chat_completion", fake_plan)
     monkeypatch.setattr(llm, "json_completion", fake_json)

@@ -275,8 +275,18 @@ async def run(
     try:
         # 1 --------------------------------------------------------- PLAN --
         await steps.open(STEP_PLAN)
+
+        async def _plan_delta(text: str) -> None:
+            """The plan goes to the THINKING panel, never to the answer.
+
+            `sink` tees into `pieces`, which becomes `result.text`; the plan
+            must not land there. Kind "reasoning" is what frontend/lib/sse.ts
+            renders in the thinking panel, which is where an account of how the
+            answer will be structured belongs."""
+            await emit("reasoning", {"text": text})
+
         try:
-            result.plan = await _plan(message, grounding, mode, brief)
+            result.plan = await _plan(message, grounding, mode, brief, on_text=_plan_delta)
             result.model_calls += 1
             await steps.done(_plan_detail(contract, result.plan))
         except (QueuedForRecovery, LeaseLost):
@@ -455,8 +465,35 @@ def _with_plan(messages: Sequence[dict], plan: str, brief: str = "") -> List[dic
     return body + [block]
 
 
-async def _plan(message: str, grounding: str, mode: str, brief: str = "") -> str:
+async def _plan(
+    message: str,
+    grounding: str,
+    mode: str,
+    brief: str = "",
+    *,
+    on_text: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> str:
     """One call, THINKING OFF, PLAN_MAX_TOKENS of answer.
+
+    STREAMED WHEN `on_text` IS GIVEN (2026-09-28), and that is the whole fix
+    for Max's silence. Measured on this box, 3 runs interleaved with Fast and
+    Think: a Max turn emitted its first `step` event at 1,267 ms and then
+    NOTHING AT ALL for 15.5 seconds — reasoning and the answer's first token
+    both arrived together at 16,823 ms. Fast reaches its first token in 341 ms.
+    A person watching Max sees a step line and then a dead screen for a quarter
+    of a minute.
+
+    The cause is not reasoning being discarded: this call runs with thinking
+    OFF on purpose (see the measurement below), so there is no reasoning to
+    show. The cause is that the plan — a real, readable 421-word account of how
+    the answer will be structured — was produced by a NON-STREAMING call and
+    shown to nobody until it was complete.
+
+    So it streams, and the caller puts it in the thinking panel. Same model,
+    same temperature, same ceiling, same thinking-off: only the delivery
+    changes. Without `on_text` the non-streaming call is used exactly as
+    before, which is what every offline caller and every test that does not
+    care about deltas keeps getting.
 
     It always runs on the main model, because llm.chat_completion sends to
     settings.llm_model — so there is no model to choose here. This used to
@@ -493,13 +530,31 @@ async def _plan(message: str, grounding: str, mode: str, brief: str = "") -> str
         lines.append("\nThis organisation's Salesforce data is available to the writer.")
     if grounding.strip():
         lines.append("\nEvidence the writer already holds:\n" + grounding.strip()[:4000])
-    text = await llm.chat_completion(
-        [{"role": "system", "content": _PLANNER_SYSTEM}, {"role": "user", "content": "\n".join(lines)}],
-        temperature=0.2,
-        max_tokens=PLAN_MAX_TOKENS,
-        thinking=False,
-    )
-    return (text or "").strip()
+    msgs = [
+        {"role": "system", "content": _PLANNER_SYSTEM},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+    if on_text is None:
+        text = await llm.chat_completion(
+            msgs, temperature=0.2, max_tokens=PLAN_MAX_TOKENS, thinking=False
+        )
+        return (text or "").strip()
+
+    # `effort="fast"` is how the streaming API spells thinking-off, which is
+    # what `thinking=False` means on the call above; the model is the main one
+    # either way (llm.resolve_model_choice returns it for every choice).
+    parts: List[str] = []
+    async for kind, delta in llm.stream_chat_events(
+        msgs, effort="fast", temperature=0.2, max_tokens=PLAN_MAX_TOKENS
+    ):
+        if kind != "token" or not delta:
+            continue
+        parts.append(delta)
+        try:
+            await on_text(delta)
+        except Exception:  # noqa: BLE001 — a dropped delta must not lose the plan
+            log.debug("the plan's delta sink raised", exc_info=True)
+    return "".join(parts).strip()
 
 
 def _clip(text: str) -> str:
