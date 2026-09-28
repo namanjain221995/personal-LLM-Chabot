@@ -152,7 +152,14 @@ SUBJECTS: Tuple[Diagram, ...] = (
     Diagram("data_flow", "flowchart", "a data flow diagram",
             _with_pic(r"data{J}flows?".format(J=_J)) + r"|\bdfds?\b", in_file=True),
     Diagram("process_flow", "flowchart", "a process flow diagram",
-            _with_pic(r"(?:pro[cs]es+|प्रोसेस|પ્રોસેસ)(?:{J}(?:ka|no|na|ni))?{J}flows?".format(J=_J))
+            # A PROCESS ON ITS OWN IS A DIAGRAM: "process chart of invoice
+            # approval" needs no "flow" in it. Found by the parallel
+            # `fix/flow-chart-is-a-diagram` branch's 180-phrasing grid, where
+            # `process chart` and `organizational chart` were the two nouns this
+            # vocabulary did not carry; measured here, both went to the chart
+            # lane.
+            _with_pic(r"pro[cs]es+(?:es)?|प्रोसेस|પ્રોસેસ") + r"|"
+            + _with_pic(r"(?:pro[cs]es+|प्रोसेस|પ્રોસેસ)(?:{J}(?:ka|no|na|ni))?{J}flows?".format(J=_J))
             # "show the process flow for employee offboarding": the flow IS the
             # picture, so no picture word is needed after it.
             + r"|\b(?:pro[cs]es+|प्रोसेस|પ્રોસેસ)\s+flows?\b"
@@ -196,7 +203,7 @@ SUBJECTS: Tuple[Diagram, ...] = (
 
     # --- structures ----------------------------------------------------------
     Diagram("org_chart", "flowchart", "an org chart",
-            _with_pic(r"orgs?|organi[sz]ations?|organisations?|ઓર્ગ|ऑर्ग|आर्ग")
+            _with_pic(r"orgs?|organi[sz]ations?|organi[sz]ational|ઓર્ગ|ऑर्ग|आर्ग")
             + r"|\borg{J}charts?\b".format(J=_J)
             + r"|\breporting\s+(?:structure|lines?|hierarchy)\b", in_file=True),
     Diagram("hierarchy", "flowchart", "a hierarchy diagram",

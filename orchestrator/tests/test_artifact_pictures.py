@@ -549,3 +549,37 @@ def test_the_role_palette_still_passes_the_validator_on_paper():
     assert fields and all(n["label"] for n in fields["nodes"])
     # and the key names only the roles the diagram actually declares
     assert D._legend_for(S.Diagram(**fields)) == ("service", "external")
+
+
+# ------------------------------------- the grid the parallel branch built --
+
+#: `fix/flow-chart-is-a-diagram` was built in parallel on the same `_CHART_RE`,
+#: and its test file crosses ten ask verbs with eighteen diagram nouns. Its
+#: assertions are written against that branch's own helpers
+#: (`lexicon.diagram_signal`, `lexicon.without_diagram_phrases`), which do not
+#: exist here — but the BEHAVIOUR they pin does, and the grid is a better
+#: vocabulary check than anything written from this side alone. Run through this
+#: tree's `decide` it found two nouns this module did not carry: `process chart`
+#: (a process needs no "flow" after it) and `organizational chart` (the
+#: adjective, beside the noun that was already there). 20 of 180 asked for a
+#: chart; both are fixed and it is 0 of 180 now. Kept here so the integrator can
+#: drop one of the two branches and lose nothing.
+_ASK_VERBS = ("make a", "draw a", "create a", "give me a", "generate a", "build a",
+              "i need a", "can you make a", "please draw a", "show me a")
+_DIAGRAM_NOUNS = (
+    "flow chart", "flowchart", "flow-chart", "org chart", "org-chart",
+    "organisation chart", "organization chart", "organisational chart",
+    "organizational chart", "process chart", "process flow", "data flow diagram",
+    "sequence diagram", "state diagram", "mind map", "dependency graph",
+    "call graph", "swimlane diagram",
+)
+
+
+@pytest.mark.parametrize("noun", _DIAGRAM_NOUNS)
+def test_the_parallel_branchs_grid_never_asks_for_a_table(noun):
+    for verb in _ASK_VERBS:
+        text = f"{verb} {noun} of the API which connects to the DB"
+        i = I.decide(text)
+        assert i.action == "none", f"{text!r} -> {i.action}/{i.rule}"
+        assert not i.chart_request, f"{text!r} claimed a chart of data"
+        assert i.diagram, f"{text!r} made no file but named no diagram either"
