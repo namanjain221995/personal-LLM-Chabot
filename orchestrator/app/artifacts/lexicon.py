@@ -421,13 +421,31 @@ _DIAGRAM_MOD = (
     # "entity relationship chart".
     r"sequence|swim\s*lane|architectur(?:e|al)|hierarch(?:y|ical)|state\s*machine|entity[\s-]?relationship"
 )
+#: "flow" in Devanagari, in all three spellings: no nukta, decomposed nukta
+#: (फ + U+093C) and precomposed (U+095E). A person types whichever their
+#: keyboard produces and the three are indistinguishable on screen.
+_NUKTA_FLOW = "(?:\u092b\u093c?|\u095e)\u094d\u0932\u094b"
+
 _DIAGRAM_NOUN = r"charts?|graphs?|चार्ट|ग्राफ़?|ચાર્ટ|ગ્રાફ"
 _DIAGRAM_PHRASE_RE = re.compile(
     _w(rf"(?:{_DIAGRAM_MOD})[\s-]*(?:{_DIAGRAM_NOUN})")
     # The same phrases typed in Devanagari or Gujarati. "फ्लोचार्ट" and
     # "ફ્લોચાર્ટ" are written as one word, so they get their own arm.
-    + rf"|{_B}(?:फ्लो|ફ્લો|ऑर्ग|ओर्ग|ઑર્ગ|ઓર્ગ)[\s-]*(?:{_DIAGRAM_NOUN}){_E}"
-    + rf"|{_B}(?:फ्लोचार्ट|ફ્લોચાર્ટ|ऑर्गचार्ट|ઓર્ગચાર્ટ){_E}",
+    # NUKTA: "flow" is written फ्लो AND फ़्लो, and the nukta form exists in two
+    # Unicode encodings -- decomposed (फ U+092B + U+093C) and precomposed
+    # (फ़ U+095E). Both are ordinary spellings a person types, and neither was
+    # matched, so `फ़्लो चार्ट बनाओ` still reached the chart path and got the
+    # "attach a CSV" refusal. Listed rather than normalised because stripping
+    # U+093C globally would also fold ज़/ड़/ढ़/ख़/ग़, which are different letters.
+    # The cash/fund/money exception has to be repeated here: a CASH FLOW chart
+    # is a real chart drawn from numbers, and the Latin lookbehind above cannot
+    # see कैश / કેશ. Without this the fix for the owner's "flow chart" took the
+    # chart away from every Indic cash-flow ask -- a false refusal traded for a
+    # true one, landing on exactly the users the diagram fix was for.
+    + rf"|{_B}(?<!कैश )(?<!कॅश )(?<!नकदी )(?<!फंड )(?<!फ़ंड )(?<!मनी )"
+    + rf"(?<!કેશ )(?<!કૅશ )(?<!રોકડ )(?<!ફંડ )(?<!મની )"
+    + rf"(?:{_NUKTA_FLOW}|ફ્લો|ऑर्ग|ओर्ग|ઑર્ગ|ઓર્ગ)[\s-]*(?:{_DIAGRAM_NOUN}){_E}"
+    + rf"|{_B}(?:{_NUKTA_FLOW}चार्ट|ફ્લોચાર્ટ|ऑर्गचार्ट|ઓર્ગચાર્ટ){_E}",
     re.IGNORECASE,
 )
 

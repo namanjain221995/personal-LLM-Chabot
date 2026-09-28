@@ -343,3 +343,41 @@ def test_a_question_about_a_flow_chart_inside_our_file_is_still_a_question() -> 
         intent = decide(text, has_artifacts=True, artifact_hints=("report",))
         assert intent.answer_about_artifact is True, f"{text!r} -> {intent.rule}"
         assert intent.action == "none"
+
+
+# --------------------------------------------------------------------------
+# The nukta, and the exception the first fix took away from Indic users.
+# --------------------------------------------------------------------------
+
+#: "flow" in Devanagari has three spellings that look identical on screen:
+#: no nukta, decomposed (फ + U+093C) and precomposed (U+095E). A person types
+#: whichever their keyboard gives. Before this, only the first was matched, so
+#: `फ़्लो चार्ट बनाओ` still reached the chart path and got the "attach a CSV"
+#: refusal -- the owner's reported bug, alive in an ordinary spelling.
+NUKTA_FLOW_CHART_ASKS = (
+    "फ्लो चार्ट बनाओ",
+    "फ़्लो चार्ट बनाओ",
+    "फ़्लो चार्ट बनाओ",
+    "ફ્લો ચાર્ટ બનાવો",
+)
+
+#: A CASH FLOW chart is a real chart drawn from numbers. The first fix's
+#: cash/fund/money exception was Latin-only, so blanking "flow chart" took the
+#: chart away from every Indic cash-flow ask: a false refusal traded for a true
+#: one, landing on exactly the users the diagram fix was written for.
+INDIC_CASH_FLOW_CHART_ASKS = (
+    "कैश फ्लो चार्ट बनाओ",
+    "फंड फ्लो चार्ट बनाओ",
+    "કેશ ફ્લો ચાર્ટ બનાવો",
+    "make a cash flow chart",
+)
+
+
+@pytest.mark.parametrize("text", NUKTA_FLOW_CHART_ASKS)
+def test_every_spelling_of_flow_chart_is_a_diagram(text):
+    assert LX.chart_signal(text) is False, (text, [hex(ord(c)) for c in text[:4]])
+
+
+@pytest.mark.parametrize("text", INDIC_CASH_FLOW_CHART_ASKS)
+def test_a_cash_flow_chart_is_still_a_chart_in_every_script(text):
+    assert LX.chart_signal(text) is True, (text, "the diagram fix must not eat a real chart")
