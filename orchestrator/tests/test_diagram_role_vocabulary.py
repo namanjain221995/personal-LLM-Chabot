@@ -109,8 +109,12 @@ def test_the_instruction_states_both_accessibility_rules():
     #    line 6 ... got 'TXT'" and the whole diagram is replaced by the error
     #    card -- strictly worse than grey, so the prompt names the types.
     assert "`flowchart`/`graph`" in DIAGRAM_INSTRUCTION
-    for other in ("sequenceDiagram", "erDiagram", "pie", "journey", "timeline",
-                  "mindmap", "gitGraph"):
+    # Since 2026-09-28 the other types are the ones the FILE path draws
+    # (tests/test_diagram_instruction_budget.py pins the full list against
+    # the readers); `pie` and `gitGraph` are no longer offered — pie is a
+    # chart of typed numbers, gitGraph is refused by the file path.
+    for other in ("sequenceDiagram", "erDiagram", "journey", "timeline", "mindmap",
+                  "classDiagram", "stateDiagram-v2", "kanban", "packet-beta"):
         assert other in DIAGRAM_INSTRUCTION, other
     assert "syntax error" in DIAGRAM_INSTRUCTION
 

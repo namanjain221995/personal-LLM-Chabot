@@ -561,6 +561,55 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
     """
     if not source or len(source) > 20_000:
         return None
+    from . import mermaid_grammars as G
+
+    # FRONTMATTER: `---\ntitle: X\n---` at the very top is mermaid's way of
+    # titling any diagram. Only `title:` is read; a `config:` block or
+    # anything else there is a directive by another name and refuses.
+    src_lines = source.splitlines()
+    title = ""
+    if src_lines and src_lines[0].strip() == "---":
+        end = next((i for i in range(1, len(src_lines)) if src_lines[i].strip() == "---"), None)
+        if end is None:
+            return None
+        for fm in src_lines[1:end]:
+            fm = fm.strip()
+            if not fm:
+                continue
+            if not fm.startswith("title:"):
+                return None
+            title = fm[6:].strip().strip('"').strip("'")
+        src_lines = src_lines[end + 1:]
+
+    # THE HEADER DECIDES THE GRAMMAR. A source whose first statement is a
+    # family this module reads goes to that family's reader; a keyword it
+    # does not read (gantt, pie, journey, gitGraph, ...) refuses HERE, at the
+    # header, rather than falling through to `_DECL_RE` below and becoming a
+    # box labelled "gantt" — which is what it did until 2026-09-28 (measured
+    # in the running container: `classDiagram\nA --> B\nB --> C` drew a
+    # fourth box called "classDiagram"). A headerless source stays a
+    # flowchart, as it always was.
+    if any(l.strip().startswith("%%{") for l in src_lines):
+        # `%%{init: ...}%%` is a directive wherever it sits. The flowchart
+        # loop below refuses it line by line; a family reader only sees the
+        # lines AFTER its header, so a directive placed before the header
+        # walked past both until this check (found by
+        # tests/test_mermaid_grammars.py on 2026-09-28).
+        return None
+    first_index = next((i for i, l in enumerate(src_lines) if l.strip() and not l.strip().startswith("%%")), None)
+    if first_index is not None:
+        first = src_lines[first_index].strip().rstrip(";")
+        keyword = G.header_keyword(first)
+        if keyword is not None and keyword not in ("flowchart", "graph"):
+            family = G.FAMILY_OF_KEYWORD.get(keyword)
+            if family is None or first.lower() != keyword:
+                return None
+            fields = G.read_family(family, src_lines[first_index + 1:])
+            if fields is not None and title and not fields.get("title"):
+                fields["title"] = title
+            return fields
+    source = "\n".join(src_lines)
+
     direction = "TD"
     order: List[str] = []
     labels: Dict[str, str] = {}
@@ -645,6 +694,11 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
             g = m.groupdict()
             if not _ids_are_names(g["aid"]):
                 return None
+            if G.is_keyword(g["aid"]):
+                # A diagram keyword is never a node. `_DIR_RE` above already
+                # keeps `flowchart` out of the drawing; this keeps the other
+                # thirty-odd keywords out too, wherever they sit in the source.
+                return None
             touch(g["aid"], g["alabel"], g["arole"])
             continue
         return None
@@ -654,6 +708,7 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
     if len(order) > max_nodes or len(edges) > max_edges:
         return None
     return {
+        "title": title,
         "direction": direction,
         # `roles` holds only the names the closed vocabulary knows, so a node
         # nobody tagged — and a node tagged with a name nobody defined —
@@ -1151,7 +1206,17 @@ def layout_diagram(diagram: Any, *, box_in: Tuple[float, float] = PORTRAIT_BOX_I
     that gets closest does, with `fits` False so the caller can give the
     figure more room. The declared direction is tried first, so a model that
     says LR gets LR whenever LR fits.
+
+    A diagram of another family (`spec.MermaidFigure`: a sequence, ER,
+    class, state, mindmap, timeline, journey, kanban or packet diagram) is
+    not a graph of boxes and is laid out by render/diagram_figures.py; what
+    comes back exposes the same `fits` / `effective_pt` / `fig_in` /
+    `display_in` the callers read.
     """
+    if getattr(diagram, "family", None):
+        from . import diagram_figures as F
+
+        return F.layout_figure(diagram, box_in=box_in)  # type: ignore[return-value]
     declared = "LR" if getattr(diagram, "direction", "TD") == "LR" else "TD"
     other = "TD" if declared == "LR" else "LR"
     roles = _legend_for(diagram)
@@ -1335,7 +1400,12 @@ def render_diagram_png(diagram: Any, out_path: str | Path, *,
         "path.simplify": True,
     }
     with matplotlib.rc_context(rc):
-        fig = _draw(layout)
+        if getattr(diagram, "family", None):
+            from . import diagram_figures as F
+
+            fig = F.draw_figure(layout)  # type: ignore[arg-type]
+        else:
+            fig = _draw(layout)
         try:
             buf = io.BytesIO()
             fig.savefig(buf, dpi=DPI, format="png", facecolor=PAPER, metadata={"Software": None})
@@ -1361,8 +1431,13 @@ def fonts_for(diagram: Any) -> Tuple[str, ...]:
     every text object, which on a 15-node diagram is hundreds of lines in the
     render worker's log for nothing.
     """
-    text = " ".join([getattr(diagram, "title", "") or ""] + [n.label for n in diagram.nodes]
-                    + [e.label for e in diagram.edges])
+    if getattr(diagram, "family", None):
+        from . import diagram_figures as F
+
+        text = F.figure_text(diagram)
+    else:
+        text = " ".join([getattr(diagram, "title", "") or ""] + [n.label for n in diagram.nodes]
+                        + [e.label for e in diagram.edges])
     families: List[str] = []
     for script in theme.unsupported_scripts(text):
         families.extend(theme.SCRIPT_FONTS.get(script, ()))

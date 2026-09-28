@@ -207,19 +207,38 @@ DIAGRAM_ROLES = ("service", "store", "model", "external")
 # only pushes the name onto the node's class list; it never looks the class
 # up and never raises, so an undefined class is a CSS class nothing styles.
 # The frontend's own classDefs (fix/diagram-roles) are what paint them.
+# WIDENED 2026-09-28: THE LIST OF TYPES IS THE LIST THE FILE PATH DRAWS.
+# render/diagrams.parse_mermaid read one grammar while this string named
+# seven, so a sequenceDiagram drawn in the chat became "Diagram omitted" in
+# the PDF (measured in the running container: 1 of 31 mermaid 11.17.0
+# grammars reached a file). The reader now accepts ten and this string names
+# exactly those ten; the six chart types are named as NOT diagrams because
+# they draw numbers the model typed, and a document's charts come from data.
+# Measured the same day in the running container on CPU (tokenizers 0.22.2,
+# the pinned Qwen3.6 tokenizer.json, load average 2.97): production 365
+# tokens / 1,602 characters / 1,606 bytes; this wording 415 tokens / 1,786
+# characters / 1,790 bytes. +50 per prompt over production, and +183 over
+# origin/dev's 232 — to the token, the budget the 2026-09-27 integration
+# accepted. A 431-token first draft was trimmed to it without losing a rule.
+# tests/test_diagram_instruction_budget.py pins the sizes and the type list.
 DIAGRAM_INSTRUCTION = (
     "\n\n"
-    "DIAGRAMS: ```mermaid blocks render as zoomable, downloadable "
-    "diagrams. Include one ONLY when the user explicitly asks for a "
+    "DIAGRAMS: ```mermaid blocks render as diagrams. Include one ONLY "
+    "when the user explicitly asks for a "
     "diagram/flowchart/visualization, or when a picture is easier to "
-    "follow than prose for something genuinely complex (a system "
-    "architecture, a multi-step process, entity relationships). "
+    "follow than prose for something genuinely complex (an "
+    "architecture, a process, entity relationships). "
     "Ordinary questions, short answers and conversation must NOT "
     "contain a diagram. When you do, follow ALL of these rules: at most "
     "ONE diagram per answer; keep it SMALL (under ~20 nodes — "
-    "summarize, don't enumerate); prefer `flowchart TD` or `flowchart "
-    "LR`; one statement per line; every label in double quotes and "
-    "short, with no parentheses, brackets, pipes or markdown inside "
+    "summarize, don't enumerate); use ONLY these types, which also reach "
+    "an exported file: flowchart/graph (prefer `flowchart TD` or "
+    "`flowchart LR`), sequenceDiagram, classDiagram, stateDiagram-v2, "
+    "erDiagram, mindmap, timeline, journey, kanban, packet-beta. Never "
+    "draw numbers as a diagram (no pie, xychart, radar, sankey, "
+    "quadrantChart, treemap): numbers belong in a table or a chart made "
+    "from data; one statement per line; every label in double quotes "
+    "and short, with no parentheses, brackets, pipes or markdown inside "
     "labels; NEVER use style, classDef, linkStyle, click or %%{init}%% "
     "directives and never write a colour of your own (no hex, no rgb(), "
     "no colour name): custom colours break dark mode, and the app "
@@ -228,9 +247,8 @@ DIAGRAM_INSTRUCTION = (
     "(code), store (data), model (an AI model), external (a person or "
     'outside system) — A["Payments API"]:::service. Tag only the nodes '
     "one fits; an invented name paints nothing. Put NO role in any "
-    "other type (sequenceDiagram, erDiagram, pie, journey, timeline, "
-    "mindmap, gitGraph): there `:::` is a syntax error and the diagram "
-    "fails to draw. The LABEL carries the meaning: two nodes must never "
+    "other type: there `:::` is a syntax error. The LABEL carries the "
+    "meaning: two nodes must never "
     "differ by colour alone, so it reads for someone who cannot see "
     "colour. Never draw ASCII-art boxes. Right after it, add one or two "
     "plain sentences saying what it shows so a non-technical reader can "

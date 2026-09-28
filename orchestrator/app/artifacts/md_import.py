@@ -89,6 +89,13 @@ _UNDER_RE = re.compile(r"(?<![\w_])_(?=\S)([^_\n]{1,1000}?)(?<=\S)_(?![\w_])")
 _STRIKE_RE = re.compile(r"~~(?=\S)((?:(?!~~)[^\n]){1,1000}?)(?<=\S)~~")
 
 
+#: What a mermaid CHART (pie, xychart, radar, sankey, quadrantChart, treemap)
+#: becomes in the document, in place of a picture of numbers nobody computed.
+CHART_NOT_A_DIAGRAM_TITLE = "Chart not reproduced"
+CHART_NOT_A_DIAGRAM_TEXT = ("A {kind} in the answer was written as a diagram with its numbers typed in. Charts in a "
+                            "document are drawn from data: ask for a chart of the table and it will be computed.")
+
+
 def _inline(text: str, notes: List[str]) -> str:
     """Inline markdown → plain text, keeping every visible word."""
     t = text
@@ -298,7 +305,10 @@ class _Builder:
             fields = D.parse_mermaid(source)
             if not fields:
                 return False
-            self.blocks.append(S.DiagramBlock(diagram=S.Diagram(**fields)))
+            # `diagram_from_fields` builds the model-declared `Diagram` for a
+            # flowchart and the typed family (sequence, er, class, ...) for
+            # anything else `parse_mermaid` read; both are `DiagramBlock`s.
+            self.blocks.append(S.DiagramBlock(diagram=S.diagram_from_fields(fields)))
             return True
         except Exception:
             # A LINE, because silence here is indistinguishable from a fence
@@ -408,8 +418,20 @@ def markdown_to_document(md: str, *, title_hint: str = "") -> Tuple[S.DocumentSp
                     # The fallback is exactly what every mermaid fence used to
                     # get: a callout, because a source this reader could not
                     # understand must never become a half-drawn picture.
-                    b.callout("note", "Diagram omitted", "A diagram in the answer was not reproduced in this document.")
-                    b.notes.append("A diagram in the answer could not be read, so it was left out (diagrams are never executed while importing).")
+                    from .render import mermaid_grammars as G
+
+                    kind, name = G.header_kind(code)
+                    if kind == "chart":
+                        # A pie, xychart, radar, sankey, quadrant or treemap
+                        # draws NUMBERS the model typed. A document's charts
+                        # are drawn from data (render/charts.py), so the
+                        # picture is refused and the callout says which path
+                        # a chart of the real table takes.
+                        b.callout("note", CHART_NOT_A_DIAGRAM_TITLE, CHART_NOT_A_DIAGRAM_TEXT.format(kind=name))
+                        b.notes.append(f"A {name} in the answer carried numbers the model typed and was left out; ask for a chart of the data instead.")
+                    else:
+                        b.callout("note", "Diagram omitted", "A diagram in the answer was not reproduced in this document.")
+                        b.notes.append("A diagram in the answer could not be read, so it was left out (diagrams are never executed while importing).")
             elif code.strip():
                 b.code(lang, code)
             continue

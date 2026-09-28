@@ -175,6 +175,41 @@ from pathlib import Path
 
 from app.engines import DIAGRAM_INSTRUCTION
 
+# WIDENED 2026-09-28: THE PROMPT TEACHES WHAT THE FILE PATH ACCEPTS.
+#
+# render/diagrams.parse_mermaid read ONE grammar (the flowchart) while this
+# string named seven types, so a sequenceDiagram the model wrote on request
+# drew in the chat and became a "Diagram omitted" callout in the PDF —
+# measured in the running container that morning: of 31 mermaid 11.17.0
+# grammars, 1 reached a file. The reader now accepts ten (flowchart/graph,
+# sequenceDiagram, classDiagram, stateDiagram-v2, erDiagram, mindmap,
+# timeline, journey, kanban, packet-beta), and this string names exactly
+# those ten, because a parser that accepts what the prompt never teaches
+# changes nothing for a person. It also names the six chart types (pie,
+# xychart, radar, sankey, quadrantChart, treemap) as NOT diagrams, since
+# they draw numbers the model typed and a document's charts come from data.
+#
+# THE COST, measured 2026-09-28 in the running orchestrator container on CPU
+# (tokenizers 0.22.2 over /models/repos/nvidia--Qwen3.6-35B-A3B-NVFP4--
+# 491c2f1ea524/tokenizer.json, load average 2.97, no GPU touched):
+#
+#     production (ae25da28, the 2026-09-27 wording)   365 tokens   1,602 chars   1,606 bytes
+#     THIS TREE                                       415 tokens   1,786 chars   1,790 bytes
+#
+# +50 tokens per prompt over production; +183 over origin/dev's 232, which is
+# EXACTLY the +183 / 5.29%-of-a-3,458-token-mean-prompt budget the
+# 2026-09-27 integration accepted (it accepted fix/diagram-roles' 415-token
+# wording; this tree spends the same 415 on ten type names instead of prose).
+# The first draft measured 431 and was trimmed to the budget: "zoomable,
+# downloadable", "system"/"multi-step" in the examples, and "and the diagram
+# fails to draw" after "syntax error" went, with no rule lost (every rule
+# test in this file still holds). The em-dash count is unchanged at two, so
+# UTF-8 bytes stay four over the character count.
+#
+# The 2026-09-27 constants below are kept under their own names because
+# the arithmetic they pin (+53 of restored fragments, -220 against the naive
+# merge) is the record of THAT edit and is still true of it.
+
 
 def _flat(path: Path) -> str:
     """A file's text with every run of whitespace collapsed to one space.
@@ -191,11 +226,16 @@ def _flat(path: Path) -> str:
 #: the raise below is always read against the string this branch started from.
 PRE_EDIT_CHARS = 1082
 
-#: What the reconciled wording actually measures, imported on this tree on
-#: 2026-09-27. It is the CEILING: every rule from both branches, plus the
-#: three restored origin/dev fragments above, is in the string at this size,
-#: so anything larger is a rule nobody has argued for.
-CHARS_CEILING = 1602
+#: What the reconciled wording measured on 2026-09-27: every rule from both
+#: branches plus the three restored origin/dev fragments. The historical
+#: arithmetic in this file is pinned against it.
+RECONCILED_2026_09_27_CHARS = 1602
+RECONCILED_2026_09_27_UTF8_BYTES = 1606
+
+#: The CEILING on this tree, measured 2026-09-28 (see the note at the top):
+#: the 2026-09-27 wording plus the ten-type list and the six-chart ban.
+#: Anything larger is a rule nobody has argued for.
+CHARS_CEILING = 1786
 
 #: The same string in UTF-8, measured on the same commit: 1,086. The
 #: document-vocabulary edit took it to 1,088 — two bytes, one extra em dash —
@@ -204,9 +244,16 @@ CHARS_CEILING = 1602
 #: after", which was the character count wearing a byte's name.
 PRE_EDIT_UTF8_BYTES = 1086
 
-#: The same string in UTF-8 on this tree: 1,606. Two em dashes (U+2014, three
+#: The same string in UTF-8 on this tree: 1,790. Two em dashes (U+2014, three
 #: UTF-8 bytes each) account for the four bytes over the character count.
-UTF8_BYTES_CEILING = 1606
+UTF8_BYTES_CEILING = 1790
+
+#: Tokens, the unit prefill is charged in, measured 2026-09-28 in the running
+#: container on CPU (tokenizers 0.22.2, the pinned Qwen3.6 tokenizer.json):
+#: production 365, this tree 415. Not asserted at import (the tokenizer is
+#: not a test dependency); recorded so the next raise is argued against it.
+TOKENS_PRODUCTION_2026_09_28 = 365
+TOKENS_THIS_TREE_2026_09_28 = 415
 
 #: The reconciliation this tree restored three fragments ON TOP OF, measured
 #: on integ/diagram-group at 7f16f4b7. The three deltas below have to add up
@@ -256,22 +303,26 @@ def test_the_instruction_is_measured_in_the_unit_it_names():
     chars = len(DIAGRAM_INSTRUCTION)
     encoded = len(DIAGRAM_INSTRUCTION.encode("utf-8"))
     assert chars == CHARS_CEILING, (
-        f"{chars} characters; the reconciled wording measured {CHARS_CEILING} on 2026-09-27"
+        f"{chars} characters; the ten-type wording measured {CHARS_CEILING} on 2026-09-28"
     )
     assert encoded <= UTF8_BYTES_CEILING, (
         f"DIAGRAM_INSTRUCTION is {encoded} UTF-8 bytes, over the {UTF8_BYTES_CEILING} measured for this edit"
     )
     assert encoded > chars, "this string carries non-ASCII, so the two units are not interchangeable"
     assert encoded - chars == 4, (
-        f"the reconciled wording spends two em dashes, so UTF-8 is 4 bytes over the "
+        f"the wording spends two em dashes, so UTF-8 is 4 bytes over the "
         f"character count; it is now {encoded - chars}"
     )
-    assert encoded - PRE_EDIT_UTF8_BYTES == 520, (
-        f"the raise over origin/dev was measured at +520 UTF-8 bytes; it is now "
-        f"{encoded - PRE_EDIT_UTF8_BYTES}. Re-measure the Fast cost before moving this "
-        f"(the measurement of record is +133 tokens per prompt, 3.85% of the 3,458-token "
-        f"mean golden prompt, 2026-09-27)."
+    # The 2026-09-27 raise was +520 over origin/dev in both units; the
+    # 2026-09-28 widening adds +184 in both (no em dash gained or lost).
+    assert RECONCILED_2026_09_27_UTF8_BYTES - PRE_EDIT_UTF8_BYTES == 520
+    assert encoded - RECONCILED_2026_09_27_UTF8_BYTES == 184 == chars - RECONCILED_2026_09_27_CHARS, (
+        f"the widening over the 2026-09-27 wording was measured at +184; it is now "
+        f"{encoded - RECONCILED_2026_09_27_UTF8_BYTES}. Re-measure the Fast cost before moving this "
+        f"(the measurement of record is 415 tokens, +50 over production and exactly the +183 "
+        f"budget over origin/dev, 2026-09-28)."
     )
+    assert TOKENS_THIS_TREE_2026_09_28 - 232 == 183, "the accepted budget, to the token"
 
 
 def test_the_three_fragment_costs_are_the_arithmetic_of_their_own_total():
@@ -286,7 +337,7 @@ def test_the_three_fragment_costs_are_the_arithmetic_of_their_own_total():
     strings: +3 ("fer"), +14 (" inside labels"), +36 (" custom colours break
     dark mode, and").
     """
-    assert sum(RESTORED_FRAGMENT_CHARS.values()) == CHARS_CEILING - RECONCILED_CHARS == 53
+    assert sum(RESTORED_FRAGMENT_CHARS.values()) == RECONCILED_2026_09_27_CHARS - RECONCILED_CHARS == 53
     root = Path(__file__).resolve().parents[1]
     prose = _flat(root / "app" / "engines" / "__init__.py")
     mine = _flat(Path(__file__))
@@ -316,10 +367,10 @@ def test_the_delta_against_the_naive_merge_is_arithmetic_and_not_a_referent_erro
     reads it, and its sha256 map covers the 24 fixture files only — so
     correcting that note costs no recapture.)
     """
-    assert NAIVE_MERGE_CHARS - CHARS_CEILING == 220
-    assert DIAGRAM_ROLES_CHARS - CHARS_CEILING == 246
+    assert NAIVE_MERGE_CHARS - RECONCILED_2026_09_27_CHARS == 220
+    assert DIAGRAM_ROLES_CHARS - RECONCILED_2026_09_27_CHARS == 246
     root = Path(__file__).resolve().parents[1]
-    naive, roles = NAIVE_MERGE_CHARS - CHARS_CEILING, DIAGRAM_ROLES_CHARS - CHARS_CEILING
+    naive, roles = NAIVE_MERGE_CHARS - RECONCILED_2026_09_27_CHARS, DIAGRAM_ROLES_CHARS - RECONCILED_2026_09_27_CHARS
     manifest = _flat(root / "tests/fixtures/context_assembly_golden/MANIFEST.json")
     assert f"-{naive} against the naive merge" in manifest
     assert f"-{roles} against the naive merge" not in manifest, "the wrong referent is back"
@@ -454,6 +505,34 @@ def test_the_role_clause_teaches_the_closed_list_and_bans_colour():
     # rule did not.
     assert "never write a colour of your own" in DIAGRAM_INSTRUCTION
     assert "no rgb()" in DIAGRAM_INSTRUCTION
+
+
+def test_the_prompt_teaches_exactly_the_types_the_file_path_accepts():
+    """1b of the 2026-09-28 widening: the two lists must match. Every family
+    render/mermaid_grammars.py reads is named in the string, every chart
+    type it refuses as a chart is named as NOT a diagram, and no excluded
+    grammar (gantt, gitGraph, C4, ...) is offered — offering one would send
+    the model to a type the file path turns into a callout. RED on the
+    2026-09-27 wording, which offered gitGraph and pie and never named
+    classDiagram, stateDiagram-v2, kanban or packet-beta."""
+    from app.artifacts.render import mermaid_grammars as G
+
+    taught = {"sequencediagram": "sequence", "classdiagram": "class", "statediagram-v2": "state",
+              "erdiagram": "er", "mindmap": "mindmap", "timeline": "timeline", "journey": "journey",
+              "kanban": "kanban", "packet-beta": "packet"}
+    assert set(taught.values()) == set(G.READERS), "a reader without a prompt line, or the reverse"
+    for header in taught:
+        assert G.header_keyword(header) == header
+    types_clause = DIAGRAM_INSTRUCTION.split("use ONLY these types", 1)[1].split(". Never draw", 1)[0]
+    for name in ("flowchart/graph", "sequenceDiagram", "classDiagram", "stateDiagram-v2", "erDiagram",
+                 "mindmap", "timeline", "journey", "kanban", "packet-beta"):
+        assert name in types_clause, name
+    charts_clause = DIAGRAM_INSTRUCTION.split("Never draw numbers as a diagram", 1)[1].split(":", 1)[0]
+    for name in ("pie", "xychart", "radar", "sankey", "quadrantChart", "treemap"):
+        assert name in charts_clause, name
+    assert set(G.CHART_KEYWORDS.values()) == {"pie", "xychart", "radar", "sankey", "quadrant-chart", "treemap"}
+    for excluded in ("gitGraph", "gantt", "C4Context", "requirementDiagram", "block-beta", "architecture-beta"):
+        assert excluded not in DIAGRAM_INSTRUCTION, f"{excluded} is offered but the file path refuses it"
 
 
 def test_the_composer_does_not_import_it():

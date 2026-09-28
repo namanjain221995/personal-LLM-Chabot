@@ -1200,9 +1200,14 @@ def test_the_png_reports_its_own_size_in_inches(tmp_path):
 def test_the_module_imports_no_layout_library():
     """networkx is not in requirements.txt and must not become a dependency
     of the render path; matplotlib already is."""
+    import re as _re
+
     source = Path(D.__file__).read_text(encoding="utf-8")
     for banned in ("networkx", "pydot", "pygraphviz", "graphviz", "playwright", "mermaid"):
-        assert f"import {banned}" not in source
+        # A word boundary, since 2026-09-28: the module now reads
+        # `from . import mermaid_grammars`, our own regex readers, and a
+        # bare substring check took that for the mermaid library.
+        assert not _re.search(rf"import {banned}\b", source), banned
 
 
 # --------------------------------------------- an arrow that lost its space --
