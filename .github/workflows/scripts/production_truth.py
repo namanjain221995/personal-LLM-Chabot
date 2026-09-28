@@ -967,7 +967,7 @@ class Report:
         return out
 
     def markdown(self) -> list[str]:
-        out = ["### Production truth (scheduled)", "", "| check | reading |", "| --- | --- |"]
+        out = ["### Production truth", "", "| check | reading |", "| --- | --- |"]
         out += [f"| {label} | {value} |" for label, value in self.rows]
         if self.notes:
             out.append("")

@@ -1500,3 +1500,22 @@ class TheDocsDoNotCiteAControlThisRepositoryLacks(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheStepSummaryDoesNotClaimASchedule(unittest.TestCase):
+    """The workflow is `on: workflow_dispatch:` alone and a cron is forbidden by
+    test_commit_one_carries_no_schedule_trigger, so the one artefact a person
+    actually reads must not announce a schedule.
+
+    This existed: the commit that renamed the JOB away from "(scheduled)" left the
+    same word as the heading of `Report.markdown()`, which Actions writes to
+    GITHUB_STEP_SUMMARY on every dispatched run. Nothing pinned it, so neither the
+    mutation battery nor CI could see the contradiction.
+    """
+
+    def test_the_step_summary_heading_does_not_claim_a_schedule(self) -> None:
+        lines = pt.Report().markdown()
+        self.assertIsInstance(lines, list, "markdown() returns lines, not a string")
+        body = "\n".join(lines)
+        self.assertTrue(body.strip(), "markdown() produced nothing to check")
+        self.assertNotIn("schedul", body.lower(), lines[0])
