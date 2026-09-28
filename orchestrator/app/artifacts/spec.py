@@ -30,7 +30,7 @@ than render a guess.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
@@ -318,9 +318,478 @@ class Diagram(_Strict):
         return self
 
 
+# ------------------------------------------------- the other diagram families --
+#
+# WHAT THESE ARE. A ```mermaid fence in a chat answer reaches a document through
+# md_import → render/diagrams.parse_mermaid, and until 2026-09-28 that reader
+# knew ONE grammar, the flowchart. DIAGRAM_INSTRUCTION teaches the model six
+# more (sequenceDiagram, erDiagram, journey, timeline, mindmap, gitGraph) and
+# the browser draws all of them, so a person who asked for "a sequence diagram
+# of the login flow" saw it in the chat and got a "Diagram omitted" callout in
+# the PDF. Measured in the running container that day: of the eight types
+# below, `flowchart` drew and the other seven refused — and worse, a
+# `classDiagram` or `stateDiagram-v2` written with plain `-->` arrows DREW,
+# with a box labelled "classDiagram" in it, because the bare keyword line fell
+# through to the flowchart's node-declaration rule.
+#
+# Each family below is its OWN model with its own vocabulary, because these are
+# different grammars and not one grammar with more keywords: a sequence
+# diagram's `A->>B: msg` is an ordered message between lifelines, not an edge in
+# a graph; an entity's attributes are rows in a table; a timeline's events
+# hang off periods. Folding them into `Diagram` (nodes + edges) would have
+# meant inventing nodes nobody wrote, which is the one thing the file path
+# promises never to do.
+#
+# CODE WRITES THESE, THE MODEL NEVER DOES. `DiagramBlock.diagram` accepts them
+# through a `SkipJsonSchema` arm, so the guided-decoding schema the composer
+# constrains the model to is byte-for-byte what it was (asserted in
+# tests/test_mermaid_grammars.py): the model still declares a `Diagram`, and
+# only the mermaid reader — a regular-expression grammar that refuses a whole
+# source on the first line it cannot read — produces these. Nothing here is a
+# colour, a style or a directive; render/diagram_figures.py draws every family
+# on paper in the module's own ink.
+#
+# The caps are legibility caps, as `Diagram`'s are, and each is measured
+# against the page in render/diagram_figures.py rather than guessed: twelve
+# lifelines is already wider than a portrait page.
+
+_MERMAID_ID_RE = re.compile(r"^[^\s\"'`<>|;:,+\-\[\]{}()][^\"'`<>|;:,+\[\]{}()]{0,47}$")
+"""A participant or state id as mermaid reads it: no arrow, quote, bracket or
+statement punctuation, so an id can never hold a piece of a link."""
+
+
+class SeqParticipant(_Strict):
+    id: str = Field(min_length=1, max_length=48)
+    label: str = Field(min_length=1, max_length=48)
+    #: `actor X` draws a stick figure; `participant X` a box.
+    actor: bool = False
+
+    @field_validator("id")
+    @classmethod
+    def _id_shape(cls, v: str) -> str:
+        if not _MERMAID_ID_RE.match(v):
+            raise ValueError("a participant id holds no arrow, quote, bracket or statement punctuation")
+        return v
+
+
+class SeqMessage(_Strict):
+    """One arrow between two lifelines, in time order."""
+
+    kind: Literal["message"] = "message"
+    source: str = Field(min_length=1, max_length=48)
+    target: str = Field(min_length=1, max_length=48)
+    text: str = Field(default="", max_length=120)
+    line: Literal["solid", "dashed"] = "solid"
+    #: mermaid's own heads: `->>` filled, `->` none, `-x` cross, `-)` open
+    #: (async), `<<->>` filled at both ends.
+    head: Literal["filled", "none", "cross", "open", "both"] = "filled"
+
+
+class SeqNote(_Strict):
+    kind: Literal["note"] = "note"
+    position: Literal["left", "right", "over"] = "over"
+    ids: List[str] = Field(min_length=1, max_length=2)
+    text: str = Field(min_length=1, max_length=160)
+
+
+class SeqFrame(_Strict):
+    """`loop`, `opt`, `alt` or `par` opens a frame; `else`/`and` divides one;
+    `end` closes it. Balanced by SequenceDiagram._shape."""
+
+    kind: Literal["frame_open", "frame_divide", "frame_close"]
+    frame: Literal["loop", "opt", "alt", "par", ""] = ""
+    text: str = Field(default="", max_length=80)
+
+
+SeqStep = Annotated[Union[SeqMessage, SeqNote, SeqFrame], Field(discriminator="kind")]
+
+
+class SequenceDiagram(_Strict):
+    family: Literal["sequence"] = "sequence"
+    title: str = Field(default="", max_length=120)
+    caption: str = Field(default="", max_length=300)
+    participants: List[SeqParticipant] = Field(min_length=1, max_length=12)
+    steps: List[SeqStep] = Field(min_length=1, max_length=80)
+    autonumber: bool = False
+
+    @model_validator(mode="after")
+    def _shape(self) -> "SequenceDiagram":
+        ids = [p.id for p in self.participants]
+        if len(set(ids)) != len(ids):
+            raise ValueError("two participants share an id")
+        known = set(ids)
+        depth: List[str] = []
+        messages = 0
+        for s in self.steps:
+            if isinstance(s, SeqMessage):
+                messages += 1
+                if s.source not in known or s.target not in known:
+                    raise ValueError("a message names a participant that was never declared")
+            elif isinstance(s, SeqNote):
+                if any(i not in known for i in s.ids):
+                    raise ValueError("a note names a participant that was never declared")
+            elif s.kind == "frame_open":
+                if s.frame not in ("loop", "opt", "alt", "par"):
+                    raise ValueError("a frame must be loop, opt, alt or par")
+                depth.append(s.frame)
+            elif s.kind == "frame_divide":
+                if not depth or depth[-1] not in ("alt", "par"):
+                    raise ValueError("else/and outside an alt/par frame")
+            else:
+                if not depth:
+                    raise ValueError("end without a frame")
+                depth.pop()
+        if depth:
+            raise ValueError("a frame was never closed")
+        if messages == 0:
+            raise ValueError("a sequence diagram needs at least one message")
+        return self
+
+
+class ErAttribute(_Strict):
+    type: str = Field(min_length=1, max_length=24)
+    name: str = Field(min_length=1, max_length=40)
+    #: "PK", "FK", "UK" or a comma-joined set of them, as written.
+    keys: str = Field(default="", max_length=12)
+    comment: str = Field(default="", max_length=60)
+
+
+class ErEntity(_Strict):
+    id: str = Field(min_length=1, max_length=40)
+    label: str = Field(min_length=1, max_length=48)
+    attributes: List[ErAttribute] = Field(default_factory=list, max_length=16)
+
+    @field_validator("id")
+    @classmethod
+    def _id_shape(cls, v: str) -> str:
+        if not _NODE_ID_RE.match(v):
+            raise ValueError("an entity id must start with a letter and hold letters, digits, _ or -")
+        return v
+
+
+ErCardinality = Literal["exactly_one", "zero_or_one", "zero_or_more", "one_or_more"]
+
+
+class ErRelation(_Strict):
+    source: str = Field(min_length=1, max_length=40)
+    target: str = Field(min_length=1, max_length=40)
+    source_card: ErCardinality
+    target_card: ErCardinality
+    #: `--` identifying (solid), `..` non-identifying (dashed).
+    identifying: bool = True
+    label: str = Field(default="", max_length=48)
+
+
+class ErDiagram(_Strict):
+    family: Literal["er"] = "er"
+    title: str = Field(default="", max_length=120)
+    caption: str = Field(default="", max_length=300)
+    direction: Literal["TD", "LR"] = "TD"
+    entities: List[ErEntity] = Field(min_length=1, max_length=16)
+    relations: List[ErRelation] = Field(default_factory=list, max_length=30)
+
+    @model_validator(mode="after")
+    def _shape(self) -> "ErDiagram":
+        ids = [e.id for e in self.entities]
+        if len(set(ids)) != len(ids):
+            raise ValueError("two entities share an id")
+        known = set(ids)
+        if any(r.source not in known or r.target not in known for r in self.relations):
+            raise ValueError("a relation names an entity that was never declared")
+        return self
+
+
+class ClassBox(_Strict):
+    id: str = Field(min_length=1, max_length=40)
+    label: str = Field(min_length=1, max_length=48)
+    #: `<<interface>>`, `<<abstract>>`, ... shown above the name in guillemets.
+    annotation: str = Field(default="", max_length=24)
+    #: Display text, as mermaid shows it: visibility kept, `~T~` as `<T>`, a
+    #: method's return type after ` : `. Never wrapped, so the cap is the box.
+    attributes: List[str] = Field(default_factory=list, max_length=16)
+    methods: List[str] = Field(default_factory=list, max_length=16)
+
+    @field_validator("id")
+    @classmethod
+    def _id_shape(cls, v: str) -> str:
+        if not _NODE_ID_RE.match(v):
+            raise ValueError("a class id must start with a letter and hold letters, digits, _ or -")
+        return v
+
+    @field_validator("attributes", "methods")
+    @classmethod
+    def _member_shape(cls, v: List[str]) -> List[str]:
+        if any(not m or len(m) > 80 for m in v):
+            raise ValueError("a class member is 1 to 80 characters")
+        return v
+
+
+ClassHead = Literal["none", "inheritance", "composition", "aggregation", "arrow"]
+
+
+class ClassRelation(_Strict):
+    source: str = Field(min_length=1, max_length=40)
+    target: str = Field(min_length=1, max_length=40)
+    line: Literal["solid", "dashed"] = "solid"
+    #: The glyph at EACH end, exactly where mermaid draws it: `A <|-- B` puts
+    #: the hollow triangle at A. Semantics are the author's; the picture is
+    #: faithful to the source either way.
+    source_head: ClassHead = "none"
+    target_head: ClassHead = "none"
+    source_card: str = Field(default="", max_length=12)
+    target_card: str = Field(default="", max_length=12)
+    label: str = Field(default="", max_length=48)
+
+
+class ClassDiagram(_Strict):
+    family: Literal["class"] = "class"
+    title: str = Field(default="", max_length=120)
+    caption: str = Field(default="", max_length=300)
+    direction: Literal["TD", "LR"] = "TD"
+    classes: List[ClassBox] = Field(min_length=1, max_length=16)
+    relations: List[ClassRelation] = Field(default_factory=list, max_length=30)
+
+    @model_validator(mode="after")
+    def _shape(self) -> "ClassDiagram":
+        ids = [c.id for c in self.classes]
+        if len(set(ids)) != len(ids):
+            raise ValueError("two classes share an id")
+        known = set(ids)
+        if any(r.source not in known or r.target not in known for r in self.relations):
+            raise ValueError("a relation names a class that was never declared")
+        return self
+
+
+#: The pseudo-states `[*]` becomes: one start, one end, never a box.
+STATE_START = "__start__"
+STATE_END = "__end__"
+
+
+class StateNode(_Strict):
+    id: str = Field(min_length=1, max_length=40)
+    label: str = Field(min_length=1, max_length=48)
+    #: `S : text` lines, shown under the name.
+    lines: List[str] = Field(default_factory=list, max_length=4)
+
+    @field_validator("id")
+    @classmethod
+    def _id_shape(cls, v: str) -> str:
+        if not _NODE_ID_RE.match(v):
+            raise ValueError("a state id must start with a letter and hold letters, digits, _ or -")
+        return v
+
+    @field_validator("lines")
+    @classmethod
+    def _lines_shape(cls, v: List[str]) -> List[str]:
+        if any(not s or len(s) > 48 for s in v):
+            raise ValueError("a state description line is 1 to 48 characters")
+        return v
+
+
+class StateTransition(_Strict):
+    source: str = Field(min_length=1, max_length=40)
+    target: str = Field(min_length=1, max_length=40)
+    label: str = Field(default="", max_length=48)
+
+
+class StateDiagram(_Strict):
+    family: Literal["state"] = "state"
+    title: str = Field(default="", max_length=120)
+    caption: str = Field(default="", max_length=300)
+    direction: Literal["TD", "LR"] = "TD"
+    states: List[StateNode] = Field(min_length=1, max_length=24)
+    transitions: List[StateTransition] = Field(min_length=1, max_length=40)
+
+    @model_validator(mode="after")
+    def _shape(self) -> "StateDiagram":
+        ids = [s.id for s in self.states]
+        if len(set(ids)) != len(ids):
+            raise ValueError("two states share an id")
+        known = set(ids) | {STATE_START, STATE_END}
+        for t in self.transitions:
+            if t.source not in known or t.target not in known:
+                raise ValueError("a transition names a state that was never declared")
+            if t.source == STATE_END or t.target == STATE_START:
+                raise ValueError("nothing leaves the end pseudo-state and nothing enters the start")
+        return self
+
+
+MindShape = Literal["default", "rounded", "square", "circle", "hexagon"]
+
+
+class MindNode(_Strict):
+    id: str = Field(min_length=1, max_length=40)
+    label: str = Field(min_length=1, max_length=48)
+    #: None for the root, and exactly one node is the root.
+    parent: Optional[str] = None
+    shape: MindShape = "default"
+
+
+class MindmapDiagram(_Strict):
+    family: Literal["mindmap"] = "mindmap"
+    title: str = Field(default="", max_length=120)
+    caption: str = Field(default="", max_length=300)
+    #: Parents precede their children, as the indented source lists them.
+    nodes: List[MindNode] = Field(min_length=2, max_length=40)
+
+    @model_validator(mode="after")
+    def _shape(self) -> "MindmapDiagram":
+        ids = [n.id for n in self.nodes]
+        if len(set(ids)) != len(ids):
+            raise ValueError("two mindmap nodes share an id")
+        roots = [n for n in self.nodes if n.parent is None]
+        if len(roots) != 1 or self.nodes[0].parent is not None:
+            raise ValueError("a mindmap has exactly one root, and it comes first")
+        seen = set()
+        for n in self.nodes:
+            if n.parent is not None and n.parent not in seen:
+                raise ValueError("a mindmap node's parent must be declared before it")
+            seen.add(n.id)
+        return self
+
+
+class TimelinePeriod(_Strict):
+    time: str = Field(min_length=1, max_length=40)
+    section: str = Field(default="", max_length=48)
+    events: List[str] = Field(default_factory=list, max_length=8)
+
+    @field_validator("events")
+    @classmethod
+    def _events_shape(cls, v: List[str]) -> List[str]:
+        if any(not s or len(s) > 80 for s in v):
+            raise ValueError("a timeline event is 1 to 80 characters")
+        return v
+
+
+class TimelineDiagram(_Strict):
+    family: Literal["timeline"] = "timeline"
+    title: str = Field(default="", max_length=120)
+    caption: str = Field(default="", max_length=300)
+    periods: List[TimelinePeriod] = Field(min_length=1, max_length=24)
+
+
+class JourneyTask(_Strict):
+    """One step of a user journey: what happens, how it felt (1-5), who
+    was involved."""
+
+    name: str = Field(min_length=1, max_length=80)
+    section: str = Field(default="", max_length=48)
+    score: int = Field(ge=1, le=5)
+    actors: List[str] = Field(default_factory=list, max_length=6)
+
+    @field_validator("actors")
+    @classmethod
+    def _actors_shape(cls, v: List[str]) -> List[str]:
+        if any(not a or len(a) > 32 for a in v):
+            raise ValueError("a journey actor is 1 to 32 characters")
+        return v
+
+
+class JourneyDiagram(_Strict):
+    family: Literal["journey"] = "journey"
+    title: str = Field(default="", max_length=120)
+    caption: str = Field(default="", max_length=300)
+    tasks: List[JourneyTask] = Field(min_length=1, max_length=24)
+
+
+class KanbanColumn(_Strict):
+    id: str = Field(min_length=1, max_length=40)
+    label: str = Field(min_length=1, max_length=48)
+    #: Card texts, in the order written. A card's id is not shown, as in mermaid.
+    cards: List[str] = Field(default_factory=list, max_length=16)
+
+    @field_validator("cards")
+    @classmethod
+    def _cards_shape(cls, v: List[str]) -> List[str]:
+        if any(not c or len(c) > 120 for c in v):
+            raise ValueError("a kanban card is 1 to 120 characters")
+        return v
+
+
+class KanbanDiagram(_Strict):
+    family: Literal["kanban"] = "kanban"
+    title: str = Field(default="", max_length=120)
+    caption: str = Field(default="", max_length=300)
+    columns: List[KanbanColumn] = Field(min_length=1, max_length=8)
+
+    @model_validator(mode="after")
+    def _shape(self) -> "KanbanDiagram":
+        ids = [c.id for c in self.columns]
+        if len(set(ids)) != len(ids):
+            raise ValueError("two kanban columns share an id")
+        return self
+
+
+class PacketField(_Strict):
+    """A run of bits in a packet layout. `start`/`end` are bit positions,
+    inclusive, as the author numbered them: structure, not data."""
+
+    start: int = Field(ge=0, le=4095)
+    end: int = Field(ge=0, le=4095)
+    label: str = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _shape(self) -> "PacketField":
+        if self.end < self.start:
+            raise ValueError("a packet field ends before it starts")
+        return self
+
+
+class PacketDiagram(_Strict):
+    family: Literal["packet"] = "packet"
+    title: str = Field(default="", max_length=120)
+    caption: str = Field(default="", max_length=300)
+    #: Bits per drawn row: mermaid's default and the only value read.
+    bits_per_row: Literal[32] = 32
+    fields: List[PacketField] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _shape(self) -> "PacketDiagram":
+        # Contiguous and non-overlapping, from bit 0, as mermaid requires:
+        # it refuses a gap or an overlap with a parse error, and so do we.
+        expect = 0
+        for f in self.fields:
+            if f.start != expect:
+                raise ValueError("packet fields must be contiguous from bit 0 with no gaps or overlaps")
+            expect = f.end + 1
+        return self
+
+
+#: The families code can read from a mermaid fence, discriminated by `family`.
+MermaidFigure = Annotated[
+    Union[SequenceDiagram, ErDiagram, ClassDiagram, StateDiagram, MindmapDiagram, TimelineDiagram,
+          JourneyDiagram, KanbanDiagram, PacketDiagram],
+    Field(discriminator="family"),
+]
+
+#: Everything a DiagramBlock can carry: the model-declared `Diagram`, or one
+#: of the mermaid families code read. `getattr(d, "family", "graph")` names
+#: which; `Diagram` has no `family` field on purpose, so its schema is exactly
+#: what the model has always been shown.
+AnyDiagram = Union[Diagram, MermaidFigure]
+
+
+def diagram_family(diagram: Any) -> str:
+    """"graph" for the model-declared `Diagram`, else the family's name."""
+    return getattr(diagram, "family", "graph") or "graph"
+
+
+def diagram_from_fields(fields: Dict[str, Any]) -> Any:
+    """The typed diagram for a dict `parse_mermaid` returned: a `Diagram`
+    when it carries no `family`, else the named family. Validation errors
+    propagate, as `Diagram(**fields)` always did."""
+    family = fields.get("family")
+    if not family:
+        return Diagram(**fields)
+    return DiagramBlock.model_validate({"diagram": fields}).diagram
+
+
 class DiagramBlock(_Strict):
     type: Literal["diagram"] = "diagram"
-    diagram: Diagram
+    #: The model declares a `Diagram`; the `SkipJsonSchema` arm is what a
+    #: mermaid fence in a chat answer becomes (see the families above) and
+    #: is invisible to the guided schema the model is constrained to.
+    diagram: Union[Diagram, SkipJsonSchema[MermaidFigure]]
 
 
 class Callout(_Strict):
@@ -1373,6 +1842,11 @@ __all__ = [
     "SPEC_VERSION", "ArtifactSpec", "DocumentSpec", "PresentationSpec", "WorkbookSpec",
     "Heading", "Paragraph", "Bullets", "Numbered", "TableBlock", "ChartBlock", "Callout",
     "Code", "Diagram", "DiagramBlock", "DiagramNode", "DiagramEdge", "DiagramRole", "DIAGRAM_ROLES",
+    "SequenceDiagram", "SeqParticipant", "SeqMessage", "SeqNote", "SeqFrame", "ErDiagram", "ErEntity", "ErAttribute",
+    "ErRelation", "ClassDiagram", "ClassBox", "ClassRelation", "StateDiagram", "StateNode", "StateTransition",
+    "STATE_START", "STATE_END", "MindmapDiagram", "MindNode", "TimelineDiagram", "TimelinePeriod", "MermaidFigure",
+    "JourneyDiagram", "JourneyTask", "KanbanDiagram", "KanbanColumn", "PacketDiagram", "PacketField",
+    "AnyDiagram", "diagram_family", "diagram_from_fields",
     "KPI", "KPIRow", "PageBreak", "Slide", "Sheet", "Column", "Total", "Table", "Chart",
     "Series", "Citation", "Generator", "GenColumn", "OnlyWhen", "Derived", "TextPool", "Rewrite",
     "Highlight", "SheetStyle", "ColumnFormat", "schema_for", "parse_body", "load", "validation_summary",

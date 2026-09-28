@@ -191,46 +191,9 @@ _CRITIQUE_SCHEMA = {
 
 # --------------------------------------------------------------- the steps --
 
-
-class _Steps:
-    """The timeline. One `emit("step", …)` frame per transition, ids counted
-    from 1, and an open step ALWAYS closed — deep_research.py leaves its
-    open step in a variable for exactly this reason, because a phase that
-    raises otherwise leaves a spinner running in the UI forever."""
-
-    def __init__(self, emit: Emit) -> None:
-        self._emit = emit
-        self._next = 0
-        self._open: Optional[tuple] = None
-        self.finished: List[dict] = []
-
-    async def open(self, title: str) -> int:
-        await self.close_open("interrupted")
-        self._next += 1
-        self._open = (self._next, title)
-        await self._emit("step", {"id": self._next, "title": title, "status": "running"})
-        return self._next
-
-    async def done(self, detail: str = "") -> None:
-        await self._close("done", detail)
-
-    async def failed(self, detail: str = "") -> None:
-        await self._close("failed", detail)
-
-    async def close_open(self, detail: str = "") -> None:
-        if self._open is not None:
-            await self._close("failed", detail)
-
-    async def _close(self, status: str, detail: str) -> None:
-        if self._open is None:
-            return
-        step_id, title = self._open
-        self._open = None
-        frame = {"id": step_id, "title": title, "status": status}
-        if detail:
-            frame["detail"] = detail[:200]
-        self.finished.append(dict(frame))
-        await self._emit("step", frame)
+# The timeline lives in core/steps.py since 2026-09-28: engines/chat.py's
+# best-of-N branch narrates itself with the same class.
+from .steps import Steps as _Steps  # noqa: E402
 
 
 # ---------------------------------------------------------------- the loop --

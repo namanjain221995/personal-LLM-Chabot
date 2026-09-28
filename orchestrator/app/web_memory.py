@@ -33,7 +33,7 @@ import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
 
 from . import db, metrics, rerank, web_index
@@ -605,18 +605,62 @@ def _term_positions(text: str, wanted: set) -> Dict[str, List[int]]:
     pos: Dict[str, List[int]] = {t: [] for t in wanted}
     if not wanted:
         return pos
-    # `_stem` only ever strips a SUFFIX, so a stem is a prefix of its word and
-    # the first two characters must match. Testing that first skips the stemmer
-    # on the ~99% of a page's tokens that cannot match any question term.
-    heads = {t[:2] for t in wanted}
-    for m in _WORD.finditer(text.lower()):
+    # `_stem` only ever strips a SUFFIX, so a stem is a PREFIX of its word: a
+    # token can only stem to a wanted term if it STARTS with that term. So the
+    # scan asks the regex engine for those tokens only (`_wanted_token_re`)
+    # instead of yielding all ~470,000 tokens of a 3 MB page into Python and
+    # rejecting them one at a time. Same tokens found, same offsets, same
+    # dict — measured byte-identical on the live corpus, 229 -> 95 ms over
+    # 5.9 M chars of real page text (24 lexical rows, load 5.1).
+    for m in _wanted_token_re(frozenset(wanted)).finditer(text.lower()):
         w = m.group(0)
-        if len(w) < 2 or w[:2] not in heads or w in _STOP:
+        if len(w) < 2 or w in _STOP:
             continue
         hit = pos.get(_stem(w))
         if hit is not None:
             hit.append(m.start())
     return pos
+
+
+#: The separator class inside `_WORD`: a token may be several [a-z0-9] runs
+#: joined by one of these ("oc-h1", "3.14.5", "kv_cache").
+_WORD_SEP = r"[.\-_]"
+
+#: A `_WORD` token, anchored: the shape every stem has.
+_TOKEN_SHAPE = re.compile(r"[a-z0-9]+(?:[.\-_][a-z0-9]+)*\Z")
+
+
+@functools.lru_cache(maxsize=256)
+def _wanted_token_re(wanted: FrozenSet[str]) -> "re.Pattern[str]":
+    r"""`_WORD`, narrowed to the tokens that could stem to one of `wanted`.
+
+    Two things make this exactly `_WORD`'s tokens and not a superset:
+
+    * the extent is `_WORD`'s own pattern with the first run's opening
+      characters pinned to a wanted term, so a match spans the whole token
+      the plain scan would have produced;
+    * the two lookbehinds put the match at a token START. `(?<![a-z0-9])`
+      rejects opening in the middle of a run ("ex" inside "complex") and
+      `(?<![a-z0-9][.\-_])` rejects opening after a separator that `_WORD`
+      would have consumed as part of the preceding token ("def" in
+      "abc.def"). Both are fixed width, so `re` accepts them.
+
+    Cached because `_best_window` is called once per candidate page with the
+    same question, and a retrieval windows up to 24 of them.
+    """
+    # A term that is not itself a `_WORD` token cannot be a stem (`_terms`
+    # yields `_stem` of a `_WORD` match and `_stem` only strips a suffix), and
+    # admitting one breaks the equivalence: a term opening with a separator
+    # matches where `_WORD` has no token boundary and SWALLOWS the real token,
+    # and one ending with a separator matches a token `_WORD` cannot produce.
+    usable = [t for t in wanted if _TOKEN_SHAPE.match(t)]
+    if not usable:
+        return re.compile(r"(?!)")
+    alts = "|".join(sorted((re.escape(t) for t in usable), key=len, reverse=True))
+    return re.compile(
+        r"(?<![a-z0-9])(?<![a-z0-9]" + _WORD_SEP + r")"
+        r"(?:" + alts + r")[a-z0-9]*(?:" + _WORD_SEP + r"[a-z0-9]+)*"
+    )
 
 
 def terms_present(texts: Iterable[str], wanted: Set[str]) -> Set[str]:

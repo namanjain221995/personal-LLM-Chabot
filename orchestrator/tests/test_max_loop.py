@@ -570,7 +570,15 @@ def test_the_documented_kill_switch_really_turns_the_loop_off(monkeypatch):
     monkeypatch.setattr(settings, "max_loop_enabled", False)
     _answer, events, recorded = _run_chat(OWNER_PROMPT, "max", monkeypatch)
     assert recorded.names == ["best_of", "judge"]
-    assert [k for k, _ in events if k == "step"] == []
+    # Not one of the LOOP's phases reached the timeline. Best-of-N has rows of
+    # its own since 2026-09-28 ("Drafting 3 answers in parallel", "Choosing
+    # the best draft"), so "no step at all" would now fail for the wrong
+    # reason; what this pins is that none of the loop's titles appear.
+    from app.core import max_loop as _ml
+
+    loop_titles = {_ml.STEP_PLAN, _ml.STEP_DRAFT, _ml.STEP_CHECK, _ml.STEP_CRITIQUE, _ml.STEP_REVISE}
+    shown = [d["title"] for k, d in events if k == "step"]
+    assert shown and not (set(shown) & loop_titles), shown
 
 
 def test_a_looping_revision_does_not_cost_the_person_their_answer(monkeypatch):
@@ -640,7 +648,15 @@ def test_a_max_turn_of_the_wrong_shape_still_gets_best_of_n(monkeypatch):
     characters. It is routed to by shape and kept switchable."""
     _answer, events, recorded = _run_chat("What is the capital of France?", "max", monkeypatch)
     assert recorded.names == ["best_of", "judge"]
-    assert [k for k, _ in events if k == "step"] == []
+    # Not one of the LOOP's phases reached the timeline. Best-of-N has rows of
+    # its own since 2026-09-28 ("Drafting 3 answers in parallel", "Choosing
+    # the best draft"), so "no step at all" would now fail for the wrong
+    # reason; what this pins is that none of the loop's titles appear.
+    from app.core import max_loop as _ml
+
+    loop_titles = {_ml.STEP_PLAN, _ml.STEP_DRAFT, _ml.STEP_CHECK, _ml.STEP_CRITIQUE, _ml.STEP_REVISE}
+    shown = [d["title"] for k, d in events if k == "step"]
+    assert shown and not (set(shown) & loop_titles), shown
 
 
 @pytest.mark.parametrize(
@@ -662,7 +678,15 @@ def test_a_question_over_a_pasted_document_still_gets_best_of_n(name, monkeypatc
         ORDINARY_ASKS_WITH_A_LIST[name], "max", monkeypatch
     )
     assert recorded.names == ["best_of", "judge"]
-    assert [k for k, _ in events if k == "step"] == []
+    # Not one of the LOOP's phases reached the timeline. Best-of-N has rows of
+    # its own since 2026-09-28 ("Drafting 3 answers in parallel", "Choosing
+    # the best draft"), so "no step at all" would now fail for the wrong
+    # reason; what this pins is that none of the loop's titles appear.
+    from app.core import max_loop as _ml
+
+    loop_titles = {_ml.STEP_PLAN, _ml.STEP_DRAFT, _ml.STEP_CHECK, _ml.STEP_CRITIQUE, _ml.STEP_REVISE}
+    shown = [d["title"] for k, d in events if k == "step"]
+    assert shown and not (set(shown) & loop_titles), shown
 
 
 def test_a_question_over_a_pasted_style_guide_still_gets_best_of_n(monkeypatch):
@@ -672,7 +696,15 @@ def test_a_question_over_a_pasted_style_guide_still_gets_best_of_n(monkeypatch):
 
     _answer, events, recorded = _run_chat(PASTED_STYLE_GUIDE, "max", monkeypatch)
     assert recorded.names == ["best_of", "judge"]
-    assert [k for k, _ in events if k == "step"] == []
+    # Not one of the LOOP's phases reached the timeline. Best-of-N has rows of
+    # its own since 2026-09-28 ("Drafting 3 answers in parallel", "Choosing
+    # the best draft"), so "no step at all" would now fail for the wrong
+    # reason; what this pins is that none of the loop's titles appear.
+    from app.core import max_loop as _ml
+
+    loop_titles = {_ml.STEP_PLAN, _ml.STEP_DRAFT, _ml.STEP_CHECK, _ml.STEP_CRITIQUE, _ml.STEP_REVISE}
+    shown = [d["title"] for k, d in events if k == "step"]
+    assert shown and not (set(shown) & loop_titles), shown
 
 
 def test_a_max_turn_of_the_right_shape_runs_the_loop(monkeypatch):

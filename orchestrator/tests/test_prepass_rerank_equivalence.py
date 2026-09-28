@@ -18,6 +18,25 @@ stubbed, deterministically):
     failing after the speculative run finished (the salvage case): the
     decision, the sources, and the DISTINCT lists sent to rerank.score (dev
     sent the same list twice in the second shape; salvage sends it once).
+
+REGENERATED ONCE, 2026-09-28, and here is the whole of what moved.
+KNOWLEDGE_FAST_SPECULATE_STATIC (default ON) makes the speculative Fast
+retrieval guess STATIC rather than RECENT for a question the deterministic pass
+could not classify. On a router FAILURE the fallback verdict is not STATIC, so
+`salvageable` (`same_level and ...`) is false, the salvage is not attempted and
+the full retrieval runs — which means the cross-encoder is asked twice again in
+the `router_down` shape, as it was on dev before the salvage existed.
+
+The diff was four cases, one key: `prepare.router_down.rerank_distinct`, in
+coverage-gap-not-absence, followup-bare-pronoun, multi-source-comparison and
+stable-fact. `sources` and `decision` are byte-identical in all fourteen cases
+and in both shapes. Nothing a turn cites moved, which is what this file is for;
+the per-key guard in the test now checks that BEFORE the dict equality, so the
+next regeneration cannot quietly cover a citation change.
+
+The cost that shows up here is the one recorded in
+tests/test_prepass_latency.py: about 166 ms saved on every unclassified turn,
+one extra retrieval when the router is down.
 """
 from __future__ import annotations
 
@@ -200,4 +219,17 @@ def test_rerank_inputs_and_sources_match_dev(case, monkeypatch):
     golden = json.loads(GOLDEN.read_text())[case["id"]]
     assert any(v["rerank"] for v in observed["retrieve"].values()), "premise: the cross-encoder ran"
     assert max(len(docs) for v in observed["retrieve"].values() for docs in v["rerank"]) >= 12, "premise: a full head"
+    # WHAT A TURN CITES IS CHECKED FIRST, AND ON ITS OWN (2026-09-28). The full
+    # dict equality below is a big diff to read, and this file has now been
+    # regenerated once for a change that moved the rerank CALL SEQUENCE without
+    # moving a single source. Whoever regenerates it next should have to look at
+    # this line: a citation change fails here, by name, before the shape diff.
+    for section in ("retrieve", "prepare"):
+        for shape, want in sorted(golden.get(section, {}).items()):
+            got = observed.get(section, {}).get(shape, {})
+            for key in ("sources", "evidence", "superseded", "decision", "verdict"):
+                if key in want:
+                    assert got.get(key) == want[key], (
+                        f"{section}.{shape}.{key} moved: this turn no longer cites what dev cited"
+                    )
     assert observed == golden

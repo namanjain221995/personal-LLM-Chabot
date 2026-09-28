@@ -532,6 +532,19 @@
     "decision": "stale_offline",
     "rerank_distinct": [
      [
+      "2640514a97684996",
+      "8966d11f300f4eb2",
+      "e0adaa1179bb8018",
+      "5f36077b5b1f12f3",
+      "5a621c28349cad3b",
+      "de9521615547f1ef",
+      "8340662821234b47",
+      "98a64aacaac31a9c",
+      "21e6b90dc75a5897",
+      "a4e0cd692c4ab29d",
+      "28eefeb7fa6c1109"
+     ],
+     [
       "583e911055bd02e0",
       "2640514a97684996",
       "db8ca18bf3a17686",
@@ -1804,6 +1817,16 @@
     "decision": "stale_offline",
     "rerank_distinct": [
      [
+      "42730e5a232f6728",
+      "fbadee3f3c532a00",
+      "28eefeb7fa6c1109",
+      "3a69c4e8d094b6f2",
+      "9382dfa17c45c78e",
+      "b0d86c23cd789706",
+      "db8ca18bf3a17686",
+      "69111d180a60c1d8"
+     ],
+     [
       "e7d468db0ee87704",
       "a3a94a55726c689b",
       "db8ca18bf3a17686",
@@ -2566,6 +2589,18 @@
     "rerank_distinct": [
      [
       "fbadee3f3c532a00",
+      "ef9b24baf1388175",
+      "2b58f85f3694b080",
+      "1ed63303990fbbcd",
+      "3c629da3017d32cd",
+      "db8ca18bf3a17686",
+      "bedbee9dc694db11",
+      "6f5d274aff7dfe2d",
+      "5ff1866dfb038a9d",
+      "236a6bdade7f9f78"
+     ],
+     [
+      "fbadee3f3c532a00",
       "db8ca18bf3a17686",
       "ef9b24baf1388175",
       "1d5c6ba460293c88",
@@ -3077,6 +3112,17 @@
    "router_down": {
     "decision": "local",
     "rerank_distinct": [
+     [
+      "a4e0cd692c4ab29d",
+      "28eefeb7fa6c1109",
+      "71d4a334f54c95a9",
+      "f159efcbac81d9da",
+      "3823e850bc285be2",
+      "3c629da3017d32cd",
+      "a195ca98ae8012ea",
+      "db45a3df958c1ea1",
+      "21e6b90dc75a5897"
+     ],
      [
       "e7d468db0ee87704",
       "28eefeb7fa6c1109",

@@ -11,6 +11,7 @@ intervals scaled from minutes to tens of milliseconds.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 
 import pytest
@@ -87,6 +88,20 @@ def test_a_poison_prompt_consumes_at_most_two_recoveries_then_fails_and_the_inno
     cluster = Cluster(view, budget=4)
     born = {}
 
+    # THE INNOCENT RUN HAS TO STILL BE RUNNING WHEN THE HEAD RESTARTS
+    # (2026-09-28). This test used to arrange that with the clock: 60 tokens at
+    # 0.01 s against a poison run launched 0.05 s later that restarts the head
+    # two tokens in. On a loaded CI runner the sleeps coalesce, the innocent run
+    # reaches its 60th token before the restart, never sees the fault it is
+    # supposed to survive, and `engine_fault_attempts` is 0 instead of 1. Seen
+    # on shard 2 of run 36416199617; the same shard passes 5,353/5,353 locally
+    # in CI's own order, which is what a timing race looks like.
+    #
+    # So the innocent run now WAITS for the restart instead of racing it. The
+    # timeout is a backstop: if the poison run never restarts the head, this
+    # test fails on its own assertions rather than hanging.
+    restarted = asyncio.Event()
+
     async def hook(engine, call, index):
         key = id(call)
         born.setdefault(key, cluster.generation)
@@ -95,7 +110,11 @@ def test_a_poison_prompt_consumes_at_most_two_recoveries_then_fails_and_the_inno
         prompt = str(call.messages[0]["content"])
         if "POISON" in prompt and index == call.start_index + 2:
             cluster.restart()
+            restarted.set()
             raise RemoteProtocolError("peer closed connection")
+        if "POISON" not in prompt and index == call.start_index + 3 and not restarted.is_set():
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(restarted.wait(), timeout=20.0)
 
     engine = FakeMainEngine(answer_tokens=60, delay_s=0.01, before_token=hook).install(monkeypatch)
     tenant = make_tenant(keys=2)

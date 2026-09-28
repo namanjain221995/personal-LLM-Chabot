@@ -243,7 +243,7 @@ def chart_filename(ordinal: int) -> str:
     return f"chart-{int(ordinal)}.png"
 
 
-def spec_diagrams(spec: S.ArtifactSpec) -> List[S.Diagram]:
+def spec_diagrams(spec: S.ArtifactSpec) -> List[S.AnyDiagram]:
     """Every diagram in the spec, in document order; the 1-based position is
     the picture's file number. Diagrams are a document block only — a slide
     has no diagram field — so a deck contributes none."""

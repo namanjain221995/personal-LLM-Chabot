@@ -139,6 +139,7 @@ from typing import Any, Awaitable, Callable, List, Optional, Sequence, Tuple
 
 from . import formats as F
 from . import lexicon as LX
+from . import pictures as PIC
 from . import types as T
 from . import visuals as VIS
 
@@ -382,6 +383,18 @@ _IMPERATIVE_EDIT_RE = re.compile(
 )
 #: Polite imperatives are requests: "can you make…", "could you create…".
 _POLITE_RE = re.compile(r"^\s*(?:can|could|would|will|please|pls|kindly)\b\s*(?:you|u)?\s*(?:please\s+)?", re.I)
+#: A capability question: a modal, a making verb, a format in the PLURAL or
+#: as "<format> files", a question mark and nothing else. "can you make a pdf
+#: of this?" names an object and is not this.
+#: A question opener, English or Indic, for the content-free form below.
+_CAPABILITY_LEAD_RE = re.compile(
+    r"^\W*(?:can|could|do|are|will|would|kya|su|shu|tame|tum|aap|ap|क्या|आप|तुम|શું|તમે)(?![\w\u0900-\u0AFF])", re.I)
+_CAPABILITY_Q_RE = re.compile(
+    rf"^\W*(?:can|could|do|are|will)\s+(?:you|u)\s+(?:also\s+|even\s+)?(?:able\s+to\s+)?"
+    rf"(?:make|create|generate|produce|build|export|do|handle|output|write|support)\s+"
+    rf"(?:{_FORMAT_WORD})(?:'?s|\s+files?|\s+documents?|\s+format)\s*\?+\W*$",
+    re.I,
+)
 
 #: A negation, then at most a few adverbs, then a creation verb (any form:
 #: "making", "created") and the rest of that clause up to a comma, an
@@ -577,6 +590,20 @@ class ArtifactIntent:
     #: (`decide` runs on the event loop). Read by
     #: artifacts/describe.answers_from_spec.
     names_our_file: bool = False
+    #: The mermaid head of a DIAGRAM this turn asks to be drawn in the answer
+    #: — "flowchart", "sequencediagram", "erdiagram", … — from
+    #: `pictures.Diagram.head`. Set only with action "none" and no chart
+    #: claimed: nothing is made, nothing is refused, and the answering prompt
+    #: is free to emit the ```mermaid fence the browser renders.
+    #:
+    #: It exists because "no file" was not enough to tell the route WHY. A
+    #: flow-chart request and a "thanks!" both decided action "none", so
+    #: nothing downstream could say which picture had been asked for — and
+    #: nothing upstream could stop the classifier being asked to turn the
+    #: first one into a PNG (finding 2, 2026-09-28).
+    diagram: str = ""
+    #: `pictures.Diagram.token` for that diagram — "flow_chart", "org_chart".
+    diagram_kind: str = ""
 
     @property
     def wants_file(self) -> bool:
@@ -631,7 +658,9 @@ def _rule_view(text: str) -> str:
     negated creation clause blanked (#9). `decide` reads it for the whole
     message; the question gate (step 1a) reads it for the person's own prose
     alone."""
-    low = LX.normalize(_without_negated_clauses((text or "").lower()))
+    # The Gujlish possessive "no" ("aa data no report banavo") is rewritten
+    # before the raw-text blanking below can read it as a negation.
+    low = LX.normalize(_without_negated_clauses(LX.gujlish_genitive((text or "").lower())))
     return _without_negated_clauses(_blank_neg_token_clauses(low))
 
 
@@ -813,6 +842,29 @@ _SOV_RE = re.compile(
     rf"\b(?:{_FORMAT_WORD}|{_ARTIFACT_NOUNS}|file|sheet|charts?)\b(?:\s+\S+){{0,6}}?\s+(?:_give_|_convert_)",
     re.I,
 )
+
+
+def _sov(low: str) -> bool:
+    """`_SOV_RE` on the view that holds no DIAGRAM: "flow chart banao" and
+    "ફ્લો ચાર્ટ બનાવો" are not a chart to be drawn from a table, and the
+    bare `charts?` alternative above cannot tell them from "chart banao"
+    (measured 2026-09-28: both reached create/create-postposition, while the
+    English "make a flowchart of our deploy process" fell through to chat).
+    `LX.without_diagram_phrases` owns that vocabulary -- one home, shared
+    with `LX.chart_signal` and artifacts/formats.py -- and it only ever
+    removes a diagram phrase, so every OTHER alternative of `_SOV_RE`
+    (a format word, an artifact noun, `file`, `sheet`) reads the same text
+    it always did: "flow chart pdf me bana do" is still a PDF.
+
+    The three readers of `_SOV_RE` all ask the same question -- is this a
+    postposition-shaped request for a DELIVERABLE -- which is why the blank
+    belongs here and not in `_rule_view`. `low` itself keeps the words,
+    because a QUESTION about a flow chart inside a file we made is still a
+    question about that file's contents ("what is in the flow chart?" ->
+    answer-artifact:contents, measured today before and after)."""
+    return bool(_SOV_RE.search(LX.without_diagram_phrases(low)))
+
+
 #: A new deliverable with its own topic: "a Word document summarizing the
 #: vendors", "a pdf on two-factor authentication" — a create, not an export
 #: of the answer, unless the topic IS the reference ("a word version of the
@@ -926,12 +978,24 @@ _CHART_ASK_RE = re.compile(
     # only at the start, and never a story's plot or a maths graph to explain
     # (verifier 2026-09-15: "plot of the movie Inception" and "explain the
     # graph of y=x^2" made chart files).
-    r"|^\W*(?:an?\s+|the\s+)?(?:[\w-]+\s+)?(?:chart|graph|plot|histogram|heat\s*map|timeline)s?\s+(?:of|with|for|showing|comparing|by)\b"
+    # `from` joined the relations on 2026-09-28: "timeline chart FROM the dates
+    # in this sheet" and "gantt chart FROM the project rows" named the table
+    # they wanted plotted and were read as no request at all — the one relation
+    # word that points at the data was the one missing.
+    r"|^\W*(?:an?\s+|the\s+)?(?:[\w-]+\s+)?(?:chart|graph|plot|histogram|heat\s*map|timeline)s?\s+(?:of|with|for|from|showing|comparing|by)\b"
     r"(?!\s+(?:the\s+|this\s+|that\s+|a\s+)?(?:movie|film|book|novel|story|show|series|play|episode|game|anime|manga|song|opera|poem)s?\b)"
     # AS3 integration (live 2026-09-15): "scatter of Salary vs Experience
     # with a trend line in a pdf" read as no request (lexicon._CHART_RE reads
     # the chart; this reads the noun-first ask).
     r"|^\W*(?:an?\s+|the\s+)?(?:scatter|bubble|waterfall|funnel|radar|pie|donut|doughnut|gantt)\s+(?:of|showing|comparing)\s+\S+(?:\s+\S+){0,6}?\s+(?:vs\.?|versus|by|per|against|over)\b"
+    # A QUADRANT NAMED WITH TWO MEASURES is a plot of those two columns: "put
+    # these vendors on a quadrant of price vs rating" drew nothing at all.
+    # Anywhere in the sentence, not only at the head, because this shape
+    # arrives as "put these X on a quadrant of …". A quadrant named WITHOUT a
+    # measure pair ("draw a priority quadrant chart, no data needed") is the
+    # concept and `pictures` draws it — see `pictures.SUBJECTS`, where quadrant
+    # is dual.
+    r"|\bquadrants?\s+(?:of|showing|comparing)\s+\S+(?:\s+\S+){0,6}?\s+(?:vs\.?|versus|against|by|over)\b"
     r"|^\W*(?:an?\s+)?(?:(?:bar|line|pie|donut|doughnut|area|scatter|stacked|column|bubble|radar|funnel|waterfall|gantt|box|combo|"
     r"horizontal|vertical|simple|colou?red|blue|red|green|monthly|weekly)[- ]?){1,2}(?:chart|graph|plot)s?\b"
     r"|^\W*(?:an?\s+)?(?:histogram|heat\s*map|scatter\s*plot|box\s*plot)\b|(?:chart|graph|plot)[^:]{0,60}:\s*\S",
@@ -1679,8 +1743,45 @@ _FUNCTION_WORDS_RE = re.compile(
 )
 
 
+#: Word boundaries for the two Indian scripts. Python's `\b` fails after a
+#: combining vowel sign (see `_Q_WH_ANY`), so every Indic pattern in this
+#: module uses these lookarounds instead.
+_IB = r"(?<![\w\u0900-\u0AFF])"
+_IE = r"(?![\w\u0900-\u0AFF])"
+#: THE FUNCTION WORDS OF HINDI, GUJARATI AND THEIR ROMANISATIONS (2026-09-28).
+#: `_FUNCTION_WORDS_RE` above is what decides that "pdf bana do" is
+#: CONTENT-FREE (a hand-over of the answer) while "sales ki report banao"
+#: names a topic (a create). It listed English function words only, so every
+#: Indic pronoun, postposition, copula and light verb counted as a TOPIC:
+#: measured on the live product, "ફાઈલ PDF માં આપો", "upar wala jawab pdf me
+#: de do", "Mujhe excel sheet chahiye.", "डॉक्स फाइल बना दो।" and "file
+#: banavo pdf mate." each became a NEW file of model-invented content after
+#: an answer, while their English twins were exported. Devanagari export
+#: 17/20 and Gujarati 9/16 against English 107/124 was this list.
+_INDIC_FUNCTION_WORDS_RE = re.compile(
+    _IB + r"(?:"
+    # pronouns and their case forms
+    r"mujhe|muje|mujhko|hume|humko|hamko|humein|hame|mane|mne|mare|maare|amne|tame|tum|tu|aap|ap|ye|yeh|aa|e|ee|es|is|iss|"
+    r"मुझे|मुझको|हमें|हमको|मैं|मैंने|मेरे|मेरी|मेरा|मने|मारे|आप|आपको|तुम|तुम्हें|हम|મને|મારે|મારા|મારી|મારો|અમને|તમે|આપ|यह|ये|इस|इसे|इसको|आ|એ|"
+    # postpositions and case markers
+    r"ko|ka|ki|ke|se|ma|maa|mein|me|nu|ni|no|ne|mate|maate|liye|vaste|upar|uper|wala|wali|wale|vala|vali|"
+    r"को|का|की|के|से|में|मे|માં|ने|ને|નો|ની|નું|ના|માટે|लिए|वास्ते|ऊपर|ઉપર|वाला|वाली|वाले|"
+    # copulas and light verbs
+    r"che|chhe|chhu|chu|hai|hain|hu|hoon|hun|ho|kar|karo|kardo|kari|karjo|karna|karvanu|do|de|dena|dijiye|"
+    r"hona|honi|hone|hovu|hovi|hoy|jaruri|zaruri|chahiye|joie|joiye|joiti|joitu|"
+    r"है|हैं|हूँ|हूं|हो|છે|છું|છો|હું|करो|कर|करें|कीजिए|दो|दें|दीजिए|દો|કરો|કરી|કરજો|होना|होनी|होने|હોવું|હોવો|હોવી|જોઈએ|जरूरी|ज़रूरी|જરૂરી|चाहिए|"
+    # the little words of a request
+    r"bas|sirf|khali|fakt|ready|taiyar|tayar|thodi|thoda|thodu|jara|zara|ek|ekad|answer|reply|response|"
+    r"बस|सिर्फ|फक्त|ફક્ત|ખાલી|બસ|तैयार|તૈયાર|थोड़ा|थोड़ी|જરા|ज़रा|एक|એક|जवाब|उत्तर|જવાબ"
+    r")" + _IE,
+    re.I,
+)
+
+
 def _content_words(low: str) -> bool:
-    return bool(_FUNCTION_WORDS_RE.sub(" ", low).split())
+    # Indic first: `_FUNCTION_WORDS_RE`'s punctuation arm (`[^\w\s]`) strips
+    # the vowel signs, which are not `\w`, and would leave "માં" as "મ".
+    return bool(_FUNCTION_WORDS_RE.sub(" ", _INDIC_FUNCTION_WORDS_RE.sub(" ", low)).split())
 
 
 def _export_shape(low: str, explicit: Sequence[str]) -> Optional[str]:
@@ -1749,9 +1850,114 @@ def _export_shape(low: str, explicit: Sequence[str]) -> Optional[str]:
     # Without a reference, only a CONTENT-FREE postposition hands the answer
     # over ("pdf bana do"); "sales ki report banao" names a new topic and is a
     # create (verifier 2026-09-15: it exported the previous answer).
-    if _SOV_RE.search(low) and (ref or (len(low.split()) <= 6 and not _content_words(low))):
+    if _sov(low) and (ref or (len(low.split()) <= 6 and not _content_words(low))):
         return "export-postposition"
     return None
+
+
+# ------------------------------------------ A CORRECTION OF THE LAST FILE --
+
+_CORRECTION_NEG = (
+    r"(?:no|nope|nah|nahi|nahin|nai|nhi|na|not|wrong|galat|khotu|khoto|khoti|sorry|"
+    r"नहीं|नही|ना|गलत|ના|નહીં|નહિ|ખોટું|ખોટો|ખોટી)"
+)
+#: The turn OPENS with a negation or a fault word.
+_CORRECTION_LEAD_RE = re.compile(
+    rf"^\W*(?:(?:ok|okay|and|but|umm|hmm|arre|arey|bhai|yaar|sir|bro|oops|hey|hi|please|pls)\W+)*"
+    rf"{_IB}{_CORRECTION_NEG}{_IE}",
+    re.I,
+)
+#: "I said …", "I meant …", "maine … bola tha", "મેં … કહ્યું હતું", "mane …
+#: joiti hati", and the go-ahead "yes, go ahead with …".
+_CORRECTION_SAID_RE = re.compile(
+    rf"{_IB}(?:(?:i|we)\s+(?:said|meant|mean|wanted|want|asked(?:\s+for)?|told\s+you|need|needed)"
+    rf"|(?:maine|mene|mein|me|mane|mai|mai\s+ne|main\s+ne|मैंने|मैने|મેં)\s+(?:\w+\s+){{0,3}}?(?:bola|kaha|kahyu|kidhu|kahi|kehlu|कहा|बोला|કહ્યું|કીધું)"
+    rf"|(?:mane|mare|maare|mujhe|muje|मुझे|મારે|મને)\s+(?:\w+\s+){{0,3}}?(?:joiti|joitu|joito|chahiye|_give_)\s*(?:hati|hatu|hato|thi|tha|the|હતી|હતું|હતો|थी|था|थे)?"
+    rf"|(?:yes|yeah|yep|ya|haan|han|ha|sure|ok|okay|હા|हाँ|हां)\W+(?:go\s+ahead|proceed|do\s+it|karo|kar\s+do|kari\s+do|कर\s+दो|કરો)"
+    rf"|go\s+ahead\s+with|proceed\s+with){_IE}",
+    re.I,
+)
+#: The whole message is a format said two or more times: "PDF. PDF. PDF."
+_FORMAT_REPEAT_RE = re.compile(rf"^\W*(?:(?:{_FORMAT_WORD})\W+){{2,}}$", re.I)
+#: The words a correction is made of. Stripped before `_content_words` asks
+#: whether anything ELSE was said.
+_CORRECTION_VOCAB_RE = re.compile(
+    rf"{_IB}(?:{_CORRECTION_NEG}|said|meant|mean|wanted|want|asked|for|told|need|needed|instead|actually|again|first|earlier|before|"
+    r"maine|mene|mein|mai|main|bola|kaha|kahyu|kidhu|kahi|kehlu|tha|thi|the|tu|hatu|hati|hato|"
+    r"yes|yeah|yep|ya|haan|han|ha|sure|go|ahead|proceed|it|karo|kar|kari|"
+    r"मैंने|मैने|मैं|कहा|बोला|था|थी|थे|हाँ|हां|હા|મેં|કહ્યું|કીધું|હતું|હતી|હતો|"
+    rf"format|formats|type|wala|wali|vala|vali){_IE}",
+    re.I,
+)
+_REJECTED_BEFORE = r"(?:not|no|nahi|nai|nhi|nahin|na|नहीं|नही|ना|ન|ના|નહીં|નહિ)"
+_REJECTED_AFTER = r"(?:nahi|nai|nhi|nahin|nay|nathi|नहीं|नही|ना|ના|નહીં|નહિ)"
+_CORRECTION_FORMAT_WORDS = {
+    "pdf": ("pdf",),
+    "docx": ("docx", "word", "doc"),
+    "pptx": ("pptx", "powerpoint", "ppt", "deck", "slides", "presentation"),
+    "xlsx": ("xlsx", "excel", "spreadsheet", "workbook", "sheet"),
+    "csv": ("csv", "cvs"),
+}
+#: A PART of the file named in the correction, and a change said of it.
+_CORRECTED_PART_RE = re.compile(
+    rf"{_IB}(?:columns?|rows?|fields?|cells?|headers?|footers?|titles?|headings?|sheets?|tabs?|slides?|pages?|tables?|charts?|graphs?|"
+    r"ax[ie]s|legends?|labels?|totals?|sections?|dates?|deadlines?|numbers?|values?|figures?|formulas?|colou?rs?|fonts?|names?|order|"
+    r"sorting|spelling|units?|currency|"
+    rf"पंक्ति\w*|कॉलम|स्तंभ|तारीख\w*|संख्या|रंग|હરોળ|કૉલમ|કોલમ|તારીખ\w*|સંખ્યા|રંગ|ફોન્ટ){_IE}",
+    re.I,
+)
+_CORRECTION_CHANGE_RE = re.compile(
+    rf"{_IB}(?:should(?:n'?t)?|wrong|incorrect|galat|khotu|khoto|khoti|missing|instead|not|nahi|nai|nhi|"
+    r"hona|honi|hone|hovo|hovu|hovi|joie|joiye|_give_|be|fix|change|badlo|badal|off|"
+    rf"गलत|नहीं|नही|होना|होनी|होने|चाहिए|बदलो|ગલત|ખોટું|ખોટો|ખોટી|નહીં|હોવો|હોવું|હોવી|જોઈએ){_IE}",
+    re.I,
+)
+
+
+#: Praise or assent in a turn that opens with "no": "no, the chart is fine".
+_CORRECTION_PRAISE_RE = re.compile(
+    rf"{_IB}(?:fine|good|great|perfect|correct|right|ok|okay|nice|thanks|thank\s+you|sahi|theek|thik|barabar|saras|"
+    rf"ठीक|सही|बराबर|બરાબર|સરસ|સાચું){_IE}", re.I)
+
+
+def _part_correction(low: str, raw: str) -> bool:
+    """A negation opens the turn, a PART of the file is named, and a change
+    is said of it: an edit of the file just made. Praise in the same words
+    ("no, the chart is fine") is not a change."""
+    return bool(
+        _CORRECTION_LEAD_RE.match(low) and _CORRECTED_PART_RE.search(low) and _CORRECTION_CHANGE_RE.search(low)
+        and not _CORRECTION_PRAISE_RE.search(low) and "?" not in raw
+        # "no, not a chart -- a flowchart of the process": the picture lane's,
+        # not a correction of the chart that exists.
+        and not LX.diagram_signal(low)
+    )
+
+
+def _format_correction(low: str, raw: str, explicit: Sequence[str]) -> Optional[str]:
+    """The ONE format the person now wants, when the turn is a correction
+    that names formats and asks for nothing else; else None. The rejected
+    format ("not docx", "word nahi") is read off the unblanked words."""
+    # `formats_in` rather than `explicit`: "wrong format, I wanted a deck"
+    # names its format in a slot the explicit reader does not count.
+    named = [f for f in LX.formats_in(low) if f in _CORRECTION_FORMAT_WORDS]
+    if not named or "?" in raw or _EDIT_VERBS_RE.search(low) or _MORE_EDIT_VERBS_RE.search(low) \
+            or _positional_create(low) or _NEW_TOPIC_RE.search(low):
+        return None
+    if not (_CORRECTION_LEAD_RE.match(low) or _CORRECTION_SAID_RE.search(low) or _FORMAT_REPEAT_RE.match(low)):
+        return None
+    unblanked = LX.normalize(raw)
+    rejected = set()
+    for fmt in named:
+        words = "|".join(_CORRECTION_FORMAT_WORDS.get(fmt, (fmt,)))
+        if re.search(rf"{_IB}{_REJECTED_BEFORE}\s+(?:(?:a|an|the)\s+)?(?:{words}){_IE}", unblanked, re.I) \
+                or re.search(rf"{_IB}(?:{words})(?:\s+(?:file|version|format))?\s+{_REJECTED_AFTER}{_IE}", unblanked, re.I):
+            rejected.add(fmt)
+    wanted = [f for f in dict.fromkeys(named) if f not in rejected]
+    if len(wanted) != 1:
+        return None
+    if _content_words(_CORRECTION_VOCAB_RE.sub(" ", low)):
+        return None
+    return wanted[0]
 
 
 def _shape_of(value: Any) -> Optional[Any]:
@@ -1829,7 +2035,102 @@ _DATASET_CHART_ASK_RE = re.compile(
 )
 
 
-def _dataset_ask(low: str, raw: str, chart: bool) -> str:
+#: A CHART TYPE in a slot where it can only name a chart (2026-09-28). With
+#: a spreadsheet in the conversation, "Headcount per department as a pie.",
+#: "Stacked bar of Q1 and Q2 sales by region.", "Average score by owner, bars
+#: please." and "region wise sales ka bar chart" made NOTHING -- 38 of the
+#: 140 chart asks in the understanding corpus, 26 of them not even offered to
+#: the classifier, because `file_signal` knew "chart" but no chart TYPE, and
+#: the create rule wanted a request verb. The word is not the meaning: "bar"
+#: in "bar the door" and "line" in "line 3" are not charts, so the type word
+#: counts only in a chart-shaped slot -- after "as a"/"_in_", leading "of
+#: ...", or standing alone as its own clause ("..., bars please").
+_DATASET_TYPE = (
+    rf"(?:(?:horizontal|vertical|100%|percent|grouped|clustered)\s+)?"
+    rf"(?:{LX.CHART_TYPE_WORDS}|bars|columns|lines|pies|donuts|doughnuts|funnels|histograms|heat\s*maps|tree\s*maps|sunbursts|timeline|quadrant)"
+    rf"(?:\s+(?:bar|column|line|area))?(?:\s+(?:chart|graph|plot))?s?"
+)
+_DATASET_TYPE_SLOT_RE = re.compile(
+    rf"\b(?:as|in|into|on|_in_)\s+(?:(?:a|an|one)\s+)?{_DATASET_TYPE}\b"
+    rf"|{_DATASET_TYPE}\s+_in_\b"
+    rf"|^\W*{_DATASET_TYPE}\s+(?:of|for|showing|by|per)\b"
+    rf"|(?:^|[,;:]\s*){_DATASET_TYPE}(?:\s+(?:please|pls))?\s*(?:$|[,;.!?])",
+    re.I,
+)
+#: A PICTURE RULED OUT: "no chart please", "without a graph", "skip the
+#: diagram", "don't want a chart". Measured 2026-09-28 with a spreadsheet
+#: bound: "no chart please" opened a chart job, because a chart word is a chart
+#: word whichever side of a negation it sits on.
+_NO_CHART_RE = re.compile(
+    r"\b(?:no|without|skip|avoid|not)\s+(?:a\s+|an\s+|any\s+|the\s+)?"
+    r"(?:\w+\s+){0,2}?(?:chart|graph|plot|diagram|visuali[sz]ation)s?\b"
+    r"|\b(?:don'?t|do\s+not|dont)\s+(?:want|need|make|create|draw|add)\s+"
+    r"(?:a\s+|an\s+|any\s+|the\s+)?(?:\w+\s+){0,2}?(?:chart|graph|plot|diagram)s?\b",
+    re.I)
+#: A CHART THAT ALREADY EXISTS, spoken about rather than asked for. Two shapes
+#: the copula guard below cannot see: the product is credited with drawing it
+#: ("the bar chart you drew is unreadable"), or the verb is speech ABOUT it
+#: rather than production of it ("explain the bar chart you drew"). Measured
+#: 2026-09-28, with a spreadsheet bound: both opened a second chart job.
+#:
+#: The speech arm stops at a production verb, so "explain the data then make a
+#: bar chart of it" is still a request for the chart.
+_CHART_ALREADY_THERE_RE = re.compile(
+    r"\b(?:chart|graph|plot|diagram)s?\s+(?:that\s+)?you\s+(?:just\s+)?"
+    r"(?:drew|draw|made|make|created|create|gave|give|generated|generate|produced|built)\b"
+    r"|^\W*(?:explain|describe|interpret|summari[sz]e|walk\s+me\s+through)\b"
+    r"(?:(?!\b(?:make|create|draw|build|generate|add)\b)[^.?!;\n])*"
+    r"\b(?:chart|graph|plot|diagram)s?\b",
+    re.I)
+#: The chart word followed by a copula: "the plot is wrong", "the chart
+#: looks off" -- talk about a chart, not an ask.
+_CHART_COPULA_RE = re.compile(
+    r"\b(?:chart|graph|plot|bar|column|line|pie|donut|histogram)s?\s+(?:is|are|was|were|looks?|seems?|has|have|does|did)\b", re.I)
+_DATASET_OPINION_RE = re.compile(r"^\W*(?:i|we)\s+(?:don'?t|do\s+not|never|hate|dislike|like|love|prefer|think|feel|see|know)\b", re.I)
+_DATASET_CLAUSE_RE = re.compile(r"[^.?!;\n]+[.?!;\n]*")
+
+#: The Latin-script Hinglish question words. `_WH_QUESTION_RE` covers the
+#: English ones and `_KYA_WHAT_RE` the "kya" family, but neither reads "kahan"
+#: (where), "kaun" (which) or "kitne" (how many): "is sheet ka chart kahan hai ??"
+#: — where IS the chart of this sheet — opened a chart job (2026-09-28).
+_HINGLISH_WH_RE = re.compile(r"\b(?:kahan|kaha|kidhar|kyun|kyu|kyo|kab|kaun|kaunsa|kitne|kitna|kitni|konsa)\b", re.I)
+
+
+
+
+def _dataset_chart_clause(clause: str, chart_words: bool) -> bool:
+    """Does this one clause, said over an uploaded table, ask for a chart of
+    it? A chart word (`chart_words`, the lexicon's reading of this clause) or
+    a chart type in a chart-shaped slot, and nothing that makes it a
+    question about charts, an opinion, an edit or a story."""
+    c = clause.strip()
+    if not c or _STORY_PLOT_RE.search(c) or _CHART_COPULA_RE.search(c) or _DATASET_OPINION_RE.match(c) \
+            or _CHART_ALREADY_THERE_RE.search(c) or _NO_CHART_RE.search(c) \
+            or _STATEMENT_RE.match(c) or _EDIT_VERBS_RE.search(c) or _HINGLISH_WH_RE.search(c) \
+            or _question_not_a_request(c, raw=c):
+        return False
+    if _DATASET_CHART_ASK_RE.match(c):
+        return True
+    if chart_words and not _QUESTION_ABOUT_RE.match(c):
+        return True
+    if _DATASET_TYPE_SLOT_RE.search(c):
+        return True
+    # THE TYPE NAMED AS A BARE NOUN, the widest of the three readings and the
+    # last, so the vetoes above apply to it too. "Stacked bar of status broken
+    # down by priority", "Headcount per department as a pie", "Funnel of the
+    # conversion stages", "Revenue per quarter as columns" — four of the
+    # product's own 77 authored chart requests, all rule=no-request with a
+    # spreadsheet bound. `LX.chart_type_noun_ask` is deliberately NOT part of
+    # `chart_signal`: "the line is flat in august" names a type and asks for
+    # nothing, and a wrong lane is a wrong answer delivered confidently.
+    return bool(
+        LX.chart_type_noun_ask(c)
+        and not _KYA_WHAT_RE.search(c) and not _Q_SOV_RE.search(c)
+        and not (("?" in c) and _WH_QUESTION_RE.search(c))
+    )
+
+
+def _dataset_ask(low: str, raw: str, chart: bool, explicit: Sequence[str] = ()) -> str:
     """The rule name when these words ask for a file made from the
     conversation's dataset, else "". Called only when one exists."""
     if _DATASET_REPORT_RE.match(low):
@@ -1838,6 +2139,18 @@ def _dataset_ask(low: str, raw: str, chart: bool) -> str:
     # ask; this closes only the band they call ambiguous.
     if chart and "?" in raw and _DATASET_CHART_ASK_RE.match(low) and not _STORY_PLOT_RE.search(low):
         return "dataset-chart"
+    # A chart of the table, said without a request verb. A document format
+    # named as the DESTINATION ("pie of status in a pdf") is the create
+    # rules' below; named as the source ("from the dates in this sheet") it
+    # is not a destination.
+    dest = bool(explicit) and not LX.reads_source(low) and bool(
+        _AS_FORMAT_RE.search(low) or _CONVERT_RE.search(low) or _MAKE_IT_FORMAT_RE.search(low))
+    # Read one clause at a time, so "I don't like pie charts. Bar chart of
+    # status." keeps the bar chart, and so every reading inside
+    # `_dataset_chart_clause` is held to the same vetoes.
+    if not dest and any(
+            _dataset_chart_clause(c, LX.chart_signal(c)) for c in _DATASET_CLAUSE_RE.findall(low)):
+        return "dataset-chart-type"
     return ""
 
 
@@ -1972,8 +2285,12 @@ _Q_WH_ANY = (
     # `kitni` is the feminine of `kitna`, and Gujarati's `ketli` was here
     # without it: "workbook me KITNI sheets hai ??" was not a question at all
     # while "workbook me KITNE sheets hai ??" was (measured 2026-09-28).
-    r"(?<!\w)(?:what'?s?|how\s+many|how\s+much|kya|kaya|kitne|kitna|kitni|ketla|ketli|su|shu"
-    r"|क्या|कितन\w*|શું|કેટલ\w*)(?!\w)"
+    r"(?<!\w)(?:what'?s?|how\s+many|how\s+much|kya|kaya|kayi|kitne|kitna|kitni|ketla|ketli|su|shu"
+    # WHICH, in all four (2026-09-28): "इस फ़ाइल में कौन-कौन से कॉलम हैं?",
+    # "આ ફાઇલમાં કયા કૉલમ છે?" and "isme kaun se column hai?" were answered
+    # without reading the file, while "what columns does it have?" was not.
+    r"|kaun(?:\s*s[aie])?|kon(?:\s*s[aie])?"
+    r"|क्या|कितन\w*|कौन(?:-कौन)?(?:\s*स[ाीे])?|શું|કેટલ\w*|કયા|કયો|કઈ|કયું)(?!\w)"
 )
 #: `where`, `which` and `why` open a question at the START of a clause and
 #: SUBORDINATE one inside it: "make the Status column red WHERE Open, in the
@@ -1987,6 +2304,7 @@ _Q_WH_LEAD = (
     r"(?:where|which|why)(?!\w)"
 )
 _Q_WH = rf"(?:{_Q_WH_ANY}|{_Q_WH_LEAD})"
+_Q_WH_ANY_RE = re.compile(_Q_WH_ANY, re.I)
 _Q_GAP = r"(?:\w+\W+){0,4}?"
 #: The three atoms above, as whole words, for the tests that need one of them
 #: present anywhere in a clause.
@@ -2167,6 +2485,16 @@ _Q_DID_YOU_DIRECT_RE = re.compile(
 #: words are an imperative ("do the same for headcount", "delete the last
 #: column"), and a wh-question needs no mark to be a question ("what is in
 #: this sheet").
+#: A copula question about the file's format: "is it in excel?", "is this an
+#: excel?", "is the tracker a pdf?". No verb, no request -- the format word
+#: is the SUBJECT of the question, never a destination.
+_Q_COPULA_FORMAT_RE = re.compile(
+    rf"^\W*(?:(?:ok|okay|so|and|also|but|now|then|hey|hi|sir|just)\W+)*"
+    rf"(?:is|are|was|were)\s+(?:it|this|that|these|those|(?:the|this|that)\s+(?:\w+\s+)?(?:file|one|sheet|doc|document|report|deck|workbook|tracker))"
+    rf"\s+(?:(?:an?|the|in|as|already|still|also|now)\s+){{0,3}}(?:{_FORMAT_WORD})(?:\s+(?:file|format|version))?"
+    rf"(?:\s+or\s+\w+)?\W*$",
+    re.I,
+)
 _Q_YES_NO_RE = re.compile(
     rf"^\W*(?:(?:ok|okay|so|and|also|but|now|then|please|pls|hey|hi|sir|just)\W+)*"
     rf"(?:does|do|did|is|are|was|were|has|have)\s+(?:there\b|you\b|{_Q_THIS_FILE})",
@@ -2451,6 +2779,11 @@ def _artifact_question_kind(clause: str, marked: bool = False) -> str:
         or _Q_INSIDE_RE.search(clause) or _Q_DID_YOU_DIRECT_RE.search(clause)
     ):
         return "what-you-did"
+    if (marked or "?" in clause) and _Q_COPULA_FORMAT_RE.match(clause):
+        # "is it in excel?", "is this file an excel?": a question about the
+        # file's FORMAT. Until 2026-09-28 the format word was read as a
+        # conversion target (convert-artifact-turn -> an xlsx job).
+        return "format"
     if (marked or "?" in clause) and _Q_YES_NO_RE.match(clause) and (
         _Q_CONTENT_NOUN_RE.search(clause) or _Q_INSIDE_RE.search(clause)
     ):
@@ -2545,7 +2878,9 @@ def _artifact_question(own_low: str) -> str:
         if not kind:
             if _asks_for_work(clause):
                 return ""
-        elif not _Q_DID_YOU_RE.search(clause) and _names_a_deliverable(clause):
+        elif kind != "format" and not _Q_DID_YOU_RE.search(clause) and _names_a_deliverable(clause):
+            # (a format QUESTION names its format as the subject, not as a
+            # deliverable -- `_AS_FORMAT_RE` reads "in excel" either way)
             return ""
     return next(k for k in kinds if k)
 
@@ -2609,6 +2944,46 @@ def decide(
     style = bool(LX.style_phrases(low))
     chart = LX.chart_signal(low)
     prev_shape = _shape_of(last_deliverable)
+    # THE PICTURE THIS TURN ASKS FOR (2026-09-28). `pictures.diagram_ask` reads
+    # the SUBJECT in front of the picture word — a flow, an org, a sequence, a
+    # dependency — and not the word itself, because "chart" in "flow chart"
+    # names a diagram while "chart" in "bar chart" names a plot. The owner
+    # asked for a "Flow Chart of Api Which Coonect to Db" and was told to
+    # attach a CSV; one space away, "flowchart" drew the picture.
+    #
+    # Four things take the turn back, and each is a defect this closes:
+    #   * a QUESTION about a picture that already exists in an attachment —
+    #     "what does the flow chart on page 3 show?" is something to READ;
+    #   * a plot of NUMBERS named as well ("a flow chart of the approval steps
+    #     AND a bar chart of tickets per owner"): the chart lane wins and the
+    #     model still draws the flow chart in the same answer;
+    #   * a FORMAT named outright — "put a flow chart of the deploy pipeline in
+    #     a PDF" makes the PDF, and the diagram goes inside it;
+    #   * any OTHER deliverable named once the picture's own words are set
+    #     aside ("add a process flow diagram to that report" edits the report).
+    #
+    # A FORMAT WORD THAT SAYS WHERE THE NUMBERS COME FROM IS NOT A FILE ASK.
+    # "org chart of the team from the names in this sheet" read as explicit
+    # xlsx, so every guard below thought a workbook had been asked for. This is
+    # the same text with its source clauses removed, and it is what the picture
+    # rules read; `explicit` itself is untouched, because a real conversion
+    # ("this sheet as a pdf") must keep naming both.
+    _no_source = PIC.without_source_clauses(low)
+    _deliverable_formats = F.explicit_formats(_no_source)
+    _diagram = PIC.diagram_ask(low, has_dataset=bool(has_dataset))
+    if _diagram is not None and (
+            VIS.asks_about_attachment_content(raw.lower())
+            or PIC.data_chart_named(low)
+            or _deliverable_formats
+            # A FILE NAMED AS A THING, and nothing looser. An earlier version
+            # asked `formats.kind_for` about the sentence with the picture's own
+            # name blanked, which reads the SUBJECT as a deliverable: "gantt
+            # chart of a three month plan, make the dates up" came back
+            # "document words" on the word `plan` and lost its diagram. What
+            # matters is whether a file was asked for, and a file is a format or
+            # a file noun.
+            or LX.file_noun_signal(_no_source)):
+        _diagram = None
 
     def made(action: Action, **kw) -> ArtifactIntent:
         kw.setdefault("formats", explicit)
@@ -2753,6 +3128,20 @@ def decide(
         answer = artifact_question_answer(artifact_id_hint=str(artifact_id))
         if answer is not None:
             return answer
+        # A REQUEST FOR A PICTURE IS NOT AN EDIT OF THE OPEN REPORT
+        # (2026-09-28). The UI binds this box to EVERY turn while the panel is
+        # open, so with a report on screen "flowchart of the deploy pipeline",
+        # "draw a sequence diagram for the login path", "ER diagram of the
+        # schema", "make me a mind map of the roadmap now", "draw the
+        # architecture diagram of the platform" and "timeline of the
+        # milestones" all silently re-rendered that report — 6 of 6, measured.
+        # Remove `artifact_id` and all six were already right, so this is the
+        # binding and not the words. Same shape as the question fix above: an
+        # edit needs something to edit named in it, and none of these names the
+        # file at all.
+        if _diagram is not None:
+            return made("none", rule=f"diagram-in-chat:{_diagram.token}", instruction="", formats=[],
+                        diagram=_diagram.head, diagram_kind=_diagram.token)
         version = _VERSION_RE.search(low)
         return made("edit", reference="named", reference_hint=f"version {version.group(1)}" if version else "",
                     version=int(version.group(1)) if version and re.search(r"\b(?:go back|revert|restore|use|return|switch|undo)\b", low) else None,
@@ -2789,10 +3178,39 @@ def decide(
         return made("none", rule="chat-only", instruction="")
     shape = LX.negative_shape(low, uploads)
     if shape is not None:
+        if _diagram is not None and shape in ("how_to", "trivia"):
+            # "flow chart banao ki request database tak kaise pahunchti hai" —
+            # make a flow chart of HOW a request reaches the database. The
+            # normaliser writes "kaise"/"કેવી રીતે" as `_howto_`, so the sentence
+            # wore the how-to hat and the turn was decided as a question about a
+            # procedure. Both verdicts make no file, so nothing downstream moves;
+            # what was lost is that a PICTURE was asked for, and with it any
+            # chance of the answering prompt being told which one to draw.
+            #
+            # Only these two shapes yield. `how_to` and `trivia` are about the
+            # SUBJECT being explained, and a diagram is a way of explaining it.
+            # The others say the person does not want a deliverable at all
+            # (`feedback`, `code_request`, `read_source`) and a diagram named
+            # inside one of those really is a mention.
+            return made("none", rule=f"diagram-in-chat:{_diagram.token}", instruction="", formats=[],
+                        diagram=_diagram.head, diagram_kind=_diagram.token)
         return made("none", rule=f"negative:{shape}", instruction="")
     if _CODE_RE.search(low) and not _AS_FORMAT_RE.search(low):
         return made("none", rule="code", instruction="")
     if _ABOUT_FORMAT_RE.search(low) and not _POLITE_RE.match(low):
+        return made("none", rule="about-format", instruction="")
+    if "?" in raw and explicit and not has_artifacts and not has_assistant_answer and not uploads \
+            and not _BARE_REF_RE.search(low) and (
+            _CAPABILITY_Q_RE.match(low)
+            or (_CAPABILITY_LEAD_RE.match(low) and not _content_words(_Q_WH_ANY_RE.sub(" ", low)))):
+        # "can you make pdf files?", "can u make ppt's?", "kya tum pdf bana
+        # sakte ho?", "શું તમે પીડીએફ બનાવી શકો છો?" in a FRESH chat: a
+        # question about what the product can do, with nothing to make it of
+        # (2026-09-28: each built a pdf/pptx of nothing). A TOPIC in the words
+        # ("kya tum vendor payments ki sheet bana sakte ho?") is a request,
+        # and so is a REFERENCE ("Can you make a PDF of this?" points at the
+        # material pasted in the same message), and so are the same words
+        # with an answer or a file in the room.
         return made("none", rule="about-format", instruction="")
 
     # 1b. A VISUAL THIS PLATFORM CANNOT DRAW (2026-09-16). "plot this on a
@@ -2821,10 +3239,59 @@ def decide(
         # when the NORMALISED text already names the visual, so a clause the
         # normalisation blanked ("I don't want a map") cannot come back.
         _visual = VIS.asked_for(raw.lower())
-    if (_visual is not None and not explicit and F.kind_for(low, [])[1] == "default"
+    # THE GUARD READ THE PICTURE'S OWN NAME AS A DELIVERABLE (2026-09-28).
+    # `F.kind_for` over the whole sentence answered "document words" for
+    # "make a word cloud of the ticket descriptions" — the `word` inside "word
+    # cloud" is the Word alias — so the refusal was skipped and the turn became
+    # a .docx FOR A PICTURE. That is the 2026-09-16 incident exactly, on a
+    # different visual. "floor plan of a 2bhk" lost its refusal to `plan`, and
+    # "fit a decision tree on this dataset and show it" to the dataset it names
+    # as the SOURCE. `pictures.deliverable_is_the_picture` blanks the visual's
+    # own words and the source clauses and asks about what is left, so a real
+    # file ask ("put the map in a PDF report") still keeps the refusal off.
+    if _visual is not None and uploads and VIS.asks_about_attachment_content(raw.lower()):
+        # A PICTURE THAT ALREADY EXISTS IN AN ATTACHMENT IS SOMETHING TO READ.
+        # `main.py._asks_about_an_attachment` has suppressed this refusal at the
+        # route since 2026-09-16 — "what does the map on page 2 show?" with the
+        # PDF attached must read the file, not be told this platform cannot draw
+        # a map. `decide` did not know that, so its verdict and the answer the
+        # person received disagreed, and every reader of `decide` alone (this
+        # corpus included) saw a refusal that never shipped. The two now agree.
+        _visual = None
+    if (_visual is not None and not _deliverable_formats
+            and PIC.deliverable_is_the_picture(low, _visual.pattern, F.kind_for)
             and not VIS.names_a_drawable_type(low)):
         return made("none", rule=f"unsupported-visual:{_visual.token}", instruction="",
                     unsupported_visual=_visual.token)
+
+    # 1c. A DIAGRAM DRAWN IN THE ANSWER (2026-09-28). The turn asks for a
+    #     picture of a PROCESS or a STRUCTURE, no file is named, and no plot of
+    #     numbers is named either: nothing is made, nothing is refused, and the
+    #     answering prompt emits the ```mermaid fence the browser renders.
+    #
+    #     IT IS DECIDED HERE AND NOT BY THE CLASSIFIER, and that is the point.
+    #     `intent_llm._SYSTEM` described a two-way world — produce a file, or
+    #     tell them what a file contains — and named "PNG/SVG charts" among the
+    #     things it can make. Asked the owner's own sentence it answered
+    #     `create` / formats=['png'] / chart_request in 5 of 5 runs, so the
+    #     refusal he saw survived even where the rules had stood aside. The
+    #     prompt is corrected too, but a picture in the chat must not depend on
+    #     a model being asked, or on it being asked in time: on Fast the
+    #     classifier has ~2.5 s and falls back to these rules in silence.
+    #
+    #     `_should_consult` refuses the classifier for this rule for the same
+    #     reason it refuses it for an artifact question and for an
+    #     unsupported-visual refusal — a decision a model can flip into a file
+    #     is a decision that fails under load.
+    #
+    #     AFTER 1b, deliberately. A visual this platform cannot draw is refused
+    #     first: "network diagram from this edge list" names a picture laid out
+    #     from ROWS, which nothing here draws, and saying so is the right
+    #     answer even though "network diagram" is otherwise a diagram like any
+    #     other.
+    if _diagram is not None:
+        return made("none", rule=f"diagram-in-chat:{_diagram.token}", instruction="", formats=[],
+                    diagram=_diagram.head, diagram_kind=_diagram.token)
 
     # 2. Follow-ups on an existing artifact.
     if has_artifacts:
@@ -2846,6 +3313,31 @@ def decide(
         if LX.undo_signal(low) and len(low.split()) <= 12 and not (explicit and _AS_FORMAT_RE.search(low)):
             # "undo that", "revert", "पहले जैसा कर दो" (AS3 (g)).
             return made("edit", reference="latest", rule="restore-version")
+        # 2-corr. A CORRECTION OF THE FILE JUST MADE (2026-09-28). The turn
+        #     after a wrong file opens with a negation and names what was
+        #     wrong; category `correct` scored 14/34 because no rule read
+        #     that shape. Two forms, both anchored to the card being the last
+        #     turn (or the file being named):
+        #       * a PART named with a change said of it -> an edit of that
+        #         file: "no, the deadline column is wrong, it should be end
+        #         of month", "nahi, deadline column galat hai", "नहीं, चार्ट
+        #         क्षेत्र के अनुसार होना चाहिए" (which was a SECOND chart);
+        #       * a FORMAT named and nothing else asked -> a conversion to
+        #         it: "no i meant pdf", "I said pdf. PDF. not docx", "wrong
+        #         format, I wanted a deck", "maine excel bola tha, word nahi",
+        #         "ના, મારે પીડીએફ જોઈતી હતી", "PDF. PDF. PDF.", and the
+        #         go-ahead "yes go ahead with the pdf". The format the person
+        #         REJECTS ("not docx", "word nahi") is read off the unblanked
+        #         words, so the one they want is the one that is left.
+        if last_turn_is_artifact or _mentions_hint(low, artifact_hints):
+            if _part_correction(low, raw):
+                return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints),
+                            rule="edit-correction")
+            _wanted = _format_correction(low, raw, explicit)
+            if _wanted:
+                return made("convert", reference="latest", formats=[_wanted],
+                            reference_hint=_hint(low, artifact_hints, exclude=_target_words([_wanted])),
+                            rule="convert-correction")
         # 2a. The last deliverable HELD A CHART and these words change only
         #     its type: "make it a bar chart instead", "now do the same as a
         #     line chart". An EDIT, so the binding that version already
@@ -3001,7 +3493,7 @@ def decide(
         # "Also as PDF" with nothing else said.
         if explicit and re.match(r"^\s*(?:also|and|plus|too)?\s*(?:as|in)\s+(?:an?\s+)?\w+(?:\s+\w+)?\s*(?:too|as well|please)?\s*[.!]?\s*$", low):
             return made("convert", reference="latest", rule="convert-short")
-        if explicit and re.search(r"\balso\b", low) and (_SOV_RE.search(low) or _FORMAT_ONLY_RE.match(low)):
+        if explicit and re.search(r"\balso\b", low) and (_sov(low) or _FORMAT_ONLY_RE.match(low)):
             # "pdf version bhi chahiye" → "pdf version also _give_".
             return made("convert", reference="latest", rule="convert-short")
         # No edit rule took it, and the person ruled out a file or placed the
@@ -3029,18 +3521,23 @@ def decide(
     #     1.1): decided here so it never depends on the classifier. The
     #     report is made from the conversation, not from the answer before.
     if has_dataset:
-        dataset_rule = _dataset_ask(low, raw, chart)
+        dataset_rule = _dataset_ask(low, raw, chart, explicit)
         if dataset_rule == "dataset-report":
             return made("create", rule=dataset_rule, target="conversation")
+        if dataset_rule == "dataset-chart-type":
+            # `chart` is False by construction here — the message names no
+            # picture word at all, which is why nothing caught it before — so
+            # `chart_request` has to be claimed rather than inherited.
+            return made("create", rule=dataset_rule, chart_request=True)
         if dataset_rule:
-            return made("create", rule=dataset_rule)
+            return made("create", rule=dataset_rule, chart_request=True)
 
     # 4. Creation.
     if _TEXT_OBJECT_RE.search(low) and not explicit and not _AS_FORMAT_RE.search(low) and not _FILE_CUE_RE.search(low):
         # "draft an email telling the team the report is delayed".
         return made("none", rule="text-object", instruction="")
     as_format = bool(_AS_FORMAT_RE.search(low)) and bool(_ASKING_RE.search(low)) and not _STATEMENT_RE.match(low)
-    sov = bool(_SOV_RE.search(low)) and not (("?" in low and _WH_QUESTION_RE.search(low)) or _KYA_WHAT_RE.search(low))
+    sov = _sov(low) and not (("?" in low and _WH_QUESTION_RE.search(low)) or _KYA_WHAT_RE.search(low))
     chart_ask = chart and bool(_CHART_ASK_RE.search(low)) and not _QUESTION_ABOUT_RE.match(low) and not _STORY_PLOT_RE.search(low)
     # Explicit formats with an object and no verb: "XLSX, Word, PDF and
     # CSV of this audit please". A question is not this shape.
@@ -3158,10 +3655,18 @@ def _should_consult(intent: ArtifactIntent, text: str) -> bool:
         return False
     if intent.ambiguous:
         return True
-    if intent.rule.startswith(("negative:", "unsupported-visual:")) or intent.rule in ("code", "about-format", "empty", "text-object", "chat-only"):
+    if intent.rule.startswith(("negative:", "unsupported-visual:", "diagram-in-chat:")) or intent.rule in ("code", "about-format", "empty", "text-object", "chat-only"):
         # A visual with no chart type cannot become a file whatever the
         # classifier believes; asking it would only buy back the document
         # the 2026-09-16 incident produced.
+        #
+        # `diagram-in-chat:` joined them 2026-09-28. Measured on the owner's
+        # verbatim sentence before this line existed: the rules stood aside
+        # (`ambiguous`), the gate consulted the classifier, and the classifier
+        # answered `create` / png / chart_request in 5 of 5 runs — so he was
+        # told to attach a CSV for a flow chart through a path no regex fix
+        # touches. A picture drawn in the answer needs no file, so there is
+        # nothing for a model to add and one thing for it to get wrong.
         return False
     # The SAME window `decide` read. It used to be `text[:_DECIDE_CHARS]`,
     # so a swallowed ask had no escape hatch either: measured False at 120
@@ -3180,6 +3685,22 @@ def verdict_to_intent(verdict: Any, rules: ArtifactIntent, *, has_artifacts: boo
     if action not in _HOOK_ACTIONS or action == "none":
         return None
     formats = [f for f in (getattr(verdict, "formats", None) or []) if f in _VERDICT_FORMATS]
+    if formats and LX.diagram_signal(rules.raw_text) and not LX.chart_signal(rules.raw_text):
+        # A DIAGRAM IS NOT A CHART IMAGE (2026-09-28). An image format here
+        # reaches the engine as `explicit_only`, which `formats._decide_images`
+        # honours WITHOUT consulting `_chart_image_formats` -- so the diagram
+        # guard there is bypassed and `engines/artifact._image_only` produces
+        # the owner's refusal from the model's verdict alone.
+        #
+        # Measured today on the e2e stack, with the rules and formats fixed:
+        # "org chart of the team: Asha is CEO, Ravi and Meera report to her,
+        # Dev reports to Ravi" is `file_signal` True (the `reports?` in "report
+        # to her"), so `_should_consult` offered it to the classifier, which
+        # answered create/['png'] -- and the answer was "I can only draw a
+        # chart from data I can read as a table", in 1.0 s, on both Fast and
+        # Think. An image-only version IS its charts, and no diagram can be
+        # one; the document formats the words ask for are still decided below.
+        formats = [f for f in formats if f not in T.IMAGE_FORMATS]
     target = str(getattr(verdict, "target", "") or "none")
     if action == "edit" and not has_artifacts:
         # An edit of a file that does not exist: the model misread a remark
@@ -3193,6 +3714,17 @@ def verdict_to_intent(verdict: Any, rules: ArtifactIntent, *, has_artifacts: boo
     if action == "export" and not has_assistant_answer:
         action = "create"
     if action == "convert" and has_assistant_answer and not last_turn_is_artifact and target == "previous_answer":
+        action = "export"
+    if action == "create" and has_assistant_answer and not last_turn_is_artifact \
+            and not any(f in T.IMAGE_FORMATS for f in formats) \
+            and not _content_words(_rule_view(_clean(rules.raw_text))[:_DECIDE_CHARS]):
+        # A CONTENT-FREE create right after an answer hands that answer over
+        # (2026-09-28). The classifier answered create for "Excel sheet bana
+        # ke de.", "Please ye ppt ready kar do." and "PDF. PDF. PDF.", and
+        # each became a fresh file of invented content: the mapping above
+        # read export->create when no answer exists, never create->export
+        # when one does. A topic in the words ("sales ki report banao") is
+        # still a create.
         action = "export"
     out = ArtifactIntent(
         action,

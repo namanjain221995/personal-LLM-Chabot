@@ -89,6 +89,41 @@ _UNDER_RE = re.compile(r"(?<![\w_])_(?=\S)([^_\n]{1,1000}?)(?<=\S)_(?![\w_])")
 _STRIKE_RE = re.compile(r"~~(?=\S)((?:(?!~~)[^\n]){1,1000}?)(?<=\S)~~")
 
 
+#: WHAT A READER CALLS EACH MERMAID HEAD. The callout for a picture this
+#: document cannot hold has to name the picture — "This document cannot hold a
+#: sequence diagram" — and the head is a camel-case identifier, not a phrase.
+#: Only the heads `frontend/lib/mermaid.ts` DIAGRAM_HEADS draws are here; a head
+#: absent from this table falls back to the anonymous wording, which is correct
+#: for a source that failed for some OTHER reason (a bad label, a chained
+#: statement) rather than for its kind.
+_DIAGRAM_KIND_WORDS = {
+    "sequencediagram": "a sequence diagram",
+    "classdiagram": "a class diagram",
+    "gantt": "a Gantt chart",
+    "journey": "a user journey map",
+    "timeline": "a timeline",
+    "gitgraph": "a git graph",
+    "kanban": "a kanban board",
+    "quadrantchart": "a quadrant chart",
+    "pie": "a pie diagram",
+    "radar": "a radar diagram",
+    "sankey": "a Sankey diagram",
+    "treemap": "a treemap diagram",
+    "block": "a block diagram",
+    "packet": "a packet diagram",
+    "c4context": "a C4 context diagram",
+    "requirementdiagram": "a requirement diagram",
+    "xychart": "an xy chart",
+    "architecture": "an architecture diagram",
+}
+
+#: What a mermaid CHART (pie, xychart, radar, sankey, quadrantChart, treemap)
+#: becomes in the document, in place of a picture of numbers nobody computed.
+CHART_NOT_A_DIAGRAM_TITLE = "Chart not reproduced"
+CHART_NOT_A_DIAGRAM_TEXT = ("A {kind} in the answer was written as a diagram with its numbers typed in. Charts in a "
+                            "document are drawn from data: ask for a chart of the table and it will be computed.")
+
+
 def _inline(text: str, notes: List[str]) -> str:
     """Inline markdown → plain text, keeping every visible word."""
     t = text
@@ -298,7 +333,10 @@ class _Builder:
             fields = D.parse_mermaid(source)
             if not fields:
                 return False
-            self.blocks.append(S.DiagramBlock(diagram=S.Diagram(**fields)))
+            # `diagram_from_fields` builds the model-declared `Diagram` for a
+            # flowchart and the typed family (sequence, er, class, ...) for
+            # anything else `parse_mermaid` read; both are `DiagramBlock`s.
+            self.blocks.append(S.DiagramBlock(diagram=S.diagram_from_fields(fields)))
             return True
         except Exception:
             # A LINE, because silence here is indistinguishable from a fence
@@ -405,11 +443,59 @@ def markdown_to_document(md: str, *, title_hint: str = "") -> Tuple[S.DocumentSp
             code = "\n".join(body).strip("\n")
             if lang == "mermaid":
                 if not b.diagram(code):
-                    # The fallback is exactly what every mermaid fence used to
-                    # get: a callout, because a source this reader could not
-                    # understand must never become a half-drawn picture.
-                    b.callout("note", "Diagram omitted", "A diagram in the answer was not reproduced in this document.")
-                    b.notes.append("A diagram in the answer could not be read, so it was left out (diagrams are never executed while importing).")
+                    # The fallback is still a callout, because a source this
+                    # reader could not understand must never become a
+                    # half-drawn picture. What it SAYS depends on why, from the
+                    # most specific reason to the least.
+                    from .render import diagrams as _D
+                    from .render import mermaid_grammars as G
+
+                    head = _D.head_of(code)
+                    kind_of_head, name = G.header_kind(code)
+                    why = _D.UNTRANSLATABLE_REASON.get(head, "")
+                    kind = _DIAGRAM_KIND_WORDS.get(head, "")
+                    if kind_of_head == "chart":
+                        # A pie, xychart, radar, sankey, quadrant or treemap
+                        # draws NUMBERS the model typed. A document's charts
+                        # are drawn from data (render/charts.py), so the
+                        # picture is refused and the callout says which path
+                        # a chart of the real table takes.
+                        b.callout("note", CHART_NOT_A_DIAGRAM_TITLE, CHART_NOT_A_DIAGRAM_TEXT.format(kind=name))
+                        b.notes.append(f"A {name} in the answer carried numbers the model typed and was left out; ask for a chart of the data instead.")
+                    elif kind and why:
+                        # It SAYS WHICH PICTURE AND WHY. "Diagram omitted / A
+                        # diagram in the answer was not reproduced in this
+                        # document" was true and useless: a reader could not
+                        # tell whether the model had failed, the document had,
+                        # or the platform simply cannot put that kind of
+                        # picture in a file. It is the third, for every kind
+                        # named in `diagrams.UNTRANSLATABLE_REASON`, and the
+                        # picture is still there in the chat above.
+                        body = (f"This document cannot hold {kind}: {why}. "
+                                "It is drawn in the answer above.")
+                        # The title drops the article the phrase carries for
+                        # prose: "A sequence diagram not included" reads as a
+                        # sentence with a word missing.
+                        bare = re.sub(r"^(?:an?)\s+", "", kind)
+                        b.callout("note", f"{bare[0].upper()}{bare[1:]} not included", body)
+                        b.notes.append(f"{kind[0].upper()}{kind[1:]} in the answer was left out of this "
+                                       f"document: {why}.")
+                    else:
+                        b.callout("note", "Diagram omitted",
+                                  "A diagram in the answer could not be read, so it was left out. It is "
+                                  "drawn in the answer above.")
+                        b.notes.append("A diagram in the answer could not be read, so it was left out "
+                                       "(diagrams are never executed while importing).")
+                else:
+                    note = ""
+                    try:
+                        from .render import diagrams as _D2
+
+                        note = _D2.rewrite_note(code)
+                    except Exception:  # noqa: BLE001 — a missing note must not lose the picture
+                        note = ""
+                    if note:
+                        b.notes.append(note)
             elif code.strip():
                 b.code(lang, code)
             continue

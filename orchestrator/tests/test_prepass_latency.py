@@ -102,7 +102,28 @@ def _judged_retrieval(q, level, *, degraded="", judged=True):
     return out
 
 
-def test_salvage_calls_retrieve_once_while_the_speculative_run_is_still_running(monkeypatch):
+@pytest.mark.parametrize("speculate_static", [True, False])
+def test_what_a_router_FAILURE_costs_with_and_without_the_static_guess(monkeypatch, speculate_static):
+    """THE PRICE OF THE STATIC GUESS, written down (2026-09-28).
+
+    The salvage exists because a router TIMEOUT used to cost a whole second
+    retrieval: the verdict falls back to 'default', which was the SAME LEVEL as
+    the speculative run's guess, so the judged candidates could simply be
+    re-partitioned (`_salvage`'s docstring).
+
+    KNOWLEDGE_FAST_SPECULATE_STATIC breaks that premise on purpose. The guess is
+    now STATIC while the 'default' fallback is not, so `_salvage` refuses on
+    `spec.freshness is not level` and the full retrieval runs. It is not worth
+    widening the guess to top_k 5 to make this salvageable: that would make the
+    COMMON case (the router answers STATIC, which it does for 13 of 15 of this
+    population) a wider retrieval than the timeless branch asks for, to save the
+    RARE case where the router is down.
+
+    So the trade is: every unclassified turn saves about 166 ms, and a router
+    failure costs one extra retrieval. Both states are held here so the next
+    person changing the guess sees the bill rather than discovering it.
+    """
+    monkeypatch.setattr(lk.settings, "knowledge_fast_speculate_static", speculate_static, raising=False)
     _router(monkeypatch, "down")  # fails at once: the speculative run is mid-flight
     calls = []
 
@@ -112,17 +133,45 @@ def test_salvage_calls_retrieve_once_while_the_speculative_run_is_still_running(
         return _judged_retrieval(q, kw["level"])
 
     monkeypatch.setattr(lk, "retrieve", fake_retrieve)
-    before = _counter("knowledge_salvage_total", how="salvaged")
+    before_salvaged = _counter("knowledge_salvage_total", how="salvaged")
+    before_unjudged = _counter("knowledge_salvage_total", how="fallback_unjudged")
     prepared = run(_prepare())
     assert prepared.verdict.reason == "default"
-    assert calls == ["router"]
-    assert _counter("knowledge_salvage_total", how="salvaged") == before + 1
+    if speculate_static:
+        # The guess was STATIC, the fallback is not, and `salvageable` is
+        # `same_level and not reusable and ...` — so the salvage is not even
+        # ATTEMPTED and no salvage counter fires. Two retrievals.
+        assert calls == ["router", "default"], calls
+        assert _counter("knowledge_salvage_total", how="fallback_unjudged") == before_unjudged
+        assert _counter("knowledge_salvage_total", how="salvaged") == before_salvaged
+    else:
+        # Same level: the judged candidates are re-partitioned, one retrieve.
+        assert calls == ["router"], calls
+        assert _counter("knowledge_salvage_total", how="salvaged") == before_salvaged + 1
     # Built from copies: prepare's filtering cannot edit the judged list.
     assert [e.page_id for e in prepared.retrieval.evidence] == [1, 2]
     assert not prepared.retrieval.superseded, "'default' forbids supersession"
 
 
-def test_a_router_static_answer_still_cancels_the_speculative_run(monkeypatch):
+@pytest.mark.parametrize("speculate_static", [True, False])
+def test_what_a_router_static_answer_does_to_the_speculative_run(monkeypatch, speculate_static):
+    """THE WHOLE POINT OF THE FLAG, in one test.
+
+    The speculative run guesses a freshness before the router answers. When the
+    router then says STATIC:
+
+      flag ON (the default) -- the guess was STATIC too, so the run MATCHES and
+        is reused. Nothing is cancelled and nothing is retrieved twice. That is
+        the win the flag exists for: measured 522 -> 356 ms, and on a graded
+        corpus the router answers STATIC for 13 of 15 of exactly this
+        population.
+      flag OFF -- the guess was RECENT, so the run cannot be reused: it is
+        cancelled and a second retrieval runs at STATIC. This is what every
+        turn used to do.
+
+    This test held only the second behaviour, under a name that asserted it as
+    the rule ("still cancels"), so the flag's own default failed it."""
+    monkeypatch.setattr(lk.settings, "knowledge_fast_speculate_static", speculate_static, raising=False)
     _router(monkeypatch, Freshness.STATIC)
     monkeypatch.setattr(lk, "_topical_precheck", lambda q: None)
     levels, cancelled = [], []
@@ -140,7 +189,15 @@ def test_a_router_static_answer_still_cancels_the_speculative_run(monkeypatch):
     monkeypatch.setattr(lk, "retrieve", fake_retrieve)
     prepared = run(_prepare())
     assert prepared.verdict.requirement is Freshness.STATIC
-    assert levels[1:] == [Freshness.STATIC] and cancelled == [True]
+    assert levels[:1] == [Freshness.STATIC] if speculate_static else levels[:1] != [Freshness.STATIC]
+    if speculate_static:
+        # Reused: one retrieval, no cancellation.
+        assert levels[1:] == [], levels
+        assert cancelled == [], "the guess matched, so there was nothing to cancel"
+    else:
+        # Not reusable: cancelled, and a second retrieval at STATIC.
+        assert levels[1:] == [Freshness.STATIC], levels
+        assert cancelled == [True]
 
 
 @pytest.mark.parametrize("shape", ["raises", "degraded", "cache_hit_without_judged_list"])

@@ -64,6 +64,21 @@ _SETTING_FOR = {
 }
 
 
+def _recent_guess(monkeypatch):
+    """Guess RECENT for the unclassifiable question, as the pre-2026-09-28
+    default did (KNOWLEDGE_FAST_SPECULATE_STATIC off).
+
+    The salvage, supersession and evidence-cache rules below are about a
+    speculative run whose LEVEL matched the router's answer but whose
+    supersession rule did not, and only a RECENT guess can reach them: at
+    STATIC `_partition` is a no-op, so there is no second partition to get
+    wrong. The default guess is STATIC (see `lk.speculate_static`), and the
+    timeless branch's reuse of it is pinned in
+    test_living_knowledge_speculate_static.py.
+    """
+    monkeypatch.setattr(settings, "knowledge_fast_speculate_static", False, raising=False)
+
+
 def _tune(monkeypatch, const, value):
     monkeypatch.setattr(lk, const, value)
     monkeypatch.setattr(settings, _SETTING_FOR[const], value, raising=False)
@@ -591,6 +606,8 @@ def test_a_time_sensitive_fast_question_still_consults_the_router(monkeypatch):
 
 
 def test_fast_starts_the_time_sensitive_retrieval_while_the_router_is_deciding(monkeypatch):
+    _recent_guess(monkeypatch)
+
     seen = []
 
     async def body():
@@ -616,6 +633,8 @@ def test_fast_starts_the_time_sensitive_retrieval_while_the_router_is_deciding(m
 
 
 def test_a_router_verdict_that_changes_the_level_discards_the_speculative_retrieval(monkeypatch):
+    _recent_guess(monkeypatch)
+
     _router(monkeypatch, Freshness.STATIC)
     monkeypatch.setattr(lk, "_topical_precheck", lambda q: None)
     levels, cancelled = [], []
@@ -757,6 +776,8 @@ def test_the_partition_really_differs_between_the_two_verdicts(monkeypatch):
 
 
 def test_with_salvage_a_router_timeout_turn_equals_heads_recomputation_with_one_retrieval(monkeypatch):
+    _recent_guess(monkeypatch)
+
     rerank_calls = []
     _seed_bicycles(monkeypatch, rerank_calls)
     _router_down(monkeypatch)
@@ -779,6 +800,8 @@ def test_with_salvage_a_router_timeout_turn_equals_heads_recomputation_with_one_
 
 
 def test_salvage_writes_the_cache_only_under_the_real_verdict(monkeypatch):
+    _recent_guess(monkeypatch)
+
     rerank_calls = []
     _seed_bicycles(monkeypatch, rerank_calls)
     _router_down(monkeypatch)
@@ -798,6 +821,8 @@ def test_salvage_writes_the_cache_only_under_the_real_verdict(monkeypatch):
 
 
 def test_salvage_prefers_a_cache_entry_stored_under_the_real_key_while_the_router_was_deciding(monkeypatch):
+    _recent_guess(monkeypatch)
+
     rerank_calls = []
     _seed_bicycles(monkeypatch, rerank_calls)
     monkeypatch.setattr(settings, "knowledge_evidence_cache_ttl_s", 60.0)
@@ -901,6 +926,7 @@ def test_a_speculative_retrieval_the_router_overrules_leaves_nothing_in_the_evid
     'router', supersession allowed) under the RECENT key, which carries no
     verdict. Turn 2's router times out ('default', no supersession) and would
     have been served that partition. HEAD never ran the RECENT retrieval."""
+    _recent_guess(monkeypatch)
     monkeypatch.setattr(settings, "knowledge_evidence_cache_ttl_s", 300.0)
     monkeypatch.setattr(settings, "knowledge_rerank", False)
     _seed_docs(monkeypatch)

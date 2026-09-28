@@ -14,6 +14,7 @@ case is proven with two runtimes sharing only PostgreSQL.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from typing import Any, Dict, List
@@ -45,9 +46,25 @@ class TokenEngine:
     continuation carries on after the tokens already in the final assistant
     message, as vLLM's `continue_final_message` does."""
 
-    def __init__(self, delay_s: float = 0.0) -> None:
+    def __init__(self, delay_s: float = 0.0, hold_after: int = 0) -> None:
         self.delay_s = delay_s
         self.calls: List[Dict[str, Any]] = []
+        #: `hold_after` tokens of the FIRST call, then the generator stops
+        #: until `release` is set — and `held` says it has stopped.
+        #:
+        #: WHY A HANDSHAKE AND NOT A SLEEP (2026-09-28). The restart test below
+        #: used to race the clock: eight tokens at 0.05 s, and the follower
+        #: suspended the runtime once it had seen two of them. On a loaded CI
+        #: runner the sleeps coalesce, the generator runs to the end and the run
+        #: SETTLES before the suspend lands — so the second runtime attaches to
+        #: a finished run, never continues it, and `len(engine.calls)` is 1
+        #: instead of 2. Seen on shard 2 of run 36416199617; the same shard
+        #: passes 5,353/5,353 locally in CI's own order, which is what a timing
+        #: race looks like. The engine now cannot finish before the test says
+        #: so, so the test no longer depends on how busy the box is.
+        self.hold_after = hold_after
+        self.release = asyncio.Event()
+        self.held = asyncio.Event()
 
     def __call__(self, messages, *, continue_final_message=False, max_tokens=None, **kwargs):
         start = 0
@@ -55,14 +72,26 @@ class TokenEngine:
             emitted = str(messages[-1].get("content") or "")
             while start < len(ANSWER) and emitted.startswith("".join(ANSWER[: start + 1])):
                 start += 1
+        first_call = not self.calls
         self.calls.append({"start": start, "continue": continue_final_message})
         engine = self
 
         async def run():
-            for token in ANSWER[start:]:
+            for offset, token in enumerate(ANSWER[start:]):
                 if engine.delay_s:
                     await asyncio.sleep(engine.delay_s)
                 yield ("token", token)
+                if first_call and engine.hold_after and offset + 1 == engine.hold_after:
+                    engine.held.set()
+                    # BOUNDED, and the bound is load-bearing. `suspend_all`
+                    # joins the generator, so parking here until the test
+                    # releases us deadlocks whenever the suspend gets there
+                    # first — measured: the whole test hung instead of failing.
+                    # Two seconds is far longer than a suspend takes and far
+                    # shorter than the suite's patience, so the ORDER is still
+                    # decided by the handshake and never by the clock.
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(engine.release.wait(), timeout=2.0)
             llm._finish_reason.set("stop")
             llm._record_usage(21, len(ANSWER) - start)
 
@@ -152,7 +181,9 @@ def test_a_chat_stream_carries_the_annotations_on_its_final_chunk(monkeypatch):
 
 
 def test_a_durable_run_settled_by_another_process_still_annotates_its_answer(monkeypatch, tmp_path):
-    engine = TokenEngine(delay_s=0.05)
+    # Two tokens, then the engine STOPS until this test releases it: the run
+    # cannot settle before the suspend, whatever the runner is doing.
+    engine = TokenEngine(delay_s=0.05, hold_after=2)
     monkeypatch.setattr(llm, "stream_chat_events", engine)
     tenant = make_tenant()
     extra = {durable.FILE_CITATIONS_KEY: durable.citation_index_to_json(_index())}
@@ -161,16 +192,29 @@ def test_a_durable_run_settled_by_another_process_still_annotates_its_answer(mon
         a = _runtime(tmp_path, "A")
         await a.start()
         handle = await a.launch(make_spec(max_tokens=100), caller=tenant.caller(), streamed=True, extra=extra)
-        seen = []
+
+        async def drain():
+            seen = []
+            with contextlib.suppress(durable.FollowerAborted):
+                async for item in handle.follow(0, heartbeat=0.05):
+                    if item is not durable.HEARTBEAT:
+                        seen.append(item)
+            return seen
+
+        # THE SUSPEND IS ORDERED BY THE ENGINE, NOT BY THE FOLLOWER. This used
+        # to suspend from inside the follow loop, once it had seen two text
+        # deltas — so whether the run was still running when the suspend landed
+        # depended on the follower being scheduled promptly, which on a loaded
+        # CI runner it is not. Now the engine parks after two tokens and says so
+        # with `held`; the suspend waits for THAT and cannot arrive late.
+        follower = asyncio.create_task(drain())
         try:
-            async for item in handle.follow(0, heartbeat=0.05):
-                if item is durable.HEARTBEAT:
-                    continue
-                seen.append(item)
-                if sum(r[1] == events.RESPONSE_OUTPUT_TEXT_DELTA for r in seen) >= 2:
-                    await a.suspend_all("restart")
-        except durable.FollowerAborted:
-            pass
+            await asyncio.wait_for(engine.held.wait(), timeout=10.0)
+            await a.suspend_all("restart")
+        finally:
+            engine.release.set()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(follower, timeout=10.0)
         await a.stop()
         b = _runtime(tmp_path, "B")
         await b.start()

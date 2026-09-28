@@ -162,7 +162,7 @@ def _stub_every_model_call(monkeypatch, recorded, *, candidates=None):
         recorded.append("proposer")
         return json.dumps({"items": []})
 
-    async def fake_candidates(prompt, *, n, temperature, max_tokens):
+    async def fake_candidates(prompt, *, n, temperature, max_tokens, **_):
         recorded.append("best_of")
         if candidates is not None:
             return candidates

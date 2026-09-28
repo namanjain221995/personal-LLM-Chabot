@@ -38,6 +38,10 @@ rules synchronously on the event loop for every small-talk candidate.
 from __future__ import annotations
 
 import re
+
+from functools import lru_cache
+
+from . import pictures as PIC
 import unicodedata
 from dataclasses import dataclass
 from typing import List, Literal, Optional, Pattern, Sequence, Tuple
@@ -95,6 +99,26 @@ _SHOW = (r"दिखाओ|दिखा\s*(?:दो|दें|दीजिए|�
          r"dikhao|dikha\s*(?:do|de|dijiye|dena)|dikhado|dikhaiye|dekhao|batavo|batavjo")
 _SHOW_LONG = r"બતાવી\s+(?:આપો|દો)|batavi\s+(?:aapo|apo|do)"
 
+#: THE GUJLISH GENITIVE IS NOT THE ENGLISH "NO" (2026-09-28). "aa data no
+#: report banavo" is "make a report of this data"; intent._rule_view blanks
+#: negated creation clauses on the RAW text before normalising, and read
+#: "no report" as a refusal of a report, so the clause vanished and nothing
+#: was made. Between two nouns of the conversation and with no article, `no`
+#: is the possessive; it is rewritten to the Gujlish `nu`, which no rule
+#: reads as a negation. One home, read by `_NORMALISE` and by `_rule_view`.
+_GUJLISH_NO_RE = re.compile(
+    rf"{_B}(data|answer|jawab|report|content|text|summary|audit|list|table|feedback|sales|team|project)\s+no"
+    rf"(?=\s+(?:report|pdf|word|doc|docx|excel|csv|ppt|pptx|file|document|sheet|chart|graph|summary|table|deck|presentation|tracker)\b)",
+    re.IGNORECASE,
+)
+
+
+def gujlish_genitive(text: str) -> str:
+    """`text` with the Gujlish possessive `no` between two nouns rewritten to
+    `nu`, so the English negation rules cannot read it. Raw or normalised."""
+    return _GUJLISH_NO_RE.sub(r" \1 nu ", text or "")
+
+
 #: Applied in order. Indic phrases first (they are longest), then Latin
 #: script Hinglish/Gujlish, then English typos. Every replacement is padded
 #: with spaces; whitespace is collapsed at the end.
@@ -103,7 +127,16 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _script_word(r"पीडीएफ़?|पी\s?डी\s?एफ|પીડીએફ|પી\s?ડી\s?એફ", "pdf"),
     _script_word(r"वर्ड|વર્ડ", "word"),
     _script_word(r"डॉक्यूमेंट|डाक्यूमेंट|दस्तावेज़?|ડોક્યુમેન્ટ|ડૉક્યુમેન્ટ|દસ્તાવેજ", "document"),
+    # "डॉक्स फाइल बना दो" (2026-09-28): the plural spelling carried no
+    # format at all, so the hand-over after an answer became a create.
+    _script_word(r"डॉक्स|ડોક્સ|ડૉક્સ", "docx"),
     _script_word(r"डॉक|ડૉક|ડોક", "doc"),
+    _script_word(r"ट्रैकर|ટ્રેકર", "tracker"),
+    # Parts of a file, so a question about them is a question about the file:
+    # "इसमें कितनी पंक्तियाँ हैं?", "આમાં કેટલા પાના છે?" (2026-09-28).
+    _script_word(r"पंक्तियाँ|पंक्तियां|पंक्तियों|पंक्ति|हरोळ|હરોળો|હરોળ", "rows"),
+    _script_word(r"पन्ने|पन्नों|पृष्ठ|પાનાં|પાના|પાનું|પૃષ્ઠ", "pages"),
+    _script_word(r"फ़ॉर्मेट|फॉर्मेट|फार्मेट|ફોર્મેટ", "format"),
     _script_word(r"एक्सेल|એક્સેલ", "excel"),
     _script_word(r"शीट|શીટ", "sheet"),
     _script_word(r"सीएसवी|સીએસવી", "csv"),
@@ -113,7 +146,19 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _script_word(r"स्लाइड्स?|સ્લાઇડ્સ?|સ્લાઈડ્સ?", "slides"),
     _script_word(r"बार\s+चार्ट|બાર\s+ચાર્ટ", "bar chart"),
     _script_word(r"पाई\s+चार्ट|પાઇ\s+ચાર્ટ", "pie chart"),
+    # A chart TYPE typed in the script: "દર મહિનાના વેચાણનો લાઇન ગ્રાફ" reached
+    # the rules as "લાઇન chart" and named no type (measured 2026-09-28).
+    _script_word(r"लाइन\s+(?:चार्ट|ग्राफ़?)|લાઇન\s+(?:ચાર્ટ|ગ્રાફ)|લાઈન\s+(?:ચાર્ટ|ગ્રાફ)", "line chart"),
+    _script_word(r"स्टैक्ड\s+बार|સ્ટેક્ડ\s+બાર", "stacked bar"),
+    _script_word(r"डोनट\s+चार्ट|ડોનટ\s+ચાર્ટ", "donut chart"),
     _script_word(r"चार्ट|ग्राफ़?|ચાર્ટ|ગ્રાફ", "chart"),
+    # The chart TYPE said in script. Without these, "દર મહિનાના વેચાણનો લાઇન
+    # ગ્રાફ" normalised to "…વેચાણનો લાઇન chart" — the possessive and the picture
+    # word were readable and the type between them was not, so the whole
+    # request read as no request (measured 2026-09-28).
+    _script_word(r"लाइन|लाईन|લાઇન|લાઈન", "line"),
+    _script_word(r"बार|બાર", "bar"),
+    _script_word(r"पाई|પાઇ|પાઈ", "pie"),
     _script_word(r"फ़ाइल|फाइल|फ़ाईल|फाईल|ફાઇલ|ફાઈલ", "file"),
     _script_word(r"रिपोर्ट|રિપોર્ટ", "report"),
     _script_word(r"जवाब|उत्तर|જવાબ", "answer"),
@@ -147,6 +192,9 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"(?:डाउनलोड|ડાઉનલોડ)(?:\s+(?:कर\s*(?:दो|दें|दीजिए)|करो|करें|કરો|કરી\s+(?:દો|આપો)))?", "download"),
     _word(r"(?:कन्वर्ट|કન્વર્ટ)(?:\s+(?:कर\s*(?:दो|दें|दीजिए)|करो|करें|કરો|કરી\s+(?:દો|આપો)))?", "_convert_"),
     _word(r"(?:एक्सपोर्ट|એક્સપોર્ટ)(?:\s+(?:कर\s*(?:दो|दें|दीजिए)|करो|करें|કરો|કરી\s+(?:દો|આપો)))?", "export"),
+    # The Sanskrit-register word for export, said as an order: "ફાઇલ નિર્યાત
+    # કરો" (measured 2026-09-28: no rule read it at all).
+    _word(r"(?:निर्यात|નિર્યાત)\s+(?:कर\s*(?:दो|दें|दीजिए)|करो|करें|કરો|કરી\s+(?:દો|આપો))", "export _give_"),
     _word(r"(?:एडिट|એડિટ|अपडेट|અપડેટ)(?:\s+(?:कर\s*(?:दो|दें|दीजिए)|करो|करें|કરો|કરી\s+(?:દો|આપો)))?", "update"),
     _word(r"फेरबदल\s+(?:करो|कर\s+दो)|बदलाव\s+(?:करो|कर\s+दो|करें)|ફેરફાર\s+(?:કરો|કરી\s+(?:દો|આપો))", "change"),
     _word(r"पूरा\s+(?:करो|कर\s+दो)|પૂરું\s+કરો|પૂરો\s+કરો", "complete"),
@@ -155,7 +203,20 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     (re.compile(rf"(pdf|word|doc|excel|csv|powerpoint|presentation|file|document|sheet|_in_|में|માં)\s+(?:बदल\s*(?:दो|दें|दीजिए|देना)|बदलें|बदलो|ફેરવો|ફેરવી\s+આપો|બદલો|બદલી\s+આપો|કન્વર્ટ\s+કરો){_E}"), r" \1 _convert_ "),
     _word(r"बनाकर\s+(?:दो|दें|दीजिए|दे\s+दो)|बना\s*(?:दो|दें|दीजिए|देना)|बनाओ|बनाइए|बनाइये|बनाएं|बनाएँ|बनाये|बनाकर|"
           r"तैयार\s+(?:करें|करो|कीजिए|कर\s+दो|करके\s+दो)|दे\s+(?:दो|दीजिए|दें)|दीजिए|भेज\s*(?:दो|दीजिए)|भेजो|चाहिए|"
-          r"બનાવી\s+(?:આપો|આપજો|દો)|બનાવો|બનાવજો|તૈયાર\s+કરો|તૈયાર\s+કરી\s+આપો|આપો|આપજો|જોઈએ|મોકલો|મોકલી\s+આપો", "_give_"),
+          r"બનાવી\s+(?:આપો|આપજો|દો)|બનાવો|બનાવજો|તૈયાર\s+કરો|તૈયાર\s+કરી\s+આપો|આપો|આપજો|જોઈએ|મોકલો|મોકલી\s+આપો|"
+          # THE POSSIBILITY FORM IS A REQUEST (2026-09-28). "क्या इसकी पीडीएफ
+          # बन सकती है?", "શું આની પીડીએફ બની શકે?", "क्या आप ... बना सकते
+          # हैं?" and "હું પીડીએફ માંગું છું" were all none/no-request: this
+          # table held imperatives only, so the polite and the possible were
+          # not asks. English "can this be made into a pdf?" was already one.
+          r"बन\s+सकत[ाीे](?:\s+(?:है|हैं|हो))?|बना\s+सकत[ाीे](?:\s+(?:हो|हैं|है))?|बना\s+सकें|बना\s+सकोगे|बनाया\s+जा\s+सकता(?:\s+है)?|"
+          r"બની\s+શકે|બનાવી\s+શક(?:ો|ાય|શો)|માંગું\s+છું|જોઈતી|જોઈતું|જોઈતો|"
+          # The past form, for the refusal "मैंने फ़ाइल नहीं माँगी थी": with it
+          # the negation rule below writes `_neg_`, as it does for "मत बनाओ".
+          r"माँग[ीाे]|मांग[ीाे]|માંગી|માંગ્યું|માંગ્યો", "_give_"),
+    # A potential ADD is still an add: "क्या इसमें एक टोटल पंक्ति जुड़ सकती
+    # है?", "શું આમાં ટોટલ હરોળ ઉમેરી શકાય?".
+    _word(r"जुड़\s+सकत[ाीे]|जोड़\s+सकत[ाीे]|जोड़ा\s+जा\s+सकता|ઉમેરી\s+શક(?:ાય|ો|શો)|ઉમેરાઈ\s+શકે", "add"),
     # SHOW. Measured 2026-09-16 (measure2 harness): "show this as a pie
     # chart" returned action=none in all 4 languages, because SHOW had no
     # entry at all. It is a hand-over ONLY after a chart word — "pie chart me
@@ -188,7 +249,15 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"bana\s*(?:do|de|dijiye|dena|dijie)|banao|bnao|bna\s*do|banaiye|banaye|banake\s+(?:do|de\s*do|dijiye)|bana\s+ke\s+(?:do|dijiye)|"
           r"banana\s+hai|banani\s+hai|generate\s+kar\s*do|download\s+karna\s+hai|download\s+kar\s*do|bhej\s*do|nikal\s+do|"
           r"de\s*do|dedo|dijiye|dijie|chahiye|chaiye|chahie|chahiya|"
-          r"banavi\s+(?:aapo|apo|aapjo|do)|banavo|banavjo|mokli\s+aapo|kari\s+aapo|aapo|apo|aapjo|joie|joiye|joiae", "_give_"),
+          r"banavi\s+(?:aapo|apo|aapjo|do)|banavo|banavjo|mokli\s+aapo|kari\s+aapo|aapo|apo|aapjo|joie|joiye|joiae|"
+          # 2026-09-28: the forms people actually typed after an answer, none
+          # of them read -- "Excel sheet bana ke de", "Please ye ppt ready kar
+          # do", "Report ko docx me lao", "Aap ye file pdf me bana sakte
+          # hain?", "aa answer ni pdf bani shake?", "kem chhe, file banaavo".
+          r"bana\s+ke\s+(?:de|dena)|banake\s+de|bana\s+sakt[aie](?:\s+(?:ho|hain|hai))?|ban\s+sakt[aie](?:\s+(?:hai|hain|ho))?|"
+          r"bana\s+sakoge|bani\s+shake|bani\s+shak[ae]y?|banavi\s+shak(?:o|ay|sho)|banaavo|banaavi\s+aapo|"
+          r"ready\s+kar\s*(?:do|de|dena)|taiyar\s+kar\s*(?:do|de)|joiti|joitu|joito|mangu\s+ch?hu|maangu\s+ch?hu|"
+          r"mangi|maangi|lao|laao|le\s+aao", "_give_"),
     # Verifier 2026-09-15: "isko excel sheet me daal do" puts the thing IN a format: a hand-over, not an add.
     (re.compile(rf"(pdf|word|doc|docs|docx|excel|exel|csv|ppt|pptx|powerpoint|presentation|file|document|sheet)\s+(?:me|mein|mai|mei|ma|maa)\s+(?:daal|dal|daalo|daldo|rakh)\s*(?:do|de|dijiye|dena)?{_E}"), r" \1 _in_ _give_ "),
     _word(r"pichla\s+change\s+(?:hata\s*do|hatao|wapas\s+lo|remove\s+kar\s*do)|last\s+change\s+(?:hata\s*do|hatao|wapas\s+lo)|"
@@ -199,13 +268,33 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"wapas|vapas|pehle\s+jaisa|pahle\s+jaisa|pehla\s+jevu|pachu", "undo"),
     _word(r"kaise|kese|kaisey|kaise\s+kare|kevi\s+rite|kem\s+kari", "_howto_"),
     _word(r"samjhao|samjha\s+do|samjhaiye|batao|bata\s+do|bataiye|samjavo|samjhavo|kaho", "_read_"),
+    # "I ASKED what is in it": the tell-me of a person repeating a question
+    # the product answered with a file ("nahi, file nahi maangi thi, pucha
+    # tha isme kya hai", 2026-09-28).
+    _word(r"pucha\s+tha|poocha\s+tha|puchha\s+tha|puchyu\s+(?:tu|hatu)|puchu\s+tu|पूछा\s+था|પૂછ્યું\s+હતું", "_read_"),
+    # Gujlish "turn it into": "aa pdf ne word ma pheravo".
+    _word(r"pheravo|feravo|pheravi\s+(?:aapo|do)|feravi\s+(?:aapo|do)|badli\s+aapo", "_convert_"),
     _word(r"isko|iska|iski|iske|ise|isse|isme|isey|aane|aano|aani|aanu|aana|ama", "_this_"),
+    # The romanised answer word, so "upar wala jawab pdf me de do" reaches the
+    # rules as the English "above answer pdf ..." does (2026-09-28: it was a
+    # CREATE of invented content, the answer never handed over).
+    _word(r"jawab|jawaab|javab|jvab|uttar", "answer"),
+    # "jawab do" / "जवाब दो" / "khali jawab aapo": give me the ANSWER, said
+    # in the SOV order -- the tell-me token, the same as "batao".
+    _word(r"answer\s+_give_", "_read_"),
+    # The Gujlish genitive is not the English "no" (see `_GUJLISH_NO_RE`).
+    (_GUJLISH_NO_RE, r" \1 nu "),
     (re.compile(rf"{_B}(?:is|iss|ye|yeh|aa|es|e){_E}(?=\s+(?:pdf|word|doc|docs|excel|csv|file|document|report|answer|data|sheet|table|audit|jawab|chart|list|text|content|reply|response|output|info|information|summary|explanation|ppt|presentation)\b)"), " _this_ "),
     # An object marker after a noun of the conversation: "report ne pdf ma
     # aapjo", "ye reply ko word file me" — the existing thing.
     (re.compile(rf"{_B}(report|answer|content|data|text|reply|response|jawab|summary|output|audit)\s+(?:ne|ko|nu|ka|ki)(?=\s+(?:pdf|word|doc|docx|excel|csv|ppt|pptx|file|document|sheet)\b)"), r" the \1 "),
     # An English verb and a Hinglish/Gujlish light verb: "create karo", "banavi do ne".
     (re.compile(rf"{_B}(?:create|generate|make|prepare|build|export|convert|save|download|send|share|tayyar|taiyar|taiyyar|tayar)\s+(?:karo|kar\s*do|kari\s+(?:do|aapo|dejo)|karjo|kar\s*ke\s+do|karke\s+do|kardo|kar\s*dijiye|karvanu)(?:\s+ne)?{_E}"), " _give_ "),
+    # "colors edit karo", "title update kar do": an English EDIT verb with the
+    # light verb is that edit, not a hand-over (the create rule above lists
+    # only the making/sending verbs).
+    (re.compile(rf"{_B}(?:edit|update|change|fix|correct|modify)\s+(?:karo|kar\s*do|kari\s+(?:do|aapo|dejo)|karjo|kardo|kar\s*dijiye)(?:\s+ne)?{_E}"), " update "),
+    _word(r"motu|moto|mota|bada|badi|bade", "bigger"),
     _word(r"navi|navu|nayi|naya|नई|नया|નવી|નવું", "new"),
     _word(r"kripya|kripaya|कृपया|કૃપા\s+કરીને", "please"),
     _word(r"upar\s+(?:wala|wale|wali|ka|ki|ke|diya|diye|lakhelo|no)|above\s+wala|uparno", "above"),
@@ -221,7 +310,10 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     # this platform made. `output` is deliberately NOT here: "output me a
     # summary" is an English imperative with the pronoun, so the noun cannot
     # disambiguate it (tests/test_artifact_question_route.py records the cost).
-    (re.compile(rf"(pdf|word|doc|docs|docx|excel|exel|csv|ppt|pptx|powerpoint|presentation|file|document|sheet|format|report|version|tracker|work\s?book|deck|deliverable)\s+(?:me|mein|mai|mei|ma|maa|mā){_E}"), r" \1 _in_ "),
+    # `chart`, `graph` and the bare type words joined 2026-09-28: "Q1 aur Q2
+    # ki region wise sales stacked bar me do" carried no `_in_` and so no
+    # hand-over, and made nothing over the uploaded sheet.
+    (re.compile(rf"(pdf|word|doc|docs|docx|excel|exel|csv|ppt|pptx|powerpoint|presentation|file|document|sheet|format|report|version|tracker|work\s?book|deck|deliverable|chart|graph|bar|pie|donut|column)\s+(?:me|mein|mai|mei|ma|maa|mā){_E}"), r" \1 _in_ "),
     _word(r"neela|nila|neele", "blue"),
     _word(r"gehra\s+neela|gehre\s+neele|dark\s+neela", "dark blue"),
     _word(r"lal|laal", "red"),
@@ -246,6 +338,34 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"chnage|chng|chang|chage|cahnge|chnge", "change"),
     _word(r"tittle|titel|tilte|titile", "title"),
     _word(r"colum|coloumn|collumn|colmn|coulmn|colunm", "column"),
+    _word(r"colums|columsn|colmns|coloumns|collumns|colums", "columns"),
+    # THE PICTURE WORDS, MISTYPED. Three of the product's own 77 authored chart
+    # requests reached no chart at all, purely on the spelling: "pie chrat of
+    # staus", "bar grpah of revnue per regoin", "histogarm of hours" (measured
+    # 2026-09-28). Every string here is a transposition that is not a word in
+    # English, Hindi, Gujarati or Hinglish.
+    #
+    # A BARE `chat` is deliberately absent. This product's own name for its main
+    # surface is "chat": rewriting it to "chart" would read "what did I ask in
+    # the chat?" as a plotting request. The one rewrite of `chat` below needs a
+    # chart type in front of it ("bar chat of status"), which no question about
+    # this surface has.
+    _word(r"chrat|chartt|chrt|chatr|charrt|cahrt|chart's", "chart"),
+    _word(r"grpah|grph|graf|garph|grapgh|grah|grahp", "graph"),
+    _word(r"histogarm|histgram|histogrm|histagram|histrogram|hisogram", "histogram"),
+    _word(r"scater|scattter|sactter", "scatter"),
+    _word(r"diagrm|diagam|digram|diagramm|daigram", "diagram"),
+    _word(r"flowchrt|flwochart", "flowchart"),
+    (re.compile(rf"{_B}(bar|pie|line|column|donut|area|scatter|stacked|bubble|radar|funnel)\s+chat{_E}"), r" \1 chart "),
+    _word(r"wat|whta|waht|wht", "what"),
+    _word(r"dis|thsi|tihs", "this"),
+    _word(r"rite|wrte|wirte", "write"),
+    _word(r"templat|tempalte|templete", "template"),
+    _word(r"floww|flwo|folw", "flow"),
+    _word(r"hav", "have"),
+    _word(r"wich|whcih|whihc", "which"),
+    _word(r"ment|menat|meent", "meant"),
+    (re.compile(rf"{_B}(i|we|you|u)\s+sed{_E}"), r" \1 said "),
     (re.compile(_w(r"ad") + r"(?=\s+(?:a|an|the|new|one|column|row|section|slide|chart|table|page|footer|header|total)\b)"), " add "),
     _word(r"hedings|headngs|headins|heddings", "headings"),
     _word(r"heding|headng|headin|hedding", "heading"),
@@ -256,6 +376,11 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"repot|reprt|reoprt", "report"),
     _word(r"landscap|lanscape|landscpae|landscaep", "landscape"),
     _word(r"pls|plz|plss|plx|plzz|pleas|kindly", "please"),
+    # The politest wrappers are still the ask: "would you mind making a
+    # deck of this?", "are you able to make a deck?" (2026-09-28: none/
+    # no-request and none/about-format). Read as the plain "can you make".
+    _word(r"(?:would|do|did)\s+(?:you|u)\s+mind\s+(?:making|creating|generating|building|preparing|drafting|writing|producing)", "can you make"),
+    _word(r"(?:are|will|would)\s+(?:you|u)\s+(?:be\s+)?able\s+to", "can you"),
     _word(r"u", "you"),
     _word(r"ur", "your"),
     (re.compile(rf"(?<=[a-z])\s+n\s+(?=[a-z])"), " and "),
@@ -275,23 +400,53 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"ek", "a"),
     # "pdf mat banao", "file nahi chahiye", "પીડીએફ ના બનાવો": a negated
     # hand-over. intent.py blanks the clause that carries it.
-    (re.compile(rf"{_B}(?:mat|nahi|nahin|nai|na|nako|मत|नहीं|ना|ના|નહીં|નહિ)\s+_give_"), " _neg_ "),
-    (re.compile(rf"_give_\s+(?:mat|nahi|nahin|मत|नहीं|ના|નહીં){_E}"), " _neg_ "),
+    # The bare Gujarati ન, the Gujlish "nathi joiti" (with joiti -> _give_
+    # above) and the past "नहीं माँगी थी" joined 2026-09-28: "નવી ફાઇલ ન બનાવો,
+    # બસ અહીં કહો" and "navi file nathi joiti, khali jawab aapo" -- explicit
+    # refusals -- each BUILT a document through create-first-clause.
+    (re.compile(rf"{_B}(?:mat|nahi|nahin|nahi|nhi|nai|na|nako|nathi|nati|nhoti|nahoti|मत|नहीं|नही|ना|ना|ન|ના|નહીં|નહિ|નહોતી|નહોતું)\s+_give_"), " _neg_ "),
+    (re.compile(rf"_give_\s+(?:mat|nahi|nahin|nhi|nathi|nati|मत|नहीं|नही|ન|ના|નહીં|નહોતી){_E}"), " _neg_ "),
     (re.compile(rf"{_B}docs?{_E}\s*$"), " docx "),
 ]
 
 _SPACES = re.compile(r"[ \t\r\f\v]+")
 
 
-def normalize(text: str) -> str:
-    """Case folded, zero-width stripped, typos and script variants mapped to
-    canonical tokens. Newlines are kept (clauses are split on them)."""
+def _normalize_uncached(text: str) -> str:
     out = unicodedata.normalize("NFKC", text or "")
     out = _ZERO_WIDTH.sub("", out).casefold()
     out = out.replace("’", "'").replace("‘", "'")
     for rx, repl in _NORMALISE:
         out = rx.sub(repl, out)  # type: ignore[arg-type]
     return _SPACES.sub(" ", out).strip()
+
+
+#: One turn normalises the SAME message six times (measured 2026-09-28 by
+#: counting the calls inside one `intent.decide`), and on a 4,000-character
+#: message the table of typo rewrites costs about 6 ms a pass -- 36 ms of the
+#: 61 ms that `decide` spent. It is a pure function of its text, so the answer
+#: is cached rather than the rewrites made cheaper.
+#:
+#: 256 entries, because the cache exists to serve ONE turn's repeated calls and
+#: not to remember conversations: a few hundred entries of a few kB is well
+#: under a megabyte, and the eviction order does not matter when every hit
+#: happens within milliseconds of its miss. The table it applies is a module
+#: constant, so an entry cannot go stale while the process lives.
+@lru_cache(maxsize=256)
+def _normalize_cached(text: str) -> str:
+    return _normalize_uncached(text)
+
+
+def normalize(text: str) -> str:
+    """Case folded, zero-width stripped, typos and script variants mapped to
+    canonical tokens. Newlines are kept (clauses are split on them)."""
+    if not text:
+        return ""
+    # A message far past anything a person types is not worth a cache slot, and
+    # `decide` is bounded elsewhere; normalise it and move on.
+    if len(text) > 100_000:
+        return _normalize_uncached(text)
+    return _normalize_cached(text)
 
 
 # ------------------------------------------------------------- signals --
@@ -309,6 +464,10 @@ FORMAT_ALIASES = {
 }
 _FORMAT_RE = re.compile(_w("|".join(f"(?:{p})" for p in FORMAT_ALIASES.values())))
 _FILE_NOUN_RE = re.compile(_w(r"files?|documents?|docs?|reports?|attachments?|downloadable|download"))
+#: The slide-family nouns. They live in `FORMAT_ALIASES["pptx"]` as a FORMAT;
+#: `file_noun_signal` needs them as a THING as well, so a diagram asked for
+#: inside a deck reaches the deck.
+_DECK_NOUN_RE = re.compile(_w(r"decks?|slides?|presentations?|workbooks?|spreadsheets?|sheets?"))
 _CHART_RE = re.compile(_w(
     r"(?:bar|line|pie|donut|doughnut|area|scatter|bubble|column|stacked(?:\s+bar)?|combo|radar|funnel|waterfall|gantt(?:-style)?|box|"
     r"histogram|heat\s*map)\s+(?:chart|graph|plot)s?|charts?|graphs?|plots?|histograms?|heat\s*maps?|scatter\s*plots?|"
@@ -322,8 +481,14 @@ _CHART_RE = re.compile(_w(
     # while their bare forms are ordinary words.
     r"tree\s*maps?|sunbursts?|candlesticks?|ohlc|"
     # AS3 integration (live 2026-09-15): a chart type named as a noun, "scatter of Salary vs Experience".
-    r"(?:scatter|bubble|waterfall|funnel|radar|pie|donut|doughnut|gantt)\s+(?:of|showing|comparing)\s+\S+(?:\s+\S+){0,6}?\s+(?:vs\.?|versus|by|per|against|over)"
+    r"(?:scatter|bubble|waterfall|funnel|radar|pie|donut|doughnut|gantt)\s+(?:of|showing|comparing)\s+\S+(?:\s+\S+){0,6}?\s+(?:vs\.?|versus|by|per|against|over)|"
+    # A QUADRANT OF TWO MEASURES (2026-09-28): "put these vendors on a quadrant
+    # of price vs rating" drew nothing, because `quadrant` was in no chart
+    # vocabulary at all. The measure pair is what makes it a plot; a quadrant
+    # named alone is the 2x2 concept and `pictures` draws it as mermaid.
+    r"quadrants?\s+(?:of|showing|comparing)\s+\S+(?:\s+\S+){0,6}?\s+(?:vs\.?|versus|against|by|over)"
 ))
+
 #: A chart TYPE said in words — chart_spec.CHART_TYPES plus the words people
 #: type for them. One home, read by intent.py (which routes "make it a bar
 #: chart instead" to an edit) and by edits.py (which turns it into a
@@ -337,6 +502,98 @@ CHART_TYPE_WORDS = (
     # instead" has to reach the set_chart edit the same way "bar chart" does.
     r"tree\s*map|sunburst|candlestick|ohlc|pareto|violin|bullet"
 )
+
+#: A CHART TYPE NAMED AS A BARE NOUN, with a data relation — no "chart",
+#: "graph" or "plot" anywhere. This is how a third of the product's own 77
+#: authored chart requests are written, and none of them reached a chart:
+#: measured 2026-09-28 with a table bound and a spreadsheet uploaded,
+#:
+#:   "Stacked bar of status broken down by priority."   rule=no-request
+#:   "Average score by owner, bars please."             rule=no-request
+#:   "Headcount per department as a pie."                rule=no-request
+#:   "Funnel of the conversion stages."                 rule=no-request
+#:   "Revenue per quarter as columns."                  rule=no-request
+#:
+#: `_CHART_RE` needs the literal picture word and the create rules need a
+#: request verb, and these have neither. CI never saw it: the fixture's own
+#: tests resolve every oracle offline and score VALUES, not routing.
+#:
+#: THIS IS DELIBERATELY NOT PART OF `chart_signal`. Widening that would put
+#: every sentence containing the word "line" or "area" on the plot path with no
+#: table in sight — a wrong lane is a wrong answer delivered confidently.
+#: `intent._dataset_ask` is the only reader, and it runs only when a dataset is
+#: actually bound to the conversation, so the table the plot needs is there.
+_CHART_TYPE_NOUN_ASK_RE = re.compile(
+    # The type LEADING the message: "Stacked bar of status broken down by
+    # priority", "Funnel of the conversion stages".
+    r"^\W*(?:(?:please|now|ok|okay|and|also|just|kindly)\s+)*(?:\d+\s*%?\s+)?(?:an?\s+|the\s+)?"
+    rf"(?:{CHART_TYPE_WORDS})(?:[\s-]+(?:{CHART_TYPE_WORDS}))?s?\s+(?:of|for|from|showing|comparing|by|per|with|broken\s+down|vs\.?|versus)\b"
+    # …or the type as the FORM the answer should take: "Headcount per department
+    # as a pie", "Revenue per quarter as columns", "…, bars please", and the
+    # Hinglish postposition "stacked bar me do" (the normaliser writes `_in_`).
+    rf"|\b(?:as|in|_in_)\s+(?:an?\s+|the\s+)?(?:{CHART_TYPE_WORDS})s?\b"
+    rf"|\b(?:{CHART_TYPE_WORDS})(?:[\s-]+(?:{CHART_TYPE_WORDS}))?s?\s+(?:_in_|me|mein|ma|maa)\s+"
+    r"(?:do|de|dedo|dijiye|dena|_give_|_read_)\b"
+    # …or SET OFF at the end, which is how a request that led with the question
+    # names its picture: "Tickets per category, bar chart in dark blue.",
+    # "Units by product, horizontal bars, show data labels.", "Critical and
+    # high priority tickets by owner, stacked.", "…? Column chart."
+    #
+    # THE POSITION IS THE GUARD. Only after a comma, colon, semicolon, dash,
+    # question mark or full stop — never mid-clause — because mid-clause is
+    # where a chart is TALKED ABOUT rather than asked for: "explain the bar
+    # chart you drew" names a type and asks for no plot, and it does not match.
+    rf"|(?:^|[,;:.?!—–-]\s*)(?:an?\s+|the\s+)?(?:{CHART_TYPE_WORDS})(?:[\s-]+(?:{CHART_TYPE_WORDS}))?[\s-]*(?:charts?|graphs?|plots?)"
+    # …AND THE PHRASE HAS TO END ITS CLAUSE. Without this lookahead the arm
+    # matched a REMARK about a chart that already exists — "the bar chart is
+    # wrong", "the line chart looks off" both opened a new chart job, measured
+    # 2026-09-28 — because a remark also begins with "the <type> chart". A
+    # request names the picture and then stops, or hangs a style clause off it;
+    # a remark continues into a verb.
+    r"(?=\s*(?:$|[.,;:!?]|\s+(?:in|with|of|for|by|from|per|showing|using|please|pls|only|kindly)\b))"
+    rf"|[,;:]\s*(?:an?\s+|the\s+)?(?:{CHART_TYPE_WORDS})(?:[\s-]+(?:{CHART_TYPE_WORDS}))?s?\s*(?:\.|$|,\s|\s+(?:please|pls|only|kindly)\b)"
+    # THE INDIAN-LANGUAGE POSSESSIVE, which puts the picture LAST. Hindi,
+    # Gujarati and Hinglish say "<subject>-of <picture>", so there is no
+    # punctuation and no verb in front of the chart — the arms above cannot see
+    # it. Measured 2026-09-28 with a table bound and an xlsx uploaded, four of
+    # the product's own authored rows reached no chart on this shape alone:
+    #
+    #   "region wise sales ka bar chart, neele rang me"          no-request
+    #   "क्षेत्र के अनुसार बिक्री का बार चार्ट"                          no-request
+    #   "प्राथमिकता के अनुसार टिकटों की संख्या का चार्ट"                   no-request
+    #   "દર મહિનાના વેચાણનો લાઇન ગ્રાફ"                            no-request
+    #
+    # The Gujarati possessive is a SUFFIX (વેચાણનો = "of the sales"), so નો/ના/ની
+    # are matched without a leading word boundary; the Latin ones need one.
+    # `no`, `na` and `nu` are NOT in the Latin list, although they are real
+    # Gujlish possessives: "no chart please" matched `\bno` + "chart" and opened
+    # a chart job for a message that refused one (measured 2026-09-28, before
+    # this note). Gujarati is served by its own script forms below, which
+    # collide with nothing.
+    rf"|(?:का|के|की|नो|ના|નો|ની|નું|નાં|\bka\b|\bki\b|\bke\b|\bkaa\b)\s+"
+    rf"(?:an?\s+|the\s+)?(?:(?:{CHART_TYPE_WORDS})(?:[\s-]+(?:{CHART_TYPE_WORDS}))?[\s-]*)?"
+    r"(?:charts?|graphs?|plots?)\b"
+    # "Chart Q1 units by product from the docx" — the picture word AS THE VERB
+    # at the head of the message, with the data relation later in it. `plot` is
+    # deliberately absent: "plot of the movie Inception" is a story, and
+    # `_STORY_PLOT_RE` should not be the only thing standing between that and a
+    # chart file.
+    r"|^\W*(?:charts?|graphs?|visuali[sz]e)\s+(?!of\b)\S+(?:\s+\S+){0,8}?\s+(?:by|per|of|for|from|vs\.?|versus|against|over)\b"
+    # "Which product brings the most revenue? Chart it." — the question first,
+    # the picture asked of its answer.
+    r"|[.?!]\s*(?:chart|graph|plot|visuali[sz]e)\s+(?:it|this|that|these|those|_this_)\b",
+    re.I,
+)
+
+
+def chart_type_noun_ask(text: str) -> bool:
+    """Does this name a chart TYPE as a bare noun, over data it points at?
+
+    Read only by `intent._dataset_ask`, and only with a table bound — see
+    `_CHART_TYPE_NOUN_ASK_RE`.
+    """
+    return bool(_CHART_TYPE_NOUN_ASK_RE.search(_ensure_norm(text)))
+
 
 _REQUEST_VERB_RE = re.compile(_w(
     r"make|create|generate|build|prepare|produce|export|convert|turn|put|save|download|give|send|share|provide|deliver|"
@@ -360,15 +617,206 @@ def formats_in(norm: str) -> List[str]:
     return out
 
 
+#: A DIAGRAM THAT HAPPENS TO BE NAMED WITH THE WORD "CHART". A flow chart is
+#: a picture of steps and an org chart a picture of a hierarchy; neither is a
+#: chart drawn from the rows of a table. They belong to the chat path, where
+#: the model draws mermaid, exactly as "diagram" and "flowchart" already do.
+#:
+#: MEASURED 2026-09-28, owner report against the release ae25da28:
+#:
+#:   "Make A Digram or Flow Chart of Api Which Coonect to Db ??"
+#:   -> "I can only draw a chart from data I can read as a table. Attach the
+#:       file again (CSV or Excel), or paste the table into the message, and
+#:       I'll plot it."
+#:
+#: There was no table because he never wanted one. `_CHART_RE` carries a bare
+#: `charts?` alternative (kept on purpose, so "make me a chart of this table"
+#: works with no type word at all), so ANY phrase whose last word is "chart"
+#: matched it. The proof that the WORD was doing the work and not the MEANING:
+#: `chart_signal("flow chart of the API")` was True and reached
+#: create-chart, while `chart_signal("flowchart of our deploy")` was False and
+#: fell through to chat -- two spellings of one request, two answers.
+#:
+#: HOW IT IS APPLIED. These phrases are BLANKED out of the text before
+#: `_CHART_RE` reads it (`without_diagram_phrases`), never removed from
+#: `_CHART_RE` itself. Two things follow, and both are the point:
+#:
+#:   * every real chart type keeps its own alternative untouched -- `gantt
+#:     chart` IS a data chart and is named in the regex on purpose, and so
+#:     are bar, line, pie, donut, area, scatter, bubble, column, stacked,
+#:     combo, radar, funnel, waterfall, box, histogram, heat map, treemap,
+#:     sunburst, candlestick and ohlc;
+#:   * a message that asks for BOTH -- "a flow chart of the API and a bar
+#:     chart of headcount" -- still carries its chart, because only the
+#:     diagram phrase is blanked.
+#:
+#: WHAT IS DELIBERATELY NOT HERE.
+#:   * `cash flow`, `fund flow` and `money flow` make `flow` a MEASURED
+#:     QUANTITY rather than a sequence of steps: a cash-flow chart is a real
+#:     chart of real numbers (tests/fixtures/chart_requests.py c01 and hi05
+#:     are that request in English and Hindi), so the flow arm refuses to
+#:     match behind those three words.
+#:   * `network`, `sankey` and `venn`. artifacts/visuals.py owns those words
+#:     and answers them with a sentence that says why the picture cannot be
+#:     drawn from a table; falling through to chat instead would lose that.
+#:
+#: THE INDIC ARM reads the script forms directly, because this pattern is
+#: read on RAW text too (artifacts/formats.py, whose own chart vocabulary
+#: lists चार्ट / ગ્રાફ the same way). On normalised text the noun is already
+#: folded to "chart" by `_NORMALISE`, so "फ्लो chart" is the shape that
+#: actually arrives there -- which is why the noun alternation below accepts
+#: the English word next to an Indic modifier.
+_DIAGRAM_MOD = (
+    # "flow chart", "flowchart", "flow-chart", "data flow chart",
+    # "workflow chart", "process flow chart".
+    r"(?<!cash\s)(?<!cash-)(?<!fund\s)(?<!fund-)(?<!funds\s)(?<!money\s)(?<!capital\s)(?<!net\s)(?<!free\s)flow|work\s*flow|data\s*flow|process(?:\s+flow)?|"
+    # "org chart", "orgchart", "org-chart", "organisation/organization chart",
+    # "organisational/organizational chart".
+    r"org|organi[sz]ationa?l?|"
+    # "sequence chart", "swimlane chart", "swim lane chart",
+    # "architecture chart", "hierarchy chart", "state machine chart",
+    # "entity relationship chart".
+    r"sequence|swim\s*lane|architectur(?:e|al)|hierarch(?:y|ical)|state\s*machine|entity[\s-]?relationship"
+)
+#: "flow" in Devanagari, in all three spellings: no nukta, decomposed nukta
+#: (फ + U+093C) and precomposed (U+095E). A person types whichever their
+#: keyboard produces and the three are indistinguishable on screen.
+_NUKTA_FLOW = "(?:\u092b\u093c?|\u095e)\u094d\u0932\u094b"
+
+_DIAGRAM_NOUN = r"charts?|graphs?|चार्ट|ग्राफ़?|ચાર્ટ|ગ્રાફ"
+_DIAGRAM_PHRASE_RE = re.compile(
+    _w(rf"(?:{_DIAGRAM_MOD})[\s-]*(?:{_DIAGRAM_NOUN})")
+    # The same phrases typed in Devanagari or Gujarati. "फ्लोचार्ट" and
+    # "ફ્લોચાર્ટ" are written as one word, so they get their own arm.
+    # NUKTA: "flow" is written फ्लो AND फ़्लो, and the nukta form exists in two
+    # Unicode encodings -- decomposed (फ U+092B + U+093C) and precomposed
+    # (फ़ U+095E). Both are ordinary spellings a person types, and neither was
+    # matched, so `फ़्लो चार्ट बनाओ` still reached the chart path and got the
+    # "attach a CSV" refusal. Listed rather than normalised because stripping
+    # U+093C globally would also fold ज़/ड़/ढ़/ख़/ग़, which are different letters.
+    # The cash/fund/money exception has to be repeated here: a CASH FLOW chart
+    # is a real chart drawn from numbers, and the Latin lookbehind above cannot
+    # see कैश / કેશ. Without this the fix for the owner's "flow chart" took the
+    # chart away from every Indic cash-flow ask -- a false refusal traded for a
+    # true one, landing on exactly the users the diagram fix was for.
+    + rf"|{_B}(?<!कैश )(?<!कॅश )(?<!नकदी )(?<!फंड )(?<!फ़ंड )(?<!मनी )"
+    + rf"(?<!કેશ )(?<!કૅશ )(?<!રોકડ )(?<!ફંડ )(?<!મની )"
+    + rf"(?:{_NUKTA_FLOW}|ફ્લો|ऑर्ग|ओर्ग|ઑર્ગ|ઓર્ગ)[\s-]*(?:{_DIAGRAM_NOUN}){_E}"
+    + rf"|{_B}(?:{_NUKTA_FLOW}चार्ट|ફ્લોચાર્ટ|ऑर्गचार्ट|ઓર્ગચાર્ટ){_E}",
+    re.IGNORECASE,
+)
+
+
+def without_diagram_phrases(text: str) -> str:
+    """`text` with every DIAGRAM spelt with a chart word blanked out, so the
+    chart vocabulary below cannot read "flow chart" or "org chart" as a chart
+    drawn from data. Reads raw or normalised text; the blank keeps the
+    surrounding words' boundaries."""
+    return _DIAGRAM_PHRASE_RE.sub(" ", text or "")
+
+
+#: A DIAGRAM, named as itself. The phrases above are the ones spelt with a
+#: chart word; these are the words that name a diagram and nothing else, and
+#: they are here because `formats._chart_image_formats` needs the whole
+#: judgement in one predicate: an image-only version IS its charts
+#: (render/__init__ builds it from `_standalone_images`, which draws charts
+#: and refuses "The artifact has no charts to draw as images"), so a request
+#: for a diagram must never produce one. Measured 2026-09-28: under a
+#: classifier verdict of chart_request=True, "make a flowchart of our deploy
+#: process" and "draw a diagram of the API" both came back ['png'] -- the
+#: one-word spelling of the owner's own request, on the path where the rules
+#: are silent and the model is the only judge.
+_DIAGRAM_WORD_RE = re.compile(
+    _w(r"diagrams?|flowcharts?|orgcharts?|mind\s*maps?|swim\s*lanes?|"
+       # Only the words that are driven in
+       # tests/test_artifact_flow_chart_is_a_diagram.py are listed: the wider
+       # Hindi "आकृति" (a figure, a shape) is deliberately absent.
+       r"डायग्राम|ડાયગ્રામ|फ्लोचार्ट|ફ્લોચાર્ટ|ऑर्गचार्ट|ઓર્ગચાર્ટ"),
+    re.IGNORECASE,
+)
+
+
+def diagram_signal(text: str) -> bool:
+    """Does this text name a DIAGRAM -- a picture of boxes and arrows, laid out
+    from words, never from the rows of a table? True for "diagram" and
+    "flowchart", and for the diagrams spelt with a chart word ("flow chart",
+    "org chart"). Reads raw or normalised text."""
+    t = text or ""
+    return bool(_DIAGRAM_WORD_RE.search(t) or _DIAGRAM_PHRASE_RE.search(t))
+
+
+def _diagram_spans(text: str) -> List[Tuple[int, int]]:
+    """Every stretch of `text` a DIAGRAM already accounts for, read from BOTH
+    vocabularies: `pictures.SUBJECTS`, which names what the picture is OF (a
+    flow, an org, a dependency, a fishbone), and `_DIAGRAM_PHRASE_RE`, which
+    names a diagram spelt with a chart word in every script this product reads.
+    Neither list is a superset of the other, and a request only has to be a
+    diagram in ONE of them. One home, so no caller has to know there are two.
+    """
+    t = text or ""
+    spans = list(PIC.spans(t))
+    spans.extend((m.start(), m.end()) for m in _DIAGRAM_PHRASE_RE.finditer(t))
+    return spans
+
+
+def _chart_in(text: str) -> bool:
+    """Does this text name a chart DRAWN FROM DATA? The one reader of
+    `_CHART_RE`, so no caller can forget the diagram phrases.
+
+    A chart word INSIDE a diagram's own span is not evidence of a plot: "flow
+    chart" names one picture whose noun is "flow". A chart word anywhere else
+    still counts, so "a flow chart of the approval steps and a bar chart of
+    tickets per owner" keeps its bar chart.
+    """
+    t = text or ""
+    found = list(_CHART_RE.finditer(t))
+    if not found:
+        return False
+    diagrams = _diagram_spans(t)
+    if not diagrams:
+        return True
+    return any(
+        not any(s < m.end() and m.start() < e for s, e in diagrams) for m in found
+    )
+
+
 def file_signal(text: str) -> bool:
     """Does the message name a file format, a file, or a chart? Reads raw or
     normalised text (normalises when it looks raw)."""
     norm = _ensure_norm(text)
-    return bool(_FORMAT_RE.search(norm) or _CHART_RE.search(norm) or _FILE_NOUN_RE.search(norm))
+    return bool(_FORMAT_RE.search(norm) or _chart_in(norm) or _FILE_NOUN_RE.search(norm))
+
+
+def file_noun_signal(text: str) -> bool:
+    """Does the message name a FILE as a thing — "a file", "a report", "the
+    document", "the deck"? Not a format (that is `formats.explicit_formats`)
+    and not a chart. Read by `intent`'s diagram rule, which must stand aside
+    when the picture was asked for INSIDE something: "add a process flow
+    diagram to that report" edits the report."""
+    norm = _ensure_norm(text)
+    return bool(_FILE_NOUN_RE.search(norm) or _DECK_NOUN_RE.search(norm))
 
 
 def chart_signal(text: str) -> bool:
-    return bool(_CHART_RE.search(_ensure_norm(text)))
+    """Do these words ask for a PLOT OF NUMBERS?
+
+    THE WORD IS NOT THE MEANING (2026-09-28). `_CHART_RE` carries the bare
+    alternatives `charts?|graphs?|plots?`, so every phrase ending in one of
+    them read as a request to plot a spreadsheet — and the owner, who asked for
+    a "Flow Chart of Api Which Coonect to Db", was told to attach a CSV. The
+    match is still made by `_CHART_RE`; what is new is that a match which a
+    DIAGRAM already accounts for is not evidence of a plot. "flow chart" names
+    one picture, and its noun is "flow".
+
+    This is not a list of banned words. A chart word ELSEWHERE in the same
+    sentence survives: "a flow chart of the approval steps and a bar chart of
+    tickets per owner" still asks for the bar chart, and still gets it.
+
+    Dual subjects (gantt, timeline, quadrant, pyramid, roadmap) are drawn both
+    ways and are deliberately NOT discounted — see `pictures.spans`.
+    `intent.decide`, which knows whether a table is bound, settles those.
+    """
+    return _chart_in(_ensure_norm(text))
 
 
 def _ensure_norm(text: str) -> str:
@@ -525,7 +973,7 @@ def _clauses(norm: str) -> List[str]:
 
 
 def _is_request_clause(clause: str) -> bool:
-    return bool(_TARGET_RE.search(clause) and (_FORMAT_OR_KIND_RE.search(clause) or _CHART_RE.search(clause)))
+    return bool(_TARGET_RE.search(clause) and (_FORMAT_OR_KIND_RE.search(clause) or _chart_in(clause)))
 
 
 def negative_shape(text: str, upload_formats: Sequence[str] = ()) -> Optional[NegativeShape]:
@@ -676,7 +1124,7 @@ def language_of(text: str) -> Language:
 
 __all__ = [
     "request_marker",
-    "StylePhrase", "normalize", "formats_in", "file_signal", "chart_signal", "style_phrases", "strip_style_clauses",
+    "StylePhrase", "normalize", "formats_in", "file_signal", "file_noun_signal", "chart_signal", "chart_type_noun_ask", "style_phrases", "strip_style_clauses",
     "undo_signal", "negative_shape", "reads_source", "language_of", "FORMAT_ALIASES", "DEST_AFTER",
-    "CHART_TYPE_WORDS",
+    "CHART_TYPE_WORDS", "without_diagram_phrases", "diagram_signal", "gujlish_genitive",
 ]
