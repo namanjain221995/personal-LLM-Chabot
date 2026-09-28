@@ -227,7 +227,7 @@ _SEQ_PARTICIPANT_RE = re.compile(rf"^(?P<kind>participant|actor)\s+(?P<id>{_LOOS
 #: Longest arrow first: `-->>` before `-->`, `->>` before `->`.
 _SEQ_ARROW = r"(?P<arrow><<-->>|<<->>|-->>|->>|--x|-x|--\)|-\)|-->|->)"
 _SEQ_MESSAGE_RE = re.compile(rf"^(?P<a>{_LOOSE_ID})\s*{_SEQ_ARROW}\s*(?P<act>[+-])?\s*(?P<b>{_LOOSE_ID})\s*:\s*(?P<text>.*)$")
-_SEQ_NOTE_RE = re.compile(rf"^[Nn]ote\s+(?P<pos>left of|right of|over)\s+(?P<ids>[^:]+?)\s*:\s*(?P<text>.*)$")
+_SEQ_NOTE_RE = re.compile(r"^[Nn]ote\s+(?P<pos>left of|right of|over)\s+(?P<ids>[^:]+?)\s*:\s*(?P<text>.*)$")
 _SEQ_FRAME_RE = re.compile(r"^(?P<kw>loop|opt|alt|par|critical|break|rect|box|else|and|option|end)(?:\s+(?P<text>.*))?$")
 _SEQ_REFUSED_RE = re.compile(r"^(activate|deactivate|links?|properties|details|create|destroy|accTitle|accDescr)\b", re.IGNORECASE)
 _SEQ_ARROWS: Dict[str, Tuple[str, str]] = {

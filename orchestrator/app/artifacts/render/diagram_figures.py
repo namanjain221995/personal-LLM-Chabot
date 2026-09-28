@@ -1137,7 +1137,9 @@ def plan_er(d: Any, direction: Optional[str] = None) -> FigureLayout:
             if rows:
                 w_type = max(_tw(r[0], SMALL_PT) for r in rows)
                 w_name = max(_tw(r[1], SMALL_PT) for r in rows)
-                w_keys = max(_tw(r[2], SMALL_PT) for r in rows)
+                # No w_keys: the comment is right-aligned to the box edge and
+                # cannot reach the keys column, because `_er_entity_size`
+                # already counts every column AND the comment in the box width.
                 ry = y + _ER_HEAD + 0.03
                 for t, name, keys, comment in rows:
                     cy_r = ry + _ER_ROW / 2

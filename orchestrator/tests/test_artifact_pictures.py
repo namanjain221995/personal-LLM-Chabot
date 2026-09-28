@@ -465,20 +465,40 @@ def test_the_three_kinds_that_are_node_and_edge_graphs_are_drawn():
     `flowchart`/`graph`, so a source opening `erDiagram`, `stateDiagram-v2` or
     `mindmap` refused at its first line and md_import substituted a callout.
     "a docx of the schema with an ER diagram" routed perfectly and then shipped
-    an apology where the picture goes."""
+    an apology where the picture goes.
+
+    WIDENED 2026-09-28: each of these three now has its OWN reader and is drawn
+    in its own shapes (crow's feet, bullseyes, a radial tree) rather than
+    translated into a flowchart, so the fields carry a `family` and the typed
+    model for it. What this test holds is unchanged -- the picture reaches the
+    file -- so it asks `diagram_from_fields`, which is what md_import calls,
+    instead of the flowchart model directly."""
     from app.artifacts import spec as S
     from app.artifacts.render import diagrams as D
 
     cases = {
-        "erDiagram\n    USERS ||--o{ SESSIONS : has\n    SESSIONS ||--o{ MESSAGES : contains": (3, 2),
-        "stateDiagram-v2\n    [*] --> Queued\n    Queued --> Running: picked up\n    Running --> [*]": (4, 3),
-        "mindmap\n  root((Roadmap))\n    Q1\n      Upload reliability\n    Q2": (4, 3),
+        "erDiagram\n    USERS ||--o{ SESSIONS : has\n    SESSIONS ||--o{ MESSAGES : contains": ("er", 3, 2),
+        # TWO states, not four: `[*]` is a terminal, drawn as a start and an end
+        # bullseye. The flowchart translation had to make each one a NODE and
+        # call it a state; the state reader does not.
+        "stateDiagram-v2\n    [*] --> Queued\n    Queued --> Running: picked up\n    Running --> [*]": ("state", 2, 3),
+        "mindmap\n  root((Roadmap))\n    Q1\n      Upload reliability\n    Q2": ("mindmap", 4, 3),
     }
-    for src, (nodes, edges) in cases.items():
+    for src, (family, boxes, links) in cases.items():
         fields = D.parse_mermaid(src)
         assert fields, src.splitlines()[0]
-        S.Diagram(**fields)                       # the strict model must accept it
-        assert (len(fields["nodes"]), len(fields["edges"])) == (nodes, edges), src.splitlines()[0]
+        block = S.diagram_from_fields(fields)     # the strict model must accept it
+        assert block is not None, src.splitlines()[0]
+        assert fields.get("family", "") == family, (src.splitlines()[0], fields.get("family"))
+        drawn = D.layout_for(block, box_in=D.PORTRAIT_BOX_IN)
+        assert drawn is not None, src.splitlines()[0]
+        if family == "er":
+            counted = (len(fields["entities"]), len(fields["relations"]))
+        elif family == "state":
+            counted = (len(fields["states"]), len(fields["transitions"]))
+        else:
+            counted = (len(fields["nodes"]), len(fields["nodes"]) - 1)
+        assert counted == (boxes, links), (src.splitlines()[0], counted)
 
 
 def test_a_mindmap_label_is_not_truncated_to_its_last_word():
@@ -512,9 +532,13 @@ def test_the_kinds_a_file_cannot_hold_say_which_one_and_why():
     from app.artifacts import md_import as M
     from app.artifacts.render import diagrams as D
 
-    for src, kind in (("sequenceDiagram\n    A->>B: x", "Sequence diagram"),
-                      ("gantt\n  title P\n  section A\n  T :a1, 2026-01-01, 30d", "Gantt chart"),
-                      ("kanban\n  Todo\n    A", "Kanban board")):
+    # NARROWED 2026-09-28: a sequence diagram and a kanban board now have their
+    # own drawers and DO reach a file, so neither is a kind a file cannot hold
+    # any more. What is left here is what still has no drawer, and the point of
+    # the test -- the callout names the picture and the reason -- is unchanged.
+    for src, kind in (("gantt\n  title P\n  section A\n  T :a1, 2026-01-01, 30d", "Gantt chart"),
+                      ("gitGraph\n  commit\n  branch dev\n  commit", "Git graph"),
+                      ("C4Context\n  Person(a, \"A\")\n  System(s, \"S\")", "C4 context diagram")):
         doc, notes = M.markdown_to_document("# T\n\n```mermaid\n" + src + "\n```\n")
         callouts = [b for b in doc.blocks if type(b).__name__ == "Callout"]
         assert len(callouts) == 1, src.splitlines()[0]
@@ -529,6 +553,10 @@ def test_the_kinds_a_file_cannot_hold_say_which_one_and_why():
                        _re.S).group(1)
     for name in [h.strip().strip("'\"") for h in heads.replace("\n", " ").split(",") if h.strip()]:
         if name in ("flowchart", "graph") or name in D.TRANSLATABLE:
+            continue
+        # A head with its own family reader draws in a file; it needs no reason.
+        from app.artifacts.render import mermaid_grammars as G
+        if G.FAMILY_OF_KEYWORD.get(name) in G.READERS:
             continue
         assert name in D.UNTRANSLATABLE_REASON, f"{name} would get the anonymous callout"
 
