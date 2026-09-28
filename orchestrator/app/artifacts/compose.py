@@ -1055,10 +1055,20 @@ _ITEM_END_RE = re.compile(r"[.;:!?\n]")
 #: digit in it" and none of them is a section.
 _LEAD_ORDINAL_RE = re.compile(r"^\(?\d{1,2}[.)]\s*")
 
-_SECTIONS_COLON_RE = re.compile(r"\bsections?\s*:\s*(?P<list>[^.;!?\n]{3,300})", re.I)
+#: Where an INLINE list stops: at the next item's ordinal. "2. Architecture
+#: including hardware, software and network 3. Security" — the "3." is the
+#: next item's, and reading on to its period named a section "network 3"
+#: that no heading could cover (measured on ea895477: 0.5 overlap, so the
+#: repair pass and the Max-loop contract counted it missing forever). A
+#: tempered character, one short lookahead per position, so the scan is
+#: still linear and still bounded at 300.
+_NOT_AT_ORDINAL = r"(?!\s\(?\d{1,2}[.)](?:\s|$))"
+_SECTIONS_COLON_RE = re.compile(
+    r"\bsections?\s*:\s*(?P<list>(?:" + _NOT_AT_ORDINAL + r"[^.;!?\n]){3,300})", re.I)
 _SECTION_LIST_RE = re.compile(
     r"\b(?P<verb>includ(?:e|es|ing)|contain(?:s|ing)?|cover(?:s|ing)?|with)\s+"
-    r"(?:the\s+|these\s+)?(?:following\s+)?(?:sections?\s+(?:on|for|about)?\s*)?(?P<list>[^.;:!?\n]{3,300})",
+    r"(?:the\s+|these\s+)?(?:following\s+)?(?:sections?\s+(?:on|for|about)?\s*)?"
+    r"(?P<list>(?:" + _NOT_AT_ORDINAL + r"[^.;:!?\n]){3,300})",
     re.I,
 )
 _LIST_SPLIT_RE = re.compile(r"\s*(?:,|;|\band\b|&|\bplus\b)\s*", re.I)
@@ -1158,10 +1168,67 @@ def _content_words(text: str) -> set:
     return {_stem(w) for w in re.split(r"\s+", text.strip()) if w and _stem(w) and _stem(w) not in _STOP_WORDS}
 
 
+#: A SIZE beside a name is a size, not the name (2026-09-28). "2-page
+#: summary" names the summary, "Executive Summary (about 200 words)" the
+#: executive summary; kept whole, the size tokens stayed in the phrase and
+#: no heading the model wrote could reach the 60% overlap (`_missing_
+#: sections`), so the repair pass wrote a section CALLED that. Only units of
+#: length are a size: "3-year forecast" and "10-year plan" keep their number,
+#: which is part of what they are called.
+_SIZE_UNITS = r"(?:pages?|words?|paragraphs?|paras?|lines?|slides?|sentences?|minutes?|mins?|chars?|characters?)"
+_NUMBER_WORDS = ("one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve",
+                 "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty", "thirty",
+                 "forty", "fifty", "sixty", "seventy", "eighty", "ninety", "hundred", "thousand", "million", "billion",
+                 "dozen", "half", "single", "double", "triple", "couple")
+_QUANTIFIER = (r"(?:about|around|approx\.?|approximately|roughly|circa|at\s+least|at\s+most|max(?:imum)?\.?|"
+               r"min(?:imum)?\.?|up\s+to|no\s+more\s+than|~)?")
+_LEAD_SIZE_RE = re.compile(
+    r"^(?:\d[\d,.]*|" + "|".join(_NUMBER_WORDS) + r")[\s-]*" + _SIZE_UNITS + r"\b[\s-]+", re.I)
+_TRAIL_SIZE_RE = re.compile(
+    r"\s*(?:[(\[][^()\[\]]*\d[^()\[\]]*[)\]]"
+    r"|[-–—,]\s*" + _QUANTIFIER + r"\s*\d[\d,.]*\s*" + _SIZE_UNITS + r"\b.*)$", re.I)
+
+#: The words that MEASURE a document rather than name a part of it:
+#: quantifiers ("about", "at least", "per"), units ("words", "pages",
+#: "diagrams") and numbers spelled out. `_naming_words` removes them, so
+#: "About 3000 words" and "At least three diagrams" have no naming word
+#: left while "Q3 2026 Revenue", "Top 10 Accounts", "Minimum Viable Product"
+#: and "Long Term Vision" keep theirs. Stemmed, like everything `_content_
+#: words` returns.
+_MEASURE_WORDS = frozenset(_stem(w) for w in (
+    "about around approx approximately roughly circa at least most minimum maximum min max per long only up more "
+    "than over under exactly fewer less between plus minus within each atleast no not as "
+    "words pages paragraphs paras lines sentences slides sections diagrams figures charts tables items bullets "
+    "characters chars minutes hours days weeks months years quarters"
+).split() + list(_NUMBER_WORDS))
+#: A token that is a number in a word's clothing: "3000", "3,000", "2-page"
+#: (stemmed to "2page"), "10k", "12pt", "Q3", "FY26", "H1".
+_MEASURE_TOKEN_RE = re.compile(r"^(?:\d[\d,.]*[a-z]{0,6}|q[1-4]|fy\d{2,4}|h[12])$")
+
+#: A numbered item that is an INSTRUCTION, not a name: an instruction verb
+#: first, then a lowercase word — "Use professional Markdown", "Include at
+#: least three diagrams", "Do not skip any section", "Keep the tone formal".
+#: Driven live on ea895477, "8. Use professional Markdown" was a level-1
+#: heading with a paragraph about Markdown under it. The lowercase word is
+#: the evidence: "Use Cases", "Keep Warm Strategy", "Make or Buy Decision",
+#: "Use of Funds" and "Do's and Don'ts" are headings and stay.
+_IMPERATIVE_ITEM_RE = re.compile(
+    r"^(?i:use|write|do|don'?t|make|format|include|add|ensure|keep|avoid|provide|follow|apply|prefer|"
+    r"remember|cite|put|give)\s+(?!(?:or|and|vs|versus|of|&)\b)[a-z]")
+
+
+def _naming_words(phrase: str) -> set:
+    """The content words of a phrase that could NAME a part of the document:
+    `_content_words` less the numbers, quantifiers and units."""
+    return {w for w in _content_words(phrase) if not (w in _MEASURE_WORDS or _MEASURE_TOKEN_RE.match(w))}
+
+
 def _section_phrase(raw: str) -> str:
     text = " ".join(raw.split()).strip(" -–—:'\"")
     text = _LEAD_ORDINAL_RE.sub("", text)
+    text = _TRAIL_SIZE_RE.sub("", text)
     text = _LEAD_WORDS_RE.sub("", text)
+    text = _LEAD_SIZE_RE.sub("", text)
     text = _TRAIL_WORDS_RE.sub("", text)
     return text.strip()
 
@@ -1216,9 +1283,12 @@ _ORDINAL_ITEM_RE = re.compile(r"(?:\A|(?<=\s))\(?(\d{1,2})[.)][ \t]+")
 #: file: "… 15. Conclusion Use professional Markdown." arrived as the section
 #: name 'Conclusion Use professional Markdown' — a wrong heading in every
 #: section-writer prompt AND a false "Conclusion missing" from
-#: `_missing_sections`. Narrow on purpose: imperatives, none a plausible word
-#: INSIDE a heading, and the cut only ever applies to the LAST item of a list
-#: that ran over.
+#: `_missing_sections`. Narrow on purpose: imperatives, and the cut only ever
+#: applies to the LAST item of a list. The verb alone is not evidence —
+#: "Acceptable Use Policy", "How We Use Data" and "Data Use" carry one
+#: (measured on ea895477: 'Acceptable', 'How We', and dropped). The
+#: evidence is the word AFTER the verb: lowercase, in a list whose other
+#: items are Title Case, and the tail is a sentence, not a heading.
 _INSTRUCTION_VERB_RE = re.compile(
     r"\b(?:use|using|write|do|don\'?t|make|format|include|including|add|ensure|keep|avoid|"
     r"provide|follow|apply|prefer|note that|remember)\b", re.I)
@@ -1228,30 +1298,77 @@ _INSTRUCTION_VERB_RE = re.compile(
 #: "Conclusion and" — the conjunction is not part of the heading.
 _TRAILING_JOIN_RE = re.compile(r"(?:\s+(?:and|or|of|the|a|an|to|for|with|in|on|&))+$", re.I)
 
+#: Where a MARKED item's NAME ends when the item goes on to describe its
+#: contents: "2. Architecture including hardware, software and network"
+#: names Architecture (measured on ea895477 the whole seven-word run was the
+#: name, and no heading could cover it). Only the verbs that introduce
+#: contents; "with" only when a LIST follows it ("with hardware, software
+#: and network"), since "Comparison with Competitors" is one heading. The
+#: clause itself is still read by `_SECTION_LIST_RE`.
+_ITEM_CLAUSE_RE = re.compile(
+    r"\s(?:including|includes|covering|covers|containing|contains|such\s+as|e\.g\.|i\.e\.|"
+    r"with(?=\s[^,;:.\n]*(?:,|\s(?:and|&)\s)))\s", re.I)
 
-def _trim_runover(items: List[str]) -> List[str]:
-    """Cut the LAST item of a list that ran over back to its heading.
+#: The person pointing at MATERIAL ahead of a bare numbered list — "the
+#: document below", "summarise this", "turn it into a brief". The list is
+#: then the material's own table of contents, not the request's. The fence
+#: (`_own_words`) draws this line whenever `pasted.fenced` wrapped the paste;
+#: measured with the real fence, a 151-character paste and an "ask, blank
+#: line, TOC + body" shape of 535 characters are both unfenced, and on
+#: ea895477 both made the brief carry the pasted document's eight sections,
+#: spend a correction call and warn "requested sections not found". A list
+#: under a heading word ("Requirements:") is the person's own and is not
+#: guarded here, so "a report from the attached notes covering:" still reads.
+_MATERIAL_AHEAD_RE = re.compile(
+    r"\b(?:below|above|attached|pasted|enclosed|"
+    r"(?:this|that|the)\s+(?:document|text|doc|article|paper|passage|draft|notes?|transcript|email|posting|jd|"
+    r"material)|"
+    r"summari[sz]e|summary\s+of|brief\s+of|condense|shorten|rewrite|reword|rephrase|paraphrase|proofread|"
+    r"translate|tidy|polish|restructure|reformat|"
+    r"turn\s+(?:it|this|that|these|them|the\s+\w+)\s+into)\b", re.I)
 
-    Two bounds, both read off the list itself rather than guessed:
-      1. an instruction verb — the sentence after the list starts with one;
+
+def _title_cased(items: Sequence[str]) -> bool:
+    """Do these list items read as headings — at least half start with a
+    capital? What tells "Use professional Markdown" (a sentence run on after
+    a Title Case list) from a list the person typed in lowercase, where a
+    lowercase word after a verb is no evidence at all."""
+    return bool(items) and sum(1 for x in items if x[:1].isupper()) * 2 >= len(items)
+
+
+def _trim_runover(items: List[str], *, ran_over: bool) -> List[str]:
+    """Cut the LAST item of a list back to its heading when it ran into the
+    sentence after it. Two bounds, both read off the list itself:
+      1. an instruction verb followed by a lowercase word, in a list whose
+         other items are Title Case — the tail is a sentence. Applied to
+         every list shape: a multi-line list's last line can end in a
+         sentence too ("3. Conclusion Use professional Markdown.").
       2. the longest of the earlier items — a list of two-word headings does
-         not have a six-word last one. A backstop, and deliberately timid:
-         four items or more, multi-word siblings, and a last item more than
-         one word longer than any of them. Without those three conditions it
-         destroys real headings ("Intro" then "The Complete Regulatory
-         Landscape Review" would lose its second heading to one word).
+         not have a six-word last one. Only for a list that RAN OVER (a
+         one-line list, whose last item nothing ended); a multi-line list
+         bounds every item with its own line, and there the rule only
+         destroyed real headings ('Incident Response Plan Overview.' ->
+         'Incident Response', 'Vendor Risk Assessment Framework' -> 'Vendor
+         Risk' on ea895477). A backstop, and deliberately timid: four items
+         or more, multi-word siblings, and a last item more than one word
+         longer than any of them.
     Nothing is cut when neither applies, so a genuinely long last heading
     survives.
     """
     if len(items) < 2:
         return items
     last = items[-1]
-    m = _INSTRUCTION_VERB_RE.search(last)
-    if m is not None and m.start() > 0:
-        cut = _TRAILING_JOIN_RE.sub("", last[: m.start()].strip())
-        if cut:
-            items[-1] = cut
-            return items
+    if _title_cased(items[:-1]):
+        for m in _INSTRUCTION_VERB_RE.finditer(last):
+            if m.start() == 0:
+                continue
+            if last[m.end():].lstrip()[:1].islower():
+                cut = _TRAILING_JOIN_RE.sub("", last[: m.start()].strip())
+                if cut:
+                    items[-1] = cut
+                return items
+    if not ran_over:
+        return items
     words = last.split()
     sibling_words = max((len(x.split()) for x in items[:-1]), default=0)
     if len(items) >= 4 and sibling_words >= 2 and len(words) > sibling_words + 1:
@@ -1259,23 +1376,26 @@ def _trim_runover(items: List[str]) -> List[str]:
     return items
 
 
-def _ran_over(block: str, last_stop: Optional[re.Match]) -> bool:
-    """Did the LAST item of a list run into the sentence after it? Two
-    shapes, and the list itself says which:
-      * a ONE-LINE list has no newline anywhere, so its last item had nothing
-        to end it and always ran over — including when it runs to the end of
-        the message with no punctuation at all;
-      * a MULTI-LINE list bounds each item with its own line, so its last
-        item ran over only when something OTHER than a newline ended it (a
-        sentence end on the same line: "3. Conclusion Use professional
-        Markdown."). A last item ended by a newline, or by the end of the
-        message, is already correct and is left alone — measured on the
-        ceilings branch before this rule, 'Acceptable Use Policy' ->
-        'Acceptable' and 'How We Use Data' -> 'How We'.
-    """
-    if "\n" not in block:
-        return True
-    return last_stop is not None and last_stop.group(0) != "\n"
+def _item_text(chunk: str) -> Tuple[str, Optional[re.Match]]:
+    """One marked item's name, and what ended it. The item runs to the first
+    clause or sentence end (`_ITEM_END_RE`), and its NAME stops earlier where
+    the item goes on to describe its contents (`_ITEM_CLAUSE_RE`)."""
+    stop = _ITEM_END_RE.search(chunk)
+    text = chunk[: stop.start()] if stop else chunk
+    clause = _ITEM_CLAUSE_RE.search(text)
+    if clause is not None and clause.start() > 0:
+        text = text[: clause.start()]
+    return text, stop
+
+
+def _ran_over(text: str, marks: Sequence[re.Match], last_stop: Optional[re.Match]) -> bool:
+    """Did the LAST item of this list run into the sentence after it? Only a
+    ONE-LINE list (no newline between its first and last marker) has an item
+    nothing ended, and only when that item was not ended by a newline
+    either. A multi-line list bounds each item with its own line."""
+    if "\n" in text[marks[0].start(): marks[-1].start()]:
+        return False
+    return last_stop is None or last_stop.group(0) != "\n"
 
 
 def _ordinal_run_items(text: str) -> List[str]:
@@ -1283,9 +1403,11 @@ def _ordinal_run_items(text: str) -> List[str]:
 
     No heading word required. Returns [] unless the run starts at 1 and is at
     least `_ORDINAL_RUN_MIN` long, which is what tells a table of contents
-    from a stray ordinal in prose. Bounded: one linear pass over text the
-    caller has already clipped to `_SECTION_SCAN_CHARS`, stopping at the
-    first number that does not continue the run.
+    from a stray ordinal in prose — and [] when the words before the list
+    point at material (`_MATERIAL_AHEAD_RE`), which makes the list the
+    material's own contents. Bounded: one linear pass over text the caller
+    has already clipped to `_SECTION_SCAN_CHARS`, stopping at the first
+    number that does not continue the run.
     """
     run: List[re.Match] = []
     for m in _ORDINAL_ITEM_RE.finditer(text):
@@ -1296,16 +1418,15 @@ def _ordinal_run_items(text: str) -> List[str]:
             run = [m]
         else:
             break
-    if len(run) < _ORDINAL_RUN_MIN:
+    if len(run) < _ORDINAL_RUN_MIN or _MATERIAL_AHEAD_RE.search(text[: run[0].start()]):
         return []
     items: List[str] = []
     stop: Optional[re.Match] = None
     for i, m in enumerate(run):
         end = run[i + 1].start() if i + 1 < len(run) else len(text)
-        chunk = text[m.end():end]
-        stop = _ITEM_END_RE.search(chunk)
-        items.append(chunk[: stop.start()] if stop else chunk)
-    return _trim_runover(items) if _ran_over(text, stop) else items
+        item, stop = _item_text(text[m.end():end])
+        items.append(item)
+    return _trim_runover(items, ran_over=_ran_over(text, run, stop))
 
 
 def _list_items(block: str) -> List[str]:
@@ -1314,28 +1435,29 @@ def _list_items(block: str) -> List[str]:
     clause end, whichever comes first. Items are NOT split on "and":
     "Authentication and Authorization" is one section (item 9 of the
     owner's fifteen), not two. The last item of a list that ran into the
-    sentence after it is trimmed back to its heading (`_ran_over`)."""
+    sentence after it is trimmed back to its heading (`_trim_runover`)."""
     marks = list(_LIST_MARKER_RE.finditer(block))
     items: List[str] = []
     stop: Optional[re.Match] = None
     for i, m in enumerate(marks):
         end = marks[i + 1].start() if i + 1 < len(marks) else len(block)
-        chunk = block[m.end():end]
-        stop = _ITEM_END_RE.search(chunk)
-        items.append(chunk[: stop.start()] if stop else chunk)
-    return _trim_runover(items) if items and _ran_over(block, stop) else items
+        item, stop = _item_text(block[m.end():end])
+        items.append(item)
+    return _trim_runover(items, ran_over=_ran_over(block, marks, stop)) if items else items
 
 
 def requested_sections(instruction: str) -> List[str]:
     """The sections a request names — "include A, B, C and D", "covering
     A and B", "sections: A, B", and a numbered or bulleted list under a
     heading such as "Requirements:" — as short phrases, in order,
-    deduplicated. A phrase is a section only when it is one to five words
-    with no digit (its ordinal having been stripped first) and at least
-    one content word that does not name a file part (rows, logo, PDF,
-    chart …); "with" needs a list of two or more, because "with a total
-    row" describes the table, not a chapter. Empty when the request names
-    none.
+    deduplicated. A phrase is a section only when it is a NAME: at most
+    `MAX_SECTION_WORDS` words for a marked item (`INLINE_SECTION_WORDS` for
+    an inline clause), its ordinal and any size beside it stripped, with at
+    least one naming word — not a number, a quantifier, a unit or a file
+    part (rows, logo, PDF, chart …) — and not an instruction ("Use
+    professional Markdown"); "with" needs a list of two or more, because
+    "with a total row" describes the table, not a chapter. Empty when the
+    request names none.
 
     Only the first `_SECTION_SCAN_CHARS` characters are read, and the
     slice is the FIRST thing that happens — before the join that copies
@@ -1352,21 +1474,25 @@ def requested_sections(instruction: str) -> List[str]:
     not_sections = {_stem(w) for w in _NOT_SECTION_WORDS}
 
     def eligible(ph: str, limit: int) -> bool:
-        # A HEADING MAY CARRY A NUMBER (2026-09-28, carried from the ceilings
-        # branch). The old rule discarded any phrase with a digit in it, so
-        # "Sections:\n1. Q3 2026 Revenue\n2. Data Model\n3. Top 10 Accounts"
-        # returned NOTHING — two names carry digits and the minimum-of-two
-        # rule then threw the survivor away too. The ordinal is already
-        # stripped by `_section_phrase`, so a digit here is the person's own.
-        # The word that makes a phrase a section must still be a WORD: "3
-        # charts" and "2 tables" are file parts with a count in front, and on
-        # the ceilings branch the digit itself counted as content, so "with 3
-        # charts and 2 tables" named two chapters. A font size stays styling.
+        # A SECTION NAME IS A NOUN PHRASE NAMING A PART OF THE DOCUMENT
+        # (2026-09-28). A heading may carry a number — "Q3 2026 Revenue",
+        # "Top 10 Accounts" — so the old any-digit rule is gone; what decides
+        # is what the phrase IS. A quantity ("About 3000 words"), a
+        # constraint ("At least 3 diagrams", "Around 4 pages long") and a
+        # count of file parts ("3 charts per", "2 tables") have no NAMING
+        # word once the numbers, quantifiers and units are set aside
+        # (`_naming_words`), and an instruction ("Use professional
+        # Markdown") is a sentence, not a name. Driven live on ea895477,
+        # "7. About 3000 words" was a level-1 heading whose paragraph read
+        # "This section serves as a structural placeholder required by the
+        # prompt". A font size stays styling.
         words = ph.split()
         if not ph or not 1 <= len(words) <= limit or re.search(r"\d\s*pt\b", ph, re.I):
             return False
-        content = {w for w in _content_words(ph) if any(ch.isalpha() for ch in w)}
-        return bool(content) and not content <= not_sections
+        if _IMPERATIVE_ITEM_RE.match(ph):
+            return False
+        naming = _naming_words(ph)
+        return bool(naming) and not naming <= not_sections
 
     def add(phrases: Sequence[str], minimum: int, limit: int = INLINE_SECTION_WORDS) -> None:
         keep = [ph for ph in phrases if eligible(ph, limit)]

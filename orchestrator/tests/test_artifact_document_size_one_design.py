@@ -157,6 +157,216 @@ def test_more_than_twenty_named_sections_survive():
     assert C.MAX_REQUESTED_SECTIONS == 40
 
 
+# ----------------------------------------------------- what a name IS --
+#
+# A section name is a NOUN PHRASE NAMING A PART OF THE DOCUMENT. The parse
+# above was relaxed (a digit allowed, eight words, a bare list, a run-over
+# trim) for the owner's fifteen, and each relaxation found things that are
+# not sections. Two reached a real file on the live engine (2026-09-28,
+# ea895477): "7. About 3000 words" became a level-1 heading whose paragraph
+# read "This section serves as a structural placeholder required by the
+# prompt", and "8. Use professional Markdown" a heading with a paragraph
+# about Markdown under it.
+
+_REQ = "Write a security report.\nRequirements:\n1. Executive Summary\n2. Data Model\n3. Threat Scope\n4. Conclusion\n5. "
+_FOUR = ["Executive Summary", "Data Model", "Threat Scope", "Conclusion"]
+
+
+@pytest.mark.parametrize("item", [
+    "About 3000 words", "At least 3 diagrams", "At least three diagrams", "Around 4 pages long", "Minimum 10",
+    "3 charts per", "5 tables", "Q3 2026 numbers only", "No more than 2 pages",
+])
+def test_a_quantity_or_a_constraint_in_a_numbered_list_is_not_a_section(item):
+    """Decided from what the item IS, not from whether it carries a digit:
+    once the numbers, quantifiers and units are set aside nothing is left
+    that names a part of the document."""
+    assert C.requested_sections(_REQ + item) == _FOUR
+    assert not C._naming_words(item) or C._naming_words(item) <= {C._stem(w) for w in C._NOT_SECTION_WORDS}
+
+
+@pytest.mark.parametrize("item", [
+    "Q3 2026 Revenue", "Top 10 Accounts", "2026 Roadmap", "10-year plan", "2024 vs 2025 comparison",
+    "Minimum Viable Product", "Long Term Vision", "3D Modelling", "Single Sign-On",
+])
+def test_a_name_that_carries_a_number_or_a_quantifier_word_is_still_a_section(item):
+    assert C.requested_sections(_REQ + item) == _FOUR + [item]
+
+
+@pytest.mark.parametrize("item", [
+    "Use professional Markdown", "Include at least three diagrams", "Do not skip any section",
+    "Keep the tone formal", "Cite every figure you use", "Provide a glossary",
+])
+def test_a_numbered_instruction_is_not_a_section(item):
+    """An imperative — instruction verb, then a lowercase word — is a
+    sentence about the file, not the name of a part of it."""
+    assert C.requested_sections(_REQ + item) == _FOUR
+
+
+def test_a_list_that_is_only_instructions_names_nothing():
+    text = ("Write a report, about 3000 words.\nRequirements:\n1. Use professional markdown\n"
+            "2. Include at least three diagrams\n3. Do not skip any\n4. Cite every figure you use\n5. Keep the tone formal")
+    assert C.requested_sections(text) == []
+
+
+def test_the_live_case_b_shape_names_six_sections_not_eight():
+    """The shape driven live on ea895477: six names, one quantity, one
+    instruction. The file carried eight level-1 headings."""
+    text = ("Write a security report.\nRequirements:\n1. Executive Summary\n2. Data Model\n3. Threat Scope\n"
+            "4. Access Control\n5. Monitoring\n6. Conclusion\n7. About 3000 words\n8. Use professional Markdown")
+    assert C.requested_sections(text) == [
+        "Executive Summary", "Data Model", "Threat Scope", "Access Control", "Monitoring", "Conclusion"]
+
+
+@pytest.mark.parametrize("item", [
+    "Use Cases", "Use of Funds", "Make or Buy Decision", "Do's and Don'ts", "Keep Warm Strategy",
+    "Add-on Services",
+])
+def test_a_heading_that_starts_with_an_instruction_verb_is_a_heading(item):
+    """The verb alone is not evidence; the Title Case word after it is."""
+    assert C.requested_sections(_REQ + item) == _FOUR + [item]
+
+
+@pytest.mark.parametrize("item,name", [
+    ("2-page summary", "summary"),
+    ("500-word risk register", "risk register"),
+    ("Risk Register (about 200 words)", "Risk Register"),
+    ("Risk Register - 200 words", "Risk Register"),
+    ("Risks [2 pages]", "Risks"),
+])
+def test_a_size_beside_a_name_is_not_part_of_the_name(item, name):
+    """Kept whole, the size tokens stayed in the phrase and no heading the
+    model wrote could reach the 60% overlap, so the repair pass wrote a
+    section CALLED "2-page summary"."""
+    assert C.requested_sections(_REQ + item) == _FOUR + [name]
+    assert C.requested_sections("Write a document with a 2-page summary and 3-year forecast.") == [
+        "summary", "3-year forecast"]
+
+
+# ------------------------------------------------- the pasted document --
+
+_TOC = "\n".join(f"{i}. {n}" for i, n in enumerate([
+    "Introduction", "Scope and Definitions", "Methodology", "Results", "Discussion", "Limitations",
+    "Conclusion", "Appendix A"], 1))
+_BODY = "\n".join(["This document describes the vendor assessment programme carried out in the second quarter."] * 4)
+
+
+@pytest.mark.parametrize("text", [
+    "Summarise this in one page:\n" + _TOC,
+    "Turn the document below into a two-page brief.\n\n" + _TOC + "\n" + _BODY,
+    "Write a report from the attached notes. 1. Findings 2. Risks 3. Roadmap",
+], ids=["151-char paste", "535-char ask, blank line, TOC + body", "bare list after 'attached'"])
+def test_an_unfenced_pasted_table_of_contents_is_not_the_requests_sections(text):
+    """The fence heuristic does not wrap either paste (pinned: this is the
+    hole), so `_own_words` cannot draw the line; the bare-list fallback
+    draws it from the words before the list, which point at material. On
+    ea895477 the brief was told to carry the document's eight sections,
+    spent a correction call and warned 'requested sections not found'."""
+    from app.core import pasted
+    fenced = pasted.fenced(text)
+    assert pasted.OPEN_TAG not in fenced
+    assert C.requested_sections(fenced) == []
+
+
+def test_a_bare_list_under_a_plain_request_and_a_heading_word_over_pasted_material_still_read():
+    """The guard is only for the BARE list: a heading word is the person's
+    own statement that what follows is their list."""
+    assert C.requested_sections(
+        "Create a technical report on our platform, about 3000 words.\n1. Executive Summary\n2. Architecture\n"
+        "3. Hardware Layer\n4. Security\n5. Conclusion\nUse professional Markdown.") == [
+        "Executive Summary", "Architecture", "Hardware Layer", "Security", "Conclusion"]
+    assert C.requested_sections(
+        "Write a report from the attached notes covering: 1. Findings 2. Risks 3. Roadmap") == [
+        "Findings", "Risks", "Roadmap"]
+
+
+# ------------------------------------------------- the neighbouring item --
+
+
+@pytest.mark.parametrize("text", [
+    "Requirements: 1. Executive Summary 2. Architecture including hardware, software and network 3. Security 4. Conclusion",
+    "Requirements: 1. Executive Summary 2. Architecture with hardware, software and network 3. Security 4. Conclusion",
+])
+def test_an_inline_clause_stops_at_the_next_items_ordinal_and_names_only_the_item(text):
+    """On ea895477 this named 'network 3' (never coverable: 0.5 overlap, so
+    the repair and the Max-loop contract counted it missing forever) and the
+    seven-word run 'Architecture including hardware, software and network'."""
+    got = C.requested_sections(text)
+    assert got == ["Executive Summary", "Architecture", "Security", "Conclusion", "hardware", "software", "network"]
+    assert not any(any(ch.isdigit() for ch in name) for name in got)
+
+
+def test_with_cuts_an_item_only_when_a_list_follows_it():
+    assert C.requested_sections("Requirements:\n1. Comparison with Competitors\n2. Pricing\n3. Roadmap") == [
+        "Comparison with Competitors", "Pricing", "Roadmap"]
+
+
+# --------------------------------------------- the run-over trim, bounded --
+
+
+@pytest.mark.parametrize("text,last", [
+    ("Requirements: 1. Executive Summary 2. Data Model 3. Threat Scope 4. Acceptable Use Policy", "Acceptable Use Policy"),
+    ("Requirements: 1. Executive Summary 2. Data Model 3. How We Use Data", "How We Use Data"),
+    ("Requirements: 1. Collection 2. Storage 3. Data Use", "Data Use"),
+    ("Requirements: 1. Scope 2. Design 3. Security 4. Use Cases", "Use Cases"),
+    ("requirements: 1. executive summary 2. data model 3. acceptable use policy", "acceptable use policy"),
+])
+def test_a_one_line_heading_with_a_verb_in_it_is_not_cut(text, last):
+    """Main kept every one of these; ea895477 cut them to 'Acceptable',
+    'How We' and dropped 'Data Use'. The verb is followed by a Title Case
+    word (or nothing), or the list is not Title Case at all."""
+    assert C.requested_sections(text)[-1] == last
+
+
+@pytest.mark.parametrize("text,last", [
+    ("Requirements:\n1. Executive Summary.\n2. Data Model.\n3. Threat Scope.\n4. Incident Response Plan Overview.",
+     "Incident Response Plan Overview"),
+    ("Requirements:\n1. Executive Summary\n2. Data Model\n3. Threat Scope\n4. Vendor Risk Assessment Framework: cover all vendors.",
+     "Vendor Risk Assessment Framework"),
+])
+def test_a_multi_line_list_never_cuts_its_last_heading_by_sibling_length(text, last):
+    """Each line bounds its own item; the sibling rule is for a one-line
+    list only. ea895477 gave 'Incident Response' and 'Vendor Risk'."""
+    got = C.requested_sections(text)
+    assert got[3] == last
+
+
+def test_the_run_over_cut_needs_a_lowercase_word_after_the_verb():
+    """'Conclusion Use professional Markdown' is cut; the same list with the
+    tail in Title Case is a heading the parser cannot tell from one, and is
+    left to the sibling rule."""
+    one_line = "Requirements: 1. Executive Summary 2. Data Model 3. Threat Scope 4. Conclusion Use professional Markdown."
+    assert C.requested_sections(one_line)[-1] == "Conclusion"
+    multi = "Requirements:\n1. Executive Summary\n2. Data Model\n3. Conclusion Keep it factual."
+    assert C.requested_sections(multi)[-1] == "Conclusion"
+
+
+def test_the_live_case_b_shape_is_written_in_six_sections_through_the_real_compose(monkeypatch):
+    """compose() end to end with the model scripted: the outline is told the
+    six names, six section writes, and neither the quantity nor the
+    instruction is a heading in the file."""
+    names = ["Executive Summary", "Data Model", "Threat Scope", "Access Control", "Monitoring", "Conclusion"]
+    text = ("Write a security report, about 3000 words.\nRequirements:\n" +
+            "\n".join(f"{i}. {n}" for i, n in enumerate(names, 1)) +
+            "\n7. About 3000 words\n8. Use professional Markdown")
+    model = _Recorder(names)
+    monkeypatch.setattr(llm, "json_completion", model)
+    monkeypatch.setattr(C, "_pace", _no_pace)
+    result = asyncio.run(C.compose(_req(text)))
+    outline = next(c for c in model.calls if c["name"] == "artifact_outline")
+    told = outline["user"].split("The request names these ", 1)[1].split(".", 1)[0]
+    assert told.startswith("6 sections"), told
+    assert "About 3000 words" not in told and "Use professional Markdown" not in told, told
+    # The sections the writer was asked for are the six names and nothing
+    # else (the extension pass re-asks for short ones, so the set, not the
+    # count: the recorder's 200-word sections are short against 3,000).
+    asked = {c["user"].split("“", 1)[1].split("”", 1)[0]
+             for c in model.calls if c["name"] == "artifact_section_write"}
+    assert asked == set(names), asked
+    headings = [b.text for b in result.spec.body.blocks if isinstance(b, S.Heading) and b.level == 1]
+    assert headings == names
+    assert not any("not found" in w for w in result.warnings), result.warnings
+
+
 # --------------------------------------------------------------- the split --
 
 
