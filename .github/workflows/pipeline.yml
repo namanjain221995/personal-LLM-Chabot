@@ -246,12 +246,42 @@ jobs:
       # 464 here, because a branch has to be green on its own tree to be
       # verifiable, and CI never builds this branch alone (`push` is main and dev
       # only; a `pull_request` builds the merge result).
+      # (2026-09-13): a module that skips itself at import no longer counts
+      # towards it.
+      #
+      # MEASURED, on the merge of this branch into dev at ff1a5d7c: 402 executed,
+      # 0 skipped, of 402 collected, across 11 modules, of which 82 are the new
+      # db-rehearsal suite. Three runs, same number each time (load average
+      # 28.3-30.8, 21.4-24.1 s wall). dev alone is 320.
+      #
+      # Earlier drafts of this comment said 220/37, then 225/42, then 395/75, and
+      # each was stale by the next commit. Two lessons, both worth the line: a
+      # count of THIS BRANCH alone is not the count the gate will see, because
+      # dev gained five test modules while the branch sat unmerged; and a count
+      # measured before the last commit is not a count of the branch. The number
+      # here is the merged one, taken after the final commit.
+      #
+      # WHAT 205 CATCHES AND WHAT IT DOES NOT. The floor was 95 from the day it
+      # was written, which by 320 could not catch a whole module dropping out of
+      # discovery and taking a hundred tests with it while the rest still pass.
+      # 205 catches a catastrophic loss - roughly half the suite - and it does
+      # NOT catch one module going missing: losing all 75 db-rehearsal tests
+      # leaves 320, which clears it. It is deliberately loose, not tight: there
+      # are ~18 branches in flight against this directory, and a floor set just
+      # under the current count turns any one of them that nets the total down
+      # into a red `policy` job that blocks every other merge. Tighten it to just
+      # under the measured count once the wave has landed and the count is stable
+      # - that is a one-line change and it is the point at which this line starts
+      # doing its whole job.
+      #
+      # Deliberately deleting tests still means lowering this number in the same
+      # commit, where a reviewer reads the line.
       - name: The CI gate scripts have tests, and they pass
         run: |
           python .github/workflows/scripts/unittest_gate.py \
             --label "workflow scripts" \
             --start .github/workflows/scripts/tests \
-            --min-tests 325
+            --min-tests 698
 
       - name: Migration table invariants (no database needed)
         run: |
@@ -753,6 +783,254 @@ jobs:
         env:
           APP_DATABASE_URL: ${{ env.UPGRADE_DSN }}
         run: python ../.github/workflows/scripts/schema_parity.py --orchestrator . upgrade
+
+  # ==========================================================================
+  # THE SCHEMA CHANGE HAS TO BE REVERSIBLE, NOT JUST CORRECT
+  #
+  # The `schema` job above proves these migrations are consistent with each
+  # other: fresh equals upgraded, and re-running changes nothing. It does that
+  # with the migrations from the CHECKOUT, in the runner's own Python. Two
+  # things it cannot see, and this job exists for both:
+  #
+  #   1. THE CODE THAT SHIPS IS AN IMAGE. Production runs `app/db.py` inside
+  #      orchestrator-cpu/cuda against that image's pinned dependency set. A
+  #      migration that needs a psycopg feature the image's version does not
+  #      have is green in `schema` and red on the box. So this job BUILDS a
+  #      real orchestrator-cpu image and runs the migrations out of it, through
+  #      scripts/deploy-db-rehearsal.sh rather than a CI-only copy of it -- the
+  #      same script a release runs BY HAND before a deploy.
+  #
+  #      By hand, and not automatically: no deploy path invokes it. `grep -rn
+  #      rehears scripts/deploy.sh scripts/deploy-preflight.sh
+  #      scripts/deploy-rollback.sh techsara` is empty, and this workflow is its
+  #      only caller in the repository. An earlier version of this comment said
+  #      "the same thing it does before a deploy", which reads as if the box
+  #      already ran it on every deploy. It does not, and that is the reason
+  #      this job exists: CI is where it actually runs.
+  #
+  #   2. AN IMAGE ROLLBACK DOES NOT ROLL THE DATABASE BACK. There are no down
+  #      migrations and `init_schema` skips versions already recorded in
+  #      `schema_migrations`, so rolling the orchestrator back leaves the
+  #      PREVIOUS release's code in front of THIS release's schema.
+  #      scripts/deploy-rollback.sh refuses to cross a schema boundary
+  #      precisely because nobody has ever run that combination. This job runs
+  #      it: the database is staged at this commit's version and the previous
+  #      released commit's image is booted in front of it, and has to answer
+  #      /health, answer a route that reads `users`, and still WRITE through its
+  #      own db.py. Reading is half a rollback.
+  #
+  # WHY TWO IMAGE BUILDS, AND WHAT THAT COSTS
+  # The baseline arm and the reversibility arm need the SAME thing -- the
+  # previous release's real historical code -- so the previous commit's image is
+  # built once and used for both. Two native orchestrator-cpu builds dominate
+  # this job's wall clock. The 60-minute ceiling is sized from the `images` job,
+  # which builds orchestrator-cpu plus three other images inside 45; it has NOT
+  # been measured on a hosted runner for this job and the first run is the
+  # measurement.
+  #
+  # WHY `fetch-depth: 0`
+  # actions/checkout fetches ONE commit by default, and neither
+  # `github.event.before` nor a merge-base exists in a one-commit clone. The
+  # baseline step refuses rather than guesses when the commit it resolved is not
+  # in the checkout, and names this line in the message.
+  #
+  # WHAT THIS JOB DOES NOT PROVE
+  # That the deploy is safe. It rehearses the SCHEMA on a hosted runner against
+  # the same PostgreSQL major production runs. It never touches the box, the
+  # GPU or the live database. The verdict block says so in the run summary, and
+  # labels every line FACT (measured here) or NOT PROVED (not run, or not
+  # provable here) so a green summary cannot be misread as broader evidence
+  # than it is.
+  #
+  # IT IS NOT IN `ci-ok` YET, DELIBERATELY
+  # ci_gate.py fails a dependency that is in `needs:` but not in `--require`,
+  # and fails a required job that is missing from `needs:` -- so adding this
+  # job to the gate is a two-line edit that must happen in ONE commit, and it
+  # is a separate commit on purpose: this one can be reverted without touching
+  # branch protection, and the promotion commit is where a reviewer decides
+  # that a red rehearsal should block a merge. Until then this job is
+  # advisory: it goes red on its own line and nothing is blocked.
+  # ==========================================================================
+  db-rehearsal:
+    name: Database rehearsal (fresh, upgrade, reversibility)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        # THE SAME DIGEST AS THE `orchestrator` AND `schema` JOBS, AND AS
+        # PRODUCTION. Three copies of one string is a real risk, so the
+        # rehearsal ASSERTS the major rather than trusting the pin: the digest
+        # is passed to scripts/deploy-db-rehearsal.sh as --pg-image together
+        # with --expect-major 18, and that script compares the declared major
+        # against `SHOW server_version` from the server it is about to use. A
+        # digest repointed to a different major fails here with the major in
+        # the message, which is exactly what a digest cannot tell you by
+        # itself.
+        image: postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: techsara_rehearsal_test
+          # conftest is not involved here, but the rehearsal creates its
+          # databases from template1 and the seeded rows are compared by an
+          # ORDER BY -- so the collation has to be the one production uses.
+          POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test -d techsara_rehearsal_test -q"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PG_IMAGE: postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+      # Declared, because a digest says nothing about a version. Asserted
+      # against the running server by the rehearsal script.
+      PG_MAJOR: "18"
+      # `postgres` is the ADMIN database the rehearsal connects to in order to
+      # CREATE its own; it never writes there.
+      REHEARSAL_SERVER: postgresql://test:test@127.0.0.1:5432/postgres
+      REVERSE_DSN: postgresql://test:test@127.0.0.1:5432/rehearsal_reverse_test
+      NEW_IMAGE: db-rehearsal-orchestrator-cpu:this-commit
+      OLD_IMAGE: db-rehearsal-orchestrator-cpu:baseline
+      REVERSE_PORT: "18731"
+      # The default branch, read as DATA. Interpolating `github.event.*` into a
+      # `run:` body is a shell-injection hole and workflow_policy.py P6 fails
+      # the run for it.
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+      # An escape hatch with a reviewable name: set the repository variable to a
+      # commit sha to rehearse against that baseline instead of the resolved
+      # one. Unset is an empty string, which the resolver treats as "not
+      # declared" -- it does NOT mean false (see the `vars.X != 'false'` trap
+      # in the `deploy` job).
+      DB_REHEARSAL_PREVIOUS_SHA: ${{ vars.DB_REHEARSAL_PREVIOUS_SHA }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Required. See "WHY fetch-depth: 0" above.
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+
+      # Each arm writes its own outcome here and the verdict step reads all of
+      # them. A missing file is how "this step never ran" reaches the verdict,
+      # so the directory is created and nothing else ever cleans it.
+      - name: Somewhere for the arms to report
+        run: mkdir -p .ci-reports
+
+      # Which commit counts as "the previous release". This repository has no
+      # release tags and records deploys in .runtime/releases ON THE BOX, which
+      # a hosted runner cannot read -- so the rule that produced the baseline is
+      # named in the summary rather than implied, and a baseline that cannot be
+      # established is a refusal, not a fallback to HEAD.
+      - name: Which commit is the baseline
+        id: baseline
+        run: |
+          python .github/workflows/scripts/db_rehearsal.py baseline \
+            --repo . --default-branch "$DEFAULT_BRANCH"
+
+      - name: Check the baseline commit out beside this one
+        env:
+          BASELINE_SHA: ${{ steps.baseline.outputs.previous }}
+        run: |
+          set -euo pipefail
+          git worktree add --detach ../db-rehearsal-baseline "$BASELINE_SHA"
+          git -C ../db-rehearsal-baseline log -1 --format='baseline is %H %s'
+
+      # Two native amd64 builds. The baseline image is the one the UPGRADE arm
+      # migrates FROM and the one the REVERSIBILITY arm boots, so it is built
+      # once and used twice.
+      - name: Build this commit's orchestrator-cpu image
+        run: |
+          set -euo pipefail
+          docker build --file orchestrator/Dockerfile.cpu --tag "$NEW_IMAGE" orchestrator
+
+      - name: Build the baseline commit's orchestrator-cpu image
+        run: |
+          set -euo pipefail
+          docker build --file ../db-rehearsal-baseline/orchestrator/Dockerfile.cpu \
+            --tag "$OLD_IMAGE" ../db-rehearsal-baseline/orchestrator
+
+      # Read out of the image, not out of the checkout: the number that matters
+      # is the one the code that ships believes in.
+      - name: What version does each image migrate to
+        id: versions
+        run: |
+          set -euo pipefail
+          new="$(docker run --rm --entrypoint python "$NEW_IMAGE" \
+                   -c 'from app.db import LATEST_SCHEMA_VERSION; print(LATEST_SCHEMA_VERSION)')"
+          old="$(docker run --rm --entrypoint python "$OLD_IMAGE" \
+                   -c 'from app.db import LATEST_SCHEMA_VERSION; print(LATEST_SCHEMA_VERSION)')"
+          echo "this commit migrates to V$new; the baseline migrates to V$old"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "old=$old" >> "$GITHUB_OUTPUT"
+
+      # ARMS 1 AND 2 (and the restore rehearsal the same script performs):
+      # the real deploy-time script, with production's identity DECLARED
+      # because a hosted runner has no stack to read it from. --require-upgrade
+      # turns "no baseline image, so the upgrade phase was skipped" into a
+      # failure: on a laptop that skip is honest, in a gate it is a green that
+      # means nothing.
+      #
+      # --require-upgrade is BELT AND BRACES here and cannot fire as this step is
+      # written: --from-image is always "$OLD_IMAGE", which is a literal tag and
+      # never empty, so the script always has a baseline to look at. It is kept
+      # for the edit that drops --from-image, and because it is not the only lock
+      # on that door -- `_incomplete_reason` in db_rehearsal.py refuses a `pass`
+      # record whose `from_image` or `from_version` is empty, which catches the
+      # same thing from the verdict's side even if this flag is ever removed.
+      - name: FRESH and UPGRADE, out of the real images
+        run: |
+          set -euo pipefail
+          scripts/deploy-db-rehearsal.sh \
+            --server "$REHEARSAL_SERVER" \
+            --pg-image "$PG_IMAGE" --expect-major "$PG_MAJOR" \
+            --image "$NEW_IMAGE" --from-image "$OLD_IMAGE" \
+            --require-upgrade \
+            --json .ci-reports/arm-fresh-upgrade.json
+
+      # ARM 3: the rollback direction. Staged with the NEW image so the
+      # database really is at this commit's version, then the OLD image is
+      # booted in front of it.
+      - name: Stage a database at this commit's schema version
+        run: |
+          set -euo pipefail
+          docker run --rm --network host -e PGPASSWORD=test --entrypoint psql "$PG_IMAGE" \
+            -h 127.0.0.1 -p 5432 -U test -d postgres -v ON_ERROR_STOP=1 \
+            -c 'DROP DATABASE IF EXISTS rehearsal_reverse_test WITH (FORCE)' \
+            -c 'CREATE DATABASE rehearsal_reverse_test'
+          docker run --rm --network host -e APP_DATABASE_URL="$REVERSE_DSN" \
+            --entrypoint python "$NEW_IMAGE" \
+            -c 'from app.db import init_schema, schema_version; init_schema(); print("staged at V", schema_version())'
+
+      - name: REVERSIBILITY - the previous release, in front of this schema
+        env:
+          EXPECT_SCHEMA: ${{ steps.versions.outputs.new }}
+        run: |
+          set -euo pipefail
+          python .github/workflows/scripts/db_rehearsal.py reversibility \
+            --old-image "$OLD_IMAGE" \
+            --dsn "$REVERSE_DSN" \
+            --expect-schema "$EXPECT_SCHEMA" \
+            --port "$REVERSE_PORT" \
+            --json .ci-reports/arm-reversibility.json
+
+      # ALWAYS, and it is the step that decides. A missing arm file is a
+      # refusal, so a step that was deleted, renamed or never reached cannot
+      # turn this green by staying quiet -- the same rule ci_gate.py applies to
+      # a job missing from `needs:`.
+      - name: The verdict
+        if: always()
+        env:
+          BASELINE_SHA: ${{ steps.baseline.outputs.previous }}
+          BASELINE_HOW: ${{ steps.baseline.outputs.how }}
+        run: |
+          python .github/workflows/scripts/db_rehearsal.py verdict \
+            --results .ci-reports/arm-fresh-upgrade.json .ci-reports/arm-reversibility.json \
+            --head "$GITHUB_SHA" \
+            --previous "$BASELINE_SHA" \
+            --how "$BASELINE_HOW" \
+            --pg-major "$PG_MAJOR"
 
   # ==========================================================================
   # 4. SUPPLY CHAIN: dependencies, secrets, container images
