@@ -758,6 +758,24 @@ class Generation:
         finally:
             await self._close()
 
+    def undelivered_text(self) -> List[str]:
+        """The text the producer queued and no consumer took, in order.
+
+        Only meaningful once the producer is DONE (after `aclose`): the queue
+        then holds exactly what the engine sent past the consumer's last read.
+        A durable run that stops between chunks reads this when the engine
+        turns out to have finished first, because those chunks are the end of
+        a complete answer and nothing will generate them again
+        (durable.Runtime._attempt)."""
+        out: List[str] = []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return out
+            if item is not None and item.kind == TOKEN_KIND and item.text:
+                out.append(item.text)
+
     def applied_max_output_tokens(self) -> int:
         """What this generation was actually allowed (planning's rule), never
         more than the window retry sent when it ran."""

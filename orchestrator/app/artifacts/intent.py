@@ -376,11 +376,58 @@ _ABOUT_FORMAT_RE = re.compile(
 _CODE_RE = re.compile(r"\b(?:regex|regular expression)\b", re.I)
 #: An imperative edit at the start of a short message — "Add our logo.",
 #: "Use a more formal tone." — is about the latest artifact when there is one.
+_EDIT_VERB = (r"add|insert|include|remove|delete|drop|change|update|rename|retitle|shorten|expand|"
+              r"rewrite|reword|revise|tighten|trim|fix|tweak|adjust")
 _IMPERATIVE_EDIT_RE = re.compile(
-    r"^\s*(?:please\s+)?(?:add|insert|include|remove|delete|drop|change|update|rename|retitle|shorten|expand|"
-    r"rewrite|reword|revise|tighten|trim|fix|tweak|adjust|use (?:a )?(?:more|less)|make\b.{1,40}?\b(?:shorter|longer|simpler|clearer|concise|formal|professional))\b",
+    rf"^\s*(?:please\s+)?(?:{_EDIT_VERB}|use (?:a )?(?:more|less)|"
+    r"make\b.{1,40}?\b(?:shorter|longer|simpler|clearer|concise|formal|professional))\b",
     re.I,
 )
+#: THE SAME INSTRUCTION WITH THE VERB LAST, which is where Hindi and Gujarati
+#: put it (2026-09-28).
+#:
+#: `lexicon.normalize` already carries the grammar across — "colors edit karo"
+#: becomes "color update", "फील में कलर बदल दो" becomes "फील _in_ कलर change",
+#: "new column add karo excel me" becomes "new column add excel _in_". The
+#: rule above then missed every one of them, because it anchors the verb at
+#: the START of the line and these say the object first. On the 1,553-turn
+#: understanding corpus that was most of what separated gujlish (94%) from
+#: English (99%): a person with a file open, typing a four-word instruction
+#: in their own word order, was told there was no request.
+#:
+#: Deliberately narrow: the whole message must be SHORT (the caller already
+#: bounds it at 12 words), the verb must be the last word or followed only by
+#: a postposition marker the normaliser emitted, and there must be something
+#: in front of it to be the object. "update" alone is not an instruction, and
+#: "the report is out of date" never reaches here — the verb is not final.
+_SOV_EDIT_RE = re.compile(
+    rf"\b\w[\w-]*\s+(?:{_EDIT_VERB})\s*"
+    r"(?:_in_|_this_|_give_|kar\s*do|kar\s*dijiye|kari\s+(?:do|nakho)|kardo|karo|do)?\s*[.!?]?\s*$",
+    re.I,
+)
+#: ...AND THE WORDS MUST BE IN A LANGUAGE THAT PUTS THE VERB LAST. English
+#: does not: an English sentence that ends in "change", "update" or "fix"
+#: ends in a NOUN — "give me bullet points on climate change", "the latest
+#: software update", "a quick fix" — and the rule above made the first of
+#: those an edit of whatever file was open (AS3 verifier case, CI shard 3 on
+#: b010719e, 2026-09-28). So the verb-last reading needs evidence of the
+#: grammar in the person's OWN words, read before `normalize` folds it away
+#: ("colors edit karo" normalises to "color update"): Hindi or Gujarati
+#: script, or a Hinglish/Gujlish light verb — the words lexicon's rules turn
+#: into add / remove / change / update. `language_of` alone is not that
+#: evidence: it calls "give me the latest software update" Hinglish, because
+#: "me" is a Hindi word too.
+_INDIC_LIGHT_VERB_RE = re.compile(
+    r"(?<![\wऀ-૿])(?:karo|kar\s*do|kardo|kar\s*dijiye|karjo|kari\s+(?:do|aapo|dejo|nakho)|"
+    r"daal\s*do|dal\s*do|daalo|daldo|jod\s*do|jodo|umero|umeri\s+do|hata\s*do|hatao|nikal\s*do|nikalo|"
+    r"kadhi\s+nakho|kadho|badal\s*do|badlo|badli\s+(?:do|nakho))(?![\wऀ-૿])",
+    re.I,
+)
+
+
+def _said_verb_last(raw: str, language: str) -> bool:
+    """The person's own words carry verb-last grammar (see `_SOV_EDIT_RE`)."""
+    return language in ("hi", "gu") or bool(_INDIC_LIGHT_VERB_RE.search(raw or ""))
 #: Polite imperatives are requests: "can you make…", "could you create…".
 _POLITE_RE = re.compile(r"^\s*(?:can|could|would|will|please|pls|kindly)\b\s*(?:you|u)?\s*(?:please\s+)?", re.I)
 #: A capability question: a modal, a making verb, a format in the PLURAL or
@@ -798,6 +845,10 @@ _FOLLOWUP_VERB_RE = re.compile(
 )
 #: Verbs that keep what exists: the answer is the content.
 _KEEP_VERB_RE = re.compile(r"\b(?:save|download|export|convert|_convert_)\b", re.I)
+#: A keeping verb with the object dropped, as Hindi and Gujarati say it:
+#: "export karo", "save kar do", "download karo" normalise to
+#: "<verb> _give_". See `_export_shape`.
+_PRO_DROP_KEEP_RE = re.compile(r"\b(?:save|download|export)\s+_give_\b", re.I)
 #: "as a file", "into a nice looking document", "in a doc".
 _AS_FILE_RE = re.compile(rf"\b(?:as|in|into|to)\s+(?:an?\s+)?(?:{_ADJ}\s+){{0,2}}(?:file|document|doc|downloadable)\b", re.I)
 #: The words a person types the moment the product missed: "no, I meant
@@ -1784,7 +1835,7 @@ def _content_words(low: str) -> bool:
     return bool(_FUNCTION_WORDS_RE.sub(" ", _INDIC_FUNCTION_WORDS_RE.sub(" ", low)).split())
 
 
-def _export_shape(low: str, explicit: Sequence[str]) -> Optional[str]:
+def _export_shape(low: str, explicit: Sequence[str], *, has_upload: bool = True) -> Optional[str]:
     """The follow-up that hands the previous answer over in a format (AS3
     (b)). Returns the rule name, or None."""
     if _NEW_TOPIC_RE.search(low):
@@ -1839,8 +1890,32 @@ def _export_shape(low: str, explicit: Sequence[str]) -> Optional[str]:
     # "download this table", "save that": a KEEPING verb on a bare
     # reference, with the format left to the policy (a table becomes a
     # workbook). `reads_source` keeps "download the pdf I attached" a read.
-    if ref and not explicit and _KEEP_VERB_RE.search(low) and not LX.reads_source(low) and not _UPLOAD_SOURCE_RE.search(low):
+    #
+    # THE UPLOAD VETO NEEDS AN UPLOAD (2026-09-28). `_UPLOAD_SOURCE_RE` names
+    # "the upload named as the source" and it includes `_this_ data` — "this
+    # data" — so that "download the data I attached" stays a read of the
+    # upload. With no upload in the conversation there is nothing for "this
+    # data" to be but the answer, and the veto turned "aapo ye data export
+    # karo" (give this data, export it) into no request at all. `has_upload`
+    # defaults to True, so a caller that does not pass it keeps the old rule.
+    upload_named = has_upload and bool(_UPLOAD_SOURCE_RE.search(low))
+    if ref and not explicit and _KEEP_VERB_RE.search(low) and not LX.reads_source(low) and not upload_named:
         return "export-keep-verb"
+    # THE PRONOUN THAT IS NOT THERE (2026-09-28). Hindi and Gujarati drop the
+    # object pronoun: "export karo" MEANS "export it", where English has to
+    # say "export this". So a keeping verb followed by the normaliser's Indic
+    # verb marker carries its object with it, and `ref` — which looks for a
+    # pronoun that the language does not use — cannot be the gate.
+    # "shu report che, export karo" (what report is it — export it) read as a
+    # brand-new file because nothing in it matched `ref`.
+    #
+    # Narrow on purpose: `_give_` is emitted ONLY by lexicon.normalize from
+    # Indic or romanised-Indic input, so no English sentence reaches this arm;
+    # the caller still requires an answer in the room; and an upload named as
+    # the source keeps its veto.
+    if (not ref and not explicit and _PRO_DROP_KEEP_RE.search(low)
+            and not LX.reads_source(low) and not upload_named):
+        return "export-pro-drop"
     # "pdf of the second summary", "a word file of the above audit": a named
     # format whose OBJECT is the reference. `_FORMAT_ONLY_RE` reads only the
     # pronoun objects ("pdf of this"), so a named answer was made from the
@@ -3421,7 +3496,7 @@ def decide(
         if has_assistant_answer and not last_turn_is_artifact and not chart and not style and not (
             _EDIT_VERBS_RE.search(low) or _MORE_EDIT_VERBS_RE.search(low)
         ):
-            rule = _export_shape(low, explicit)
+            rule = _export_shape(low, explicit, has_upload=bool(upload_formats))
             if rule and not re.search(r"\b(?:also|too|as well|same|version|copy)\b", low):
                 return made("export", reference="previous_answer", rule=rule)
         # A REMARK about the file is not an instruction: "I opened the docx
@@ -3445,7 +3520,9 @@ def decide(
         if not _is_remark(low) and (_EDIT_VERBS_RE.search(low) or _wider_edit) \
                 and (_REFERENCE_RE.search(low) or _mentions_hint(low, artifact_hints)):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit")
-        if not _is_remark(low) and _IMPERATIVE_EDIT_RE.match(low) and len(low.split()) <= 12:
+        if not _is_remark(low) and len(low.split()) <= 12 and (
+            _IMPERATIVE_EDIT_RE.match(low) or (_SOV_EDIT_RE.search(low) and _said_verb_last(raw, language))
+        ):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit-imperative")
         # 2d. A style clause, or an edit verb on an element (AS3 (f)): "make
         #     the headings dark blue", "make the document landscape", "font
@@ -3511,7 +3588,7 @@ def decide(
     #     "isko docx me dedo", "इसे पीडीएफ में बदल दो". A chart is made, not
     #     exported. After a FILE CARD the same words convert that artifact.
     if not chart:
-        rule = _export_shape(low, explicit)
+        rule = _export_shape(low, explicit, has_upload=bool(upload_formats))
         if rule and last_turn_is_artifact and explicit:
             return made("convert", reference="latest", rule="convert-artifact-turn")
         if rule and has_assistant_answer:

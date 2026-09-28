@@ -1617,6 +1617,54 @@ def test_a_run_whose_prefill_every_chat_turn_preempts_keeps_its_place_after_thre
     assert row["stalled_attempts"] == 0
 
 
+def test_a_yield_that_lands_after_the_engine_finished_keeps_every_token_the_engine_sent(monkeypatch, tmp_path):
+    """The engine's tokens reach the runner through a queue, and the producer
+    may be AHEAD of the runner: on a busy box it can have written the whole
+    answer, and its finish reason, before the runner has read the first of
+    them. A chat yield landing in that gap used to stop the runner at the next
+    chunk and throw away that chunk and everything still queued behind it —
+    and because the engine HAD finished, the run then settled `completed`
+    with the answer's tail missing. Seen on dev CI (run 36465473720, shard 2):
+    the test above completed with "... w47 w48 " instead of "... w48 w49 ".
+
+    Made deterministic here: after the prefill the engine writes all fifty
+    tokens without yielding the loop, and the chat turn asks for the yield as
+    the engine writes its LAST token — so the runner has read none of this
+    burst when it sees the stop."""
+    monkeypatch.setattr(capacity, "chat_long_admission_present", lambda: False)
+    box = {}
+
+    async def burst(engine, call, index):
+        if index == 0:
+            await asyncio.sleep(0.05)  # the prefill: the runner parks on an empty queue
+        if index == engine.answer_tokens - 1:
+            assert box["runtime"].request_yield(box["id"])
+
+    engine = FakeMainEngine(answer_tokens=50, before_token=burst).install(monkeypatch)
+    tenant = make_tenant()
+
+    async def scenario():
+        runtime = _runtime(tmp_path)
+        await runtime.start()
+        try:
+            handle = await runtime.launch(make_spec(), caller=tenant.caller(), streamed=True, keyed=True)
+            box.update(runtime=runtime, id=handle.id)
+            return handle, await collect(handle)
+        finally:
+            await runtime.stop()
+
+    handle, records = asyncio.run(scenario())
+    assert records[-1][1] == "response.completed"
+    text = "".join(r[2]["delta"] for r in records if r[1] == "response.output_text.delta")
+    assert text == expected_text(50)
+    # Settled from what the engine sent: nothing was generated twice.
+    assert len(engine.calls) == 1
+    final = records[-1][2]["response"]
+    # The settled Response carries the answer with its trailing space
+    # trimmed, as every settled answer does (test_publicapi_fake_vllm.py).
+    assert final["output"][0]["content"][0]["text"] == expected_text(50).rstrip()
+
+
 def test_two_concurrent_claims_of_one_run_in_one_process_start_one_runner(monkeypatch, tmp_path):
     """Found while testing the review fixes: the store lets an owner re-take
     its own lease, so the dispatcher and an attach (or the follower poller)

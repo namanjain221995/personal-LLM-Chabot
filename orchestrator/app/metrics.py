@@ -66,6 +66,7 @@ _BUCKETS_BY_METRIC = {
     # retrieve p50 0.72 s / p90 2.09 s), so its whole-prepare time is read on
     # the same edges as the TTFT it is being subtracted from.
     "knowledge_prepare_seconds": _TTFT_BUCKETS,
+    "knowledge_fast_lookup_seconds": _TTFT_BUCKETS,
     # Event-loop lag (server performance track, 2026-09-15): 1 ms to 2.5 s.
     "orchestrator_event_loop_lag_seconds": (
         0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
@@ -257,6 +258,11 @@ KNOWLEDGE_DECISIONS = frozenset({
     "stale_offline", "escalate_search", "fast_lookup", "fast_lookup_failed",
     # main.py's Fast small-talk lane (app/fast_lane.py): no pre-pass at all.
     "small_talk_lane",
+    # The pre-pass ran and produced no decision: it hit the deadline or
+    # raised, and the answer goes out ungrounded. Added 2026-09-28 with the
+    # observation at the await, which is the first time this histogram saw a
+    # real turn at all.
+    "none",
 })
 
 #: app/fast_lane.py's vocabulary, for fast_lane_total. Literal here so this
@@ -331,6 +337,10 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
     "knowledge_prepare_seconds": {
         "effort": set(CHAT_EFFORTS),
         "decision": set(KNOWLEDGE_DECISIONS),
+        "outcome": set(STEP_OUTCOMES),
+    },
+    "knowledge_fast_lookup_seconds": {
+        "stage": {"fetch", "readback"},
         "outcome": set(STEP_OUTCOMES),
     },
     # The route is not known yet while the context is assembled; `mode` is
@@ -530,6 +540,24 @@ def chat_first_visible(seconds: float, *, route: str, effort: str, kind: str) ->
         route=route,
         effort=effort,
         kind=kind,
+    )
+
+
+def knowledge_fast_lookup(seconds: float, *, stage: str, outcome: str) -> None:
+    """The live network lookup on the Fast pre-pass, stage by stage.
+
+    UNTIMED UNTIL 2026-09-28, and it is the most expensive thing in front of
+    the first token on a turn that needs sources: measured p50 3,014 ms and
+    p95 6,267 ms for the whole `fetch`, inside a pre-pass of p50 4,072 ms.
+    `stage` is "fetch" (search + robots + page reads + extraction + index) or
+    "readback" (the second retrieval, which is NOT inside the fetch deadline).
+    """
+    observe(
+        "knowledge_fast_lookup_seconds",
+        seconds,
+        "The Fast pre-pass's live network lookup, by stage.",
+        stage=stage,
+        outcome=outcome,
     )
 
 

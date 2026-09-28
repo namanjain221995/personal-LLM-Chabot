@@ -59,6 +59,25 @@ class _Calls:
         return [w for w, _ in self.rows]
 
 
+def _stream_of(fake_plan):
+    """`llm.stream_chat_events` that replays a non-streaming plan stub.
+
+    `run()` has streamed the plan since 2026-09-28: Max used to emit a step
+    line and then nothing at all for 15.5 seconds (measured — first step
+    1,267 ms, first reasoning AND first answer token both 16,823 ms) because
+    the plan came from a non-streaming call and was shown to nobody until it
+    was finished. Every fixture here still records through its own
+    `fake_plan`, so what each test asserts about the planner's messages is
+    unchanged; only the delivery is.
+    """
+
+    async def stream(messages, **kwargs):
+        text = await fake_plan(messages, **kwargs)
+        yield ("token", text)
+
+    return stream
+
+
 @pytest.fixture()
 def calls(monkeypatch):
     """Stubs for every model call the loop can make, and nothing else."""
@@ -90,6 +109,7 @@ def calls(monkeypatch):
         return json.dumps({"items": []})
 
     monkeypatch.setattr(llm, "chat_completion", fake_plan)
+    monkeypatch.setattr(llm, "stream_chat_events", _stream_of(fake_plan))
     monkeypatch.setattr(llm, "json_completion", fake_json)
     monkeypatch.setattr(llm, "router_chat_completion", fake_router)
     monkeypatch.setattr(continuation, "stream_long_completion", fake_stream)
@@ -178,7 +198,12 @@ def test_the_planner_does_not_think_either(calls):
     BEFORE the draft's first token."""
     _run_loop(calls)
     plan = calls.of("plan")[0]
-    assert plan["thinking"] is False
+    # The STREAMING call spells thinking-off as `effort="fast"`; the
+    # non-streaming one spells it `thinking=False`. `run()` takes the streaming
+    # path since 2026-09-28 (the plan is shown in the thinking panel as it is
+    # written, instead of 15.5 seconds of silence). The invariant under test is
+    # the same either way: this call does not reason.
+    assert plan.get("thinking") is False or plan.get("effort") in ("fast", "low"), plan
     assert plan["max_tokens"] == max_loop.PLAN_MAX_TOKENS
 
 
@@ -365,6 +390,7 @@ def test_a_parked_turn_is_never_swallowed_by_a_phase_guard(monkeypatch, calls):
         raise QueuedForRecovery(30.0)
 
     monkeypatch.setattr(llm, "chat_completion", parked)
+    monkeypatch.setattr(llm, "stream_chat_events", _stream_of(parked))
     events = []
 
     async def emit(kind, data):
@@ -415,7 +441,12 @@ def test_a_plan_that_fails_is_not_fatal(monkeypatch, calls):
     async def boom(*_a, **_k):
         raise RuntimeError("no plan today")
 
+    async def boom_stream(*_a, **_k):
+        raise RuntimeError("no plan today")
+        yield ("token", "")  # pragma: no cover — unreachable, keeps it a generator
+
     monkeypatch.setattr(llm, "chat_completion", boom)
+    monkeypatch.setattr(llm, "stream_chat_events", boom_stream)
     text, events, _meta = _run_loop(calls)
     assert text.startswith(THIN_DRAFT)
     plan_steps = [s for s in _steps(events) if s["title"] == max_loop.STEP_PLAN]
@@ -443,7 +474,12 @@ def test_the_counted_brief_reaches_the_writer_even_when_the_plan_fails(monkeypat
     async def boom(*_a, **_k):
         raise RuntimeError("no plan today")
 
+    async def boom_stream(*_a, **_k):
+        raise RuntimeError("no plan today")
+        yield ("token", "")  # pragma: no cover — unreachable, keeps it a generator
+
     monkeypatch.setattr(llm, "chat_completion", boom)
+    monkeypatch.setattr(llm, "stream_chat_events", boom_stream)
     _run_loop(calls)
     system = "\n".join(
         m["content"] for m in calls.of("draft")[0]["messages"] if m["role"] == "system"
@@ -525,6 +561,7 @@ def _run_chat(message, effort, monkeypatch):
     from app.core import best_of
 
     monkeypatch.setattr(llm, "chat_completion", fake_plan)
+    monkeypatch.setattr(llm, "stream_chat_events", _stream_of(fake_plan))
     monkeypatch.setattr(llm, "json_completion", fake_json)
     monkeypatch.setattr(llm, "router_chat_completion", fake_router)
     monkeypatch.setattr(continuation, "stream_long_completion", fake_stream)
@@ -618,6 +655,7 @@ def test_a_looping_revision_does_not_cost_the_person_their_answer(monkeypatch):
         return continuation.LongResult(text=text, stop_reason="complete")
 
     monkeypatch.setattr(llm, "chat_completion", fake_plan)
+    monkeypatch.setattr(llm, "stream_chat_events", _stream_of(fake_plan))
     monkeypatch.setattr(llm, "json_completion", fake_json)
     monkeypatch.setattr(llm, "router_chat_completion", fake_router)
     monkeypatch.setattr(continuation, "stream_long_completion", fake_stream)

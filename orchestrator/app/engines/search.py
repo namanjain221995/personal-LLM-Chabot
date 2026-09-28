@@ -29,7 +29,7 @@ import idna  # a dependency of httpx, so installed wherever this runs
 from . import DIAGRAM_INSTRUCTION, conversation_turns, recent_turns
 from .. import llm
 from ..config import settings
-from .. import db, web_index
+from .. import db, metrics, web_index
 from ..core import extract, net, pasted, provenance, robots
 from ..freshness import _OFFICE, Freshness, Verdict, classify_offline
 from ..search.base import SearchResult, SearchUnavailableError, get_provider
@@ -131,6 +131,40 @@ _FIRST_HAND_BONUS = 0.15
 _FETCH_CONCURRENCY = 16
 # Extraction is CPU-bound and trafilatura is not thread-safe — one worker.
 _EXTRACT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="extract")
+
+
+async def _extract_bounded(fetched, headers: dict, *, where: str):
+    """`_call_extract` on the extraction pool, under EXTRACT_TIMEOUT_MS.
+
+    THE WAIT IS BOUNDED, NOT THE WORK. `run_in_executor` hands a callable to a
+    thread and a thread cannot be cancelled, so a timeout here returns control
+    to the turn and leaves the parse running; the single extraction worker
+    stays busy until it finishes. That is still the difference between a turn
+    that answers and a turn that does not: the caller falls back to the
+    provider's snippet, exactly as it already does for a page that timed out on
+    the network.
+
+    Raises `asyncio.TimeoutError`, which both callers already treat as "this
+    page could not be read" through their `except Exception`.
+    """
+    loop = asyncio.get_running_loop()
+    budget = max(0.0, float(getattr(settings, "extract_timeout_ms", 5000)) / 1000.0)
+    running = loop.run_in_executor(
+        _EXTRACT_POOL, _call_extract, fetched.content_type, fetched.body, fetched.url, headers
+    )
+    try:
+        # SHIELDED: cancelling the wrapper would not stop the thread anyway,
+        # and an unshielded cancel leaves the executor future to raise into
+        # nothing and log "exception was never retrieved".
+        return await asyncio.wait_for(asyncio.shield(running), timeout=budget)
+    except asyncio.TimeoutError:
+        running.add_done_callback(lambda f: f.exception())
+        metrics.inc("search_stage_timeout_total", stage="extract", where=where)
+        log.info(
+            "extraction exceeded %.1fs; the page falls back to its snippet: %s",
+            budget, fetched.url,
+        )
+        raise
 
 
 def _import_extractor() -> None:
@@ -1536,14 +1570,7 @@ async def _fetch_source(
         # post-search expansion can walk from a page served fresh-from-store
         # (the review found that path silently linkless).
         headers = getattr(fetched, "headers", None) or {}
-        ext, page_links = await loop.run_in_executor(
-            _EXTRACT_POOL,
-            _call_extract,
-            fetched.content_type,
-            fetched.body,
-            fetched.url,
-            headers,
-        )
+        ext, page_links = await _extract_bounded(fetched, headers, where="fetch_source")
         meta = _provenance_of(ext, fetched.url, fetched.content_type, headers)
         digest = hashlib.sha256((ext.text or "").encode("utf-8")).hexdigest()
         # Persist the FULL extracted text BEFORE the prompt truncation — the
@@ -2300,8 +2327,21 @@ async def fetch_for_freshness(
     # a user's deadline for work nobody is waiting on. The repair belongs to
     # the worker, which has nobody waiting on it; this call still stamps the
     # current chunker on what it writes.
+    # BOUNDED (2026-09-28). This await had no timeout of any kind and was
+    # measured at max 4,305 ms inside a single 8,432 ms pre-pass — the second
+    # largest contributor to that path's tail, in front of the first token.
+    # On a timeout the pages are already STORED; only the vector index lags,
+    # and the next turn's `index_pending` picks them up, which is what
+    # "pending" means. The readback then answers from what the store already
+    # held rather than from the newest page: less fresh, but an answer.
     try:
-        await web_index.index_pending(repair_stale_chunks=False)
+        await asyncio.wait_for(
+            web_index.index_pending(repair_stale_chunks=False),
+            timeout=max(0.0, float(getattr(settings, "index_pending_timeout_ms", 6000)) / 1000.0),
+        )
+    except asyncio.TimeoutError:
+        metrics.inc("search_stage_timeout_total", stage="index_pending", where="fetch_for_freshness")
+        log.info("index_pending exceeded its budget; the new pages index on the next turn")
     except Exception:  # noqa: BLE001 — evidence is stored; indexing retries
         pass
 
@@ -2437,14 +2477,7 @@ async def refetch_page(
             }
         loop = asyncio.get_running_loop()
         headers = getattr(fetched, "headers", None) or {}
-        ext, page_links = await loop.run_in_executor(
-            _EXTRACT_POOL,
-            _call_extract,
-            fetched.content_type,
-            fetched.body,
-            fetched.url,
-            headers,
-        )
+        ext, page_links = await _extract_bounded(fetched, headers, where="refetch_page")
     except Exception:  # noqa: BLE001 — an unreadable page is a miss
         return None
 

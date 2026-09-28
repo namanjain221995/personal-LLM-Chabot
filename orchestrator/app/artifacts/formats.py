@@ -97,7 +97,19 @@ _ALIAS: Dict[str, str] = {
     # lexicon.normalize from Indic or romanised input, so requiring one of
     # them keeps a bare English "the word me is a pronoun" — which the
     # postposition rule also rewrites to "word _in_" — out of this.
-    "docx": r"(?:docx|\.docx|word (?:document|file|doc|docs|version|copy|format)|ms[- ]word|microsoft word|in word|as word|to word|word docs?|"
+    # `in word` / `as word` / `to word` NAME THE FORMAT ONLY WHEN A NUMBER
+    # DOES NOT FOLLOW (2026-09-28). The owner asked
+    # "Best Ai model ?? in word n 2026 ??" — "world" mistyped as "word" and
+    # "in" as "n" — and the product built a Word document called "AI Model
+    # Landscape Assessment" instead of answering. Two dropped letters turned a
+    # question about the state of the field into a file.
+    #
+    # A number after it is the tell: "in word 2026" and "in word n 2026" are
+    # someone reaching for "world", while "give me this in word", "in word
+    # format" and "as a word document" are the format and still match here.
+    # Anyone who does want Word alongside a year writes one of those.
+    "docx": r"(?:docx|\.docx|word (?:document|file|doc|docs|version|copy|format)|ms[- ]word|microsoft word"
+            r"|(?:in|as|to) word\b(?!\s+n?\s*\d)|word docs?|"
             r"word _in_(?:\s+\S+){0,2}?\s+(?:_convert_|_give_)|word (?:_convert_|_give_))",
     # `deck` names the pptx only where a FORMAT belongs — "a deck version",
     # "as a deck", "in deck format". Measured 2026-09-16: "create a pdf on
