@@ -1,0 +1,2880 @@
+{
+ "_about": "Every kind of PICTURE a person asks this product for, in the words they type, labelled with which of the product's three real mechanisms should serve it — or that none can and saying so is the right answer. Built 2026-09-28 for the 'a person can ask for a picture in many ways' survey, after the owner's flow-chart request was answered with 'attach the file again (CSV or Excel)'.",
+ "_provenance": "One item is the owner's verbatim sentence as quoted in the programme brief (provenance=production). Every other item is authored for this evaluation. No conversation, database row or log was read: nothing here is user content.",
+ "_labels": {
+  "chart-from-data": "a real plot computed from a bound table. decide must want a file AND set chart_request.",
+  "diagram-in-chat": "the model draws it as a ```mermaid fence in the answer. decide must make NO file, claim no chart, and refuse nothing.",
+  "diagram-in-file": "a diagram inside a generated PDF/DOCX/PPTX. decide must want a file in the format the person named.",
+  "refuse-with-a-reason": "this platform genuinely cannot draw it. decide must make no file AND name the visual so visuals.refusal_for can say why.",
+  "answer-about-a-file": "the picture already exists — in an attachment or in a file we made. Read it back; draw nothing new.",
+  "_route-corrects_tag": "an item whose decide() verdict is overridden LOWER DOWN, by main.py._asks_about_an_attachment: with a PDF or an image on the turn the unsupported-visual refusal is skipped and the file is read. Scored, and reported apart, so a decide()-only number is not mistaken for what the person receives."
+ },
+ "_kinds_doc": "For each kind of picture: `mermaid` is the head from frontend/lib/mermaid.ts DIAGRAM_HEADS that the browser would draw it with ('' = none); `chart` is the chart_spec.CHART_TYPES id that draws it FROM A TABLE ('' = none); `in_file` is whether render/diagrams.py could carry it into a generated PDF/DOCX/PPTX — its _DIR_RE accepts `flowchart`/`graph` only, so every other mermaid kind is False even though the browser draws it.",
+ "_contexts_doc": "ctx names a row of `contexts`; the scorer passes those keywords to intent.decide",
+ "_scoring_doc": "score_pictures.py drives each item through intent.decide and grades the DECISION, not the wording of any answer: a chart-from-data item must end in a file with chart_request set; a diagram-in-chat item must end in NO file, with no chart claimed and nothing refused, so the model is free to emit a ```mermaid fence; a diagram-in-file item must end in a file in the format named; a refuse-with-a-reason item must end in no file AND name the visual, so visuals.refusal_for can say why.",
+ "contexts": {
+  "N": {
+   "_doc": "fresh chat: no table, no artifact, no previous answer. The ordinary way a diagram is asked for.",
+   "has_artifacts": false,
+   "last_turn_is_artifact": false,
+   "has_assistant_answer": false,
+   "artifact_hints": []
+  },
+  "T": {
+   "_doc": "an uploaded spreadsheet is in the conversation (the chat route's dataset_ready). The ordinary way a CHART is asked for.",
+   "has_artifacts": false,
+   "last_turn_is_artifact": false,
+   "has_assistant_answer": false,
+   "artifact_hints": [],
+   "has_dataset": true,
+   "upload_formats": [
+    "xlsx"
+   ]
+  },
+  "A": {
+   "_doc": "a substantial assistant ANSWER precedes this turn; no table, no file.",
+   "has_artifacts": false,
+   "last_turn_is_artifact": false,
+   "has_assistant_answer": true,
+   "artifact_hints": []
+  },
+  "F": {
+   "_doc": "a file the product made is already in the conversation (a report).",
+   "has_artifacts": true,
+   "last_turn_is_artifact": true,
+   "has_assistant_answer": true,
+   "artifact_hints": [
+    "report"
+   ],
+   "artifact_id": "art_pic_1"
+  },
+  "PDF": {
+   "_doc": "a PDF is attached to THIS turn — the person is asking about a picture that already exists inside it.",
+   "has_artifacts": false,
+   "last_turn_is_artifact": false,
+   "has_assistant_answer": false,
+   "artifact_hints": [],
+   "upload_formats": [
+    "pdf"
+   ]
+  }
+ },
+ "kinds": {
+  "flow_chart": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": ""
+  },
+  "process_flow": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": ""
+  },
+  "data_flow": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": ""
+  },
+  "swimlane": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": "subgraph per lane; not true BPMN pools"
+  },
+  "bpmn": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": "approximated; no BPMN notation"
+  },
+  "architecture": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": ""
+  },
+  "network_diagram": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": "named boxes only; refused when it names a TABLE"
+  },
+  "deployment": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": ""
+  },
+  "org_chart": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": ""
+  },
+  "hierarchy": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": ""
+  },
+  "tree": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": ""
+  },
+  "family_tree": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": ""
+  },
+  "decision_tree": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": ""
+  },
+  "dependency_graph": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": ""
+  },
+  "call_graph": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": ""
+  },
+  "fishbone": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": "approximated as a flowchart"
+  },
+  "value_stream": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": "approximated as a flowchart"
+  },
+  "pert": {
+   "mermaid": "flowchart",
+   "chart": "",
+   "in_file": true,
+   "note": "no critical-path maths"
+  },
+  "sequence": {
+   "mermaid": "sequencediagram",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "er_diagram": {
+   "mermaid": "erdiagram",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "class_diagram": {
+   "mermaid": "classdiagram",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "state_machine": {
+   "mermaid": "statediagram",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "mind_map": {
+   "mermaid": "mindmap",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "timeline": {
+   "mermaid": "timeline",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "user_journey": {
+   "mermaid": "journey",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "roadmap": {
+   "mermaid": "timeline",
+   "chart": "gantt",
+   "in_file": false,
+   "note": "mermaid timeline in chat; gantt chart from a table"
+  },
+  "git_graph": {
+   "mermaid": "gitgraph",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "requirements": {
+   "mermaid": "requirementdiagram",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "kanban": {
+   "mermaid": "kanban",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "block_diagram": {
+   "mermaid": "block",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "c4": {
+   "mermaid": "c4context",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "packet": {
+   "mermaid": "packet",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "quadrant_concept": {
+   "mermaid": "quadrantchart",
+   "chart": "",
+   "in_file": false,
+   "note": "conceptual 2x2; a quadrant OF DATA is a scatter"
+  },
+  "swot": {
+   "mermaid": "quadrantchart",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "pyramid_concept": {
+   "mermaid": "flowchart",
+   "chart": "funnel",
+   "in_file": false,
+   "note": "conceptual pyramid stacks as a flowchart; a pyramid OF VALUES is a funnel"
+  },
+  "bar": {
+   "mermaid": "",
+   "chart": "bar",
+   "in_file": false,
+   "note": ""
+  },
+  "column": {
+   "mermaid": "",
+   "chart": "bar",
+   "in_file": false,
+   "note": ""
+  },
+  "stacked_bar": {
+   "mermaid": "",
+   "chart": "stacked_bar",
+   "in_file": false,
+   "note": ""
+  },
+  "line": {
+   "mermaid": "",
+   "chart": "line",
+   "in_file": false,
+   "note": ""
+  },
+  "area": {
+   "mermaid": "",
+   "chart": "area",
+   "in_file": false,
+   "note": ""
+  },
+  "pie": {
+   "mermaid": "",
+   "chart": "pie",
+   "in_file": false,
+   "note": ""
+  },
+  "donut": {
+   "mermaid": "",
+   "chart": "donut",
+   "in_file": false,
+   "note": ""
+  },
+  "scatter": {
+   "mermaid": "",
+   "chart": "scatter",
+   "in_file": false,
+   "note": ""
+  },
+  "bubble": {
+   "mermaid": "",
+   "chart": "bubble",
+   "in_file": false,
+   "note": ""
+  },
+  "histogram": {
+   "mermaid": "",
+   "chart": "histogram",
+   "in_file": false,
+   "note": ""
+  },
+  "box_plot": {
+   "mermaid": "",
+   "chart": "box",
+   "in_file": false,
+   "note": ""
+  },
+  "violin": {
+   "mermaid": "",
+   "chart": "violin",
+   "in_file": false,
+   "note": ""
+  },
+  "heat_map": {
+   "mermaid": "",
+   "chart": "heatmap",
+   "in_file": false,
+   "note": ""
+  },
+  "treemap": {
+   "mermaid": "",
+   "chart": "treemap",
+   "in_file": false,
+   "note": ""
+  },
+  "sunburst": {
+   "mermaid": "",
+   "chart": "sunburst",
+   "in_file": false,
+   "note": ""
+  },
+  "radar": {
+   "mermaid": "radar",
+   "chart": "radar",
+   "in_file": false,
+   "note": ""
+  },
+  "waterfall": {
+   "mermaid": "",
+   "chart": "waterfall",
+   "in_file": false,
+   "note": ""
+  },
+  "funnel": {
+   "mermaid": "",
+   "chart": "funnel",
+   "in_file": false,
+   "note": ""
+  },
+  "pareto": {
+   "mermaid": "",
+   "chart": "pareto",
+   "in_file": false,
+   "note": ""
+  },
+  "gantt": {
+   "mermaid": "gantt",
+   "chart": "gantt",
+   "in_file": false,
+   "note": ""
+  },
+  "candlestick": {
+   "mermaid": "",
+   "chart": "candlestick",
+   "in_file": false,
+   "note": ""
+  },
+  "combo": {
+   "mermaid": "",
+   "chart": "combo",
+   "in_file": false,
+   "note": ""
+  },
+  "bullet": {
+   "mermaid": "",
+   "chart": "bullet",
+   "in_file": false,
+   "note": ""
+  },
+  "quadrant_data": {
+   "mermaid": "quadrantchart",
+   "chart": "scatter",
+   "in_file": false,
+   "note": ""
+  },
+  "map": {
+   "mermaid": "",
+   "chart": "",
+   "in_file": false,
+   "note": "no geographic chart type"
+  },
+  "choropleth": {
+   "mermaid": "",
+   "chart": "",
+   "in_file": false,
+   "note": "no geographic chart type"
+  },
+  "sankey": {
+   "mermaid": "sankey",
+   "chart": "",
+   "in_file": false,
+   "note": "mermaid 11 HAS sankey-beta; chart_spec does not"
+  },
+  "chord": {
+   "mermaid": "",
+   "chart": "",
+   "in_file": false,
+   "note": "nothing draws it, and no word of it anywhere"
+  },
+  "word_cloud": {
+   "mermaid": "",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "venn": {
+   "mermaid": "",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "calendar": {
+   "mermaid": "",
+   "chart": "",
+   "in_file": false,
+   "note": "no month-grid renderer"
+  },
+  "wireframe": {
+   "mermaid": "",
+   "chart": "",
+   "in_file": false,
+   "note": "not mermaid, not a chart"
+  },
+  "floor_plan": {
+   "mermaid": "",
+   "chart": "",
+   "in_file": false,
+   "note": "not mermaid, not a chart"
+  },
+  "circuit": {
+   "mermaid": "",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "picture": {
+   "mermaid": "",
+   "chart": "",
+   "in_file": false,
+   "note": "no image model on this platform"
+  },
+  "infographic": {
+   "mermaid": "",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  },
+  "isometric_3d": {
+   "mermaid": "",
+   "chart": "",
+   "in_file": false,
+   "note": ""
+  }
+ },
+ "items": [
+  {
+   "id": "flow_chart-01",
+   "text": "Make A Digram or Flow Chart of Api Which Coonect to Db ??",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "typo",
+    "caps-words",
+    "owner-punctuation",
+    "PRODUCTION",
+    "anchor"
+   ],
+   "provenance": "production"
+  },
+  {
+   "id": "flow_chart-02",
+   "text": "flow chart of the API",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "no-article",
+    "anchor"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-03",
+   "text": "flowchart of our deploy pipeline",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "one-word",
+    "control"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-04",
+   "text": "draw a flow chart of how a request reaches the database",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-05",
+   "text": "can you show me a flow-chart of the checkout steps?",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "hyphen",
+    "can-you"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-06",
+   "text": "FLOW CHART OF THE LOGIN PROCESS",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "all-caps"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-07",
+   "text": "make me a flow chart for the refund workflow",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "make-me"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-08",
+   "text": "i need a floww chart of the onboarding",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "typo"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-09",
+   "text": "visualise the order lifecycle as a flow chart",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "visualise"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-10",
+   "text": "FlowChart of the retry logic please",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "camelcase"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-11",
+   "text": "process flow chart of how we handle a support ticket",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "compound"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-12",
+   "text": "ek flow chart banao jisme API se DB tak ka flow ho",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "hinglish"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-13",
+   "text": "फ्लो चार्ट बनाओ कि रिक्वेस्ट डेटाबेस तक कैसे पहुँचती है",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "hi",
+    "devanagari"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-14",
+   "text": "ફ્લો ચાર્ટ બનાવો કે ઓર્ડર કેવી રીતે પ્રોસેસ થાય છે",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "gu",
+    "gujarati"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-15",
+   "text": "flow chart banake dikhao deployment ka",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "hinglish",
+    "dikhao"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-16",
+   "text": "give me a flow chart of the approval steps and a bar chart of tickets per owner",
+   "kind": "flow_chart",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "both",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "process_flow-01",
+   "text": "show the process flow for employee offboarding",
+   "kind": "process_flow",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "show"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "process_flow-02",
+   "text": "process flow diagram of the nightly batch",
+   "kind": "process_flow",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "process_flow-03",
+   "text": "map out the steps a lead goes through",
+   "kind": "process_flow",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "map-verb",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "process_flow-04",
+   "text": "PROCESS FLOW of invoice approval, 6 steps",
+   "kind": "process_flow",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "all-caps"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "process_flow-05",
+   "text": "prosess flow of how we onboard a client",
+   "kind": "process_flow",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "typo"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "process_flow-06",
+   "text": "process ka flow chart chahiye",
+   "kind": "process_flow",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "hinglish"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "data_flow-01",
+   "text": "draw a data flow diagram for the sync worker",
+   "kind": "data_flow",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "data_flow-02",
+   "text": "data flow chart from CRM to the warehouse",
+   "kind": "data_flow",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "chart-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "data_flow-03",
+   "text": "DFD of the ingestion pipeline",
+   "kind": "data_flow",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "acronym"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "data_flow-04",
+   "text": "how does data move through the system? diagram please",
+   "kind": "data_flow",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "question"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "swimlane-01",
+   "text": "swimlane diagram of the purchase order approval",
+   "kind": "swimlane",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "swimlane-02",
+   "text": "make a swim lane chart showing sales, finance and legal",
+   "kind": "swimlane",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "chart-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "swimlane-03",
+   "text": "can you draw a swimlane for the hiring process",
+   "kind": "swimlane",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "can-you"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "bpmn-01",
+   "text": "BPMN diagram of the claims process",
+   "kind": "bpmn",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "acronym"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "bpmn-02",
+   "text": "give me a bpmn flow for order fulfilment",
+   "kind": "bpmn",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "architecture-01",
+   "text": "draw the architecture diagram of our platform",
+   "kind": "architecture",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "architecture-02",
+   "text": "architecture diagram showing the orchestrator, the model and postgres",
+   "kind": "architecture",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "architecture-03",
+   "text": "can you show me a system architecture chart",
+   "kind": "architecture",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "chart-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "architecture-04",
+   "text": "high level architecture of the chatbot, as a picture",
+   "kind": "architecture",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "picture-word"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "architecture-05",
+   "text": "ARCHITECTURE DIAGRAM PLEASE",
+   "kind": "architecture",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "all-caps"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "architecture-06",
+   "text": "architecture ka diagram banao",
+   "kind": "architecture",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "hinglish"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "architecture-07",
+   "text": "आर्किटेक्चर डायग्राम बनाओ",
+   "kind": "architecture",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "hi",
+    "devanagari"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "network_diagram-01",
+   "text": "draw a network diagram of how the services talk to each other",
+   "kind": "network_diagram",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "network_diagram-02",
+   "text": "network diagram of the two DGX nodes and the switch",
+   "kind": "network_diagram",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "network_diagram-03",
+   "text": "network diagram from this edge list",
+   "kind": "network_diagram",
+   "ctx": "T",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "names-data",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "network_diagram-04",
+   "text": "make a network graph of the rows in this sheet",
+   "kind": "network_diagram",
+   "ctx": "T",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "names-data",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "deployment-01",
+   "text": "deployment diagram for staging and production",
+   "kind": "deployment",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "deployment-02",
+   "text": "show how the containers are deployed across the two boxes",
+   "kind": "deployment",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "show"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "org_chart-01",
+   "text": "org chart of the team",
+   "kind": "org_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "no-article",
+    "anchor"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "org_chart-02",
+   "text": "make an organisation chart with the CEO at the top",
+   "kind": "org_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "chart-word"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "org_chart-03",
+   "text": "ORG CHART for engineering",
+   "kind": "org_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "all-caps"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "org_chart-04",
+   "text": "draw our reporting structure",
+   "kind": "org_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw",
+    "no-chart-word"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "org_chart-05",
+   "text": "orgchart of the company please",
+   "kind": "org_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "one-word"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "org_chart-06",
+   "text": "team ka org chart banao",
+   "kind": "org_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "hinglish"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "org_chart-07",
+   "text": "ઓર્ગ ચાર્ટ બનાવો ટીમનો",
+   "kind": "org_chart",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "gu",
+    "gujarati"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "org_chart-08",
+   "text": "org chart of the team from the names in this sheet",
+   "kind": "org_chart",
+   "ctx": "T",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "table-present",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "hierarchy-01",
+   "text": "show the hierarchy of our product categories",
+   "kind": "hierarchy",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "show"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "hierarchy-02",
+   "text": "hierarchy chart of the permission levels",
+   "kind": "hierarchy",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "chart-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "hierarchy-03",
+   "text": "draw the folder hierarchy of the repo",
+   "kind": "hierarchy",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "tree-01",
+   "text": "draw a tree of the config options",
+   "kind": "tree",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "tree-02",
+   "text": "tree diagram of the API routes",
+   "kind": "tree",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "family_tree-01",
+   "text": "make a family tree for the Sharma family, 3 generations",
+   "kind": "family_tree",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "family_tree-02",
+   "text": "family tree chart of my grandparents down to me",
+   "kind": "family_tree",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "chart-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "decision_tree-01",
+   "text": "decision tree for choosing an effort level",
+   "kind": "decision_tree",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "decision_tree-02",
+   "text": "draw a decision tree: if the upload is a PDF do X, if CSV do Y",
+   "kind": "decision_tree",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "decision_tree-03",
+   "text": "DECISION TREE of the refund policy",
+   "kind": "decision_tree",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "all-caps"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "decision_tree-04",
+   "text": "fit a decision tree on this dataset and show it",
+   "kind": "decision_tree",
+   "ctx": "T",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "ml",
+    "debatable"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "dependency_graph-01",
+   "text": "dependency graph of our python packages",
+   "kind": "dependency_graph",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "graph-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "dependency_graph-02",
+   "text": "draw which service depends on which",
+   "kind": "dependency_graph",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "call_graph-01",
+   "text": "call graph for decide()",
+   "kind": "call_graph",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "graph-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "call_graph-02",
+   "text": "show me what calls what in the artifacts package",
+   "kind": "call_graph",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "show"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "fishbone-01",
+   "text": "fishbone diagram of why the deploy fails",
+   "kind": "fishbone",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "fishbone-02",
+   "text": "ishikawa chart for the latency problem",
+   "kind": "fishbone",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "chart-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "value_stream-01",
+   "text": "value stream map of our release process",
+   "kind": "value_stream",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "map-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "pert-01",
+   "text": "PERT chart for the migration",
+   "kind": "pert",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "chart-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "sequence-01",
+   "text": "draw a sequence diagram for login",
+   "kind": "sequence",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw",
+    "anchor"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "sequence-02",
+   "text": "sequence diagram of the SSE handshake",
+   "kind": "sequence",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "sequence-03",
+   "text": "can you show the message sequence between browser, orchestrator and vllm",
+   "kind": "sequence",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "can-you"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "sequence-04",
+   "text": "SEQUENCE DIAGRAM of the upload flow",
+   "kind": "sequence",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "all-caps"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "sequence-05",
+   "text": "sequnce diagram for the retry path",
+   "kind": "sequence",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "typo"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "sequence-06",
+   "text": "sequence diagram banao login ka",
+   "kind": "sequence",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "hinglish"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "er_diagram-01",
+   "text": "ER diagram of our schema",
+   "kind": "er_diagram",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "acronym",
+    "anchor"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "er_diagram-02",
+   "text": "draw the entity relationship diagram for users, sessions and messages",
+   "kind": "er_diagram",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "er_diagram-03",
+   "text": "schema diagram of the postgres tables",
+   "kind": "er_diagram",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "er_diagram-04",
+   "text": "can you visualise the database relationships",
+   "kind": "er_diagram",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "visualise"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "er_diagram-05",
+   "text": "ERD for the artifacts tables",
+   "kind": "er_diagram",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "acronym"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "er_diagram-06",
+   "text": "database ka ER diagram banao",
+   "kind": "er_diagram",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "hinglish"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "er_diagram-07",
+   "text": "ડેટાબેઝનો ER ડાયગ્રામ બનાવો",
+   "kind": "er_diagram",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "gu",
+    "gujarati"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "class_diagram-01",
+   "text": "UML class diagram for ArtifactIntent and its fields",
+   "kind": "class_diagram",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "class_diagram-02",
+   "text": "draw a class diagram of the spec models",
+   "kind": "class_diagram",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "class_diagram-03",
+   "text": "class diagram please, with inheritance",
+   "kind": "class_diagram",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "state_machine-01",
+   "text": "state machine of an upload session",
+   "kind": "state_machine",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "state_machine-02",
+   "text": "draw the state diagram for a job: queued, running, done, failed",
+   "kind": "state_machine",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "state_machine-03",
+   "text": "STATE CHART of the order status",
+   "kind": "state_machine",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "chart-word",
+    "all-caps",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "state_machine-04",
+   "text": "show the states a ticket can be in",
+   "kind": "state_machine",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "show"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "mind_map-01",
+   "text": "make me a mind map of the roadmap",
+   "kind": "mind_map",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "make-me",
+    "anchor"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "mind_map-02",
+   "text": "mind map of everything the product can do",
+   "kind": "mind_map",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "mind_map-03",
+   "text": "mindmap for my exam revision on photosynthesis",
+   "kind": "mind_map",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "one-word"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "mind_map-04",
+   "text": "MIND MAP of the release plan",
+   "kind": "mind_map",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "all-caps"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "mind_map-05",
+   "text": "mind map banao product features ka",
+   "kind": "mind_map",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "hinglish"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "mind_map-06",
+   "text": "माइंड मैप बनाओ रोडमैप का",
+   "kind": "mind_map",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "hi",
+    "devanagari"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "timeline-01",
+   "text": "timeline of the project milestones",
+   "kind": "timeline",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "timeline-02",
+   "text": "draw a timeline of what shipped each month this year",
+   "kind": "timeline",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "timeline-03",
+   "text": "can you show the history of the platform as a timeline",
+   "kind": "timeline",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "can-you"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "timeline-04",
+   "text": "timeline chart from the dates in this sheet",
+   "kind": "timeline",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "table-present",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "user_journey-01",
+   "text": "user journey map for a new customer",
+   "kind": "user_journey",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "map-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "user_journey-02",
+   "text": "draw the user journey from signup to first chart",
+   "kind": "user_journey",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "user_journey-03",
+   "text": "customer journey diagram, 5 stages",
+   "kind": "user_journey",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "roadmap-01",
+   "text": "roadmap for Q4",
+   "kind": "roadmap",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "no-article"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "roadmap-02",
+   "text": "draw a product roadmap picture for the next two quarters",
+   "kind": "roadmap",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "roadmap-03",
+   "text": "ROADMAP of the migration, visually",
+   "kind": "roadmap",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "all-caps"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "git_graph-01",
+   "text": "draw the branch graph: main, dev and my feature branch",
+   "kind": "git_graph",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "graph-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "git_graph-02",
+   "text": "git graph of how we merge to dev then main",
+   "kind": "git_graph",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "graph-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "requirements-01",
+   "text": "requirement diagram linking the specs to the tests",
+   "kind": "requirements",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "kanban-01",
+   "text": "kanban board of my open tasks",
+   "kind": "kanban",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "kanban-02",
+   "text": "draw a kanban with todo, doing and done",
+   "kind": "kanban",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "block_diagram-01",
+   "text": "block diagram of the inference server",
+   "kind": "block_diagram",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "c4-01",
+   "text": "C4 context diagram of the platform",
+   "kind": "c4",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "packet-01",
+   "text": "packet diagram of the SSE frame",
+   "kind": "packet",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "quadrant_concept-01",
+   "text": "2x2 quadrant of effort versus impact for our backlog",
+   "kind": "quadrant_concept",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "quadrant_concept-02",
+   "text": "draw a priority quadrant chart, no data needed",
+   "kind": "quadrant_concept",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "chart-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "swot-01",
+   "text": "SWOT diagram for the product",
+   "kind": "swot",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "acronym"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "swot-02",
+   "text": "draw a swot quadrant for us vs the competition",
+   "kind": "swot",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "pyramid_concept-01",
+   "text": "draw Maslow's pyramid",
+   "kind": "pyramid_concept",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "pyramid_concept-02",
+   "text": "pyramid diagram of our three support tiers",
+   "kind": "pyramid_concept",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "pyramid_concept-03",
+   "text": "pyramid chart of headcount by level from this sheet",
+   "kind": "pyramid_concept",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "table-present",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "bar-01",
+   "text": "bar chart of tickets per owner",
+   "kind": "bar",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "no-article",
+    "anchor"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "bar-02",
+   "text": "Make a bar graph of sales by region.",
+   "kind": "bar",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "bar-03",
+   "text": "BAR CHART OF HOURS BY OWNER",
+   "kind": "bar",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "all-caps"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "bar-04",
+   "text": "can you plot revenue per month as bars",
+   "kind": "bar",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "can-you"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "bar-05",
+   "text": "bar chat of status counts",
+   "kind": "bar",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "typo"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "bar-06",
+   "text": "बार चार्ट बनाओ ओनर के हिसाब से",
+   "kind": "bar",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "hi",
+    "devanagari"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "bar-07",
+   "text": "બાર ચાર્ટ બનાવો પ્રદેશ પ્રમાણે",
+   "kind": "bar",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "gu",
+    "gujarati"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "bar-08",
+   "text": "bar chart banao owner wise",
+   "kind": "bar",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "hinglish"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "column-01",
+   "text": "column chart of units sold per product",
+   "kind": "column",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "stacked_bar-01",
+   "text": "stacked bar of status broken down by priority",
+   "kind": "stacked_bar",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "line-01",
+   "text": "line chart of daily sales",
+   "kind": "line",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "line-02",
+   "text": "plot the trend of tickets over time",
+   "kind": "line",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "no-chart-word",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "line-03",
+   "text": "LINE GRAPH of monthly revenue",
+   "kind": "line",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "all-caps"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "area-01",
+   "text": "area chart of cumulative signups",
+   "kind": "area",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "pie-01",
+   "text": "Make a pie chart of ticket status.",
+   "kind": "pie",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "anchor"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "pie-02",
+   "text": "pie chart me dikhao status ka breakup",
+   "kind": "pie",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "hinglish",
+    "dikhao"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "pie-03",
+   "text": "पाई चार्ट बनाओ स्टेटस का",
+   "kind": "pie",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "hi",
+    "devanagari"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "donut-01",
+   "text": "donut chart of spend by category",
+   "kind": "donut",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "scatter-01",
+   "text": "scatter of salary vs experience",
+   "kind": "scatter",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "scatter-02",
+   "text": "scatter plot showing hours against score",
+   "kind": "scatter",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "bubble-01",
+   "text": "bubble chart of revenue, margin and headcount",
+   "kind": "bubble",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "histogram-01",
+   "text": "histogram of hours spent per ticket",
+   "kind": "histogram",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "box_plot-01",
+   "text": "box plot of hours by priority",
+   "kind": "box_plot",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "violin-01",
+   "text": "violin plot of scores by team",
+   "kind": "violin",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "heat_map-01",
+   "text": "heatmap of tickets by status and priority",
+   "kind": "heat_map",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "heat_map-02",
+   "text": "HEAT MAP of defects by module and week",
+   "kind": "heat_map",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "all-caps"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "treemap-01",
+   "text": "visualise this table as a treemap",
+   "kind": "treemap",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "visualise"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "sunburst-01",
+   "text": "show this as a sunburst",
+   "kind": "sunburst",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "show"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "radar-01",
+   "text": "radar chart of the five scores for each team",
+   "kind": "radar",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "waterfall-01",
+   "text": "waterfall chart of the cash movements",
+   "kind": "waterfall",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "funnel-01",
+   "text": "funnel chart of the signup steps",
+   "kind": "funnel",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "pareto-01",
+   "text": "pareto chart of defect causes",
+   "kind": "pareto",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "gantt-01",
+   "text": "gantt chart of the project tasks from this sheet",
+   "kind": "gantt",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "gantt-02",
+   "text": "gantt chart of a three month plan, make the dates up",
+   "kind": "gantt",
+   "ctx": "N",
+   "want": "diagram-in-chat",
+   "tags": [
+    "en",
+    "no-table",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "candlestick-01",
+   "text": "candlestick chart of the daily prices",
+   "kind": "candlestick",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "combo-01",
+   "text": "combo chart: revenue as bars and margin as a line",
+   "kind": "combo",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "bullet-01",
+   "text": "bullet chart of actual against target",
+   "kind": "bullet",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "quadrant_data-01",
+   "text": "put these vendors on a quadrant of price vs rating",
+   "kind": "quadrant_data",
+   "ctx": "T",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "bar-09",
+   "text": "bar chart of tickets per owner",
+   "kind": "bar",
+   "ctx": "N",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "no-table",
+    "asks-for-the-table"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "pie-04",
+   "text": "pie chart of our market share",
+   "kind": "pie",
+   "ctx": "N",
+   "want": "chart-from-data",
+   "tags": [
+    "en",
+    "no-table",
+    "asks-for-the-table"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "map-01",
+   "text": "plot these records on a map",
+   "kind": "map",
+   "ctx": "T",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "anchor"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "map-02",
+   "text": "show the counts state-wise on an india map",
+   "kind": "map",
+   "ctx": "T",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "show"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "map-03",
+   "text": "isko map pe dikhao",
+   "kind": "map",
+   "ctx": "T",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "hinglish",
+    "dikhao"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "map-04",
+   "text": "इसे नक्शे पर दिखाओ",
+   "kind": "map",
+   "ctx": "T",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "hi",
+    "devanagari"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "map-05",
+   "text": "આ નકશા પર બતાવો",
+   "kind": "map",
+   "ctx": "T",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "gu",
+    "gujarati"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "choropleth-01",
+   "text": "choropleth of revenue by state",
+   "kind": "choropleth",
+   "ctx": "T",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "sankey-01",
+   "text": "sankey diagram of how users move between stages",
+   "kind": "sankey",
+   "ctx": "T",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "sankey-02",
+   "text": "draw a sankey of the energy flow",
+   "kind": "sankey",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "draw"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "chord-01",
+   "text": "chord diagram of who emails whom",
+   "kind": "chord",
+   "ctx": "T",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "unnamed",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "chord-02",
+   "text": "draw a chord diagram of the trade flows",
+   "kind": "chord",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "unnamed",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "word_cloud-01",
+   "text": "word cloud of the ticket descriptions",
+   "kind": "word_cloud",
+   "ctx": "T",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "venn-01",
+   "text": "venn diagram of the three plans and what they share",
+   "kind": "venn",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "venn-02",
+   "text": "draw a VENN of python vs sql skills on the team",
+   "kind": "venn",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "all-caps"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "calendar-01",
+   "text": "calendar view of the deadlines this month",
+   "kind": "calendar",
+   "ctx": "T",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "unnamed",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "calendar-02",
+   "text": "draw me a calendar for October with the sprints marked",
+   "kind": "calendar",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "unnamed",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "wireframe-01",
+   "text": "draw a wireframe of the chat screen",
+   "kind": "wireframe",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "unnamed",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "wireframe-02",
+   "text": "make me a mockup of the settings page",
+   "kind": "wireframe",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "unnamed",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "wireframe-03",
+   "text": "UI mockup chart for the dashboard",
+   "kind": "wireframe",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "chart-word",
+    "unnamed",
+    "debatable"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "floor_plan-01",
+   "text": "floor plan of a 2bhk with the kitchen on the east",
+   "kind": "floor_plan",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "unnamed",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "floor_plan-02",
+   "text": "draw the seating plan for the office",
+   "kind": "floor_plan",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "unnamed",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "circuit-01",
+   "text": "circuit diagram for an LED with a resistor",
+   "kind": "circuit",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "unnamed",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "picture-01",
+   "text": "draw me a picture of a cat wearing sunglasses",
+   "kind": "picture",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "unnamed",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "picture-02",
+   "text": "generate an image of our logo on a billboard",
+   "kind": "picture",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "unnamed",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "infographic-01",
+   "text": "make an infographic of our 2026 numbers",
+   "kind": "infographic",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "unnamed",
+    "debatable"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "isometric_3d-01",
+   "text": "3d isometric diagram of the data centre",
+   "kind": "isometric_3d",
+   "ctx": "N",
+   "want": "refuse-with-a-reason",
+   "tags": [
+    "en",
+    "unnamed",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-17",
+   "text": "put a flow chart of the deploy pipeline in a PDF",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-file",
+   "tags": [
+    "en",
+    "pdf"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-18",
+   "text": "write a Word document explaining onboarding, with a flowchart in it",
+   "kind": "flow_chart",
+   "ctx": "N",
+   "want": "diagram-in-file",
+   "tags": [
+    "en",
+    "docx"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "architecture-08",
+   "text": "make a PDF report on our architecture with an architecture diagram",
+   "kind": "architecture",
+   "ctx": "N",
+   "want": "diagram-in-file",
+   "tags": [
+    "en",
+    "pdf"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "er_diagram-08",
+   "text": "a docx of the schema with an ER diagram",
+   "kind": "er_diagram",
+   "ctx": "N",
+   "want": "diagram-in-file",
+   "tags": [
+    "en",
+    "docx",
+    "non-flowchart",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "sequence-07",
+   "text": "slide deck of the request path, include a sequence diagram",
+   "kind": "sequence",
+   "ctx": "N",
+   "want": "diagram-in-file",
+   "tags": [
+    "en",
+    "pptx",
+    "non-flowchart",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "mind_map-07",
+   "text": "export the roadmap as a pdf with a mind map",
+   "kind": "mind_map",
+   "ctx": "N",
+   "want": "diagram-in-file",
+   "tags": [
+    "en",
+    "pdf",
+    "non-flowchart",
+    "hard"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "process_flow-07",
+   "text": "add a process flow diagram to that report",
+   "kind": "process_flow",
+   "ctx": "F",
+   "want": "diagram-in-file",
+   "tags": [
+    "en",
+    "edit"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-19",
+   "text": "what does the flow chart on page 3 show?",
+   "kind": "flow_chart",
+   "ctx": "PDF",
+   "want": "answer-about-a-file",
+   "tags": [
+    "en",
+    "read-back",
+    "route-corrects"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "map-06",
+   "text": "what does the map on page 2 show?",
+   "kind": "map",
+   "ctx": "PDF",
+   "want": "answer-about-a-file",
+   "tags": [
+    "en",
+    "read-back",
+    "route-corrects"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "flow_chart-20",
+   "text": "what does the diagram in that report show?",
+   "kind": "flow_chart",
+   "ctx": "F",
+   "want": "answer-about-a-file",
+   "tags": [
+    "en",
+    "read-back"
+   ],
+   "provenance": "authored"
+  },
+  {
+   "id": "bar-10",
+   "text": "which chart did you put in the deck?",
+   "kind": "bar",
+   "ctx": "F",
+   "want": "answer-about-a-file",
+   "tags": [
+    "en",
+    "read-back"
+   ],
+   "provenance": "authored"
+  }
+ ]
+}
