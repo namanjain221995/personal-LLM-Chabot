@@ -376,9 +376,32 @@ _ABOUT_FORMAT_RE = re.compile(
 _CODE_RE = re.compile(r"\b(?:regex|regular expression)\b", re.I)
 #: An imperative edit at the start of a short message — "Add our logo.",
 #: "Use a more formal tone." — is about the latest artifact when there is one.
+_EDIT_VERB = (r"add|insert|include|remove|delete|drop|change|update|rename|retitle|shorten|expand|"
+              r"rewrite|reword|revise|tighten|trim|fix|tweak|adjust")
 _IMPERATIVE_EDIT_RE = re.compile(
-    r"^\s*(?:please\s+)?(?:add|insert|include|remove|delete|drop|change|update|rename|retitle|shorten|expand|"
-    r"rewrite|reword|revise|tighten|trim|fix|tweak|adjust|use (?:a )?(?:more|less)|make\b.{1,40}?\b(?:shorter|longer|simpler|clearer|concise|formal|professional))\b",
+    rf"^\s*(?:please\s+)?(?:{_EDIT_VERB}|use (?:a )?(?:more|less)|"
+    r"make\b.{1,40}?\b(?:shorter|longer|simpler|clearer|concise|formal|professional))\b",
+    re.I,
+)
+#: THE SAME INSTRUCTION WITH THE VERB LAST, which is where Hindi and Gujarati
+#: put it (2026-09-28).
+#:
+#: `lexicon.normalize` already carries the grammar across — "colors edit karo"
+#: becomes "color update", "फील में कलर बदल दो" becomes "फील _in_ कलर change",
+#: "new column add karo excel me" becomes "new column add excel _in_". The
+#: rule above then missed every one of them, because it anchors the verb at
+#: the START of the line and these say the object first. On the 1,553-turn
+#: understanding corpus that was most of what separated gujlish (94%) from
+#: English (99%): a person with a file open, typing a four-word instruction
+#: in their own word order, was told there was no request.
+#:
+#: Deliberately narrow: the whole message must be SHORT (the caller already
+#: bounds it at 12 words), the verb must be the last word or followed only by
+#: a postposition marker the normaliser emitted, and there must be something
+#: in front of it to be the object. "update" alone is not an instruction, and
+#: "the report is out of date" never reaches here — the verb is not final.
+_SOV_EDIT_RE = re.compile(
+    rf"\b\w[\w-]*\s+(?:{_EDIT_VERB})\s*(?:_in_|_this_|_give_|kar(?:o|do|dijiye)?|karo|do)?\s*[.!?]?\s*$",
     re.I,
 )
 #: Polite imperatives are requests: "can you make…", "could you create…".
@@ -3445,7 +3468,9 @@ def decide(
         if not _is_remark(low) and (_EDIT_VERBS_RE.search(low) or _wider_edit) \
                 and (_REFERENCE_RE.search(low) or _mentions_hint(low, artifact_hints)):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit")
-        if not _is_remark(low) and _IMPERATIVE_EDIT_RE.match(low) and len(low.split()) <= 12:
+        if not _is_remark(low) and len(low.split()) <= 12 and (
+            _IMPERATIVE_EDIT_RE.match(low) or _SOV_EDIT_RE.search(low)
+        ):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit-imperative")
         # 2d. A style clause, or an edit verb on an element (AS3 (f)): "make
         #     the headings dark blue", "make the document landscape", "font
