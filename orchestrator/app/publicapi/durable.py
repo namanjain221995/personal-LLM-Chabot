@@ -2292,9 +2292,16 @@ class Runtime:
         )
         run.generation = generation
         first = True
+        #: Text that arrived AFTER the stop was seen. Not recorded here: if the
+        #: attempt is continued, the continuation regenerates it from the text
+        #: already recorded. Recorded below only if the engine turns out to
+        #: have finished first — then nothing will ever generate it again.
+        held: List[str] = []
         try:
             async for chunk in generation.stream():
                 if run.stop_reason is not None:
+                    if getattr(chunk, "kind", "") == streaming.TOKEN_KIND and getattr(chunk, "text", ""):
+                        held.append(str(chunk.text))
                     break
                 if getattr(chunk, "kind", "") != streaming.TOKEN_KIND:
                     continue
@@ -2332,19 +2339,37 @@ class Runtime:
                 self._quarantined_dispatched = None
                 self._quarantine_prefill = False
             self._dispatch_state_changed()
-        new_tokens = run.generated_tokens - tokens_before
-        self._note_usage(run, generation, new_tokens, continuing=continuing, tokens_before=tokens_before)
         verdict: Optional[liveness.Verdict] = getattr(generation, "interrupt", None)
         dispatched = getattr(guard, "dispatched_at", None) is not None
         error = getattr(generation, "error", None)
         finish_reason = getattr(generation, "finish_reason", None)
-
-        if (
+        engine_finished_first = (
             run.stop_reason in ("yield", "store", "orphaned")
             and error is None
             and verdict is None
             and finish_reason in ("stop", "length")
-        ):
+        )
+        if engine_finished_first:
+            # THE WHOLE ANSWER, NOT THE PART THE RUNNER HAD READ (2026-09-29).
+            # The engine's tokens reach this loop through a queue, and on a
+            # busy box the producer can be far ahead: the engine may have sent
+            # the entire answer and its finish reason before the loop read the
+            # first of them. The loop stops at the next chunk after a stop, so
+            # that chunk and everything queued behind it were dropped — and the
+            # branch below then settled the run `completed` with its tail
+            # missing, or with no text at all when the burst was the whole
+            # answer (test_a_yield_that_lands_after_the_engine_finished_…).
+            # The producer is done here (`aclose` above), so the queue holds
+            # exactly the rest of what the engine sent.
+            for text in held + generation.undelivered_text():
+                if run.first_token_at is None:
+                    run.first_token_at = time.monotonic()
+                run.emitted_first_token_this_attempt = True
+                run.add_delta(text, 1)
+        new_tokens = run.generated_tokens - tokens_before
+        self._note_usage(run, generation, new_tokens, continuing=continuing, tokens_before=tokens_before)
+
+        if engine_finished_first:
             # The engine had already finished when the stop arrived: settle
             # the answer rather than "continue" a complete one.
             if run.stop_reason != "orphaned":
