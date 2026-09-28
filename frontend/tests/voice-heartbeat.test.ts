@@ -229,7 +229,7 @@ describe('the bar while a recording is transcribed', () => {
 
   const bar = () =>
     createElement(VoiceBar, {
-      state: 'transcribing',
+      state: 'finishing',
       levels: [],
       // The recording's own length; the wait clock must not start from it.
       elapsedMs: 42_000,
@@ -386,7 +386,7 @@ describe('the wait clock, adversarially', () => {
     vi.useRealTimers();
   });
 
-  const bar = (state: 'recording' | 'transcribing', elapsedMs = 42_000) =>
+  const bar = (state: 'recording' | 'finishing', elapsedMs = 42_000) =>
     createElement(VoiceBar, {
       state,
       levels: [],
@@ -397,13 +397,13 @@ describe('the wait clock, adversarially', () => {
     });
 
   it('starts again from 0:00 for the next recording, not where the last wait stopped', () => {
-    const view = render(bar('transcribing'));
+    const view = render(bar('finishing'));
     act(() => {
       vi.advanceTimersByTime(95_000);
     });
     expect(screen.getByText('1:35')).toBeTruthy();
     view.rerender(bar('recording', 3_000));
-    view.rerender(bar('transcribing', 3_000));
+    view.rerender(bar('finishing', 3_000));
     expect(screen.getByText('0:00')).toBeTruthy();
     expect(screen.queryByText('1:35')).toBeNull();
     act(() => {
@@ -413,7 +413,7 @@ describe('the wait clock, adversarially', () => {
   });
 
   it('keeps counting past ten minutes (the timeout is 600 s)', () => {
-    render(bar('transcribing'));
+    render(bar('finishing'));
     act(() => {
       vi.advanceTimersByTime(10 * 60_000 + 5_000);
     });
