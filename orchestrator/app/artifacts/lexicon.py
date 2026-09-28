@@ -453,7 +453,19 @@ def normalize(text: str) -> str:
 
 #: Formats named in normalised text. `sheet` is not here: "cheat sheet".
 FORMAT_ALIASES = {
-    "docx": r"docx|word\s+(?:document|file|doc|docs|version|copy|format|report)|ms\s*word|microsoft\s+word|(?:in|as|to|into)\s+word|"
+    # `in word` NAMES THE FORMAT ONLY WHEN A NUMBER DOES NOT FOLLOW IT
+    # (2026-09-28). The owner asked "Best Ai model ?? in word n 2026 ??" —
+    # "world" mistyped as "word", "in" mistyped as "n" — and the product built
+    # a Word document called "AI Model Landscape Assessment" instead of
+    # answering the question. Two letters dropped, and a question about the
+    # state of the field became a file.
+    #
+    # A year or any number after it is the tell: "in word 2026" and "in word n
+    # 2026" are someone reaching for "world", while "give me this in word",
+    # "in word format" and "as word" are the format and keep it. Anyone
+    # genuinely asking for the format alongside a year writes "in word format"
+    # or "as a word document", both of which still match.
+    "docx": r"docx|word\s+(?:document|file|doc|docs|version|copy|format|report)|ms\s*word|microsoft\s+word|(?:in|as|to|into)\s+word\b(?!\s+n?\s*\d)|"
             # The normaliser's SOV shape — see formats._ALIAS for the measurement.
             r"word\s+_in_(?:\s+\S+){0,2}?\s+(?:_convert_|_give_)|word\s+(?:_convert_|_give_)",
     "xlsx": r"xlsx|xls|excel|spreadsheets?|workbook|(?<!cheat )(?<!fact )(?<!balance )(?<!time )sheet(?!\s*\d)",
