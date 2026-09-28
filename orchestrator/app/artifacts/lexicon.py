@@ -210,7 +210,18 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"kripya|kripaya|कृपया|કૃપા\s+કરીને", "please"),
     _word(r"upar\s+(?:wala|wale|wali|ka|ki|ke|diya|diye|lakhelo|no)|above\s+wala|uparno", "above"),
     _word(r"bhi|pan\s+(?=pdf|excel|word|csv|ppt)", "also"),
-    (re.compile(rf"(pdf|word|doc|docs|docx|excel|exel|csv|ppt|pptx|powerpoint|presentation|file|document|sheet|format|report|version)\s+(?:me|mein|mai|mei|ma|maa|mā){_E}"), r" \1 _in_ "),
+    # THE POSTPOSITION AFTER A FILE NOUN. The noun list is the disambiguator:
+    # after one of these, romanised `me`/`ma` is the postposition and never the
+    # English pronoun "me". `tracker`, `work ?book`, `deck` and `deliverable`
+    # were added 2026-09-28 (round 4) because a question that names our file in
+    # its own words got no `_in_` at all and so could not reach the SOV pointer
+    # in artifacts/intent.py: "tracker me kya hai ??", "workbook me kitni sheets
+    # hai ??", "deck me kitne slides hai ??" and "deliverable me kya hai ??"
+    # were each answered by the dataset engine although each names the workbook
+    # this platform made. `output` is deliberately NOT here: "output me a
+    # summary" is an English imperative with the pronoun, so the noun cannot
+    # disambiguate it (tests/test_artifact_question_route.py records the cost).
+    (re.compile(rf"(pdf|word|doc|docs|docx|excel|exel|csv|ppt|pptx|powerpoint|presentation|file|document|sheet|format|report|version|tracker|work\s?book|deck|deliverable)\s+(?:me|mein|mai|mei|ma|maa|mā){_E}"), r" \1 _in_ "),
     _word(r"neela|nila|neele", "blue"),
     _word(r"gehra\s+neela|gehre\s+neele|dark\s+neela", "dark blue"),
     _word(r"lal|laal", "red"),

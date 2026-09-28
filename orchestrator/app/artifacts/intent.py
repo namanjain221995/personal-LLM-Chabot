@@ -9,6 +9,8 @@
     "Export the previous answer as PDF."          export   (the last assistant turn → a file)
     "What is a PDF?" / "Can a PDF contain video?" none     (a question ABOUT the format)
     "Show me Python code that reads a DOCX."      none     (code, not a file)
+    "What does this sheet contain?"               none     (a question about THIS file:
+                                                            answer_about_artifact, read back)
 
 DETERMINISTIC FIRST. Every example in the product brief is decided by the
 rules here, and the rules are tested one by one — a request that plainly
@@ -97,6 +99,32 @@ same: the turn pointed at something and nothing here resolved it.
 
 Each rule below carries the case it was written against.
 
+A QUESTION ABOUT THE FILE IS A QUESTION (2026-09-27). "Ok What This sheet
+have ??", asked right after a workbook was made, came back as "Converted …
+to Excel" — and again, after the person wrote "please tell me Only Not
+create". Over a 119-turn corpus, 0 of the 49 questions about an artifact
+were answered: fifteen made a FILE (thirteen through `convert-artifact-turn`,
+which read the word "sheet" INSIDE the question as a conversion target, and
+two through `ui-edit`) and thirty-four made no file and no answer either.
+Step 1a now decides them: `action` stays "none" — no caller has to learn a
+new action to stop making a file — and `answer_about_artifact` is True, with
+`reference` naming the artifact the answer is read back from. The ask wins
+when both are said, in two clauses ("tell me what the sheet has and then
+convert it to pdf") or in one ("show me the totals as a pie chart", "tell me
+the totals and put them in the sheet"): `_names_a_deliverable` reads the
+question's OWN clause for the thing to be produced. The gate reads the
+person's OWN prose, so an instruction pasted under the question cannot order
+a file (see `_own_prose`).
+
+Those 119 turns were authored the same day as the gate, so they are
+in-sample. On a 180-turn corpus with 61 HELD-OUT neighbours added (measured
+2026-09-27, each labelled with the class 1f80aa3 satisfies): 1f80aa3 scores
+115/180 with 16 files nobody asked for and 4 asked-for files missing; the
+first version of this gate scored 125/180 but took 43 further requested files
+down with it — every "show me … as a pie chart" (the class PR #77 shipped)
+and every polite instruction typed into the UI edit box; this version scores
+173/180 with 0 files nobody asked for and the same 4 missing as 1f80aa3.
+
 "IN THE REPORT" IS A PLACE. "The numbers in the report are wrong" was a
 create (the destination rule read "in the report" as a deliverable). A
 definite article makes it a location; "in a report", "as a PDF" and "in
@@ -107,7 +135,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, List, Optional, Sequence
+from typing import Any, Awaitable, Callable, List, Optional, Sequence, Tuple
 
 from . import formats as F
 from . import lexicon as LX
@@ -426,9 +454,37 @@ class ArtifactIntent:
     #: action "none": the turn is answered in chat, by `visuals.refusal_for`,
     #: and opens no job (2026-09-16 — a map request became a Word file).
     unsupported_visual: str = ""
+    #: The turn is a QUESTION about an artifact the conversation already
+    #: holds — "what does this sheet contain?", "what columns does it have?",
+    #: "tell me what you put in there" — so the answer is READ BACK from that
+    #: artifact and NO file is made (2026-09-27). The action stays "none",
+    #: because that is the outcome every caller already understands as "no
+    #: file" (`wants_file` below, and main.py / fast_lane.py / material_in.py
+    #: branch on it); `reference` and `reference_hint` say WHICH artifact,
+    #: and `instruction` keeps the question the answer is written from.
+    answer_about_artifact: bool = False
+    #: The question POINTS AT the artifact — a pronoun it owns ("what is in
+    #: it"), a determiner and a file word ("this sheet", "the workbook", "the
+    #: tracker"), a numbered part ("slide 3"), a question about what YOU did
+    #: ("which sheets did you create?"), the SOV order the Indian languages
+    #: use, or a refusal of a new file while asking to be told. Set only on an
+    #: artifact-question verdict, and False on every other intent.
+    #:
+    #: It exists because `answer_about_artifact` alone cannot say WHICH file
+    #: the question is about, and the route needs that when the conversation
+    #: also holds an uploaded dataset: "what is the total spend?" is an
+    #: artifact question by shape and a DATASET question by subject. Computed
+    #: here, where the normalised text and the question's own shape are
+    #: already in hand, so the route does not normalise a second time
+    #: (`decide` runs on the event loop). Read by
+    #: artifacts/describe.answers_from_spec.
+    names_our_file: bool = False
 
     @property
     def wants_file(self) -> bool:
+        """Does this turn end in a FILE? An artifact QUESTION does not: it
+        decides action "none" on purpose, so no caller has to learn a new
+        action to stop making one."""
         return self.action != "none"
 
 
@@ -454,6 +510,16 @@ def _without_negated_clauses(low: str) -> str:
         return m.group(0) if _FIRST_PERSON_NEGATION_RE.search(head + m.group(0)[:24]) else " "
 
     return _NEGATED_FORMAT_RE.sub(" ", _NEGATED_CLAUSE_RE.sub(clause, low))
+
+
+def _rule_view(text: str) -> str:
+    """The text the rules read: the lexicon's normalisation (typos, Hindi,
+    Gujarati, Hinglish and Gujlish mapped to the rule vocabulary) with every
+    negated creation clause blanked (#9). `decide` reads it for the whole
+    message; the question gate (step 1a) reads it for the person's own prose
+    alone."""
+    low = LX.normalize(_without_negated_clauses((text or "").lower()))
+    return _without_negated_clauses(_blank_neg_token_clauses(low))
 
 
 def _prose_before_table(original: str) -> str:
@@ -1182,6 +1248,715 @@ def _dataset_ask(low: str, raw: str, chart: bool) -> str:
     return ""
 
 
+# ------------------------------------- A QUESTION ABOUT THIS FILE (2026-09-27) --
+#
+# THE ANCHOR CASE, in the owner's words: "The user wants to understand the
+# sheet -- what it has -- then it does not give an answer, it creates that
+# sheet again." The production transcript, after a workbook was made:
+#
+#   "Ok What This sheet have ??"                 -> "Converted … to Excel" v2
+#   "I said ??? what you create inside the sheet ??? i want to Know ??
+#    please tell me Only Not create d??"         -> "Converted … to Excel" v3
+#
+# Measured on 1f80aa3: thirteen of the fifteen files nobody asked for came
+# from `convert-artifact-turn` — the word "sheet" INSIDE the question was read
+# as a conversion target, which is why the card said "Converted" and not
+# "Created" — and two from `ui-edit`, which the UI's edit box binds every turn
+# to. The other thirty-four questions produced no file and no answer either:
+# nothing in the layer said "this turn is a question ABOUT the file", so
+# nothing downstream could read it back.
+#
+# THE DECISION, not the answer. These rules say only that the turn is a
+# question about the artifact: `action` stays "none" (no file — the outcome
+# every caller already understands) and `answer_about_artifact` is True.
+# Reading the workbook back — "2 sheets, 5 rows, 6 columns" — needs the
+# stored spec (`store.read_spec`), which is not reachable from what the gate
+# is handed (`deliverable.Deliverable` carries kind/formats/charts only): that
+# is the engine's half of the fix and is deliberately not attempted here.
+#
+# WHY THE RULES AND NOT THE CLASSIFIER. On Fast the classifier has a ~2.5 s
+# budget and, when it runs out, the system falls back to these rules IN
+# SILENCE (the hotfix-1.1 history). A question that is only understood when a
+# model answers in time is not understood. `_should_consult` therefore refuses
+# to offer an artifact question to the model at all.
+
+#: The words that name what is INSIDE a file: a question about one of these
+#: is answered by reading the file back. Format names are deliberately
+#: absent — "what is a PDF?" asks about the format as a concept
+#: (`_ABOUT_FORMAT_RE`) — and so are the file nouns themselves, so "what do
+#: you think of the tracker?" cannot reach these rules through its noun.
+#:
+#: The nouns are a LIST, not a pattern, because two other patterns below are
+#: this list with something taken out of it, and a copy of the list cannot be
+#: trusted to stay a copy (2026-09-28: the first attempt at
+#: `_Q_CONTENT_ONLY_NOUN` restated all 37 of them by hand).
+_Q_CONTENT_NOUN_WORDS = (
+    "columns?", "colums?", "rows?", "sheets?", "worksheets?", "tabs?", "sections?", "headings?",
+    "headers?", "titles?", "subtitles?", "pages?", "slides?", "cells?", "fields?", "formulas?",
+    "formulae", "totals?", "subtotals?", "charts?", "graphs?", "tables?", "data", "datasets?",
+    "contents?", "records?", "entries", "values", "figures", "numbers", "names", "labels?",
+    "paragraphs?", "bullets?", "dates?", "structure", "format",
+)
+#: The file itself, as a noun a determiner can point at.
+_Q_FILE_WORD_WORDS = (
+    "files?", "documents?", "docs?", "pdfs?", "docx", "xlsx", "xls", "excel", "csv", "pptx",
+    "powerpoint", "ppt", "work ?books?", "spread ?sheets?", "sheets?", "trackers?", "reports?",
+    "decks?", "presentations?", "attachments?", "outputs?", "deliverables?", "versions?",
+)
+
+
+def _alt(words) -> str:
+    """The words as one non-capturing alternation, in the order given."""
+    return "(?:" + "|".join(words) + ")"
+
+
+_Q_CONTENT_NOUN = _alt(_Q_CONTENT_NOUN_WORDS)
+_Q_FILE_WORD = _alt(_Q_FILE_WORD_WORDS)
+#: The file words that CANNOT name our own file with no determiner in front of
+#: them, COMPUTED as the difference below (2026-09-28, round 4). Two kinds:
+#:
+#:   * a bare FORMAT name — `csv`, `excel`, `pdf`, `xlsx`, `ppt` — is what the
+#:     person's OWN upload is called, and this platform publishes those formats
+#:     too (artifacts/formats.py), so the word names either file;
+#:   * a bare GENERIC CONTAINER — `file`, `document`, `doc`, `attachment` — names
+#:     any file at all, and `attachments?` is the vocabulary
+#:     `_Q_THEIR_UPLOAD_RE` uses to say a file is THEIRS.
+#:
+#: `_Q_OUR_FILE`'s determiner arm already requires the|this|that|my|our|your in
+#: front of a file word for exactly this reason. The SOV pointer below has NO
+#: determiner in its bare arm, so it needs the narrower set: measured through
+#: POST /chat with customers.csv and a workbook in one conversation, the bare
+#: `_Q_FILE_WORD` there answered "csv me total spend kitna hai ??", "excel me
+#: kitne rows hai ??", "csv में कितने rows हैं ?", "csv ma ketla rows che ??",
+#: "pdf me kitne pages hai ??", "file me kitne rows hai ??" and "doc me kitne
+#: pages hai ??" with "**Workflow Tracker** (v1) is a workbook with 1 sheet:
+#: `Tasks`" — a description of a workbook nobody asked about.
+#:
+#: What is LEFT is the vocabulary of a thing this platform MADE: `work ?books?`,
+#: `spread ?sheets?`, `sheets?`, `trackers?`, `reports?`, `decks?`,
+#: `presentations?`, `outputs?`, `deliverables?`, `versions?`. Nobody calls the
+#: CSV they just uploaded a tracker or a deliverable.
+_Q_NOT_OURS_ALONE_WORDS = (
+    "files?", "documents?", "docs?", "pdfs?", "docx", "xlsx", "xls", "excel", "csv",
+    "pptx", "powerpoint", "ppt", "attachments?",
+)
+_Q_OUR_FILE_NOUN = _alt(w for w in _Q_FILE_WORD_WORDS if w not in _Q_NOT_OURS_ALONE_WORDS)
+#: The content nouns a DATASET owns just as much as a file this platform made —
+#: the content nouns MINUS the file words, COMPUTED (2026-09-28). A noun that is
+#: also a file word (`sheets?` is the only one today) still points at our file,
+#: and every other one of them names something a CSV has too, so it points at
+#: nothing on its own. The difference is taken here rather than written out
+#: because a hand-copied list is a claim about two other lists that nothing
+#: checks; this one cannot be wrong, and
+#: tests/test_artifact_answer_read_source.py pins what the difference currently
+#: is so that adding an overlapping word to either list is a decision someone
+#: has to make on purpose.
+_Q_CONTENT_ONLY_NOUN = _alt(w for w in _Q_CONTENT_NOUN_WORDS if w not in _Q_FILE_WORD_WORDS)
+#: THIS file: a bare pronoun (with an artifact in the room, "it" is the
+#: artifact), a determiner and a file or content word, or a numbered part.
+#: An INDEFINITE article is not here: "a pdf" is the format as a concept.
+_Q_THIS_FILE = (
+    rf"(?:(?:it|this|that|these|those|them|_this_)\b"
+    rf"|(?:the|this|that|these|those|my|our|your)\s+(?:\w+\s+){{0,2}}?(?:{_Q_FILE_WORD}|{_Q_CONTENT_NOUN})\b"
+    rf"|(?:slide|page|sheet|tab|section|column|row)\s+\d+\b)"
+)
+#: A containment word: what a file DOES with its contents. `of` is not here
+#: — "what do you think OF the tracker?" is an opinion, not the contents.
+_Q_INSIDE = (
+    r"(?:in|inside|within|contain\w*|includ\w*|have|has|had|got|hold\w*|consist\w*|compris\w*|says?|shows?|lists?)"
+)
+#: The question words, English and the two Indian languages the normaliser
+#: leaves as written (`क्या`/`શું`, and the romanised kya/su/shu the
+#: Hinglish and Gujlish turns use). `who` is absent: "who else can see this
+#: file?" asks a fact the file does not hold.
+#: `\b` is useless at the end of `क्या` / `શું`: both end in a combining
+#: vowel mark, which Python's `\w` does not match, so there is no word
+#: boundary there at all and every Devanagari and Gujarati question word
+#: silently failed to match (measured on the corpus: q34/q35 still converted
+#: the workbook). The guards are lookarounds instead, and the shapes below
+#: must NOT wrap `_Q_WH` in `\b`.
+_Q_WH_ANY = (
+    # `kitni` is the feminine of `kitna`, and Gujarati's `ketli` was here
+    # without it: "workbook me KITNI sheets hai ??" was not a question at all
+    # while "workbook me KITNE sheets hai ??" was (measured 2026-09-28).
+    r"(?<!\w)(?:what'?s?|how\s+many|how\s+much|kya|kaya|kitne|kitna|kitni|ketla|ketli|su|shu"
+    r"|क्या|कितन\w*|શું|કેટલ\w*)(?!\w)"
+)
+#: `where`, `which` and `why` open a question at the START of a clause and
+#: SUBORDINATE one inside it: "make the Status column red WHERE Open, in the
+#: sheet" is an instruction, and reading `where` as a question word wherever
+#: it stood turned that verifier case into one
+#: (tests/test_artifact_intent.py, the style-as-a-place cases of 2026-09-15).
+#: `^` is the clause's start: the gate reads one clause at a time and the
+#: text has no newlines left in it.
+_Q_WH_LEAD = (
+    r"^\W*(?:(?:ok|okay|so|and|also|but|now|then|please|pls|hey|hi|sir|bro|just|i\s+said)\W+)*"
+    r"(?:where|which|why)(?!\w)"
+)
+_Q_WH = rf"(?:{_Q_WH_ANY}|{_Q_WH_LEAD})"
+_Q_GAP = r"(?:\w+\W+){0,4}?"
+#: The three atoms above, as whole words, for the tests that need one of them
+#: present anywhere in a clause.
+_Q_CONTENT_NOUN_RE = re.compile(rf"\b{_Q_CONTENT_NOUN}\b", re.I)
+_Q_CONTENT_ONLY_NOUN_RE = re.compile(rf"\b{_Q_CONTENT_ONLY_NOUN}\b", re.I)
+_Q_INSIDE_RE = re.compile(rf"\b{_Q_INSIDE}\b", re.I)
+_Q_THIS_FILE_RE = re.compile(rf"\b{_Q_THIS_FILE}", re.I)
+#: THIS file, with the CONTENT nouns removed: a pronoun the artifact owns
+#: ("what is in it"), a determiner and a word for a FILE ("this sheet", "the
+#: workbook", "the tracker"), or a numbered part ("slide 3"). It is
+#: `_Q_THIS_FILE` minus `_Q_CONTENT_NOUN`, and the subtraction is the point.
+#:
+#: WHY IT EXISTS (verifier, 2026-09-27). `_Q_THIS_FILE` admits `the` + a
+#: content noun, and `totals?`, `dates?`, `data`, `values`, `numbers` and
+#: `figures` are content nouns — so "what is the TOTAL spend?", "what is the
+#: DATE range?" and "which countries are in the DATA?" all point at "this
+#: file" as far as that pattern is concerned. They are questions about the
+#: person's own uploaded DATASET, whose answer is a real number the dataset
+#: engine computes; the read-back holds the artifact's structure and never a
+#: cell value, so answering them from it replaces the number with a
+#: description of the wrong file. This pattern is what `names_our_file`
+#: records, and it is read ONLY when the conversation also holds a dataset
+#: (artifacts/describe.answers_from_spec) — with no dataset in the room there
+#: is no other file for the question to be about, and the broad reading is
+#: right.
+_Q_OUR_FILE = (
+    rf"(?:(?:it|this|that|these|those|them|_this_)\b(?!\s+{_Q_CONTENT_ONLY_NOUN}\b)"
+    rf"|(?:the|this|that|these|those|my|our|your|_this_)\s+(?:\w+\s+){{0,2}}?{_Q_FILE_WORD}\b"
+    rf"|(?:slide|page|sheet|tab|section|column|row)\s+\d+\b)"
+)
+_Q_OUR_FILE_RE = re.compile(rf"\b{_Q_OUR_FILE}", re.I)
+#: THE SOV POINTER — a file word, then the postposition the normaliser writes
+#: (2026-09-28). `_Q_SOV_RE` cannot serve as one, and reading it as one is what
+#: sent every Indian-language value question to the workbook: its first arm is
+#: <wh> … `_in_` with NO file reference in it at all, and its second ORs
+#: `_Q_CONTENT_NOUN` straight back in — the exact set `_Q_OUR_FILE` subtracts.
+#: Measured through POST /chat with customers.csv and a workbook in one
+#: conversation: "डेटा में कुल spend कितना है ?", "data में कुल spend कितना है ?"
+#: and "rows में कितने countries हैं ?" were each answered "**Workflow Tracker**
+#: (v1) is a workbook with 1 sheet: `Tasks`", while the English equivalent
+#: ("what is the total spend in the data ?") reached the dataset engine — the
+#: same question, answered correctly in one language and not the other.
+#:
+#: `\b` IS LOAD-BEARING at the front: `it` closes ordinary words, so without it
+#: "credit note में क्या है ?" — normalised "credit note _in_ kya hai" — matched
+#: through the `it` inside "credit" and pointed a question about the person's
+#: own credit note at our workbook.
+#:
+#: THE BARE ARM CARRIES NO DETERMINER, so it reads `_Q_OUR_FILE_NOUN` and not
+#: `_Q_FILE_WORD` (2026-09-28, round 4): a bare format name or a bare generic
+#: container is what the person's own upload is called, and this arm was
+#: answering ten measured questions about an uploaded CSV with a description of
+#: a workbook. The determiner arm inside `_Q_OUR_FILE` still admits the whole
+#: file-word list, which is why "what is in the csv?" stays the stated residual
+#: that tests/test_artifact_answer_read_source.py pins.
+_Q_SOV_OUR_FILE_RE = re.compile(
+    rf"\b(?:{_Q_OUR_FILE}|{_Q_OUR_FILE_NOUN})(?:\W+\w+){{0,4}}?\W+_in_\b",
+    re.I,
+)
+#: …and THEIR file, named as their own: "the csv i uploaded", "the attachment",
+#: "the sheet i sent". It vetoes the pointer above, because our own artifacts
+#: are xlsx/pdf/docx/pptx AND csv (formats.py's `data` template makes a CSV), so
+#: `csv`, `excel` and `spread sheet` are in `_Q_FILE_WORD` and cannot say whose
+#: file is meant on their own: measured 2026-09-27, "what is in the csv i
+#: uploaded?" pointed at OUR workbook. Naming the artifact by its TITLE still
+#: wins — that is the most specific pointer there is.
+#:
+#: NARROW, and it is the same vocabulary app.main._NAMES_AN_UPLOAD_RE uses one
+#: layer up, minus the `page \d+` / timestamp arms: a PDF this platform made
+#: HAS pages. Measured over the programme's 119-turn corpus: 0 rows match, so
+#: it cannot cost the read-back class.
+_Q_THEIR_UPLOAD_RE = re.compile(
+    r"\b(?:i|we)\s+(?:just\s+)?(?:sent|uploaded|shared|attached)\b"
+    r"|\b(?:the|that|this|my)\s+(?:attach(?:ment|ed)|upload(?:ed)?)\b"
+    r"|\b(?:attach(?:ed|ment)|upload(?:ed)?)\s+"
+    r"(?:file|csv|xlsx?|excel|sheet|workbook|spread ?sheet|data ?set|data|pdf|doc|document)\b",
+    re.I,
+)
+
+#: "what is in it", "what's inside the workbook", "what does this sheet
+#: contain", "what the tracker has", "what is on slide 3".
+_Q_FILE_CONTENTS_RE = re.compile(
+    rf"{_Q_WH}\W+{_Q_GAP}(?:{_Q_INSIDE}|on)\b\W+{_Q_GAP}{_Q_THIS_FILE}"
+    rf"|{_Q_WH}\W+{_Q_GAP}{_Q_THIS_FILE}\W+{_Q_GAP}{_Q_INSIDE}\b",
+    re.I,
+)
+#: A question word and one of the file's own content words, in either order:
+#: "what columns does it have?", "how many rows are in it?", and the SOV
+#: order the Indian languages use ("isme kya kya COLUMNS hai" — the question
+#: word comes first, the noun last, and "is sheet me kya kya hai" reverses
+#: them).
+_Q_WH_CONTENT_RE = re.compile(
+    rf"{_Q_WH}(?:\W+\w+){{0,5}}?\W+{_Q_CONTENT_NOUN}\b",
+    re.I,
+)
+#: The REVERSED order — the content word first, the question word after it —
+#: read only when a question mark closed the clause. Unmarked it claimed a
+#: noun-first chart REQUEST: `charts?` is a content noun and "how many"
+#: follows within five words, so the repository's own authored chart ask
+#: (tests/fixtures/chart_requests.py t02, "Bar chart of how many tickets each
+#: priority has.") was answered instead of drawn — measured 2026-09-27
+#: against 1f80aa3, which draws it (create/create-chart).
+_Q_CONTENT_WH_RE = re.compile(
+    rf"\b{_Q_CONTENT_NOUN}\b(?:\W+\w+){{0,5}}?\W+{_Q_WH}",
+    re.I,
+)
+
+
+def _q_wh_content(clause: str, marked: bool) -> bool:
+    """A question word and a content word in the same clause. The reversed
+    order needs the question mark; see `_Q_CONTENT_WH_RE`."""
+    if _Q_WH_CONTENT_RE.search(clause):
+        return True
+    return (marked or "?" in clause) and bool(_Q_CONTENT_WH_RE.search(clause))
+
+
+#: The postposition forms the normaliser writes: "is sheet me kya hai"
+#: becomes "_this_ sheet _in_ kya hai", where the question word can be
+#: anywhere. `_in_` is written only for me/mein/में/માં, so this shape
+#: cannot fire on an English turn.
+#:
+#: A BARE FILE WORD counts (2026-09-28, round 4). The second arm read
+#: `_Q_THIS_FILE` — which needs a determiner — or a content noun, so "tracker me
+#: kya hai ??", "deliverable me kya hai ??" and "document me kya hai ??" were
+#: not questions about a file AT ALL: they carry no determiner and no content
+#: noun, and the whole turn reached the dataset engine although the person had
+#: just been shown the file card. The English "what is in the tracker?" is
+#: `_Q_FILE_CONTENTS_RE`'s, because `in` is a containment word there; `_in_` is
+#: not in `_Q_INSIDE` and must not be (every `pdf me convert karo` writes one),
+#: so the SOV shape names the case itself. WHOSE file it is stays
+#: `_Q_SOV_OUR_FILE_RE`'s question, and a bare format word there is still the
+#: person's own upload.
+_Q_SOV_RE = re.compile(
+    rf"{_Q_WH}(?:\W+\w+){{0,6}}?\W+_in_\b"
+    rf"|(?:{_Q_THIS_FILE}|{_Q_CONTENT_NOUN}|{_Q_FILE_WORD})(?:\W+\w+){{0,4}}?\W+_in_\b(?:\W+\w+){{0,4}}?\W+{_Q_WH}",
+    re.I,
+)
+#: A question about WHAT WAS DONE: "what did you put in the second sheet",
+#: "which sheets did you create?", "did you include the due dates?", "why
+#: did you add a priority column?", "explain what you created", and the
+#: owner's own "what you create inside the sheet" — which has no `did` at
+#: all. `can you …` is deliberately absent: that is a request to do
+#: something, not a question about what is already there.
+_Q_DID_YOU_RE = re.compile(
+    r"\b(?:what'?s?|which|why|where|when|how|did|do|does|have|has|are|were|was)\s+(?:\w+\s+){0,3}?"
+    r"(?:did\s+|do\s+|have\s+)?you\s+(?:\w+\s+){0,2}?"
+    r"(?:do|does|did|done|mak\w*|made|creat\w*|add\w*|put|includ\w*|writ\w*|wrote|generat\w*|build|built|"
+    r"sav\w*|us\w*|used|choos\w*|chose|pick\w*|nam\w*|call\w*|set|insert\w*|fill\w*|leave|left)\b",
+    re.I,
+)
+#: The same shape with NO NOUN PHRASE OF ITS OWN between the question word
+#: and `you`: the question word governs `you` directly ("what you created",
+#: "what did you put …"), or the clause OPENS with the auxiliary ("did you
+#: include the due dates?").
+#:
+#: The four-word gap in `_Q_DID_YOU_RE` exists for "which SHEETS did you
+#: create?" and "what FORMAT did you save it in ??", and it also let a
+#: question about something else entirely wear this hat: "what model are you
+#: using?" matched <wh> model are you us… and was answered from the workbook.
+#: Measured 2026-09-27: 1f80aa3 decides that none/no-request — ordinary chat —
+#: and answering it from the spec would describe the workbook to someone who
+#: asked which model is running. A `what-you-did` clause must therefore either
+#: name the file or something in it, or have this tighter shape.
+_Q_DID_YOU_VERB = (
+    r"(?:do|does|did|done|mak\w*|made|creat\w*|add\w*|put|includ\w*|writ\w*|wrote|generat\w*|build|built|"
+    r"sav\w*|us\w*|used|choos\w*|chose|pick\w*|nam\w*|call\w*|set|insert\w*|fill\w*|leave|left)"
+)
+_Q_DID_YOU_DIRECT_RE = re.compile(
+    rf"\b(?:what'?s?|which|why|where|when|how)\s+(?:did\s+|do\s+|does\s+|have\s+|has\s+)?you\s+"
+    rf"(?:\w+\s+){{0,2}}?{_Q_DID_YOU_VERB}\b"
+    rf"|^\W*(?:(?:ok|okay|so|and|also|but|now|then|please|pls|hey|hi|sir|bro|just|i\s+said)\W+)*"
+    rf"(?:did|do|does|have|has|are|were|was)\s+you\s+(?:\w+\s+){{0,2}}?{_Q_DID_YOU_VERB}\b",
+    re.I,
+)
+#: A yes/no question about the contents: "does it have a status column?",
+#: "is there a column for owner?", "is the tracker two sheets or one ??".
+#: The question MARK is required here and nowhere else: without it the same
+#: words are an imperative ("do the same for headcount", "delete the last
+#: column"), and a wh-question needs no mark to be a question ("what is in
+#: this sheet").
+_Q_YES_NO_RE = re.compile(
+    rf"^\W*(?:(?:ok|okay|so|and|also|but|now|then|please|pls|hey|hi|sir|just)\W+)*"
+    rf"(?:does|do|did|is|are|was|were|has|have)\s+(?:there\b|you\b|{_Q_THIS_FILE})",
+    re.I,
+)
+#: An instruction to SPEAK, not to build: "tell me what is inside the
+#: workbook", "list the headings in the document", "summarise the tracker
+#: you made", "read back what the sheet has", and the `_read_` the
+#: normaliser writes for "bata do" / "kaho" / "दिखाओ". `give me …` is NOT
+#: here: a hand-over verb asks for the thing itself, not for a description
+#: of it, and `explain how to …` is a how-to (`LX.negative_shape`).
+_Q_TELL_RE = re.compile(
+    r"\b(?:tell|show)\s+(?:me|us)\b|\blet\s+(?:me|us)\s+know\b|\b_read_\b"
+    r"|\b(?:list|explain|describe|summari[sz]e|recap|read\s+back|read\s+out|walk\s+(?:me|us)\s+through)\b",
+    re.I,
+)
+#: ADVICE, OPINION AND ACCESS ARE NOT THE CONTENTS. "what should I put in
+#: it?" asks what to write, "what do you think of the tracker?" asks for an
+#: opinion, and "who else can see this file?" asks a fact the file does not
+#: hold: reading the spec back would be the wrong answer to all three.
+_Q_NOT_CONTENTS_RE = re.compile(
+    # "what should the sheet contain?" and "how many pages should it be?" ask
+    # what to PUT there, not what is there: any subject, not just the first
+    # person, because a read-back is the wrong answer to all of them.
+    r"\b(?:should|shall|ought\s+to)\s+(?:i|we|it|this|that|the|there|they|you|he|she)\b"
+    r"|\bwhat\s+(?:should|would|could|can)\s+(?:i|we|you)\b"
+    r"|\bdo\s+you\s+(?:think|reckon|feel|suggest|recommend|advise|prefer)\b"
+    r"|\bwhat\s+(?:do|did)\s+you\s+think\b|\byour\s+(?:opinion|advice|thoughts)\b"
+    r"|\bany\s+(?:ideas|suggestions|advice|thoughts)\b"
+    r"|\bwho\s+(?:else\s+)?(?:can|could|may|has|have|is|are)\b"
+    # A POLITE INSTRUCTION wearing a question word. "what if you made it a
+    # pdf as well", "how about you make it two pages", "why don't you add a
+    # totals row", "do you mind making it landscape", "is it possible to add
+    # a status column?", "which columns do you want removed?" and "do you
+    # have the bandwidth to also make a deck?" all ask for WORK. They open
+    # with the question word, so `_Q_IMPERATIVE_LEAD_RE` cannot see the build
+    # verb; measured 2026-09-27 against 1f80aa3, which gives them
+    # convert/['pdf'], edit and create/create-first-clause respectively, and
+    # edit/ui-edit for every one of them typed into the UI's edit box.
+    r"|\b(?:what|how)\s+if\s+(?:you|we)\b|\b(?:what|how)\s+about\b"
+    r"|\bwhy\s+(?:not|do\s?n['’]?t|dont|do\s+not)\b"
+    r"|\b(?:is|are|was|were|would|will)\s+(?:it|this|that)\s+(?:be\s+)?possible\b"
+    r"|\bdo\s+you\s+mind\b|\bdo\s+you\s+have\s+(?:the\s+)?(?:time|bandwidth|capacity|availability)\b"
+    r"|\bdo\s+you\s+(?:want|wanna|need|propose|plan)\b"
+    r"|\b(?:how\s+many|how\s+much)(?:\W+\w+){0,4}?\W+can\s+you\b"
+    # "what I want is a totals row in the sheet", "what I need is the sheet
+    # in pdf": a STATEMENT of the deliverable, not a question about the
+    # contents — and "what I want to know is …" is untouched, because `is`
+    # has to follow the verb directly.
+    r"|\bwhat\s+(?:i|we)\s+(?:really\s+|just\s+)?(?:want|wanted|need|needed|would\s+like)\s+is\b",
+    re.I,
+)
+#: "just tell me", "tell me only", "i want to know", "sirf bata do": the
+#: person asks to be TOLD, and for nothing else.
+#:
+#: `told_gap` NAMES the words between the intensifier and the speech verb,
+#: because `_names_nothing_but_the_ask` has to put them back (2026-09-28, round
+#: 4). In English the verb comes before its object, so "just tell me the total
+#: spend" leaves the subject standing after the phrase; in VERB-FINAL Hinglish
+#: and Gujlish the object sits INSIDE the gap — "fakt kul spend kaho", "bas
+#: countries bata do" — and subtracting the phrase whole subtracted the subject
+#: with it, which is why six measured refusals that plainly name their own
+#: subject went on pointing at our workbook.
+_Q_TELL_ONLY_RE = re.compile(
+    r"\b(?:just|only|simply|sirf|faqt|fakt|khali|bas)\s+(?P<told_gap>(?:\w+\s+){0,2}?)(?:tell|say|show|explain|answer|_read_)\b"
+    r"|\b(?:tell|explain|show)\s+(?:me|us)\s+(?:only|just)\b"
+    r"|\b(?:i|we)\s+(?:just\s+|only\s+|really\s+)?(?:want|need|would\s+like|wanna)\s+to\s+know\b"
+    r"|\b(?:i|we)\s+(?:only|just)\s+(?:want|need)\b"
+    r"|\blet\s+(?:me|us)\s+know\b|\bplease\s+tell\s+(?:me|us)\b|\btell\s+(?:me|us)\s+only\b|\b_read_\b",
+    re.I,
+)
+#: The WHOLE message is the ask to be told, and nothing else: "i only want
+#: to know", "just tell me", "only tell me please". Anchored at both ends, so
+#: "just tell me the deadline" — which names its own subject — is not this.
+#: Read only when the last assistant turn was the file card: then there is
+#: nothing else the person can mean, and the transcript's third turn is this
+#: shape ("i want to Know ?? please tell me Only").
+_Q_TELL_ONLY_BARE_RE = re.compile(
+    r"^\W*(?:(?:ok|okay|no|nope|and|but|so|now|then|please|pls|kindly|hey|sir|bro|yaar|bhai|i\s+said)\W+)*"
+    r"(?:(?:i|we)\s+(?:just\s+|only\s+|really\s+)?(?:want|need|would\s+like|wanna)\s+to\s+know"
+    r"|(?:just|only|simply|sirf|fakt|faqt|khali|bas)\s+(?:tell|let|say)\s+(?:me|us)(?:\s+know)?"
+    r"|(?:tell|let)\s+(?:me|us)(?:\s+know)?\s+(?:only|just)"
+    r"|(?:i|we)\s+(?:only|just)\s+(?:want|need)(?:\s+to\s+know)?"
+    r"|_read_)"
+    r"(?:\s+(?:please|pls|now|first|only|just|ok|okay|na))*\W*$",
+    re.I,
+)
+#: A refusal to make anything: "don't create anything", "Not create",
+#: "i dont want a new one", and the `_neg_` the normaliser writes for
+#: "nayi file mat banao" / "navi file na banavo". Read on the text BEFORE
+#: `_without_negated_clauses` blanks it — that pass exists so the rest of
+#: the message decides, and here the negation IS the decision.
+_Q_REFUSE_CREATE_RE = re.compile(
+    r"\b(?:do\s*n['’]?t|dont|do\s+not|never|no\s+need\s+to|not|mat|na|nahi|nathi)\s+"
+    r"(?:(?:just|simply|actually|really|please|bother\s+to|go\s+ahead\s+and|try\s+to|need\s+to|"
+    r"want\s+to|have\s+to|you\s+to|to)\s+)*"
+    r"(?:creat\w*|re-?creat\w*|mak\w*|remak\w*|generat\w*|produc\w*|build\w*|rebuild|banao|banavo|banavvu|banana)\b"
+    r"|_neg_"
+    r"|\b(?:i|we)\s+(?:do\s*n['’]?t|dont|do\s+not)\s+(?:want|need)\s+"
+    r"(?:a\s+|an\s+|any\s+|another\s+|the\s+)?(?:new|other|second|extra|more|another)\b",
+    re.I,
+)
+#: WORDS THAT NAME NOTHING: politeness, discourse filler, the pronouns and
+#: auxiliaries the ask to be told is built from, and the bare objects a refusal
+#: takes ("a new one", "anything", "a file"). Whatever survives this AND the
+#: three phrase patterns above is a subject the person named for themselves.
+#: `d` is in it because the transcript's own turn ends "Not create d??".
+#: The MANNER ADVERBS are here because `_Q_TELL_ONLY_RE`'s gap is kept rather
+#: than subtracted (2026-09-28, round 4): in English the two words that may
+#: stand between "just" and the speech verb are an adverb — "just quickly tell
+#: me" — and an adverb names no subject, so keeping the gap must not turn one
+#: into a subject and cost the read-back the turn had before.
+_Q_NO_SUBJECT_FILLER_RE = re.compile(
+    r"\b(?:i|we|me|us|my|our|you|your|it|its|this|that|just|only|simply|sirf|fakt|faqt|khali|bas|"
+    r"please|pls|kindly|ok|okay|no|nope|yes|ya|and|but|so|now|then|also|first|na|hey|hi|sir|bro|yaar|"
+    r"bhai|said|want|wanted|need|needed|wanna|would|like|to|know|d|"
+    r"quick|quickly|brief|briefly|short|shortly|fast|straight|plainly|honestly|directly|"
+    r"a|an|the|any|another|new|other|second|extra|more|one|ones|anything|something|thing|files?)\b"
+    r"|\W+",
+    re.I,
+)
+#: THE LONGEST MESSAGE that can be nothing but the ask to be told. The ask and
+#: the refusal are short phrases — the longest real one measured is 84
+#: characters ("please tell me only, do not make a new file - what is the
+#: average spend per country?", which names a subject and is not this) — and a
+#: message longer than this names plenty besides them, so it is not a pointer
+#: whatever the subtraction would say. It is a BOUND, not a heuristic: a pasted
+#: refusal is a realistic shape and `_names_nothing_but_the_ask` runs three
+#: regex substitutions over the whole text, which cost 24.8 ms on a 108,000-
+#: character turn against 330-380 us for a short one (measured 2026-09-28).
+_Q_NOTHING_BUT_THE_ASK_MAX_CHARS = 400
+
+
+def _names_nothing_but_the_ask(text: str) -> bool:
+    """Is the whole message the ask to be TOLD and/or the refusal of a new file,
+    and nothing else?
+
+    WHY THIS IS THE TEST (2026-09-28). A refusal says which OUTPUT the person
+    wants — a sentence, not a file — and never which FILE the question is about.
+    Reading it as a pointer at the artifact is what answered three questions
+    about an uploaded dataset with a description of a workbook; measured through
+    POST /chat with customers.csv and a workbook in one conversation, "dont
+    create a file, just tell me the total spend", "please tell me only, do not
+    make a new file - what is the average spend per country?" and "sirf bata do
+    nayi file mat banao - total spend kitna hai" each came back
+    `meta.route` "artifact" and "**Workflow Tracker** (v1) is a workbook with 1
+    sheet: `Tasks`".
+
+    What the refusal CAN say is that the message names no subject at all — and
+    then the file card the last assistant turn showed is the only thing left for
+    it to be about. That is the transcript's own third turn, "i want to Know ??
+    please tell me Only Not create d??", which names nothing: it keeps its
+    read-back with a dataset in the room, and the three above do not.
+
+    A SUBTRACTION, not a list of shapes. The three phrase patterns are the ones
+    the gate already uses to recognise the ask and the refusal, so this cannot
+    drift away from them; the residual is measured, not enumerated. It must be
+    read on the UNBLANKED text (`decide`'s `own_unblanked`): `_rule_view` blanks
+    negated clauses, and on these turns that blanks the question itself — the
+    whole of "sirf bata do nayi file mat banao - total spend kitna hai" reduces
+    to a single space there, which is how a first attempt at this rule passed a
+    turn that names a total straight through.
+
+    WORD ORDER (2026-09-28, round 4). The subtraction has to KEEP the words
+    `_Q_TELL_ONLY_RE` allows between the intensifier and the speech verb. In
+    English the verb precedes its object, so "just tell me the total spend"
+    leaves "total spend" standing; in the verb-final order Gujarati and Hindi
+    speakers type, those words ARE the object — "fakt kul spend _read_", "bas
+    countries _read_" — and subtracting the phrase whole left nothing, so six
+    measured refusals that name their own subject were read as pointers and
+    answered "**Workflow Tracker** (v1) is a workbook with 1 sheet: `Tasks`".
+    `_Q_NO_SUBJECT_FILLER_RE` still decides whether what is put back names
+    anything, which is what keeps "just quickly tell me" a pointer.
+    """
+    if len(text) > _Q_NOTHING_BUT_THE_ASK_MAX_CHARS:
+        return False
+    rest = _Q_TELL_ONLY_RE.sub(lambda m: " %s " % (m.group("told_gap") or ""), text)
+    rest = _Q_REFUSE_CREATE_RE.sub(" ", rest)
+    rest = _Q_TELL_RE.sub(" ", rest)
+    return not _Q_NO_SUBJECT_FILLER_RE.sub(" ", rest).strip()
+
+
+#: A clause that OPENS WITH A BUILD VERB is an instruction, whatever
+#: question word stands later in it: "make it show what the totals are"
+#: changes the file. The speech verbs (tell, list, explain, summarise, read
+#: back) are deliberately absent — they are how the owner asked to be told.
+_Q_IMPERATIVE_LEAD_RE = re.compile(
+    r"^\W*(?:(?:please|pls|kindly|now|ok|okay|and|also|but|then|plus|just|can|could|would|will|you)\W+)*"
+    r"(?:make|creat|add|remov|delet|drop|chang|updat|convert|export|sav|download|renam|retitl|sort|"
+    r"highlight|bold|italici|underlin|set|put|insert|fill|turn|render|redo|recreat|rebuild|build|generat|"
+    r"writ|draft|prepar|design|develop|mov|merg|split|translat|apply|format|restyl|reformat|redesign|"
+    r"shorten|lengthen|expand|trim|cut|fix|tweak|adjust|replac|swap|reorder|restructur|colou?r|styl)\w*\b",
+    re.I,
+)
+#: WRITE THIS INTO the file: "put them in the sheet", "copy that into the
+#: tracker", "stick it on slide 3". `_EDIT_VERBS_RE` carries no `put`, and
+#: widening that list would change the edit path everywhere, so the shape is
+#: named here and read only by the question gate. Measured 2026-09-27: "tell
+#: me the totals and put them in the sheet" is ONE clause, and with no shape
+#: for it the gate kept the whole turn as a question (1f80aa3:
+#: convert/['xlsx']). A question ABOUT what was written is exempt from the
+#: veto, so "what did you put in the second sheet ??" is untouched.
+_Q_WRITE_INTO_RE = re.compile(
+    rf"\b(?:put|place|stick|paste|enter|log|append)\s+"
+    rf"(?:(?:it|them|that|this|those|these|_this_|the\s+\w+|a\s+\w+|an\s+\w+)\s+)?"
+    rf"(?:in|into|inside|on|onto|to)\s+{_Q_THIS_FILE}",
+    re.I,
+)
+#: A line that opens PASTED material: a table row, a quote marker, a rule, a
+#: fence, or a mail/chat header. What follows is DATA, never instruction.
+_Q_PASTE_LINE_RE = re.compile(
+    r"^\s*(?:>|#{0,6}\s*(?:---+|===+|___+|\*\*\*+)\s*$|```|~~~"
+    r"|(?:system|assistant|user|human|ai|from|to|cc|bcc|subject|sent|date|re)\s*:)",
+    re.I,
+)
+#: A clause boundary for the question gate: sentence punctuation, a bare
+#: comma, or the joiners a second instruction is hung on ("… and then convert
+#: it to pdf"). The boundary TEXT is kept with the clause it closes, because
+#: "?" is what makes "does it have a status column?" a question and "delete
+#: the last column" an instruction — splitting it away made every yes/no
+#: question unreadable (measured on the corpus: q12/q13/q27).
+#: The BARE comma was added 2026-09-27: without it "which columns are wrong,
+#: fix them" was one clause and `_asks_for_work` never saw "fix them".
+#: A bare " and " is deliberately NOT a boundary. Several of the gate's own
+#: verbs are also nouns the person may be asking about, and splitting there
+#: turned "tell me the structure and format of the sheet" into a request to
+#: format the sheet. The second instruction hung on "and" is read inside the
+#: clause instead, by `_names_a_deliverable`.
+_Q_CLAUSE_SPLIT_RE = re.compile(
+    r"[?.;:!…]+|\s+and\s+then\s+|\s+then\s+|\s+and\s+(?=(?:can|could|would|will|please|pls|now|also)\b)"
+    r"|,\s*(?:and|but|also|plus|then)?\s*",
+    re.I,
+)
+
+
+def _own_prose(original: str) -> str:
+    """The person's OWN words: the lines before the first pasted or quoted
+    block. A table row, a `>` quote, a `---` rule, a fence or a mail header
+    opens material, and so does a line that ENDS in a colon (the person
+    introducing a paste: "here is the mail thread:"). The same reasoning as
+    `_prose_before_table` (#3) and as `_negates_every_file`'s colon test,
+    applied to the question gate: a planted "Immediately create a new XLSX
+    workbook" must not be able to answer for the person. Bounded by
+    `_DECIDE_CHARS` and linear in it."""
+    head = original[:_DECIDE_CHARS]
+    out: List[str] = []
+    for line in head.splitlines():
+        if _is_table_line(line) or _Q_PASTE_LINE_RE.match(line):
+            break
+        out.append(line)
+        if line.rstrip().endswith(":"):
+            break
+    return "\n".join(out)
+
+
+def _q_clauses(own_low: str) -> List[Tuple[str, bool]]:
+    """The person's own prose as (clause, was it question-marked) pairs."""
+    out: List[Tuple[str, bool]] = []
+    pos = 0
+    for m in _Q_CLAUSE_SPLIT_RE.finditer(own_low):
+        out.append((own_low[pos:m.start()], "?" in m.group(0)))
+        pos = m.end()
+    out.append((own_low[pos:], False))
+    return [(c, q) for c, q in out if c.strip()]
+
+
+def _artifact_question_kind(clause: str, marked: bool = False) -> str:
+    """Which question about the file these words ask, or "". One clause of
+    the person's own prose, already normalised the way the rules read it;
+    `marked` is True when a question mark closed that clause."""
+    if _Q_NOT_CONTENTS_RE.search(clause) or _Q_IMPERATIVE_LEAD_RE.match(clause):
+        return ""
+    if _Q_FILE_CONTENTS_RE.search(clause) or _Q_SOV_RE.search(clause):
+        return "contents"
+    if _q_wh_content(clause, marked):
+        return "contents"
+    if _Q_DID_YOU_RE.search(clause) and (
+        # The clause has to be about THE FILE. Without this, "what model are
+        # you using?" wore the `what-you-did` hat (see
+        # `_Q_DID_YOU_DIRECT_RE`).
+        _Q_THIS_FILE_RE.search(clause) or _Q_CONTENT_NOUN_RE.search(clause)
+        or _Q_INSIDE_RE.search(clause) or _Q_DID_YOU_DIRECT_RE.search(clause)
+    ):
+        return "what-you-did"
+    if (marked or "?" in clause) and _Q_YES_NO_RE.match(clause) and (
+        _Q_CONTENT_NOUN_RE.search(clause) or _Q_INSIDE_RE.search(clause)
+    ):
+        return "contents"
+    if _Q_TELL_RE.search(clause) and (
+        _Q_FILE_CONTENTS_RE.search(clause) or _q_wh_content(clause, marked)
+        or _Q_SOV_RE.search(clause) or _Q_DID_YOU_RE.search(clause)
+        or _Q_THIS_FILE_RE.search(clause)
+    ):
+        return "tell-me"
+    return ""
+
+
+def _chart_ask(clause: str) -> bool:
+    """These words ask for a CHART to be drawn — the same test the create
+    path makes (`chart_ask`, step 4), so the question gate vetoes itself
+    exactly where a chart would otherwise have been produced. A chart merely
+    MENTIONED is not this: "what is in the chart?" names no ask verb, which
+    is why `LX.chart_signal` alone cannot stand here."""
+    return (LX.chart_signal(clause) and bool(_CHART_ASK_RE.search(clause))
+            and not _QUESTION_ABOUT_RE.match(clause.strip())
+            and not _STORY_PLOT_RE.search(clause))
+
+
+def _names_a_deliverable(clause: str) -> bool:
+    """Does THIS clause — the one that also reads as a question — name the
+    thing to be PRODUCED? A format to put the content in, a new file, a chart
+    to draw, an edit to make, or a second instruction hung on "and".
+
+    `_CREATE_RE` and `F.explicit_formats` are deliberately absent. Both match
+    inside the owner's own question — "what you create inside the sheet" has
+    the verb `create` and the format word `sheet` — and reading either as a
+    deliverable is the defect this gate exists to fix.
+
+    `_AS_FORMAT_RE` is not read on an SOV clause. Its postposition arm exists
+    for "pdf me de do" (give it IN pdf), but `_in_` is also the locative of
+    the question itself: corpus q31 "kya hai is sheet me ??" normalises to
+    "kya hai _this_ sheet _in_", where that arm matched "sheet _in_" and the
+    Hinglish question went back to converting the workbook (measured
+    2026-09-27). `_Q_SOV_RE` is exactly that shape, and it needs a question
+    word, so "is sheet ko pdf me de do" is untouched."""
+    return bool(
+        _CONVERT_RE.search(clause) or _MAKE_IT_FORMAT_RE.search(clause)
+        or (_AS_FORMAT_RE.search(clause) and not _Q_SOV_RE.search(clause))
+        or _NEW_FILE_RE.search(clause) or _POSITIONAL_CREATE_RE.search(clause)
+        or _EDIT_VERBS_RE.search(clause) or _MORE_EDIT_VERBS_RE.search(clause)
+        or _Q_WRITE_INTO_RE.search(clause) or _MAKE_IT_RE.match(clause.strip())
+        or _chart_ask(clause)
+    )
+
+
+def _asks_for_work(clause: str) -> bool:
+    """Does this clause ask for a file to be made or changed? Read on the
+    clauses that are NOT the question, where the broad creation shapes are
+    safe: "what is in it? and can you add a total row?" keeps its edit."""
+    return bool(
+        _CREATE_RE.search(clause) or _Q_IMPERATIVE_LEAD_RE.match(clause)
+        or _names_a_deliverable(clause)
+    )
+
+
+def _artifact_question(own_low: str) -> str:
+    """The question these words ask about the file, or "": a question in one
+    clause, and no clause — the question's own included — asking for work.
+    The ask wins when both are said, whether they are said in two clauses
+    ("tell me what the sheet has and then convert it to pdf") or in one
+    ("tell me the totals and put them in the sheet", "show me the totals as a
+    pie chart").
+
+    A clause that is a question ABOUT WHAT WAS DONE (`_Q_DID_YOU_RE`) is the
+    one exception: the verb there belongs to the question, so "what you create
+    inside the sheet", "did you include the due dates?", "why did you add a
+    priority column?" (corpus q26) and "what did you put in the second sheet
+    ??" (q11) keep their answer. The test is that shape and NOT the kind
+    label: q11 and q26 are labelled `contents`, because a past-tense question
+    about the contents is still a question about the contents. A polite
+    instruction that wears a question word ("why don't you add a totals row")
+    never reaches this point — `_Q_NOT_CONTENTS_RE` drops it first.
+
+    Until 2026-09-27 the veto ran only on the clauses that produced NO kind,
+    so one clause that both asked to be told and asked for a file was decided
+    as a question. Measured against 1f80aa3: that cost 43 of the 61 held-out
+    corpus neighbours their file, and 50 of a 118-case probe wave over the two
+    verifiers' phrasings. Among them every "show me … as a pie chart"
+    (create/create-chart) and every "… and add them to the sheet"
+    (edit/edit-element)."""
+    clauses = _q_clauses(own_low)
+    kinds = [_artifact_question_kind(c, marked) for c, marked in clauses]
+    if not any(kinds):
+        return ""
+    for (clause, _marked), kind in zip(clauses, kinds):
+        if not kind:
+            if _asks_for_work(clause):
+                return ""
+        elif not _Q_DID_YOU_RE.search(clause) and _names_a_deliverable(clause):
+            return ""
+    return next(k for k in kinds if k)
+
+
 def decide(
     text: str,
     *,
@@ -1226,8 +2001,7 @@ def decide(
     # Hinglish/Gujlish mapped to the rule vocabulary) with its negated
     # creation clauses blanked (#9); `raw` — the instruction the composer
     # gets — keeps the person's words.
-    low = LX.normalize(_without_negated_clauses(raw.lower()))
-    low = _without_negated_clauses(_blank_neg_token_clauses(low))
+    low = _rule_view(raw)
     low = _REPORT_VERB_RE.sub(r"\g<lead> _report_", low)
     uploads = [str(f).lower().lstrip(".") for f in (upload_formats or ()) if f]
     explicit = F.explicit_formats(low)
@@ -1267,6 +2041,106 @@ def decide(
         return ArtifactIntent(action, raw_text=original, row_count=rows, new_artifact=(action == "create"),
                               language=language, **kw)
 
+    #: The person's own prose — the message without the material pasted
+    #: under it — as the rules read it, and as the NORMALISER wrote it before
+    #: the negated clauses were blanked (the refusal needs to see them). Both
+    #: are computed once, only for a conversation that holds an artifact, and
+    #: the common case (nothing pasted) reuses `low` instead of normalising
+    #: again: `decide` runs on the event loop.
+    own: dict = {}
+
+    def own_text() -> str:
+        if "low" not in own:
+            head = _clean(_own_prose(original))[:_DECIDE_CHARS]
+            own["raw"] = head
+            own["low"] = low if head == raw else _rule_view(head)
+        return own["low"]
+
+    def own_unblanked() -> str:
+        if "norm" not in own:
+            own_text()
+            own["norm"] = LX.normalize(own["raw"].lower())
+        return own["norm"]
+
+    def artifact_question_answer(**kw) -> Optional[ArtifactIntent]:
+        """The turn is a QUESTION about the artifact this conversation holds,
+        so it is ANSWERED from that artifact and no file is made. Two
+        signals, either of which is enough:
+
+          * an interrogative shape about THIS file with no other clause
+            asking for work ("what does this sheet contain?", "what columns
+            does it have?", "tell me what you put in there");
+          * the person REFUSING a new file while asking to be told ("please
+            tell me Only Not create", "sirf bata do nayi file mat banao",
+            "i dont want a new one") — the strongest signal in the
+            transcript, and the one that must hold whatever else the
+            sentence contains.
+
+        A file ATTACHED to this turn is not this: a read verb on an upload is
+        the hard-negative pass's ("summarize this pdf"), and answering it from
+        the artifact instead would read back the wrong document.
+
+        The shapes are tested first and the vetoes second: a turn that asks no
+        question about the file leaves this function after one pass over the
+        person's own prose, which is what every edit, conversion and create
+        turn does."""
+        kind = _artifact_question(own_text())
+        if kind:
+            if _Q_REFUSE_CREATE_RE.search(own_unblanked()):
+                kind = "told-not-to-create"
+        elif (_Q_REFUSE_CREATE_RE.search(own_unblanked())
+                and (_Q_TELL_ONLY_RE.search(own_text()) or _Q_TELL_ONLY_RE.search(own_unblanked()))):
+            kind = "told-not-to-create"
+        elif last_turn_is_artifact and _Q_TELL_ONLY_BARE_RE.match(own_text()):
+            kind = "tell-me-only"
+        else:
+            return None
+        if uploads and (LX.reads_source(own_text()) or _UPLOAD_SOURCE_RE.search(own_text())):
+            return None
+        shape = LX.negative_shape(own_text(), uploads)
+        if shape is not None and shape != "trivia":
+            # A how-to, a request for code, praise: the hard negatives own
+            # them. `trivia` is excepted because it is what "what is in this
+            # sheet" and "what is on slide 3?" were classified as — a
+            # question about the FORMAT is `_ABOUT_FORMAT_RE`'s, below.
+            return None
+        if _ABOUT_FORMAT_RE.search(own_text()) and not _Q_THIS_FILE_RE.search(own_text()):
+            # "what is a PDF?" is the format as a concept. "what is on slide
+            # 3?" names a part of THIS file and is not: `slides?` is a format
+            # word, so the concept rule matched it and the answer was lost.
+            return None
+        kw.setdefault("reference", _which(low, artifact_hints))
+        kw.setdefault("reference_hint", _hint(low, artifact_hints))
+        # WHICH file the question is about, recorded for the route (see
+        # `ArtifactIntent.names_our_file`). The shape signals are as good as
+        # the pointer here: a question about what YOU did is about the file
+        # you made, the SOV order carries the file word as its object
+        # ("sheet _in_ su su che" — corpus q36), and a person refusing a new
+        # file while asking to be told is talking about the one that exists.
+        names_ours = bool(
+            # The artifact by TITLE outranks everything: nothing is more
+            # specific than the file's own name.
+            _mentions_hint(own_text(), artifact_hints)
+            or (
+                (_Q_OUR_FILE_RE.search(own_text())
+                 or _Q_DID_YOU_RE.search(own_text())
+                 or _Q_SOV_OUR_FILE_RE.search(own_text())
+                 # A REFUSAL IS NOT A POINTER — unless the message names
+                 # nothing else at all (2026-09-28; see
+                 # `_names_nothing_but_the_ask`, which measures that). "Don't
+                 # make a file, just tell me X" says which OUTPUT the person
+                 # wants and leaves X to say what the question is about; "just
+                 # tell me" after the file card names nothing, so the card is
+                 # the only thing left.
+                 or (kind in ("told-not-to-create", "tell-me-only")
+                     and _names_nothing_but_the_ask(own_unblanked())))
+                # …unless the person named the file as THEIRS.
+                and not _Q_THEIR_UPLOAD_RE.search(own_text())
+            )
+        )
+        return made("none", rule=f"answer-artifact:{kind}", answer_about_artifact=True,
+                    names_our_file=names_ours, target="artifact", formats=[], **kw)
+
     # 0. The UI's "Edit with a prompt" names the artifact (AS3 (i)); the
     #    caller checked that the person owns it.
     if artifact_id:
@@ -1274,10 +2148,27 @@ def decide(
             return made("convert", reference="named", reference_hint="", rule="ui-convert", artifact_id_hint=str(artifact_id))
         if LX.undo_signal(low) and not _VERSION_RE.search(low):
             return made("edit", reference="latest", rule="ui-undo", artifact_id_hint=str(artifact_id))
+        # A QUESTION typed into the edit box is still a question. Until
+        # 2026-09-27 this branch bound EVERY turn to an edit, so "what
+        # columns does it have?" re-rendered the file (rule=`ui-edit`).
+        answer = artifact_question_answer(artifact_id_hint=str(artifact_id))
+        if answer is not None:
+            return answer
         version = _VERSION_RE.search(low)
         return made("edit", reference="named", reference_hint=f"version {version.group(1)}" if version else "",
                     version=int(version.group(1)) if version and re.search(r"\b(?:go back|revert|restore|use|return|switch|undo)\b", low) else None,
                     rule="ui-edit", artifact_id_hint=str(artifact_id))
+
+    # 1a. A QUESTION ABOUT THE ARTIFACT (2026-09-27). Before every other
+    #     rule that can read a file word as a deliverable: "Ok What This
+    #     sheet have ??" was a CONVERSION to xlsx because `sheet` inside the
+    #     question named a format, and "what is in this sheet" was format
+    #     trivia. Nothing here makes or changes a file, so no rule below is
+    #     weakened; the turn is answered from the artifact instead.
+    if has_artifacts:
+        answer = artifact_question_answer()
+        if answer is not None:
+            return answer
 
     # 1. The HARD-NEGATIVE pass (AS3 (a)) and the old question/code checks:
     #    a format named as the source, a how-to, trivia, praise or a request
@@ -1636,6 +2527,21 @@ def _should_consult(intent: ArtifactIntent, text: str) -> bool:
     no negative shape (or code/about-format veto) fired, and the message
     names a file, a format or a chart. The old ambiguous band is in it."""
     if intent.action != "none":
+        return False
+    if intent.answer_about_artifact:
+        # A question about the artifact is DECIDED. On Fast the classifier has
+        # a ~2.5 s budget and falls back to these rules in silence when it
+        # runs out, so a decision that can be flipped into a file by a model
+        # is a decision that fails under load — which is how the transcript's
+        # "please tell me Only Not create" came back as a third workbook.
+        #
+        # This line removes the recovery path for a MISREAD, so it is only
+        # honest while the rules do not misread. Re-measured 2026-09-27 on the
+        # 180-turn corpus after the clause-level veto landed: of the 61
+        # held-out neighbours, 0 file requests are claimed as questions
+        # (no_file 4, the same 4 that 1f80aa3 misses) and 0 turns that are not
+        # about the artifact are claimed either (over_grounded 0). Before the
+        # veto those two counts were 43 and 5.
         return False
     if intent.ambiguous:
         return True
