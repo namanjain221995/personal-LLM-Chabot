@@ -165,12 +165,36 @@ def test_a_fast_turn_whose_prepass_fetches_shows_the_status_before_the_answer(wi
     from fastapi.testclient import TestClient
 
     from app import living_knowledge, main
+    from app.config import settings
     from app.living_knowledge import Prepared
+
+    # The fetch lasts until the handler has ANNOUNCED it. A fixed sleep here
+    # is a race the test loses on a loaded box: the first /chat of a process
+    # does cold imports between starting the pre-pass and awaiting it, a 50 ms
+    # fake fetch finishes first, and the handler is right not to announce a
+    # lookup that is already over (the "narrowest race" case in
+    # test_first_token_seams.py). Reproduced 2026-09-28 at load 7-9. So the
+    # fetch ends when the status has gone out through the handler's own emit;
+    # a handler that never announces it hits the (shortened) deadline instead
+    # and the assertion below says so.
+    announced = asyncio.Event()
+    real_await = main._await_knowledge
+
+    async def await_knowledge(task, started, emit, **kwargs):
+        async def relay(kind, data):
+            await emit(kind, data)
+            if kind == "status":
+                announced.set()
+
+        return await real_await(task, started, relay, **kwargs)
+
+    monkeypatch.setattr(main, "_await_knowledge", await_knowledge)
+    monkeypatch.setattr(settings, "knowledge_prepare_deadline_s", 3.0)
 
     async def fetching_prepare(question, *, emit=None, **kw):
         if emit is not None:
             await emit("lookup", {"query": question})  # "I am fetching now"
-        await asyncio.sleep(0.05)                      # the fetch
+        await announced.wait()                         # the fetch
         return Prepared()
 
     monkeypatch.setattr(living_knowledge, "prepare", fetching_prepare)

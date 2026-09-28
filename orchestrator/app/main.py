@@ -7078,7 +7078,16 @@ async def _await_knowledge(
     that is not happening broke the assistant-mode event contract once before.
 
     Raises asyncio.TimeoutError past the deadline, as `asyncio.wait_for` did.
+
+    `asyncio.timeout` has no equivalent of `wait_for`'s "deadline already past,
+    but the future is done" fast path: it arms the deadline, the first `await`
+    yields, and a result that was ALREADY computed is thrown away as a
+    TimeoutError. KNOWLEDGE_PREPARE_DEADLINE_S=0 is how an operator turns this
+    wait off (it is how the sibling topical knobs are documented), so that
+    shape has to keep handing back the grounding it already has.
     """
+    if deadline_s <= 0 and task.done():
+        return task.result()
     shielded = asyncio.shield(task)
     waiter: "Optional[asyncio.Future]" = asyncio.ensure_future(lookup_started.wait())
     try:

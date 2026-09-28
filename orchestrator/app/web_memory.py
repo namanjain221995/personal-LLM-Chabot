@@ -626,6 +626,9 @@ def _term_positions(text: str, wanted: set) -> Dict[str, List[int]]:
 #: joined by one of these ("oc-h1", "3.14.5", "kv_cache").
 _WORD_SEP = r"[.\-_]"
 
+#: A `_WORD` token, anchored: the shape every stem has.
+_TOKEN_SHAPE = re.compile(r"[a-z0-9]+(?:[.\-_][a-z0-9]+)*\Z")
+
 
 @functools.lru_cache(maxsize=256)
 def _wanted_token_re(wanted: FrozenSet[str]) -> "re.Pattern[str]":
@@ -645,7 +648,15 @@ def _wanted_token_re(wanted: FrozenSet[str]) -> "re.Pattern[str]":
     Cached because `_best_window` is called once per candidate page with the
     same question, and a retrieval windows up to 24 of them.
     """
-    alts = "|".join(sorted((re.escape(t) for t in wanted), key=len, reverse=True))
+    # A term that is not itself a `_WORD` token cannot be a stem (`_terms`
+    # yields `_stem` of a `_WORD` match and `_stem` only strips a suffix), and
+    # admitting one breaks the equivalence: a term opening with a separator
+    # matches where `_WORD` has no token boundary and SWALLOWS the real token,
+    # and one ending with a separator matches a token `_WORD` cannot produce.
+    usable = [t for t in wanted if _TOKEN_SHAPE.match(t)]
+    if not usable:
+        return re.compile(r"(?!)")
+    alts = "|".join(sorted((re.escape(t) for t in usable), key=len, reverse=True))
     return re.compile(
         r"(?<![a-z0-9])(?<![a-z0-9]" + _WORD_SEP + r")"
         r"(?:" + alts + r")[a-z0-9]*(?:" + _WORD_SEP + r"[a-z0-9]+)*"
