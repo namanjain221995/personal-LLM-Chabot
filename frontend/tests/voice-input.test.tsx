@@ -48,7 +48,7 @@ const ALL_STATES: VoiceState[] = [
   'idle',
   'requesting',
   'recording',
-  'transcribing',
+  'finishing',
   'error',
 ];
 
@@ -60,8 +60,8 @@ const ALL_STATES: VoiceState[] = [
 const LEGAL: Record<VoiceState, VoiceState[]> = {
   idle: ['requesting'],
   requesting: ['recording', 'idle', 'error'],
-  recording: ['transcribing', 'idle', 'error'],
-  transcribing: ['idle', 'error'],
+  recording: ['finishing', 'idle', 'error'],
+  finishing: ['idle', 'error'],
   error: ['idle', 'requesting'],
 };
 
@@ -88,8 +88,8 @@ describe('the voice state machine', () => {
   it('refuses to reopen a recording that is already being transcribed', () => {
     // The failure this prevents: a second click on Stop, or a stale closure
     // from an older render, restarting a capture whose upload is in flight.
-    expect(canTransition('transcribing', 'recording')).toBe(false);
-    expect(canTransition('transcribing', 'idle')).toBe(true);
+    expect(canTransition('finishing', 'recording')).toBe(false);
+    expect(canTransition('finishing', 'idle')).toBe(true);
   });
 });
 
@@ -289,6 +289,7 @@ function jsonResponse(status: number, payload: unknown): Response {
 
 let getUserMedia: ReturnType<typeof vi.fn>;
 let fetchMock: ReturnType<typeof vi.fn>;
+let sessionsMock: ReturnType<typeof vi.fn>;
 /** The clock the hook measures recordings against, advanced by hand. */
 let clock = 0;
 
@@ -325,7 +326,19 @@ beforeEach(() => {
       processing_ms: 310,
     }),
   );
-  vi.stubGlobal('fetch', fetchMock);
+  // 2026-09-29: pressing the microphone first asks for a recording SESSION.
+  // Every test in this file is about the one-blob road, so the server here
+  // has sessions turned off, and `fetchMock` keeps meaning "the transcription
+  // POST". The session road has its own file: tests/voice-session-recorder.test.tsx.
+  sessionsMock = vi.fn(async () =>
+    jsonResponse(404, { detail: 'Long recordings are not enabled.', reason: 'sessions_off' }),
+  );
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((url: string, init?: RequestInit) =>
+      String(url).startsWith('/api/audio/sessions') ? sessionsMock(url, init) : fetchMock(url, init),
+    ),
+  );
 });
 
 afterEach(() => {
@@ -678,7 +691,7 @@ describe('the recording bar', () => {
   });
 
   it('renames its escape hatch once the recording is uploading', () => {
-    renderBar({ state: 'transcribing' });
+    renderBar({ state: 'finishing' });
     expect(screen.getByLabelText('Cancel transcription')).toBeTruthy();
     expect(screen.getByText('Transcribing your recording')).toBeTruthy();
     // Nothing left to stop — the recorder is already closed.

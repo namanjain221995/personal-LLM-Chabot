@@ -184,16 +184,26 @@ beforeEach(() => {
   }));
   vi.stubGlobal(
     'fetch',
-    vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        text: 'the status',
-        language: 'en',
-        duration_ms: 1200,
-        processing_ms: 310,
-      }),
-    })),
+    vi.fn(async (url: string) =>
+      // The meter is the same on both roads; these tests take the one-blob
+      // road, so the server here has recording sessions turned off.
+      String(url).startsWith('/api/audio/sessions')
+        ? {
+            ok: false,
+            status: 404,
+            json: async () => ({ detail: 'Not enabled.', reason: 'sessions_off' }),
+          }
+        : {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              text: 'the status',
+              language: 'en',
+              duration_ms: 1200,
+              processing_ms: 310,
+            }),
+          },
+    ),
   );
 });
 

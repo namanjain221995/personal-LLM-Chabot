@@ -44,9 +44,9 @@ import { imageExtFromMime } from '@/lib/pasted';
 import type { SelectedContext } from '@/lib/types';
 import { activateComposerMenuItem, trustLine } from '@/lib/composerMenu';
 import { AttachMenu } from './AttachMenu';
-import { VoiceBar } from './VoiceBar';
+import { VoiceBar, VoiceFollowUpLine } from './VoiceBar';
 import { useVoiceRecorder } from './useVoiceRecorder';
-import { mergeTranscript } from '@/lib/voice';
+import { mergeTranscript, replaceTranscript } from '@/lib/voice';
 import { ModelPicker } from './ModelPicker';
 import { QuotedContext } from './QuotedContext';
 import { useToast } from './Providers';
@@ -72,10 +72,10 @@ const MAX_DOCS = 5;
 const LINE_HEIGHT = 24;
 const MAX_ROWS = 10;
 /**
- * The dictation ceiling, ten minutes. Composer dictation, not transcription
- * of a meeting: the server enforces the same number (ASR_MAX_AUDIO_SECONDS),
- * and the recorder stops ITSELF at it so the person sees a finished recording
- * rather than an upload that gets refused.
+ * The LEGACY dictation ceiling, ten minutes, used only when the server has no
+ * recording sessions (POST /audio/transcribe refuses anything longer). A
+ * session has no ceiling: the owner asked for an hour and more on 2026-09-28,
+ * and the recorder sends it in parts while the person talks.
  */
 const VOICE_MAX_MS = 10 * 60 * 1000;
 
@@ -484,9 +484,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     const videoAllowed = features?.video_analysis !== false;
     const voice = useVoiceRecorder({
       maxMs: VOICE_MAX_MS,
-      onTranscript: (transcript, notice) => {
+      onTranscript: (transcript, notice, replaces) => {
         setText((prev) => {
-          const next = mergeTranscript(prev, transcript);
+          // `replaces` is set when a saved recording was transcribed again
+          // (Retry): its first transcript is already in the draft.
+          const next = replaces
+            ? replaceTranscript(prev, replaces, transcript)
+            : mergeTranscript(prev, transcript);
           onDraftChange?.(next);
           return next;
         });
@@ -504,7 +508,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     const voiceActive =
       voice.state === 'requesting' ||
       voice.state === 'recording' ||
-      voice.state === 'transcribing';
+      voice.state === 'finishing';
 
     // One place to surface a recording failure, so it reads like every other
     // error in the app rather than inventing a second error surface inside
@@ -1223,6 +1227,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 ))}
               </div>
             )}
+            {/* What a finished dictation left to do: Retry a saved
+                recording's missing parts, end one left running elsewhere, or
+                insert one a closed tab finished. */}
+            {voice.followUp && !voiceActive && <VoiceFollowUpLine followUp={voice.followUp} />}
             <textarea
               ref={textareaRef}
               value={text}
@@ -1284,10 +1292,13 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 point is that the transcript joins what is already typed. */}
             {voiceActive ? (
               <VoiceBar
-                state={voice.state as 'requesting' | 'recording' | 'transcribing'}
+                state={voice.state as 'requesting' | 'recording' | 'finishing'}
                 levels={voice.levels}
                 elapsedMs={voice.elapsedMs}
-                maxMs={VOICE_MAX_MS}
+                maxMs={voice.limitMs}
+                progress={voice.progress}
+                hint={voice.hint}
+                warning={voice.warning}
                 onCancel={voice.cancel}
                 onStop={voice.stop}
               />
