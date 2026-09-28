@@ -74,8 +74,11 @@ def _outline(headings):
             "needs_current_facts": False, "assumptions": []}
 
 
-def _section(heading, words):
-    return {"blocks": [{"type": "heading", "level": 1, "text": heading}] + _prose(words)}
+def _section(heading, words, *, placeholder=False):
+    blocks = [{"type": "heading", "level": 1, "text": heading}] + _prose(words)
+    if placeholder:
+        blocks.append({"type": "paragraph", "text": "TBD"})
+    return {"blocks": blocks}
 
 
 def _doc(headings, words_each):
@@ -93,6 +96,19 @@ def _headings(spec):
 # ------------------------------------------- B-1: a correction may not halve --
 
 
+#
+# UPDATED 2026-09-27. B-1's scenario was the COVERAGE correction on a
+# sectioned draft, and that correction no longer exists: a sectioned draft
+# missing a requested section is now repaired one section at a time
+# (`_write_missing_sections`), because the whole-document correction is
+# `_compose_once` and on a create that call does not carry the draft at all
+# — measured in sf-local-ai-orchestrator-1 on 2026-09-27, where it cost a
+# 13th model call and added nothing. The FLOOR B-1 bought is unchanged and
+# still guards every whole-document correction a sectioned draft can still
+# get; the two tests below exercise it through the PLACEHOLDER pass, which
+# is one such call, and then check the coverage repair beside it.
+
+
 def test_a_correction_cannot_halve_a_document_written_section_by_section(monkeypatch):
     """QA reproduced 6,005 words across Overview/Findings/Recommendations
     being replaced, in ONE call, by 3,205 words across Overview/Appendix —
@@ -102,36 +118,50 @@ def test_a_correction_cannot_halve_a_document_written_section_by_section(monkeyp
                    "Recommendations and Appendix")
     model = _Model(
         [_outline(["Overview", "Findings", "Recommendations"])]
-        + [_section(h, 2_000) for h in ("Overview", "Findings", "Recommendations")]
-        # The one correction call that adds the missing "Appendix" — and
-        # drops two sections while it is there.
+        + [_section("Overview", 2_000), _section("Findings", 2_000),
+           _section("Recommendations", 2_000, placeholder=True)]
+        # The one whole-document correction this path still makes — the
+        # placeholder pass — dropping two sections while it is there.
         + [_doc(["Overview", "Appendix"], 1_600)]
+        # And the coverage repair beside it: ONE call for the ONE section the
+        # request named and the draft does not have.
+        + [_section("Appendix", 400)]
     )
     monkeypatch.setattr(llm, "json_completion", model)
     result = asyncio.run(C.compose(_req(instruction, tables=[_table()])))
 
     words = len(S.text_of(result.spec).split())
-    assert words == 6_005, f"the sectioned draft must survive the correction, got {words} words"
-    assert _headings(result.spec) == ["Overview", "Findings", "Recommendations"]
-    assert any("was not applied" in w and "6,005 words to 3,204" in w for w in result.warnings), result.warnings
-    # The one section the model never wrote is still reported honestly.
-    assert any(w.startswith("requested sections not found in the document: Appendix") for w in result.warnings)
+    assert words == 6_006 + 401, f"the sectioned draft must survive the correction, got {words} words"
+    assert _headings(result.spec) == ["Overview", "Findings", "Recommendations", "Appendix"]
+    assert any("was not applied" in w and "6,006 words to 3,204" in w for w in result.warnings), result.warnings
+    # The placeholder the refused correction was meant to remove is reported.
+    assert any(w.startswith("placeholder text remains") for w in result.warnings), result.warnings
+    # And the section the sectioned writer never planned is now IN the file,
+    # so there is nothing left to report as missing.
+    assert not any(w.startswith("requested sections not found") for w in result.warnings), result.warnings
+    assert model.calls == ["artifact_outline", "artifact_section_write", "artifact_section_write",
+                           "artifact_section_write", "artifact_document",
+                           "artifact_section_write"], model.calls
 
 
 def test_a_correction_that_keeps_the_document_is_still_applied(monkeypatch):
-    """The floor is a floor, not a ban: a correction that adds the missing
-    section and keeps the rest is applied exactly as before."""
+    """The floor is a floor, not a ban: a whole-document correction that
+    keeps the draft is applied exactly as before."""
     instruction = ("please give a big report on the customers file with sections Overview, Findings, "
                    "Recommendations and Appendix")
     model = _Model(
         [_outline(["Overview", "Findings", "Recommendations"])]
-        + [_section(h, 2_000) for h in ("Overview", "Findings", "Recommendations")]
+        + [_section("Overview", 2_000), _section("Findings", 2_000),
+           _section("Recommendations", 2_000, placeholder=True)]
         + [_doc(["Overview", "Findings", "Recommendations", "Appendix"], 1_500)]
     )
     monkeypatch.setattr(llm, "json_completion", model)
     result = asyncio.run(C.compose(_req(instruction, tables=[_table()])))
     assert _headings(result.spec) == ["Overview", "Findings", "Recommendations", "Appendix"]
     assert not any("was not applied" in w for w in result.warnings), result.warnings
+    # The applied correction already carries Appendix, so the coverage repair
+    # spends nothing: five calls, not six.
+    assert model.calls.count("artifact_section_write") == 3, model.calls
 
 
 def test_an_edit_asked_to_be_shorter_may_still_shrink(monkeypatch):
@@ -320,8 +350,21 @@ def test_a_size_the_person_named_still_buys_the_sectioned_writer_at_fast(monkeyp
 
 
 def test_think_may_spend_the_sectioned_writer_on_a_derived_size(monkeypatch):
-    """Think and Max already pay for an outline pass, so a derived size
-    buys them the sectioned writer; Fast does not have one and does not."""
+    """Think and Max already pay for an outline pass, so a DERIVED size buys
+    them the sectioned writer; Fast has no outline pass, so a derived size
+    does not buy it there.
+
+    READ THAT NARROWLY. Fast is NOT excluded from the sectioned writer — the
+    chooser is `target.words > SECTIONED_WRITER_WORDS and (target.explicit
+    or budget.outline_pass)`, and `target.explicit` alone satisfies it at
+    every effort. The test above this one is the proof: "a big report" is an
+    explicit 3,000 words and takes the sectioned path AT FAST, and so does
+    the owner's own fifteen-section request once a size word is in it
+    (tests/test_artifact_sectioned_requested_sections.py).
+    An audit of 2026-09-27 quoted this docstring as "Fast is excluded from
+    the sectioned writer on purpose" and closed the owner's fifteen-section
+    complaint on it, while the live Fast request was on that path the whole
+    time."""
     model = _Model([_outline(FIFTEEN_SECTIONS)] + [_section(h, 400) for h in FIFTEEN_SECTIONS]
                    + [{"ok": True, "issues": []}])
     monkeypatch.setattr(llm, "json_completion", model)
