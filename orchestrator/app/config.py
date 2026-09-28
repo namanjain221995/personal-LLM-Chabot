@@ -968,6 +968,38 @@ class Settings:
         self.brave_api_key: str = os.environ.get("BRAVE_API_KEY", "")
         self.search_max_results: int = _int("SEARCH_MAX_RESULTS", 100)
         self.fetch_timeout_ms: int = _int("FETCH_TIMEOUT_MS", 8000)
+        # EXTRACT_TIMEOUT_MS — how long one page's extraction may hold the
+        # turn. trafilatura/lxml (and pypdfium2 for a PDF) parse bodies up to
+        # FETCH_MAX_BYTES of CPU-bound work on a single-worker pool, and until
+        # 2026-09-28 that await had NO BOUND of any kind: no env var, no
+        # asyncio timeout, nothing, in either the Fast lookup or the full
+        # search engine. Measured on the Fast path, extraction was p50 262 ms,
+        # p95 2,386 ms and max 3,510 ms — the largest single contributor to
+        # that path's tail.
+        #
+        # 5 s is deliberately ABOVE the measured maximum: the point is to stop
+        # a pathological page holding a turn open for ever, not to drop pages
+        # that work today. A page that exceeds it is cited from the provider's
+        # snippet, which is what `_fetch_source` already does for a page that
+        # times out on the network.
+        #
+        # HONEST LIMIT: `run_in_executor` cannot be cancelled, so this bounds
+        # THE WAIT and not the work. The thread finishes its parse and the
+        # single extraction worker stays busy until it does.
+        self.extract_timeout_ms: int = _int("EXTRACT_TIMEOUT_MS", 5000)
+        # INDEX_PENDING_TIMEOUT_MS — how long the embed-and-write of the pages
+        # just fetched may hold the answer. It is deliberately SYNCHRONOUS
+        # (engines/search.py): the caller is about to read the corpus back, so
+        # a write-behind index would answer from evidence that has not landed.
+        # It also had no bound, and was measured at max 4,305 ms inside a
+        # single 8,432 ms pre-pass.
+        #
+        # 6 s is above that maximum for the same reason as above. On a
+        # timeout the pages are already STORED — only the vector index lags,
+        # and the next turn's `index_pending` picks them up, which is what
+        # "pending" means. The answer is then grounded on what the store
+        # already held rather than on the newest page.
+        self.index_pending_timeout_ms: int = _int("INDEX_PENDING_TIMEOUT_MS", 6000)
         self.fetch_max_bytes: int = _int("FETCH_MAX_BYTES", 5_000_000)
         # Per-source extraction budget (~2k tokens ≈ 8k chars) and per-user
         # search rate limit (searches per minute).
