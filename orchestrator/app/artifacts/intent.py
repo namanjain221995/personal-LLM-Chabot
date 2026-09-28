@@ -401,9 +401,33 @@ _IMPERATIVE_EDIT_RE = re.compile(
 #: in front of it to be the object. "update" alone is not an instruction, and
 #: "the report is out of date" never reaches here — the verb is not final.
 _SOV_EDIT_RE = re.compile(
-    rf"\b\w[\w-]*\s+(?:{_EDIT_VERB})\s*(?:_in_|_this_|_give_|kar(?:o|do|dijiye)?|karo|do)?\s*[.!?]?\s*$",
+    rf"\b\w[\w-]*\s+(?:{_EDIT_VERB})\s*"
+    r"(?:_in_|_this_|_give_|kar\s*do|kar\s*dijiye|kari\s+(?:do|nakho)|kardo|karo|do)?\s*[.!?]?\s*$",
     re.I,
 )
+#: ...AND THE WORDS MUST BE IN A LANGUAGE THAT PUTS THE VERB LAST. English
+#: does not: an English sentence that ends in "change", "update" or "fix"
+#: ends in a NOUN — "give me bullet points on climate change", "the latest
+#: software update", "a quick fix" — and the rule above made the first of
+#: those an edit of whatever file was open (AS3 verifier case, CI shard 3 on
+#: b010719e, 2026-09-28). So the verb-last reading needs evidence of the
+#: grammar in the person's OWN words, read before `normalize` folds it away
+#: ("colors edit karo" normalises to "color update"): Hindi or Gujarati
+#: script, or a Hinglish/Gujlish light verb — the words lexicon's rules turn
+#: into add / remove / change / update. `language_of` alone is not that
+#: evidence: it calls "give me the latest software update" Hinglish, because
+#: "me" is a Hindi word too.
+_INDIC_LIGHT_VERB_RE = re.compile(
+    r"(?<![\wऀ-૿])(?:karo|kar\s*do|kardo|kar\s*dijiye|karjo|kari\s+(?:do|aapo|dejo|nakho)|"
+    r"daal\s*do|dal\s*do|daalo|daldo|jod\s*do|jodo|umero|umeri\s+do|hata\s*do|hatao|nikal\s*do|nikalo|"
+    r"kadhi\s+nakho|kadho|badal\s*do|badlo|badli\s+(?:do|nakho))(?![\wऀ-૿])",
+    re.I,
+)
+
+
+def _said_verb_last(raw: str, language: str) -> bool:
+    """The person's own words carry verb-last grammar (see `_SOV_EDIT_RE`)."""
+    return language in ("hi", "gu") or bool(_INDIC_LIGHT_VERB_RE.search(raw or ""))
 #: Polite imperatives are requests: "can you make…", "could you create…".
 _POLITE_RE = re.compile(r"^\s*(?:can|could|would|will|please|pls|kindly)\b\s*(?:you|u)?\s*(?:please\s+)?", re.I)
 #: A capability question: a modal, a making verb, a format in the PLURAL or
@@ -3497,7 +3521,7 @@ def decide(
                 and (_REFERENCE_RE.search(low) or _mentions_hint(low, artifact_hints)):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit")
         if not _is_remark(low) and len(low.split()) <= 12 and (
-            _IMPERATIVE_EDIT_RE.match(low) or _SOV_EDIT_RE.search(low)
+            _IMPERATIVE_EDIT_RE.match(low) or (_SOV_EDIT_RE.search(low) and _said_verb_last(raw, language))
         ):
             return made("edit", reference=_which(low, artifact_hints), reference_hint=_hint(low, artifact_hints), rule="edit-imperative")
         # 2d. A style clause, or an edit verb on an element (AS3 (f)): "make

@@ -83,6 +83,33 @@ def test_the_arm_needs_something_in_front_of_the_verb():
     assert _SOV_EDIT_RE.search("update") is None
 
 
+@pytest.mark.parametrize("text", [
+    "give me bullet points on climate change",   # the AS3 verifier case CI caught
+    "give me the latest software update",        # language_of calls this Hinglish ("me")
+    "how to do a quick fix",                     # also "Hinglish" ("do", "to")
+    "write a note on the policy change",
+    "summarise the price change",
+])
+def test_an_english_sentence_ending_in_a_noun_is_not_a_verb_last_edit(text):
+    """In English the word after the object is a NOUN: "climate change",
+    "software update", "quick fix". The first of these was an edit of the
+    open file on b010719e (CI shard 3, test_artifact_as3_verifier.py:141),
+    because the verb-last arm read `climate change` as <object> <verb>. The
+    arm now needs verb-last grammar in the person's own words."""
+    intent = I.decide(text, artifact_hints=["Sales Report"], **OPEN)
+    assert intent.action != "edit", (text, intent.action, intent.rule)
+
+
+@pytest.mark.parametrize("text", [
+    "heading remove kar do",      # the light verb survives normalize here
+    "title change karo",
+    "chart ma color badlo",
+])
+def test_a_light_verb_is_the_evidence_of_verb_last_grammar(text):
+    intent = I.decide(text, **OPEN)
+    assert intent.action == "edit", (text, intent.action, intent.rule)
+
+
 def test_the_rule_only_fires_on_a_short_message():
     """The caller bounds this at 12 words. A long sentence that happens to end
     in an edit verb is prose, not an instruction."""
