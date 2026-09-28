@@ -5811,9 +5811,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .living_knowledge import Prepared
 
                 try:
-                    prepared_early = await asyncio.wait_for(
-                        asyncio.shield(knowledge_task),
-                        timeout=float(settings.knowledge_prepare_deadline_s),
+                    prepared_early = await _await_knowledge(
+                        knowledge_task,
+                        knowledge_lookup_started,
+                        emit,
+                        deadline_s=float(settings.knowledge_prepare_deadline_s),
                     )
                 except asyncio.TimeoutError:
                     knowledge_task.cancel()
@@ -6479,10 +6481,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 if prepared_early is not None:
                     prepared = prepared_early
                 elif knowledge_task is not None:
+                    # NOT REACHED on the assistant path since the pre-pass was
+                    # awaited above (`prepared_early` is set whenever
+                    # `knowledge_task` is): that is why the status line this
+                    # branch exists for never appeared on the turns whose
+                    # pre-pass fetched a page, and it is now emitted from the
+                    # await itself (`_await_knowledge`). Kept as the fallback
+                    # for a shape that reaches here without that await.
                     if knowledge_lookup_started.is_set() and not knowledge_task.done():
-                        # A live lookup is genuinely in flight and the user
-                        # is now waiting on exactly that. Say so instead of
-                        # showing an empty spinner.
                         await emit("status", {"text": "Checking recent sources…"})
                     prepared = await knowledge_task
                 else:
@@ -7046,6 +7052,49 @@ class StopRequest(BaseModel):
     @classmethod
     def _conversation_id_is_not_synthetic(cls, value: Optional[str]) -> Optional[str]:
         return _reject_synthetic_conversation_id(value)
+
+
+async def _await_knowledge(
+    task: "asyncio.Task",
+    lookup_started: "asyncio.Event",
+    emit,
+    *,
+    deadline_s: float,
+):
+    """Wait for the knowledge pre-pass, saying so if it goes to the network.
+
+    WHY (2026-09-28). The pre-pass is awaited here under
+    KNOWLEDGE_PREPARE_DEADLINE_S (12 s) on a path whose budget is one second,
+    and on the 2 of 20 live Fast turns whose pre-pass fetched a page that wait
+    ran 5.0-9.6 s — the measured p95 of 10 s — with NOTHING on screen. The
+    status line written for exactly that case sat below, on a branch that
+    `prepared_early` makes unreachable, so it never fired once.
+
+    The bound is unchanged and nothing is skipped: the only difference is that
+    the ONE slow branch announces itself. `lookup_started` is set by the
+    pre-pass when it enters the live lookup, not merely when it is still
+    running — on a host where the embedding or router calls fail slowly an
+    unfinished task means nothing is being fetched, and announcing a lookup
+    that is not happening broke the assistant-mode event contract once before.
+
+    Raises asyncio.TimeoutError past the deadline, as `asyncio.wait_for` did.
+    """
+    shielded = asyncio.shield(task)
+    waiter: "Optional[asyncio.Future]" = asyncio.ensure_future(lookup_started.wait())
+    try:
+        async with asyncio.timeout(deadline_s):
+            while True:
+                waiting = {shielded} if waiter is None else {shielded, waiter}
+                done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+                if shielded in done:
+                    return shielded.result()
+                # The lookup started and the answer is now waiting on it.
+                waiter = None  # announced once, then only the task is awaited
+                with contextlib.suppress(Exception):
+                    await emit("status", {"text": "Checking recent sources…"})
+    finally:
+        if waiter is not None and not waiter.done():
+            waiter.cancel()
 
 
 async def _prepare_knowledge(
