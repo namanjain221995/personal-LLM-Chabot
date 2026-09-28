@@ -59,11 +59,21 @@ describe('parseRecordingPage', () => {
           bytes: 980_000,
           mimeType: 'audio/webm',
           deleteAfter: null,
+          kept: true,
           preview: 'hello there',
         },
       ],
       nextBefore: '2026-09-29T04:05:06.123456+00:00',
     });
+  });
+
+  it("reads the server's kept flag, and takes a missing one as kept", () => {
+    const row = { session_id: ID, created_at: '2026-09-29T00:00:00+00:00', status: 'done' };
+    const page = parseRecordingPage({
+      sessions: [{ ...row, kept: false }, { ...row, session_id: 'cd'.repeat(16) }],
+      next_before: null,
+    });
+    expect(page?.recordings.map((r) => r.kept)).toEqual([false, true]);
   });
 
   it('drops rows it could not play or delete, and cancelled ones', () => {
@@ -113,6 +123,11 @@ describe('removedByRetention', () => {
     expect(removedByRetention(rec('2026-10-29T12:00:00+00:00'), now)).toBe(false);
     expect(removedByRetention(rec('2026-09-28T12:00:00+00:00'), now)).toBe(true);
     expect(removedByRetention(rec('not a time'), now)).toBe(false);
+  });
+  it("is true whenever the server says the audio is no longer kept", () => {
+    const now = Date.parse('2026-09-29T12:00:00Z');
+    expect(removedByRetention({ deleteAfter: null, kept: false } as Recording, now)).toBe(true);
+    expect(removedByRetention({ deleteAfter: null, kept: true } as Recording, now)).toBe(false);
   });
 });
 

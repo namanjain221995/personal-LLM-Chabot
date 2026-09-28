@@ -78,6 +78,7 @@ function retentionNote(rec: Recording, removed: boolean): string | null {
   if (removed && rec.deleteAfter) {
     return `Its audio and transcript were deleted automatically on ${formatDay(rec.deleteAfter)}.`;
   }
+  if (removed) return 'Its audio and transcript are no longer stored.';
   if (rec.deleteAfter) return `Kept until ${formatDay(rec.deleteAfter)}, then deleted automatically.`;
   // delete_after is null for a finished recording only when retention is off.
   if (rec.status === 'done' || rec.status === 'failed') return 'Kept until you delete it.';

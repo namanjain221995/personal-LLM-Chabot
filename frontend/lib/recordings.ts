@@ -56,6 +56,12 @@ export interface Recording {
   mimeType: string | null;
   /** ISO time retention will delete it, or null: kept until deleted. */
   deleteAfter: string | null;
+  /**
+   * False once the server no longer holds the audio (the list's `kept`): the
+   * row is a tombstone whose read answers 404 and whose audio answers 410.
+   * True when the server sends no flag (an orchestrator older than it).
+   */
+  kept: boolean;
   /** First 120 characters of the transcript, only once status is done. */
   preview: string | null;
 }
@@ -112,6 +118,7 @@ export function parseRecordingPage(body: unknown): RecordingPage | null {
         bytes: num(r.bytes),
         mimeType: str(r.mime_type),
         deleteAfter: str(r.delete_after),
+        kept: r.kept !== false,
         preview: preview && preview.trim() ? preview : null,
       },
     ];
@@ -134,12 +141,14 @@ export const STATUS_LABEL: Record<RecordingStatus, string> = {
 
 /**
  * True when retention has already removed this recording's audio and
- * transcript. The list keeps such a row as a tombstone and says nothing more
- * (no `kept` flag), but `delete_after` is exactly the moment the hourly sweep
- * may remove it, so a past `delete_after` means the player would only get a
- * 410. The row stays deletable.
+ * transcript. The list keeps such a row as a tombstone. The server says so
+ * with `kept: false`; before it did, `delete_after` was the only sign, and it
+ * still counts: it is exactly the moment the hourly sweep may remove the
+ * audio, so a past `delete_after` means the player would only get a 410.
+ * The row stays deletable.
  */
 export function removedByRetention(rec: Recording, now: number = Date.now()): boolean {
+  if (rec.kept === false) return true;
   if (!rec.deleteAfter) return false;
   const at = Date.parse(rec.deleteAfter);
   return Number.isFinite(at) && at <= now;
