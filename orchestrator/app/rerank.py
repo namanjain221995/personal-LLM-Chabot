@@ -84,9 +84,24 @@ CANARY_NEGATIVE = "The museum opens at nine in the morning and closes at five on
 CANARY_MIN_POSITIVE = 0.9
 CANARY_MAX_NEGATIVE = 0.1
 CANARY_MIN_MARGIN = 0.7
-#: n ≥ this and every score within this band → the model is not judging.
+#: n ≥ this and every score within this band → LOOK CLOSER (see `degenerate`).
 DEGENERATE_MIN_N = 6
 DEGENERATE_BAND = 0.02
+#: Below this, the differences between scores are float noise and carry no
+#: ordering. Above it, a small spread is still a ranking.
+#:
+#: MEASURED 2026-09-28 against the live reranker (Qwen/Qwen3-Reranker-0.6B).
+#: On a mixed pool — "What is the capital city of France?" over eight
+#: documents, two about Paris and six about other things — the spread is
+#: 0.999443 and the order is exactly right. On the pool a Fast lookup actually
+#: builds, which is two fetched pages about the ONE topic that was asked,
+#: chunked into eight on-topic passages, the scores run 0.999973 down to
+#: 0.999759: a strict, sensible order inside a spread of 0.000214.
+#:
+#: That second case is three orders of magnitude above this floor and one
+#: hundred times BELOW `DEGENERATE_BAND`, which is why the band alone called
+#: it a failure.
+DEGENERATE_NOISE = 1e-6
 
 
 class RerankUnavailable(RuntimeError):
@@ -275,10 +290,36 @@ def parse_scores(payload: object, n: int) -> List[float]:
 
 
 def degenerate(scores: Sequence[float]) -> bool:
-    """All the same (within a hair) across a real pool: not a judgement."""
+    """No judgement at all: a score vector that does not order the pool.
+
+    A SMALL SPREAD IS NOT A FAILURE, and reading it as one cost this product
+    every cross-encoder judgement on the turns where retrieval worked best.
+    Measured 2026-09-28: of 29 Fast turns that went to the network, 29 came
+    back `rerank_degenerate` — and the live reranker was healthy the whole
+    time. A Fast lookup fetches two pages about the ONE topic that was asked
+    and chunks them into passages, so EVERY candidate is on-topic by
+    construction and the model says so: 0.999973 down to 0.999759, a strict
+    and sensible order inside a spread of 0.000214.
+
+    The old rule discarded that ranking because the spread was under
+    `DEGENERATE_BAND`. Discarding it is not neutral — `_answerability` returns
+    early without setting `ev.answer`, so the evidence keeps only its retrieval
+    score and `Prepared.confidence` stays 0.0, which is what the local-first
+    decision reads (ADR-0001 D6).
+
+    So the question is not "how wide is the spread" but "is there an ordering
+    here at all". A vector whose values differ only by float noise carries
+    none, and that is the failure this guard is for. A vector that separates
+    the pool by a fraction of a percent carries the best information anyone
+    has about it.
+    """
     if len(scores) < DEGENERATE_MIN_N:
         return False
-    return (max(scores) - min(scores)) < DEGENERATE_BAND
+    spread = max(scores) - min(scores)
+    if spread >= DEGENERATE_BAND:
+        return False
+    # Tight. It is still a judgement if it orders the pool by more than noise.
+    return spread < DEGENERATE_NOISE
 
 
 async def _post(query: str, documents: Sequence[str], instruction: Optional[str], timeout: float) -> List[float]:
