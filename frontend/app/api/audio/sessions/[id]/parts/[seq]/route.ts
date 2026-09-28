@@ -22,5 +22,5 @@ export async function PUT(
   const { id, seq } = await params;
   if (!SESSION_ID.test(id)) return notFound();
   if (!PART_SEQ.test(seq)) return badRequest('The part number must be a non-negative integer.');
-  return forwardSession(req, `/audio/sessions/${id}/parts/${seq}`);
+  return forwardSession(req, `/audio/sessions/${id}/parts/${seq}`, { kind: 'part' });
 }

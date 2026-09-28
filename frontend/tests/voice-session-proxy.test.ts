@@ -153,10 +153,17 @@ describe('a part passes through untouched', () => {
   });
 
   it('forwards the browser’s abort, so a withdrawn upload does not run on', async () => {
+    // The upstream signal also carries the proxy's own deadline since
+    // 2026-09-29, so it is not the browser's signal object any more; what is
+    // held is the behaviour: the browser going away aborts the upstream call.
     const { PUT } = await import('../app/api/audio/sessions/[id]/parts/[seq]/route');
-    const req = partRequest('http://x/');
+    const browser = new AbortController();
+    const req = new Request(partRequest('http://x/'), { signal: browser.signal });
     await PUT(req, params({ id: ID, seq: '0' }));
-    expect((upstream.mock.calls[0]![1] as RequestInit).signal).toBe(req.signal);
+    const upstreamSignal = (upstream.mock.calls[0]![1] as RequestInit).signal!;
+    expect(upstreamSignal.aborted).toBe(false);
+    browser.abort();
+    expect(upstreamSignal.aborted).toBe(true);
   });
 });
 

@@ -15,5 +15,5 @@ export async function POST(
 ): Promise<Response> {
   const { id } = await params;
   if (!SESSION_ID.test(id)) return notFound();
-  return forwardSession(req, `/audio/sessions/${id}/retranscribe`);
+  return forwardSession(req, `/audio/sessions/${id}/retranscribe`, { json: true });
 }
