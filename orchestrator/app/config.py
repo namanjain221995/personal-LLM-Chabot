@@ -278,9 +278,13 @@ class Settings:
         # other replica (asr.ASRTimeout), and /audio/transcribe heartbeats
         # while it waits, so no proxy's first-byte limit is met.
         self.asr_timeout_s: float = _float("ASR_TIMEOUT_S", 600.0)
-        # Composer dictation, not podcast transcription. Ten minutes is the
-        # ceiling; the browser stops recording at it rather than uploading
-        # something that will be refused.
+        # The ceiling of the LEGACY one-request dictation path
+        # (POST /audio/transcribe) only. Since 2026-09-29 the composer records
+        # through recording sessions (app/dictation.py), which have no length
+        # limit: the audio arrives in parts and is transcribed in windows of
+        # at most VOICE_SESSION_WINDOW_MAX_S, so this number never applies to
+        # them. It stays for stale tabs, direct callers, and deployments with
+        # VOICE_SESSIONS_ENABLED=false.
         self.asr_max_audio_seconds: int = _int("ASR_MAX_AUDIO_SECONDS", 600)
         # ~24 MB at the browser's Opus bitrate for ten minutes, with room for
         # a codec that compresses less well. Enforced while reading, before
@@ -308,11 +312,115 @@ class Settings:
         # Past this, callers are told to try again instead of queueing behind
         # work they cannot see.
         self.asr_queue_wait_s: float = _float("ASR_QUEUE_WAIT_S", 8.0)
-        # A ceiling on the transcript, not on the audio: a runaway decode on
-        # a noisy clip must not stream forever.
+        # DEAD CONFIGURATION, kept only so an environment file that sets it
+        # still parses. Nothing reads it: the whisper server takes no token
+        # limit, and a 9-minute dictation came back complete at 2,064 whisper
+        # tokens, twice this number, with its last sentence matching the
+        # audio at 525-540 s (measured 2026-09-28). It was a Qwen3-ASR-era
+        # setting, and it is not why long recordings failed.
         self.asr_max_tokens: int = _int("ASR_MAX_TOKENS", 1024)
         # Per person, per minute. Dictation is bursty but not machine-fast.
         self.asr_rate_per_min: int = _int("ASR_RATE_PER_MIN", 20)
+
+        # -- Recording sessions: chunked, stored dictation (2026-09-29) --------
+        #
+        # The composer's microphone opens a SESSION (app/dictation.py). The
+        # browser uploads the recording in numbered parts while it records,
+        # the server appends them to one stored file per recording, and the
+        # recording is transcribed in voice-activity windows as it arrives.
+        # There is no length limit on a session. The owner asked for the
+        # recording to be kept, so it is stored per user, mode 0600.
+        #
+        # Off switch: with this false the composer falls back to the legacy
+        # one-request path above, unchanged. Only meaningful when ASR_ENABLED.
+        self.voice_sessions_enabled: bool = _bool("VOICE_SESSIONS_ENABLED", True)
+        # Where recordings live: <dir>/<user_id>/<session_id>/. On the /data
+        # volume beside /data/video, and deliberately NOT under WORKSPACE_DIR,
+        # whose top-level directories are swept by age.
+        self.voice_data_dir: str = os.environ.get("VOICE_DATA_DIR", "/data/voice")
+        # Days a finished recording is kept. 0 keeps it until the person
+        # deletes it or the account is removed, because the owner asked for
+        # recordings to be stored; the retention window itself is an owner
+        # decision still open.
+        self.voice_retention_days: int = max(0, _int("VOICE_RETENTION_DAYS", 0))
+        # The MediaRecorder timeslice the browser must use, in ms. At the
+        # measured 128.7 kb/s Chrome default a 5 s part is about 80 KB.
+        self.voice_part_ms: int = max(250, _int("VOICE_PART_MS", 5000))
+        # The largest part accepted. A browser catching up after an outage
+        # concatenates queued slices up to this, so a reconnect costs a few
+        # requests instead of hundreds. 1 MiB, not the design's 8 MiB: the
+        # request-body middleware (main.body_cap_for) gives a part route the
+        # default 1 MiB cap, so a larger part would be refused before the route
+        # saw it. The create response reports the effective number
+        # (dictation.part_limit_bytes). At 128.7 kb/s, 1 MiB is ~65 s of audio.
+        self.voice_part_max_bytes: int = max(
+            64 * 1024, _int("VOICE_PART_MAX_BYTES", 1024 * 1024)
+        )
+        # 0 = the browser's default bitrate (about 128.7 kb/s measured in
+        # Chrome 153). A lower number is only safe after a word-error-rate
+        # comparison, which nobody has run.
+        self.voice_recorder_bits_per_second: int = max(
+            0, _int("VOICE_RECORDER_BITS_PER_SECOND", 0)
+        )
+        # A session that receives no part for this long is closed (ended_by
+        # 'idle') and everything received is transcribed and kept.
+        self.voice_session_idle_s: float = _float("VOICE_SESSION_IDLE_S", 600.0)
+        # How many sessions may be recording or finishing at once, across the
+        # deployment. Each one runs an ffmpeg decoder inside the orchestrator
+        # on the head node, whose resident memory has not been measured.
+        self.voice_session_max_active: int = max(1, _int("VOICE_SESSION_MAX_ACTIVE", 8))
+        # New sessions are refused, and a recording one is stopped, when the
+        # filesystem holding VOICE_DATA_DIR has less than this free.
+        self.voice_min_free_bytes: int = max(
+            0, _int("VOICE_MIN_FREE_BYTES", 20 * 1024 * 1024 * 1024)
+        )
+        # The longest clip a session sends the engine. Kept at or under 32 s:
+        # a 30 s window is 960,044 bytes of WAV, under Starlette's 1,048,576
+        # byte multipart spool threshold (measured), so the engine never
+        # writes a session window to its /tmp, and a clip inside whisper's
+        # 30 s receptive field needs no sequential long-form decoding.
+        self.voice_session_window_max_s: float = min(
+            32.0, max(5.0, _float("VOICE_SESSION_WINDOW_MAX_S", 30.0))
+        )
+        # A stretch of speech shorter than this is held while the person is
+        # still talking and packed with what follows, if the pause before it
+        # is under VOICE_SESSION_FLUSH_PAUSE_S: fewer, longer clips.
+        self.voice_session_window_min_s: float = max(0.0, _float("VOICE_SESSION_WINDOW_MIN_S", 8.0))
+        # A pause this long ends a window whatever its length, so a short
+        # answer followed by silence is not held back.
+        self.voice_session_flush_pause_s: float = max(0.5, _float("VOICE_SESSION_FLUSH_PAUSE_S", 3.0))
+        # How many SESSION windows may decode at once, across the whole fleet.
+        # 1 means recording sessions alone never put both nodes' speech
+        # engines to work at once, which caps their chat cost at the one-node
+        # figure (107 -> 53 tok/s measured 2026-09-28) instead of the
+        # both-nodes figure (28 tok/s). 2 is the owner's trade.
+        self.voice_session_asr_concurrency: int = max(1, _int("VOICE_SESSION_ASR_CONCURRENCY", 1))
+        # Before each window a session waits while someone is waiting for a
+        # chat answer: up to this long while the person is still recording...
+        self.voice_session_pace_live_s: float = max(0.0, _float("VOICE_SESSION_PACE_LIVE_S", 20.0))
+        # ...and up to this long after they pressed Stop, when they are the
+        # one waiting.
+        self.voice_session_pace_finish_s: float = max(0.0, _float("VOICE_SESSION_PACE_FINISH_S", 3.0))
+        # A window the engine has not answered in this long is given up on
+        # for this attempt (and retried). A 20-29 s clip decoded in 2.0-3.1 s
+        # on a quiet worker, so this is a stuck-engine guard, not a budget.
+        self.voice_session_window_timeout_s: float = max(
+            10.0, _float("VOICE_SESSION_WINDOW_TIMEOUT_S", 120.0)
+        )
+        # The lease a process holds on a session it is transcribing; renewed
+        # every third of it. A process that dies loses its sessions to the
+        # next one after this long, as video analyses do (V29).
+        self.voice_session_lease_ttl_s: float = max(1.0, _float("VOICE_SESSION_LEASE_TTL_S", 90.0))
+        # Re-read multi-region windows region by region when their language
+        # may have been decided for two languages (video.transcribe
+        # .language_guard). Off by default: about +33% engine time on the
+        # windows it checks.
+        self.voice_session_language_guard: bool = _bool("VOICE_SESSION_LANGUAGE_GUARD", False)
+        # Per person, per minute: sessions started, and parts uploaded. A
+        # 5 s part is 12 a minute; the part limit leaves room for a catch-up
+        # after an outage.
+        self.voice_session_create_per_min: int = max(1, _int("VOICE_SESSION_CREATE_PER_MIN", 10))
+        self.voice_part_per_min: int = max(1, _int("VOICE_PART_PER_MIN", 120))
 
         # -- Video understanding (2026-09-09) ----------------------------------
         #
