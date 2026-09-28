@@ -2912,8 +2912,20 @@ _MIGRATION_V42 = """
 --
 -- RETENTION. The row outlives the audio: VOICE_RETENTION_DAYS (0 = keep)
 -- deletes the directory and stamps audio_deleted_at, and the owner and admin
--- routes then answer 410. An account removal cascades the rows; the sweep
--- removes the orphaned directories after a 24 h grace.
+-- routes then answer 410. REMOVING A MEMBER DELETES NOTHING HERE: removal
+-- (authn/admin_api.remove_member) deletes the membership and disables the
+-- account but never the users row, so the ON DELETE CASCADE below fires only
+-- if an operator deletes the users row by hand. A removed member's recordings
+-- stay listable, playable and deletable by a super admin (audited). The
+-- sweep removes a directory with no row after a 24 h grace, which covers
+-- that manual deletion only.
+--
+-- A CONTINUATION (continues_session_id) is the session a browser opens for
+-- audio it held while offline longer than VOICE_SESSION_IDLE_S, after the
+-- server idle-closed the recording it belonged to. Its transcript is its
+-- own; its bytes may continue the earlier session's container stream, and
+-- audio_since (when the held audio can have started) is what the arrival
+-- and decoded-length ceilings count from.
 CREATE TABLE IF NOT EXISTS voice_sessions (
     id                text        PRIMARY KEY
                       CONSTRAINT voice_sessions_id CHECK (id ~ '^[0-9a-f]{32}$'),
@@ -2941,7 +2953,8 @@ CREATE TABLE IF NOT EXISTS voice_sessions (
                        'engine_unavailable', 'undecodable')),
     ended_by          text
                       CONSTRAINT voice_sessions_ended_by CHECK (ended_by IS NULL OR ended_by IN
-                      ('person', 'idle', 'storage_full', 'recorder_error', 'lost_parts', 'page_hidden')),
+                      ('person', 'idle', 'storage_full', 'recorder_error', 'lost_parts', 'page_hidden',
+                       'undecodable', 'quota_full')),
     language          text,
     language_code     text,
     -- sha256 of source.<ext>, computed when the recording ends.
@@ -2956,6 +2969,8 @@ CREATE TABLE IF NOT EXISTS voice_sessions (
     lease_owner       text,
     lease_expires_at  timestamptz,
     error             jsonb,
+    continues_session_id text REFERENCES voice_sessions(id) ON DELETE SET NULL,
+    audio_since       timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT voice_sessions_client_key UNIQUE (user_id, client_key)
 );
 
@@ -2970,6 +2985,10 @@ CREATE INDEX IF NOT EXISTS idx_voice_sessions_live
 -- The retention sweep: finished sessions whose audio still exists.
 CREATE INDEX IF NOT EXISTS idx_voice_sessions_sweep
     ON voice_sessions (finished_at) WHERE audio_deleted_at IS NULL;
+-- One continuation per idle-closed session (a second tab gets 409).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_sessions_one_continuation
+    ON voice_sessions (continues_session_id)
+    WHERE continues_session_id IS NOT NULL AND status <> 'cancelled';
 """
 
 

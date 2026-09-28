@@ -128,6 +128,12 @@ def voice(tmp_path, monkeypatch):
     # The suite uploads far faster than anyone speaks; the limits have their own test.
     monkeypatch.setattr(settings, "voice_part_per_min", 1_000_000)
     monkeypatch.setattr(settings, "voice_session_create_per_min", 1_000)
+    # ...and far faster than time passes: two hours arrive in about a minute.
+    # The arrival and decoded-length ceilings have their own tests
+    # (tests/test_voice_hardening.py).
+    monkeypatch.setattr(settings, "voice_max_bits_per_second", 1 << 40)
+    monkeypatch.setattr(settings, "voice_rate_slack_s", 1e9)
+    monkeypatch.setattr(settings, "voice_retranscribe_per_hour", 1_000)
     audio_api.reset_for_tests()
     with db.connection() as con:
         con.execute("TRUNCATE TABLE voice_sessions, voice_transcriptions RESTART IDENTITY")
