@@ -144,8 +144,32 @@ from . import visuals as VIS
 
 Action = str  # "create" | "edit" | "convert" | "export" | "none"
 
-#: How much of a message the rules read.
+#: How much of a message the rules read, in whitespace-collapsed
+#: characters. The bound is deliberate: a regex with a word gap is
+#: quadratic in what it scans and a 250 kB paste held the event loop for
+#: minutes (review 2026-09-11).
 _DECIDE_CHARS = 4000
+#: ...and WHERE those characters come from. The bound used to be the HEAD
+#: alone, which silently swallowed the ask people type AFTER their data: a
+#: 120-row paste (4,475 collapsed chars) then "Make a sheet of this for me
+#: please" decided none/no-request, where the identical words over 40 rows
+#: (1,515 chars) decided create, and the same ask ABOVE the paste survived
+#: 10,000 rows. The loss was POSITIONAL, not about length, and nothing
+#: logged it (W3, measured 2026-09-27).
+#:
+#: THE COST, measured today on the same box, median of 40 `decide` calls on
+#: a tab-separated paste with NO ask anywhere, so the verdict is identical
+#: either way and only the window differs: 120 rows 27.6 -> 28.1 ms, 400
+#: rows 27.7 -> 28.1 ms, 10,000 rows 29.8 -> 30.1 ms, 100,000 rows (3.84 MB)
+#: 54.5 -> 52.8 ms. Half a millisecond at most, and still flat in the size
+#: of the paste, because the TOTAL scanned length is unchanged: the head is
+#: 3,000 characters instead of 4,000 and the tail is the other 1,000.
+#: Deciding a FILE for one of these turns costs a further ~4.7 ms (27.6 ->
+#: 32.4 ms at 120 rows), which is the create path running on the window
+#: rather than falling through to `no-request` -- the price of the right
+#: answer, not of the window.
+_DECIDE_HEAD_CHARS = 3000
+_DECIDE_TAIL_CHARS = _DECIDE_CHARS - _DECIDE_HEAD_CHARS
 #: A conversation artifact's title is matched as a whole phrase, and only
 #: when it is distinctive enough to mean something: "The" or "Plan" would
 #: turn every later message with an edit verb into an edit.
@@ -208,9 +232,47 @@ _ARTIFACT_NOUNS = (
     r"calculator|financial model|budget\s+(?:calculator|tracker|planner|sheet|spread ?sheet|template|model|workbook)|"
     rf"{_DATA_NOUNS})"
 )
+#: `sheets?` and `doc` are the words the OWNER types, and they were the two
+#: `formats.explicit_formats` mapped ("sheet" -> xlsx, "doc" -> docx) while
+#: this constant did not, so every rule built on it was blind to them:
+#: `_AS_FORMAT_RE`, `_CONVERT_RE`, `_NEGATED_FORMAT_RE`, `_ABOUT_FORMAT_RE`,
+#: `_FORMAT_ONLY_RE`, `_FORMAT_OF_REF_RE`, `_MAKE_IT_FORMAT_RE`,
+#: `_NAMED_FILE_RE`, `_FORMAT_LIST_OBJECT_RE`, `_FUNCTION_WORDS_RE`. The
+#: worst of it was an exclusion being built: "make it a pdf, not a sheet"
+#: returned ['pdf', 'xlsx'] where "not a spreadsheet" returned ['pdf'] (W4,
+#: measured 2026-09-27). `tests/test_wider_misreads.py` now fails if the two
+#: vocabularies diverge again.
+#:
+#: The `sheets?` lookbehinds are the UNION of the two guards that already
+#: existed for the same word -- `_ARTIFACT_NOUNS` above (cheat, fact,
+#: balance, time, score, answer) and `formats._ALIAS["xlsx"]` (cheat, fact,
+#: term, style, rate, balance, time) -- so "cheat sheet", "balance sheet"
+#: and "style sheet" are not formats, and `(?!\s*\d)` keeps "sheet 2" a
+#: PART of a workbook rather than a format.
+#:
+#: `(?<!google )` IS THE QA FIX OF 2026-09-27, and it is the guard lexicon.py
+#: had already written for the same word one line over: `(?<!google )docs?`,
+#: because "google docs" names a PLACE and not a deliverable. Adding `sheets?`
+#: here without it made "google sheets" a destination format, and the create
+#: and convert paths acted on it. Measured on this branch against origin/dev
+#: 1f80aa3a2b, `decide()` rules only: "can you open the sheet in google
+#: sheets?" went none/no-request -> create/['xlsx'] under P0 and PA, "open the
+#: sheet in google sheets" went none/no-request -> convert/['xlsx'] under PC,
+#: and once the W2c fix above stopped the question guard from masking it, "is
+#: it possible to open the sheet in google sheets?" went none/no-request ->
+#: create/['xlsx'] under P0 and export/['xlsx'] under PA. None of the three
+#: asks for a file; all three name where the data already lives.
+#: "google slides" has the same shape and is NOT fixed here: `slides?` is a
+#: format word on origin/dev too, so 'is it possible to open this in google
+#: slides?' exports there as well -- pre-existing, and outside this branch.
+_SHEET_FORMAT = (
+    r"(?<!cheat )(?<!fact )(?<!term )(?<!style )(?<!rate )(?<!balance )(?<!time )(?<!score )(?<!answer )"
+    r"(?<!google )sheets?(?!\s*\d)"
+)
 _FORMAT_WORD = (
     rf"(?:pdf|docx|{_WORD_FORMAT}|powerpoint|power ?point|powerpint|pptx?|excel|exel|excell|xlsx|xlxs|xls|spread ?sheet|"
-    r"work ?book|slides?|deck|presentation|document|report|csv|cvs|comma[- ]separated(?: values?)?|data ?set|data file)"
+    rf"work ?book|slides?|deck|presentation|document|doc|report|csv|cvs|comma[- ]separated(?: values?)?|data ?set|data file|"
+    rf"{_SHEET_FORMAT})"
 )
 
 #: A creation verb, then an artifact noun within six words. The noun alone
@@ -241,7 +303,14 @@ _FILE_NOUNS = (
     r"excel|xlsx|spread ?sheet|work ?book|tracker|calculator|financial model|document|doc|report|sop|memo|brief|"
     r"one[- ]pagers?|proposal|policy|letter|handout|write[- ]?up|whitepaper|csv|data ?set|data file|file|dashboard)"
 )
-_NEW_FILE_RE = re.compile(rf"\b(?:new|another|separate|fresh|second|different)\s+(?:\w+\s+){{0,2}}?{_FILE_NOUNS}\b", re.I)
+#: The determiner words that make a file a NEW one, and the phrase they
+#: build. Named, because the refusal guard (`_REFUSED_NEW_FILE_RE` below)
+#: has to negate exactly the phrase this creates: W1 (measured 2026-09-27)
+#: was 24 turns where a refusal built the file, because the create signal
+#: and the negation guards read different vocabularies.
+_NEW_DETERMINER = r"(?:new|another|separate|fresh|second|different)"
+_NEW_FILE_PHRASE = rf"{_NEW_DETERMINER}\s+(?:\w+\s+){{0,2}}?{_FILE_NOUNS}"
+_NEW_FILE_RE = re.compile(rf"\b{_NEW_FILE_PHRASE}\b", re.I)
 #: "as a PDF" / "in Word" / "to Excel" — the deliverable named as a form.
 #: Up to two adjectives between the preposition and the format (AS3 (c)):
 #: "in a standard and classy format" is not this, "in a classy pdf" is.
@@ -266,7 +335,11 @@ _GAP_WORD = r"(?:(?!the\s|this\s|that\s|these\s|those\s|my\s|our\s|your\s|his\s|
 _AS_FORMAT_RE = re.compile(
     rf"\bas\s+(?:an?\s+|the\s+|one\s+|two\s+|three\s+|\d+\s+)?(?:{_ADJ}\s+){{0,2}}{_GAP_WORD}{{0,1}}(?:{_FORMAT_WORD})\b"
     rf"|\b(?:in|into|to)\s+(?:an?\s+|one\s+)?(?:{_ADJ}\s+){{0,2}}{_GAP_WORD}{{0,1}}(?:{_FORMAT_WORD})\b"
-    rf"|\b(?:{_FORMAT_WORD}|sheet)(?:\s+(?:file|format|version|copy|doc))?\s+_in_\b{LX.DEST_AFTER}"
+    # `|sheet` stood here by hand, in ONE of these four alternatives, while
+    # the other three could not see the word: that half-closed patch is what
+    # `_FORMAT_WORD` now carries for all of them, with the lookbehind guard
+    # the hand patch did not have (W4, 2026-09-27).
+    rf"|\b{_FORMAT_WORD}(?:\s+(?:file|format|version|copy|doc))?\s+_in_\b{LX.DEST_AFTER}"
     # "put it in a 2000 word doc" (normalised to "docx"): the count's `word`
     # stopped being the format (2026-09-18), so the doc it sizes is named here.
     r"|\b(?:as|in|into)\s+(?:an?\s+)?[0-9][0-9,]*[kK]?\s*[-–—]?\s*word\s+(?:docx|docs?|documents?|files?)\b",
@@ -335,6 +408,31 @@ _FIRST_PERSON_NEGATION_RE = re.compile(rf"\b(?:i|we)\s+(?:{_NEGATION_ADVERBS}\s+
 #: "not a Word document", "rather than a deck", "instead of Excel": a
 #: format the person ruled out, which must not become one of the files.
 _NEGATED_FORMAT_RE = re.compile(rf"\b(?:not|never|no|rather than|instead of|don['’]?t\s+want|do\s+not\s+want|no\s+need\s+for)\s+(?:(?:as|in|into|to)\s+)?(?:an?\s+|the\s+)?{_FORMAT_WORD}\b", re.I)
+#: The VOLITION verbs of a refusal. They are here and not in
+#: `_NEGATED_VERBS` on purpose: `_NEGATED_CLAUSE_RE` blanks the clause it
+#: matches unless `_FIRST_PERSON_NEGATION_RE` protects it, and "I don't
+#: want" is first person, so adding `want` there would have changed
+#: nothing. A refusal is a wish, not an inability.
+_REFUSAL_VERBS = r"(?:want(?:ed|s)?|need(?:ed|s)?|require(?:d|s)?|ask(?:ed|ing)?\s+for|bother(?:ed)?\s+with|care\s+for)"
+#: "I don't want another file", "I didn't ask for a new excel", "don't
+#: bother with another deck": a refusal of ANOTHER file, written in the
+#: determiner words `_NEW_FILE_RE` keys on. Every negation guard above
+#: wants the refused noun ADJACENT to its determiner
+#: (`_NEGATED_CLAUSE_RE`, `_NEGATED_FORMAT_RE`, `_CHAT_ONLY_RE`,
+#: `_NEGATED_FILE_RE`), and `new|another|separate|fresh|second|different`
+#: sits between them - so the one phrase carrying the strongest create
+#: signal was the one phrase no guard could see, and 24 of 24 measured
+#: refusals built a file once an artifact was in the room while 0 of 24
+#: did without one (W1, 2026-09-27). Only the volition verbs above are
+#: taken: an IMPERATIVE negation of a new file rules out a SECOND file and
+#: not the first, which is why `_NEGATED_FILE_RE` excludes it and why
+#: "Create a PDF. Don't create a separate file for the appendix." is still
+#: a create (QA 2026-09-18).
+_REFUSED_NEW_FILE_RE = re.compile(
+    rf"\b(?:{_NEGATION}|did\s?n['’]?t|didnt|no\s+need\s+for)\s+(?:{_NEGATION_ADVERBS}\s+)*"
+    rf"{_REFUSAL_VERBS}\s+(?:me\s+)?(?:an?\s+|any\s+|the\s+)?{_NEW_FILE_PHRASE}\b",
+    re.I,
+)
 #: A line of a pasted table: a tab, a pipe, or a comma/semicolon record
 #: of four or more cells with no space after the separators (a CSV export;
 #: a sentence puts a space after its commas). The prose the row count is
@@ -490,6 +588,21 @@ class ArtifactIntent:
 
 def _clean(text: str) -> str:
     return " ".join((text or "").split())
+
+
+def _decide_window(cleaned: str) -> str:
+    """The bounded slice of a whitespace-collapsed message the rules read:
+    its first `_DECIDE_HEAD_CHARS` characters and its last
+    `_DECIDE_TAIL_CHARS`, or all of it when it is short enough.
+
+    See `_DECIDE_HEAD_CHARS`. The two halves are joined by a full stop so
+    the head's cut-off clause cannot glue onto the tail's first one: every
+    clause-end pattern in this module ends at `.`, and without it "Team 3
+    Engineer" + "Make a sheet" would read as one clause.
+    """
+    if len(cleaned) <= _DECIDE_CHARS:
+        return cleaned
+    return cleaned[:_DECIDE_HEAD_CHARS] + " . " + cleaned[-_DECIDE_TAIL_CHARS:]
 
 
 def _first_clause(low: str) -> str:
@@ -658,10 +771,31 @@ _FOLLOWUP_VERB_RE = re.compile(
 _KEEP_VERB_RE = re.compile(r"\b(?:save|download|export|convert|_convert_)\b", re.I)
 #: "as a file", "into a nice looking document", "in a doc".
 _AS_FILE_RE = re.compile(rf"\b(?:as|in|into|to)\s+(?:an?\s+)?(?:{_ADJ}\s+){{0,2}}(?:file|document|doc|downloadable)\b", re.I)
+#: The words a person types the moment the product missed: "no, I meant
+#: pdf", "I said pdf", "as I said, pdf", "again, pdf". `_FORMAT_ONLY_RE`
+#: below is ANCHORED, and its leading set was a closed seven words
+#: (a|an|the|just|only|also|and), so a correction opener displaced the
+#: format word from position 0 and the match failed -- bare "pdf" exported
+#: the answer and every one of these six reached `no-request` (W5, measured
+#: 2026-09-27). The fallbacks could not cover it either: export-content-free
+#: and export-destination-only both require `not _content_words(low)`, and
+#: `meant`, `said`, `asked` are not in `_FUNCTION_WORDS_RE`, so they read as
+#: TOPIC words. This is the second strike in the owner's three-strike
+#: transcript, whose third turn opens "I said ???".
+#:
+#: BOUNDED BY A TEST THAT ALREADY PASSED: with a finite verb phrase after
+#: the opener ("no, I meant give me a pdf of that") the same openers cost
+#: nothing today, so only the ELLIPTICAL form was broken and widening the
+#: leading set is the whole fix.
+_CORRECTION_PREFACE = (
+    r"(?:(?:no|nope|nah|sorry|my\s+bad|oops|again|as)\W+)?"
+    r"(?:(?:i|we)\s+(?:meant|mean|said|asked\s+for|told\s+you|wanted|want)\W*)?"
+)
 #: A format with nothing but "please"/"version"/"of this": "docx version
-#: please", "pdf of this pls", "word file too".
+#: please", "pdf of this pls", "word file too" -- or a correction preface in
+#: front of exactly that (see `_CORRECTION_PREFACE`).
 _FORMAT_ONLY_RE = re.compile(
-    rf"^\W*(?:(?:a|an|the|just|only|also|and)\s+)?(?:{_ADJ}\s+)?(?:{_FORMAT_WORD})(?:\s+(?:file|version|copy|format|doc))?"
+    rf"^\W*{_CORRECTION_PREFACE}(?:(?:a|an|the|just|only|also|and)\s+)?(?:{_ADJ}\s+)?(?:{_FORMAT_WORD})(?:\s+(?:file|version|copy|format|doc))?"
     rf"(?:\s+(?:of|for)\s+(?:it|this|that|_this_|the\s+above|everything|all\s+of\s+(?:it|this|that)))?"
     rf"(?:\s+(?:please|too|as\s+well|also))*\W*$",
     re.I,
@@ -752,6 +886,27 @@ def _negates_every_file(low: str) -> bool:
         # and is blanked there, so one scan of the rest is enough.
         after = _without_negated_clauses(low[m.end():])
         return not (_CREATE_RE.search(after) or _AS_FORMAT_RE.search(after) or _NEW_FILE_RE.search(after))
+    return False
+
+
+def _refuses_another_file(low: str) -> bool:
+    """`low` (lower-cased, NOT yet clause-blanked) refuses ANOTHER file and
+    asks for nothing else in the same turn. See `_REFUSED_NEW_FILE_RE`.
+
+    A request on EITHER side of the refusal wins, because the refusal then
+    bounds a request rather than replacing it: "Create a PDF, I don't want
+    another excel" is the PDF and "I don't want another file, make a deck
+    instead" is the deck. Same shape as `_negates_every_file` above, one
+    scan of the text either side of the first match.
+    """
+    for m in _REFUSED_NEW_FILE_RE.finditer(low):
+        before = _without_negated_clauses(low[: m.start()])
+        if _CREATE_RE.search(before) or _AS_FORMAT_RE.search(before):
+            continue
+        after = _without_negated_clauses(low[m.end():])
+        if _CREATE_RE.search(after) or _AS_FORMAT_RE.search(after) or _NEW_FILE_RE.search(after):
+            continue
+        return True
     return False
 
 #: Chart phrasing that asks for one: a verb, "chart of|with|for", a chart
@@ -980,6 +1135,440 @@ _STORY_PLOT_RE = re.compile(
     re.I,
 )
 _QUESTION_ABOUT_RE = re.compile(r"^\W*(?:what|which|why|how|who|where|when|is|are|does|do|did|was|were)\b", re.I)
+#: The MODAL interrogative openers `_QUESTION_ABOUT_RE` does not hold:
+#: "would a new report help here?", "should we prepare a separate brief for
+#: legal?". Together the two cover the shapes that ask WHETHER to build
+#: something (W2, 2026-09-27).
+#: `\b` alone would fire on the "can" of "can't": the apostrophe is a
+#: non-word character, so "can't you just give it in docs? provide a dox
+#: file" -- a real production request (test_artifact_intent_labelled
+#: PRODUCTION_SHAPES) -- read as a question and lost its docx. A NEGATED
+#: auxiliary is a request, and `_REQUEST_OF_YOU_RE` below takes it.
+_MODAL_QUESTION_RE = re.compile(
+    r"^\W*(?:would|should|shall|could|can|will|may|might|must|am|have|has|had|if|whether)\b(?![\u2019'])", re.I)
+#: The AVAILABILITY nouns of an indirect request: "do you have the
+#: BANDWIDTH to also make a deck?". Asking whether the assistant is free to
+#: do the thing is the politest way there is of asking for the thing, and it
+#: is not a question about whether the thing is a good idea.
+#:
+#: FROZEN ON 2026-09-27, AND DO NOT ADD A WORD TO IT. This list is what made
+#: W2c ship the same defect twice: a moment, a sec, `have you got`, and the
+#: person's typo `bandwith` are all this frame and none of them is here.
+#: `_asks_you_to_build` below reads the INFINITIVE instead and needs no noun,
+#: which makes this constant vestigial for every shape that carries one:
+#: measured today, deleting this alternative from `_REQUEST_OF_YOU_RE` moves
+#: 0 of 920 probe rows, 0 of the 48 `HELD_OUT_STILL_A_FILE` cases, 0 of the
+#: 18 `HELD_OUT_INDIRECT_REQUESTS` cases, 0 of the 686 labelled items and 0
+#: of the 77 authored chart requests. It is kept only because deleting it is
+#: a wider change than the defect needs. THE NEXT PHRASING FOUND GOES TO
+#: `HELD_OUT_INDIRECT_REQUESTS` in tests/test_wider_misreads.py and is closed
+#: structurally; `test_the_two_indirect_request_enumerations_are_frozen`
+#: fails if this line or the feasibility adjectives below grow instead.
+_CAPACITY_NOUNS = (r"(?:bandwidth|time|capacity|capabilit(?:y|ies)|abilit(?:y|ies)|resources?|room|cycles|"
+                   r"headroom|energy)")
+#: The turn is addressed to the assistant AS A REQUEST. Narrower than
+#: `_POLITE_RE`, whose `you` is optional: "would a new report help here?"
+#: matches `_POLITE_RE` on its bare "would" and is not a request, so the
+#: question guard below cannot use `_POLITE_RE` as its escape hatch
+#: (measured 2026-09-27).
+#:
+#: THE INDIRECT FORMS BELOW ARE THE QA FIX OF 2026-09-27. The W2 guard is
+#: right that a question about building is not an order, but it read every
+#: INDIRECT request as one of those, and an indirect request is the shape a
+#: polite person uses: measured on this branch before the fix, `decide('do
+#: you have the bandwidth to also make a deck?', PC)` was
+#: `none`/`ambiguous` where origin/dev and fix/question-not-edit-r2 both
+#: produced the deck -- and it is case 38 of that branch's own 48-case
+#: `HELD_OUT_STILL_A_FILE` list, which this file's W2c section now carries.
+#: Five further phrasings went the same way ("do you have time to ...",
+#: "do you have the capacity to build a one-pager?", "is it possible to
+#: also make a deck?", "is there any way you can make a deck?", "do you
+#: think you could make a deck?"), one lost an EXPORT ("would it be
+#: possible to get a pdf of this?": export/export-followup-handover on
+#: origin/dev, none/no-request here), and with a FORMAT named the loss
+#: reached a fresh conversation too ("do you have the bandwidth to make a
+#: pdf?": create/['pdf'] on origin/dev under P0, PA, PC and PF;
+#: none/ambiguous on all four here).
+#:
+#: EVERY ALTERNATIVE BELOW WAS ABLATED ONE AT A TIME AND KEPT ONLY IF IT
+#: MOVED A ROW. "would you mind making a deck of this?", "do you mind making
+#: a deck?" and "are you able to make a deck?" are NOT here: they produce no
+#: file on origin/dev either (no-request, and `about-format` for the third,
+#: with or without the question mark), so a marker for them would have been
+#: unreachable. They are a separate pre-existing gap, marked
+#: xfail(strict=True) in tests/test_wider_misreads.py rather than asserted as
+#: correct.
+#:
+#: WHY THIS AND NOT "a build verb plus a deliverable noun makes a file",
+#: which is the rule the obvious reading suggests: every W2/W2b question
+#: carries both ("did you make a new SHEET?", "do you want me to write a
+#: MEMO?", "is it normal to create a second EXCEL for this?"), so that rule
+#: reverses the fix it sits next to. What separates the two families is WHO
+#: is being asked to act and WHEN: these frames put the work to the
+#: assistant, in the present. PAST tense stays out on purpose -- `did` is
+#: absent from the availability form below, because "did you have time to
+#: make the deck?" asks about the past, exactly as W2b's "did you make a new
+#: sheet?" does. So is the NORM question: "is it POSSIBLE to ..." is a
+#: request, "is it NORMAL/usual to create a second excel for this?" is W2b
+#: and must not match, which is why the adjective is named and not a class.
+_REQUEST_OF_YOU_RE = re.compile(
+    r"^\W*(?:please|pls|kindly)\b"
+    r"|^\W*(?:can|could|would|will|may|might)\s+(?:you|u)\b"
+    # The exasperated form, which is the owner's own tone: "can't you just
+    # give it in docs?", "won't you send the pdf".
+    r"|^\W*(?:can|could|would|wo|do|does|did|is|are|ai)n[\u2019']?t\s+(?:you|u)\b"
+    # "can I download this as a file?", "may I download the answer as a
+    # file?". The verb used to be a closed three (get|have|please), so every
+    # other verb of RECEIVING read as a question about building: measured on
+    # this branch before the fix, "can I download this as a file?" (item v16
+    # of tests/fixtures/artifact_intent_set.py, gold `convert` under PA) went
+    # from `export`/`export-followup` on origin/dev to `create`/`create` --
+    # a brand-new invented document in place of the answer the person had
+    # just read -- and "may I download the answer as a file?" produced
+    # nothing at all. First person asking to be given something is a
+    # request whatever the verb; it still has to carry a file signal
+    # downstream to produce one, because this pattern only declines to VETO.
+    r"|^\W*(?:can|could|may)\s+(?:i|we)\b"
+    r"|^\W*(?:i|we)\s+(?:need|want|would\s+like|'?d\s+like)\b"
+    # The availability question, present tense only (see above).
+    rf"|^\W*(?:do|does|would|will)\s+(?:you|u)\s+(?:still\s+)?(?:have|got)\s+"
+    rf"(?:the\s+|any\s+|enough\s+|some\s+)?{_CAPACITY_NOUNS}\b"
+    # "do you think you could make a deck?"
+    r"|^\W*(?:do|does|would)\s+(?:you|u)\s+(?:think|reckon|suppose)\s+(?:you|u)\s+"
+    r"(?:could|can|would|might|may)\b"
+    # "is there any way you can make a deck?", "any chance you could ...?"
+    r"|^\W*is\s+there\s+(?:any\s+|some\s+|a\s+)?(?:way|chance|possibility)\b"
+    # "is it possible to also make a deck?", "would it be possible to get a
+    # pdf of this?" -- `possible` and its synonyms of FEASIBILITY only.
+    r"|^\W*(?:is|would)\s+it\s+(?:be\s+)?(?:possible|feasible|doable)\b",
+    re.I,
+)
+#: The message OPENS with a creation or hand-over verb, so it is an order
+#: however it is punctuated: "OK Make sheet for Me ??", "give me a pdf of
+#: this?". This is the request marker the step-4 question guard needs: a
+#: named FORMAT is not one, and using `explicit` as the marker let "did you
+#: make a new sheet?" build a workbook in a FRESH conversation (W2b,
+#: 2026-09-27).
+_IMPERATIVE_CREATE_RE = re.compile(
+    r"^\W*(?:(?:please|pls|kindly|just|also|and|then|now|ok|okay|hey|hi|so)\W+)*"
+    r"(?:make|create|generate|build|write|draft|prepare|produce|compile|assemble|put\s+together|design|develop|"
+    r"give|send|get|export|convert|save|download|turn|put|format|wrap|render|print|share|provide|deliver|hand|"
+    r"_give_|_convert_)\b",
+    re.I,
+)
+
+
+#: THE VERBS THAT ARE NOT WORK -- and the list is this way round on purpose.
+#:
+#: W2d (2026-09-27) replaced an enumeration of politeness WRAPPERS with an
+#: enumeration of thirty build VERBS and called the open end closed. It was
+#: the same defect one level down, and QA defeated it the same day with `put`
+#: (the list held `put together` only), `collate`, `extract`, `organise`,
+#: `package` and `translate`, then with thirty-odd more of the same kind:
+#: `pull together`, `throw together`, `work up`, `draw up`, `type up`,
+#: `set up`, `mock up`, `sketch out`, `lay out`, `populate`, `tabulate`,
+#: `fill in`, `log`, `capture`, `copy`, `stick`, `pop`, `chuck`, `zip up`,
+#: `outline`, `publish`, `upload`, `summarise`, `chart`, `graph`, `plot`,
+#: `forward`, `shoot`, `ping`, `supply`, `hand over`, `hand me`. MEASURED
+#: 2026-09-28 on 852 rows over four contexts: origin/dev -> 581ffd67 gained
+#: 0 files and lost 52, and 32 of those losses -- twelve phrasings -- were
+#: indirect requests origin/dev built and the branch did not, in the exact
+#: family the branch exists to close. Every one was invisible to a probe that
+#: varies the wrapper, because the probe never varied the verb.
+#:
+#: So the verb is not enumerated either. ANY infinitive that governs a
+#: deliverable is read as work, EXCEPT the verbs that take the deliverable as
+#: their TOPIC or their EXISTING object: access, cognition, speech-about and
+#: undoing. "to REVIEW my pdf", "to READ the pdf", "to KNOW who edited the
+#: sheet", "to UNDO the last edit to the deck" -- `NON_BUILD_VERB_FRAMES` in
+#: tests/test_wider_misreads.py pins all seven of those. That class has a
+#: boundary English respects; "the verbs of producing" has none.
+#:
+#: AND THIS IS WHERE THE OPEN END BELONGS, which is what W2d's own commit
+#: message claimed and did not deliver. A verb missing from THIS list is an
+#: unwanted file: the person sees the card, says no, and W1's refusal path
+#: honours the no. A verb missing from the old build-verb list was a file
+#: that was asked for and silently never made. Same for the adverb list and
+#: the determiner list below -- a word missing from either makes the WORD
+#: ITSELF the candidate verb, which can only ever produce a file, never
+#: withhold one.
+#:
+#: THE LIST IS A TUPLE, not a pattern, so the tests can WALK it: every word in
+#: it is asserted to be a question in a request wrapper
+#: (`test_every_non_work_verb_is_still_a_question`), which is the check that
+#: catches a word put here by mistake. Three were, and were measured out again
+#: on the day it was written: `walk` ("to WALK me through this in a DECK" is a
+#: request for the deck, which origin/dev builds under PA, PC and PF), `scan`
+#: ("to SCAN this into a spreadsheet") and `drop` ("to DROP this into a
+#: spreadsheet"). A word wrongly ON this list is a LOST file; a word MISSING
+#: from it is a spurious card. That asymmetry is the whole reason the list is
+#: this way round, and it is also why the list is kept SHORT and each entry has
+#: to have no production sense at all.
+_NON_WORK_VERB_WORDS = (
+    # ACCESS: the deliverable already exists and is being looked at.
+    "read", "re-?read", "review", "proofread", "check", "re-?check", "verify", "confirm",
+    "validate", "see", "look", "view", "watch", "examine", "inspect", "skim", "browse",
+    "open", "close", "access", "revisit",
+    # COGNITION and OPINION.
+    "know", "understand", "learn", "think", "reckon", "remember", "recall", "forget",
+    "guess", "realise", "realize", "decide", "consider", "compare", "judge", "assess",
+    "evaluate",
+    # SPEECH ABOUT the deliverable rather than production of it.
+    "explain", "clarify", "describe", "discuss", "talk", "chat", "speak", "mention",
+    "comment", "ask", "answer", "reply", "respond", "tell", "say", "go", "meet", "sync",
+    # UNDOING and REMOVAL.
+    "undo", "revert", "rollback", r"roll\s+back", "delete", "remove", "cancel", "stop",
+    "ignore", "skip", "archive",
+    # FINDING what is already there.
+    "find", "locate", "search",
+)
+_NON_WORK_INFINITIVE_VERBS = "(?:" + "|".join(_NON_WORK_VERB_WORDS) + ")"
+#: The words that cannot BE the verb because they are not verbs: determiners,
+#: pronouns and the copula. Without this, "is it relevant to a deck?" reads
+#: `a` as the verb and builds the deck. A genuinely closed class, unlike the
+#: verbs above.
+_NOT_A_VERB_AFTER_TO = (
+    r"(?:a|an|the|this|that|these|those|my|our|your|his|her|their|its|it|me|us|you|u|them|him|"
+    r"some|any|no|one|two|three|both|each|every|all|more|most|another|such|what|which|who|whom|"
+    r"whose|be|being|been|here|there)"
+)
+#: The adverbs that may sit between `to` and the verb: "to ALSO make a deck",
+#: "to QUICKLY knock up a deck". `[a-z]+ly` is generic, with the -ly VERBS
+#: excluded -- `supply` is one of the verbs the old enumeration was defeated
+#: with, so reading it as an adverb would re-open the defect.
+_INF_ADVERBS = (
+    r"(?:also|just|then|now|maybe|perhaps|please|kindly|first|even|already|still|only|"
+    r"(?!(?:supply|apply|reply|imply|comply|multiply|rely|ply|fly)\b)[a-z]+ly)"
+)
+#: A word that cannot be the infinitive's verb, in any of the three ways.
+_NOT_THE_VERB = rf"(?:{_NON_WORK_INFINITIVE_VERBS}|{_NOT_A_VERB_AFTER_TO}|{_INF_ADVERBS})"
+#: The words that end the noun phrase, so the deliverable has to be reached
+#: without crossing one: "to email priya AND ask her for a deck" is not a
+#: request to email a deck. The gap may not cross a sentence end either
+#: (`.?!;` are outside its separator class), which is what keeps the head+tail
+#: window (`_decide_window` joins the two halves with " . ") from letting the
+#: TAIL of a long paste supply a deliverable.
+#:
+#: `to` IS NOT ONE OF THEM, and that was measured: "do you have a moment to
+#: convert this TO excel?" reaches its deliverable through the resultative
+#: preposition, and breaking on `to` cost that row in P0 and PA against both
+#: origin/dev and W2d (2026-09-28). An infinitive `to` inside the phrase is
+#: harmless, because the verb after it then has to fail the noun test anyway.
+_CLAUSE_BREAK_WORDS = (
+    r"(?:and|or|but|because|so|if|when|whether|that|which|who|while|since|unless|although|"
+    r"though|before|after|then)"
+)
+#: THE INFINITIVE AND ITS DELIVERABLE: `to make` + `a deck`, `to put` +
+#: `this in a spreadsheet`, `to make` + `a clean professional client ready
+#: deck`. Searched, not anchored: `_asks_you_to_build` below owns the wrapper,
+#: because the wrapper's three exclusions and its word bound are decided per
+#: CANDIDATE, and the first `to <verb>` in a turn is not always the ask ("SORRY
+#: TO BOTHER YOU, do you have a moment to make a deck?").
+#:
+#: The ten-word gap is a performance bound, not a grammar one: the gap is
+#: lazy and the candidates are linear in the turn, so the whole predicate
+#: stays linear. It is also generous enough that the clause-break guard, not
+#: the count, is what normally ends the phrase -- the longest deliverable
+#: phrase measured in the corpus is six words ("a clean professional client
+#: ready deck").
+_BUILD_INFINITIVE_RE = re.compile(
+    rf"(?P<inf>\bto\s+(?:{_INF_ADVERBS}\s+){{0,3}}(?!{_NOT_THE_VERB}\b)[a-z][\w'’-]*)"
+    rf"(?:[^\w.?!;]+(?!{_CLAUSE_BREAK_WORDS}\b)[\w'’-]+){{0,10}}?"
+    rf"[^\w.?!;]+{_ARTIFACT_NOUNS}\b",
+    re.I,
+)
+#: The wrapper asks about a PRACTICE, not about this piece of work: "is it
+#: NORMAL to create a second excel for this?" (W2b). THIS is the enumerated
+#: list now, and the inversion is deliberate -- see `_asks_you_to_build`.
+#:
+#: The word has to sit in the PREDICATE of a copula ("is it ok to ...") or be
+#: the -ly adverb ("do people normally ..."). A bare word list would have read
+#: the discourse openers people actually type -- "ok, do you have a moment to
+#: make a deck?", "right, is it viable to make a deck?" -- as norm questions
+#: and swallowed the request: measured 2026-09-27, both of those lost the file
+#: with the first draft of this pattern and keep it with this one.
+_NORM_WRAPPER_RE = re.compile(
+    r"\b(?:is|are|was|were|would|will|it's|it’s|its)\s+(?:it\s+|that\s+|this\s+)?(?:be\s+)?"
+    r"(?:really\s+|actually\s+|even\s+|ever\s+|at\s+all\s+|always\s+|generally\s+)?"
+    r"(?:normal|usual|typical|standard|customary|common|ok|okay|fine|acceptable|advisable|"
+    r"appropriate|proper|right|wise|sensible|smart|silly|necessary|needed|required|expected|"
+    r"mandatory|overkill|worth|weird|odd|strange|unusual|rude|allowed|permitted|legal|ethical|"
+    r"the\s+norm|good\s+practice|best\s+practice|standard\s+practice)\b"
+    r"|\b(?:normally|usually|typically|customarily|conventionally)\b", re.I)
+#: The wrapper puts the work on SOMEONE ELSE, so the infinitive is not being
+#: asked of the assistant: "do you want ME to write a memo?" (W2), "can I ask
+#: Ravi to make a deck?". The pronoun sits immediately before `to`.
+_OTHER_AGENT_RE = re.compile(
+    r"\b(?:me|us|him|her|them|myself|ourselves|someone|somebody|anyone|anybody|everyone|"
+    r"people|they|he|she)\s*$", re.I)
+#: The wrapper is about the PAST: "DID you have time to make the deck?",
+#: "WAS it possible to build a deck?" -- W2b's own family. Searched rather
+#: than anchored, because a discourse opener comes first often enough ("ok,
+#: did you have time to make the deck?"), and the auxiliary has to govern a
+#: subject so that "I had a thought" is not read as a past question.
+_PAST_WRAPPER_RE = re.compile(
+    r"\b(?:did|was|were|had)\s+(?:you|u|i|we|it|there|he|she|they|that|this)\b"
+    r"|\b(?:you|u|i|we|it|there|he|she|they|that|this|nobody|no\s+one)\s+"
+    r"(?:did|was|were|had|didn[\u2019']?t|wasn[\u2019']?t|weren[\u2019']?t|hadn[\u2019']?t)\b", re.I)
+#: The wrapper embeds SOMEBODY ELSE'S clause, so the infinitive is theirs:
+#: "is it clear what THEY NEED to make a deck?". A subject in the third
+#: person with its own verb, anywhere in the wrapper. `_OTHER_AGENT_RE` above
+#: only sees the pronoun directly before `to`, which is the "do you want me
+#: to" shape and not this one.
+_THIRD_PARTY_CLAUSE_RE = re.compile(
+    r"\b(?:they|he|she|someone|somebody|anyone|anybody|everyone|people|the\s+\w+|my\s+\w+|"
+    r"our\s+\w+|their\s+\w+)\s+"
+    r"(?:need|needs|want|wants|wanted|expect|expects|ask|asks|asked|has|have|is|are|will|would|"
+    r"said|says|plans?|planned|intends?|tried|tries|try)\b", re.I)
+#: THE WRAPPER IS ADDRESSED: it mentions the assistant (`you`) or the act
+#: (`it`, `there`). "I forgot to make a deck" and "we decided to build a deck"
+#: mention neither, and they are the shapes the test is for.
+#:
+#: THIS USED TO BE AN ANCHORED MATCH over a list of 25 discourse openers
+#: (`ok|so|hey|right|well|...`) followed by an optional auxiliary, and that
+#: list was a third open end on the SILENT side: "WHEN you get a chance, do
+#: you have a moment to make a deck?" lost its file because `when` was not on
+#: it, where the identical turn opening "if you get a chance" kept it
+#: (measured 2026-09-28, origin/dev builds the file for both). A list of the
+#: ways a person may open a sentence is not a list that can be finished, so
+#: the openers are not read at all: what is read is whether the assistant or
+#: the act is named anywhere before the infinitive. The three exclusions
+#: below -- the past, someone else's work, a practice -- are what keep a
+#: mention from being enough on its own, and they are searched over the same
+#: text.
+_ADDRESSED_WRAPPER_RE = re.compile(r"\b(?:you|u|it|there)\b", re.I)
+#: The turn's OPENING CLAUSE: leading punctuation skipped, then everything up
+#: to the first sentence end. `_asks_you_to_build` reads this and nothing
+#: else, which is what stops a request quoted at the bottom of a pasted mail
+#: thread from arming the rule (W3's disclosed exposure stays bounded to the
+#: quoted IMPERATIVE, which predates this branch).
+_OPENING_CLAUSE_RE = re.compile(r"^\W*([^.?!;]*)")
+#: HOW FAR IN THE ASK MAY START, in words of the wrapper. THIS IS THE ONE
+#: NUMBER LEFT ON THE SILENT SIDE of this rule and it is a floor, not a
+#: proof: a politeness wrapper longer than this loses the file, silently.
+#: Sixteen was chosen against the longest wrapper anyone has written down --
+#: "i know you are busy but do you have a moment to" is eleven -- and it is
+#: the bound that keeps a 5-row or 40-row paste (25 words and up, plus the
+#: `.` in a quoted From: address) from reaching a quoted ask.
+_WRAPPER_WORD_BOUND = 16
+
+
+def _asks_you_to_build(low: str) -> bool:
+    """The opening clause asks the assistant, however politely, to build a
+    named deliverable: "do you have a MOMENT to make a deck?".
+
+    THIS IS THE STRUCTURAL RULE, and it exists because the alternative --
+    naming the politeness wrapper -- is an open-ended enumeration that lost
+    the same file twice. `_REQUEST_OF_YOU_RE` above spells out an
+    availability NOUN (`bandwidth|time|capacity|…`) and a feasibility
+    ADJECTIVE (`possible|feasible|doable`), and English has no end of either:
+    QA found five more phrasings on 2026-09-27 AFTER the seven that constant
+    was widened for -- "do you have a moment to ...", "do you have a sec to
+    ...", "have you got time to ...", "do you have the bandwith to ..."
+    (a TYPO), "is it viable to ..." -- each of them `create` on origin/dev
+    2559fd1f36 under PC and PF and `none`/`ambiguous` here.
+
+    So the wrapper is not read at all, and NEITHER IS THE VERB. What is read
+    is the INFINITIVE: a clause that says `to <verb>` and names a deliverable
+    is asking for that deliverable, whatever words open it and whatever the
+    verb is, so the typo, the availability noun, the feasibility adjective and
+    the thirty-word build-verb list all stop mattering. The only verbs read
+    are the ones that CANNOT be work (`_NON_WORK_INFINITIVE_VERBS`).
+
+    THREE FAMILIES MUST STILL BE QUESTIONS, and each is excluded by a
+    property of the wrapper rather than by a phrase:
+
+    * THE PAST. "did you have time to make the deck?" asks what happened.
+      `_PAST_WRAPPER_RE`. This is why the rule is the infinitive and not "a
+      build verb plus a deliverable noun": "did you make a new sheet?" (W2b)
+      has both and no infinitive.
+    * SOMEONE ELSE'S WORK. "do you want me to write a memo?" (W2) puts the
+      memo on the person. `_OTHER_AGENT_RE`, the pronoun before `to`, and
+      `_THIRD_PARTY_CLAUSE_RE` for an embedded clause with its own subject
+      ("is it clear what they need to make a deck?").
+    * A PRACTICE. "is it normal to create a second excel for this?" (W2b) and
+      "is it usual to build a separate deck for this?" ask whether people do
+      this, not for the thing. `_NORM_WRAPPER_RE`.
+
+    ...and the wrapper itself has to be ADDRESSED: it names `you`, `it` or
+    `there` somewhere before the infinitive (`_ADDRESSED_WRAPPER_RE`). "I
+    forgot to make a deck" and "we decided to build a deck" name none of the
+    three, and this rule leaves them where they were.
+
+    EVERY CANDIDATE IS TRIED, not just the first. The first `to <verb>` in a
+    turn is often not the ask -- "SORRY TO BOTHER YOU, do you have a moment to
+    make a deck?" -- and with the verb no longer enumerated there is nothing
+    to stop `to bother` from being the leftmost match. Each candidate carries
+    its own wrapper, so each is excluded on its own.
+
+    THE INVERSION IS THE POINT, and W2d only got it half right. Version 3
+    (2026-09-28) finished it. `possible|feasible|doable` and
+    `bandwidth|time|capacity|…` are lists of the shapes that MUST make a file,
+    so a word missing from them is a file the person asked for and did not get
+    -- silent, invisible in every instrument this repo has, and the defect
+    that shipped twice. W2d moved the wrapper to a structural test and then
+    put the SAME open-ended list one level down, as thirty build verbs plus a
+    four-word deliverable gap, an eight-word wrapper bound and 25 discourse
+    openers. Measured on 852 rows: that cost 32 rows of files origin/dev
+    builds, in twelve phrasings, all silent. All four are now inverted or
+    removed:
+
+    * THE VERB is any verb except the verbs of access, cognition,
+      speech-about, undoing and finding (`_NON_WORK_VERB_WORDS`). A word
+      MISSING there is an unwanted file -- the visible side. A word wrongly
+      PRESENT is a lost file, which the inversion does NOT fix: `walk`, `scan`
+      and `drop` were three, found by sweeping 130 verbs against origin/dev,
+      and `test_every_non_work_verb_is_still_a_question` walks the tuple in
+      three wrappers so the next one is caught the same way.
+    * THE DELIVERABLE GAP ends at a clause-break word, not at a word count;
+      the count that remains is a performance bound at ten, which the corpus
+      never reaches (six is the longest).
+    * THE OPENERS are not read at all (`_ADDRESSED_WRAPPER_RE`).
+    * THE WRAPPER BOUND is `_WRAPPER_WORD_BOUND`, sixteen words, and IT IS
+      THE OTHER THING LEFT ON THE SILENT SIDE. It cannot be removed without an
+      attribution model, because it is also what stops a request quoted in a
+      pasted mail thread from arming the rule (W3). Named in the commit
+      message's left_open, with the measured row count.
+
+    Neither list is a proof; both are floors, and the floors whose OMISSIONS
+    can only cost a spurious card are the ones that are allowed to stay open.
+    """
+    clause = _OPENING_CLAUSE_RE.match(low).group(1)
+    for m in _BUILD_INFINITIVE_RE.finditer(clause):
+        wrapper = clause[: m.start("inf")]
+        if len(wrapper.split()) > _WRAPPER_WORD_BOUND:
+            # Candidates only move right, so no later one is closer in.
+            return False
+        if _PAST_WRAPPER_RE.search(wrapper) or _NORM_WRAPPER_RE.search(wrapper):
+            continue
+        if _OTHER_AGENT_RE.search(wrapper) or _THIRD_PARTY_CLAUSE_RE.search(wrapper):
+            continue
+        if _ADDRESSED_WRAPPER_RE.search(wrapper):
+            return True
+    return False
+
+
+def _question_not_a_request(low: str, *, raw: str = "") -> bool:
+    """The turn ASKS about making a file instead of ordering one.
+
+    A question mark, an interrogative opener, and nothing that addresses the
+    assistant as a request. Step 4's creation gate has had this test since
+    the "Would a report help here?" case; step 2b (`create-first-clause`)
+    did not, so an existing artifact REMOVED a guard rather than adding
+    context -- the five W2 questions were `none` in a fresh conversation and
+    `create` the moment a file was in the room (measured 2026-09-27).
+
+    `raw` is the person's own words, which is where the decisive sites look
+    for the question mark; `_export_shape` has only the normalised text and
+    already looked for it there, so it passes none.
+    """
+    if "?" not in (raw or low) or _REQUEST_OF_YOU_RE.match(low) or _IMPERATIVE_CREATE_RE.match(low):
+        return False
+    if _asks_you_to_build(low):
+        return False
+    return bool(_QUESTION_ABOUT_RE.match(low) or _MODAL_QUESTION_RE.match(low))
+
+
 #: The upload named as the source: "the pdf I uploaded", "from the attached
 #: sheet", "this file" (AS3 (h)).
 _UPLOAD_SOURCE_RE = re.compile(
@@ -1103,8 +1692,12 @@ def _export_shape(low: str, explicit: Sequence[str]) -> Optional[str]:
         return None
     # Verifier 2026-09-15: a WH-question about the file's content is not a
     # hand-over ("my boss said pdf bana do, so what should go in it?", "docs me
-    # kya likhna chahiye").
-    if ("?" in low and _WH_QUESTION_RE.search(low)) or _KYA_WHAT_RE.search(low):
+    # kya likhna chahiye"). Nor is any other question that is not addressed
+    # as a request: "is it normal to create a second excel for this?" named a
+    # format and a reference and came back as a CONVERSION of the artifact
+    # (W2b, 2026-09-27) once the create paths above stopped taking it.
+    if ("?" in low and _WH_QUESTION_RE.search(low)) or _KYA_WHAT_RE.search(low) \
+            or _question_not_a_request(low):
         return None
     ref = bool(_BARE_REF_RE.search(low))
     # "I need to know the page count of this PDF": a question, whatever the verb.
@@ -1994,7 +2587,13 @@ def decide(
     # event loop for minutes (review, 2026-09-11). The engine gets the
     # whole text in `raw_text`.
     original = text or ""
-    raw = _clean(original)[:_DECIDE_CHARS]
+    cleaned = _clean(original)
+    # `raw` is the WINDOW the rules read (`_decide_window`: head and tail);
+    # `instruction` stays the head slice, because it is what the composer
+    # is handed and a job's instruction must read as the person's own
+    # opening words (test_artifact_engine.py:808, test_artifact_intent.py:410).
+    raw = _decide_window(cleaned)
+    instruction = cleaned[:_DECIDE_CHARS]
     if not raw:
         return ArtifactIntent("none", rule="empty")
     # The rules read the NORMALISED text (AS3: typos, Hindi/Gujarati/
@@ -2013,7 +2612,7 @@ def decide(
 
     def made(action: Action, **kw) -> ArtifactIntent:
         kw.setdefault("formats", explicit)
-        kw.setdefault("instruction", raw)
+        kw.setdefault("instruction", instruction)
         if action == "none":
             kw.setdefault("target", "none")
         elif action == "export":
@@ -2181,6 +2780,11 @@ def decide(
     # "Update the report, don't create a file" edits that report.
     no_file = (bool(_answer_placed_here(low) or _negates_every_file(raw.lower()))
                and not (chart or _NAMED_FILE_RE.search(low)) and not _FILE_DESPITE_RE.search(low))
+    # A refusal of ANOTHER file (W1) is read the same way, minus the
+    # `_NAMED_FILE_RE` veto: the format that veto finds IS the refused one
+    # ("I don't want another pdf" named the pdf in order to rule it out).
+    if not no_file and not chart and not _FILE_DESPITE_RE.search(low) and _refuses_another_file(raw.lower()):
+        no_file = True
     if (_CHAT_ONLY_RE.search(low) and not _FILE_DESPITE_RE.search(low)) or (no_file and not has_artifacts):
         return made("none", rule="chat-only", instruction="")
     shape = LX.negative_shape(low, uploads)
@@ -2315,7 +2919,10 @@ def decide(
         # 2b. A new file, said first: "Create a professional PDF report on
         #     X. Make it visually professional." is a create, not an edit
         #     of the last artifact (CONTRACT-2 §5; discovery C2).
-        if _positional_create(low) and not no_file:
+        #     A QUESTION about whether to build one is not an order
+        #     (`_question_not_a_request`): step 4 below has always tested
+        #     this and this branch did not (W2, 2026-09-27).
+        if _positional_create(low) and not no_file and not _question_not_a_request(low, raw=raw):
             return made("create", rule="create-first-clause")
         # 2c. A pronoun follow-up after an ANSWER (not a file card) exports
         #     that answer even when files exist in the conversation.
@@ -2446,9 +3053,15 @@ def decide(
     counted = (bool(explicit or _FILE_CUE_RE.search(low)) and bool(_COUNTED_PIECE_RE.search(low))
                and not _QUESTION_ABOUT_RE.match(low))
     if _CREATE_RE.search(low) or as_format or _BEST_OR_ALL_RE.search(low) or sov or chart_ask or noun_first or counted:
-        if "?" in raw and not _POLITE_RE.match(low) and not explicit and not sov:
+        if "?" in raw and not _POLITE_RE.match(low) and not sov \
+                and not (explicit and not _question_not_a_request(low, raw=raw)):
             # "Would a report help here?" — a creation verb, a document noun,
             # a question, no format: the one shape the rules cannot read.
+            # A named FORMAT used to switch this guard off on its own, so
+            # "did you make a new sheet?" and "what happens if I generate
+            # another workbook?" built one in a FRESH conversation (W2b,
+            # 2026-09-27). The format may still carry a request — "pdf of
+            # this?" — but only when the turn is addressed as one.
             return made("none", rule="ambiguous", ambiguous=True)
         return made("create", rule="create-chart" if chart_ask and not (_CREATE_RE.search(low) or as_format or sov) else
                     ("create-postposition" if sov and not _CREATE_RE.search(low) else "create"))
@@ -2550,7 +3163,10 @@ def _should_consult(intent: ArtifactIntent, text: str) -> bool:
         # classifier believes; asking it would only buy back the document
         # the 2026-09-16 incident produced.
         return False
-    return LX.file_signal(text[:_DECIDE_CHARS])
+    # The SAME window `decide` read. It used to be `text[:_DECIDE_CHARS]`,
+    # so a swallowed ask had no escape hatch either: measured False at 120
+    # and 400 rows (W3, 2026-09-27).
+    return LX.file_signal(_decide_window(_clean(text)))
 
 
 def verdict_to_intent(verdict: Any, rules: ArtifactIntent, *, has_artifacts: bool, has_assistant_answer: bool,
@@ -2637,7 +3253,9 @@ async def decide_with_hook(
     if verdict is None:
         return intent
     if not isinstance(verdict, ArtifactIntent):
-        if str(getattr(verdict, "action", "")) in ("create", "export") and not LX.request_marker((text or "")[:_DECIDE_CHARS]):
+        # The same window again: a verdict whose request marker sits below a
+        # long paste would otherwise be thrown away at the exit (W3).
+        if str(getattr(verdict, "action", "")) in ("create", "export") and not LX.request_marker(_decide_window(_clean(text))):
             # A statement that mentions a format is not a request for a new
             # file, whatever the classifier's confidence (verifier 2026-09-15).
             return intent
