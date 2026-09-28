@@ -96,6 +96,75 @@ async def _inspectable_member(principal: Principal, user_id: int) -> Dict[str, A
     return target
 
 
+def _removed_member_row(workspace_id: str, user_id: int) -> Optional[Dict[str, Any]]:
+    """The user, when they were REMOVED from this workspace: a users row, no
+    membership any more, and a `user_removed` event of this workspace naming
+    them (remove_member writes it). Nothing else proves which workspace a
+    membership-less account belonged to."""
+    user = store.get_user(user_id)
+    if user is None or store.membership(user_id) is not None:
+        return None
+    with db.connection() as con:
+        removed = con.execute(
+            "SELECT 1 FROM audit_events WHERE workspace_id = %s AND action = 'user_removed' "
+            "AND target_user_id = %s LIMIT 1",
+            (workspace_id, user_id),
+        ).fetchone()
+    if removed is None:
+        return None
+    return {**user, "role": None, "member_since": None, "removed": True}
+
+
+async def voice_member(principal: Principal, user_id: int) -> Dict[str, Any]:
+    """The member whose VOICE RECORDINGS a super admin is reaching (the
+    caller, app/audio_api, has already required SUPER_ADMIN).
+
+    A current member passes `_inspectable_member`. A member REMOVED from this
+    workspace passes too, for voice recordings only: removal keeps a
+    person's data (remove_member, "data_kept") and deletes no users row, so
+    before 2026-09-29 their recordings were kept forever and reachable by
+    nobody, because `_target_member` 404s once the membership is gone. The
+    owner's default is that a super admin can list, play and delete them,
+    audited. Anything else stays 404."""
+    try:
+        member = await _inspectable_member(principal, user_id)
+        return {**member, "removed": False}
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+    row = await db.run_in_thread(_removed_member_row, principal.workspace_id, user_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such member.")
+    return row
+
+
+def removed_members_with_recordings(workspace_id: str) -> List[Dict[str, Any]]:
+    """Members removed from this workspace who still have stored recordings."""
+    with db.connection() as con:
+        rows = con.execute(
+            """SELECT u.id, u.username, u.display_name, count(v.id) AS recordings,
+                      COALESCE(sum(v.bytes_stored), 0) AS bytes
+               FROM users u
+               JOIN voice_sessions v ON v.user_id = u.id
+                    AND v.audio_deleted_at IS NULL AND v.status <> 'cancelled'
+               WHERE NOT EXISTS (SELECT 1 FROM workspace_memberships m WHERE m.user_id = u.id)
+                 AND EXISTS (SELECT 1 FROM audit_events a WHERE a.workspace_id = %s
+                             AND a.action = 'user_removed' AND a.target_user_id = u.id)
+               GROUP BY u.id, u.username, u.display_name
+               ORDER BY u.id""",
+            (workspace_id,),
+        ).fetchall()
+    return [
+        {
+            "user_id": int(r["id"]),
+            "name": r.get("display_name") or r["username"],
+            "recordings": int(r["recordings"]),
+            "bytes": int(r["bytes"]),
+        }
+        for r in rows
+    ]
+
+
 # How long an IDENTICAL list/stats read is folded into the event already
 # written for it. The key is the whole event — actor, action, target, meta
 # (page offset, limit, result counts) and source address — so paging to

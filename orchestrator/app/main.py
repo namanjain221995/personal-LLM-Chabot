@@ -213,6 +213,14 @@ async def lifespan(_app: FastAPI):
     artifact_pipeline.set_visual_reviewer(artifact_engine.visual_reviewer)
     artifact_pipeline.install_busy_probe(_chat_is_busy)
     await artifact_pipeline.start()
+    # Recording sessions (app/dictation.py): idle close, lease adoption after
+    # a restart, retention and the orphan sweep. Until 2026-09-29 only a
+    # /audio/sessions request started this, so after a restart none of it
+    # ran until somebody touched the microphone.
+    if settings.asr_enabled and settings.voice_sessions_enabled:
+        from . import dictation as _dictation
+
+        _dictation.RUNNER.ensure_maintenance()
     # The developer platform (CONTRACT-3). Two pieces of wiring, both here
     # because both need the pool open and the schema applied.
     _configure_api_key_pepper()
@@ -290,6 +298,10 @@ async def lifespan(_app: FastAPI):
         await _stop_webhook_worker(webhook_worker)
         await video_pipeline.stop()
         await artifact_pipeline.stop()
+        # Before the pool closes, or its next pass fails every 15 s.
+        from . import dictation as _dictation_stop
+
+        _dictation_stop.RUNNER.stop_maintenance()
         await web_worker.stop()
         await continuity.stop()
         await engine_state.stop()

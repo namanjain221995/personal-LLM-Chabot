@@ -151,6 +151,7 @@ def reset_for_tests() -> None:
     from . import dictation
 
     dictation.reset_for_tests()
+    _POLLS.clear()
 
 
 async def require_voice(request: Request) -> None:
@@ -601,11 +602,37 @@ async def _json_body(request: Request) -> Optional[dict]:
     return payload if isinstance(payload, dict) else None
 
 
+def _not_json(request: Request) -> Optional[JSONResponse]:
+    """415 unless the body is declared application/json. `request.json()`
+    ignores the content type, so without this a cross-site text/plain POST (a
+    form, needing no preflight) could start, stop or retranscribe somebody's
+    recording on the strength of their SameSite=Lax cookie alone (security
+    review item 13, server side)."""
+    declared = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if declared != "application/json":
+        return _flat(415, "bad_content_type", "The body must be sent as application/json.")
+    return None
+
+
+#: Session long-polls open now, per person (security review item 11): a
+#: second tab is normal, a dozen is a stuck page holding database polls.
+_POLLS: dict[int, int] = {}
+
+#: How often a long-poll for a session run by ANOTHER process re-reads its row.
+#: Was 1 s; Postgres has 60 connection slots for everything.
+_ROW_POLL_S = 2.5
+
+
 @router.post("/sessions")
 async def create_session(request: Request, user: UserRow = Depends(require_user)) -> Any:
     """Open a recording session: 201 with the session state and the recorder's
-    config, or 200 with the same session for a retried client_key."""
-    refusal = await _voice_refusal(request)
+    config, or 200 with the same session for a retried client_key.
+
+    "continues": "<session id>" opens a CONTINUATION of a recording the
+    server idle-closed while the browser was offline: the audio the browser
+    still holds goes into the new session, linked to the old one, with its
+    own transcript (app/dictation.create)."""
+    refusal = await _voice_refusal(request) or _not_json(request)
     if refusal is not None:
         return refusal
     if not settings.asr_enabled:
@@ -615,9 +642,15 @@ async def create_session(request: Request, user: UserRow = Depends(require_user)
     payload = await _json_body(request)
     if payload is None:
         return _flat(400, "bad_request", "The body must be a JSON object.")
+    continues = payload.get("continues")
+    if continues is not None and not isinstance(continues, str):
+        return _flat(400, "bad_request", "continues must be a session id.")
     try:
         row, created = await db.run_in_thread(
-            dictation.create, int(user["id"]), payload.get("client_key"), str(payload.get("mime_type") or "")
+            lambda: dictation.create(
+                int(user["id"]), payload.get("client_key"), str(payload.get("mime_type") or ""),
+                continues=continues,
+            )
         )
     except dictation.SessionError as exc:
         return _refused(exc)
@@ -679,9 +712,12 @@ async def put_part(
     try:
         row, duplicate = await db.run_in_thread(dictation.append_part, user_id, session_id, number, body, sha)
     except dictation.SessionError as exc:
-        if exc.reason == "storage_full":
+        if exc.reason in ("storage_full", "quota_full"):
             dictation.RUNNER.notify(session_id, status=dictation.STATUS_FINISHING)
-        return _refused(exc)
+        response = _refused(exc)
+        if exc.reason == "too_fast":
+            response.headers["Retry-After"] = str(exc.extra.get("retry_after_s", 1))
+        return response
     dictation.RUNNER.notify(
         session_id, bytes_stored=row["bytes_stored"], next_part=row["next_part"], rev=row["rev"]
     )
@@ -692,7 +728,7 @@ async def put_part(
 async def finish_session(session_id: str, request: Request, user: UserRow = Depends(require_user)) -> Any:
     """The person pressed Stop (or the recorder did): 202 while the rest is
     transcribed, 200 for a finish that already happened."""
-    refusal = await _voice_refusal(request)
+    refusal = await _voice_refusal(request) or _not_json(request)
     if refusal is not None:
         return refusal
     payload = await _json_body(request)
@@ -719,17 +755,20 @@ async def list_sessions(
     user: UserRow = Depends(require_user),
 ) -> Any:
     """The caller's own recordings, newest first. A stored recording its owner
-    cannot find or delete would be retention without consent."""
-    refusal = await _voice_refusal(request)
-    if refusal is not None:
-        return refusal
+    cannot find or delete would be retention without consent, so this needs
+    only a signed-in owner: NOT the VOICE_INPUT feature (security review item
+    7), which gates making recordings, never reaching the ones you have."""
     count = _int_param(limit, minimum=1)
     if count is None or count > 100:
         return _flat(400, "bad_request", "limit must be 1 to 100.")
     cutoff = None
     if before:
+        # `next_before` is isoformat with "+00:00". Sent unencoded, the query
+        # string turns that "+" into a space; sent as %2B it arrives as "+".
+        # Both are the same instant.
+        text = before.strip().replace(" ", "+").replace("Z", "+00:00")
         try:
-            cutoff = _datetime.fromisoformat(before.replace("Z", "+00:00"))
+            cutoff = _datetime.fromisoformat(text)
         except ValueError:
             return _flat(400, "bad_request", "before must be an ISO 8601 time.")
     return await db.run_in_thread(
@@ -747,10 +786,9 @@ async def session_state(
     user: UserRow = Depends(require_user),
 ) -> Any:
     """The session state, as a long-poll: answered as soon as `rev` moves past
-    `since_rev`, or after `wait_s` (at most 25 s) unchanged."""
-    refusal = await _voice_refusal(request)
-    if refusal is not None:
-        return refusal
+    `since_rev`, or after `wait_s` (at most 25 s) unchanged. Owner only, no
+    feature gate (item 7): a finished recording's text must stay readable.
+    At most VOICE_LONG_POLLS_PER_USER open at once per person (429)."""
     since = _int_param(cursor)
     try:
         rev_seen = int(since_rev)
@@ -770,6 +808,30 @@ async def session_state(
     if row["status"] in dictation.LIVE_STATUSES and dictation.RUNNER.get(session_id) is None:
         # Nobody in this process runs it: adopt it if its lease has lapsed.
         dictation.RUNNER.ensure(session_id)
+    if wait > 0 and dictation.current_rev(row) <= rev_seen:
+        if _POLLS.get(user_id, 0) >= settings.voice_long_polls_per_user:
+            response = _flat(
+                429, "too_many_polls", "Too many open requests for your recordings. Close other tabs and try again.",
+            )
+            response.headers["Retry-After"] = "3"
+            return response
+        _POLLS[user_id] = _POLLS.get(user_id, 0) + 1
+        try:
+            row = await _long_poll(row, session_id, rev_seen, wait)
+        finally:
+            left = _POLLS.get(user_id, 1) - 1
+            if left > 0:
+                _POLLS[user_id] = left
+            else:
+                _POLLS.pop(user_id, None)
+    try:
+        row = await db.run_in_thread(dictation._owned_row, session_id, user_id)
+    except dictation.SessionError as exc:
+        return _refused(exc)
+    return dictation.state(row, cursor=since)
+
+
+async def _long_poll(row: dict, session_id: str, rev_seen: int, wait: float) -> dict:
     deadline = time.monotonic() + wait
     while dictation.current_rev(row) <= rev_seen and time.monotonic() < deadline:
         if dictation.RUNNER.get(session_id) is not None:
@@ -783,20 +845,15 @@ async def session_state(
         row = fresh
         if dictation.current_rev(row) > rev_seen:
             break
-        await asyncio.sleep(1.0)
-    try:
-        row = await db.run_in_thread(dictation._owned_row, session_id, user_id)
-    except dictation.SessionError as exc:
-        return _refused(exc)
-    return dictation.state(row, cursor=since)
+        await asyncio.sleep(min(_ROW_POLL_S, max(0.0, deadline - time.monotonic())))
+    return row
 
 
 @router.delete("/sessions/{session_id}", response_class=Response)
 async def discard_session(session_id: str, request: Request, user: UserRow = Depends(require_user)) -> Any:
-    """The person's discard: the recording and its transcript are deleted."""
-    refusal = await _voice_refusal(request)
-    if refusal is not None:
-        return refusal
+    """The person's discard: the recording and its transcript are deleted.
+    Owner only, no feature gate: a person whose voice input was turned off
+    must still be able to delete what the microphone stored (item 7)."""
     try:
         await db.run_in_thread(dictation.discard, int(user["id"]), session_id)
     except dictation.SessionError as exc:
@@ -808,7 +865,7 @@ async def discard_session(session_id: str, request: Request, user: UserRow = Dep
 async def retranscribe_session(session_id: str, request: Request, user: UserRow = Depends(require_user)) -> Any:
     """Transcribe the STORED audio again (the failed windows, or all of it):
     'Try again' no longer means 'say it all again'."""
-    refusal = await _voice_refusal(request)
+    refusal = await _voice_refusal(request) or _not_json(request)
     if refusal is not None:
         return refusal
     payload = await _json_body(request) or {}
@@ -837,10 +894,8 @@ def _recording_response(row: dict) -> FileResponse:
 @router.get("/sessions/{session_id}/audio")
 async def session_audio(session_id: str, request: Request, user: UserRow = Depends(require_user)) -> Any:
     """The stored recording, exactly as the browser encoded it. Its owner
-    only; a super admin uses the audited admin route."""
-    refusal = await _voice_refusal(request)
-    if refusal is not None:
-        return refusal
+    only, with no feature gate (item 7); a super admin uses the audited admin
+    route."""
     try:
         row = await db.run_in_thread(dictation._owned_row, session_id, int(user["id"]))
         return _recording_response(row)
@@ -864,13 +919,16 @@ async def session_audio(session_id: str, request: Request, user: UserRow = Depen
 _admin = APIRouter(tags=["admin"])
 
 
-async def _admin_member(principal: Principal, user_id: int) -> None:
-    from .authn.admin_api import _inspectable_member
+async def _admin_member(principal: Principal, user_id: int) -> dict:
+    """The member whose recordings a SUPER ADMIN is reaching: a current
+    member under the inspection rule, or one REMOVED from this workspace,
+    whose recordings removal kept (authn/admin_api.voice_member)."""
+    from .authn.admin_api import voice_member
     from .authn.rbac import Role
 
     if Role(principal.role) is not Role.SUPER_ADMIN:
         raise HTTPException(status_code=404, detail="No such member.")
-    await _inspectable_member(principal, user_id)
+    return await voice_member(principal, user_id)
 
 
 async def _admin_session(principal: Principal, user_id: int, session_id: str) -> dict:
@@ -945,6 +1003,71 @@ async def admin_member_recording_transcript(
         resource_type="voice_session", resource_id=session_id,
     )
     return transcript
+
+
+@_admin.delete("/admin/api/members/{user_id}/voice/{session_id}", response_class=Response)
+async def admin_delete_member_recording(
+    user_id: int,
+    session_id: str,
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.WORKSPACE_CONTENT_READ)),
+) -> Any:
+    """A super admin deletes a REMOVED member's recording. The owner was told
+    (2026-09-29) that removal keeps recordings and that a super admin can
+    list, play and delete them; nobody else can reach them any more. A
+    current member deletes their own, so this refuses them (409). The audit
+    event is written BEFORE the deletion and a failure to write it refuses
+    the deletion: an irreversible act on another person's data must never
+    go unrecorded (security review item 14)."""
+    member = await _admin_member(principal, user_id)
+    if not member.get("removed"):
+        return _flat(409, "member_active", "A current member deletes their own recordings.")
+    await _admin_session(principal, user_id, session_id)
+    from .authn import store as authn_store
+    from .authn.sessions import client_meta
+
+    ip, agent = client_meta(request)
+    try:
+        await db.run_in_thread(
+            lambda: authn_store.record_audit(
+                workspace_id=principal.workspace_id, actor_user_id=principal.user_id,
+                action="admin_deleted_voice_recording", target_user_id=user_id,
+                resource_type="voice_session", resource_id=session_id, ip=ip, user_agent=agent,
+            )
+        )
+    except Exception:  # noqa: BLE001 — refused, not deleted, when unaudited
+        log.exception("voice recording %s not deleted: its audit event could not be written", session_id)
+        return _flat(503, "audit_unavailable", "The deletion could not be recorded, so nothing was deleted.")
+    try:
+        await db.run_in_thread(dictation.admin_discard, user_id, session_id)
+    except dictation.SessionError as exc:
+        return _refused(exc)
+    return Response(status_code=204)
+
+
+@_admin.get("/admin/api/voice/removed-members")
+async def admin_removed_members_with_recordings(
+    request: Request,
+    principal: Principal = Depends(require_capability(Cap.WORKSPACE_CONTENT_READ)),
+) -> dict:
+    """Members removed from this workspace whose recordings are still stored:
+    where a super admin finds the ids the routes above take. Counts and
+    names only; audited like every list read of other members' content."""
+    from .authn.admin_api import READ_AUDIT_COALESCE_S, removed_members_with_recordings
+    from .authn.rbac import Role
+
+    if Role(principal.role) is not Role.SUPER_ADMIN:
+        raise HTTPException(status_code=404, detail="Not found.")
+    members = await db.run_in_thread(removed_members_with_recordings, principal.workspace_id)
+    from .authn.principal import audit
+
+    await db.run_in_thread(
+        lambda: audit(
+            principal, request, "admin_listed_removed_voice_members",
+            meta={"count": len(members)}, coalesce_seconds=READ_AUDIT_COALESCE_S,
+        )
+    )
+    return {"members": members}
 
 
 router.routes.extend(_admin.routes)

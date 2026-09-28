@@ -60,7 +60,22 @@ VOICE_DATA_DIR/<user_id>/<session_id>/:
     transcript.txt   the final text
 Readable through the application by its owner, and by a super admin through
 the audited admin routes. VOICE_RETENTION_DAYS (0 = keep) is the only thing
-that deletes a finished recording, apart from the person.
+that deletes a finished recording, apart from the person and a super admin.
+REMOVING A MEMBER DELETES NOTHING: authn/admin_api.remove_member disables the
+account and deletes its membership, never its users row, so no cascade fires;
+the recordings stay listable, playable and deletable by a super admin through
+the audited admin routes (the owner's default, 2026-09-29).
+
+WHAT BOUNDS IT (security review, 2026-09-29). Storing a part is cheap, so a
+recording is ACCEPTED whenever disk and the person's quota allow; the scarce
+things queue instead of refusing. Per session: bytes may not arrive faster
+than VOICE_MAX_BITS_PER_SECOND of wall time (plus VOICE_RATE_SLACK_S), decoded
+audio may not exceed wall time x 32,000 bytes, and a stream that stops decoding
+closes the session. Per person: VOICE_USER_QUOTA_BYTES stored, one live
+recording, one retranscription in flight. Per process: at most
+VOICE_DECODERS_MAX ffmpeg decoders (`_DecoderGate`), some reserved for SHORT
+sessions, and one session window in the speech engine at a time
+(asr.SESSION_GATE), short sessions first.
 
 THE COST TO CHAT, STATED PLAINLY. Whisper decodes one clip at a time per
 replica, and the chat model is tensor-parallel across both Sparks, so while a
@@ -119,8 +134,11 @@ STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
 LIVE_STATUSES = (STATUS_RECORDING, STATUS_FINISHING)
 
-ENDED_BY = ("person", "idle", "storage_full", "recorder_error", "lost_parts", "page_hidden")
-#: What the BROWSER may say about why it stopped; the other two are the server's.
+ENDED_BY = (
+    "person", "idle", "storage_full", "recorder_error", "lost_parts", "page_hidden",
+    "undecodable", "quota_full",
+)
+#: What the BROWSER may say about why it stopped; the others are the server's.
 ENDED_BY_CLIENT = ("person", "recorder_error", "lost_parts", "page_hidden")
 
 #: The owner of leases taken by this process (the video pipeline's shape).
@@ -134,8 +152,9 @@ LONG_POLL_MAX_S = 25
 #: times before it becomes a gap; the waits are video/transcribe's backoff.
 _WINDOW_ATTEMPTS = 4
 
-#: How long an orphaned directory (no row, e.g. after an account was deleted
-#: and its rows cascaded) is left before the sweep removes it.
+#: How long an orphaned directory (no row) is left before the sweep removes it.
+#: A directory loses its row only when an operator deletes a users row by hand
+#: (the V42 cascade); removing a member through the admin surface does not.
 _ORPHAN_GRACE_S = 24 * 3600.0
 
 #: The session's row is written at most this often while it runs (status
@@ -296,7 +315,7 @@ _COLUMNS = (
     "audio_ms, transcribed_ms, speech_ms, windows_total, windows_done, windows_failed, "
     "outcome, ended_by, language, language_code, source_sha256, retranscribe, created_at, "
     "last_part_at, finish_requested_at, finished_at, audio_deleted_at, lease_owner, "
-    "lease_expires_at, error"
+    "lease_expires_at, error, continues_session_id, audio_since"
 )
 
 
@@ -352,26 +371,49 @@ def _update(
     return dict(row) if row else None
 
 
-def _create_row(user_id: int, client_key: str, mime: str, ext: str) -> Tuple[Dict[str, Any], bool]:
+def _create_row(
+    user_id: int, client_key: str, mime: str, ext: str, continues: Optional[str] = None,
+) -> Tuple[Dict[str, Any], bool]:
     """(row, created). Idempotent on (user, client_key); SessionError 409 when
-    this person already has a recording in progress."""
+    this person already has a recording in progress, or when the session it
+    continues already has a continuation."""
     import psycopg
 
     session_id = uuid.uuid4().hex
+    now = _now()
+    audio_since = now
+    if continues is not None:
+        # The held audio can have started as early as the continued
+        # session's last acknowledged part: the arrival and decoded-length
+        # ceilings count from there, or a catch-up after 15 minutes offline
+        # would look like 15 minutes of audio arriving in no time.
+        prev = _row(continues) or {}
+        audio_since = min(now, prev.get("last_part_at") or prev.get("created_at") or now)
     try:
         with db.connection() as con:
             row = con.execute(
                 f"""INSERT INTO voice_sessions (id, user_id, client_key, status, mime_type, ext,
-                        created_at, lease_owner, lease_expires_at)
-                    VALUES (%s, %s, %s, 'recording', %s, %s, %s, %s, %s)
+                        created_at, lease_owner, lease_expires_at, continues_session_id, audio_since)
+                    VALUES (%s, %s, %s, 'recording', %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (user_id, client_key) DO NOTHING
                     RETURNING {_COLUMNS}""",
                 (
-                    session_id, int(user_id), client_key, mime, ext, _now(), _OWNER,
-                    _now() + timedelta(seconds=settings.voice_session_lease_ttl_s),
+                    session_id, int(user_id), client_key, mime, ext, now, _OWNER,
+                    now + timedelta(seconds=settings.voice_session_lease_ttl_s),
+                    continues, audio_since,
                 ),
             ).fetchone()
-    except psycopg.errors.UniqueViolation:
+    except psycopg.errors.UniqueViolation as exc:
+        if getattr(getattr(exc, "diag", None), "constraint_name", None) == "idx_voice_sessions_one_continuation":
+            with db.connection() as con:
+                other = con.execute(
+                    "SELECT id FROM voice_sessions WHERE continues_session_id = %s AND status <> 'cancelled'",
+                    (continues,),
+                ).fetchone()
+            raise SessionError(
+                409, "already_continued", "This recording has already been continued.",
+                session_id=(other or {}).get("id"),
+            ) from None
         # The partial unique index: one live recording per person.
         with db.connection() as con:
             other = con.execute(
@@ -450,11 +492,11 @@ _rate_lock = threading.Lock()
 _recent: Dict[Tuple[str, int], List[float]] = {}
 
 
-def _rate_ok(kind: str, user_id: int, limit: int) -> bool:
+def _rate_ok(kind: str, user_id: int, limit: int, *, window_s: float = 60.0) -> bool:
     now = time.monotonic()
     with _rate_lock:
         key = (kind, int(user_id))
-        window = [t for t in _recent.get(key, []) if now - t < 60.0]
+        window = [t for t in _recent.get(key, []) if now - t < window_s]
         if len(window) >= limit:
             _recent[key] = window
             return False
@@ -476,7 +518,9 @@ def extension_for(mime: str) -> Optional[str]:
 
 def _magic_ok(ext: str, head: bytes) -> bool:
     """Whether part 0 opens with the declared container's signature. Nothing
-    after a wrong opening could decode, so it is refused at once."""
+    after a wrong opening could decode, so it is refused at once. EVERY
+    declared type is checked: the mp3 and ADTS pass-through this replaced let
+    any bytes at all be stored as "audio" (security review item 3)."""
     if ext == "webm":
         return head[:4] == b"\x1a\x45\xdf\xa3"
     if ext in ("mp4", "m4a", "3gp"):
@@ -487,7 +531,16 @@ def _magic_ok(ext: str, head: bytes) -> bool:
         return head[:4] == b"RIFF" and head[8:12] == b"WAVE"
     if ext == "flac":
         return head[:4] == b"fLaC"
-    return True  # mp3 and ADTS have no fixed opening worth trusting
+    if ext == "mp3":
+        # An ID3v2 tag, or an MPEG audio frame sync (11 set bits) with a
+        # valid layer (not the reserved 00).
+        return head[:3] == b"ID3" or (
+            len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0 and (head[1] & 0x06) != 0
+        )
+    if ext == "aac":
+        # ADTS: 12-bit sync, layer 00; or an ADIF header.
+        return head[:4] == b"ADIF" or (len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xF6) == 0xF0)
+    return False
 
 
 def part_limit_bytes() -> int:
@@ -526,10 +579,16 @@ class _WavPassthrough:
     ffmpeg with the bytes seen so far."""
 
     progressive_after_bytes = 0
+    #: The most header bytes held before the `data` chunk. A real WAV header
+    #: is 44 bytes (a few hundred with a LIST chunk); without a cap, a huge
+    #: chunk before `data` was buffered whole in memory with O(n^2) joins
+    #: (security review item 12). Past it, ffmpeg reads the file instead.
+    head_max_bytes = 64 * 1024
+    dead = False
 
     def __init__(self, on_pcm: Callable[[bytes], None]) -> None:
         self._on_pcm = on_pcm
-        self._head = b""
+        self._head = bytearray()
         self._in_data = False
         self._odd = b""
 
@@ -541,9 +600,22 @@ class _WavPassthrough:
             self._emit(data)
             return
         self._head += data
-        buf = self._head
-        if len(buf) < 12:
+        body = self._data_offset(bytes(self._head))
+        if body is None:
+            if len(self._head) > self.head_max_bytes:
+                raise _Undecodable("no WAV data chunk in the first 64 KiB")
             return
+        self._in_data = True
+        rest = bytes(self._head[body:])
+        self._head = bytearray()
+        self._emit(rest)
+
+    @staticmethod
+    def _data_offset(buf: bytes) -> Optional[int]:
+        """Where the samples start, None while the header is incomplete;
+        `_Undecodable` for any WAV but 16 kHz mono 16-bit PCM."""
+        if len(buf) < 12:
+            return None
         if buf[:4] != b"RIFF" or buf[8:12] != b"WAVE":
             raise _Undecodable("not a RIFF/WAVE file")
         offset = 12
@@ -554,7 +626,7 @@ class _WavPassthrough:
             body = offset + 8
             if tag == b"fmt ":
                 if body + 16 > len(buf):
-                    return
+                    return None
                 fmt_tag = int.from_bytes(buf[body:body + 2], "little")
                 channels = int.from_bytes(buf[body + 2:body + 4], "little")
                 rate = int.from_bytes(buf[body + 4:body + 8], "little")
@@ -567,14 +639,11 @@ class _WavPassthrough:
             if tag == b"data":
                 if not fmt_ok:
                     raise _Undecodable("WAV data before its format")
-                self._in_data = True
-                rest = buf[body:]
-                self._head = b""
-                self._emit(rest)
-                return
+                return body
             if body + size + (size % 2) > len(buf):
-                return  # a chunk we skip, not fully arrived yet
+                return None  # a chunk we skip, not fully arrived yet
             offset = body + size + (size % 2)
+        return None
 
     def _emit(self, data: bytes) -> None:
         data = self._odd + data
@@ -590,9 +659,34 @@ class _WavPassthrough:
         return None
 
 
+#: The ONE demuxer ffmpeg may use for each stored extension. Without `-f`,
+#: ffmpeg probed the stream against the whole 23-format allowlist
+#: (publicapi/audio_jobs._FALLBACK_FORMATS: avi, asf, flv, mpegts, ...), so a
+#: part 0 that merely opened like WebM could be parsed by any of them
+#: (security review item 4). The declared type decides, as it does the file's
+#: extension.
+DEMUXERS = {
+    "webm": "matroska",
+    "mp4": "mov", "m4a": "mov", "3gp": "mov",
+    "ogg": "ogg", "opus": "ogg",
+    "wav": "wav",
+    "mp3": "mp3",
+    "flac": "flac",
+    "aac": "aac",
+}
+
+
 class _FfmpegStream:
     """ONE ffmpeg for the life of a session: the container stream on stdin as
     it arrives, 16 kHz mono s16le on stdout as it decodes.
+
+    MEMORY, measured 2026-09-29 on the head with the orchestrator image's
+    ffmpeg (6.1.1), this argv, fed 80 KB parts: 45-47 MB VmRSS per process,
+    of which 11.1-12.5 MB is private (RssAnon) and ~34 MB is the shared
+    libraries every decoder maps once; flat from 600 s to 7,200 s of
+    WebM/Opus (RssAnon 11.6 MB after two hours). 8 concurrent WebM, MP4/AAC
+    and Ogg/Opus decoders: Pss 15.3-16.7 MB each. VOICE_DECODERS_MAX=32 is
+    therefore about 32 x 12.5 + 34 = ~0.43 GB at worst.
 
     The argv is publicapi/audio_jobs.Decoder's (nice 19, ionice idle, one
     thread, the input format and protocol allowlists), reading `pipe:0` and
@@ -608,12 +702,21 @@ class _FfmpegStream:
     #: The wait for ffmpeg to flush and exit once the input has ended.
     drain_timeout_s = 120.0
 
-    def __init__(self, on_pcm: Callable[[bytes], None]) -> None:
+    def __init__(self, on_pcm: Callable[[bytes], None], ext: str = "webm") -> None:
         self._on_pcm = on_pcm
+        self.ext = ext
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader: Optional[asyncio.Task] = None
         self._stderr: Optional[asyncio.Task] = None
         self._dead = False
+
+    @property
+    def dead(self) -> bool:
+        """ffmpeg stopped before its input ended: a corrupt stream, or bytes
+        that were never this container. Nothing fed after it can decode."""
+        if self._dead:
+            return True
+        return self._proc is not None and self._proc.returncode is not None
 
     @staticmethod
     def binary() -> Optional[str]:
@@ -628,6 +731,7 @@ class _FfmpegStream:
             self.binary() or "ffmpeg",
             "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "1",
             *audio_jobs.input_args(pipe=True),
+            "-f", DEMUXERS.get(self.ext, "matroska"),
             "-i", "pipe:0",
             "-map", "0:a:0", "-vn", "-sn", "-dn",
             "-ac", "1", "-ar", str(SAMPLE_RATE),
@@ -1005,6 +1109,178 @@ def join_texts(parts: Sequence[str]) -> str:
 _LANGUAGE_NAMES = {code: name for name, code in asr._LANGUAGE_CODES.items()}
 
 
+# ------------------------------------------------------- the decoder gate --
+
+
+class _DecoderGate:
+    """Admission for ffmpeg session decoders in this process.
+
+    WHY A GATE AND NOT A REFUSAL. Storing a recording costs one fsynced append
+    per part; DECODING it costs an ffmpeg process (~12.5 MB private memory
+    each, measured: `_FfmpegStream`) on the head, whose memory is scarce. So
+    a recording is always accepted and stored, and only its decoding waits
+    for a slot: its transcript lags, nothing is lost, and the decoder catches
+    up from the stored file (ffmpeg decodes Opus hundreds of times faster
+    than real time).
+
+    FAIRNESS. At most VOICE_DECODERS_MAX slots. A RESTRICTED session (long,
+    VOICE_SHORT_SESSION_S or more of audio, and nobody waiting on it: still
+    recording, or a retranscription) may hold at most VOICE_DECODERS_MAX -
+    VOICE_DECODERS_SHORT_RESERVED of them (at least one), so hour-long
+    recordings can never take every decoder: a short dictation, or anyone who
+    pressed Stop, finds a slot. A holder that BECOMES restricted while the
+    restricted slots are all taken yields: its ffmpeg is stopped and started
+    again from byte 0 when a slot frees, the PCM it already produced being
+    discarded as it comes out again (decoding is deterministic; it is the
+    path a crashed worker's successor takes). That is one re-decode of about
+    VOICE_SHORT_SESSION_S of audio, once per session. Waiters go short first,
+    then waited-on, then first come first served. Runner loop only.
+    """
+
+    def __init__(self) -> None:
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self.holders: Dict[str, "_Live"] = {}
+        #: holders granted a slot while unrestricted (short, or waited on)
+        self._granted_free: set = set()
+        self._waiters: List[Tuple[int, "_Live", "asyncio.Future[None]"]] = []
+        self._seq = 0
+
+    def _bind(self) -> asyncio.AbstractEventLoop:
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:
+            self._loop = loop
+            self.holders = {}
+            self._granted_free = set()
+            self._waiters = []
+        return loop
+
+    @staticmethod
+    def size() -> int:
+        return max(1, int(settings.voice_decoders_max))
+
+    @classmethod
+    def restricted_cap(cls) -> int:
+        size = cls.size()
+        return max(1, size - min(max(0, int(settings.voice_decoders_short_reserved)), size - 1))
+
+    def restricted_held(self) -> int:
+        return sum(1 for live in list(self.holders.values()) if live.decode_restricted())
+
+    @property
+    def waiting(self) -> int:
+        return sum(1 for _seq, _live, future in self._waiters if not future.done())
+
+    def _fits(self, live: "_Live") -> bool:
+        if len(self.holders) >= self.size():
+            return False
+        return not live.decode_restricted() or self.restricted_held() < self.restricted_cap()
+
+    def _publish(self) -> None:
+        metrics.set_gauge("voice_decoders_active", len(self.holders), "ffmpeg session decoders running")
+        metrics.set_gauge("voice_decoders_waiting", self.waiting, "sessions stored but waiting for a decoder")
+
+    def _grant(self) -> None:
+        self._waiters = [w for w in self._waiters if not w[2].done()]
+        order = sorted(
+            self._waiters,
+            key=lambda w: (0 if w[1].is_short() else 1, 1 if w[1].decode_restricted() else 0, w[0]),
+        )
+        for entry in order:
+            _seq, live, future = entry
+            if self._fits(live):
+                self._waiters.remove(entry)
+                self.holders[live.id] = live
+                if not live.decode_restricted():
+                    self._granted_free.add(live.id)
+                future.set_result(None)
+        self._publish()
+
+    async def acquire(self, live: "_Live") -> None:
+        loop = self._bind()
+        if live.id in self.holders:
+            return
+        self._seq += 1
+        future: "asyncio.Future[None]" = loop.create_future()
+        self._waiters.append((self._seq, live, future))
+        self._grant()
+        try:
+            await future
+        except BaseException:
+            if future.done() and not future.cancelled():
+                # Granted in the same pass as the cancellation: give it back.
+                self.holders.pop(live.id, None)
+                self._granted_free.discard(live.id)
+            self._waiters = [w for w in self._waiters if w[2] is not future]
+            self._grant()
+            raise
+
+    def release(self, live: "_Live") -> None:
+        self._granted_free.discard(live.id)
+        if self.holders.pop(live.id, None) is not None:
+            self._grant()
+        else:
+            self._publish()
+
+    def regrant(self) -> None:
+        """Grant again after a waiter's class changed (runner loop only)."""
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._loop is running and self._waiters:
+            self._grant()
+
+    def must_yield(self, live: "_Live") -> bool:
+        """Only a holder that was granted its slot unrestricted and has since
+        become restricted yields; the long holders that were admitted as long
+        keep decoding."""
+        return (
+            live.id in self._granted_free
+            and live.decode_restricted()
+            and self.restricted_held() > self.restricted_cap()
+        )
+
+    def reset_for_tests(self) -> None:
+        self._loop = None
+        self.holders = {}
+        self._granted_free = set()
+        self._waiters = []
+
+
+DECODERS = _DecoderGate()
+
+#: One small pool for the session workers' file I/O (PCM writes, window
+#: reads, predecessor reads), so none of it runs on the runner loop. Two
+#: threads, not the default executor's dozens: glibc keeps a malloc arena per
+#: thread, which is what made publicapi/audio_jobs' memory depend on how many
+#: threads happened to be used (its _worker comment, 2026-09-13).
+_io_pool_: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_io_pool_lock = threading.Lock()
+
+
+def _io_pool() -> concurrent.futures.ThreadPoolExecutor:
+    global _io_pool_
+    with _io_pool_lock:
+        if _io_pool_ is None:
+            _io_pool_ = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="voice-io")
+        return _io_pool_
+
+
+async def _io(fn: Callable[..., Any], *args: Any) -> Any:
+    return await asyncio.get_running_loop().run_in_executor(_io_pool(), fn, *args)
+
+
+#: PCM is written in batches of this, off the loop (security review item 4:
+#: every 64 KiB was written synchronously on the one loop that also runs
+#: every session's voice-activity detection and planning).
+_PCM_FLUSH_BYTES = 1024 * 1024
+#: Free space is measured again after every this much decoded PCM.
+_FREE_CHECK_BYTES = 64 * 1024 * 1024
+#: The largest read fed to a decoder at once: bounds the PCM one feed can
+#: produce before the next flush (16 kb/s Opus decodes 256 KiB to ~4 MB).
+_FEED_BYTES = 256 * 1024
+
+
 # ------------------------------------------------------------ the runner --
 
 
@@ -1068,13 +1344,26 @@ class _Runner:
             self.ensure(session_id)
 
     def ensure_maintenance(self) -> None:
+        """Start the maintenance loop (idle close, lease adoption, retention,
+        orphan sweep) if it is not running. The app lifespan calls this at
+        start-up; before 2026-09-29 only a session route did, so after a
+        restart none of it ran until somebody touched /audio/sessions."""
+        loop = self.loop()  # takes self._lock itself
         with self._lock:
             running = self._maintenance is not None and not self._maintenance.done()
-        if running:
-            return
-        future = asyncio.run_coroutine_threadsafe(_maintain(), self.loop())
+            if running:
+                return
+            self._maintenance = asyncio.run_coroutine_threadsafe(_maintain(), loop)
+
+    def maintenance_running(self) -> bool:
         with self._lock:
-            self._maintenance = future
+            return self._maintenance is not None and not self._maintenance.done()
+
+    def stop_maintenance(self) -> None:
+        with self._lock:
+            maintenance, self._maintenance = self._maintenance, None
+        if maintenance is not None:
+            maintenance.cancel()
 
     def stop_all(self, timeout: float = 20.0) -> None:
         """Cancel every worker and the maintenance loop (tests; a shutdown)."""
@@ -1088,6 +1377,7 @@ class _Runner:
             await asyncio.gather(*tasks, return_exceptions=True)
             self.live.clear()
             asr.SESSION_GATE.reset_for_tests()
+            DECODERS.reset_for_tests()
 
         with self._lock:
             maintenance, self._maintenance = self._maintenance, None
@@ -1185,6 +1475,66 @@ class _Live:
         self._decoder: Any = None
         self.engine_ms = 0
         self.paced_s = 0.0
+        #: A retranscription: its windows go at RECORDING priority and pace,
+        #: never as if somebody had just pressed Stop (security review item 2).
+        self.retranscribing = False
+        #: Decoded PCM not yet on disk, and how much of `pcm_bytes` is.
+        self._pcm_buf = bytearray()
+        self.pcm_written = 0
+        self._pcm_lock: Optional[asyncio.Lock] = None
+        self._free_checked_at = 0
+        #: PCM to discard as it comes out: the recordings a continuation's
+        #: stream continues, and what a restarted decoder produces again.
+        self._skip_left = 0
+        #: (path, size, pcm bytes) of those recordings, oldest first.
+        self._prefix: List[Tuple[str, int, int]] = []
+        self._prefix_bytes = 0
+        self._prefix_pcm = 0
+        self._wav_failed = False
+        #: Why decoding stopped for good: 'pcm_ceiling', 'undecodable' or
+        #: 'storage_full'. The recording then accepts no more parts.
+        self.fatal: Optional[str] = None
+        #: Waiting for a decoder slot (`_DecoderGate`) or a predecessor.
+        self.decoder_queued = False
+        self._persisted: Tuple[Any, ...] = ()
+
+    # -- class, for the decoder gate and the engine gate -------------------
+
+    def _wall_span_s(self) -> float:
+        """Seconds of audio this recording can hold at most: from when its
+        audio could have started (audio_since; created_at for a session that
+        continues nothing) to now while it records, to its last part after."""
+        start = self.row.get("audio_since") or self.row.get("created_at")
+        if not isinstance(start, datetime):
+            return 0.0
+        end = _now()
+        if self.status != STATUS_RECORDING:
+            last = self.row.get("last_part_at") or self.row.get("finish_requested_at")
+            if isinstance(last, datetime):
+                end = min(end, last)
+        return max(0.0, (end - start).total_seconds())
+
+    def span_s(self) -> float:
+        return max(self.pcm_bytes / PCM_BYTES_PER_S, self._wall_span_s())
+
+    def is_short(self) -> bool:
+        return self.span_s() < float(settings.voice_short_session_s)
+
+    def recording_class(self) -> bool:
+        """Nobody is waiting on this session right now: it is still being
+        recorded, or it is a retranscription of stored audio."""
+        return self.status == STATUS_RECORDING or self.retranscribing
+
+    def decode_restricted(self) -> bool:
+        return self.recording_class() and not self.is_short()
+
+    def _pcm_ceiling(self) -> int:
+        """The most PCM this recording can honestly decode to: its wall-clock
+        span plus VOICE_RATE_SLACK_S, at 32,000 bytes a second. The output
+        length is set by the codec and its timestamps (aresample=async=1 fills
+        gaps), not by the bytes uploaded, so a crafted stream could otherwise
+        decode to any length (security review item 4)."""
+        return int((self._wall_span_s() + float(settings.voice_rate_slack_s)) * PCM_BYTES_PER_S)
 
     # -- state shared with request threads --------------------------------
 
@@ -1215,6 +1565,9 @@ class _Live:
             if fields.get("status") == STATUS_CANCELLED:
                 self.status = STATUS_CANCELLED
             self.rev += 1
+        # Pressing Stop makes a waiting session one somebody waits on, which
+        # may let it take a slot it could not take while it was recording.
+        DECODERS.regrant()
         self._kick()
 
     def audio_ms(self) -> int:
@@ -1237,6 +1590,18 @@ class _Live:
             if w.status in ("failed", "dropped")
         ]
 
+    def _waiting_on_locked(self) -> str:
+        """Why the backlog exists right now. 'engine' is a BUSY engine (or a
+        decoder slot: both are this server's transcription capacity);
+        'engine_unavailable' is one that is down or hung, which the person
+        should hear differently: it will not clear by itself soon."""
+        waiting = self.waiting_on
+        if waiting == "none" and self.decoder_queued:
+            waiting = "engine"
+        if waiting == "engine" and asr.SESSION_GATE.engine_state() == "unavailable":
+            waiting = "engine_unavailable"
+        return waiting
+
     def snapshot(self, cursor: int = 0) -> Dict[str, Any]:
         with self.lock:
             cursor = max(0, int(cursor))
@@ -1247,7 +1612,7 @@ class _Live:
                 "bytes_stored": self.bytes_stored,
                 "audio_ms": self.audio_ms(),
                 "transcribed_ms": self._transcribed_ms_locked(),
-                "waiting_on": self.waiting_on,
+                "waiting_on": self._waiting_on_locked(),
                 "progressive": self.progressive,
                 "count": len(self.segments),
                 "segments": self.segments[cursor:],
@@ -1265,6 +1630,8 @@ class _Live:
             if row is None:
                 return  # another process holds it, or it is no longer live
             self.row = row
+            self.retranscribing = bool(row.get("retranscribe"))
+            self._pcm_lock = asyncio.Lock()
             with self.lock:
                 self.status = row["status"]
                 self.bytes_stored = int(row["bytes_stored"] or 0)
@@ -1314,6 +1681,7 @@ class _Live:
             with contextlib.suppress(Exception):
                 await self._decoder.kill()
             self._decoder = None
+        DECODERS.release(self)
         if self.pcm_file is not None:
             with contextlib.suppress(Exception):
                 self.pcm_file.close()
@@ -1387,21 +1755,52 @@ class _Live:
         pcm = self._p("audio.pcm")
         fd = os.open(pcm, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         self.pcm_file = os.fdopen(fd, "wb", buffering=0)
-        if retranscribe:
-            await db.run_in_thread(_update, self.id, retranscribe=None, bump=False)
+        # The `retranscribe` marker stays on the row until `_finalize`: it is
+        # what "one retranscription in flight per person" counts.
         self.bump()
 
     # -- ingest: stored bytes -> PCM -> planned windows --------------------
 
     def _on_pcm(self, data: bytes) -> None:
-        if self.pcm_file is not None:
-            self.pcm_file.write(data)
+        if self._skip_left:
+            cut = min(self._skip_left, len(data))
+            self._skip_left -= cut
+            data = data[cut:]
+            if not data:
+                return
+        if self.fatal is not None:
+            return
+        if self.pcm_bytes + len(data) > self._pcm_ceiling():
+            self.fatal = "pcm_ceiling"
+            self.decode_error = "the decoded audio is longer than this recording has existed"
+            self.ingest_kick.set()
+            return
+        self._pcm_buf += data
         with self.lock:
             self.pcm_bytes += len(data)
         if self.planner is not None and not self.planner.closed:
             self.planner.push(data)
             self._commit(self.planner.plan(finishing=False))
         self.dispatch_kick.set()
+
+    async def _flush_pcm(self) -> None:
+        """Decoded PCM to audio.pcm, in batches, off the loop; and, every
+        64 MiB of it, a look at the free space (security review item 4)."""
+        assert self._pcm_lock is not None
+        async with self._pcm_lock:
+            if not self._pcm_buf or self.pcm_file is None:
+                return
+            data = bytes(self._pcm_buf)
+            self._pcm_buf.clear()
+            await _io(self.pcm_file.write, data)
+            self.pcm_written += len(data)
+            if self.pcm_written - self._free_checked_at >= _FREE_CHECK_BYTES:
+                self._free_checked_at = self.pcm_written
+                free = await _io(free_bytes, None)
+                if free is not None and free < settings.voice_min_free_bytes and self.fatal is None:
+                    self.fatal = "storage_full"
+                    self.decode_error = "the server ran out of space while decoding this recording"
+                    self.ingest_kick.set()
 
     def _commit(self, records: List[Dict[str, Any]], *, final: bool = False) -> None:
         for record in records:
@@ -1426,27 +1825,139 @@ class _Live:
             self.dispatch_kick.set()
 
     async def _open_decoder(self, head: bytes) -> Any:
-        if self.row["ext"] == "wav" and head[:4] == b"RIFF":
+        if self.row["ext"] == "wav" and head[:4] == b"RIFF" and not self._wav_failed:
             return _WavPassthrough(self._on_pcm)
-        decoder = _FfmpegStream(self._on_pcm)
-        await decoder.start()
+        self.decoder_queued = True
+        self.bump()
+        try:
+            await DECODERS.acquire(self)
+        finally:
+            self.decoder_queued = False
+            self.bump()
+        decoder = _FfmpegStream(self._on_pcm, self.row["ext"])
+        try:
+            await decoder.start()
+        except BaseException:
+            DECODERS.release(self)
+            raise
         return decoder
 
+    def _restart_from_zero(self) -> None:
+        """Feed the decoder from the first byte again, discarding the PCM that
+        comes out again: what the continued recordings decode to, and what
+        this one already produced (kept, buffered or on disk)."""
+        self.fed = 0
+        self._skip_left = self._prefix_pcm + self.pcm_bytes
+
+    async def _yield_decoder(self) -> None:
+        if self._decoder is not None:
+            await self._decoder.kill()
+            self._decoder = None
+        DECODERS.release(self)
+        self._restart_from_zero()
+        metrics.inc("voice_decoder_yields_total", "session decoders stopped to keep slots for short sessions")
+
+    def _read_input(self, offset: int, size: int) -> bytes:
+        """`size` bytes at `offset` of the decoder's input: the recordings
+        this one continues, then its own stored file. Blocking."""
+        base = 0
+        for path, length, _pcm in self._prefix:
+            if offset < base + length:
+                with open(path, "rb") as fh:
+                    fh.seek(offset - base)
+                    return fh.read(min(size, base + length - offset))
+            base += length
+        with open(source_path(self.row), "rb") as fh:
+            fh.seek(offset - self._prefix_bytes)
+            return fh.read(size)
+
+    async def _resolve_chain(self) -> None:
+        """A CONTINUATION whose first part does not open like its container is
+        the rest of an earlier session's stream (the browser held it while
+        offline, the server idle-closed that session): it can only decode
+        after the bytes it continues. Wait for those sessions to finish, then
+        decode them first and discard their audio. A continuation that opens
+        with its container's signature is a fresh stream and decodes alone."""
+        if not self.row.get("continues_session_id"):
+            return
+        while self.bytes_stored < 16 and self.status == STATUS_RECORDING:
+            await self._wait(self.ingest_kick, 2.0)
+            await self._refresh()
+        if self.bytes_stored < 16 or self.status == STATUS_CANCELLED:
+            return
+        head = await _io(self._read_input, 0, 16)
+        if _magic_ok(self.row["ext"], head):
+            return
+        chain: List[Tuple[str, int, int]] = []
+        current = self.row.get("continues_session_id")
+        user_id = int(self.row["user_id"])
+        for _depth in range(64):
+            if not current:
+                break
+            prev = await db.run_in_thread(_row, current)
+            while prev is not None and prev["status"] in LIVE_STATUSES and self.status != STATUS_CANCELLED:
+                self.decoder_queued = True
+                await asyncio.sleep(2.0)
+                prev = await db.run_in_thread(_row, current)
+            self.decoder_queued = False
+            if (
+                prev is None or int(prev["user_id"]) != user_id or prev["status"] == STATUS_CANCELLED
+                or prev.get("audio_deleted_at") is not None or prev["ext"] != self.row["ext"]
+            ):
+                log.info("voice session %s: the recording it continues is gone; decoding it alone", self.id)
+                return
+            path = source_path(prev)
+            size = int(prev["bytes_stored"] or 0)
+            saved = _saved_transcript(prev)
+            pcm = int(saved.get("pcm_bytes") or int(prev.get("audio_ms") or 0) * (PCM_BYTES_PER_S // 1000))
+            chain.insert(0, (path, size, pcm - (pcm % 2)))
+            try:
+                with open(path, "rb") as fh:
+                    prev_head = fh.read(16)
+            except OSError:
+                return
+            current = prev.get("continues_session_id") if not _magic_ok(prev["ext"], prev_head) else None
+        self._prefix = chain
+        self._prefix_bytes = sum(size for _p, size, _pcm in chain)
+        self._prefix_pcm = sum(pcm for _p, _size, pcm in chain)
+        self._skip_left = self._prefix_pcm
+
+    async def _end_recording(self, ended_by: str) -> None:
+        """Decoding stopped for good: stop the decoder and close the
+        recording, so the next part is refused 409 session_closed with this
+        `ended_by` instead of being stored behind a decoder that can no
+        longer read it (security review item 3)."""
+        if self._decoder is not None:
+            await self._decoder.kill()
+            self._decoder = None
+        DECODERS.release(self)
+        with contextlib.suppress(SessionError):
+            row = await db.run_in_thread(_finish_sync, self.id, None, ended_by, None)
+            self.row.update(row)
+        with self.lock:
+            if self.status == STATUS_RECORDING:
+                self.status = STATUS_FINISHING
+            self.rev += 1
+
     async def _ingest(self) -> None:
-        src = source_path(self.row)
-        fed_since_pcm = 0
         try:
+            await self._resolve_chain()
             while self.status != STATUS_CANCELLED:
-                if self.fed < self.bytes_stored:
-                    with open(src, "rb") as fh:
-                        fh.seek(self.fed)
-                        chunk = fh.read(min(1024 * 1024, self.bytes_stored - self.fed))
+                if self.fatal is not None:
+                    raise _Undecodable(self.decode_error or self.fatal)
+                if self._decoder is not None and self._decoder.dead:
+                    raise _Undecodable("the decoder stopped: the rest is not audio in the declared format")
+                if self._decoder is not None and DECODERS.must_yield(self):
+                    await self._yield_decoder()
+                    continue
+                total = self._prefix_bytes + self.bytes_stored
+                if self.fed < total:
+                    chunk = await _io(self._read_input, self.fed, min(_FEED_BYTES, total - self.fed))
                     if not chunk:
                         await asyncio.sleep(0.2)
                         continue
                     if self._decoder is None:
                         self._decoder = await self._open_decoder(chunk)
-                    before = self.pcm_bytes
                     try:
                         await self._decoder.feed(chunk)
                     except _Undecodable:
@@ -1454,22 +1965,34 @@ class _Live:
                             raise
                         # Not the WAV the passthrough reads: ffmpeg gets the
                         # recording from its first byte instead.
-                        self._decoder = _FfmpegStream(self._on_pcm)
-                        await self._decoder.start()
-                        self.fed = 0
+                        self._decoder = None
+                        self._wav_failed = True
+                        self._restart_from_zero()
                         continue
                     self.fed += len(chunk)
-                    fed_since_pcm = 0 if self.pcm_bytes > before else fed_since_pcm + len(chunk)
+                    own_fed = self.fed - self._prefix_bytes
                     threshold = getattr(self._decoder, "progressive_after_bytes", 0)
-                    if threshold and self.pcm_bytes == 0 and fed_since_pcm > threshold and self.progressive:
-                        with self.lock:
-                            self.progressive = False
-                            self.rev += 1
+                    if threshold and self.pcm_bytes == 0 and own_fed > threshold:
+                        # The decoder's reader runs beside this loop: give it
+                        # a moment before calling the stream undecodable.
+                        for _ in range(50):
+                            if self.pcm_bytes or self._decoder.dead:
+                                break
+                            await asyncio.sleep(0.1)
+                        if self.pcm_bytes == 0:
+                            raise _Undecodable(f"no audio came out of the first {own_fed} bytes")
+                    if self._decoder.dead:
+                        raise _Undecodable("the decoder stopped: the rest is not audio in the declared format")
+                    if len(self._pcm_buf) >= _PCM_FLUSH_BYTES:
+                        await self._flush_pcm()
                     await asyncio.sleep(0)  # let the decoder's reader run
                     continue
+                # Caught up. The PCM stays buffered (up to _PCM_FLUSH_BYTES)
+                # until a window needs it or the input ends: a write per 5 s
+                # part is what batching exists to avoid.
                 if self.status == STATUS_FINISHING:
                     await self._refresh(force=True)
-                    if self.fed >= self.bytes_stored and self.status == STATUS_FINISHING:
+                    if self.fed >= self._prefix_bytes + self.bytes_stored and self.status == STATUS_FINISHING:
                         break
                     continue
                 await self._wait(self.ingest_kick, 2.0)
@@ -1480,14 +2003,16 @@ class _Live:
             if self._decoder is not None:
                 self.decode_error = await self._decoder.close()
                 self._decoder = None
+            DECODERS.release(self)
             # No bytes at all (the microphone was never allowed, the tab went
             # away before the first part) is a recording with no speech in
             # it, not an undecodable one.
         except _Undecodable as exc:
             self.decode_error = str(exc)
-            if self._decoder is not None:
-                await self._decoder.kill()
-                self._decoder = None
+            if self.fatal is None:
+                self.fatal = "undecodable"
+            await self._end_recording("storage_full" if self.fatal == "storage_full" else "undecodable")
+        await self._flush_pcm()
         if self.planner is not None and not self.planner.closed:
             self._commit(self.planner.plan(finishing=True), final=True)
         with self.lock:
@@ -1527,8 +2052,15 @@ class _Live:
         now = time.monotonic()
         if not force and now - self._last_row_write < _ROW_WRITE_EVERY_S:
             return
-        self._last_row_write = now
         snap = self.snapshot(cursor=1 << 30)
+        key = (snap["rev"], snap["audio_ms"], snap["transcribed_ms"], len(self.windows))
+        if not force and key == self._persisted:
+            # Nothing a reader could see has changed: with many recordings
+            # waiting for a decoder, an unconditional write every 2 s each was
+            # the larger part of their database cost.
+            return
+        self._last_row_write = now
+        self._persisted = key
         await db.run_in_thread(
             _update,
             self.id,
@@ -1558,7 +2090,10 @@ class _Live:
                 continue
             w = self.windows[self.stitched]
             if w.status == "pending":
-                covered = self.pcm_bytes >= int(w.end_s * SAMPLE_RATE) * 2
+                need = int(w.end_s * SAMPLE_RATE) * 2
+                if self.pcm_written < need and self.pcm_bytes > self.pcm_written:
+                    await self._flush_pcm()
+                covered = self.pcm_written >= need
                 if not covered and not self.ingest_done:
                     await self._wait(self.dispatch_kick, 1.0)
                     continue
@@ -1580,7 +2115,7 @@ class _Live:
         waited = 0.0
         while probe is not None:
             limit = (
-                settings.voice_session_pace_live_s if self.status == STATUS_RECORDING
+                settings.voice_session_pace_live_s if self.recording_class()
                 else settings.voice_session_pace_finish_s
             )
             if waited >= limit:
@@ -1627,12 +2162,14 @@ class _Live:
             if self.status == STATUS_CANCELLED:
                 return
             await self._pace()
+            clip = await _io(self._clip, w)
             self._set_waiting("engine")
             try:
                 reply = await asr.transcribe_session_window(
-                    self._clip(w),
+                    clip,
                     filename=f"s{w.i:05d}.wav",
-                    urgent=lambda: self.status != STATUS_RECORDING,
+                    urgent=lambda: not self.recording_class(),
+                    short=self.is_short,
                     on_admitted=lambda: self._set_waiting("none"),
                 )
                 break
@@ -1644,6 +2181,9 @@ class _Live:
                 reason = "engine_unavailable"
                 log.info("voice session %s window %d: %s (attempt %d of %d)", self.id, w.i, exc, attempt, _WINDOW_ATTEMPTS)
                 if attempt < _WINDOW_ATTEMPTS:
+                    # Waiting out an engine that is down is not waiting for a
+                    # busy one, and the person is told which.
+                    self._set_waiting("engine_unavailable")
                     await asyncio.sleep(_backoff_s(attempt))
             finally:
                 self._set_waiting("none")
@@ -1759,6 +2299,9 @@ class _Live:
             "transcribed_ms": snap["transcribed_ms"],
             "speech_ms": snap["speech_ms"],
             "progressive": snap["progressive"],
+            # Exact, for a continuation that has to skip this recording's
+            # audio when it decodes after it (audio_ms is rounded).
+            "pcm_bytes": self.pcm_bytes,
             "text": text,
             **(extra or {}),
         }
@@ -1789,7 +2332,7 @@ class _Live:
         failed = [w for w in self.windows if w.status == "failed"]
         error = None
         status = STATUS_DONE
-        if self.pcm_bytes == 0 and self.decode_error:
+        if (self.pcm_bytes == 0 and self.decode_error) or self.fatal == "pcm_ceiling":
             status, outcome = STATUS_FAILED, "undecodable"
             error = {"reason": "undecodable", "detail": "The server couldn't read the audio in this recording."}
         elif speech_ms == 0 or not self.windows:
@@ -1803,8 +2346,12 @@ class _Live:
             outcome = "no_words"
         else:
             outcome = "transcribed"
+        if error is None and self.fatal == "undecodable":
+            error = {"reason": "undecodable", "detail": "The server couldn't read the rest of this recording."}
+        elif error is None and self.fatal == "storage_full":
+            error = {"reason": "storage_full", "detail": "The server ran out of space before the end of this recording was transcribed."}
         src = source_path(self.row)
-        sha = await asyncio.to_thread(_sha256_file, src) if os.path.exists(src) else None
+        sha = await _io(_sha256_file, src) if os.path.exists(src) else None
         self._write_transcript(
             final=True,
             extra={"outcome": outcome, "language": language, "language_code": code, "decode_error": self.decode_error},
@@ -1836,6 +2383,7 @@ class _Live:
             windows_done=sum(1 for w in self.windows if w.status in ("done", "dropped")),
             windows_failed=len(failed),
             error=error,
+            retranscribe=None,
             rev=self.current_rev() + 1,
         )
         with self.lock:
@@ -1943,8 +2491,11 @@ def _lapsed_and_idle() -> Dict[str, List[str]]:
 
 def retention_sweep(*, now: Optional[datetime] = None) -> int:
     """Delete finished recordings older than VOICE_RETENTION_DAYS (0 keeps
-    them), and directories that have had no row for 24 h (an account removal
-    cascades the rows, not the files). The row stays as a tombstone."""
+    them), and directories that have had no row for 24 h. A directory loses
+    its row only when an operator deletes a users row by hand (the V42
+    cascade); removing a member through the admin surface deletes no row, so
+    their recordings are kept and stay reachable by a super admin. The row
+    stays as a tombstone."""
     now = now or _now()
     removed = 0
     days = int(settings.voice_retention_days)
@@ -2079,6 +2630,9 @@ def state(row: Dict[str, Any], *, cursor: int = 0) -> Dict[str, Any]:
         "ended_by": row.get("ended_by"),
         "stored": _stored(row),
         "error": row.get("error"),
+        # The idle-closed recording this one continues; its transcript is
+        # that session's own, and this one's is separate.
+        "continues_session_id": row.get("continues_session_id"),
     }
     if status == STATUS_DONE:
         body["text"] = saved.get("text") or ""
@@ -2105,8 +2659,69 @@ def config() -> Dict[str, Any]:
     }
 
 
-def create(user_id: int, client_key: str, mime: str) -> Tuple[Dict[str, Any], bool]:
-    """Open (or, for a retried create, find) this person's session."""
+def stored_bytes(user_id: int) -> int:
+    """What this person has stored: every recording whose audio still exists."""
+    with db.connection() as con:
+        row = con.execute(
+            "SELECT COALESCE(sum(bytes_stored), 0) AS n FROM voice_sessions "
+            "WHERE user_id = %s AND audio_deleted_at IS NULL AND status <> 'cancelled'",
+            (int(user_id),),
+        ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def _quota_refusal(user_id: int, adding: int) -> Optional[SessionError]:
+    quota = int(settings.voice_user_quota_bytes)
+    if quota <= 0:
+        return None
+    used = stored_bytes(user_id)
+    if used + int(adding) <= quota:
+        return None
+    return SessionError(
+        507, "quota_full",
+        "Your saved recordings use all the space your account has. Delete some on the Recordings page to record again.",
+        used_bytes=used, quota_bytes=quota,
+    )
+
+
+def _continuation_of(user_id: int, continues: Any, ext: str) -> str:
+    """The id of the idle-closed session a new one continues, or a refusal.
+
+    Only a session the server itself closed for silence (ended_by 'idle')
+    can be continued: that is the one case where the browser still holds
+    audio the server never received, and must not lose it."""
+    session_id = str(continues or "")
+    prev = _row(session_id)
+    if prev is None or int(prev["user_id"]) != int(user_id) or prev["status"] == STATUS_CANCELLED:
+        raise _not_found()
+    if prev.get("ended_by") != "idle" or prev["status"] == STATUS_RECORDING:
+        raise SessionError(
+            409, "not_continuable", "Only a recording the server closed after a long silence can be continued.",
+            session_id=session_id, status=prev["status"], ended_by=prev.get("ended_by"),
+        )
+    if prev["ext"] != ext:
+        raise SessionError(400, "bad_request", "A continuation must be recorded in the same format.")
+    with db.connection() as con:
+        other = con.execute(
+            "SELECT id FROM voice_sessions WHERE continues_session_id = %s AND status <> 'cancelled'",
+            (session_id,),
+        ).fetchone()
+    if other is not None:
+        raise SessionError(
+            409, "already_continued", "This recording has already been continued.", session_id=other["id"],
+        )
+    return session_id
+
+
+def create(
+    user_id: int, client_key: str, mime: str, *, continues: Optional[str] = None,
+) -> Tuple[Dict[str, Any], bool]:
+    """Open (or, for a retried create, find) this person's session.
+
+    ACCEPTED WHENEVER DISK AND QUOTA ALLOW (2026-09-29). Storing is cheap;
+    decoding and the engine queue (`_DecoderGate`, asr.SESSION_GATE), so a
+    busy server makes the transcript lag instead of refusing the recording.
+    VOICE_SESSION_MAX_ACTIVE is only a safety ceiling far above that."""
     try:
         client_key = str(uuid.UUID(str(client_key)))
     except (ValueError, TypeError, AttributeError):
@@ -2126,14 +2741,16 @@ def create(user_id: int, client_key: str, mime: str) -> Tuple[Dict[str, Any], bo
         if existing["status"] == STATUS_CANCELLED:
             raise _not_found()
         return dict(existing), False
+    previous = _continuation_of(user_id, continues, ext) if continues is not None else None
     if not _rate_ok("create", user_id, settings.voice_session_create_per_min):
         raise SessionError(429, "rate_limited", "Too many recordings were started just now.")
     if _live_count() >= settings.voice_session_max_active:
         raise SessionError(503, "capacity_full", "Too many people are recording right now.")
-    refusal = _storage_refusal()
+    # A new recording needs room for at least its first byte.
+    refusal = _storage_refusal() or _quota_refusal(user_id, 1)
     if refusal is not None:
         raise refusal
-    row, created = _create_row(user_id, client_key, base_type(mime), ext)
+    row, created = _create_row(user_id, client_key, base_type(mime), ext, previous)
     if created:
         _private_dirs(user_id, row["id"])
         metrics.inc("voice_sessions_started_total", "recording sessions opened")
@@ -2151,22 +2768,64 @@ def _parts_record(row: Dict[str, Any], seq: int) -> Optional[Dict[str, Any]]:
     return None
 
 
-_append_locks: Dict[str, threading.Lock] = {}
-_append_locks_guard = threading.Lock()
+#: key -> [lock, holders]. An entry lives only while somebody holds or waits
+#: for it. The map used to keep a lock per session id forever, created BEFORE
+#: the id was validated, so a DELETE loop with random (or kilobyte-long) ids
+#: grew it without bound on a port the LAN can reach (security review item 8).
+_locks: Dict[str, List[Any]] = {}
+_locks_guard = threading.Lock()
 
 
-def _append_lock(session_id: str) -> threading.Lock:
-    with _append_locks_guard:
-        lock = _append_locks.get(session_id)
-        if lock is None:
-            lock = _append_locks[session_id] = threading.Lock()
-        return lock
+@contextlib.contextmanager
+def _keyed_lock(key: str):
+    with _locks_guard:
+        entry = _locks.get(key)
+        if entry is None:
+            entry = _locks[key] = [threading.Lock(), 0]
+        entry[1] += 1
+    try:
+        with entry[0]:
+            yield
+    finally:
+        with _locks_guard:
+            entry[1] -= 1
+            if entry[1] <= 0 and _locks.get(key) is entry:
+                del _locks[key]
+
+
+def _session_lock(session_id: str):
+    """The per-session lock, for a well-formed id only (validate first)."""
+    if not _SESSION_ID.match(session_id or ""):
+        raise _not_found()
+    return _keyed_lock(f"s:{session_id}")
+
+
+def _arrival_refusal(row: Dict[str, Any], adding: int) -> Optional[SessionError]:
+    """429 too_fast when the session would hold more bytes than a recorder
+    could have produced by now: (seconds since its audio could have started
+    + VOICE_RATE_SLACK_S) x VOICE_MAX_BITS_PER_SECOND / 8."""
+    start = row.get("audio_since") or row.get("created_at")
+    if not isinstance(start, datetime):
+        return None
+    rate = int(settings.voice_max_bits_per_second) / 8.0
+    elapsed = max(0.0, (_now() - start).total_seconds())
+    allowed = int((elapsed + float(settings.voice_rate_slack_s)) * rate)
+    total = int(row.get("bytes_stored") or 0) + int(adding)
+    if total <= allowed:
+        return None
+    wait = max(1, int(-(-(total - allowed) // rate)))
+    return SessionError(
+        429, "too_fast", "This recording is arriving faster than it could have been recorded. Send this part again shortly.",
+        retry_after_s=wait,
+    )
 
 
 def append_part(user_id: int, session_id: str, seq: int, body: bytes, sha: str) -> Tuple[Dict[str, Any], bool]:
     """Store one part: fsynced into source.<ext> at the next offset BEFORE the
     row says so. Returns (row, duplicate). Blocking; run it in a thread."""
-    with _append_lock(session_id):
+    # The route checked ownership before reading the body; the lock map
+    # entry exists only while this call holds it (`_keyed_lock`).
+    with _session_lock(session_id):
         row = _owned_row(session_id, user_id)
         next_part = int(row["next_part"] or 0)
         if seq < next_part:
@@ -2185,14 +2844,25 @@ def append_part(user_id: int, session_id: str, seq: int, body: bytes, sha: str) 
             )
         if seq > next_part:
             raise SessionError(409, "out_of_order", "A part is missing before this one.", next_part=next_part)
-        if seq == 0 and not _magic_ok(row["ext"], body[:16]):
-            # Nothing after a wrong opening can decode: the session goes.
+        if seq == 0 and not row.get("continues_session_id") and not _magic_ok(row["ext"], body[:16]):
+            # Nothing after a wrong opening can decode: the session goes. (A
+            # continuation may open mid-stream: it continues an earlier
+            # session's container, `_Live._resolve_chain`. What stops it being
+            # a store for arbitrary bytes is the decoder check, which closes
+            # it once no audio comes out, and the two ceilings below.)
             _cancel_sync(row)
             raise SessionError(415, "unsupported_format", f"{row['mime_type']} audio did not start the way that format starts.")
+        refusal = _arrival_refusal(row, len(body))
+        if refusal is not None:
+            raise refusal
         free = free_bytes()
         if free is not None and free < settings.voice_min_free_bytes:
             _finish_sync(session_id, user_id, "storage_full", None)
             raise SessionError(507, "storage_full", "The server ran out of space for recordings.")
+        refusal = _quota_refusal(user_id, len(body))
+        if refusal is not None:
+            _finish_sync(session_id, user_id, "quota_full", None)
+            raise refusal
         bytes_stored = int(row["bytes_stored"] or 0)
         try:
             _private_dirs(row["user_id"], session_id)
@@ -2288,8 +2958,10 @@ def discard(user_id: int, session_id: str) -> None:
     Under the session's append lock, so a part being stored at the same
     moment cannot recreate the directory after it is removed; the row is
     cancelled first, so the worker (whose row writes are `only_live`) cannot
-    bring the session back while it unwinds."""
-    with _append_lock(session_id):
+    bring the session back while it unwinds. Ownership is checked before
+    the lock exists (security review item 8)."""
+    _owned_row(session_id, user_id, allow_cancelled=True)
+    with _session_lock(session_id):
         row = _owned_row(session_id, user_id, allow_cancelled=True)
         live = RUNNER.get(session_id)
         if live is not None:
@@ -2302,7 +2974,26 @@ def discard(user_id: int, session_id: str) -> None:
     metrics.inc("voice_sessions_discarded_total", "recording sessions discarded by their owner")
 
 
+def _retranscribe_in_flight(user_id: int) -> Optional[str]:
+    with db.connection() as con:
+        row = con.execute(
+            "SELECT id FROM voice_sessions WHERE user_id = %s AND retranscribe IS NOT NULL "
+            "AND status IN ('recording', 'finishing') LIMIT 1",
+            (int(user_id),),
+        ).fetchone()
+    return row["id"] if row else None
+
+
 def retranscribe(user_id: int, session_id: str, scope: str) -> Tuple[Dict[str, Any], bool]:
+    """Transcribe stored audio again.
+
+    Each one re-decodes the whole recording on the head and sends every
+    window again, so it is bounded like a recording (security review item 2):
+    it counts against VOICE_SESSION_MAX_ACTIVE, needs the free space a
+    recording needs, runs at most once at a time per person (409
+    retranscribe_busy) and VOICE_RETRANSCRIBE_PER_HOUR times an hour (429),
+    and its windows go at RECORDING priority, behind anybody waiting after
+    Stop (`_Live.recording_class`)."""
     if scope not in ("gaps", "all"):
         raise SessionError(400, "bad_request", "scope must be gaps or all.")
     row = _owned_row(session_id, user_id)
@@ -2312,17 +3003,36 @@ def retranscribe(user_id: int, session_id: str, scope: str) -> Tuple[Dict[str, A
         raise SessionError(410, "audio_deleted", "This recording's audio has been deleted.")
     if scope == "gaps" and row["status"] == STATUS_DONE and not int(row.get("windows_failed") or 0):
         return row, False
-    if row.get("outcome") == "undecodable":
-        # Nothing was decoded, so nothing was planned: plan again from the audio.
-        for name in ("plan.jsonl", "results.jsonl"):
-            with contextlib.suppress(OSError):
-                os.unlink(_path(row["user_id"], row["id"], name))
-    updated = _update(
-        session_id, status=STATUS_FINISHING, retranscribe=scope, outcome=None, error=None,
-        finished_at=None, finish_requested_at=_now(),
-    )
+    with _keyed_lock(f"u:{int(user_id)}"):
+        busy = _retranscribe_in_flight(user_id)
+        if busy is not None:
+            raise SessionError(
+                409, "retranscribe_busy", "Another of your recordings is being transcribed again. Try this one when it's done.",
+                session_id=busy,
+            )
+        if _live_count() >= settings.voice_session_max_active:
+            raise SessionError(503, "capacity_full", "Too many recordings are being transcribed right now.")
+        refusal = _storage_refusal()
+        if refusal is not None:
+            raise refusal
+        if not _rate_ok("retranscribe", user_id, settings.voice_retranscribe_per_hour, window_s=3600.0):
+            raise SessionError(429, "rate_limited", "This was tried again too often in the last hour.")
+        if row.get("outcome") == "undecodable":
+            # Nothing was decoded, so nothing was planned: plan again from the audio.
+            for name in ("plan.jsonl", "results.jsonl"):
+                with contextlib.suppress(OSError):
+                    os.unlink(_path(row["user_id"], row["id"], name))
+        with db.connection() as con:
+            updated = con.execute(
+                f"""UPDATE voice_sessions SET status = 'finishing', retranscribe = %s, outcome = NULL,
+                        error = NULL, finished_at = NULL, finish_requested_at = %s, rev = rev + 1
+                    WHERE id = %s AND status IN ('done', 'failed') RETURNING {_COLUMNS}""",
+                (scope, _now(), session_id),
+            ).fetchone()
+    if updated is None:
+        raise SessionError(409, "session_busy", "This recording is still being transcribed.")
     RUNNER.ensure(session_id)
-    return updated or row, True
+    return dict(updated), True
 
 
 def list_sessions(user_id: int, *, limit: int, before: Optional[datetime], preview: bool = True) -> Dict[str, Any]:
@@ -2341,6 +3051,7 @@ def list_sessions(user_id: int, *, limit: int, before: Optional[datetime], previ
     rows = rows[:limit]
     out = []
     for row in rows:
+        stored = _stored(row)
         item = {
             "session_id": row["id"],
             "created_at": _iso(row["created_at"]),
@@ -2349,13 +3060,22 @@ def list_sessions(user_id: int, *, limit: int, before: Optional[datetime], previ
             "audio_ms": int(row.get("audio_ms") or 0),
             "bytes": int(row.get("bytes_stored") or 0),
             "mime_type": row["mime_type"],
-            "delete_after": _stored(row)["delete_after"],
+            # False once retention (or anyone) removed the audio: the row
+            # stays as a tombstone, its read answers 404 and its audio 410,
+            # so the list must not present it as a playable recording.
+            "kept": stored["kept"],
+            "delete_after": stored["delete_after"],
+            "continues_session_id": row.get("continues_session_id"),
         }
         if preview:
-            text = _saved_transcript(row).get("text") if row["status"] == STATUS_DONE else None
+            text = _saved_transcript(row).get("text") if row["status"] == STATUS_DONE and stored["kept"] else None
             item["preview"] = (text or "")[:120] or None
         out.append(item)
-    return {"sessions": out, "next_before": _iso(rows[-1]["created_at"]) if more and rows else None}
+    return {
+        "sessions": out,
+        "retention_days": int(settings.voice_retention_days),
+        "next_before": _iso(rows[-1]["created_at"]) if more and rows else None,
+    }
 
 
 def audio_file(row: Dict[str, Any]) -> str:
@@ -2377,9 +3097,16 @@ def transcript_of(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def admin_discard(user_id: int, session_id: str) -> None:
+    """A super admin deleting a REMOVED member's recording (audio_api's
+    audited admin route has already checked who may): the member's own
+    discard, run for them."""
+    discard(user_id, session_id)
+
+
 def reset_for_tests() -> None:
     RUNNER.stop_all()
     with _rate_lock:
         _recent.clear()
-    with _append_locks_guard:
-        _append_locks.clear()
+    with _locks_guard:
+        _locks.clear()
