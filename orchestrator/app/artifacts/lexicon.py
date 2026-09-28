@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import re
 
+from functools import lru_cache
+
 from . import pictures as PIC
 import unicodedata
 from dataclasses import dataclass
@@ -410,15 +412,41 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
 _SPACES = re.compile(r"[ \t\r\f\v]+")
 
 
-def normalize(text: str) -> str:
-    """Case folded, zero-width stripped, typos and script variants mapped to
-    canonical tokens. Newlines are kept (clauses are split on them)."""
+def _normalize_uncached(text: str) -> str:
     out = unicodedata.normalize("NFKC", text or "")
     out = _ZERO_WIDTH.sub("", out).casefold()
     out = out.replace("’", "'").replace("‘", "'")
     for rx, repl in _NORMALISE:
         out = rx.sub(repl, out)  # type: ignore[arg-type]
     return _SPACES.sub(" ", out).strip()
+
+
+#: One turn normalises the SAME message six times (measured 2026-09-28 by
+#: counting the calls inside one `intent.decide`), and on a 4,000-character
+#: message the table of typo rewrites costs about 6 ms a pass -- 36 ms of the
+#: 61 ms that `decide` spent. It is a pure function of its text, so the answer
+#: is cached rather than the rewrites made cheaper.
+#:
+#: 256 entries, because the cache exists to serve ONE turn's repeated calls and
+#: not to remember conversations: a few hundred entries of a few kB is well
+#: under a megabyte, and the eviction order does not matter when every hit
+#: happens within milliseconds of its miss. The table it applies is a module
+#: constant, so an entry cannot go stale while the process lives.
+@lru_cache(maxsize=256)
+def _normalize_cached(text: str) -> str:
+    return _normalize_uncached(text)
+
+
+def normalize(text: str) -> str:
+    """Case folded, zero-width stripped, typos and script variants mapped to
+    canonical tokens. Newlines are kept (clauses are split on them)."""
+    if not text:
+        return ""
+    # A message far past anything a person types is not worth a cache slot, and
+    # `decide` is bounded elsewhere; normalise it and move on.
+    if len(text) > 100_000:
+        return _normalize_uncached(text)
+    return _normalize_cached(text)
 
 
 # ------------------------------------------------------------- signals --
