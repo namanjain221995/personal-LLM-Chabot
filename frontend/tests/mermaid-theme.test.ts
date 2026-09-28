@@ -31,7 +31,9 @@ import {
   acceptsClassDefs,
   categoricalInk,
   diagramHead,
+  diagramRefusal,
   diagramScale,
+  guardDiagramSource,
   mermaidTheme,
   prepareDiagramSource,
   resolveCategorical,
@@ -1136,5 +1138,491 @@ describe('DIAG-33 · a misplaced role costs the colour, never the diagram', () =
     expect(prepareDiagramSource(flow, 'dark')).toContain(':::service');
     expect(prepareDiagramSource(flow, 'dark')).toContain('classDef service');
     expect(acceptsClassDefs(flow)).toBe(true);
+  });
+});
+
+// -------------------------------------------------------------- DIAG-35…35n
+
+/**
+ * DIAG-35 — the PREAMBLE is the other half of the colour ban.
+ *
+ * `fix/diagram-roles` said its colour and style ban was "enforced in CODE, not
+ * by asking". It was not: mermaid takes an in-source config override from TWO
+ * channels, a `%%{init: …}%%` directive AND a YAML frontmatter `config:` block,
+ * and only the first was ever removed. Measured today against the real bundle
+ * (Chromium 153.0.8010.36, mermaid 11.17.0, esbuild bundle of the real
+ * <MermaidBlock>, the same way the role colours were verified):
+ *
+ *     ---
+ *     config:
+ *       themeCSS: |
+ *         .node rect { fill: #ff0000 !important; stroke: #00ff00 !important;
+ *                      stroke-width: 6px !important; }
+ *         .flowchart-link { stroke: #ff00ff !important; stroke-width: 5px !important; }
+ *     ---
+ *     flowchart TD
+ *       SVC[Gateway]:::service --> PLAIN[Plain node]
+ *
+ * drew PLAIN at fill rgb(255,0,0), stroke rgb(0,255,0), stroke-width 6px and
+ * its edge at stroke rgb(255,0,255), 5px — against rgb(51,56,61) /
+ * rgb(139,148,158) / 1px and rgb(154,163,173) / 1px for the same diagram with
+ * the block removed. A `pie` and a `sequenceDiagram` get no classDefs at all,
+ * and there EVERY slice and EVERY actor rect went rgb(255,0,0).
+ *
+ * These tests pin the source the renderer is handed. The colour half — that
+ * Chromium then paints the theme's own values — is proved by rendering the
+ * corpus in a real browser, exactly as the header of this file says.
+ */
+describe('DIAG-35 · the preamble cannot carry a display override', () => {
+  const FLOW = 'flowchart TD\n  SVC[Gateway]:::service --> PLAIN[Store]';
+
+  const OVERRIDES: [string, string][] = [
+    ['themeCSS (block scalar)', 'config:\n  themeCSS: |\n    .node rect { fill: #ff0000 !important; }'],
+    ['themeCSS (flow map)', 'config: { themeCSS: ".node rect { fill: #ff0000 !important }" }'],
+    ['themeCSS (display:none)', 'config:\n  themeCSS: ".flowchart-link { display: none !important }"'],
+    ['theme', 'config:\n  theme: default'],
+    ['themeVariables', 'config:\n  themeVariables:\n    primaryColor: "#ff0000"'],
+    ['securityLevel', 'config:\n  securityLevel: loose'],
+    ['htmlLabels', 'config:\n  htmlLabels: true'],
+    ['flowchart.htmlLabels', 'config:\n  flowchart:\n    htmlLabels: true'],
+    ['look', 'config:\n  look: handDrawn'],
+    ['layout', 'config:\n  layout: elk'],
+    ['fontFamily', 'config:\n  fontFamily: "Comic Sans MS"'],
+    ['altFontFamily', 'config:\n  altFontFamily: "Comic Sans MS"'],
+    ['darkMode', 'config:\n  darkMode: false'],
+    ['displayMode', 'displayMode: compact'],
+  ];
+
+  it.each(OVERRIDES)('DIAG-35 · a frontmatter %s block is dropped whole', (_name, block) => {
+    const out = sanitizeDiagramSource(`---\n${block}\n---\n${FLOW}`);
+    expect(out).not.toContain('---');
+    expect(out).not.toContain('config');
+    expect(out).not.toContain('#ff0000');
+    // …and the diagram itself is untouched.
+    expect(out).toContain('SVC[Gateway]:::service --> PLAIN[Store]');
+    expect(diagramHead(out)).toBe('flowchart');
+  });
+
+  it('DIAG-35b · an INDENTED frontmatter block is frontmatter here too', () => {
+    // Mermaid captures the indent and accepts the block; a reader that only
+    // looks at column 0 misses it. Measured: this painted rgb(255,0,0).
+    const out = sanitizeDiagramSource(
+      '  ---\n  config:\n    themeCSS: ".node rect { fill: #ff0000 !important }"\n  ---\n  flowchart TD\n    A-->B',
+    );
+    expect(out).not.toContain('#ff0000');
+    expect(out).not.toContain('config');
+    expect(out).toContain('A-->B');
+  });
+
+  it('DIAG-35c · a CRLF frontmatter block is frontmatter here too', () => {
+    // mermaid's cleanupText normalises line endings BEFORE it looks, so this
+    // guard has to as well. Measured: this painted rgb(255,0,0).
+    const out = sanitizeDiagramSource(
+      '---\r\nconfig:\r\n  themeCSS: ".node rect { fill: #ff0000 !important }"\r\n---\r\nflowchart TD\r\n  A-->B',
+    );
+    expect(out).not.toContain('#ff0000');
+    expect(out).toContain('A-->B');
+  });
+
+  it('DIAG-35d · a `title:` line is the ONE key that survives', () => {
+    const out = sanitizeDiagramSource(`---\ntitle: Request path\n---\n${FLOW}`);
+    expect(out).toContain('title: Request path');
+    expect(diagramHead(out)).toBe('flowchart');
+    expect(prepareDiagramSource(`---\ntitle: Request path\n---\n${FLOW}`, 'dark')).toContain(
+      'classDef service',
+    );
+  });
+
+  it.each([
+    ['a second key beside it', '---\ntitle: Kept\nconfig:\n  themeCSS: "x"\n---'],
+    ['a block scalar', '---\ntitle: |\n  config:\n---'],
+    ['a flow map value', '---\ntitle: {config: {themeCSS: "x"}}\n---'],
+    ['an anchor', '---\ntitle: &a x\n---'],
+    ['a tag', '---\ntitle: !!str x\n---'],
+    ['an empty value', '---\ntitle:\n---'],
+  ])('DIAG-35e · a title with %s takes the whole block down with it', (_name, block) => {
+    const out = sanitizeDiagramSource(`${block}\n${FLOW}`);
+    expect(out).not.toContain('title');
+    expect(out).not.toContain('config');
+    expect(out).toContain('SVC[Gateway]:::service --> PLAIN[Store]');
+  });
+
+  /**
+   * The two SECOND-ORDER shapes. Both exist only because this guard rewrites
+   * the text, and both were reproduced against a single-pass version of it.
+   */
+  it('DIAG-35f · dropping one block does not PROMOTE the next one', () => {
+    // Mermaid reads only the first block, so a second one is a parse error —
+    // until the guard removes the first and the second becomes the first.
+    const out = sanitizeDiagramSource(
+      '---\nconfig:\n  look: handDrawn\n---\n---\nconfig:\n  themeCSS: ".node rect { fill: #ff0000 !important }"\n---\n' +
+        FLOW,
+    );
+    expect(out).not.toContain('themeCSS');
+    expect(out).not.toContain('#ff0000');
+    expect(out).not.toContain('---');
+    expect(out).toContain('SVC[Gateway]:::service --> PLAIN[Store]');
+  });
+
+  it('DIAG-35g · a directive above a block does not PROMOTE it either', () => {
+    // Mermaid extracts frontmatter BEFORE directives, so this block is body to
+    // mermaid and the source does not parse. Strip the directive and trim the
+    // blank line it leaves — which the sanitiser does — and the block lands at
+    // column 0 of line 1, alive.
+    const out = sanitizeDiagramSource(
+      '%%{init: {"maxTextSize": 1000}}%%\n---\nconfig:\n  themeCSS: ".node rect { fill: #ff0000 !important }"\n---\n' +
+        FLOW,
+    );
+    expect(out).not.toContain('themeCSS');
+    expect(out).not.toContain('---');
+    expect(diagramHead(out)).toBe('flowchart');
+  });
+
+  it('DIAG-35h · a kept title stops the promotion, and nothing behind it is config', () => {
+    const src =
+      '---\ntitle: Kept\n---\n---\nconfig:\n  themeCSS: "x"\n---\n' + FLOW;
+    const out = sanitizeDiagramSource(src);
+    // The title block is kept, so mermaid stops there too and the rest is
+    // body — a parse error, which the block shows as source. Never config.
+    expect(out.startsWith('---\ntitle: Kept\n---\n')).toBe(true);
+    expect(guardDiagramSource(src).refusal).toBe('');
+  });
+
+  /**
+   * The one construct that is REFUSED rather than stripped. A `}%%` inside a
+   * directive's own string value ends the balanced strip early and leaves a
+   * fragment in the middle of a statement. Dropping the fragment's line can
+   * delete a real `A-->B`; keeping it draws whatever it parses as. A wrong
+   * picture is worse than no picture, so the source is refused whole.
+   */
+  it('DIAG-35i · a directive with `}%%` in its own value refuses the source', () => {
+    const src = '%%{init: {"themeCSS": "a}%% .node rect{fill:#ff0000}"}}%%\n' + FLOW;
+    expect(guardDiagramSource(src).refusal).toMatch(/malformed %%\{…\}%% directive/);
+    expect(diagramRefusal(src)).toMatch(/malformed/);
+    // A refused source gets no classDefs: they are the app's own text and
+    // would read as the author's under a refusal notice.
+    expect(prepareDiagramSource(src, 'dark')).not.toContain('classDef service');
+  });
+
+  it('DIAG-35j · every source the guard accepts carries no refusal', () => {
+    for (const src of [
+      FLOW,
+      `---\ntitle: Kept\n---\n${FLOW}`,
+      `---\nconfig:\n  themeCSS: "x"\n---\n${FLOW}`,
+      "%%{init: {'theme':'default'}}%%\n" + FLOW,
+      'sequenceDiagram\n  A->>B: hi',
+      '',
+    ]) {
+      expect(diagramRefusal(src), JSON.stringify(src)).toBe('');
+    }
+  });
+
+  it('DIAG-35k · a `---` pair that is NOT frontmatter to mermaid stays body', () => {
+    // Mermaid's regex needs a line AFTER the closing `---`, so a trailing
+    // block is diagram text. Deleting it would be deleting the author's body.
+    const src = 'flowchart TD\n  A-->B\n---\nconfig:\n  themeCSS: "x"\n---';
+    expect(guardDiagramSource(src).code).toBe(src);
+  });
+
+  it('DIAG-35l · an ordinary source still reaches the Code tab unchanged', () => {
+    for (const src of [
+      FLOW,
+      'sequenceDiagram\n  A->>B: hi\n  B-->>A: ok',
+      'pie title Split\n  "A" : 50\n  "B" : 50',
+      'timeline\n  title Rollout\n  2026 : first',
+    ]) {
+      expect(sanitizeDiagramSource(src)).toBe(src);
+    }
+  });
+
+  /**
+   * The second line of defence. `secure` is mermaid's own key blocklist and it
+   * is applied to DIRECTIVES only — never to what we pass `initialize` — so
+   * listing a key this file sets itself costs nothing and buys the guarantee a
+   * third override channel we have not met cannot restyle the diagram.
+   */
+  it.each([
+    'themeCSS',
+    'htmlLabels',
+    'flowchart',
+    'look',
+    'layout',
+    'fontFamily',
+    'altFontFamily',
+    'darkMode',
+  ])('DIAG-35m · `%s` is secured in the mermaid config too', (key) => {
+    expect(SECURE_KEYS).toContain(key);
+    for (const mode of MODES) {
+      expect(mermaidTheme(mode).secure).toEqual(expect.arrayContaining([key]));
+    }
+  });
+
+  it('DIAG-35n · securing those keys does not blank our own config', () => {
+    // `secure` never runs over `initialize`, so every value this file declares
+    // has to still be there — the regression this test exists to catch is
+    // someone "fixing" the list by also filtering our own theme.
+    for (const mode of MODES) {
+      const cfg = mermaidTheme(mode);
+      expect(cfg.theme).toBe('base');
+      expect(cfg.htmlLabels).toBe(false);
+      expect(cfg.flowchart.htmlLabels).toBe(false);
+      expect(cfg.securityLevel).toBe('strict');
+      expect(cfg.fontFamily).toContain('IBM Plex Sans');
+      expect(Object.keys(cfg.themeVariables).length).toBeGreaterThan(40);
+    }
+  });
+});
+
+// -------------------------------------------------------------- DIAG-37…37j
+
+/**
+ * DIAG-37 — the holes DIAG-35 left, each one measured in a real browser before
+ * it was closed.
+ *
+ * DIAG-35 shipped with the guard's reach one character short of the sanitiser's
+ * own trim, with the statement pass able to promote a block the guard had
+ * already walked past, with a pass cap that handed a live block over on
+ * exhaustion, with a refusal that fired on sources carrying no directive at
+ * all, and with three diagram types whose paint channel the statement ban never
+ * named. All five were reproduced on the commit before this one with
+ * Chromium 153.0.8010.36 + mermaid 11.17.0 and an esbuild bundle of the real
+ * <MermaidBlock>, and against mermaid's OWN `frontMatterRegex` + js-yaml over
+ * `prepareDiagramSource`'s output, which answers the only question that
+ * matters: what does mermaid read out of the string we hand it?
+ *
+ * Load average 3.1-15.7 during the measurements, 2026-09-28.
+ */
+describe('DIAG-37 · the preamble guard reaches as far as the trim does', () => {
+  const FLOW = 'flowchart TD\n  SVC[Gateway]:::service --> PLAIN[Store]';
+  const BLOCK =
+    '---\nconfig:\n  themeCSS: ".node rect { fill: #ff0000 !important }"\n---\n';
+
+  /**
+   * `\s` minus `[ \t\n\r]` is exactly this set. Each one is a line the
+   * sanitiser's final `/^\s*\n/` deletes, so each one is a line the guard's own
+   * trim has to delete FIRST — otherwise the block below it is invisible to
+   * `FRONTMATTER_RE` (whose `([^\S\n\r]*)` indent cannot span a newline), the
+   * trim promotes it to column 0, and mermaid reads it.
+   *
+   * Measured on the commit before this one: the `c4:` form of this block moved
+   * `c4.width` 216 -> 400 and `personFontSize` 14 -> 40 and redrew a C4 diagram
+   * at 700x724 px with 40 px type, inside a chat answer, from ONE preamble
+   * character.
+   */
+  it.each([
+    ['NBSP', ' '],
+    ['form feed', '\f'],
+    ['vertical tab', '\v'],
+    ['BOM', '﻿'],
+    ['LINE SEPARATOR', ' '],
+    ['PARAGRAPH SEPARATOR', ' '],
+    ['OGHAM SPACE MARK', ' '],
+    ['EN QUAD', ' '],
+    ['HAIR SPACE', ' '],
+    ['NARROW NO-BREAK SPACE', ' '],
+    ['MEDIUM MATHEMATICAL SPACE', ' '],
+    ['IDEOGRAPHIC SPACE', '　'],
+  ])('DIAG-37 · a %s line above a block does not smuggle it through', (_name, ws) => {
+    const out = sanitizeDiagramSource(`${ws}\n${BLOCK}${FLOW}`);
+    expect(out).not.toContain('config');
+    expect(out).not.toContain('themeCSS');
+    expect(out).not.toContain('---');
+    expect(out).not.toContain('#ff0000');
+    expect(diagramHead(out)).toBe('flowchart');
+  });
+
+  /**
+   * The same set, against the EXPORTED guard on its own.
+   *
+   * `sanitizeDiagramSource` alternates the guard with the statement pass to a
+   * fixed point, and that alternation happens to catch these too — the
+   * statement pass's own trim deletes the whitespace line and the next guard
+   * round then sees the block. That is a second line of defence, not the fix:
+   * `guardDiagramSource` is an exported function whose whole contract is "the
+   * returned code carries no live config", and it has to hold that contract by
+   * itself. Narrow its trim back to `[ \t]` and DIAG-37 still passes while this
+   * fails, which is exactly the discrimination the one-character fix needs.
+   */
+  it.each([
+    ['NBSP', '\u00a0'],
+    ['form feed', '\f'],
+    ['BOM', '\ufeff'],
+    ['IDEOGRAPHIC SPACE', '\u3000'],
+  ])('DIAG-37a · the guard ALONE strips a block hidden by a %s line', (_name, ws) => {
+    const guarded = guardDiagramSource(`${ws}\n${BLOCK}${FLOW}`);
+    expect(guarded.refusal).toBe('');
+    expect(guarded.code).not.toContain('config');
+    expect(guarded.code).not.toContain('themeCSS');
+    expect(guarded.code).not.toContain('---');
+    expect(guarded.code.startsWith('flowchart TD')).toBe(true);
+  });
+
+  it('DIAG-37b · a plain-space line is still covered, and the body survives', () => {
+    const out = sanitizeDiagramSource(` \n \t \n${BLOCK}${FLOW}`);
+    expect(out).not.toContain('config');
+    expect(out).toContain('SVC[Gateway]:::service --> PLAIN[Store]');
+  });
+
+  /**
+   * The promotion the guard cannot see, because the guard runs FIRST.
+   * `FRONTMATTER_RE` is anchored at `^`, so a statement on line 1 hides the
+   * block; the statement pass then empties line 1, the trim deletes it, and the
+   * block lands at column 0 alive. Measured with mermaid's own regex on the
+   * commit before this one: `config: [themeCSS]`, and `config: [c4]` for the
+   * `c4:` form. Only `looksRenderable` kept mermaid away, by reading `classdef`
+   * as the head and refusing to render anything at all — a permanent
+   * "Rendering the diagram…" and a hole the moment that check learns to look
+   * past a preamble.
+   */
+  it.each([
+    ['classDef', 'classDef zz fill:#fff'],
+    ['style', 'style A fill:#fff'],
+    ['linkStyle', 'linkStyle 0 stroke:#f00'],
+    ['click', 'click A "x"'],
+    ['classDef then a NBSP line', 'classDef zz fill:#fff\n '],
+    ['a `;`-terminated classDef', 'classDef zz fill:#fff;'],
+  ])('DIAG-37c · a stripped %s statement above a block does not promote it', (_n, stmt) => {
+    const out = sanitizeDiagramSource(`${stmt}\n${BLOCK}${FLOW}`);
+    expect(out).not.toContain('config');
+    expect(out).not.toContain('themeCSS');
+    expect(out).not.toContain('---');
+    expect(out).toContain('SVC[Gateway]:::service --> PLAIN[Store]');
+  });
+
+  /**
+   * Exhausting the pass cap FAILS CLOSED. Measured on the commit before this
+   * one: 65 stacked blocks left block 65 live at the head of the guard's
+   * output. Such a source is not a diagram anyway — mermaid reads only the
+   * first block, so the other 64 are body and a parse error — so refusing it
+   * costs nothing and says something true.
+   */
+  it('DIAG-37d · more blocks than the cap strips is a refusal, not a pass-through', () => {
+    const many = BLOCK.repeat(65);
+    expect(diagramRefusal(many + FLOW)).toMatch(/stacks more preamble blocks/);
+    expect(prepareDiagramSource(many + FLOW, 'dark')).not.toContain('classDef service');
+  });
+
+  it('DIAG-37e · exactly the cap is still stripped, and still drawn', () => {
+    const out = sanitizeDiagramSource(BLOCK.repeat(64) + FLOW);
+    expect(diagramRefusal(BLOCK.repeat(64) + FLOW)).toBe('');
+    expect(out).not.toContain('config');
+    expect(out).toBe(FLOW);
+  });
+
+  /**
+   * The refusal must not fire on a source that never carried a directive.
+   * `}%%` is not a directive to mermaid — its own `directiveRegex` needs the
+   * opening `%%{` — so a label containing those three characters is an ordinary
+   * diagram. Measured: this source drew two nodes in theme colours on
+   * fix/diagram-roles and was refused on the commit before this one, with a
+   * notice naming a construct its author never wrote.
+   */
+  it('DIAG-37f · a `}%%` with no directive anywhere is not refused', () => {
+    for (const src of [
+      'flowchart LR\n  A["50}%% done"] --> B[Next]',
+      'flowchart TD\n  A{Ready?}%% decide here\n  A --> B[Go]',
+      'sequenceDiagram\n  A->>B: 50}%% done',
+    ]) {
+      expect(diagramRefusal(src), JSON.stringify(src)).toBe('');
+    }
+  });
+
+  it('DIAG-37g · the directive that DOES need refusing still refuses', () => {
+    const src = '%%{init: {"themeCSS": "a}%% .node rect{fill:#ff0000}"}}%%\n' + FLOW;
+    expect(diagramRefusal(src)).toMatch(/malformed %%\{…\}%% directive/);
+  });
+
+  /**
+   * The three paint channels `COLOUR_DIRECTIVE` does not name. None is a
+   * regression of this branch — all three painted identically before it — but
+   * this branch IS the colour ban. Every value below was read off the real SVG
+   * in Chromium today, on both commits.
+   */
+  it('DIAG-37h · a C4 `Update*Style` statement carries no colour through', () => {
+    const src =
+      'C4Context\n  title C4\n  Person(p, "User")\n  System(s, "Sys")\n  Rel(p, s, "uses")\n' +
+      '  UpdateElementStyle(p, $bgColor="#ff0000", $fontColor="#00ff00", $borderColor="#ff00ff")\n' +
+      '  UpdateRelStyle(p, s, $textColor="#ff0000", $lineColor="#00ff00")\n' +
+      '  UpdateLayoutConfig($c4ShapeInRow="1", $c4BoundaryInRow="1")';
+    const out = sanitizeDiagramSource(src);
+    expect(out).not.toContain('#ff0000');
+    expect(out).not.toContain('UpdateElementStyle');
+    expect(out).not.toContain('UpdateRelStyle');
+    expect(out).not.toContain('UpdateLayoutConfig');
+    // The graph itself is untouched: every Person, System and Rel survives.
+    expect(out).toContain('Person(p, "User")');
+    expect(out).toContain('System(s, "Sys")');
+    expect(out).toContain('Rel(p, s, "uses")');
+    // Node `mmd-1-p` drew at computed fill rgb(255, 0, 0) before this, and at
+    // rgb(8, 66, 123) after — the same value as the same diagram without the
+    // statement, at the same 832x493 px and the same 23,058 ink pixels.
+  });
+
+  /**
+   * `box` is STRUCTURAL — it groups actors and is closed by `end` — so the
+   * statement survives with `transparent` written into the segment mermaid
+   * reads as the colour. That is what makes the rule fail closed: whatever
+   * follows is the title, so an unrecognised colour can only become TEXT.
+   * mermaid's own `parseBoxData` falls back to `transparent` when the first
+   * word is not a CSS colour and then keeps the WHOLE string as the title,
+   * which is why a non-colour first word is kept here too.
+   */
+  it.each([
+    ['rgb()', 'box rgb(255,0,0) Hot path', 'box transparent Hot path'],
+    ['rgba()', 'box rgba(255, 0, 0, 0.5) Hot', 'box transparent Hot'],
+    ['hsl()', 'box hsl(0, 100%, 50%) Hot', 'box transparent Hot'],
+    ['oklch()', 'box oklch(0.7 0.3 20) Hot', 'box transparent Hot'],
+    ['a named colour', 'box Red path', 'box transparent path'],
+    ['a NON-colour first word', 'box Hot path', 'box transparent Hot path'],
+    ['a word that merely starts like one', 'box reddish thing', 'box transparent reddish thing'],
+    ['an already-transparent box', 'box transparent Keep', 'box transparent Keep'],
+    ['a colour and nothing else', 'box red', 'box transparent'],
+  ])('DIAG-37i · a sequence `box` with %s keeps its group and loses its fill', (_n, line, want) => {
+    const src = `sequenceDiagram\n  ${line}\n    participant A\n    participant B\n  end\n  A->>B: hi`;
+    const out = sanitizeDiagramSource(src);
+    expect(out.split('\n')[1]).toBe(`  ${want}`);
+    // the group is still a group, and the messages are still there
+    expect(out).toContain('participant A');
+    expect(out).toContain('\n  end');
+    expect(out).toContain('A->>B: hi');
+    expect(out).not.toContain('rgb(255,0,0)');
+  });
+
+  it('DIAG-37i2 · `box` outside a sequenceDiagram is an ordinary node id', () => {
+    // A flowchart node may be called `box`. Rewriting it would delete the
+    // author's graph, so the rule is gated on the diagram's own head.
+    const src = 'flowchart LR\n  box[Label] --> other[Two]\n  box --> third';
+    expect(sanitizeDiagramSource(src)).toBe(src);
+  });
+
+  it('DIAG-37j · a quadrantChart point keeps its coordinates and loses its paint', () => {
+    const src =
+      'quadrantChart\n  title Q\n  x-axis Low --> High\n  y-axis Low --> High\n' +
+      '  "A": [0.7, 0.8] radius: 20, color: #ff0000, stroke-color: #00ff00, stroke-width: 6px\n' +
+      '  "B": [0.2, 0.3]';
+    const out = sanitizeDiagramSource(src);
+    expect(out).toContain('"A": [0.7, 0.8]');
+    expect(out).toContain('"B": [0.2, 0.3]');
+    expect(out).not.toContain('#ff0000');
+    expect(out).not.toContain('stroke-color');
+    // `<circle … fill="#ff0000" stroke="#00ff00" stroke-width="6px">` before,
+    // `fill="#3596f8" stroke="#3596f8" stroke-width="0px"` after — the same
+    // values as the same chart with no style clause.
+  });
+
+  it('DIAG-37j2 · a quadrantChart `:::role` survives, because it is inert', () => {
+    const src = 'quadrantChart\n  "A": [0.7, 0.8]:::hot\n  "B": [0.2, 0.3]';
+    expect(sanitizeDiagramSource(src)).toBe(src);
+  });
+
+  it('DIAG-37k · none of this changes a diagram that carries no paint', () => {
+    for (const src of [
+      'C4Context\n  Person(p, "User")\n  System(s, "Sys")\n  Rel(p, s, "uses")',
+      'sequenceDiagram\n  participant A\n  A->>A: hi',
+      'quadrantChart\n  "A": [0.7, 0.8]\n  "B": [0.2, 0.3]',
+      'flowchart LR\n  A --> B',
+    ]) {
+      expect(sanitizeDiagramSource(src), JSON.stringify(src)).toBe(src);
+    }
   });
 });
