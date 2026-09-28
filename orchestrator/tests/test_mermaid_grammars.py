@@ -359,15 +359,17 @@ def test_each_family_png_is_paper_sized_and_its_labels_are_readable(family, tmp_
 
 
 def test_the_largest_allowed_instances_still_draw_and_report_their_scale():
-    """The spec caps bound the figure sizes; the wide ones (twelve
-    lifelines, twenty-four timeline periods) do not fit a portrait page at
-    8 pt and SAY so through `fits`, rather than shipping unreadable text."""
+    """The spec caps bound the figure sizes; the wide one that cannot fold
+    (twelve lifelines) does not fit a portrait page at 8 pt and SAYS so
+    through `fits`, rather than shipping unreadable text. Twenty-four
+    timeline periods FOLD into rows and fit (they shipped at under 4 pt
+    until 2026-09-28; tests/test_diagram_drawers_pictures.py)."""
     twelve = "sequenceDiagram\n" + "".join(f"  participant P{i} as Participant {i}\n" for i in range(12)) + "  P0->>P11: across\n"
     lay = D.layout_for(S.diagram_from_fields(D.parse_mermaid(twelve)))
     assert lay.fig_in[0] > D.PORTRAIT_BOX_IN[0] and not lay.fits and lay.effective_pt < D.MIN_EFFECTIVE_PT
     periods = "timeline\n" + "".join(f"  {2000 + i} : event {i}\n" for i in range(24))
     lay = D.layout_for(S.diagram_from_fields(D.parse_mermaid(periods)))
-    assert not lay.fits and lay.scale < 0.5
+    assert lay.fits and lay.detail["rows"] >= 4 and lay.fig_in[0] <= D.PORTRAIT_BOX_IN[0]
     # A deep-but-narrow one fits: eight states in a chain are ten layers
     # with the start dot and the end bullseye, 8.18 in tall at the 0.46 in
     # layer gap, inside the 8.4 in portrait box (measured 2026-09-28; at the

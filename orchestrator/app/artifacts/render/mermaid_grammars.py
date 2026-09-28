@@ -681,6 +681,13 @@ def parse_mindmap(lines: List[str]) -> Optional[Dict[str, Any]]:
         if got is None:
             return None
         nid, label, shape = got
+        if len(nid) > 36:
+            # A plain line's id IS its text, and spec.MindNode caps an id at
+            # 40 while a label may be 48: a 41-48 character line refused the
+            # whole map (until 2026-09-28 it raised out of validation). The
+            # id is internal — a parent reference — so it is shortened here
+            # and kept unique by the suffix below; the label is untouched.
+            nid = nid[:36]
         if nid in ids_seen:
             ids_seen[nid] += 1
             nid = f"{nid}__{ids_seen[nid]}"

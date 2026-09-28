@@ -607,7 +607,7 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
             fields = G.read_family(family, src_lines[first_index + 1:])
             if fields is not None and title and not fields.get("title"):
                 fields["title"] = title
-            return fields
+            return _within_caps(fields)
     source = "\n".join(src_lines)
 
     direction = "TD"
@@ -694,10 +694,20 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
             g = m.groupdict()
             if not _ids_are_names(g["aid"]):
                 return None
-            if G.is_keyword(g["aid"]):
-                # A diagram keyword is never a node. `_DIR_RE` above already
-                # keeps `flowchart` out of the drawing; this keeps the other
-                # thirty-odd keywords out too, wherever they sit in the source.
+            if g["alabel"] is None and g["arole"] is None and g["aid"] in G.MERMAID_KEYWORDS:
+                # A BARE keyword line — `classDiagram` on a line of its own
+                # inside a flowchart — is a keyword, never a node; the header
+                # dispatch above already sends a source that STARTS with one
+                # to its own reader. A node that merely shares a keyword's
+                # spelling is a node: mermaid's flowchart lexer reserves no
+                # words, so `info["Info page"]`, `timeline`, `pie`, `graph`
+                # and `Info` are all nodes in the browser and are drawn here.
+                # Case-SENSITIVE and bare only: until 2026-09-28 this branch
+                # lowercased and refused any keyword-spelled id declared on
+                # its own line, so `info["Info page"]` on one line and
+                # `info --> B` on the next REFUSED while the same node written
+                # `info["Info page"] --> B["Next"]` drew — main (ae25da28)
+                # drew both; the capability was lost, not gained.
                 return None
             touch(g["aid"], g["alabel"], g["arole"])
             continue
@@ -707,7 +717,7 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
         return None
     if len(order) > max_nodes or len(edges) > max_edges:
         return None
-    return {
+    return _within_caps({
         "title": title,
         "direction": direction,
         # `roles` holds only the names the closed vocabulary knows, so a node
@@ -720,7 +730,28 @@ def parse_mermaid(source: str, *, max_nodes: int = 24, max_edges: int = 40) -> O
         # and the figure's legend named a role the model never wrote.
         "nodes": [{"id": nid, "label": labels[nid], "kind": roles.get(nid)} for nid in order],
         "edges": edges,
-    }
+    })
+
+
+def _within_caps(fields: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """`fields`, or None when the typed model refuses them: a label past its
+    cap, more entities or steps than spec.py allows. The READER refuses an
+    over-cap source, like any other it cannot carry, so the caller sees the
+    ordinary None and keeps its callout. Until 2026-09-28 the pydantic
+    ValidationError escaped `diagram_from_fields`, md_import caught it and
+    logged a "parsed but did not build" bug line for what is a size refusal.
+    """
+    if fields is None:
+        return None
+    from pydantic import ValidationError
+
+    from ..spec import diagram_from_fields
+
+    try:
+        diagram_from_fields(fields)
+    except ValidationError:
+        return None
+    return fields
 
 
 # ---------------------------------------------------------------- layout --

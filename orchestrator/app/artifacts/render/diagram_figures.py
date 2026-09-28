@@ -12,26 +12,54 @@ arrows in the diagrams.py sense, and none is drawn by that module's layout.
 THE PROMISE IS THE SAME: what is drawn is what the reader read, and the
 reader refused everything it could not carry. Nothing here fills a gap the
 source left, invents a node, or drops one. Every label reaches the page as
-text; nothing is executed or fetched.
+text; nothing is executed or fetched. A label longer than its box is wide
+is WRAPPED onto as many lines as it needs and the box grows to hold them;
+this module's `_wrap` never cuts a line off with an ellipsis. (Until
+2026-09-28 it did — a kanban card past 4 lines, a mindmap or journey label
+past 3, a timeline event past 3 lines of 16 characters — and the engine's
+own browser timeline shipped "Tim Berners-Lee creates the first web brows…"
+while this docstring said nothing was dropped. diagrams.py's flowchart
+`_wrap` still caps a node label at three lines; that is the graph family's
+contract, not this one's.)
 
 COLOUR. Ink on paper. These families have no role vocabulary and mermaid's
 own colouring of them is decorative (a mindmap's branch hues, a timeline's
-section tints), so nothing is painted that could be read as a category. Two
-fills only: BOX_FILL, a light neutral wash for a box, and HEAD_FILL, a shade
-darker for a header row, both tints of diagrams.NEUTRAL against PAPER. Where
-a diagram carries a magnitude — a journey's 1-5 score — it is drawn as a
-COUNT of filled dots beside the number, never as a colour ramp, so it reads
-for someone who cannot see colour and for a grayscale print.
+section tints), so nothing is painted that could be read as a category.
+Boxes and header rows take two neutral tints — BOX_FILL, a light wash, and
+HEAD_FILL, a shade darker, both tints of diagrams.NEUTRAL against PAPER —
+and ONE more fill exists: a sequence diagram's NOTE is filled with a light
+orange tint (NOTE_FILL, `_tint("#E07B00", 0.86)`), so a note reads as a
+note and not as a participant's box, the way mermaid's own yellow note does.
+Every note gets the same tint, so it carries no category. Where a diagram
+carries a magnitude — a journey's 1-5 score — it is drawn as a COUNT of
+filled dots beside the number, never as a colour ramp, so it reads for
+someone who cannot see colour and for a grayscale print.
+
+ROUTING. A relation between two boxes is a straight line when that line
+clears every other box; when it would cross one — a link that spans more
+than one layer runs straight through whatever sits between, which is what
+USERS -> COMMENTS did through POSTS in a blog ER drawn from the engine's own
+output on 2026-09-28, its label overprinting a POSTS row — it is bowed by the
+smallest arc that clears the boxes in between, its label at the arc's apex,
+and the figure grows to hold the arc. A back edge and each half of a twin
+pair (A -> B and B -> A) bow too, the twins on opposite sides. A
+self-transition loops on the ACROSS side of the flow (right of the box in
+TD, below it in LR) and its reach is part of the layer's across size, so it
+neither lands on the next layer's box nor runs off the figure.
 
 PAGE FIT reuses diagrams.py's contract. Every plan reports the figure's
 natural size in inches and the smallest label size it used; the callers
 scale a figure that is wider or taller than the page box DOWN, and when a
 label would land under MIN_EFFECTIVE_PT (8 pt) the layout says `fits=False`
-and render/__init__.py puts a sentence in the render report. The caps in
-spec.py bound the sizes: measured on this branch (see
-tests/test_mermaid_grammars.py), every family's largest allowed instance
-still draws; the wide ones (12 lifelines, 24 timeline periods) report their
-scale honestly rather than silently shipping 5 pt text.
+and render/__init__.py puts a sentence in the render report. A TIMELINE and
+a JOURNEY, the two families that grow sideways with every item, FOLD into
+rows that fit the page width instead (the engine's typical eight-task
+journey was 12.1 in wide and shipped at 5.0 pt; a ten-period timeline 14.8
+in and 4.0 pt, measured 2026-09-28; folded, both print at full size). The
+caps in spec.py bound the rest: every family's largest allowed instance
+still draws, and the one that cannot fold — twelve lifelines — reports its
+scale honestly rather than silently shipping 5 pt text. A mindmap is a
+tree and does not fold; a deep one still shrinks and says so.
 
 COORDINATES. Every plan lays out in INCHES with y growing DOWNWARD, as a page
 reads; `_axes` inverts the matplotlib y-axis once so the code above it never
@@ -56,6 +84,8 @@ MIN_EFFECTIVE_PT = DG.MIN_EFFECTIVE_PT
 PAD = 0.22
 BOX_FILL = DG._tint(DG.NEUTRAL, 0.90)
 HEAD_FILL = DG._tint(DG.NEUTRAL, 0.78)
+#: The one non-neutral fill: a sequence note (see the module docstring).
+NOTE_FILL = DG._tint("#E07B00", 0.86)
 
 
 @dataclass
@@ -112,16 +142,33 @@ def _lh(pt: float = FONT_PT) -> float:
     return pt * LINE_SPACING / 72.0
 
 
-def _wrap(text: str, width: int, max_lines: int = 3) -> str:
-    """diagrams._wrap, joined; a `<br/>` already became a newline upstream."""
+def _wrap(text: str, width: int) -> str:
+    """`text` broken into lines of about `width` characters — ALL of them,
+    never cut with an ellipsis (see the module docstring); a word longer
+    than the width is hard-split as diagrams._wrap does. A `<br/>` already
+    became a newline upstream and stays a line break."""
     out: List[str] = []
     for part in (text or "").split("\n"):
-        out.extend(DG._wrap(part, width))
-    if len(out) > max_lines:
-        head = out[: max_lines - 1]
-        tail = " ".join(out[max_lines - 1:])
-        head.append(tail if len(tail) <= width else tail[: width - 1] + "…")
-        out = head
+        words = part.split()
+        if not words:
+            out.append("")
+            continue
+        cur = ""
+        for word in words:
+            while len(word) > width:
+                if cur:
+                    out.append(cur)
+                    cur = ""
+                out.append(word[: width - 1] + "-")
+                word = word[width - 1:]
+            candidate = f"{cur} {word}".strip()
+            if len(candidate) <= width or not cur:
+                cur = candidate
+            else:
+                out.append(cur)
+                cur = word
+        if cur:
+            out.append(cur)
     return "\n".join(out)
 
 
@@ -209,16 +256,21 @@ def _anchor(cx: float, cy: float, w: float, h: float, toward: Tuple[float, float
 
 
 def _place_boxes(sizes: Dict[str, Tuple[float, float]], links: Sequence[Tuple[str, str]], direction: str,
-                 *, layer_gap: float = 0.62, node_gap: float = 0.42) -> Tuple[Dict[str, Tuple[float, float]], float, float, Set[int]]:
+                 *, layer_gap: float = 0.62, node_gap: float = 0.42,
+                 across_extra: Optional[Dict[str, float]] = None) -> Tuple[Dict[str, Tuple[float, float]], float, float, Set[int]]:
     """Centres for boxes of the given sizes, layered along `direction`.
 
     A small Sugiyama: back edges found by depth-first search are reversed
     for layering (a cyclic graph otherwise collapses onto one layer),
     longest-path layering, then four barycentre sweeps to order each layer.
     Returns (centres, width, height, indices of the reversed links), all in
-    inches with PAD around.
+    inches with PAD around. `across_extra[k]` is room a box needs beyond its
+    own across-size on the across side (a self-loop and its label); it is
+    part of the layer's across extent, so the next box in the layer and the
+    figure's edge both clear it.
     """
     ids = list(sizes)
+    extra = across_extra or {}
     succ: Dict[str, List[Tuple[str, int]]] = {k: [] for k in ids}
     for i, (a, b) in enumerate(links):
         if a in succ and b in succ and a != b:
@@ -298,7 +350,7 @@ def _place_boxes(sizes: Dict[str, Tuple[float, float]], links: Sequence[Tuple[st
     along = (lambda k: sizes[k][1]) if direction == "TD" else (lambda k: sizes[k][0])
     across = (lambda k: sizes[k][0]) if direction == "TD" else (lambda k: sizes[k][1])
     layer_extent = {li: max(along(k) for k in row) for li, row in layers.items()}
-    row_extent = {li: sum(across(k) for k in row) + node_gap * (len(row) - 1) for li, row in layers.items()}
+    row_extent = {li: sum(across(k) + extra.get(k, 0.0) for k in row) + node_gap * (len(row) - 1) for li, row in layers.items()}
     total_across = max(row_extent.values()) if row_extent else 0.0
     centres: Dict[str, Tuple[float, float]] = {}
     cursor = PAD
@@ -309,55 +361,266 @@ def _place_boxes(sizes: Dict[str, Tuple[float, float]], links: Sequence[Tuple[st
         for k in row:
             c_across = start + across(k) / 2
             centres[k] = (c_across, mid) if direction == "TD" else (mid, c_across)
-            start += across(k) + node_gap
+            start += across(k) + extra.get(k, 0.0) + node_gap
         cursor += layer_extent[li] + layer_gap
     total_along = cursor - layer_gap + PAD
     w, h = (total_across + 2 * PAD, total_along) if direction == "TD" else (total_along, total_across + 2 * PAD)
     return centres, w, h, back
 
 
-def _edge_between(ax, a: Tuple[float, float, float, float], b: Tuple[float, float, float, float], *,
-                  dashed: bool = False, bow: bool = False) -> Tuple[Tuple[float, float], Tuple[float, float]]:
-    """A line from box a (cx, cy, w, h) to box b, clipped at both borders.
-    Returns the two end points so heads and labels can be placed."""
-    p = _anchor(a[0], a[1], a[2], a[3], (b[0], b[1]))
-    q = _anchor(b[0], b[1], b[2], b[3], (a[0], a[1]))
-    if bow:
-        _arrow(ax, p, q, head="none", dashed=dashed, rad=0.25)
-    else:
-        _line(ax, p, q, dashed=dashed)
-    return p, q
+#: A relation keeps this far from a box it does not touch; so does its label.
+_CLEAR_IN = 0.10
+#: Bows tried, smallest first, either side, when a straight line would cross
+#: a box. arc3's `rad` is a fraction of the chord length.
+_BOW_RADS: Tuple[float, ...] = (0.3, -0.3, 0.45, -0.45, 0.65, -0.65, 0.9, -0.9, 1.2, -1.2, 1.6, -1.6)
+#: The bows a twin pair may take: one sign only, because the same `rad` on
+#: the reversed chord bows to the OTHER side of the page, which is what puts
+#: A -> B and B -> A on opposite sides of each other.
+_TWIN_RADS: Tuple[float, ...] = (0.3, 0.45, 0.65, 0.9, 1.2, 1.6)
 
 
-def _mid_label(ax, p: Tuple[float, float], q: Tuple[float, float], text: str, pt: float = SMALL_PT,
-               bow: float = 0.0, twin: bool = False) -> None:
-    """A label at the middle of the line p->q.
+@dataclass
+class _Route:
+    """One relation's path: arc3 `rad` (0 for a straight line), its two end
+    points on the box borders, and where its label sits."""
+    rad: float
+    p: Tuple[float, float]
+    q: Tuple[float, float]
+    label_xy: Tuple[float, float]
 
-    On a bowed line (arc3 with `rad=bow`) it sits at the bow's apex. When
-    the edge has a TWIN running the other way (`twin`), a straight edge's
-    label is pushed 0.2 in to its own side, which is the side opposite the
-    twin's bow — so "pause" and "resume" between the same two states never
-    print on top of each other (measured in the pixels on 2026-09-28: at the
-    midpoint they did, and the apex alone was 0.19 in away, not enough).
-    """
-    if not text:
-        return
-    mx, my = (p[0] + q[0]) / 2, (p[1] + q[1]) / 2
+    def shifted(self, dx: float, dy: float) -> "_Route":
+        return _Route(self.rad, (self.p[0] + dx, self.p[1] + dy), (self.q[0] + dx, self.q[1] + dy),
+                      (self.label_xy[0] + dx, self.label_xy[1] + dy))
+
+
+def _control(p: Tuple[float, float], q: Tuple[float, float], rad: float) -> Tuple[float, float]:
+    """arc3's control point for the curve p -> q at `rad`, in the plans' inch
+    coordinates (y down). Measured on the inverted axes on 2026-09-28: a
+    positive `rad` bows toward (-uy, ux), the page-left when travelling down
+    the page — NOT the side `_mid_label` used to assume."""
     ux, uy, d = _unit(p, q)
-    # arc3's control point is mid + rad*d perpendicular and the curve's
-    # apex is halfway to it. The perpendicular is taken in DISPLAY space,
-    # and `_axes` inverts y, so the sign below is the one that lands on the
-    # bow (checked in the pixels: the other sign put "resume" on "pause").
-    off = max(bow * d * 0.5, 0.24) if bow else (0.20 if twin else 0.0)
-    mx += uy * off
-    my += -ux * off
-    _text(ax, mx, my, text, pt=pt, bg=PAPER, z=5)
+    return ((p[0] + q[0]) / 2 - uy * rad * d, (p[1] + q[1]) / 2 + ux * rad * d)
 
 
-def _twins(links: Sequence[Tuple[str, str]]) -> Set[int]:
-    """Indices of links whose reverse is also present."""
+def bezier_points(p: Tuple[float, float], q: Tuple[float, float], rad: float, n: int = 24) -> List[Tuple[float, float]]:
+    """Points along the curve arc3 draws for p -> q at `rad` (the straight
+    line when `rad` is 0), for clearance checks and for the tests."""
+    if not rad:
+        return [(p[0] + (q[0] - p[0]) * i / n, p[1] + (q[1] - p[1]) * i / n) for i in range(n + 1)]
+    c = _control(p, q, rad)
+    out: List[Tuple[float, float]] = []
+    for i in range(n + 1):
+        t = i / n
+        a, b = (1 - t) ** 2, 2 * (1 - t) * t
+        out.append((a * p[0] + b * c[0] + t * t * q[0], a * p[1] + b * c[1] + t * t * q[1]))
+    return out
+
+
+def _label_xy(p: Tuple[float, float], q: Tuple[float, float], rad: float) -> Tuple[float, float]:
+    """Where a label of the curve p -> q sits: the midpoint of a straight
+    line, the apex of a bow (never nearer the chord than 0.24 in, so the
+    text clears the line)."""
+    mx, my = (p[0] + q[0]) / 2, (p[1] + q[1]) / 2
+    if not rad:
+        return mx, my
+    ux, uy, d = _unit(p, q)
+    off = max(abs(rad) * d * 0.5, 0.24) * (1 if rad > 0 else -1)
+    return mx - uy * off, my + ux * off
+
+
+def _in_rect(pt: Tuple[float, float], r: Tuple[float, float, float, float], clear: float) -> bool:
+    return r[0] - clear <= pt[0] <= r[0] + r[2] + clear and r[1] - clear <= pt[1] <= r[1] + r[3] + clear
+
+
+def _rects_overlap(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float], clear: float) -> bool:
+    return not (a[0] + a[2] < b[0] - clear or b[0] + b[2] + clear < a[0] or a[1] + a[3] < b[1] - clear or b[1] + b[3] + clear < a[1])
+
+
+def _route(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float],
+           others: Sequence[Tuple[float, float, float, float]], label_wh: Tuple[float, float],
+           rads: Sequence[float]) -> _Route:
+    """The path from box a to box b (cx, cy, w, h): the first of `rads`
+    (0 for straight) whose curve and label clear every rectangle in
+    `others`, else the one that crosses the least."""
+    ca, cb = (a[0], a[1]), (b[0], b[1])
+    best: Optional[Tuple[int, _Route]] = None
+    for rad in rads:
+        c = _control(ca, cb, rad) if rad else None
+        p = _anchor(a[0], a[1], a[2], a[3], c or cb)
+        q = _anchor(b[0], b[1], b[2], b[3], c or ca)
+        pts = bezier_points(p, q, rad, 48)
+        hits = sum(1 for pt in pts[2:-2] for r in others if _in_rect(pt, r, _CLEAR_IN))
+        lx, ly = _label_xy(p, q, rad)
+        lw, lh = label_wh
+        if lw:
+            hits += sum(1 for r in others if _rects_overlap((lx - lw / 2, ly - lh / 2, lw, lh), r, _CLEAR_IN))
+        route = _Route(rad, p, q, (lx, ly))
+        if hits == 0:
+            return route
+        if best is None or hits < best[0]:
+            best = (hits, route)
+    assert best is not None
+    return best[1]
+
+
+def _route_links(centres: Dict[str, Tuple[float, float]], sizes: Dict[str, Tuple[float, float]],
+                 links: Sequence[Tuple[str, str]], labels: Sequence[str], back: Set[int],
+                 label_pt: float = SMALL_PT, obstacles: Sequence[Tuple[float, float, float, float]] = ()) -> Dict[int, _Route]:
+    """A `_Route` per link index (self-links have none). A straight line is
+    tried first except for a back edge, which bows as before, and for each
+    half of a twin pair, which bow on opposite sides. `obstacles` are
+    rectangles no route may cross besides the boxes: the self-loops and
+    their labels. Two straight routes whose labels would print on top of
+    each other (two transitions fanning out of one state) have their labels
+    slid apart along their own lines, one toward its source and one toward
+    its target."""
     pairs = set(links)
-    return {i for i, (a, b) in enumerate(links) if a != b and (b, a) in pairs}
+    rects = {k: (centres[k][0] - sizes[k][0] / 2, centres[k][1] - sizes[k][1] / 2, sizes[k][0], sizes[k][1]) for k in sizes}
+    routes: Dict[int, _Route] = {}
+    for i, (a, b) in enumerate(links):
+        if a == b or a not in sizes or b not in sizes:
+            continue
+        others = [r for k, r in rects.items() if k not in (a, b)] + list(obstacles)
+        label = labels[i] if i < len(labels) else ""
+        label_wh = (_tw(label, label_pt) + 0.12, _lh(label_pt)) if label else (0.0, 0.0)
+        if (b, a) in pairs:
+            rads: Sequence[float] = _TWIN_RADS
+        elif i in back:
+            rads = _BOW_RADS
+        else:
+            rads = (0.0,) + _BOW_RADS
+        routes[i] = _route((*centres[a], *sizes[a]), (*centres[b], *sizes[b]), others, label_wh, rads)
+    _spread_labels(routes, labels, label_pt)
+    return routes
+
+
+def _spread_labels(routes: Dict[int, _Route], labels: Sequence[str], label_pt: float) -> None:
+    def rect(i: int) -> Optional[Tuple[float, float, float, float]]:
+        label = labels[i] if i < len(labels) else ""
+        if not label:
+            return None
+        lw, lh = _tw(label, label_pt) + 0.12, _lh(label_pt)
+        x, y = routes[i].label_xy
+        return (x - lw / 2, y - lh / 2, lw, lh)
+
+    def at(i: int, t: float) -> Tuple[float, float]:
+        pts = bezier_points(routes[i].p, routes[i].q, routes[i].rad, 50)
+        return pts[int(round(t * 50))]
+
+    idx = sorted(routes)
+    for n, i in enumerate(idx):
+        ri = rect(i)
+        if ri is None or routes[i].rad:
+            continue
+        for j in idx[n + 1:]:
+            rj = rect(j)
+            if rj is None or routes[j].rad or not _rects_overlap(ri, rj, 0.0):
+                continue
+            # 0.30 / 0.70 along their lines: on the 0.46 in layer gap that
+            # is 0.18 in apart, one 7.5 pt line height plus clearance.
+            routes[i].label_xy = at(i, 0.30)
+            routes[j].label_xy = at(j, 0.70)
+            ri = rect(i)
+            assert ri is not None
+
+
+def _fit_routes(centres: Dict[str, Tuple[float, float]], routes: Dict[int, _Route], labels: Sequence[str],
+                W: float, H: float, label_pt: float = SMALL_PT) -> Tuple[Dict[str, Tuple[float, float]], Dict[int, _Route], float, float]:
+    """Grow the figure (and shift everything in it) so every bow and every
+    label stays at least 0.08 in inside the page."""
+    xs: List[float] = []
+    ys: List[float] = []
+    for i, r in routes.items():
+        for x, y in bezier_points(r.p, r.q, r.rad, 24):
+            xs.append(x)
+            ys.append(y)
+        label = labels[i] if i < len(labels) else ""
+        if label:
+            lw, lh = _tw(label, label_pt) + 0.12, _lh(label_pt)
+            xs += [r.label_xy[0] - lw / 2, r.label_xy[0] + lw / 2]
+            ys += [r.label_xy[1] - lh / 2, r.label_xy[1] + lh / 2]
+    if not xs:
+        return centres, routes, W, H
+    margin = 0.08
+    dx = max(0.0, margin - min(xs))
+    dy = max(0.0, margin - min(ys))
+    W = max(W, max(xs) + margin) + dx
+    H = max(H, max(ys) + margin) + dy
+    if dx or dy:
+        centres = {k: (x + dx, y + dy) for k, (x, y) in centres.items()}
+        routes = {i: r.shifted(dx, dy) for i, r in routes.items()}
+    return centres, routes, W, H
+
+
+def _draw_route(ax, r: _Route, *, head: str = "none", dashed: bool = False, shrink_b: float = 0.0) -> None:
+    if r.rad:
+        _arrow(ax, r.p, r.q, head=head, dashed=dashed, rad=r.rad, shrink_b=shrink_b)
+    elif head == "none":
+        _line(ax, r.p, r.q, dashed=dashed)
+    else:
+        _arrow(ax, r.p, r.q, head=head, dashed=dashed, shrink_b=shrink_b)
+
+
+def _route_label(ax, r: _Route, text: str, pt: float = SMALL_PT) -> None:
+    if text:
+        _text(ax, r.label_xy[0], r.label_xy[1], text, pt=pt, bg=PAPER, z=5)
+
+
+def _toward_from(r: _Route, at_p: bool) -> Tuple[float, float]:
+    """The direction a glyph at one end of the route should look along: the
+    control point on a bow (the curve's tangent there), the far end on a
+    straight line."""
+    if r.rad:
+        return _control(r.p, r.q, r.rad)
+    return r.q if at_p else r.p
+
+
+# ------------------------------------------------------------- self loops --
+
+
+def _self_loop_extent(label: str, direction: str) -> float:
+    """How far a self-loop and its label reach beyond the box on the across
+    side: right of it in TD, below it in LR."""
+    if direction == "TD":
+        return 0.34 + (_tw(label, SMALL_PT) + 0.08 if label else 0.0)
+    return 0.34 + (_lh(SMALL_PT) + 0.06 if label else 0.0)
+
+
+def _loop_rect(box: Tuple[float, float, float, float], label: str, direction: str) -> Tuple[float, float, float, float]:
+    """The rectangle a self-loop and its label occupy beside `box`."""
+    cx, cy, w, h = box
+    reach = _self_loop_extent(label, direction)
+    if direction == "TD":
+        return (cx + w / 2, cy - 0.16, reach, 0.32)
+    lw = _tw(label, SMALL_PT) + 0.12 if label else 0.32
+    return (cx - max(0.16, lw / 2), cy + h / 2, max(0.32, lw), reach)
+
+
+def _self_loop(ax, box: Tuple[float, float, float, float], label: str, direction: str, head: str) -> Tuple[float, float, float, float]:
+    """Draw the loop on the across side of `box`; return `_loop_rect`."""
+    cx, cy, w, h = box
+    if direction == "TD":
+        x = cx + w / 2
+        _arrow(ax, (x, cy - 0.12), (x, cy + 0.12), head=head, rad=-1.8)
+        if label:
+            _text(ax, x + 0.34, cy, label, pt=SMALL_PT, ha="left", bg=PAPER, z=5)
+    else:
+        y = cy + h / 2
+        _arrow(ax, (cx + 0.12, y), (cx - 0.12, y), head=head, rad=-1.8)
+        if label:
+            _text(ax, cx, y + 0.34 + _lh(SMALL_PT) / 2, label, pt=SMALL_PT, bg=PAPER, z=5)
+    return _loop_rect(box, label, direction)
+
+
+def _layer_gap(base: float, labels: Sequence[str], direction: str) -> float:
+    """The gap between layers: `base`, or in LR wide enough for the widest
+    relation label, which sits IN the gap and otherwise prints over the
+    borders of the boxes on both sides (seen 2026-09-28 on an LR order
+    lifecycle: "Payment Confirmed" erased the edges of Created and Paid)."""
+    if direction != "LR":
+        return base
+    widest = max((_tw(l, SMALL_PT) for l in labels if l), default=0.0)
+    return max(base, widest + 0.24)
 
 
 # --------------------------------------------------------------- sequence --
@@ -376,12 +639,14 @@ def plan_sequence(d: Any) -> FigureLayout:
     widths = [max(1.0, _tw(p.label) + 0.36) for p in parts]
     gaps = [0.36] * max(0, n - 1)
     right_extra = 0.0
+    left_need = 0.0
+    left_extra = 0.0
     any_actor = any(p.actor for p in parts)
     head_h = 0.72 if any_actor else 0.46
 
     def centres() -> List[float]:
         xs: List[float] = []
-        x = PAD
+        x = PAD + left_extra
         for i in range(n):
             xs.append(x + widths[i] / 2)
             x += widths[i] + (gaps[i] if i < n - 1 else 0.0)
@@ -434,7 +699,13 @@ def plan_sequence(d: Any) -> FigureLayout:
                 if i > 0:
                     gaps[i - 1] = max(gaps[i - 1], need + 0.1)
                 else:
-                    widths[0] = max(widths[0], 2 * need)  # room on the left of the first lifeline
+                    left_need = max(left_need, need)
+    # Room on the LEFT of the first lifeline for a `Note left of` it, as
+    # `right_extra` makes room on the right of the last: a margin, not a
+    # wider box. Until 2026-09-28 this widened `widths[0]` to twice the
+    # note, and a 45-character note made the first participant's head box
+    # about four times the width of the others (seen in the pixels).
+    left_extra = max(0.0, left_need + 0.12 + 0.06 - widths[0] / 2) if left_need else 0.0
     xs = centres()
     W = xs[-1] + widths[-1] / 2 + right_extra + PAD
     y_head = PAD
@@ -469,7 +740,8 @@ def plan_sequence(d: Any) -> FigureLayout:
             rows.append(("frame_close", (kind, text, y_open, dep), cursor))
             cursor += _ROW_FRAME_CLOSE
     H = cursor + PAD
-    detail = {"lifelines": {p.id: xs[i] for i, p in enumerate(parts)}, "rows": len(rows)}
+    detail = {"lifelines": {p.id: xs[i] for i, p in enumerate(parts)}, "rows": len(rows),
+              "head_widths": list(widths), "left_extra": left_extra}
 
     def draw(ax) -> None:
         for i, p in enumerate(parts):
@@ -519,7 +791,7 @@ def plan_sequence(d: Any) -> FigureLayout:
                     left, right = xs[ids[0]] + 0.12, xs[ids[0]] + 0.12 + w
                 else:
                     left, right = xs[ids[0]] - 0.12 - w, xs[ids[0]] - 0.12
-                _box(ax, left, y, right - left, h, fill=DG._tint("#E07B00", 0.86), edge=EDGE_INK, rounding=0.02, z=3)
+                _box(ax, left, y, right - left, h, fill=NOTE_FILL, edge=EDGE_INK, rounding=0.02, z=3)
                 _text(ax, (left + right) / 2, y + h / 2, text, pt=SMALL_PT, z=5)
             elif kind == "frame_open":
                 s, dep = payload
@@ -600,24 +872,28 @@ def plan_er(d: Any, direction: Optional[str] = None) -> FigureLayout:
         sizes[e.id] = (w, h)
         rows_of[e.id] = rows
     links = [(r.source, r.target) for r in d.relations]
-    centres, W, H, back = _place_boxes(sizes, links, direction, layer_gap=0.75)
-    twins = _twins(links)
+    rel_labels = [r.label for r in d.relations]
+    loops = {r.source: r.label for r in d.relations if r.source == r.target}
+    extra = {k: _self_loop_extent(l, direction) for k, l in loops.items()}
+    centres, W, H, back = _place_boxes(sizes, links, direction, layer_gap=_layer_gap(0.75, rel_labels, direction), across_extra=extra)
+    loop_rects = [_loop_rect((*centres[k], *sizes[k]), l, direction) for k, l in loops.items()]
+    routes = _route_links(centres, sizes, links, rel_labels, back, obstacles=loop_rects)
+    centres, routes, W, H = _fit_routes(centres, routes, rel_labels, W, H)
     labels = {e.id: e.label for e in d.entities}
-    detail = {"boxes": {k: (centres[k][0] - sizes[k][0] / 2, centres[k][1] - sizes[k][1] / 2, sizes[k][0], sizes[k][1]) for k in sizes}}
+    detail = {"boxes": {k: (centres[k][0] - sizes[k][0] / 2, centres[k][1] - sizes[k][1] / 2, sizes[k][0], sizes[k][1]) for k in sizes},
+              "routes": {i: (links[i][0], links[i][1], r.rad, r.p, r.q, r.label_xy) for i, r in routes.items()},
+              "loops": {}}
 
     def draw(ax) -> None:
         for i, r in enumerate(d.relations):
-            a = (*centres[r.source], *sizes[r.source])
-            b = (*centres[r.target], *sizes[r.target])
             if r.source == r.target:
-                cx, cy, w, h = a
-                _arrow(ax, (cx + w / 2, cy - 0.12), (cx + w / 2, cy + 0.12), head="none", rad=-1.8)
-                _text(ax, cx + w / 2 + 0.34, cy, r.label, pt=SMALL_PT, ha="left", bg=PAPER, z=5)
+                detail["loops"][r.source] = _self_loop(ax, (*centres[r.source], *sizes[r.source]), r.label, direction, "none")
                 continue
-            p, q = _edge_between(ax, a, b, dashed=not r.identifying, bow=i in back)
-            _crow_foot(ax, p, q, r.source_card)
-            _crow_foot(ax, q, p, r.target_card)
-            _mid_label(ax, p, q, r.label, bow=0.25 if i in back else 0.0, twin=i in twins)
+            route = routes[i]
+            _draw_route(ax, route, dashed=not r.identifying)
+            _crow_foot(ax, route.p, _toward_from(route, True), r.source_card)
+            _crow_foot(ax, route.q, _toward_from(route, False), r.target_card)
+            _route_label(ax, route, r.label)
         for k, (w, h) in sizes.items():
             cx, cy = centres[k]
             x, y = cx - w / 2, cy - h / 2
@@ -694,35 +970,36 @@ def plan_class(d: Any, direction: Optional[str] = None) -> FigureLayout:
     direction = direction or d.direction
     sizes = {c.id: _class_size(c) for c in d.classes}
     links = [(r.source, r.target) for r in d.relations]
-    centres, W, H, back = _place_boxes(sizes, links, direction, layer_gap=0.8)
-    twins = _twins(links)
+    rel_labels = [r.label for r in d.relations]
+    loops = {r.source: r.label for r in d.relations if r.source == r.target}
+    extra = {k: _self_loop_extent(l, direction) for k, l in loops.items()}
+    centres, W, H, back = _place_boxes(sizes, links, direction, layer_gap=_layer_gap(0.8, rel_labels, direction), across_extra=extra)
+    loop_rects = [_loop_rect((*centres[k], *sizes[k]), l, direction) for k, l in loops.items()]
+    routes = _route_links(centres, sizes, links, rel_labels, back, obstacles=loop_rects)
+    centres, routes, W, H = _fit_routes(centres, routes, rel_labels, W, H)
     by_id = {c.id: c for c in d.classes}
-    detail = {"boxes": {k: (centres[k][0] - sizes[k][0] / 2, centres[k][1] - sizes[k][1] / 2, sizes[k][0], sizes[k][1]) for k in sizes}}
+    detail = {"boxes": {k: (centres[k][0] - sizes[k][0] / 2, centres[k][1] - sizes[k][1] / 2, sizes[k][0], sizes[k][1]) for k in sizes},
+              "routes": {i: (links[i][0], links[i][1], r.rad, r.p, r.q, r.label_xy) for i, r in routes.items()},
+              "loops": {}}
 
     def draw(ax) -> None:
         for i, r in enumerate(d.relations):
-            a = (*centres[r.source], *sizes[r.source])
-            b = (*centres[r.target], *sizes[r.target])
             if r.source == r.target:
-                cx, cy, w, h = a
-                _arrow(ax, (cx + w / 2, cy - 0.12), (cx + w / 2, cy + 0.12), head="none", rad=-1.8)
-                _text(ax, cx + w / 2 + 0.34, cy, r.label, pt=SMALL_PT, ha="left", bg=PAPER, z=5)
+                detail["loops"][r.source] = _self_loop(ax, (*centres[r.source], *sizes[r.source]), r.label, direction, "none")
                 continue
-            p = _anchor(a[0], a[1], a[2], a[3], (b[0], b[1]))
-            q = _anchor(b[0], b[1], b[2], b[3], (a[0], a[1]))
-            p2 = _uml_head(ax, p, q, r.source_head)
-            q2 = _uml_head(ax, q, p, r.target_head)
-            if i in back:
-                _arrow(ax, p2, q2, head="none", dashed=r.line == "dashed", rad=0.25)
-            else:
-                _line(ax, p2, q2, dashed=r.line == "dashed")
-            _mid_label(ax, p, q, r.label, bow=0.25 if i in back else 0.0, twin=i in twins)
-            ux, uy, _ = _unit(p, q)
-            nx, ny = -uy, ux
+            route = routes[i]
+            p, q = route.p, route.q
+            tp, tq = _toward_from(route, True), _toward_from(route, False)
+            p2 = _uml_head(ax, p, tp, r.source_head)
+            q2 = _uml_head(ax, q, tq, r.target_head)
+            _draw_route(ax, _Route(route.rad, p2, q2, route.label_xy), dashed=r.line == "dashed")
+            _route_label(ax, route, r.label)
             if r.source_card:
-                _text(ax, p[0] + ux * 0.22 + nx * 0.14, p[1] + uy * 0.22 + ny * 0.14, r.source_card, pt=TINY_PT, bg=PAPER, z=5)
+                ux, uy, _ = _unit(p, tp)
+                _text(ax, p[0] + ux * 0.22 - uy * 0.14, p[1] + uy * 0.22 + ux * 0.14, r.source_card, pt=TINY_PT, bg=PAPER, z=5)
             if r.target_card:
-                _text(ax, q[0] - ux * 0.22 + nx * 0.14, q[1] - uy * 0.22 + ny * 0.14, r.target_card, pt=TINY_PT, bg=PAPER, z=5)
+                ux, uy, _ = _unit(q, tq)
+                _text(ax, q[0] + ux * 0.22 - uy * 0.14, q[1] + uy * 0.22 + ux * 0.14, r.target_card, pt=TINY_PT, bg=PAPER, z=5)
         for k, (w, h) in sizes.items():
             c = by_id[k]
             cx, cy = centres[k]
@@ -759,7 +1036,7 @@ def plan_state(d: Any, direction: Optional[str] = None) -> FigureLayout:
 
     sizes: Dict[str, Tuple[float, float]] = {}
     for s in d.states:
-        lines = [_wrap(l, 22, 2) for l in s.lines]
+        lines = [_wrap(l, 22) for l in s.lines]
         w = max(1.0, _tw(s.label) + 0.36, *([_tw(l, SMALL_PT) + 0.3 for l in lines] or [0.0]))
         h = 0.36 + (0.06 + sum(_nlines(l) * _lh(SMALL_PT) for l in lines) if lines else 0.0)
         sizes[s.id] = (w, h)
@@ -769,29 +1046,31 @@ def plan_state(d: Any, direction: Optional[str] = None) -> FigureLayout:
     if STATE_END in used:
         sizes[STATE_END] = (0.30, 0.30)
     links = [(t.source, t.target) for t in d.transitions]
+    tr_labels = [t.label for t in d.transitions]
+    loops = {t.source: t.label for t in d.transitions if t.source == t.target}
+    extra = {k: _self_loop_extent(l, direction) for k, l in loops.items()}
     # 0.46 in between layers, as diagrams.GAP_MAJOR_IN: a 7.5 pt transition
     # label sits in it, and an eight-state chain (ten layers with the two
     # pseudo-states) stays inside the portrait box at 8 pt.
-    centres, W, H, back = _place_boxes(sizes, links, direction, layer_gap=0.46)
-    twins = _twins(links)
+    centres, W, H, back = _place_boxes(sizes, links, direction, layer_gap=_layer_gap(0.46, tr_labels, direction), across_extra=extra)
+    loop_rects = [_loop_rect((*centres[k], *sizes[k]), l, direction) for k, l in loops.items()]
+    routes = _route_links(centres, sizes, links, tr_labels, back, obstacles=loop_rects)
+    centres, routes, W, H = _fit_routes(centres, routes, tr_labels, W, H)
     by_id = {s.id: s for s in d.states}
-    detail = {"boxes": {k: (centres[k][0] - sizes[k][0] / 2, centres[k][1] - sizes[k][1] / 2, sizes[k][0], sizes[k][1]) for k in sizes}}
+    detail = {"boxes": {k: (centres[k][0] - sizes[k][0] / 2, centres[k][1] - sizes[k][1] / 2, sizes[k][0], sizes[k][1]) for k in sizes},
+              "routes": {i: (links[i][0], links[i][1], r.rad, r.p, r.q, r.label_xy) for i, r in routes.items()},
+              "loops": {}}
 
     def draw(ax) -> None:
         from matplotlib.patches import Circle
 
         for i, t in enumerate(d.transitions):
-            a = (*centres[t.source], *sizes[t.source])
-            b = (*centres[t.target], *sizes[t.target])
             if t.source == t.target:
-                cx, cy, w, h = a
-                _arrow(ax, (cx + w / 2, cy - 0.12), (cx + w / 2, cy + 0.12), head="filled", rad=-1.8)
-                _text(ax, cx + w / 2 + 0.34, cy, t.label, pt=SMALL_PT, ha="left", bg=PAPER, z=5)
+                detail["loops"][t.source] = _self_loop(ax, (*centres[t.source], *sizes[t.source]), t.label, direction, "filled")
                 continue
-            p = _anchor(a[0], a[1], a[2], a[3], (b[0], b[1]))
-            q = _anchor(b[0], b[1], b[2], b[3], (a[0], a[1]))
-            _arrow(ax, p, q, head="filled", rad=0.25 if i in back else 0.0, shrink_b=1.5)
-            _mid_label(ax, p, q, t.label, bow=0.25 if i in back else 0.0, twin=i in twins)
+            route = routes[i]
+            _draw_route(ax, route, head="filled", shrink_b=1.5)
+            _route_label(ax, route, t.label)
         for k, (w, h) in sizes.items():
             cx, cy = centres[k]
             if k == STATE_START:
@@ -809,7 +1088,7 @@ def plan_state(d: Any, direction: Optional[str] = None) -> FigureLayout:
                 _line(ax, (x, y + 0.36), (x + w, y + 0.36), lw=1.0, z=3)
                 yy = y + 0.36 + 0.03
                 for l in s.lines:
-                    txt = _wrap(l, 22, 2)
+                    txt = _wrap(l, 22)
                     hh = _nlines(txt) * _lh(SMALL_PT)
                     _text(ax, cx, yy + hh / 2, txt, pt=SMALL_PT)
                     yy += hh
@@ -926,105 +1205,147 @@ def _section_bands(items: Sequence[str], lefts: Sequence[float], rights: Sequenc
     return bands
 
 
-def plan_timeline(d: Any) -> FigureLayout:
+def _fold(widths: Sequence[float], gap: float, limit: float) -> List[List[int]]:
+    """Rows of consecutive column indices whose widths, with `gap` between,
+    fit `limit`; a column wider than the limit is a row of its own."""
+    rows: List[List[int]] = []
+    cur: List[int] = []
+    used = 0.0
+    for i, cw in enumerate(widths):
+        add = cw + (gap if cur else 0.0)
+        if cur and used + add > limit:
+            rows.append(cur)
+            cur, used, add = [], 0.0, cw
+        cur.append(i)
+        used += add
+    if cur:
+        rows.append(cur)
+    return rows
+
+
+def _fold_columns(widths: Sequence[float], gap: float, box_w: float) -> Tuple[List[List[int]], List[float], float]:
+    """(rows, lefts, W): the columns folded into rows no wider than the page
+    box, each row starting at PAD."""
+    rows = _fold(widths, gap, box_w - 2 * PAD)
+    lefts = [0.0] * len(widths)
+    W = 0.0
+    for row in rows:
+        x = PAD
+        for i in row:
+            lefts[i] = x
+            x += widths[i] + gap
+        W = max(W, x - gap + PAD)
+    return rows, lefts, W
+
+
+_ROW_GAP = 0.34
+
+
+def plan_timeline(d: Any, box_in: Tuple[float, float] = DG.PORTRAIT_BOX_IN) -> FigureLayout:
     periods = list(d.periods)
     ev_text = [[_wrap(e, 16) for e in p.events] for p in periods]
     widths = [max(1.1, _tw(p.time) + 0.3, *([_tw(t) + 0.3 for t in evs] or [0.0])) for p, evs in zip(periods, ev_text)]
     gap = 0.22
-    lefts: List[float] = []
-    x = PAD
-    for w in widths:
-        lefts.append(x)
-        x += w + gap
+    rows, lefts, W = _fold_columns(widths, gap, box_in[0])
     rights = [l + w for l, w in zip(lefts, widths)]
-    W = x - gap + PAD
     has_sections = any(p.section for p in periods)
-    y = PAD
     band_h = 0.30 if has_sections else 0.0
-    y_axis = y + band_h + 0.22
     time_h = 0.34
     ev_gap = 0.10
-    tallest = 0.0
-    for evs in ev_text:
-        h = sum(_nlines(t) * _lh() + 0.14 for t in evs) + ev_gap * len(evs)
-        tallest = max(tallest, h)
-    H = y_axis + time_h / 2 + 0.26 + tallest + PAD
-    bands = _section_bands([p.section for p in periods], lefts, rights)
-    detail = {"columns": list(zip(lefts, widths)), "bands": bands}
+    row_top: List[float] = []
+    row_axis: List[float] = []
+    y = PAD
+    for row in rows:
+        tallest = max((sum(_nlines(t) * _lh() + 0.14 for t in ev_text[i]) + ev_gap * len(ev_text[i]) for i in row), default=0.0)
+        row_top.append(y)
+        row_axis.append(y + band_h + 0.22)
+        y = row_axis[-1] + time_h / 2 + 0.26 + tallest + _ROW_GAP
+    H = y - _ROW_GAP + PAD
+    bands: List[Tuple[str, float, float, int]] = []
+    for r, row in enumerate(rows):
+        for name, x0, x1 in _section_bands([periods[i].section for i in row], [lefts[i] for i in row], [rights[i] for i in row]):
+            bands.append((name, x0, x1, r))
+    detail = {"columns": list(zip(lefts, widths)), "bands": [b[:3] for b in bands], "rows": len(rows)}
 
     def draw(ax) -> None:
-        for name, x0, x1 in bands:
-            _box(ax, x0, y, x1 - x0, band_h - 0.06, fill=HEAD_FILL, edge="none", rounding=0.04)
-            _text(ax, (x0 + x1) / 2, y + (band_h - 0.06) / 2, name, pt=SMALL_PT, weight="bold")
-        _line(ax, (PAD, y_axis), (W - PAD, y_axis), lw=1.6, z=1)
-        for i, p in enumerate(periods):
-            cx = lefts[i] + widths[i] / 2
-            _box(ax, lefts[i], y_axis - time_h / 2, widths[i], time_h, fill=BOX_FILL, rounding=0.06, z=2)
-            _text(ax, cx, y_axis, p.time, pt=FONT_PT, weight="bold")
-            yy = y_axis + time_h / 2 + 0.26
-            if ev_text[i]:
-                _line(ax, (cx, y_axis + time_h / 2), (cx, yy), lw=1.0, z=1)
-            for t in ev_text[i]:
-                h = _nlines(t) * _lh() + 0.14
-                _box(ax, lefts[i], yy, widths[i], h, fill=PAPER, rounding=0.05, z=2)
-                _text(ax, cx, yy + h / 2, t, pt=FONT_PT)
-                yy += h + ev_gap
+        for name, x0, x1, r in bands:
+            _box(ax, x0, row_top[r], x1 - x0, band_h - 0.06, fill=HEAD_FILL, edge="none", rounding=0.04)
+            _text(ax, (x0 + x1) / 2, row_top[r] + (band_h - 0.06) / 2, name, pt=SMALL_PT, weight="bold")
+        for r, row in enumerate(rows):
+            y_axis = row_axis[r]
+            _line(ax, (lefts[row[0]], y_axis), (rights[row[-1]], y_axis), lw=1.6, z=1)
+            for i in row:
+                p = periods[i]
+                cx = lefts[i] + widths[i] / 2
+                _box(ax, lefts[i], y_axis - time_h / 2, widths[i], time_h, fill=BOX_FILL, rounding=0.06, z=2)
+                _text(ax, cx, y_axis, p.time, pt=FONT_PT, weight="bold")
+                yy = y_axis + time_h / 2 + 0.26
+                if ev_text[i]:
+                    _line(ax, (cx, y_axis + time_h / 2), (cx, yy), lw=1.0, z=1)
+                for t in ev_text[i]:
+                    h = _nlines(t) * _lh() + 0.14
+                    _box(ax, lefts[i], yy, widths[i], h, fill=PAPER, rounding=0.05, z=2)
+                    _text(ax, cx, yy + h / 2, t, pt=FONT_PT)
+                    yy += h + ev_gap
 
-    return FigureLayout("timeline", (W, H), DG.PORTRAIT_BOX_IN, draw, direction="LR", detail=detail)
+    return FigureLayout("timeline", (W, H), box_in, draw, direction="LR", detail=detail)
 
 
 # --------------------------------------------------------------- journey --
 
 
-def plan_journey(d: Any) -> FigureLayout:
+def plan_journey(d: Any, box_in: Tuple[float, float] = DG.PORTRAIT_BOX_IN) -> FigureLayout:
     tasks = list(d.tasks)
     names = [_wrap(t.name, 14) for t in tasks]
-    actors = [_wrap(", ".join(t.actors), 18, 2) for t in tasks]
+    actors = [_wrap(", ".join(t.actors), 18) for t in tasks]
     widths = [max(1.25, _tw(n) + 0.3, _tw(a, SMALL_PT) + 0.2) for n, a in zip(names, actors)]
     gap = 0.22
-    lefts: List[float] = []
-    x = PAD
-    for w in widths:
-        lefts.append(x)
-        x += w + gap
+    rows, lefts, W = _fold_columns(widths, gap, box_in[0])
     rights = [l + w for l, w in zip(lefts, widths)]
-    W = x - gap + PAD
     has_sections = any(t.section for t in tasks)
-    y = PAD
     band_h = 0.30 if has_sections else 0.0
     name_h = max(_nlines(n) for n in names) * _lh() + 0.18
-    y_name = y + band_h + 0.06
-    y_score = y_name + name_h + 0.14
-    y_actor = y_score + 0.30
     actor_h = max(_nlines(a) for a in actors) * _lh(SMALL_PT) + 0.06
-    H = y_actor + actor_h + PAD
-    bands = _section_bands([t.section for t in tasks], lefts, rights)
-    detail = {"columns": list(zip(lefts, widths)), "bands": bands, "scores": [t.score for t in tasks]}
+    row_h = band_h + 0.06 + name_h + 0.14 + 0.30 + actor_h
+    row_top = [PAD + r * (row_h + _ROW_GAP) for r in range(len(rows))]
+    H = row_top[-1] + row_h + PAD
+    bands: List[Tuple[str, float, float, int]] = []
+    for r, row in enumerate(rows):
+        for name, x0, x1 in _section_bands([tasks[i].section for i in row], [lefts[i] for i in row], [rights[i] for i in row]):
+            bands.append((name, x0, x1, r))
+    detail = {"columns": list(zip(lefts, widths)), "bands": [b[:3] for b in bands], "scores": [t.score for t in tasks],
+              "rows": len(rows)}
 
     def draw(ax) -> None:
         from matplotlib.patches import Circle
 
-        for name, x0, x1 in bands:
-            _box(ax, x0, y, x1 - x0, band_h - 0.06, fill=HEAD_FILL, edge="none", rounding=0.04)
-            _text(ax, (x0 + x1) / 2, y + (band_h - 0.06) / 2, name, pt=SMALL_PT, weight="bold")
-        # The path: one line through every task, in order.
-        _line(ax, (lefts[0] + widths[0] / 2, y_name + name_h / 2), (rights[-1] - widths[-1] / 2, y_name + name_h / 2), lw=1.4, z=1)
-        for i, t in enumerate(tasks):
-            cx = lefts[i] + widths[i] / 2
-            _box(ax, lefts[i], y_name, widths[i], name_h, fill=BOX_FILL, rounding=0.06, z=2)
-            _text(ax, cx, y_name + name_h / 2, names[i], pt=FONT_PT)
-            # Score as a COUNT of filled dots plus the number: magnitude
-            # without a colour ramp.
-            dots_w = 5 * 0.13
-            sx = cx - (dots_w + 0.36) / 2
-            for k in range(5):
-                ax.add_patch(Circle((sx + k * 0.13 + 0.05, y_score + 0.12), 0.045,
-                                    facecolor=INK if k < t.score else PAPER, edgecolor=INK, linewidth=1.0, zorder=3))
-            _text(ax, sx + dots_w + 0.08, y_score + 0.12, f"{t.score}/5", pt=SMALL_PT, ha="left")
-            if actors[i]:
-                _text(ax, cx, y_actor + actor_h / 2, actors[i], pt=SMALL_PT, color=EDGE_INK)
+        for name, x0, x1, r in bands:
+            _box(ax, x0, row_top[r], x1 - x0, band_h - 0.06, fill=HEAD_FILL, edge="none", rounding=0.04)
+            _text(ax, (x0 + x1) / 2, row_top[r] + (band_h - 0.06) / 2, name, pt=SMALL_PT, weight="bold")
+        for r, row in enumerate(rows):
+            y_name = row_top[r] + band_h + 0.06
+            y_score = y_name + name_h + 0.14
+            y_actor = y_score + 0.30
+            # The path: one line through every task of the row, in order.
+            _line(ax, (lefts[row[0]] + widths[row[0]] / 2, y_name + name_h / 2),
+                  (rights[row[-1]] - widths[row[-1]] / 2, y_name + name_h / 2), lw=1.4, z=1)
+            for i in row:
+                t = tasks[i]
+                cx = lefts[i] + widths[i] / 2
+                _box(ax, lefts[i], y_name, widths[i], name_h, fill=BOX_FILL, rounding=0.06, z=2)
+                _text(ax, cx, y_name + name_h / 2, names[i], pt=FONT_PT)
+                # Score as a COUNT of filled dots plus the number: magnitude
+                # without a colour ramp.
+                dots_w = 5 * 0.13
+                sx = cx - (dots_w + 0.36) / 2
+                for k in range(5):
+                    ax.add_patch(Circle((sx + k * 0.13 + 0.05, y_score + 0.12), 0.045,
+                                        facecolor=INK if k < t.score else PAPER, edgecolor=INK, linewidth=1.0, zorder=3))
+                _text(ax, sx + dots_w + 0.08, y_score + 0.12, f"{t.score}/5", pt=SMALL_PT, ha="left")
+                if actors[i]:
+                    _text(ax, cx, y_actor + actor_h / 2, actors[i], pt=SMALL_PT, color=EDGE_INK)
 
-    return FigureLayout("journey", (W, H), DG.PORTRAIT_BOX_IN, draw, direction="LR", detail=detail)
+    return FigureLayout("journey", (W, H), box_in, draw, direction="LR", detail=detail)
 
 
 # ---------------------------------------------------------------- kanban --
@@ -1035,7 +1356,7 @@ def plan_kanban(d: Any) -> FigureLayout:
     col_w = 1.7
     gap = 0.22
     head_h = 0.36
-    card_texts = [[_wrap(c, 22, 4) for c in col.cards] for col in cols]
+    card_texts = [[_wrap(c, 22) for c in col.cards] for col in cols]
     col_h = [head_h + 0.12 + sum(_nlines(t) * _lh() + 0.16 + 0.08 for t in texts) + 0.04 for texts in card_texts]
     W = PAD + len(cols) * col_w + (len(cols) - 1) * gap + PAD
     H = PAD + max(col_h) + PAD
@@ -1143,7 +1464,7 @@ def layout_figure(diagram: Any, *, box_in: Tuple[float, float] = DG.PORTRAIT_BOX
                 best = candidate
         assert best is not None
         return best
-    layout = planner(diagram)
+    layout = planner(diagram, box) if family in ("timeline", "journey") else planner(diagram)
     layout.box_in = box
     return layout
 
@@ -1188,4 +1509,4 @@ def figure_text(diagram: Any) -> str:
     return " ".join(p for p in parts if p)
 
 
-__all__ = ["FigureLayout", "PLANNERS", "layout_figure", "draw_figure", "figure_text"]
+__all__ = ["FigureLayout", "PLANNERS", "NOTE_FILL", "bezier_points", "layout_figure", "draw_figure", "figure_text"]
