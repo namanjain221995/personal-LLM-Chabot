@@ -1365,13 +1365,20 @@ async def transcribe_segments(
 #     decodes anywhere at a time, so sessions alone never occupy both nodes'
 #     engines, and their chat cost stays at the one-node figure (107 -> 53
 #     tok/s, measured 2026-09-28) instead of the both-nodes one (28).
-#   * WHO GOES NEXT. A session whose person pressed Stop and is waiting goes
-#     before one that is still recording (whose text is only a preview), and
-#     within each class the first window to become ready goes first. A
-#     session has at most ONE window here or in the engine, and re-enters
-#     only after that window returns, so sessions are served round-robin: a
-#     5 s dictation started during somebody's two-hour recording waits for at
-#     most the one window already decoding, never for the recording.
+#   * WHO GOES NEXT. A SHORT session (audio under VOICE_SHORT_SESSION_S)
+#     goes before a long one, then a session whose person pressed Stop and is
+#     waiting goes before one that is still recording (whose text is only a
+#     preview), and within each class the first window to become ready goes
+#     first. A session has at most ONE window here or in the engine, and
+#     re-enters only after that window returns, so sessions are served
+#     round-robin: a 5 s dictation started while thirty hour-long recordings
+#     keep the engine saturated waits for the one window already decoding,
+#     not behind thirty others. A long session's transcript lags instead.
+#     Retranscriptions are never 'urgent' (app/dictation.py).
+#   * ENGINE STATE. The gate remembers whether the last session window failed
+#     for want of an engine and how long the one inside has been there, so a
+#     session waiting here can say whether the engine is BUSY or UNAVAILABLE
+#     (hung or down): `engine_state`.
 #   * CANCELLABLE AND WITHOUT asyncio.wait_for (the Python 3.11 same-pass
 #     cancellation hang); there is no deadline on the wait at all.
 #
@@ -1381,18 +1388,26 @@ async def transcribe_segments(
 # ---------------------------------------------------------------------------
 
 
+def _hint(value: Any, default: bool) -> bool:
+    try:
+        return bool(value() if callable(value) else value)
+    except Exception:  # noqa: BLE001 — a priority hint must not break the gate
+        return default
+
+
 @dataclass
 class _SessionWaiter:
     future: "asyncio.Future[None]"
     urgent: Any  # bool, or a zero-argument callable read at grant time
     ready: float
     seq: int
+    short: Any = False  # bool, or a zero-argument callable read at grant time
 
     def is_urgent(self) -> bool:
-        try:
-            return bool(self.urgent() if callable(self.urgent) else self.urgent)
-        except Exception:  # noqa: BLE001 — a priority hint must not break the gate
-            return False
+        return _hint(self.urgent, False)
+
+    def is_short(self) -> bool:
+        return _hint(self.short, False)
 
 
 class _SessionGate:
@@ -1403,6 +1418,13 @@ class _SessionGate:
         self._waiters: List[_SessionWaiter] = []
         self._seq = 0
         self.active = 0
+        #: monotonic admission time of each window now in the engine
+        self.inflight: Dict[int, float] = {}
+        self._token = 0
+        #: monotonic time of the last window answered, and of the last that
+        #: found no engine (ASRUnavailable, which includes a timeout)
+        self.last_ok = 0.0
+        self.last_unavailable = 0.0
 
     @property
     def waiting(self) -> int:
@@ -1419,7 +1441,22 @@ class _SessionGate:
             self._loop = loop
             self._waiters = []
             self.active = 0
+            self.inflight = {}
         return loop
+
+    def engine_state(self) -> str:
+        """'unavailable' when the last session window found no engine and
+        none has been answered since, or a window has been inside the engine
+        for longer than VOICE_ENGINE_STALL_S (a hung engine answers nothing
+        and times out only after VOICE_SESSION_WINDOW_TIMEOUT_S); 'busy'
+        otherwise. Read from request threads, hence the copy."""
+        now = time.monotonic()
+        stall = float(settings.voice_engine_stall_s)
+        if any(now - t > stall for t in list(self.inflight.values())):
+            return "unavailable"
+        if self.last_unavailable > self.last_ok:
+            return "unavailable"
+        return "busy"
 
     def _publish(self) -> None:
         metrics.set_gauge("asr_session_gate_active", self.active, "session windows decoding")
@@ -1427,21 +1464,24 @@ class _SessionGate:
 
     def _grant(self) -> None:
         while self.active < self._size() and self._waiters:
-            best = min(self._waiters, key=lambda w: (0 if w.is_urgent() else 1, w.ready, w.seq))
+            best = min(
+                self._waiters,
+                key=lambda w: (0 if w.is_short() else 1, 0 if w.is_urgent() else 1, w.ready, w.seq),
+            )
             self._waiters.remove(best)
             if best.future.done():  # its task was cancelled while waiting
                 continue
             self.active += 1
             best.future.set_result(None)
 
-    async def acquire(self, *, urgent: Any = False) -> None:
+    async def acquire(self, *, urgent: Any = False, short: Any = False) -> None:
         loop = self._bind()
         if self.active < self._size() and not any(not w.future.done() for w in self._waiters):
             self.active += 1
             self._publish()
             return
         self._seq += 1
-        waiter = _SessionWaiter(loop.create_future(), urgent, time.monotonic(), self._seq)
+        waiter = _SessionWaiter(loop.create_future(), urgent, time.monotonic(), self._seq, short)
         self._waiters.append(waiter)
         self._publish()
         try:
@@ -1467,6 +1507,9 @@ class _SessionGate:
         self._loop = None
         self._waiters = []
         self.active = 0
+        self.inflight = {}
+        self.last_ok = 0.0
+        self.last_unavailable = 0.0
 
 
 SESSION_GATE = _SessionGate()
@@ -1477,17 +1520,22 @@ async def transcribe_session_window(
     *,
     filename: str,
     urgent: Any = False,
+    short: Any = False,
     on_admitted: Optional[Any] = None,
 ) -> WindowReply:
     """One recording-session window (WAV bytes) -> segments, under the
     session gate, with the engine's first-30-s silence gate OFF.
 
     `urgent` is True (or a callable that says so) while the person is
-    waiting after Stop. `on_admitted` is called once the gate lets the
+    waiting after Stop; `short` while the session's audio is under
+    VOICE_SHORT_SESSION_S. `on_admitted` is called once the gate lets the
     window through, so the session can tell the person it is no longer
     waiting for the engine."""
-    await SESSION_GATE.acquire(urgent=urgent)
+    await SESSION_GATE.acquire(urgent=urgent, short=short)
     started = time.perf_counter()
+    SESSION_GATE._token += 1
+    token = SESSION_GATE._token
+    SESSION_GATE.inflight[token] = time.monotonic()
     try:
         if on_admitted is not None:
             on_admitted()
@@ -1507,11 +1555,17 @@ async def transcribe_session_window(
                 content_type="audio/wav",
                 timeout_s=settings.voice_session_window_timeout_s,
             )
+    except ASRUnavailable:
+        SESSION_GATE.last_unavailable = time.monotonic()
+        metrics.inc("asr_session_windows_total", "recording-session windows sent to the engine", result="fail")
+        raise
     except Exception:
         metrics.inc("asr_session_windows_total", "recording-session windows sent to the engine", result="fail")
         raise
     finally:
+        SESSION_GATE.inflight.pop(token, None)
         SESSION_GATE.release()
+    SESSION_GATE.last_ok = time.monotonic()
     metrics.inc("asr_session_windows_total", "recording-session windows sent to the engine", result="ok")
     metrics.observe(
         "asr_session_window_duration_seconds",

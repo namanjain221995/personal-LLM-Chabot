@@ -339,9 +339,12 @@ class Settings:
         # whose top-level directories are swept by age.
         self.voice_data_dir: str = os.environ.get("VOICE_DATA_DIR", "/data/voice")
         # Days a finished recording is kept. 0 keeps it until the person
-        # deletes it or the account is removed, because the owner asked for
-        # recordings to be stored; the retention window itself is an owner
-        # decision still open.
+        # deletes it, because the owner asked for recordings to be stored;
+        # the retention window itself is an owner decision still open.
+        # Removing a member does NOT delete them: removal disables the account
+        # and deletes no users row, so nothing cascades. A removed member's
+        # recordings stay listable, playable and deletable by a super admin
+        # (audited; app/audio_api.py's admin routes).
         self.voice_retention_days: int = max(0, _int("VOICE_RETENTION_DAYS", 0))
         # The MediaRecorder timeslice the browser must use, in ms. At the
         # measured 128.7 kb/s Chrome default a 5 s part is about 80 KB.
@@ -365,15 +368,74 @@ class Settings:
         # A session that receives no part for this long is closed (ended_by
         # 'idle') and everything received is transcribed and kept.
         self.voice_session_idle_s: float = _float("VOICE_SESSION_IDLE_S", 600.0)
-        # How many sessions may be recording or finishing at once, across the
-        # deployment. Each one runs an ffmpeg decoder inside the orchestrator
-        # on the head node, whose resident memory has not been measured.
-        self.voice_session_max_active: int = max(1, _int("VOICE_SESSION_MAX_ACTIVE", 8))
-        # New sessions are refused, and a recording one is stopped, when the
-        # filesystem holding VOICE_DATA_DIR has less than this free.
+        # A SAFETY CEILING on sessions recording or finishing at once, across
+        # the deployment, not a capacity plan. Storing a part is one fsynced
+        # append, so a recording is accepted whenever disk and the person's
+        # quota allow; what is scarce is decoding (the ffmpeg processes below)
+        # and the speech engine, and both QUEUE instead of refusing. The old
+        # default of 8 refused every other person's dictation, even a 3 s
+        # one, for as long as 8 recordings with no length limit ran. Each
+        # live session costs one coroutine and a row read every 2 s; 200 of
+        # them are ~100 point queries a second.
+        self.voice_session_max_active: int = max(1, _int("VOICE_SESSION_MAX_ACTIVE", 200))
+        # New sessions are refused, a recording one is stopped, and decoding
+        # stops, when the filesystem holding VOICE_DATA_DIR has less than this
+        # free. 250 GiB, not 20: /data/voice is on the head's ROOT filesystem
+        # (the sf-local-ai_data volume on /dev/nvme0n1p2), shared with the OS,
+        # /var/lib/docker and production Postgres, and the Files API already
+        # stops writing there at 250 GiB (PUBLIC_API_FILES_MIN_FREE_GIB). A
+        # lower floor would let recordings eat the space that watermark keeps
+        # for the database (security review item 3, 2026-09-29).
         self.voice_min_free_bytes: int = max(
-            0, _int("VOICE_MIN_FREE_BYTES", 20 * 1024 * 1024 * 1024)
+            0, _int("VOICE_MIN_FREE_BYTES", 250 * 1024 * 1024 * 1024)
         )
+        # The most one person may have STORED across their recordings (audio
+        # not yet deleted). Generous on purpose: 50 GiB is ~920 hours at the
+        # measured 128.7 kb/s. Past it a part is refused 507 quota_full and
+        # the person is told to delete recordings on the Recordings page.
+        self.voice_user_quota_bytes: int = max(
+            0, _int("VOICE_USER_QUOTA_BYTES", 50 * 1024 * 1024 * 1024)
+        )
+        # The fastest a recording may ARRIVE: a part is refused (429
+        # too_fast, with Retry-After) when the session would hold more than
+        # (seconds since its audio could have started + VOICE_RATE_SLACK_S)
+        # x this. A recorder cannot produce audio faster than time passes, so
+        # this bounds what anybody can store without touching honest use:
+        # Chrome records at ~128.7 kb/s, and 16 kHz mono 16-bit WAV is exactly
+        # 256 kb/s. Without it one member could store 7.55 GB/h.
+        self.voice_max_bits_per_second: int = max(
+            8_000, _int("VOICE_MAX_BITS_PER_SECOND", 256_000)
+        )
+        # The head start both clocks allow: the stored-bytes ceiling above and
+        # the decoded-audio ceiling (wall seconds + this) x 32,000 bytes. A
+        # part is up to ~65 s of audio, and a catch-up after a short outage
+        # arrives all at once.
+        self.voice_rate_slack_s: float = max(10.0, _float("VOICE_RATE_SLACK_S", 120.0))
+        # How many ffmpeg session decoders may run at once in this process.
+        # A recording beyond it is still stored; its decoding waits for a
+        # slot, and its transcript lags. See VOICE_DECODERS_MAX's measurement
+        # in app/dictation.py (_DecoderGate).
+        self.voice_decoders_max: int = max(1, _int("VOICE_DECODERS_MAX", 32))
+        # Decoder slots only a SHORT session may take (VOICE_SHORT_SESSION_S),
+        # so long recordings can never hold every decoder and a 5 s dictation
+        # started during them still decodes at once.
+        self.voice_decoders_short_reserved: int = max(0, _int("VOICE_DECODERS_SHORT_RESERVED", 8))
+        # A session is SHORT while its audio is under this long: it gets the
+        # reserved decoder slots and goes ahead of long ones at the speech
+        # engine, so ordinary dictation is served promptly however many hour-
+        # long recordings are running.
+        self.voice_short_session_s: float = max(10.0, _float("VOICE_SHORT_SESSION_S", 300.0))
+        # Per person: retranscriptions ('Try again' on stored audio) per hour.
+        # Each re-decodes the whole recording and sends every window again.
+        self.voice_retranscribe_per_hour: int = max(1, _int("VOICE_RETRANSCRIBE_PER_HOUR", 5))
+        # Per person: session long-polls open at once (a second tab, a stuck
+        # page). Past it, 429 too_many_polls.
+        self.voice_long_polls_per_user: int = max(1, _int("VOICE_LONG_POLLS_PER_USER", 2))
+        # A session window in the engine for longer than this means the
+        # engine is hung, not busy: a 20-29 s clip decoded in 2.0-3.1 s on a
+        # quiet worker (2026-09-28). Sessions waiting behind it then report
+        # waiting_on 'engine_unavailable' instead of 'engine'.
+        self.voice_engine_stall_s: float = max(5.0, _float("VOICE_ENGINE_STALL_S", 45.0))
         # The longest clip a session sends the engine. Kept at or under 32 s:
         # a 30 s window is 960,044 bytes of WAV, under Starlette's 1,048,576
         # byte multipart spool threshold (measured), so the engine never
