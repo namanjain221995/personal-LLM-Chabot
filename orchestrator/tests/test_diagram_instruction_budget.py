@@ -272,15 +272,15 @@ RECONCILED_2026_09_27_CHARS = 1602
 #: load average 7.49 on 2026-09-28:
 #:
 #:   1,602 chars / 1,606 UTF-8 bytes / 365 tokens   (origin/main, ae25da28)
-#:   2,044 chars / 2,048 UTF-8 bytes / 489 tokens   (this tree)
+#:   2,061 chars / 2,065 UTF-8 bytes / 494 tokens   (this tree)
 #:
-#: +124 tokens per prompt, at every effort, at all eleven chat call sites —
-#: 3.59% of the 3,458-token mean golden prompt, and 9 tokens BELOW the +133
+#: +129 tokens per prompt, at every effort, at all eleven chat call sites —
+#: 3.73% of the 3,458-token mean golden prompt, and 4 tokens BELOW the +133
 #: the 2026-09-27 raise was accepted at. A first draft of this wording glossed
 #: every type and measured +312; it was compressed to a bare list for exactly
 #: this reason, and the gloss survives only where the type name alone does not
 #: say when to use it (gantt, quadrantChart, the flowchart family).
-CHARS_CEILING = 2044
+CHARS_CEILING = 2061
 
 #: The same string in UTF-8, measured on the same commit: 1,086. The
 #: document-vocabulary edit took it to 1,088 — two bytes, one extra em dash —
@@ -292,13 +292,13 @@ PRE_EDIT_UTF8_BYTES = 1086
 #: The same string in UTF-8 on this tree: 2,086. Two em dashes (U+2014, three
 #: UTF-8 bytes each) account for the four bytes over the character count — the
 #: count is still two, so the two units still differ by exactly 4.
-UTF8_BYTES_CEILING = 2048
+UTF8_BYTES_CEILING = 2065
 
 #: The measured token counts above, so the arithmetic in the prose is
 #: arithmetic this file performs. Re-measure both with the pinned tokenizer
 #: before moving the ceiling again; a character count is not a token count.
 TOKENS_MAIN = 365
-TOKENS_THIS_TREE = 489
+TOKENS_THIS_TREE = 494
 TOKENS_ACCEPTED_RAISE_2026_09_27 = 133
 
 #: The reconciliation this tree restored three fragments ON TOP OF, measured
@@ -377,10 +377,10 @@ def test_the_instruction_is_measured_in_the_unit_it_names():
         f"the wording spends two em dashes, so UTF-8 is 4 bytes over the "
         f"character count; it is now {encoded - chars}"
     )
-    assert encoded - PRE_EDIT_UTF8_BYTES == 962, (
-        f"the raise over origin/dev was measured at +962 UTF-8 bytes; it is now "
+    assert encoded - PRE_EDIT_UTF8_BYTES == 979, (
+        f"the raise over origin/dev was measured at +979 UTF-8 bytes; it is now "
         f"{encoded - PRE_EDIT_UTF8_BYTES}. Re-measure the Fast cost before moving this "
-        f"(the measurement of record is +124 tokens per prompt over ae25da28, 3.59% of "
+        f"(the measurement of record is +129 tokens per prompt over ae25da28, 3.73% of "
         f"the 3,458-token mean golden prompt, 2026-09-28)."
     )
 
@@ -585,10 +585,30 @@ def test_the_three_restored_fragments_are_pinned_so_they_cannot_vanish_again():
     # WHY the directive ban exists. "the app paints a ROLE instead" says what
     # happens next; it does not say what goes wrong if the model disobeys.
     assert "custom colours break dark mode" in DIAGRAM_INSTRUCTION
-    # `flowchart` is PREFERRED, not mandatory: four sentences later this same
-    # string tells the model what to do inside seven other diagram types.
-    assert "prefer `flowchart TD`" in DIAGRAM_INSTRUCTION
+    # NO TYPE IS PREFERRED, AND THAT REPLACED A PIN (2026-09-28). This line used
+    # to hold "prefer `flowchart TD`", on the reasoning that `flowchart` was
+    # preferred and not mandatory. A principal then reproduced the opposite
+    # against the live engine six times with the production string: two hard
+    # refusals with no fence at all -- "my instructions prohibit me from
+    # generating diagrams unless they are flowcharts" and "I cannot draw
+    # diagrams as I am a text-based AI assistant" -- and across 23 types x 3
+    # seeds, 7 refusals of 69 with the asked head on only 38. "prefer
+    # `flowchart`" read together with the role ban IS a whitelist, and the model
+    # read it as one.
+    #
+    # What the string must still do is name every type positively and give a
+    # flowchart its DIRECTION, which is the part of that phrase that was
+    # carrying information.
+    assert "prefer `flowchart" not in DIAGRAM_INSTRUCTION
     assert "use `flowchart TD`" not in DIAGRAM_INSTRUCTION
+    assert "give a `flowchart` a direction" in DIAGRAM_INSTRUCTION
+    assert "`TD` or `LR`" in DIAGRAM_INSTRUCTION
+    # And the role ban names no types, which is the other half of the whitelist
+    # the model read: it is a consequence ("there `:::` is a syntax error"), not
+    # a list of the types that are allowed to exist.
+    ban = DIAGRAM_INSTRUCTION.split("Put NO ", 1)[1]
+    for head in ("sequenceDiagram", "erDiagram", "journey", "timeline", "mindmap", "gitGraph"):
+        assert head not in ban, f"the role ban names {head}, which reads as a whitelist"
 
 
 def test_one_worked_example_of_a_quoted_label_survives():

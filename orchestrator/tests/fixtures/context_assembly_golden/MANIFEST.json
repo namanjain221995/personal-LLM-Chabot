@@ -1,17 +1,17 @@
 {
   "captured_on": "2026-09-28",
   "captured_from": {
-    "commit": "integrate-2026-09-28 working tree at 31386197 + the resolved DIAGRAM_INSTRUCTION: the merge of feat/every-diagram-type-reaches-a-file-r2's ten file-drawing types with feat/understand-every-picture-ask's twenty-two-head list, in ONE ordered list, with neither branch's caps",
+    "commit": "integrate-2026-09-28 working tree at bb205c0a + the resolved DIAGRAM_INSTRUCTION: the merge of feat/every-diagram-type-reaches-a-file-r2's ten file-drawing types, feat/understand-every-picture-ask's twenty-two-head list and fix/prompt-lets-the-model-draw's two live findings (the mermaid `-beta` spellings, and no preferred TYPE), with none of the three branches' caps",
     "orchestrator_tree_captured_from": "the working tree of the merge, because the prompt change IS the change under test; the fixture diff below is the review. Both parent branches recaptured these same twelve files against their own wording, which is why they conflicted; a third wording needs a third capture.",
     "how": "CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/golden_capture_test (throwaway postgres:18-alpine, --locale=C, fsync off) pytest -q -p no:cacheprovider tests/fixtures/context_assembly_golden/capture_from_baseline.py, twice, diff -r identical",
     "FAST_LANE_ENABLED": "false, set by capture_from_baseline.py itself"
   },
-  "determinism": "the two captures were diff -r identical (2026-09-28, 12 passed each in 9.7 s and 9.2 s)",
+  "determinism": "the two captures were diff -r identical (2026-09-28, 12 passed each in 9.9 s and 9.5 s)",
   "this_capture_changed": {
     "all 12 *.messages.json": "element 0 (the system message) only, and in it ONE paragraph: DIAGRAMS. Every other element byte-identical.",
     "no *.meta.json": "byte-identical: the change is prompt text, not routing, knowledge or sources",
-    "why": "the merged DIAGRAM_INSTRUCTION names all twenty-two heads the browser draws, says which ten also draw inside a downloaded file, and sends the six chart types to the chart lane, with no per-answer or node-count cap",
-    "measured": "2,044 chars / 2,048 UTF-8 bytes / 489 tokens (pinned Qwen3.6 tokenizer, in-container, CPU); production ae25da28 is 1,602 / 1,606 / 365, so +124 tokens per prompt",
+    "why": "the merged DIAGRAM_INSTRUCTION names all twenty-two heads the browser draws, in the spellings mermaid's own detectors accept, says which ten also draw inside a downloaded file, sends the six chart types to the chart lane, prefers NO type (six live refusals were traced to \"prefer `flowchart`\" read with the role ban as a whitelist), and carries no per-answer or node-count cap",
+    "measured": "2,061 chars / 2,065 UTF-8 bytes / 494 tokens (pinned Qwen3.6 tokenizer, in-container, CPU); production ae25da28 is 1,602 / 1,606 / 365, so +129 tokens per prompt",
     "budget": "inside the +133 the 2026-09-27 raise was accepted at; tests/test_diagram_instruction_budget.py pins it"
   },
   "normalised": [
@@ -25,29 +25,29 @@
     "sources"
   ],
   "sha256": {
-    "first_message.messages.json": "d63388f56676fe4b2d151706fd350b5b7b061b81ab29f35b908e4896eed5dc5a",
+    "first_message.messages.json": "c15c19adcf100088c6bbdb1abaa511598530f7ef3d2f7d09260af3e7f9551a5e",
     "first_message.meta.json": "a5af6ebca6a1de346cfad75f9ada92f1d788f0e3c307ce87183785c9074cd513",
-    "living_knowledge_topical_fast.messages.json": "d74e2735ecd17f318e59cbcd34947c5de36201c1a41a9cafbaef07c2edd553ee",
+    "living_knowledge_topical_fast.messages.json": "8184aa119ddfe28a1b49b493c9638de355679d8d626653de8104cda7bdaba4ad",
     "living_knowledge_topical_fast.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-    "living_knowledge_topical_fast_at_production_latency.messages.json": "d74e2735ecd17f318e59cbcd34947c5de36201c1a41a9cafbaef07c2edd553ee",
+    "living_knowledge_topical_fast_at_production_latency.messages.json": "8184aa119ddfe28a1b49b493c9638de355679d8d626653de8104cda7bdaba4ad",
     "living_knowledge_topical_fast_at_production_latency.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-    "living_knowledge_topical_think.messages.json": "d74e2735ecd17f318e59cbcd34947c5de36201c1a41a9cafbaef07c2edd553ee",
+    "living_knowledge_topical_think.messages.json": "8184aa119ddfe28a1b49b493c9638de355679d8d626653de8104cda7bdaba4ad",
     "living_knowledge_topical_think.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-    "real_fast_accented_page.messages.json": "9a77f6f7dad435159577b960cb64aa6e95db21e0f3cfb28ad1153c861c6deb24",
+    "real_fast_accented_page.messages.json": "d472f2cebc0d80e8dd64cab3cb2a719404a9e01bc339885b1325a4305a4bd33e",
     "real_fast_accented_page.meta.json": "3596bbf76dc6d3df0f15e25cea462406cd83e99f8873d87e8253cfb403f7b2f9",
-    "real_fast_eval_topical_hit.messages.json": "7ab48fbd82bbb68d1c63e8d8f7cd93f0d86faaecd4e6c0a0772bfb60f7d1ecf0",
+    "real_fast_eval_topical_hit.messages.json": "21fc5418d323d1895fc0536b60d277a2b5ce758ad6ea10a8f2ab216e7cae0cac",
     "real_fast_eval_topical_hit.meta.json": "a2848f350023a2eb7043ec42c5ade6dc3006233cf9e4c3d0480f85cc8a1c3ddc",
-    "real_fast_passage_past_200k.messages.json": "e2c7af615a09ea78fa499ce10ff9a931a5c398b00067f1f8c9a5921bda66ce70",
+    "real_fast_passage_past_200k.messages.json": "53ec9a7c7137230b5bcb6ebbe1d6564ecf0447ef1760971098b51612b01e4a3a",
     "real_fast_passage_past_200k.meta.json": "a64172c1e8bdfdff9955e016e122414f312f0c72b376e5ce315be1808c5fb705",
-    "real_fast_timeless_task_with_a_matching_page.messages.json": "3eda321e934aacb2d5022fe4743bf86194218035746674bb59eda64e72471ad2",
+    "real_fast_timeless_task_with_a_matching_page.messages.json": "a32bb4ad07aa8431920a99a10672c4048db976c264844ebe9f237515a6154380",
     "real_fast_timeless_task_with_a_matching_page.meta.json": "ddcccde6d0e3e175d878292727c7eaf0461898ba92e2045c679bec61c9553817",
-    "real_think_eval_topical_hit.messages.json": "7ab48fbd82bbb68d1c63e8d8f7cd93f0d86faaecd4e6c0a0772bfb60f7d1ecf0",
+    "real_think_eval_topical_hit.messages.json": "21fc5418d323d1895fc0536b60d277a2b5ce758ad6ea10a8f2ab216e7cae0cac",
     "real_think_eval_topical_hit.meta.json": "a2848f350023a2eb7043ec42c5ade6dc3006233cf9e4c3d0480f85cc8a1c3ddc",
-    "rich_fast.messages.json": "e37c9d8fbe516ff99f3627beeb3f521c9df4d45fae4da4105e686dd117938043",
+    "rich_fast.messages.json": "fe1da954335dc7907489726cec9b970fb0f5a380eb70b3c53030fc689b739cfa",
     "rich_fast.meta.json": "8c60198ebd4281fd83100ef3f467f73fbe648a31c61e73b5d3f5d8d015059e67",
-    "rich_think.messages.json": "d98e8e26381441ab97e8af02b1e95b29869a4007e6d45068c210dfbf9f4cc362",
+    "rich_think.messages.json": "0dcf3cf57e18a7bf4da4d4873289db9b1fe18bac2d869a466a75cc64e3adcc5f",
     "rich_think.meta.json": "6b8128a97f412dd2b211ad2b7c7d9cc83d300fa27209fd4d516318d54aacdbad",
-    "salesforce.messages.json": "75c08835d6433298d2e24d1dfa8d57f213ddf9c986597543d718e268f706ba77",
+    "salesforce.messages.json": "39c8c338f5d8895342112bd7b1fc0f70093dd33018c3f927b0ea6e77d61ae391",
     "salesforce.meta.json": "6cbc9e53fb682a4534e63bb6e2b8a3681400575dad9bb8a7b9f7385b260610b7"
   },
   "scenarios": {
@@ -171,6 +171,7 @@
         }
       }
     },
-    "2026-09-28, feat/every-diagram-type-reaches-a-file @ 6636dc96 (ten types, six-chart ban, both caps restored) — superseded by this merge"
+    "2026-09-28, feat/every-diagram-type-reaches-a-file @ 6636dc96 (ten types, six-chart ban, both caps restored) — superseded by this merge",
+    "2026-09-28, this branch's own first capture (2,044 chars / 489 tokens) — superseded by the `-beta` spellings and the removal of the preferred type"
   ]
 }
