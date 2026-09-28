@@ -672,7 +672,10 @@ def test_as3_classifier_times_out_at_fast_and_the_rules_answer_stands(counted, m
     async def slow_hook(text, **kw):
         return await IL.classify(text, effort="fast", completion=_completion(_YES, delay=1.0))
 
-    d = asyncio.run(I.decide_with_hook("Excel sheet bana ke de.", slow_hook, has_assistant_answer=True))
+    # "Excel sheet bana ke de." stood here until 2026-09-28, when the rules
+    # learnt to read it (export/export-content-free); "file xlsx ma ne" is
+    # still theirs to leave to the classifier.
+    d = asyncio.run(I.decide_with_hook("file xlsx ma ne", slow_hook, has_assistant_answer=True))
     assert d.action == "none" and d.rule == "no-request"
 
 
@@ -732,8 +735,10 @@ def test_as3_hook_is_called_at_most_once_and_only_in_its_band():
     for text in ("Create a PDF.", "summarize this pdf", "what time is it in Pune?"):
         asyncio.run(I.decide_with_hook(text, hook, upload_formats=["pdf"], has_assistant_answer=True))
     assert calls == []
-    d = asyncio.run(I.decide_with_hook("Excel sheet bana ke de.", hook, has_assistant_answer=True))
-    assert calls == ["Excel sheet bana ke de."] and d.action == "export" and d.llm_used and d.rule == "model"
+    # "Excel sheet bana ke de." is decided by the rules since 2026-09-28
+    # (export-content-free) and is no longer in the band; "file xlsx ma ne" is.
+    d = asyncio.run(I.decide_with_hook("file xlsx ma ne", hook, has_assistant_answer=True))
+    assert calls == ["file xlsx ma ne"] and d.action == "export" and d.llm_used and d.rule == "model"
 
 
 def test_as3_verdict_mapping_respects_the_context():
