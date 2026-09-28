@@ -202,14 +202,56 @@ jobs:
       # protection the launcher job depends on, exercised on every commit.
       #
       # The floor counts tests that EXECUTED, not tests discovery collected
-      # (2026-09-13): 102 run today, and a module that skips itself at import
-      # no longer counts towards it.
+      # (2026-09-13), and a module that skips itself at import no longer counts
+      # towards it.
+      #
+      # 335 EXECUTE TODAY, 0 SKIPPED (measured 2026-09-28 on Python 3.12.3 and
+      # on 3.11.16, which is what CI runs; 291 before this branch's own cases
+      # were added). The floor was 95, under a comment
+      # that said "102 run today", and it stayed at 95 while the box-readiness
+      # suite took this directory from 183 tests to 291: 196 of them could have
+      # stopped executing with this gate still green, in a branch whose whole
+      # subject is gates that mean what they say.
+      #
+      # The reason given for leaving it -- that the number is "shared with other
+      # tracks" -- is not true, and checking it is one line:
+      #   grep -n 'min-tests' .github/workflows/pipeline.yml
+      # `--min-tests 95` appeared exactly once, against `--start
+      # .github/workflows/scripts/tests` and nothing else. The launcher suite
+      # carries its own floor (450, in the job below) and the monitoring suite a
+      # third (33), so raising this one cannot affect either.
+      #
+      # 325 against the 335 that execute: the same shape as the monitoring floor
+      # two jobs down - close enough that a class dropping out of discovery
+      # fails the job, with enough slack that it is not edited every time a test
+      # is added. tests/test_box_wiring.py asserts this number against a LIVE
+      # count of the directory in both directions, so it can neither rot three
+      # times too low again nor be set above what exists - which would be a gate
+      # that is permanently red rather than one that means something.
+      #
+      # THAT TEST COUPLES THIS NUMBER TO THIS DIRECTORY, on purpose: a branch
+      # that adds a whole test module here makes it red until this floor is
+      # raised in the same change. That is the coupling whose absence IS the
+      # defect -- 196 tests arrived under a floor of 95 and nothing said so --
+      # and the test's failure message prints the number to use.
+      #
+      # IT IS ALREADY OWED ONE BUMP. `origin/dev` at ff1a5d7c carries four test
+      # modules of its own under this directory (test_deploy_freshness 59,
+      # test_deploy_lock_budget 22, test_deploy_smoke_model_clock 20,
+      # test_rollback_reversibility 36) and left the floor at 95 as well.
+      # Measured on the real merge of that dev into this branch on 2026-09-28,
+      # load average 27.93: 472 collected, 472 executed, 0 skipped, 13 test
+      # modules. So THE MERGE COMMIT MUST RAISE THIS NUMBER TO 464 -- the test
+      # goes red until it does, and prints 464. It is deliberately not written as
+      # 464 here, because a branch has to be green on its own tree to be
+      # verifiable, and CI never builds this branch alone (`push` is main and dev
+      # only; a `pull_request` builds the merge result).
       - name: The CI gate scripts have tests, and they pass
         run: |
           python .github/workflows/scripts/unittest_gate.py \
             --label "workflow scripts" \
             --start .github/workflows/scripts/tests \
-            --min-tests 95
+            --min-tests 325
 
       - name: Migration table invariants (no database needed)
         run: |
@@ -1589,6 +1631,15 @@ jobs:
       # A skipped job reports NO reason — GitHub shows "skipped" and nothing
       # else — so a deploy that does not happen is otherwise a guessing game.
       # This states the inputs to that decision while they are still visible.
+      #
+      # `deploy` needs TWO gates: `ci-ok` (this job) and `box-readiness`. This
+      # step can only see its own half, so it says so rather than promising a
+      # deploy on the strength of half the graph. It cannot take
+      # `box-readiness` as a `needs:` — that job is self-hosted and skips on
+      # every pull_request, and ci_gate.py counts a skipped dependency as a
+      # failure, so it would redden every PR (see P4 and the box-readiness job
+      # comment). Naming it in the text costs nothing and is asserted in
+      # tests/test_box_wiring.py so it cannot drift back.
       - name: Will the deploy run?
         env:
           KILL_SWITCH: ${{ vars.DEPLOY_ON_PUSH }}
@@ -1606,9 +1657,13 @@ jobs:
             echo ""
             case "${EVENT}:${REF}:${KILL_SWITCH}" in
               push:refs/heads/main:false|push:refs/heads/main:0|push:refs/heads/main:no|push:refs/heads/main:off)
-                echo "Deploy is **held**: the kill switch is set." ;;
+                echo "Deploy is **held**: the kill switch is set."
+                echo ""
+                echo "\`Box readiness\` is held with it: it carries the same deploy-intent clause, so the box is not read either." ;;
               push:refs/heads/main:*)
-                echo "Deploy **will run**." ;;
+                echo "Deploy **will run if both gates pass**: this job (\`CI passed\`) AND \`Box readiness\`, the read-only pre-deploy reading of the box."
+                echo ""
+                echo "This step can only see its own half. A refusal from \`Box readiness\` skips the deploy, and its own log says which probe refused and what to run." ;;
               *)
                 echo "No deploy: this is not a push to main." ;;
             esac
@@ -1621,6 +1676,313 @@ jobs:
         id: finished
         run: |
           printf 'completed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+  # ==========================================================================
+  # LANE B. BOX EVIDENCE, gathered AT THE SAME TIME as the test evidence.
+  #
+  # This is the node that turns the graph from a line into two converging
+  # pipes. Lane A asks "does this tree work?" on hosted runners; this asks
+  # "can this machine be deployed to?" on the box, while lane A is still
+  # running, and the two meet at `deploy`.
+  #
+  # Until now the first thing that looked at the box was `deploy` itself, after
+  # the full CI had passed. So every box-state refusal cost a CI run before it
+  # was even asked. RE-MEASURED from the GitHub Actions API on 2026-09-27, so
+  # the run ids below can be checked rather than believed:
+  #
+  #   * run 35002778440 (push, 31db65b2bf76, 2026-09-15): 55.4 minutes of wall
+  #     clock elapsed before the `deploy` job STARTED, and it then failed in
+  #     233s (3m53s) at the step "The box is serving the commit we asked for" -
+  #     box state, not code;
+  #   * runs 35100814873 (2026-09-16), 35427466262 (2026-09-19) and
+  #     36304046169 (2026-09-27) each failed in `verify` at "The engine API
+  #     cannot be reached from outside the cluster" - a fact that was already
+  #     true before each run started.
+  #
+  # So the FOUR most recent main-run failures were all box state, and the next
+  # two before them (34887763253, 34754339201) were test failures.
+  #
+  # NO PREDICTION IS MADE HERE ABOUT THE FIRST PUSH, and an earlier version of
+  # this paragraph made one: it said the exposure failure was "still true TODAY"
+  # and that the first push after this merges WILL refuse with `engine-exposure
+  # exposed`. That was written on 2026-09-27 from run 36304046169's log and was
+  # already stale. Three consecutive runs of this branch's own
+  # probe_engine_exposure against the real box on 2026-09-28, load average
+  # 3.18 / 3.06 / 2.97, returned `closed` with exit code 0 in 9.62s / 9.39s /
+  # 9.41s, engine_bind reporting "3 non-cluster addresses: 3 blocked, 0
+  # ACCEPTED, 0 not proven" and "RESULT: PASSED" - all three "blocked (timed
+  # out)" rather than the mix at 08:26, with techsara-host-guard.service active
+  # and enabled. A prediction in a comment is a fact with an expiry date nobody
+  # sets: the first person to read a refusal here would have been sent to chase
+  # a state that was cleared the day before. What the runs above establish is
+  # the CLASS of failure this job moves an hour earlier; the probe reports what
+  # it reads at the moment it runs, which is the only thing that can still be
+  # true when someone reads it.
+  #
+  # ------------------------------------------------------------- THE GATING
+  # `needs: [policy, security]`, and NOT `needs: [policy]`.
+  #
+  # gitleaks-over-full-history lives in the `security` job (its step is
+  # "Secret scan (full git history)"), not in `policy`. `policy` runs YAML
+  # validity, actionlint, workflow_policy P1-P8, ruff, `bash -n` over every
+  # *.sh, the gate-script suite, the schema_parity invariants and the rollback
+  # rehearsal. Today the first job to reach the box is `deploy`, which needs
+  # `ci-ok`, which needs BOTH — so gating on `policy` alone would put a
+  # self-hosted job ahead of the secret scan for the first time in this
+  # repository's history. Both are hosted, neither builds nor waits on a
+  # service, so readiness still starts long before the 18-28 minute
+  # orchestrator shards finish, and that is where the hour this job saves
+  # actually is.
+  #
+  # THIS IS A MITIGATION, NOT A CURE. Neither `policy` nor `security` is a
+  # code review. Anyone who can push to main can still cause this commit's
+  # box_readiness.py — plus everything it subprocesses — to run on the
+  # production box. "The script is read-only" is NOT the argument: read-only is
+  # a property of the intended code, not of whatever a commit contains.
+  #
+  # WHAT IS AND IS NOT CLOSED, re-read from the API on 2026-09-28 (an earlier
+  # version of this comment said main was unprotected, which the owner has since
+  # fixed - so the paragraph was describing a hole that no longer existed):
+  #   * `branches/main/protection` now returns `required_status_checks` with
+  #     `"contexts": ["CI passed"]`, `allow_force_pushes` false and
+  #     `allow_deletions` false. A push of arbitrary code straight to main no
+  #     longer reaches this job without that check first going green;
+  #   * `"enforce_admins": {"enabled": false}`, so an administrator still
+  #     bypasses it, and there is no `required_pull_request_reviews` block, so
+  #     nothing requires a human to have read the diff;
+  #   * `rulesets` returns `[]`, and the `production` environment still returns
+  #     `"protection_rules": []` with `"can_admins_bypass": true` and zero
+  #     variables and secrets.
+  # So the remaining hole is an ADMIN push, and the thing that closes it is a
+  # required reviewer on the `production` environment - which is precisely what
+  # `environment: production` on this job makes effective. Only the repository
+  # owner can set it.
+  #
+  # -------------------------------------------------------- THE CONCURRENCY
+  # PER COMMIT, and deliberately NOT the release path's `deploy-dgx-spark`.
+  # GitHub holds at most one running and one PENDING entry per group, and a
+  # newly queued entry cancels the pending one; `cancel-in-progress: false`
+  # protects only the in-progress entry. If readiness shared the release
+  # path's group, a concurrent or scheduled job could cancel a PENDING
+  # `box-readiness`; `needs.box-readiness.result` would then be `cancelled`,
+  # the deploy's `if:` would be false, and the deploy would be SKIPPED with no
+  # reason given — the exact failure class that once cost three green pushes
+  # to main. A per-sha group cannot evict the release path's, and it cannot be
+  # contended either - but only because the WORKFLOW-level group
+  # (`pipeline-${{ github.ref }}`) already admits one run per ref at a time and
+  # every path to this job is refs/heads/main, so two runs at one sha can queue
+  # but never overlap. "Cannot be evicted" is a property of that top-level
+  # block, not of per-sha naming, which is why this names it.
+  #
+  # The property the shared group was meant to buy — never run during a
+  # rollout — is delivered by two things that actually hold, and both are
+  # STATED INVARIANTS:
+  #   (a) there is ONE self-hosted runner on the head and it runs one job at a
+  #       time, so jobs on the box serialise physically;
+  #   (b) the deploy-lock probe REFUSES when the flock is held.
+  # If a second runner is ever added on the head, this job must take a read
+  # lock or rejoin `deploy-dgx-spark`.
+  #
+  # --------------------------- WHAT IT BLOCKS THAT NOTHING BLOCKED BEFORE
+  # This job is a CAPABILITY CHANGE, not only an earlier reading, and it has NO
+  # override of any kind - no input, no repository variable, no environment
+  # variable. Three refusals are states no part of the release path used to
+  # stop, so a box in any of them could previously be deployed to and now
+  # cannot:
+  #
+  #   * engine-exposure  exposed | unproven  -- `verify` checked this AFTER the
+  #     rollout, so it was a post-deploy failure and is now a pre-deploy
+  #     refusal. Clearing `exposed` NEEDS ROOT (the host packet filter) and this
+  #     job cannot do it; the refusal prints the exact commands to hand over.
+  #     The port was measured CLOSED on 2026-09-28 (see WHY THIS EXISTS above);
+  #     no claim is made here about what it will be on the day this merges;
+  #   * engine-controller  recovering | unreachable | unreadable;
+  #   * completion  wedged | empty-reply | unreachable | metrics-unreadable |
+  #     model-unknown -- nothing pre-deploy asked the engine to generate before.
+  #
+  # Plus `probe-raised` and `probe-timed-out` on any of the seven. Everything
+  # else it refuses (a dirty deploy root, the 20 GB floor, a held deploy lock, a
+  # `behind` migration) is a refusal scripts/deploy.sh or this file's own
+  # preflight already made - just an hour earlier.
+  #
+  # THREE verdicts are deliberately NOT refusals, because deploy.sh proceeds on
+  # them and refusing would be this job blocking a release the release path
+  # allows. All three are printed in the table either way:
+  #   * `deploy-root wrong-branch` - deploy.sh detaches the production checkout
+  #     on purpose on seven code paths, and the next deploy re-attaches it;
+  #   * `migrations unreadable` - deploy.sh:244-252 proceeds without the check
+  #     when the orchestrator is down and psql is unavailable, and a deploy is
+  #     what brings a down stack back;
+  #   * `engine-controller not-ready` - found on 2026-09-28 by running the probe
+  #     against the real box at load average 29.75, where the controller
+  #     answered DEGRADED (state_code 4) with its own reason reading "saturation,
+  #     not a wedge" - and Prometheus agreed without spending a generation:
+  #     `increase(vllm:generation_tokens_total{service="main"}[10m])` read 5605.
+  #     deploy.sh:938 gates on `scripts/cluster-status.sh`, which
+  #     downgrades a non-serving controller state to `check_warn`, and
+  #     `check_summary` (scripts/lib/cluster-common.sh:44-45) fails only on
+  #     `check_fail` - measured on that same box: "11 passed, 2 warnings, 0
+  #     failed", exit 0. A busy box would otherwise have skipped `deploy` for as
+  #     long as it stayed busy. The question the refusal was standing in for is
+  #     measured directly by probe 6, which refuses a wedge by the token counter
+  #     rather than by a status field. `recovering` still refuses, because a
+  #     recovery in flight is moving the same containers the rollout will move.
+  #
+  # ------------------------------------------------ WHAT IT DOES NOT CLAIM
+  # It is a PRE-check taken minutes before the deploy, not a guarantee held at
+  # deploy time. The deploy root is a working tree several sessions write to
+  # and a lock can be taken in the gap. scripts/deploy.sh's own preflight
+  # still runs and stays authoritative; nobody may remove a check from it on
+  # the strength of this job.
+  #
+  # It is deliberately NOT in `ci-ok`'s `needs:` or in ci_gate.py --require.
+  # It is self-hosted, so it skips on every pull_request, and ci_gate.py
+  # counts a skipped dependency as a failure — it would turn every PR red.
+  # P4 exists to keep self-hosted jobs out of the PR-facing gate. When this
+  # job refuses it goes RED on its own, with the reason in its own log, which
+  # is the opposite of a silent skip.
+  #
+  # ----------------------------------------------- IT ASKS FOR THE SAME THING
+  # The `if:` carries the deploy job's DEPLOY-INTENT clause verbatim, not just
+  # the branch guard. The first version guarded on `refs/heads/main` alone, and
+  # that was wrong in the direction that costs the most:
+  #
+  #   * DEPLOY_ON_PUSH is a KILL SWITCH, and the reason given on the deploy job
+  #     for making it one is "when the box is mid-incident and nobody wants to
+  #     wait on a commit and a CI run to stop the bleeding". With the switch
+  #     thrown, a push to main is not a release. A branch-only guard would
+  #     still land a self-hosted job on that mid-incident box, take its one
+  #     runner, ask the engine it is bleeding from for a generation, and turn
+  #     the run RED for box state nobody had asked about. A kill switch that
+  #     silences only half the pipeline is not a kill switch.
+  #   * `workflow_dispatch` with the `deploy` input OFF means "run the tests
+  #     only". Reading the production box is not running the tests.
+  #
+  # Evaluating the same clause in two jobs is fail-closed in both directions.
+  # Thrown between them: `deploy` skips on its own clause. Un-thrown between
+  # them: `deploy` skips anyway, because `box-readiness` is a `needs:` and it
+  # skipped - no box evidence, no deploy.
+  # ==========================================================================
+  box-readiness:
+    name: Box readiness
+    needs: [policy, security]
+    if: >-
+      needs.policy.result == 'success' &&
+      needs.security.result == 'success' &&
+      github.ref == 'refs/heads/main' &&
+      (
+        (github.event_name == 'workflow_dispatch' && inputs.deploy) ||
+        (github.event_name == 'push' &&
+         !contains(fromJSON('["false","0","no","off"]'),
+                   format('{0}', vars.DEPLOY_ON_PUSH)))
+      )
+    runs-on: [self-hosted, dgx-spark]
+    permissions:
+      contents: read
+    # INSIDE THE SAME GATE AS `deploy`. This job was the first thing in the
+    # graph to execute anything on the production box, and it was doing it
+    # OUTSIDE the `production` environment that `deploy` declares - the gate
+    # this file's own header recommends as the approval gate ("Add required
+    # reviewers and a deployment-branch policy to this environment in repo
+    # settings to turn every production deploy into an approval gate"). Without
+    # this line, configuring that gate would NOT keep code off the box:
+    # box_readiness.py plus everything it subprocesses - git in the shared
+    # deploy root, df, `flock -n` on the real deploy lock, engine_bind.py (which
+    # ssh's to the worker and opens TCP connections), curl asking the
+    # unauthenticated engine for a live generation, and a `bash -c` whose
+    # fallback runs `docker exec <production postgres> psql` - would all run on
+    # any push to main before a reviewer clicked approve. `verify` and
+    # `recovery` are also environment-less, but they run only AFTER `deploy`, so
+    # the gate has already been passed by the time they touch the box.
+    #
+    # It costs nothing today, measured on 2026-09-27:
+    # `gh api repos/{owner}/{repo}/environments/production` returns
+    # "protection_rules": [] with "can_admins_bypass": true, and the environment
+    # declares zero variables and zero secrets, so nothing about this run
+    # changes. The cost arrives with the gate: a reviewer would then approve
+    # twice per release, once for the box reading and once for the rollout. That
+    # is the honest price of the gate meaning what it says, and it is the reason
+    # this is a line of YAML rather than a paragraph in STILL OPEN.
+    environment: production
+    # Seven reads. Wall clock on a healthy head is NOT measured on this branch:
+    # the "10.0s on 2026-09-23" figure recorded on the original commit has not
+    # been reproduced since, and running this job on the box would cost a live
+    # generation on the shared TP=2 model, so it is not asserted here. What IS
+    # measured, by tests/test_box_wiring.py against a recording runner, is the
+    # WORST case - which is the only number the ceiling below depends on.
+    #
+    # The ceiling is NOT 8 minutes, and the arithmetic behind that number was
+    # wrong. It read "the sum of the per-probe subprocess timeouts (405s) plus
+    # the checkout, so even a box where every probe hangs finishes inside it".
+    # But box_probes.TIMEOUTS is per CALL, and three probes make more than one
+    # call: deploy-root runs three git commands, migrations runs two, and the
+    # completion probe runs four, one of them with a grace period on top of its
+    # own deadline. That worst case did not fit in 480s - so the one box this
+    # job exists for, a slow and sick one, is exactly the box on which GitHub
+    # would kill the job before box_readiness.py printed the table of remedies
+    # that is the entire product of it.
+    #
+    # 16 and not 14: aligning the completion probe's curl deadline with the one
+    # `verify` gives the same curl (`-m 180`, see box_probes.TIMEOUTS) moved the
+    # measured worst case from 570s to 630s. 14 minutes still fits it, with 30s
+    # of headroom, and 30s is not headroom on a sick box. Measured 2026-09-28:
+    # worst case 630s, budget 780s, headroom 150s.
+    # box_probes.JOB_TIMEOUT_MINUTES holds this number, and the test suite
+    # MEASURES the worst case by running every probe against a recording
+    # runner, so neither the ceiling nor the arithmetic can drift again.
+    timeout-minutes: 16
+    # PER COMMIT, and never the release path's `deploy-dgx-spark`; see THE
+    # CONCURRENCY above.
+    concurrency:
+      group: box-readiness-${{ github.sha }}
+      cancel-in-progress: false
+    env:
+      # The production checkout, not the runner workspace: .env, .runtime/ and
+      # the model cache live there. Same value the deploy job uses.
+      TECHSARA_DEPLOY_ROOT: ${{ vars.TECHSARA_DEPLOY_ROOT || '/home/techsphere/Documents/project/personal-LLM-Chabot' }}
+    steps:
+      # The probe scripts come from a checkout of the commit being deployed,
+      # the same way `deploy` and `verify` run theirs. The production checkout
+      # is by definition still on the OLD commit, and a gate that is missing
+      # there must not be a gate that silently does not run.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+
+      # STRICTLY READ-ONLY: nothing here starts, stops, recreates, prunes or
+      # writes. It asks whether the deploy lock is free with the same
+      # non-blocking `flock -n` that scripts/lib/deploy-common.sh's own
+      # `dr_lock_is_held` uses. That DOES briefly take the lock - the claim
+      # that it "never takes the deploy lock" was withdrawn as untrue - but
+      # only for the lifetime of a `bash -c` that does nothing else, never
+      # waiting for it and never acting on it. Every probe fails closed: a
+      # probe that cannot be performed, that raises, or that times out is a
+      # refusal, never a shrug. Every refusal prints the exact command a human
+      # runs to clear it.
+      #
+      # Probe 6 is a REAL completion, never /health: a wedged vLLM engine
+      # served a green /health for five and a half hours on this box while
+      # generating nothing. One tiny generation, thinking off, <= 8 tokens —
+      # the main model is TP=2 across both nodes, so it costs both of them and
+      # it runs beside live chat. It gives that curl the SAME `-m 180` the
+      # `verify` job's "The model actually generates" step gives it, so the
+      # pre-deploy read cannot refuse a slow prefill the post-deploy read would
+      # have passed. It reads the reply from `content` AND `reasoning_content`,
+      # because `chat_template_kwargs.enable_thinking` is honoured by the chat
+      # template and not by the server. It is STRICTER than verify in one place,
+      # on purpose: a `NaN`/`+Inf`/`-Inf` token counter is refused here, where
+      # verify's `awk` would add it and pass.
+      #
+      # Nothing that is not on an allowlist reaches stdout. This repository is
+      # public, its run summaries are world-readable, and the deploy root's
+      # .runtime/generated.env holds TECHSARA_SECRET_ENV — the pointer to the
+      # real secrets file — among 220 keys. See box_probes.py.
+      - name: Is this box in a state to be deployed to?
+        run: |
+          set -euo pipefail
+          python3 .github/workflows/scripts/box_readiness.py \
+            --deploy-root "$TECHSARA_DEPLOY_ROOT" \
+            --ref "$GITHUB_SHA"
 
   # ==========================================================================
   # 6 + 8. TRUSTED HARDWARE: preflight, rollout, smoke test, recovery
@@ -1638,7 +2000,11 @@ jobs:
   # ==========================================================================
   deploy:
     name: Deploy to production (rolling, model-preserving)
-    needs: ci-ok
+    # BOTH pipes must arrive: the hosted test evidence (`ci-ok`) and the box
+    # evidence (`box-readiness`). `needs` is what makes the skip happen; the
+    # explicit conjunct in `if:` below is what makes the guard auditable,
+    # which is the convention this file already states for `verify`.
+    needs: [ci-ok, box-readiness]
     # A push to main DEPLOYS (2026-09-08, at the owner's request): merging any
     # branch into main is the release action, so it should not also need a
     # second manual step that is easy to forget.
@@ -1663,6 +2029,7 @@ jobs:
     # rollout accepts the result — otherwise this rolls itself back.
     if: >-
       needs.ci-ok.result == 'success' &&
+      needs.box-readiness.result == 'success' &&
       github.ref == 'refs/heads/main' &&
       (
         (github.event_name == 'workflow_dispatch' && inputs.deploy) ||
@@ -2196,6 +2563,17 @@ jobs:
           check "prometheus /-/healthy"  "http://127.0.0.1:9090/-/healthy"    200
           [ "$fail" -eq 0 ]
 
+      # THE PRE-DEPLOY TWIN OF THIS STEP is box_probes.probe_real_completion,
+      # and the two are kept aligned on purpose: a readiness gate with a tighter
+      # deadline than the check it stands in for refuses boxes this step would
+      # have passed. Both give the completion curl `-m 180`. Both read the reply
+      # from `content` AND `reasoning_content` - `chat_template_kwargs` is
+      # honoured by the chat TEMPLATE, not by the server, so a template that
+      # ignores `enable_thinking` puts the tokens in `reasoning_content`, leaves
+      # `content` empty, and the old one-field read failed a healthy engine
+      # (and then fired `recovery`, which restarts the main model, to fix a
+      # reply-parsing bug). The probe is deliberately STRICTER in one place: it
+      # refuses a `NaN`/`+Inf`/`-Inf` sample where the awk below would add it.
       - name: The model actually generates (not just answers /health)
         env:
           ENGINE_URL: ${{ steps.engine.outputs.url }}
@@ -2211,7 +2589,7 @@ jobs:
           reply="$(curl -fsS -m 180 -H 'Content-Type: application/json' \
             -d "{\"model\":\"${model}\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: READY.\"}],\"max_tokens\":8,\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":false}}" \
             "${ENGINE_URL}/v1/chat/completions" \
-            | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip()[:40])')"
+            | python3 -c 'import json,sys; m=json.load(sys.stdin)["choices"][0]["message"]; print(((m.get("content") or "").strip() or (m.get("reasoning_content") or "").strip())[:40])')"
           after="$(counter)"
           echo "reply=${reply@Q}  generation_tokens_total ${before} -> ${after}"
           {
