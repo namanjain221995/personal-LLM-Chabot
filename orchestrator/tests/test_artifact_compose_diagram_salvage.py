@@ -237,13 +237,23 @@ def test_the_wording_is_the_one_a_mermaid_fence_already_gets():
 def test_the_owner_route_keeps_its_sections_when_one_diagram_is_wrong(monkeypatch):
     """The measurement this file exists for, through the real `compose()`."""
     good = _shape_of(_compose(_Model(GOOD), monkeypatch))
-    assert good == {"headings": 8, "diagrams": 1, "omitted": 0, "words": good["words"]}
+    # The section COUNT is decided by the composer's own section planning, not by
+    # this file: once `caps_for` receives the sections a request names, the same
+    # fixture plans 11 where the Fast default alone planned 8. Pinning the literal
+    # made this test fail on a tree where nothing about the salvage had changed.
+    # What this file exists to measure is that a wrong role costs NOTHING but the
+    # figure, so assert the figure and carry the count forward.
+    assert good["diagrams"] == 1 and good["omitted"] == 0, good
+    assert good["headings"] >= 8, good
     assert good["words"] > 3_000, good
 
     bad_model = _Model(_with_role("database"))
     result = _compose(bad_model, monkeypatch)
     bad = _shape_of(result)
-    assert bad["headings"] == 8, "seven sections of real prose were discarded over one role word"
+    assert bad["headings"] == good["headings"], (
+        "sections of real prose were discarded over one role word: "
+        f'{good["headings"]} good vs {bad["headings"]} bad'
+    )
     assert bad["omitted"] == 1 and bad["diagrams"] == 0
     assert bad["words"] > 3_000, bad
     # WITHIN A HANDFUL OF WORDS of the good run: the callout replaces the
@@ -264,8 +274,11 @@ def test_the_person_is_told_which_block_was_lost(monkeypatch):
 def test_every_near_miss_of_a_role_behaves_the_same(role, monkeypatch):
     """The four spellings a model actually reaches for. `DiagramRole` is a
     closed Literal, so none of them folds."""
+    good = _shape_of(_compose(_Model(GOOD), monkeypatch))
     shape = _shape_of(_compose(_Model(_with_role(role)), monkeypatch))
-    assert shape["headings"] == 8 and shape["omitted"] == 1 and shape["words"] > 3_000, (role, shape)
+    assert shape["headings"] == good["headings"], (role, shape, good)
+    assert shape["omitted"] == 1 and shape["diagrams"] == 0, (role, shape)
+    assert shape["words"] > 3_000, (role, shape)
 
 
 def test_the_repair_pass_still_runs_for_everything_else(monkeypatch):
