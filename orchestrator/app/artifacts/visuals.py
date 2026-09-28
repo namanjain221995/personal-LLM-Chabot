@@ -79,6 +79,46 @@ _MAP_PATTERN = (
     rf"|नक्शा|नक्शे|मैप|નકશો|નકશા|મેપ"
 )
 
+#: THE NETWORK ASK, SPLIT ON WHERE THE BOXES COME FROM — the second half of
+#: the correction feat/document-vocabulary made to the sankey.
+#:
+#: That commit dropped `flow diagram` from the sankey pattern because
+#: render/diagrams.py had just learned to draw one, and it reworded the
+#: network `why` from "this platform draws no node-and-edge diagrams"
+#: (false the moment that renderer landed) to "never from the ROWS OF A
+#: TABLE" — but it left the PATTERN matching every network ask, so the
+#: sentence and the gate disagreed. Measured on this tree before this edit:
+#: "draw a network diagram of how the services talk" was refused, while
+#: "draw an architecture diagram of the platform" and "can you draw a flow
+#: diagram of the pipeline" were answered. That is the SAME PICTURE
+#: refused or drawn on the noun alone, and it is now the one place a person
+#: asking for boxes and arrows is told no by a platform that draws them —
+#: on the file route too, since the composer can ask a section for one.
+#:
+#: WHAT IS STILL REFUSED IS WHAT THE `why` ALREADY SAYS: a network laid out
+#: from DATA. `node-link` and `force-directed` are layout-algorithm names
+#: that only mean anything over rows, so they stay bare; "network
+#: graph/chart/plot" stays too, because -graph and -chart are what a person
+#: calls the picture OF a dataset. A network DIAGRAM is refused only when
+#: the ask points at the data — a table, a CSV, rows, columns, an edge
+#: list, an adjacency matrix — and is otherwise a diagram like any other.
+_NETWORK_DATA = (
+    r"tables?|csvs?|spreadsheets?|sheets?|rows?|columns?|datasets?|"
+    r"data(?:\s*set)?|edge\s*lists?|adjacency|matri(?:x|ces)|records?|"
+    r"this\s+file|these\s+numbers|the\s+export"
+)
+_NETWORK_PATTERN = (
+    # The layout algorithms, and the "graph"/"chart" nouns: always a picture
+    # of a dataset, never a hand-named architecture.
+    r"\bnetwork\s+(?:graphs?|charts?|plots?)\b|\bnode[- ]link\b|\bforce[- ]directed\b"
+    # "a network diagram of this table", "draw a network diagram from the CSV",
+    # "network diagram from these rows" — the ask that names its data.
+    rf"|\bnetwork\s+diagrams?\b[^.;!?\n]{{0,60}}?\b(?:{_NETWORK_DATA})\b"
+    # ... and the same sentence the other way round: "from this table, a
+    # network diagram".
+    rf"|\b(?:{_NETWORK_DATA})\b[^.;!?\n]{{0,60}}?\bnetwork\s+diagrams?\b"
+)
+
 #: Every named visual the platform is asked for that its renderers do not
 #: have. Order is the order they are tested in; the map family is last of the
 #: geographic group so "choropleth map" is named as a choropleth.
@@ -98,7 +138,7 @@ _NAMED: Tuple[Visual, ...] = (
            r"\bcandle\s?sticks?\b|\bohlc\b"),
     Visual("venn", "a Venn diagram", "this platform draws no set diagrams", "", r"\bvenn\b"),
     Visual("network", "a network diagram", "this platform lays a diagram out from boxes and arrows that are named, never from the rows of a table, so there is no chart type that draws a network out of this data", "",
-           r"\bnetwork\s+(?:diagrams?|graphs?|charts?)\b|\bnode[- ]link\b|\bforce[- ]directed\b"),
+           _NETWORK_PATTERN),
 )
 
 #: The verbs and shapes that ask to SEE something. A name on its own ("the

@@ -205,11 +205,82 @@ _ROLE = (
     "'TBD' or 'TODO'."
 )
 
+#: THE ONE SENTENCE THAT TELLS A COMPOSER A DIAGRAM EXISTS, used verbatim
+#: wherever a block vocabulary is listed. It was missing, and the omission
+#: was the whole reason a model-composed technical report held no picture:
+#: `spec.DocumentBlock` gained a `diagram` member and `_schema_with_defs`
+#: has accepted one since, but `_OUTLINE_SCHEMA.elements` is a CLOSED enum
+#: and the comment at `_write_one_section` records what that costs — "the
+#: model follows it literally: fifteen scoped calls produced fifteen
+#: headings and no sub-heading at all, twice measured". A block the
+#: vocabulary does not name is a block the model does not write.
+#:
+#: THE ROLE NAMES ARE READ OFF `spec.DIAGRAM_ROLES` RATHER THAN SPELLED
+#: AGAIN. Three copies of this vocabulary already exist in this module and
+#: they have drifted apart in wording; a fourth copy of the ROLE list would
+#: drift into teaching a role `spec.DiagramNode` refuses. The earlier note
+#: here said such a role "is silently re-coloured rather than reported",
+#: and that is FALSE on this path: `spec.DiagramNode.kind` is a closed
+#: Literal, so `DiagramNode(id='n', label='n', kind='database')` raises a
+#: pydantic ValidationError (measured 2026-09-28; so do 'Store', 'STORE'
+#: and ''). The folding lives at render/diagrams.py:832 and :867, which
+#: the spec Literal makes unreachable from the composer. The guard is worth
+#: more than the old reason claimed, not less: an invented role does not
+#: cost one box its hue, it costs the whole draft, because
+#: `_validate_or_repair` answers any ValidationError with ONE
+#: whole-document rewrite that REPLACES the sectioned draft. Measured on
+#: the owner's route before `_salvage_diagrams` was added below: one wrong
+#: role word in section 3 of 8 turned 8 level-1 headings and 3,378 words
+#: into 6 words, with no warning naming a diagram. Roles are also what
+#: render/diagrams.py colours by, so a name that misses the set loses its
+#: hue as well as its meaning.
+#:
+#: WHAT THIS COSTS, IN THE UNIT IT IS NAMED IN. Re-measured 2026-09-28 by
+#: assembling the real prompts and removing the clause from them in memory,
+#: so both columns are the same tree (`tests/test_diagram_clause_budget.py`
+#: pins every number below and fails if one moves):
+#:
+#:     the clause itself              251 CHARACTERS, 253 UTF-8 bytes
+#:                                    (one em dash, U+2014, at index 78)
+#:     whole-document system prompt   +253 characters, every template
+#:     named-sections user message    +253 characters
+#:     per-section system prompt      +506 characters — the clause is
+#:                                    said TWICE there, see below
+#:     a 15-section report            15 x 506 = 7,590 characters, and
+#:                                    up to 9,108 with the three
+#:                                    SECTION_EXTEND_MAX extension calls
+#:
+#: THE COMMIT THAT ADDED THIS RECORDED THE FIGURE AS A BYTE COUNT, and as
+#: paid once per call. Both halves were wrong. 251 is the CHARACTER count —
+#: the byte count is 253 — and "once per call" holds only on the
+#: whole-document route: the sectioned route, which is the route a long
+#: technical report takes, pays 506 per section. This subsystem has made
+#: the character/byte mistake once before, one commit earlier, and the test
+#: file written to correct it is right that a guard naming the wrong unit
+#: is a guard that will mislead the next person to raise it. So these are
+#: pinned by tests/test_diagram_clause_budget.py rather than only written
+#: down here.
+#:
+#: WHY THE PER-SECTION PROMPT SAYS IT TWICE, ON PURPOSE. The sectioned
+#: route's system message is `_material_messages` — which carries
+#: `_KIND_GUIDE['document']` and so the clause — plus the scoped append in
+#: `_write_one_section`. That is the same shape the sub-heading sentence
+#: already has, and for the same recorded reason (see the comment there):
+#: the model writes the list it is given LAST. The duplication is the
+#: design, not a slip, and the 506 above is what it costs.
+DIAGRAM_CLAUSE = (
+    "a diagram when the point is how parts CONNECT rather than how numbers compare — an architecture, a "
+    "pipeline, a request path as boxes and arrows, each box given its role ("
+    + ", ".join(S.DIAGRAM_ROLES)
+    + "), never a picture of numbers and never decoration"
+)
+
 _KIND_GUIDE = {
     "document": (
         "Write a document: a title, then blocks in reading order. Use heading "
         "levels for structure, short paragraphs, bullet lists for enumerations, "
-        "a table when the material has rows, a chart when numbers compare, a "
+        "a table when the material has rows, a chart when numbers compare, "
+        + DIAGRAM_CLAUSE + ", a "
         "callout for a warning or key takeaway, a kpis row for a brief's "
         "headline numbers. Put an assumptions list where you had to infer. "
         "Do not repeat the same content in two blocks."
@@ -242,7 +313,7 @@ _TEMPLATE_GUIDE = {
     "executive_report": "Executive report: cover on, an executive summary first (five sentences at most), then findings, then recommendations clearly separated from findings, then appendix material.",
     "brief": "One-page executive brief: no cover, a kpis row at the top, three to five tight sections, no section longer than 120 words. It must fit one page.",
     "sop": "Standard operating procedure: purpose, scope, roles, then NUMBERED steps with a warning callout where a step can go wrong, then a checklist.",
-    "technical_report": "Technical report: context, approach, findings with tables, limitations, next steps. Precise, no marketing language.",
+    "technical_report": "Technical report: context, approach, findings with tables, limitations, next steps. A diagram where the architecture, the data path or the process is the point — that is what a technical reader opens it for. Precise, no marketing language.",
     "research_report": "Research report: question, method, findings with citations on every claim that came from a source, discussion, sources.",
     "proposal": "Proposal: the need, the proposed approach, scope, timeline (a table), pricing or effort if given, next steps.",
     "meeting_summary": "Meeting summary: attendees if known, decisions, action items with owners as a table, open questions.",
@@ -254,6 +325,40 @@ _TEMPLATE_GUIDE = {
     "dashboard": "Dashboard workbook: a Dashboard sheet of headline figures and charts, then the data sheets behind it.",
     "data": "Data workbook: the rows as given, typed columns, filters on.",
 }
+
+
+def _template_guide(kind: str, template_id: str) -> str:
+    """The template's guide, but only when the template belongs to the kind.
+
+    `_TEMPLATE_GUIDE` is ONE FLAT DICT holding document ids
+    (executive_report, brief, sop, technical_report, research_report,
+    proposal, meeting_summary), deck ids (ceo, training, quarterly_review)
+    and workbook ids (tracker, dashboard, data) together, and it used to be
+    read with a bare `.get(req.template_id, ...)` and no kind gate. That is
+    a third place a kind can be told about a block its own schema refuses,
+    beside `_KIND_GUIDE` and `_requested_line` — and it was leaking:
+    measured 2026-09-28 over all 42 kind x template_id pairs through the
+    real `_material_messages`, `presentation|technical_report` and
+    `workbook|technical_report` each carried the technical report's
+    sentence "A diagram where the architecture, the data path or the
+    process is the point", +124 characters, teaching a deck and a workbook
+    a `Slide` and a `Sheet` cannot hold.
+
+    LATENT, NOT LIVE, and it is fixed here rather than argued about because
+    the reason it is latent is not a rule anywhere: `formats.template_for`
+    is kind-scoped, every edit and restore path reads `kind` and
+    `template_id` off the same row, and the public API exposes no
+    `template_id` — so the pairing holds today only because the three id
+    namespaces happen to be disjoint. `spec.templates_for(kind)` is the
+    Literal the validator itself uses, so this gate cannot drift from the
+    schema; a stranger id falls back to the generic guide, which is what a
+    `.get` miss already did.
+    """
+    allowed = S.templates_for(kind)
+    if allowed and template_id not in allowed:
+        return _TEMPLATE_GUIDE["generic"]
+    return _TEMPLATE_GUIDE.get(template_id, _TEMPLATE_GUIDE["generic"])
+
 
 #: The prefix of the version warning that names figures the material never gave.
 FIGURES_WARNING = "figures not in the material (derived or assumed): "
@@ -472,7 +577,7 @@ def _size_line(target: Optional[LengthTarget]) -> str:
             "wherever the data supports one. Do not stop early and do not summarise what you have already written.")
 
 
-def _requested_line(requested: Sequence[str]) -> str:
+def _requested_line(requested: Sequence[str], *, kind: str = "document") -> str:
     """The sections the person named, in their words and their order.
 
     Until 2026-09-22 they reached the model only as the integer inside
@@ -498,7 +603,13 @@ def _requested_line(requested: Sequence[str]) -> str:
         "heading at LEVEL 1; the parts inside a section are sub-headings at LEVEL 2, and a section of several "
         "hundred words needs two or three of them. Write real prose under every heading rather than a heading "
         "followed by a single line. Use the block the request's own words ask for: a bullets block for an "
-        "enumeration, a numbered block for a sequence of steps, a table where things are compared, a callout "
+        "enumeration, a numbered block for a sequence of steps, a table where things are compared, "
+        # A DIAGRAM IS A DOCUMENT BLOCK AND ONLY A DOCUMENT BLOCK. This line
+        # is built for every kind — the caller passes `req.kind` — and
+        # `Slide` has no diagram field, so naming one to a deck or a workbook
+        # would teach a block its schema refuses.
+        + (DIAGRAM_CLAUSE + ", " if kind == "document" else "")
+        + "a callout "
         "with kind \"warning\" and a title for a caution or a risk, a callout with kind \"note\" and a title "
         "for an aside or a note, and recommendations written as recommendations where the request asks for them."
     )
@@ -552,7 +663,7 @@ def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget, target: O
     size = _size_line(target)
     tone = size or _TONE.get(req.effort, "")
     system = (
-        f"{_ROLE}\n\n{_KIND_GUIDE[req.kind]}{caps}{guide}\n\n{_TEMPLATE_GUIDE.get(req.template_id, _TEMPLATE_GUIDE['generic'])}\n\n"
+        f"{_ROLE}\n\n{_KIND_GUIDE[req.kind]}{caps}{guide}\n\n{_template_guide(req.kind, req.template_id)}\n\n"
         f"{tone} Limits: at most {max_sections} top-level sections, "
         f"{max_slides} slides, {budget.max_sheets} sheets. "
         f"Set template_id to \"{req.template_id}\"."
@@ -577,7 +688,7 @@ def _material_messages(req: ComposeRequest, *, budget: T.EffortBudget, target: O
     # what the user message is for. Pinned by
     # test_artifact_length.py::test_the_requested_sections_never_enter_the_system_message.
     user = "\n\n".join(
-        parts + [f"Request: {req.instruction or m.instruction}" + _requested_line(requested)]
+        parts + [f"Request: {req.instruction or m.instruction}" + _requested_line(requested, kind=req.kind)]
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -634,7 +745,7 @@ _OUTLINE_SCHEMA = {
                 "properties": {
                     "heading": {"type": "string", "maxLength": 120},
                     "purpose": {"type": "string", "maxLength": 200},
-                    "elements": {"type": "array", "maxItems": 6, "items": {"type": "string", "enum": ["paragraphs", "bullets", "table", "chart", "callout", "kpis", "numbered"]}},
+                    "elements": {"type": "array", "maxItems": 6, "items": {"type": "string", "enum": ["paragraphs", "bullets", "table", "chart", "diagram", "callout", "kpis", "numbered"]}},
                 },
                 "required": ["heading", "purpose", "elements"],
             },
@@ -750,6 +861,28 @@ def body_json_for_prompt(spec: S.ArtifactSpec) -> str:
     return json.dumps(dump, ensure_ascii=False)
 
 
+#: HOW MANY FIGURES ONE COMPOSED DOCUMENT MAY HOLD. The chat path's diagram
+#: instruction (app/engines/__init__.py) caps an ANSWER at one diagram and
+#: says ordinary questions get none — tests/test_diagram_instruction_budget.py
+#: calls those two rules "what stop an eager model decorating every answer" —
+#: and the comment beside it states that "the three-diagram allowance for a
+#: DOCUMENT lives on the artifact path". It did not: nothing in this module
+#: capped figures at all, and `DIAGRAM_CLAUSE` names no limit while being
+#: repeated in EVERY per-section prompt, so a fifteen-section report invited
+#: up to fifteen rendered PNGs. Three is the number the chat side was
+#: already told, so it is the number here rather than a new one.
+#:
+#: WHY A TRIM AND NOT A WARNING, unlike the section cap just above. The
+#: section cap only warns because cutting a section throws away the
+#: person's prose; a figure past the third is server-side matplotlib CPU on
+#: the box that is also answering live chat, and dropping it costs the
+#: document no words. It is the same trade the slide, sheet and row caps
+#: make. The FIRST three are kept, in reading order: an architecture
+#: diagram belongs near the front, and a model that draws four has spent
+#: the fourth on decoration.
+MAX_DIAGRAMS_PER_DOCUMENT = 3
+
+
 def _enforce_caps(spec: S.ArtifactSpec, budget: T.EffortBudget, requested: Sequence[str] = (),
                   *, target: Optional[LengthTarget] = None) -> List[str]:
     """Trim what the effort level allows rather than refuse: a deck with 14
@@ -778,6 +911,11 @@ def _enforce_caps(spec: S.ArtifactSpec, budget: T.EffortBudget, requested: Seque
         top = sum(1 for b in body.blocks if isinstance(b, S.Heading) and b.level == 1)
         if top > max_sections:
             warnings.append(f"the document has {top} top-level sections; this effort level asked for at most {max_sections}")
+        figures = [i for i, b in enumerate(body.blocks) if isinstance(b, S.DiagramBlock)]
+        if len(figures) > MAX_DIAGRAMS_PER_DOCUMENT:
+            cut = set(figures[MAX_DIAGRAMS_PER_DOCUMENT:])
+            warnings.append(f"the document was trimmed from {len(figures)} diagrams to {MAX_DIAGRAMS_PER_DOCUMENT}")
+            body.blocks = [b for i, b in enumerate(body.blocks) if i not in cut]
     return warnings
 
 
@@ -1257,7 +1395,8 @@ async def _write_one_section(
         " Break the section into its parts and head each part at LEVEL 2 under your level-1 heading — two or "
         "three of them, unless the section really is one single idea. Use the "
         "block the request's own words ask for: a bullets block for an enumeration, a numbered block for a "
-        "sequence of steps, a table where things are compared, a callout with kind \"warning\" and a title for a "
+        "sequence of steps, a table where things are compared, " + DIAGRAM_CLAUSE + ", a callout with kind "
+        "\"warning\" and a title for a "
         "caution or a risk, a callout with kind \"note\" and a title for an aside, and a recommendation written "
         "plainly as a recommendation where the request asks for them."
     )
@@ -1772,15 +1911,80 @@ def _promote_headings(blocks: List[Any], requested: Sequence[str]) -> None:
         b["level"] = max(1, int(b.get("level") or 1) - 1)
 
 
-def _tidy_document(raw: dict, req: ComposeRequest, requested: Sequence[str] = ()) -> None:
+#: What a section gets instead of a diagram that will not validate. The
+#: wording is `md_import`'s, deliberately: a person who exports an answer
+#: whose mermaid fence could not be read and a person whose composed report
+#: asked for a picture the model mis-declared are being told the same thing,
+#: and it should not read as two different failures.
+DIAGRAM_OMITTED_TITLE = "Diagram omitted"
+DIAGRAM_OMITTED_TEXT = "A diagram for this section could not be drawn, so it was left out."
+#: The warning the person sees when it happens. It names the block, because
+#: the only thing they were told before was that the document came back
+#: short — see `_salvage_diagrams`.
+DIAGRAM_OMITTED_WARNING = "diagram(s) the model declared could not be drawn and were left out of the document"
+
+
+def _salvage_diagrams(blocks: List[Any]) -> int:
+    """Replace every diagram block that will not validate with a callout,
+    and return how many. Mutates `blocks`.
+
+    WHY THIS EXISTS, MEASURED RATHER THAN FEARED. `spec.DiagramNode.kind`
+    is a closed four-word Literal that REFUSES an unknown role — it does
+    not fold one to the default — and `_validate_or_repair` answers ANY
+    ValidationError with ONE whole-document `_compose_once` whose reply
+    REPLACES the sectioned draft. So a single wrong word inside one figure
+    discards every other section's prose. Driven end to end through the
+    real `compose()` on the owner's route (6,000-word technical report,
+    8 named sections, sectioned because target.words > SECTIONED_WRITER_WORDS)
+    on 2026-09-28:
+
+        every role correct        8 level-1 headings, 3,378 words, 1 diagram
+        section 3 writes
+        kind='database'           0 headings, 6 words, 0 diagrams
+        with this function        8 headings, 3,378 words, 0 diagrams,
+                                  1 "Diagram omitted" callout, and a
+                                  warning that says so
+
+    'Store', 'STORE' and '' collapse the document the same way, and so do
+    the other eight shapes a model plausibly emits: no nodes, one node and
+    no edges, duplicate ids, an edge naming a node that does not exist, a
+    self-loop, 10,000 nodes, an empty label, a 4kB label.
+
+    The COLLAPSE is pre-existing — any invalid block of any type does it —
+    but only the diagram is newly invited into every technical report by
+    this branch, and it is the strictest sub-schema in `DocumentBlock`. The
+    repair pass is not removed: it still runs for everything else. This
+    only takes the figure out of its way, which is the trade `md_import`
+    already makes for a mermaid fence it cannot read.
+    """
+    dropped = 0
+    for i, b in enumerate(blocks):
+        if not isinstance(b, dict) or b.get("type") != "diagram":
+            continue
+        try:
+            S.DiagramBlock.model_validate(b)
+        except ValidationError as exc:
+            # Rule names and field paths only, never the block's content:
+            # a composed document carries the person's material.
+            log.info("artifact compose: a declared diagram did not validate and was left out: %s",
+                     S.validation_summary(exc).replace("\n", " | ")[:200])
+            blocks[i] = {"type": "callout", "kind": "note", "title": DIAGRAM_OMITTED_TITLE,
+                         "text": DIAGRAM_OMITTED_TEXT}
+            dropped += 1
+    return dropped
+
+
+def _tidy_document(raw: dict, req: ComposeRequest, requested: Sequence[str] = ()) -> List[str]:
     """AS3 (e), code not model: a document's first heading that repeats
     its title is dropped (the renderer already prints the title block),
     the heading levels are shifted up when a draft headed every requested
-    section at level 2, and every table's `numeric_columns` is inferred
-    from its cells — a column is numeric when all its non-blank cells
-    parse as numbers. Mutates."""
+    section at level 2, a diagram that will not validate becomes a callout
+    rather than costing the whole draft (`_salvage_diagrams`), and every
+    table's `numeric_columns` is inferred from its cells — a column is
+    numeric when all its non-blank cells parse as numbers. Mutates, and
+    returns the warnings the person should see."""
     if req.kind != "document" or not isinstance(raw, dict) or not isinstance(raw.get("blocks"), list):
-        return
+        return []
     blocks = raw["blocks"]
     title = " ".join(str(raw.get("title") or "").split()).casefold()
     first = blocks[0] if blocks and isinstance(blocks[0], dict) else None
@@ -1788,6 +1992,7 @@ def _tidy_document(raw: dict, req: ComposeRequest, requested: Sequence[str] = ()
             and " ".join(str(first.get("text") or "").split()).casefold() == title and int(first.get("level") or 1) == 1):
         blocks.pop(0)
     _promote_headings(blocks, requested)
+    dropped = _salvage_diagrams(blocks)
     for b in blocks:
         t = b.get("table") if isinstance(b, dict) and b.get("type") == "table" else None
         if not isinstance(t, dict) or not isinstance(t.get("columns"), list) or not isinstance(t.get("rows"), list):
@@ -1799,6 +2004,7 @@ def _tidy_document(raw: dict, req: ComposeRequest, requested: Sequence[str] = ()
             if cells and all(not isinstance(c, bool) and (isinstance(c, (int, float)) or tables.parse_number(c) is not None) for c in cells):
                 numeric.append(j)
         t["numeric_columns"] = numeric
+    return [f"{dropped} {DIAGRAM_OMITTED_WARNING}"] if dropped else []
 
 
 def _reconcile_sources(raw: dict, material: Optional[Material], parent: Optional[S.ArtifactSpec] = None) -> List[str]:
@@ -2146,7 +2352,7 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
     code-made rows are filled (CONTRACT-2 §4), so the Sheet that validates
     is the one that renders."""
     notes = _reconcile_sources(raw, req.material, req.parent_spec if req.operation == "edit" else None)
-    _tidy_document(raw, req, requested)
+    notes.extend(_tidy_document(raw, req, requested))
     _pin_template(raw, req)
     # In a thread: a 10,000-row generator or copy is CPU the event loop
     # must not spend (#11); the fill mutates `raw` and `notes` in place.
@@ -2167,7 +2373,7 @@ async def _validate_or_repair(req: ComposeRequest, budget: T.EffortBudget, raw: 
         target=target, requested=requested,
     )
     notes = _reconcile_sources(fixed, req.material, req.parent_spec if req.operation == "edit" else None)
-    _tidy_document(fixed, req, requested)
+    notes.extend(_tidy_document(fixed, req, requested))
     _pin_template(fixed, req)
     problems = await asyncio.to_thread(_fill_code_made_rows, fixed, req, notes)
     if problems:
