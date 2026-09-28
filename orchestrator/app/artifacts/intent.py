@@ -813,6 +813,29 @@ _SOV_RE = re.compile(
     rf"\b(?:{_FORMAT_WORD}|{_ARTIFACT_NOUNS}|file|sheet|charts?)\b(?:\s+\S+){{0,6}}?\s+(?:_give_|_convert_)",
     re.I,
 )
+
+
+def _sov(low: str) -> bool:
+    """`_SOV_RE` on the view that holds no DIAGRAM: "flow chart banao" and
+    "ફ્લો ચાર્ટ બનાવો" are not a chart to be drawn from a table, and the
+    bare `charts?` alternative above cannot tell them from "chart banao"
+    (measured 2026-09-28: both reached create/create-postposition, while the
+    English "make a flowchart of our deploy process" fell through to chat).
+    `LX.without_diagram_phrases` owns that vocabulary -- one home, shared
+    with `LX.chart_signal` and artifacts/formats.py -- and it only ever
+    removes a diagram phrase, so every OTHER alternative of `_SOV_RE`
+    (a format word, an artifact noun, `file`, `sheet`) reads the same text
+    it always did: "flow chart pdf me bana do" is still a PDF.
+
+    The three readers of `_SOV_RE` all ask the same question -- is this a
+    postposition-shaped request for a DELIVERABLE -- which is why the blank
+    belongs here and not in `_rule_view`. `low` itself keeps the words,
+    because a QUESTION about a flow chart inside a file we made is still a
+    question about that file's contents ("what is in the flow chart?" ->
+    answer-artifact:contents, measured today before and after)."""
+    return bool(_SOV_RE.search(LX.without_diagram_phrases(low)))
+
+
 #: A new deliverable with its own topic: "a Word document summarizing the
 #: vendors", "a pdf on two-factor authentication" — a create, not an export
 #: of the answer, unless the topic IS the reference ("a word version of the
@@ -1749,7 +1772,7 @@ def _export_shape(low: str, explicit: Sequence[str]) -> Optional[str]:
     # Without a reference, only a CONTENT-FREE postposition hands the answer
     # over ("pdf bana do"); "sales ki report banao" names a new topic and is a
     # create (verifier 2026-09-15: it exported the previous answer).
-    if _SOV_RE.search(low) and (ref or (len(low.split()) <= 6 and not _content_words(low))):
+    if _sov(low) and (ref or (len(low.split()) <= 6 and not _content_words(low))):
         return "export-postposition"
     return None
 
@@ -3001,7 +3024,7 @@ def decide(
         # "Also as PDF" with nothing else said.
         if explicit and re.match(r"^\s*(?:also|and|plus|too)?\s*(?:as|in)\s+(?:an?\s+)?\w+(?:\s+\w+)?\s*(?:too|as well|please)?\s*[.!]?\s*$", low):
             return made("convert", reference="latest", rule="convert-short")
-        if explicit and re.search(r"\balso\b", low) and (_SOV_RE.search(low) or _FORMAT_ONLY_RE.match(low)):
+        if explicit and re.search(r"\balso\b", low) and (_sov(low) or _FORMAT_ONLY_RE.match(low)):
             # "pdf version bhi chahiye" → "pdf version also _give_".
             return made("convert", reference="latest", rule="convert-short")
         # No edit rule took it, and the person ruled out a file or placed the
@@ -3040,7 +3063,7 @@ def decide(
         # "draft an email telling the team the report is delayed".
         return made("none", rule="text-object", instruction="")
     as_format = bool(_AS_FORMAT_RE.search(low)) and bool(_ASKING_RE.search(low)) and not _STATEMENT_RE.match(low)
-    sov = bool(_SOV_RE.search(low)) and not (("?" in low and _WH_QUESTION_RE.search(low)) or _KYA_WHAT_RE.search(low))
+    sov = _sov(low) and not (("?" in low and _WH_QUESTION_RE.search(low)) or _KYA_WHAT_RE.search(low))
     chart_ask = chart and bool(_CHART_ASK_RE.search(low)) and not _QUESTION_ABOUT_RE.match(low) and not _STORY_PLOT_RE.search(low)
     # Explicit formats with an object and no verb: "XLSX, Word, PDF and
     # CSV of this audit please". A question is not this shape.
@@ -3180,6 +3203,22 @@ def verdict_to_intent(verdict: Any, rules: ArtifactIntent, *, has_artifacts: boo
     if action not in _HOOK_ACTIONS or action == "none":
         return None
     formats = [f for f in (getattr(verdict, "formats", None) or []) if f in _VERDICT_FORMATS]
+    if formats and LX.diagram_signal(rules.raw_text) and not LX.chart_signal(rules.raw_text):
+        # A DIAGRAM IS NOT A CHART IMAGE (2026-09-28). An image format here
+        # reaches the engine as `explicit_only`, which `formats._decide_images`
+        # honours WITHOUT consulting `_chart_image_formats` -- so the diagram
+        # guard there is bypassed and `engines/artifact._image_only` produces
+        # the owner's refusal from the model's verdict alone.
+        #
+        # Measured today on the e2e stack, with the rules and formats fixed:
+        # "org chart of the team: Asha is CEO, Ravi and Meera report to her,
+        # Dev reports to Ravi" is `file_signal` True (the `reports?` in "report
+        # to her"), so `_should_consult` offered it to the classifier, which
+        # answered create/['png'] -- and the answer was "I can only draw a
+        # chart from data I can read as a table", in 1.0 s, on both Fast and
+        # Think. An image-only version IS its charts, and no diagram can be
+        # one; the document formats the words ask for are still decided below.
+        formats = [f for f in formats if f not in T.IMAGE_FORMATS]
     target = str(getattr(verdict, "target", "") or "none")
     if action == "edit" and not has_artifacts:
         # An edit of a file that does not exist: the model misread a remark

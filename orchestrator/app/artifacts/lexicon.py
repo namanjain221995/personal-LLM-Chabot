@@ -360,15 +360,131 @@ def formats_in(norm: str) -> List[str]:
     return out
 
 
+#: A DIAGRAM THAT HAPPENS TO BE NAMED WITH THE WORD "CHART". A flow chart is
+#: a picture of steps and an org chart a picture of a hierarchy; neither is a
+#: chart drawn from the rows of a table. They belong to the chat path, where
+#: the model draws mermaid, exactly as "diagram" and "flowchart" already do.
+#:
+#: MEASURED 2026-09-28, owner report against the release ae25da28:
+#:
+#:   "Make A Digram or Flow Chart of Api Which Coonect to Db ??"
+#:   -> "I can only draw a chart from data I can read as a table. Attach the
+#:       file again (CSV or Excel), or paste the table into the message, and
+#:       I'll plot it."
+#:
+#: There was no table because he never wanted one. `_CHART_RE` carries a bare
+#: `charts?` alternative (kept on purpose, so "make me a chart of this table"
+#: works with no type word at all), so ANY phrase whose last word is "chart"
+#: matched it. The proof that the WORD was doing the work and not the MEANING:
+#: `chart_signal("flow chart of the API")` was True and reached
+#: create-chart, while `chart_signal("flowchart of our deploy")` was False and
+#: fell through to chat -- two spellings of one request, two answers.
+#:
+#: HOW IT IS APPLIED. These phrases are BLANKED out of the text before
+#: `_CHART_RE` reads it (`without_diagram_phrases`), never removed from
+#: `_CHART_RE` itself. Two things follow, and both are the point:
+#:
+#:   * every real chart type keeps its own alternative untouched -- `gantt
+#:     chart` IS a data chart and is named in the regex on purpose, and so
+#:     are bar, line, pie, donut, area, scatter, bubble, column, stacked,
+#:     combo, radar, funnel, waterfall, box, histogram, heat map, treemap,
+#:     sunburst, candlestick and ohlc;
+#:   * a message that asks for BOTH -- "a flow chart of the API and a bar
+#:     chart of headcount" -- still carries its chart, because only the
+#:     diagram phrase is blanked.
+#:
+#: WHAT IS DELIBERATELY NOT HERE.
+#:   * `cash flow`, `fund flow` and `money flow` make `flow` a MEASURED
+#:     QUANTITY rather than a sequence of steps: a cash-flow chart is a real
+#:     chart of real numbers (tests/fixtures/chart_requests.py c01 and hi05
+#:     are that request in English and Hindi), so the flow arm refuses to
+#:     match behind those three words.
+#:   * `network`, `sankey` and `venn`. artifacts/visuals.py owns those words
+#:     and answers them with a sentence that says why the picture cannot be
+#:     drawn from a table; falling through to chat instead would lose that.
+#:
+#: THE INDIC ARM reads the script forms directly, because this pattern is
+#: read on RAW text too (artifacts/formats.py, whose own chart vocabulary
+#: lists चार्ट / ગ્રાફ the same way). On normalised text the noun is already
+#: folded to "chart" by `_NORMALISE`, so "फ्लो chart" is the shape that
+#: actually arrives there -- which is why the noun alternation below accepts
+#: the English word next to an Indic modifier.
+_DIAGRAM_MOD = (
+    # "flow chart", "flowchart", "flow-chart", "data flow chart",
+    # "workflow chart", "process flow chart".
+    r"(?<!cash\s)(?<!cash-)(?<!fund\s)(?<!fund-)(?<!money\s)flow|work\s*flow|data\s*flow|process(?:\s+flow)?|"
+    # "org chart", "orgchart", "org-chart", "organisation/organization chart",
+    # "organisational/organizational chart".
+    r"org|organi[sz]ationa?l?|"
+    # "sequence chart", "swimlane chart", "swim lane chart",
+    # "architecture chart", "hierarchy chart", "state machine chart",
+    # "entity relationship chart".
+    r"sequence|swim\s*lane|architectur(?:e|al)|hierarch(?:y|ical)|state\s*machine|entity[\s-]?relationship"
+)
+_DIAGRAM_NOUN = r"charts?|graphs?|चार्ट|ग्राफ़?|ચાર્ટ|ગ્રાફ"
+_DIAGRAM_PHRASE_RE = re.compile(
+    _w(rf"(?:{_DIAGRAM_MOD})[\s-]*(?:{_DIAGRAM_NOUN})")
+    # The same phrases typed in Devanagari or Gujarati. "फ्लोचार्ट" and
+    # "ફ્લોચાર્ટ" are written as one word, so they get their own arm.
+    + rf"|{_B}(?:फ्लो|ફ્લો|ऑर्ग|ओर्ग|ઑર્ગ|ઓર્ગ)[\s-]*(?:{_DIAGRAM_NOUN}){_E}"
+    + rf"|{_B}(?:फ्लोचार्ट|ફ્લોચાર્ટ|ऑर्गचार्ट|ઓર્ગચાર્ટ){_E}",
+    re.IGNORECASE,
+)
+
+
+def without_diagram_phrases(text: str) -> str:
+    """`text` with every DIAGRAM spelt with a chart word blanked out, so the
+    chart vocabulary below cannot read "flow chart" or "org chart" as a chart
+    drawn from data. Reads raw or normalised text; the blank keeps the
+    surrounding words' boundaries."""
+    return _DIAGRAM_PHRASE_RE.sub(" ", text or "")
+
+
+#: A DIAGRAM, named as itself. The phrases above are the ones spelt with a
+#: chart word; these are the words that name a diagram and nothing else, and
+#: they are here because `formats._chart_image_formats` needs the whole
+#: judgement in one predicate: an image-only version IS its charts
+#: (render/__init__ builds it from `_standalone_images`, which draws charts
+#: and refuses "The artifact has no charts to draw as images"), so a request
+#: for a diagram must never produce one. Measured 2026-09-28: under a
+#: classifier verdict of chart_request=True, "make a flowchart of our deploy
+#: process" and "draw a diagram of the API" both came back ['png'] -- the
+#: one-word spelling of the owner's own request, on the path where the rules
+#: are silent and the model is the only judge.
+_DIAGRAM_WORD_RE = re.compile(
+    _w(r"diagrams?|flowcharts?|orgcharts?|mind\s*maps?|swim\s*lanes?|"
+       # Only the words that are driven in
+       # tests/test_artifact_flow_chart_is_a_diagram.py are listed: the wider
+       # Hindi "आकृति" (a figure, a shape) is deliberately absent.
+       r"डायग्राम|ડાયગ્રામ|फ्लोचार्ट|ફ્લોચાર્ટ|ऑर्गचार्ट|ઓર્ગચાર્ટ"),
+    re.IGNORECASE,
+)
+
+
+def diagram_signal(text: str) -> bool:
+    """Does this text name a DIAGRAM -- a picture of boxes and arrows, laid out
+    from words, never from the rows of a table? True for "diagram" and
+    "flowchart", and for the diagrams spelt with a chart word ("flow chart",
+    "org chart"). Reads raw or normalised text."""
+    t = text or ""
+    return bool(_DIAGRAM_WORD_RE.search(t) or _DIAGRAM_PHRASE_RE.search(t))
+
+
+def _chart_in(text: str) -> bool:
+    """Does this text name a chart DRAWN FROM DATA? The one reader of
+    `_CHART_RE`, so no caller can forget the diagram phrases."""
+    return bool(_CHART_RE.search(without_diagram_phrases(text or "")))
+
+
 def file_signal(text: str) -> bool:
     """Does the message name a file format, a file, or a chart? Reads raw or
     normalised text (normalises when it looks raw)."""
     norm = _ensure_norm(text)
-    return bool(_FORMAT_RE.search(norm) or _CHART_RE.search(norm) or _FILE_NOUN_RE.search(norm))
+    return bool(_FORMAT_RE.search(norm) or _chart_in(norm) or _FILE_NOUN_RE.search(norm))
 
 
 def chart_signal(text: str) -> bool:
-    return bool(_CHART_RE.search(_ensure_norm(text)))
+    return _chart_in(_ensure_norm(text))
 
 
 def _ensure_norm(text: str) -> str:
@@ -525,7 +641,7 @@ def _clauses(norm: str) -> List[str]:
 
 
 def _is_request_clause(clause: str) -> bool:
-    return bool(_TARGET_RE.search(clause) and (_FORMAT_OR_KIND_RE.search(clause) or _CHART_RE.search(clause)))
+    return bool(_TARGET_RE.search(clause) and (_FORMAT_OR_KIND_RE.search(clause) or _chart_in(clause)))
 
 
 def negative_shape(text: str, upload_formats: Sequence[str] = ()) -> Optional[NegativeShape]:
@@ -678,5 +794,5 @@ __all__ = [
     "request_marker",
     "StylePhrase", "normalize", "formats_in", "file_signal", "chart_signal", "style_phrases", "strip_style_clauses",
     "undo_signal", "negative_shape", "reads_source", "language_of", "FORMAT_ALIASES", "DEST_AFTER",
-    "CHART_TYPE_WORDS",
+    "CHART_TYPE_WORDS", "without_diagram_phrases", "diagram_signal",
 ]

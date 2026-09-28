@@ -45,6 +45,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from . import lexicon as LX
 from . import types as T
 
 #: Data asked for by the shape or by the count: "sample records", "250
@@ -600,7 +601,51 @@ def _chart_image_formats(text: str, *, chart_request: Optional[bool] = None) -> 
     a report") already names another deliverable, which `kind_for` below
     stops well before the verdict is consulted.
     """
-    words = bool(_CHART_WORDS_RE.search(text or ""))
+    # A DIAGRAM NAMED WITH THE WORD "CHART" IS STILL A DIAGRAM (2026-09-28).
+    # This is the function that made the owner's refusal: "Make A Digram or
+    # Flow Chart of Api Which Coonect to Db ??" returned ['png'] here (the
+    # bare `chart` arm of _CHART_WORDS_RE, plus `make` in _CHART_ASK_RE),
+    # engines/artifact._image_only read the png version as "this version IS
+    # its charts", found no table, and answered "I can only draw a chart from
+    # data I can read as a table." He never wanted a table: a flow chart is a
+    # diagram, and the chat path draws it in mermaid.
+    #
+    # `_CHART_NOUN_ASK_RE` read the same phrase as a chart named as a SUBJECT
+    # ("flow chart of the API" matches its bare `charts?\s+of` arm), so both
+    # regexes read the blanked text. The vocabulary is the lexicon's
+    # (LX.without_diagram_phrases) -- ONE home, shared with LX.chart_signal
+    # and intent._sov -- and it reads this module's RAW text as well as the
+    # gate's normalised text, which is why its Indic arm spells the script
+    # forms out the way _CHART_WORDS_RE spells चार्ट / ગ્રાફ.
+    #
+    # It blanks the diagram phrase ONLY: "a flow chart of the API and a bar
+    # chart of headcount" still names a bar chart and still returns ['png'],
+    # and every real type -- gantt included -- is untouched.
+    drawable = LX.without_diagram_phrases(text or "")
+    # EVERY chart word in this message was part of a diagram phrase. No image
+    # version, whatever the gate says. This is NOT the "a False verdict is a
+    # no-op, not a veto" case the docstring above refuses -- that is the
+    # model's silence overruling the person's words; this is the person's own
+    # words naming a diagram. A png version IS its charts
+    # (engines/artifact._image_only), so a png here can only end as the
+    # refusal the owner received.
+    # THE MESSAGE NAMES A DIAGRAM AND NO REAL CHART. No image version,
+    # whatever the gate says. This is NOT the "a False verdict is a no-op, not
+    # a veto" case the docstring above refuses -- that is the model's silence
+    # overruling the person's words; this is the person's own words naming a
+    # diagram. An image-only version IS its charts: render/__init__ builds it
+    # from `_standalone_images` and refuses "The artifact has no charts to draw
+    # as images", and engines/artifact._image_only turns the same shape into
+    # the refusal the owner received. `LX.diagram_signal` covers both spellings
+    # -- the phrases with a chart word in them ("flow chart", "org chart",
+    # blanked out of `drawable` above) and the words that name a diagram on
+    # their own ("diagram", "flowchart"), which carry no chart word at all and
+    # so were reached only through the gate: measured 2026-09-28, "make a
+    # flowchart of our deploy process" and "draw a diagram of the API" were
+    # both ['png'] under chart_request=True.
+    if LX.diagram_signal(text or "") and not _CHART_WORDS_RE.search(drawable):
+        return []
+    words = bool(_CHART_WORDS_RE.search(drawable))
     # THE DECISION, AND THE RESIDUAL RISK IT LEAVES (recheck, 2026-09-16).
     # None and False are the same here: the words decide. What that gives up
     # is the one thing a False verdict could have done — veto a png that
@@ -635,12 +680,12 @@ def _chart_image_formats(text: str, *, chart_request: Optional[bool] = None) -> 
         return []
     if kind_for(text or "", [])[1] != "default":
         return []
-    if not (gate or (words and (_CHART_ASK_RE.search(text or "") or _CHART_NOUN_ASK_RE.match(text or "")))):
+    if not (gate or (words and (_CHART_ASK_RE.search(drawable) or _CHART_NOUN_ASK_RE.match(drawable)))):
         return []
     # "the plot of this novel by chapter" names no chart: `plot` is an ask
     # verb here and a story word there, and the story reading wins when the
     # sentence says so (understanding audit, 2026-09-16).
-    if _STORY_PLOT_RE.search(text or "") and not _CHART_WORDS_RE.search(_STORY_PLOT_RE.sub(" ", text or "")):
+    if _STORY_PLOT_RE.search(drawable) and not _CHART_WORDS_RE.search(_STORY_PLOT_RE.sub(" ", drawable)):
         return []
     return ["png"]
 
