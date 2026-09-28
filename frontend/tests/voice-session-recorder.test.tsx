@@ -76,7 +76,7 @@ const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
  * count: under the full suite's parallel load a hash takes many more turns.
  * `performance.now` is real; only Date and the timers are faked here.
  */
-async function until(cond: () => boolean, budgetMs = 20_000): Promise<void> {
+async function until(cond: () => boolean, what = 'condition', budgetMs = 20_000): Promise<void> {
   const deadline = performance.now() + budgetMs;
   while (performance.now() < deadline) {
     if (cond()) return;
@@ -84,19 +84,24 @@ async function until(cond: () => boolean, budgetMs = 20_000): Promise<void> {
       await turn();
     });
   }
-  if (!cond()) throw new Error('condition never became true');
+  if (!cond()) throw new Error(`never happened: ${what}`);
 }
 
 /** Like `until`, but lets the fake clock run too: the long-poll waits a second between unchanged answers. */
-async function untilWithClock(cond: () => boolean, steps = 60): Promise<void> {
-  for (let i = 0; i < steps; i += 1) {
+async function untilWithClock(cond: () => boolean, what = 'condition', budgetMs = 20_000): Promise<void> {
+  // Bounded by wall-clock time like `until`. The turn-counted version failed
+  // this file's retry test once in five full-suite runs (load 3-8; the
+  // failure text was not captured), and under that load one WebCrypto hash
+  // can take many more turns than an idle machine needs.
+  const deadline = performance.now() + budgetMs;
+  while (performance.now() < deadline) {
     if (cond()) return;
     await act(async () => {
       await vi.advanceTimersByTimeAsync(500);
     });
     for (let t = 0; t < 20; t += 1) await act(async () => turn());
   }
-  if (!cond()) throw new Error('condition never became true');
+  if (!cond()) throw new Error(`never happened: ${what}`);
 }
 
 function useServer(options: FakeOptions = {}) {
@@ -132,28 +137,34 @@ afterEach(() => {
   Reflect.deleteProperty(navigator, 'mediaDevices');
 });
 
-/** The real method, taken before any test spies on it. */
-const realAddSlice = VoiceSession.prototype.addSlice;
+/**
+ * The real method, taken before any test spies on it. Optional so that this
+ * file still RUNS against a recorder with no sessions at all (the revert
+ * check): every test then fails on what the recorder does, not on an import.
+ */
+const realAddSlice = VoiceSession?.prototype.addSlice;
 
 async function startRecording() {
   const onTranscript = vi.fn();
   // The hook builds its VoiceSession privately; the first slice hands us the
   // instance, so the test can read what the tab is actually holding.
   let session: VoiceSession | null = null;
-  vi.spyOn(VoiceSession.prototype, 'addSlice').mockImplementation(function (
-    this: VoiceSession,
-    data: Blob,
-    endMs: number,
-  ) {
-    // eslint-disable-next-line @typescript-eslint/no-this-alias -- capturing the instance IS the point
-    session = this;
-    return realAddSlice.call(this, data, endMs);
-  });
+  if (realAddSlice) {
+    vi.spyOn(VoiceSession.prototype, 'addSlice').mockImplementation(function (
+      this: VoiceSession,
+      data: Blob,
+      endMs: number,
+    ) {
+      // eslint-disable-next-line @typescript-eslint/no-this-alias -- capturing the instance IS the point
+      session = this;
+      return realAddSlice.call(this, data, endMs);
+    });
+  }
   const view = renderHook(() => useVoiceRecorder({ onTranscript, maxMs: 10 * 60 * 1000 }));
   await act(async () => {
     view.result.current.start();
   });
-  await until(() => view.result.current.state === 'recording');
+  await until(() => view.result.current.state === 'recording', 'recording started');
   return { view, onTranscript, session: () => session as VoiceSession | null, rec: FakeRecorder.last! };
 }
 
@@ -166,7 +177,11 @@ async function talk(ctx: Awaited<ReturnType<typeof startRecording>>, slices: num
       await vi.advanceTimersByTimeAsync(5000);
       ctx.rec.emit();
     });
-    if (wait) await until(() => server.appendedSlices.length >= idx + 1);
+    // Only a recorder that uploads can be waited for; one that holds the
+    // recording until Stop is simply left to record.
+    if (wait && ctx.view.result.current.mode === 'session') {
+      await until(() => server.appendedSlices.length >= idx + 1, `slice ${idx} on the server`);
+    }
   }
 }
 
@@ -174,23 +189,18 @@ async function stopAndSettle(ctx: Awaited<ReturnType<typeof startRecording>>) {
   await act(async () => {
     ctx.view.result.current.stop();
   });
-  for (let i = 0; i < 40 && ctx.view.result.current.state === 'finishing'; i += 1) {
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(1000);
-    });
-    for (let t = 0; t < 20; t += 1) await act(async () => turn());
-  }
+  await untilWithClock(() => ctx.view.result.current.state !== 'finishing', 'the recording finished');
 }
 
 describe('a session is not stopped at ten minutes', () => {
   it('records two hours, uploading every 5 s while recording, and transcribes all of it', async () => {
     const ctx = await startRecording();
+    await talk(ctx, 121); // 10:05
+    // Past the old ceiling, still recording.
+    expect(ctx.view.result.current.state).toBe('recording');
     expect(ctx.rec.timeslice).toBe(5000);
     expect(ctx.view.result.current.mode).toBe('session');
     expect(ctx.view.result.current.limitMs).toBeNull();
-
-    await talk(ctx, 121); // 10:05
-    expect(ctx.view.result.current.state).toBe('recording');
     await talk(ctx, 1440 - 121); // 2:00:00
     expect(ctx.view.result.current.state).toBe('recording');
     expect(ctx.view.result.current.elapsedMs).toBeGreaterThanOrEqual(7_200_000);
@@ -217,18 +227,24 @@ describe('a session is not stopped at ten minutes', () => {
 describe('the recorder does not accumulate the session in memory', () => {
   it('holds at most two 5 s slices at any moment of an hour, where the old recorder held all of it', async () => {
     const ctx = await startRecording();
-    let peak = 0;
-    for (let i = 0; i < 720; i += 1) {
+    let leastOnServer = Infinity;
+    for (let i = 0; i < 120; i += 1) {
       await talk(ctx, 1);
-      peak = Math.max(peak, ctx.session()!.stats().heldBytes);
+      // Measured from outside the tab: whatever the server does not have yet
+      // is what the tab must be holding. Ten minutes in, that is at most the
+      // slice on its way up.
+      leastOnServer = Math.min(leastOnServer, server.bytesStored - (i + 1) * SLICE_BYTES);
     }
-    const stats = ctx.session()!.stats();
+    expect(leastOnServer).toBeGreaterThanOrEqual(-SLICE_BYTES);
+    await talk(ctx, 600); // the rest of the hour
+    const session = ctx.session();
+    expect(session, 'the recorder made no upload session').not.toBeNull();
+    const stats = session!.stats();
     // An hour at 128.7 kb/s is 57,914,640 bytes. The old recorder kept every
     // chunk in one array until Stop; this one lets each go once it is acked.
     expect(stats.bytesAdded).toBe(720 * SLICE_BYTES);
     expect(stats.bytesAcked).toBe(720 * SLICE_BYTES);
     expect(stats.peakHeldBytes).toBeLessThanOrEqual(2 * SLICE_BYTES);
-    expect(peak).toBeLessThanOrEqual(2 * SLICE_BYTES);
     expect(stats.heldBytes).toBe(0);
   }, 240_000);
 });
@@ -253,7 +269,7 @@ describe('a chunk that fails is retried and the session continues', () => {
     }
     // (That the bar says "Connection lost" while this happens is the bar's
     // test below; progress.offline itself is asserted in voice-session-upload.)
-    await untilWithClock(() => server.appendedSlices.length === 10);
+    await untilWithClock(() => server.appendedSlices.length === 10, 'all ten slices on the server despite the failures');
     // Two sends with no answer, one whose answer was lost, and the replay the
     // server recognised as a duplicate: part 3 went up at least four times.
     expect(server.putsFor(3).length).toBeGreaterThanOrEqual(4);
@@ -295,14 +311,14 @@ describe('what the recorder tells the person', () => {
     const ctx = await startRecording();
     await talk(ctx, 4);
     await talk(ctx, 1, false);
-    await until(() => ctx.view.result.current.state === 'error');
+    await until(() => ctx.view.result.current.state === 'error', 'the recorder stopped on the sign-out', 10_000);
     expect(ctx.view.result.current.error).toEqual({
       message:
         'You were signed out. Everything up to 0:20 is saved on the server; the last few seconds will be lost if you close this tab.',
       retryable: false,
     });
     for (const t of tracks) expect(t.stop).toHaveBeenCalled();
-  });
+  }, 30_000);
 
   it('asks before discarding a recording over a minute, and deletes it from the server when told to', async () => {
     const ctx = await startRecording();
@@ -314,7 +330,7 @@ describe('what the recorder tells the person', () => {
     expect(ctx.view.result.current.state).toBe('recording');
     confirm.mockReturnValue(true);
     await act(async () => ctx.view.result.current.cancel());
-    await until(() => server.deleted);
+    await until(() => server.deleted, 'the stored recording deleted');
     expect(ctx.view.result.current.state).toBe('idle');
     expect(ctx.onTranscript).not.toHaveBeenCalled();
   });
@@ -452,14 +468,14 @@ describe('the composer on the session road', () => {
     await act(async () => {
       fireEvent.click(screen.getByLabelText('Start voice input'));
     });
-    await until(() => FakeRecorder.last?.state === 'recording');
+    await until(() => FakeRecorder.last?.state === 'recording', 'recording started');
     const rec = FakeRecorder.last!;
     for (let i = 0; i < 4; i += 1) {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(5000);
         rec.emit();
       });
-      await until(() => server.appendedSlices.length >= i + 1);
+      await until(() => server.appendedSlices.length >= i + 1, `slice ${i} on the server`);
     }
     expect(screen.getByText('Saved to your account')).toBeTruthy();
     expect(screen.getByText(/w0 w1 w2 w3/)).toBeTruthy();
@@ -467,7 +483,7 @@ describe('the composer on the session road', () => {
     await act(async () => {
       fireEvent.click(screen.getByLabelText('Stop recording and transcribe'));
     });
-    await untilWithClock(() => box.value !== 'Draft:');
+    await untilWithClock(() => box.value !== 'Draft:', 'the transcript in the draft');
     expect(box.value).toBe('Draft: w0 w1 w3 w4');
     expect(
       screen.getByText(
@@ -478,7 +494,7 @@ describe('the composer on the session road', () => {
     await act(async () => {
       fireEvent.click(screen.getByText('Retry'));
     });
-    await untilWithClock(() => box.value === 'Draft: w0 w1 w2 w3 w4');
+    await untilWithClock(() => box.value === 'Draft: w0 w1 w2 w3 w4', 'the gap filled in place');
     expect(server.retranscribes).toBe(1);
     expect(screen.queryByText('Retry')).toBeNull();
   });
