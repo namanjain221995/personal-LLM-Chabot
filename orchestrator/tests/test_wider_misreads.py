@@ -264,23 +264,11 @@ def test_an_indirect_request_for_a_file_still_makes_one(text: str, ctx: dict) ->
     assert got.action == "create", (text, got.action, got.rule)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "PRE-EXISTING, not a W2 cost and not fixed here. Measured 2026-09-27 on "
-    "origin/dev 1f80aa3a2b and on this branch, identically, with and without "
-    "the question mark and under P0/PC/PF: 'would you mind making a deck of "
-    "this?' and 'do you mind making a deck?' decide none/no-request, and 'are "
-    "you able to make a deck?' decides none/about-format -- 'able to make a "
-    "deck' reads as a question ABOUT a format. A request marker for these "
-    "shapes changes nothing, because a different rule is refusing them; the "
-    "fix belongs to whoever owns `about-format` and the noun-phrase create "
-    "path. strict=True so this goes red, and gets deleted, the day it works."))
-@pytest.mark.parametrize("text", [
-    "would you mind making a deck of this?",
-    "do you mind making a deck?",
-    "are you able to make a deck?",
-])
-def test_two_more_polite_frames_are_still_not_read_as_requests(text: str) -> None:
-    assert I.decide(text, **PC).wants_file is True
+# The strict xfail that stood here ("would you mind making a deck of this?",
+# "do you mind making a deck?", "are you able to make a deck?") went red on
+# 2026-09-28 -- the normaliser now reads those wrappers as the plain "can you
+# make" -- and was deleted as its own reason said it should be. The three
+# sentences are asserted as creates in tests/test_artifact_prompt_understanding.py.
 
 
 @pytest.mark.parametrize("ctx,ctx_id", [(P0, "fresh"), (PA, "answer-only"), (PC, "card-last"), (PF, "file-earlier")])

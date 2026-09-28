@@ -95,6 +95,26 @@ _SHOW = (r"दिखाओ|दिखा\s*(?:दो|दें|दीजिए|�
          r"dikhao|dikha\s*(?:do|de|dijiye|dena)|dikhado|dikhaiye|dekhao|batavo|batavjo")
 _SHOW_LONG = r"બતાવી\s+(?:આપો|દો)|batavi\s+(?:aapo|apo|do)"
 
+#: THE GUJLISH GENITIVE IS NOT THE ENGLISH "NO" (2026-09-28). "aa data no
+#: report banavo" is "make a report of this data"; intent._rule_view blanks
+#: negated creation clauses on the RAW text before normalising, and read
+#: "no report" as a refusal of a report, so the clause vanished and nothing
+#: was made. Between two nouns of the conversation and with no article, `no`
+#: is the possessive; it is rewritten to the Gujlish `nu`, which no rule
+#: reads as a negation. One home, read by `_NORMALISE` and by `_rule_view`.
+_GUJLISH_NO_RE = re.compile(
+    rf"{_B}(data|answer|jawab|report|content|text|summary|audit|list|table|feedback|sales|team|project)\s+no"
+    rf"(?=\s+(?:report|pdf|word|doc|docx|excel|csv|ppt|pptx|file|document|sheet|chart|graph|summary|table|deck|presentation|tracker)\b)",
+    re.IGNORECASE,
+)
+
+
+def gujlish_genitive(text: str) -> str:
+    """`text` with the Gujlish possessive `no` between two nouns rewritten to
+    `nu`, so the English negation rules cannot read it. Raw or normalised."""
+    return _GUJLISH_NO_RE.sub(r" \1 nu ", text or "")
+
+
 #: Applied in order. Indic phrases first (they are longest), then Latin
 #: script Hinglish/Gujlish, then English typos. Every replacement is padded
 #: with spaces; whitespace is collapsed at the end.
@@ -103,7 +123,16 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _script_word(r"पीडीएफ़?|पी\s?डी\s?एफ|પીડીએફ|પી\s?ડી\s?એફ", "pdf"),
     _script_word(r"वर्ड|વર્ડ", "word"),
     _script_word(r"डॉक्यूमेंट|डाक्यूमेंट|दस्तावेज़?|ડોક્યુમેન્ટ|ડૉક્યુમેન્ટ|દસ્તાવેજ", "document"),
+    # "डॉक्स फाइल बना दो" (2026-09-28): the plural spelling carried no
+    # format at all, so the hand-over after an answer became a create.
+    _script_word(r"डॉक्स|ડોક્સ|ડૉક્સ", "docx"),
     _script_word(r"डॉक|ડૉક|ડોક", "doc"),
+    _script_word(r"ट्रैकर|ટ્રેકર", "tracker"),
+    # Parts of a file, so a question about them is a question about the file:
+    # "इसमें कितनी पंक्तियाँ हैं?", "આમાં કેટલા પાના છે?" (2026-09-28).
+    _script_word(r"पंक्तियाँ|पंक्तियां|पंक्तियों|पंक्ति|हरोळ|હરોળો|હરોળ", "rows"),
+    _script_word(r"पन्ने|पन्नों|पृष्ठ|પાનાં|પાના|પાનું|પૃષ્ઠ", "pages"),
+    _script_word(r"फ़ॉर्मेट|फॉर्मेट|फार्मेट|ફોર્મેટ", "format"),
     _script_word(r"एक्सेल|એક્સેલ", "excel"),
     _script_word(r"शीट|શીટ", "sheet"),
     _script_word(r"सीएसवी|સીએસવી", "csv"),
@@ -113,6 +142,11 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _script_word(r"स्लाइड्स?|સ્લાઇડ્સ?|સ્લાઈડ્સ?", "slides"),
     _script_word(r"बार\s+चार्ट|બાર\s+ચાર્ટ", "bar chart"),
     _script_word(r"पाई\s+चार्ट|પાઇ\s+ચાર્ટ", "pie chart"),
+    # A chart TYPE typed in the script: "દર મહિનાના વેચાણનો લાઇન ગ્રાફ" reached
+    # the rules as "લાઇન chart" and named no type (measured 2026-09-28).
+    _script_word(r"लाइन\s+(?:चार्ट|ग्राफ़?)|લાઇન\s+(?:ચાર્ટ|ગ્રાફ)|લાઈન\s+(?:ચાર્ટ|ગ્રાફ)", "line chart"),
+    _script_word(r"स्टैक्ड\s+बार|સ્ટેક્ડ\s+બાર", "stacked bar"),
+    _script_word(r"डोनट\s+चार्ट|ડોનટ\s+ચાર્ટ", "donut chart"),
     _script_word(r"चार्ट|ग्राफ़?|ચાર્ટ|ગ્રાફ", "chart"),
     _script_word(r"फ़ाइल|फाइल|फ़ाईल|फाईल|ફાઇલ|ફાઈલ", "file"),
     _script_word(r"रिपोर्ट|રિપોર્ટ", "report"),
@@ -147,6 +181,9 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"(?:डाउनलोड|ડાઉનલોડ)(?:\s+(?:कर\s*(?:दो|दें|दीजिए)|करो|करें|કરો|કરી\s+(?:દો|આપો)))?", "download"),
     _word(r"(?:कन्वर्ट|કન્વર્ટ)(?:\s+(?:कर\s*(?:दो|दें|दीजिए)|करो|करें|કરો|કરી\s+(?:દો|આપો)))?", "_convert_"),
     _word(r"(?:एक्सपोर्ट|એક્સપોર્ટ)(?:\s+(?:कर\s*(?:दो|दें|दीजिए)|करो|करें|કરો|કરી\s+(?:દો|આપો)))?", "export"),
+    # The Sanskrit-register word for export, said as an order: "ફાઇલ નિર્યાત
+    # કરો" (measured 2026-09-28: no rule read it at all).
+    _word(r"(?:निर्यात|નિર્યાત)\s+(?:कर\s*(?:दो|दें|दीजिए)|करो|करें|કરો|કરી\s+(?:દો|આપો))", "export _give_"),
     _word(r"(?:एडिट|એડિટ|अपडेट|અપડેટ)(?:\s+(?:कर\s*(?:दो|दें|दीजिए)|करो|करें|કરો|કરી\s+(?:દો|આપો)))?", "update"),
     _word(r"फेरबदल\s+(?:करो|कर\s+दो)|बदलाव\s+(?:करो|कर\s+दो|करें)|ફેરફાર\s+(?:કરો|કરી\s+(?:દો|આપો))", "change"),
     _word(r"पूरा\s+(?:करो|कर\s+दो)|પૂરું\s+કરો|પૂરો\s+કરો", "complete"),
@@ -155,7 +192,20 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     (re.compile(rf"(pdf|word|doc|excel|csv|powerpoint|presentation|file|document|sheet|_in_|में|માં)\s+(?:बदल\s*(?:दो|दें|दीजिए|देना)|बदलें|बदलो|ફેરવો|ફેરવી\s+આપો|બદલો|બદલી\s+આપો|કન્વર્ટ\s+કરો){_E}"), r" \1 _convert_ "),
     _word(r"बनाकर\s+(?:दो|दें|दीजिए|दे\s+दो)|बना\s*(?:दो|दें|दीजिए|देना)|बनाओ|बनाइए|बनाइये|बनाएं|बनाएँ|बनाये|बनाकर|"
           r"तैयार\s+(?:करें|करो|कीजिए|कर\s+दो|करके\s+दो)|दे\s+(?:दो|दीजिए|दें)|दीजिए|भेज\s*(?:दो|दीजिए)|भेजो|चाहिए|"
-          r"બનાવી\s+(?:આપો|આપજો|દો)|બનાવો|બનાવજો|તૈયાર\s+કરો|તૈયાર\s+કરી\s+આપો|આપો|આપજો|જોઈએ|મોકલો|મોકલી\s+આપો", "_give_"),
+          r"બનાવી\s+(?:આપો|આપજો|દો)|બનાવો|બનાવજો|તૈયાર\s+કરો|તૈયાર\s+કરી\s+આપો|આપો|આપજો|જોઈએ|મોકલો|મોકલી\s+આપો|"
+          # THE POSSIBILITY FORM IS A REQUEST (2026-09-28). "क्या इसकी पीडीएफ
+          # बन सकती है?", "શું આની પીડીએફ બની શકે?", "क्या आप ... बना सकते
+          # हैं?" and "હું પીડીએફ માંગું છું" were all none/no-request: this
+          # table held imperatives only, so the polite and the possible were
+          # not asks. English "can this be made into a pdf?" was already one.
+          r"बन\s+सकत[ाीे](?:\s+(?:है|हैं|हो))?|बना\s+सकत[ाीे](?:\s+(?:हो|हैं|है))?|बना\s+सकें|बना\s+सकोगे|बनाया\s+जा\s+सकता(?:\s+है)?|"
+          r"બની\s+શકે|બનાવી\s+શક(?:ો|ાય|શો)|માંગું\s+છું|જોઈતી|જોઈતું|જોઈતો|"
+          # The past form, for the refusal "मैंने फ़ाइल नहीं माँगी थी": with it
+          # the negation rule below writes `_neg_`, as it does for "मत बनाओ".
+          r"माँग[ीाे]|मांग[ीाे]|માંગી|માંગ્યું|માંગ્યો", "_give_"),
+    # A potential ADD is still an add: "क्या इसमें एक टोटल पंक्ति जुड़ सकती
+    # है?", "શું આમાં ટોટલ હરોળ ઉમેરી શકાય?".
+    _word(r"जुड़\s+सकत[ाीे]|जोड़\s+सकत[ाीे]|जोड़ा\s+जा\s+सकता|ઉમેરી\s+શક(?:ાય|ો|શો)|ઉમેરાઈ\s+શકે", "add"),
     # SHOW. Measured 2026-09-16 (measure2 harness): "show this as a pie
     # chart" returned action=none in all 4 languages, because SHOW had no
     # entry at all. It is a hand-over ONLY after a chart word — "pie chart me
@@ -188,7 +238,15 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"bana\s*(?:do|de|dijiye|dena|dijie)|banao|bnao|bna\s*do|banaiye|banaye|banake\s+(?:do|de\s*do|dijiye)|bana\s+ke\s+(?:do|dijiye)|"
           r"banana\s+hai|banani\s+hai|generate\s+kar\s*do|download\s+karna\s+hai|download\s+kar\s*do|bhej\s*do|nikal\s+do|"
           r"de\s*do|dedo|dijiye|dijie|chahiye|chaiye|chahie|chahiya|"
-          r"banavi\s+(?:aapo|apo|aapjo|do)|banavo|banavjo|mokli\s+aapo|kari\s+aapo|aapo|apo|aapjo|joie|joiye|joiae", "_give_"),
+          r"banavi\s+(?:aapo|apo|aapjo|do)|banavo|banavjo|mokli\s+aapo|kari\s+aapo|aapo|apo|aapjo|joie|joiye|joiae|"
+          # 2026-09-28: the forms people actually typed after an answer, none
+          # of them read -- "Excel sheet bana ke de", "Please ye ppt ready kar
+          # do", "Report ko docx me lao", "Aap ye file pdf me bana sakte
+          # hain?", "aa answer ni pdf bani shake?", "kem chhe, file banaavo".
+          r"bana\s+ke\s+(?:de|dena)|banake\s+de|bana\s+sakt[aie](?:\s+(?:ho|hain|hai))?|ban\s+sakt[aie](?:\s+(?:hai|hain|ho))?|"
+          r"bana\s+sakoge|bani\s+shake|bani\s+shak[ae]y?|banavi\s+shak(?:o|ay|sho)|banaavo|banaavi\s+aapo|"
+          r"ready\s+kar\s*(?:do|de|dena)|taiyar\s+kar\s*(?:do|de)|joiti|joitu|joito|mangu\s+ch?hu|maangu\s+ch?hu|"
+          r"mangi|maangi|lao|laao|le\s+aao", "_give_"),
     # Verifier 2026-09-15: "isko excel sheet me daal do" puts the thing IN a format: a hand-over, not an add.
     (re.compile(rf"(pdf|word|doc|docs|docx|excel|exel|csv|ppt|pptx|powerpoint|presentation|file|document|sheet)\s+(?:me|mein|mai|mei|ma|maa)\s+(?:daal|dal|daalo|daldo|rakh)\s*(?:do|de|dijiye|dena)?{_E}"), r" \1 _in_ _give_ "),
     _word(r"pichla\s+change\s+(?:hata\s*do|hatao|wapas\s+lo|remove\s+kar\s*do)|last\s+change\s+(?:hata\s*do|hatao|wapas\s+lo)|"
@@ -199,13 +257,33 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"wapas|vapas|pehle\s+jaisa|pahle\s+jaisa|pehla\s+jevu|pachu", "undo"),
     _word(r"kaise|kese|kaisey|kaise\s+kare|kevi\s+rite|kem\s+kari", "_howto_"),
     _word(r"samjhao|samjha\s+do|samjhaiye|batao|bata\s+do|bataiye|samjavo|samjhavo|kaho", "_read_"),
+    # "I ASKED what is in it": the tell-me of a person repeating a question
+    # the product answered with a file ("nahi, file nahi maangi thi, pucha
+    # tha isme kya hai", 2026-09-28).
+    _word(r"pucha\s+tha|poocha\s+tha|puchha\s+tha|puchyu\s+(?:tu|hatu)|puchu\s+tu|पूछा\s+था|પૂછ્યું\s+હતું", "_read_"),
+    # Gujlish "turn it into": "aa pdf ne word ma pheravo".
+    _word(r"pheravo|feravo|pheravi\s+(?:aapo|do)|feravi\s+(?:aapo|do)|badli\s+aapo", "_convert_"),
     _word(r"isko|iska|iski|iske|ise|isse|isme|isey|aane|aano|aani|aanu|aana|ama", "_this_"),
+    # The romanised answer word, so "upar wala jawab pdf me de do" reaches the
+    # rules as the English "above answer pdf ..." does (2026-09-28: it was a
+    # CREATE of invented content, the answer never handed over).
+    _word(r"jawab|jawaab|javab|jvab|uttar", "answer"),
+    # "jawab do" / "जवाब दो" / "khali jawab aapo": give me the ANSWER, said
+    # in the SOV order -- the tell-me token, the same as "batao".
+    _word(r"answer\s+_give_", "_read_"),
+    # The Gujlish genitive is not the English "no" (see `_GUJLISH_NO_RE`).
+    (_GUJLISH_NO_RE, r" \1 nu "),
     (re.compile(rf"{_B}(?:is|iss|ye|yeh|aa|es|e){_E}(?=\s+(?:pdf|word|doc|docs|excel|csv|file|document|report|answer|data|sheet|table|audit|jawab|chart|list|text|content|reply|response|output|info|information|summary|explanation|ppt|presentation)\b)"), " _this_ "),
     # An object marker after a noun of the conversation: "report ne pdf ma
     # aapjo", "ye reply ko word file me" — the existing thing.
     (re.compile(rf"{_B}(report|answer|content|data|text|reply|response|jawab|summary|output|audit)\s+(?:ne|ko|nu|ka|ki)(?=\s+(?:pdf|word|doc|docx|excel|csv|ppt|pptx|file|document|sheet)\b)"), r" the \1 "),
     # An English verb and a Hinglish/Gujlish light verb: "create karo", "banavi do ne".
     (re.compile(rf"{_B}(?:create|generate|make|prepare|build|export|convert|save|download|send|share|tayyar|taiyar|taiyyar|tayar)\s+(?:karo|kar\s*do|kari\s+(?:do|aapo|dejo)|karjo|kar\s*ke\s+do|karke\s+do|kardo|kar\s*dijiye|karvanu)(?:\s+ne)?{_E}"), " _give_ "),
+    # "colors edit karo", "title update kar do": an English EDIT verb with the
+    # light verb is that edit, not a hand-over (the create rule above lists
+    # only the making/sending verbs).
+    (re.compile(rf"{_B}(?:edit|update|change|fix|correct|modify)\s+(?:karo|kar\s*do|kari\s+(?:do|aapo|dejo)|karjo|kardo|kar\s*dijiye)(?:\s+ne)?{_E}"), " update "),
+    _word(r"motu|moto|mota|bada|badi|bade", "bigger"),
     _word(r"navi|navu|nayi|naya|नई|नया|નવી|નવું", "new"),
     _word(r"kripya|kripaya|कृपया|કૃપા\s+કરીને", "please"),
     _word(r"upar\s+(?:wala|wale|wali|ka|ki|ke|diya|diye|lakhelo|no)|above\s+wala|uparno", "above"),
@@ -221,7 +299,10 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     # this platform made. `output` is deliberately NOT here: "output me a
     # summary" is an English imperative with the pronoun, so the noun cannot
     # disambiguate it (tests/test_artifact_question_route.py records the cost).
-    (re.compile(rf"(pdf|word|doc|docs|docx|excel|exel|csv|ppt|pptx|powerpoint|presentation|file|document|sheet|format|report|version|tracker|work\s?book|deck|deliverable)\s+(?:me|mein|mai|mei|ma|maa|mā){_E}"), r" \1 _in_ "),
+    # `chart`, `graph` and the bare type words joined 2026-09-28: "Q1 aur Q2
+    # ki region wise sales stacked bar me do" carried no `_in_` and so no
+    # hand-over, and made nothing over the uploaded sheet.
+    (re.compile(rf"(pdf|word|doc|docs|docx|excel|exel|csv|ppt|pptx|powerpoint|presentation|file|document|sheet|format|report|version|tracker|work\s?book|deck|deliverable|chart|graph|bar|pie|donut|column)\s+(?:me|mein|mai|mei|ma|maa|mā){_E}"), r" \1 _in_ "),
     _word(r"neela|nila|neele", "blue"),
     _word(r"gehra\s+neela|gehre\s+neele|dark\s+neela", "dark blue"),
     _word(r"lal|laal", "red"),
@@ -246,6 +327,23 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"chnage|chng|chang|chage|cahnge|chnge", "change"),
     _word(r"tittle|titel|tilte|titile", "title"),
     _word(r"colum|coloumn|collumn|colmn|coulmn|colunm", "column"),
+    _word(r"colums|columsn|colmns|coloumns|collumns|colums", "columns"),
+    # Chart words as people mistype them (2026-09-28: "pie chrat of staus",
+    # "bar grpah of revnue", "histogarm of hours", "bar chat of status" all
+    # made nothing over an uploaded sheet).
+    _word(r"chrat|chartt|chrt|chatr|charrt|chart's", "chart"),
+    _word(r"grpah|grph|graf|garph|grapgh|grah", "graph"),
+    _word(r"histogarm|histgram|histogrm|histagram", "histogram"),
+    (re.compile(rf"{_B}(bar|pie|line|column|donut|area|scatter|stacked|bubble|radar|funnel)\s+chat{_E}"), r" \1 chart "),
+    _word(r"wat|whta|waht|wht", "what"),
+    _word(r"dis|thsi|tihs", "this"),
+    _word(r"rite|wrte|wirte", "write"),
+    _word(r"templat|tempalte|templete", "template"),
+    _word(r"floww|flwo|folw", "flow"),
+    _word(r"hav", "have"),
+    _word(r"wich|whcih|whihc", "which"),
+    _word(r"ment|menat|meent", "meant"),
+    (re.compile(rf"{_B}(i|we|you|u)\s+sed{_E}"), r" \1 said "),
     (re.compile(_w(r"ad") + r"(?=\s+(?:a|an|the|new|one|column|row|section|slide|chart|table|page|footer|header|total)\b)"), " add "),
     _word(r"hedings|headngs|headins|heddings", "headings"),
     _word(r"heding|headng|headin|hedding", "heading"),
@@ -256,6 +354,11 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"repot|reprt|reoprt", "report"),
     _word(r"landscap|lanscape|landscpae|landscaep", "landscape"),
     _word(r"pls|plz|plss|plx|plzz|pleas|kindly", "please"),
+    # The politest wrappers are still the ask: "would you mind making a
+    # deck of this?", "are you able to make a deck?" (2026-09-28: none/
+    # no-request and none/about-format). Read as the plain "can you make".
+    _word(r"(?:would|do|did)\s+(?:you|u)\s+mind\s+(?:making|creating|generating|building|preparing|drafting|writing|producing)", "can you make"),
+    _word(r"(?:are|will|would)\s+(?:you|u)\s+(?:be\s+)?able\s+to", "can you"),
     _word(r"u", "you"),
     _word(r"ur", "your"),
     (re.compile(rf"(?<=[a-z])\s+n\s+(?=[a-z])"), " and "),
@@ -275,8 +378,12 @@ _NORMALISE: List[Tuple[Pattern[str], object]] = [
     _word(r"ek", "a"),
     # "pdf mat banao", "file nahi chahiye", "પીડીએફ ના બનાવો": a negated
     # hand-over. intent.py blanks the clause that carries it.
-    (re.compile(rf"{_B}(?:mat|nahi|nahin|nai|na|nako|मत|नहीं|ना|ના|નહીં|નહિ)\s+_give_"), " _neg_ "),
-    (re.compile(rf"_give_\s+(?:mat|nahi|nahin|मत|नहीं|ના|નહીં){_E}"), " _neg_ "),
+    # The bare Gujarati ન, the Gujlish "nathi joiti" (with joiti -> _give_
+    # above) and the past "नहीं माँगी थी" joined 2026-09-28: "નવી ફાઇલ ન બનાવો,
+    # બસ અહીં કહો" and "navi file nathi joiti, khali jawab aapo" -- explicit
+    # refusals -- each BUILT a document through create-first-clause.
+    (re.compile(rf"{_B}(?:mat|nahi|nahin|nahi|nhi|nai|na|nako|nathi|nati|nhoti|nahoti|मत|नहीं|नही|ना|ना|ન|ના|નહીં|નહિ|નહોતી|નહોતું)\s+_give_"), " _neg_ "),
+    (re.compile(rf"_give_\s+(?:mat|nahi|nahin|nhi|nathi|nati|मत|नहीं|नही|ન|ના|નહીં|નહોતી){_E}"), " _neg_ "),
     (re.compile(rf"{_B}docs?{_E}\s*$"), " docx "),
 ]
 
@@ -794,5 +901,5 @@ __all__ = [
     "request_marker",
     "StylePhrase", "normalize", "formats_in", "file_signal", "chart_signal", "style_phrases", "strip_style_clauses",
     "undo_signal", "negative_shape", "reads_source", "language_of", "FORMAT_ALIASES", "DEST_AFTER",
-    "CHART_TYPE_WORDS", "without_diagram_phrases", "diagram_signal",
+    "CHART_TYPE_WORDS", "without_diagram_phrases", "diagram_signal", "gujlish_genitive",
 ]
