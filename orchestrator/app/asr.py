@@ -6,11 +6,27 @@ becoming a queue on the main model's GPU. It is deliberately small: the engine
 does the hard part, and everything here is about doing it safely, once, with a
 number attached.
 
-WHERE THE AUDIO GOES. Nowhere but the engine. The bytes arrive in a request,
-are held in memory for the length of one call, and are dropped. Nothing is
-written to disk, nothing reaches the database, and the transcript is returned
-to the browser as a DRAFT — it becomes a message only if the person presses
-Send. See app/audio_api.py for the route that enforces that.
+WHERE THE AUDIO GOES. It depends on which of the two dictation paths
+carried it, and since 2026-09-29 the composer uses the second.
+
+  * The LEGACY one-request path (POST /audio/transcribe, `transcribe` below):
+    the bytes arrive in a request, are held in this process's memory for one
+    call and dropped. This process writes nothing to disk. The ENGINE does,
+    briefly: it takes the clip as a multipart field, and Starlette spools any
+    part over 1,048,576 bytes to the engine container's /tmp for the length of
+    the decode (measured 2026-09-28 on starlette 1.6.0). The old promise that
+    the audio "exists in memory on both ends and nowhere else" was never true
+    for a dictation over about a minute.
+  * RECORDING SESSIONS (app/dictation.py, `transcribe_session_window` below):
+    the owner asked for recordings to be kept, so the recording is STORED,
+    per user, mode 0600, under VOICE_DATA_DIR, and the transcript is stored
+    beside it. The engine is sent one voice-activity window of at most
+    VOICE_SESSION_WINDOW_MAX_S at a time, as WAV built in memory; a 30 s
+    window is 960,044 bytes, under the spool threshold, so the engine keeps
+    session windows in memory.
+
+Either way the transcript reaches the conversation only if the person presses
+Send.
 
 ONE ENDPOINT. /v1/audio/transcriptions, and nothing else. There used to be
 two, because Qwen3-ASR was a chat model that also answered on
@@ -215,6 +231,20 @@ class TranscriptSegments(Transcript):
     """
 
     segments: tuple = ()
+
+
+@dataclass(frozen=True)
+class WindowReply:
+    """One recording-session window's answer: the timestamped transcript and
+    the engine's own no-speech probability for it.
+
+    The probability is carried separately because `Transcript`'s fields are
+    the public response's contract (tests/test_asr_retired.py), and a session
+    needs it to decide whether a window's words earn a caution
+    (`_reply_confidence`)."""
+
+    transcript: TranscriptSegments
+    no_speech_prob: Optional[float]
 
 
 @dataclass(frozen=True)
@@ -574,6 +604,34 @@ class VLLMAudioProvider:
         )
         assert isinstance(result, TranscriptSegments)
         return result
+
+    async def transcribe_window(
+        self,
+        audio: bytes,
+        *,
+        filename: str,
+        content_type: str,
+        timeout_s: Optional[float] = None,
+    ) -> WindowReply:
+        """One recording-session window -> segments and the engine's
+        no-speech probability, with the engine's silence gate OFF.
+
+        The gate judges the FIRST 30 s of a clip, and a session window is a
+        stretch of audio that voice-activity detection already found speech
+        in, so the gate can only be wrong here: it is the defect that emptied
+        a 181 s dictation on 2026-09-24 because its first 25 s were quiet.
+        `timeout_s` bounds this one exchange (VOICE_SESSION_WINDOW_TIMEOUT_S);
+        a read timeout is an ASRTimeout, as everywhere else in this file."""
+        result, heard = await self._exchange(
+            audio,
+            filename,
+            content_type,
+            segments=True,
+            no_speech_check=False,
+            timeout_s=timeout_s,
+        )
+        assert isinstance(result, TranscriptSegments)
+        return WindowReply(result, heard.no_speech_prob)
 
     async def health(self) -> bool:
         import httpx
@@ -983,6 +1041,22 @@ class RoutedProvider:
             no_speech_check=no_speech_check,
         )
 
+    async def transcribe_window(
+        self,
+        audio: bytes,
+        *,
+        filename: str,
+        content_type: str,
+        timeout_s: Optional[float] = None,
+    ) -> WindowReply:
+        return await self._routed(
+            "transcribe_window",
+            audio,
+            filename=filename,
+            content_type=content_type,
+            timeout_s=timeout_s,
+        )
+
     async def _routed(self, method: str, audio: bytes, **kwargs: Any):
         """Send one call to the freest healthy engine, standing down any
         that is unavailable and trying the next — the same loop for every
@@ -1073,14 +1147,18 @@ class RoutedProvider:
 # ---------------------------------------------------------------------------
 # Admission control
 #
-# The engine batches happily — eight simultaneous 15-second clips finished in
-# 1.10s of wall clock, measured 2026-09-04 — so the limit here is not about
-# protecting the ASR engine. It is about the main model: an unbounded fan-out
-# of audio requests would eventually contend for the same GPU the chat model
-# runs on, and a person waiting for an ANSWER must never be slowed down by
-# someone else's dictation. A bounded pool with a short queue is the whole
-# mechanism: past it, callers are told to try again rather than queued
-# indefinitely behind work they cannot see.
+# The engine does NOT batch. compose/whisper/server.py holds one `_gpu_lock`
+# around every transcription, so a replica decodes one clip at a time: eight
+# simultaneous 20-29 s clips on one replica finished in 18.8 s, and throughput
+# stayed at 8.1-12.1 s of audio per wall-second from 1 concurrent clip to 16
+# (measured 2026-09-28; the "eight clips in 1.10 s" this comment used to quote
+# was Qwen3-ASR on vLLM, which is gone). Adding callers adds waiting, not
+# capacity. And the limit is also about the main model: it is tensor-parallel
+# across both Sparks, so a busy speech engine on EITHER node took chat decode
+# from 107 to 53 tok/s, and on both nodes to 28 (same day). A bounded pool
+# with a short queue is the whole mechanism for one-request dictation: past
+# it, callers are told to try again rather than queued indefinitely behind
+# work they cannot see. Recording sessions have their own gate below.
 # ---------------------------------------------------------------------------
 
 
@@ -1115,8 +1193,12 @@ class _Pool:
         self.waiting += 1
         metrics.set_gauge("asr_queue_depth", self.waiting, "requests waiting for a slot")
         try:
-            await asyncio.wait_for(sem.acquire(), timeout=settings.asr_queue_wait_s)
-        except asyncio.TimeoutError as exc:
+            # asyncio.timeout, not asyncio.wait_for: on Python 3.11 (CI's
+            # interpreter) wait_for can swallow a cancellation that arrives in
+            # the same pass as the timeout, which hung a CI run once.
+            async with asyncio.timeout(settings.asr_queue_wait_s):
+                await sem.acquire()
+        except TimeoutError as exc:
             raise ASRBusy("every transcription slot is busy") from exc
         finally:
             self.waiting -= 1
@@ -1265,3 +1347,229 @@ async def transcribe_segments(
         "wall clock for one batch clip, orchestrator side",
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Recording sessions (app/dictation.py, 2026-09-29)
+#
+# A session is transcribed in windows of at most VOICE_SESSION_WINDOW_MAX_S
+# while the person is still talking, so one long recording is many short
+# engine calls instead of one long one. This gate decides whose window goes
+# next, and it is deliberately different from both pools above:
+#
+#   * NO QUEUE-WAIT REFUSAL. A session's audio is already stored on disk, so a
+#     busy engine means the preview lags, never that the recording is lost.
+#     Refusing after eight seconds (POOL's rule) would turn a busy engine into
+#     a gap in the transcript.
+#   * FLEET-WIDE SIZE VOICE_SESSION_ASR_CONCURRENCY (1). One session window
+#     decodes anywhere at a time, so sessions alone never occupy both nodes'
+#     engines, and their chat cost stays at the one-node figure (107 -> 53
+#     tok/s, measured 2026-09-28) instead of the both-nodes one (28).
+#   * WHO GOES NEXT. A SHORT session (audio under VOICE_SHORT_SESSION_S)
+#     goes before a long one, then a session whose person pressed Stop and is
+#     waiting goes before one that is still recording (whose text is only a
+#     preview), and within each class the first window to become ready goes
+#     first. A session has at most ONE window here or in the engine, and
+#     re-enters only after that window returns, so sessions are served
+#     round-robin: a 5 s dictation started while thirty hour-long recordings
+#     keep the engine saturated waits for the one window already decoding,
+#     not behind thirty others. A long session's transcript lags instead.
+#     Retranscriptions are never 'urgent' (app/dictation.py).
+#   * ENGINE STATE. The gate remembers whether the last session window failed
+#     for want of an engine and how long the one inside has been there, so a
+#     session waiting here can say whether the engine is BUSY or UNAVAILABLE
+#     (hung or down): `engine_state`.
+#   * CANCELLABLE AND WITHOUT asyncio.wait_for (the Python 3.11 same-pass
+#     cancellation hang); there is no deadline on the wait at all.
+#
+# The legacy dictation POOL and the video BATCH_POOL are separate and keep
+# their behaviour, so a legacy clip or a video window can still decode beside
+# a session window.
+# ---------------------------------------------------------------------------
+
+
+def _hint(value: Any, default: bool) -> bool:
+    try:
+        return bool(value() if callable(value) else value)
+    except Exception:  # noqa: BLE001 — a priority hint must not break the gate
+        return default
+
+
+@dataclass
+class _SessionWaiter:
+    future: "asyncio.Future[None]"
+    urgent: Any  # bool, or a zero-argument callable read at grant time
+    ready: float
+    seq: int
+    short: Any = False  # bool, or a zero-argument callable read at grant time
+
+    def is_urgent(self) -> bool:
+        return _hint(self.urgent, False)
+
+    def is_short(self) -> bool:
+        return _hint(self.short, False)
+
+
+class _SessionGate:
+    """Priority admission for session windows; see the block above."""
+
+    def __init__(self) -> None:
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._waiters: List[_SessionWaiter] = []
+        self._seq = 0
+        self.active = 0
+        #: monotonic admission time of each window now in the engine
+        self.inflight: Dict[int, float] = {}
+        self._token = 0
+        #: monotonic time of the last window answered, and of the last that
+        #: found no engine (ASRUnavailable, which includes a timeout)
+        self.last_ok = 0.0
+        self.last_unavailable = 0.0
+
+    @property
+    def waiting(self) -> int:
+        return sum(1 for w in self._waiters if not w.future.done())
+
+    def _size(self) -> int:
+        return max(1, int(settings.voice_session_asr_concurrency))
+
+    def _bind(self) -> asyncio.AbstractEventLoop:
+        # Rebuilt per event loop, as `_Pool` is: a future from a dead loop
+        # (the test suite makes a new one per test) would never resolve.
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop:
+            self._loop = loop
+            self._waiters = []
+            self.active = 0
+            self.inflight = {}
+        return loop
+
+    def engine_state(self) -> str:
+        """'unavailable' when the last session window found no engine and
+        none has been answered since, or a window has been inside the engine
+        for longer than VOICE_ENGINE_STALL_S (a hung engine answers nothing
+        and times out only after VOICE_SESSION_WINDOW_TIMEOUT_S); 'busy'
+        otherwise. Read from request threads, hence the copy."""
+        now = time.monotonic()
+        stall = float(settings.voice_engine_stall_s)
+        if any(now - t > stall for t in list(self.inflight.values())):
+            return "unavailable"
+        if self.last_unavailable > self.last_ok:
+            return "unavailable"
+        return "busy"
+
+    def _publish(self) -> None:
+        metrics.set_gauge("asr_session_gate_active", self.active, "session windows decoding")
+        metrics.set_gauge("asr_session_gate_waiting", self.waiting, "session windows waiting for the engine")
+
+    def _grant(self) -> None:
+        while self.active < self._size() and self._waiters:
+            best = min(
+                self._waiters,
+                key=lambda w: (0 if w.is_short() else 1, 0 if w.is_urgent() else 1, w.ready, w.seq),
+            )
+            self._waiters.remove(best)
+            if best.future.done():  # its task was cancelled while waiting
+                continue
+            self.active += 1
+            best.future.set_result(None)
+
+    async def acquire(self, *, urgent: Any = False, short: Any = False) -> None:
+        loop = self._bind()
+        if self.active < self._size() and not any(not w.future.done() for w in self._waiters):
+            self.active += 1
+            self._publish()
+            return
+        self._seq += 1
+        waiter = _SessionWaiter(loop.create_future(), urgent, time.monotonic(), self._seq, short)
+        self._waiters.append(waiter)
+        self._publish()
+        try:
+            await waiter.future
+        except BaseException:
+            if waiter in self._waiters:
+                self._waiters.remove(waiter)
+            elif waiter.future.done() and not waiter.future.cancelled():
+                # Granted a slot in the same pass as the cancellation: give it
+                # back, or it would leak and the gate would shrink by one.
+                self.active -= 1
+                self._grant()
+            self._publish()
+            raise
+        self._publish()
+
+    def release(self) -> None:
+        self.active = max(0, self.active - 1)
+        self._grant()
+        self._publish()
+
+    def reset_for_tests(self) -> None:
+        self._loop = None
+        self._waiters = []
+        self.active = 0
+        self.inflight = {}
+        self.last_ok = 0.0
+        self.last_unavailable = 0.0
+
+
+SESSION_GATE = _SessionGate()
+
+
+async def transcribe_session_window(
+    audio: bytes,
+    *,
+    filename: str,
+    urgent: Any = False,
+    short: Any = False,
+    on_admitted: Optional[Any] = None,
+) -> WindowReply:
+    """One recording-session window (WAV bytes) -> segments, under the
+    session gate, with the engine's first-30-s silence gate OFF.
+
+    `urgent` is True (or a callable that says so) while the person is
+    waiting after Stop; `short` while the session's audio is under
+    VOICE_SHORT_SESSION_S. `on_admitted` is called once the gate lets the
+    window through, so the session can tell the person it is no longer
+    waiting for the engine."""
+    await SESSION_GATE.acquire(urgent=urgent, short=short)
+    started = time.perf_counter()
+    SESSION_GATE._token += 1
+    token = SESSION_GATE._token
+    SESSION_GATE.inflight[token] = time.monotonic()
+    try:
+        if on_admitted is not None:
+            on_admitted()
+        engine = provider()
+        method = getattr(engine, "transcribe_window", None)
+        if method is None:
+            # A stand-in provider without the session method: the same
+            # request, without the no-speech probability.
+            result = await engine.transcribe_segments(
+                audio, filename=filename, content_type="audio/wav", no_speech_check=False
+            )
+            reply = WindowReply(result, None)
+        else:
+            reply = await method(
+                audio,
+                filename=filename,
+                content_type="audio/wav",
+                timeout_s=settings.voice_session_window_timeout_s,
+            )
+    except ASRUnavailable:
+        SESSION_GATE.last_unavailable = time.monotonic()
+        metrics.inc("asr_session_windows_total", "recording-session windows sent to the engine", result="fail")
+        raise
+    except Exception:
+        metrics.inc("asr_session_windows_total", "recording-session windows sent to the engine", result="fail")
+        raise
+    finally:
+        SESSION_GATE.inflight.pop(token, None)
+        SESSION_GATE.release()
+    SESSION_GATE.last_ok = time.monotonic()
+    metrics.inc("asr_session_windows_total", "recording-session windows sent to the engine", result="ok")
+    metrics.observe(
+        "asr_session_window_duration_seconds",
+        time.perf_counter() - started,
+        "wall clock for one session window inside the gate",
+    )
+    return reply
