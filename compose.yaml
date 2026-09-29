@@ -250,6 +250,28 @@ services:
       ASR_MAX_UPLOAD_BYTES: ${ASR_MAX_UPLOAD_BYTES:-33554432}
       ASR_MAX_CONCURRENT: ${ASR_MAX_CONCURRENT:-2}
       ASR_RATE_PER_MIN: ${ASR_RATE_PER_MIN:-20}
+      # Live dictation (2026-09-29, app/voice_live.py): words while they are
+      # spoken, from the CPU streaming engine on the worker. Listed here, and
+      # BLANK by default, for the same two reasons as the developer platform
+      # block below: scripts/stt-stream.sh writes VOICE_LIVE_ENGINE_URLS into
+      # .env the way whisper.sh writes ASR_BASE_URLS (blank keeps the live
+      # path off), and blank makes config.py's defaults the only copy.
+      #
+      # VOICE_LIVE_ENGINE_TOKEN IS DELIBERATELY NOT LISTED, for
+      # API_KEY_PEPPER's reason (below): it lives in .runtime/secrets.env and
+      # arrives through `env_file`, and `${VOICE_LIVE_ENGINE_TOKEN:-}` here
+      # would blank it on any recreate whose interpolation lacks the secrets
+      # layer -- every live stream would then be refused by the engine.
+      VOICE_LIVE_ENABLED: ${VOICE_LIVE_ENABLED:-}
+      VOICE_LIVE_ENGINE_URLS: ${VOICE_LIVE_ENGINE_URLS:-}
+      VOICE_LIVE_MAX_STREAMS: ${VOICE_LIVE_MAX_STREAMS:-}
+      VOICE_LIVE_CONNECTS_PER_MIN: ${VOICE_LIVE_CONNECTS_PER_MIN:-}
+      VOICE_LIVE_IDLE_S: ${VOICE_LIVE_IDLE_S:-}
+      VOICE_LIVE_REVALIDATE_S: ${VOICE_LIVE_REVALIDATE_S:-}
+      VOICE_LIVE_MAX_FRAME_BYTES: ${VOICE_LIVE_MAX_FRAME_BYTES:-}
+      VOICE_LIVE_RESUME_MAX_S: ${VOICE_LIVE_RESUME_MAX_S:-}
+      VOICE_LIVE_ENGINE_CONNECT_S: ${VOICE_LIVE_ENGINE_CONNECT_S:-}
+      VOICE_LIVE_LANGUAGES: ${VOICE_LIVE_LANGUAGES:-}
       # Document OCR. OCR_BASE_URL IS LISTED HERE ON PURPOSE, even though
       # `env_file` carries the generated one: scripts/ocr.sh can move the
       # engine to the worker and records where in .env (OCR_REMOTE_BASE_URL),
@@ -471,6 +493,14 @@ services:
       # scripts/deploy.sh reports which path /v1 takes and warns when the
       # relay is on without them.
       V1_GATEWAY_URL: ${V1_GATEWAY_URL:-}
+      # Live dictation's WebSocket relay (frontend/server-ws-relay.cjs,
+      # 2026-09-29), named here because this service's only env_file is
+      # generated.env. Blank = the relay's own defaults: origins beyond the
+      # request's own host none, 512 relays at once (0 refuses every live
+      # socket: the kill switch), relays cut 2 s into a SIGTERM drain.
+      FRONTEND_WS_ALLOWED_ORIGINS: ${FRONTEND_WS_ALLOWED_ORIGINS:-}
+      FRONTEND_WS_MAX_RELAYS: ${FRONTEND_WS_MAX_RELAYS:-}
+      FRONTEND_DRAIN_WS_S: ${FRONTEND_DRAIN_WS_S:-}
     ports:
       - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${FRONTEND_PORT:-3000}:3000"
     networks:

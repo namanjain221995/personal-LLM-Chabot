@@ -485,6 +485,75 @@ class Settings:
         self.voice_session_create_per_min: int = max(1, _int("VOICE_SESSION_CREATE_PER_MIN", 10))
         self.voice_part_per_min: int = max(1, _int("VOICE_PART_PER_MIN", 120))
 
+        # -- Live dictation: words while they are spoken (2026-09-29) ---------
+        #
+        # A PREVIEW beside the recording session above, never instead of it:
+        # the browser also streams 16 kHz PCM over a WebSocket
+        # (/audio/sessions/{id}/live, app/voice_live.py) to a CPU streaming
+        # engine on the WORKER, and partial and final text come back while the
+        # person talks. The stored recording and whisper's transcript stay
+        # authoritative, so any failure here costs the preview and nothing
+        # else. On only when an engine address is configured: scripts/
+        # stt-stream.sh writes VOICE_LIVE_ENGINE_URLS into .env, the way
+        # whisper.sh writes ASR_BASE_URLS, and `down` takes it out again.
+        self.voice_live_enabled: bool = _bool("VOICE_LIVE_ENABLED", True)
+        # Comma list of engine base URLs (ws://host:port); /v1/stream is
+        # appended when a URL names no path. The WORKER's management address,
+        # never a 10.100.x RoCE address.
+        self.voice_live_engine_urls: tuple[str, ...] = tuple(
+            url.strip().rstrip("/")
+            for url in os.environ.get("VOICE_LIVE_ENGINE_URLS", "").split(",")
+            if url.strip()
+        )
+        # A SECRET, sent as `Authorization: Bearer` to the engine. It lives in
+        # .runtime/secrets.env and reaches the container through env_file,
+        # which is why compose.yaml does not name it (see API_KEY_PEPPER there).
+        self.voice_live_engine_token: str = os.environ.get("VOICE_LIVE_ENGINE_TOKEN", "").strip()
+        # Streams open at once in this process. The engine refuses above its
+        # own capacity anyway; this keeps a flood from ever reaching it.
+        self.voice_live_max_streams: int = max(1, _int("VOICE_LIVE_MAX_STREAMS", 64))
+        # Per person, per minute: stream connections. A reconnecting browser
+        # backs off 0.5, 1, 2, 4, 8 s then 15 s, so a stuck one stays far under.
+        self.voice_live_connects_per_min: int = max(1, _int("VOICE_LIVE_CONNECTS_PER_MIN", 30))
+        # A stream that sends no audio frame for this long is closed (4408). A
+        # recording browser sends silence as frames too, so this is a stalled
+        # page, not a quiet speaker.
+        self.voice_live_idle_s: float = max(5.0, _float("VOICE_LIVE_IDLE_S", 120.0))
+        # How often an open stream re-checks its sign-in session, the person's
+        # VOICE_INPUT access and the recording's status. A WebSocket resolves
+        # its sign-in once at the handshake, and nothing pushes a revocation,
+        # so without this a signed-out or deactivated member keeps streaming.
+        # About three point queries per check.
+        self.voice_live_revalidate_s: float = max(5.0, _float("VOICE_LIVE_REVALIDATE_S", 60.0))
+        # The largest audio frame accepted (bytes of s16le PCM; 16384 is
+        # 512 ms). A normal 40 ms frame is 1,280 bytes. Never above uvicorn's
+        # --ws-max-size (1 MiB, the Dockerfiles), which refuses first.
+        self.voice_live_max_frame_bytes: int = min(
+            1024 * 1024, max(2, _int("VOICE_LIVE_MAX_FRAME_BYTES", 16384))
+        )
+        # How much held audio a reconnecting browser may replay ahead of real
+        # time: its ring buffer is 60 s. Also the head start of the arrival
+        # ceiling ((wall seconds + this + 5) x 16,000 samples).
+        self.voice_live_resume_max_s: float = max(0.0, _float("VOICE_LIVE_RESUME_MAX_S", 60.0))
+        # Seconds to open a stream on one engine, handshake and `ready`
+        # included, before the next engine is tried.
+        self.voice_live_engine_connect_s: float = max(0.5, _float("VOICE_LIVE_ENGINE_CONNECT_S", 5.0))
+        # The languages a browser may ask the engine for (the start message's
+        # optional `language`, default "auto"). Closed, because the engine
+        # routes on it: the English-only model reads LibriSpeech at 4.13% WER
+        # against 6.23% for the multilingual one, and Hindi needs the
+        # multilingual one. Keep "auto" in the list: it is what a browser
+        # that names no language asks for. Never "gu": neither model reads
+        # Gujarati (FLEURS-gu WER 104%, 2026-09-29). Blank means the default,
+        # as for every key compose.yaml passes through blank.
+        self.voice_live_languages: tuple[str, ...] = tuple(
+            dict.fromkeys(
+                code.strip().lower()
+                for code in ((os.environ.get("VOICE_LIVE_LANGUAGES") or "").strip() or "auto,en,hi").split(",")
+                if code.strip() and len(code.strip()) <= 16
+            )
+        )
+
         # -- Video understanding (2026-09-09) ----------------------------------
         #
         # A person attaches a video; the assistant transcribes it (Whisper,
