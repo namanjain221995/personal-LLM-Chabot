@@ -678,6 +678,26 @@ def rate_ok(user_key: str) -> bool:
     return True
 
 
+def rate_peek(user_key: str) -> bool:
+    """Would a search be allowed now? Reads the window, records nothing.
+
+    For a caller that decides whether a turn MAY search before it knows
+    whether it WILL (main.py's Fast plan): `rate_ok` spent a slot on every
+    assistant turn, so from the 11th Fast turn in a minute the live lookup was
+    switched off although none of those turns had searched."""
+    now = time.monotonic()
+    window = [t for t in _rate.get(user_key, []) if now - t < 60.0]
+    return len(window) < settings.search_rate_per_min
+
+
+def rate_take(user_key: str) -> None:
+    """Record one search that is actually running against the window."""
+    now = time.monotonic()
+    window = [t for t in _rate.get(user_key, []) if now - t < 60.0]
+    window.append(now)
+    _rate[user_key] = window
+
+
 # --------------------------------------------------------------------------
 # steps
 # --------------------------------------------------------------------------
@@ -1269,8 +1289,10 @@ def _drop_unread_sources(sources: List[_Source]) -> List[_Source]:
 _BACKGROUND_TASKS: set = set()
 
 
-def _spawn(coro) -> None:
-    """create_task with a held reference and a logged (never raised) failure."""
+def _spawn(coro) -> "asyncio.Task":
+    """create_task with a held reference and a logged (never raised) failure.
+    The task is returned for a caller that must know when the work landed
+    (fetch_for_freshness); nobody else awaits it."""
     task = asyncio.get_running_loop().create_task(coro)
     _BACKGROUND_TASKS.add(task)
 
@@ -1280,6 +1302,7 @@ def _spawn(coro) -> None:
             log.warning("background web-memory task failed", exc_info=t.exception())
 
     task.add_done_callback(_done)
+    return task
 
 
 #: How old a stored page may be for a REALTIME question (a price, a score, the
@@ -1517,7 +1540,10 @@ async def _fetch_source(
     user_id: Optional[int] = None,
     conversation_id: str = "",
     question: str = "",
+    landed: Optional[dict] = None,
 ) -> Optional[_Source]:
+    """`landed`, when given, receives {result url: the store task} for a page
+    read from the network, so a caller can wait until it is in the store."""
     # Warm path: a fresh stored copy of this exact URL answers without the
     # network. The FULL stored text is cut to the prompt budget the same way a
     # live fetch would be — query-centred since 2026-09-06 (finding S1).
@@ -1579,12 +1605,14 @@ async def _fetch_source(
         # answer never waits on PostgreSQL.
         if settings.web_memory_enabled and ext.text.strip():
             full_text, canon, ctype, title0 = ext.text, fetched.url, fetched.content_type, ext.title
-            _spawn(
+            store = _spawn(
                 db.run_in_thread(
                     _store_page, r, canon, title0, full_text, ctype, page_links, meta,
                     user_id, conversation_id,
                 )
             )
+            if landed is not None and store is not None:
+                landed[r.url] = store
         text = _select_text(ext.text, question, settings.search_source_char_budget)
         empty = not text.strip()
         if empty:
@@ -1626,6 +1654,7 @@ async def _fetch_sources(
     user_id: Optional[int] = None,
     conversation_id: str = "",
     verdict: Optional[Verdict] = None,
+    landed: Optional[dict] = None,
 ) -> List[_Source]:
     stored = await _stored_pages(results, message, verdict=verdict)
     sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
@@ -1634,7 +1663,7 @@ async def _fetch_sources(
         async with sem:
             return await _fetch_source(
                 i + 1, r, stored, user_id=user_id, conversation_id=conversation_id,
-                question=message,
+                question=message, landed=landed,
             )
 
     fetched = await asyncio.gather(*(guarded(i, r) for i, r in enumerate(results)))
@@ -2251,6 +2280,7 @@ async def fetch_for_freshness(
     max_sources: int = 2,
     user_id: Optional[int] = None,
     conversation_id: str = "",
+    budget_s: Optional[float] = None,
 ) -> int:
     """A deliberately tiny search+read, for the Fast-mode freshness fallback.
 
@@ -2260,8 +2290,21 @@ async def fetch_for_freshness(
     global corpus. Writing through the same store is what lets the NEXT
     conversation answer the question locally with no network at all.
 
-    Returns how many sources were actually read. Never raises: the caller
-    falls back to stale-but-labelled evidence when this returns 0.
+    Returns how many of the pages read are IN THE STORE for the caller's
+    readback: read now and written, or served from a fresh stored copy. A
+    page that fell back to the provider's snippet is not in the store and is
+    not counted (until 2026-09-29 it was, and the readback then re-read the
+    same stale passages under a "fast_lookup" label). Never raises: the
+    caller falls back to stale-but-labelled evidence when this returns 0.
+
+    `budget_s` is what the caller can wait (the Fast lookup's deadline). The
+    provider search, the page reads, the store writes and `index_pending`
+    share what is left of it, so the pages that landed before it ran out are
+    kept. Until 2026-09-29 the caller's timeout cancelled this whole call:
+    3 of 10 measured lookups reached the 8.0 s deadline and threw away pages
+    that had already been stored, while FETCH_TIMEOUT_MS (8 s) was as long as
+    the whole budget and `index_pending` had a fixed 6 s inside it. None
+    keeps the per-stage bounds alone.
 
     NOT a small `run_search_engine`. There is no query rewrite (one provider
     call on the user's own words), no rerank, and no answer generation — this
@@ -2285,10 +2328,25 @@ async def fetch_for_freshness(
     # web_query joins lines and cuts at 200 characters: the scope is the one
     # `question` itself carries, never one the join made or the cut lost.
     query = _keep_asked_site_scope(question, [words])[0]
+    loop = asyncio.get_running_loop()
+    end = None if budget_s is None else loop.time() + max(0.0, float(budget_s))
+
+    def left() -> Optional[float]:
+        return None if end is None else max(0.0, end - loop.time())
+
+    # Each stage is timed on its own (knowledge_fast_lookup_seconds): the
+    # 2026-09-29 measurement could see only the whole fetch, p50 2,844 ms.
+    started = time.perf_counter()
     try:
-        results = await _collect_results([query], effort="fast")
-    except Exception:  # noqa: BLE001 — no provider, no freshness; not fatal
+        async with asyncio.timeout(left()):
+            results = await _collect_results([query], effort="fast")
+    except asyncio.TimeoutError:
+        _lookup_stage("search", started, "deadline")
         return 0
+    except Exception:  # noqa: BLE001 — no provider, no freshness; not fatal
+        _lookup_stage("search", started, "error")
+        return 0
+    _lookup_stage("search", started, "ok" if results else "skipped")
     if not results:
         return 0
 
@@ -2305,16 +2363,32 @@ async def fetch_for_freshness(
         if len(picked) >= max(1, int(max_sources)):
             break
 
-    try:
-        sources = await _fetch_sources(
-            picked, question, user_id=user_id, conversation_id=conversation_id,
-            # The person's words, at most WEB_QUERY_MAX_CHARS: the caller has
-            # classified the whole message already, and classify_offline is
-            # quadratic on a pathological line (13.3 s at 400 KB, QA round 1).
-            verdict=_question_verdict(words),
-        )
-    except Exception:  # noqa: BLE001 — a failed read is a miss, not an error
-        return 0
+    # The person's words, at most WEB_QUERY_MAX_CHARS: the caller has
+    # classified the whole message already, and classify_offline is
+    # quadratic on a pathological line (13.3 s at 400 KB, QA round 1).
+    verdict = _question_verdict(words)
+    landed: dict = {}
+    sources = await _read_within(
+        picked, question, verdict, landed, left,
+        user_id=user_id, conversation_id=conversation_id,
+    )
+
+    # A page read from the network is written to the store behind the read
+    # (`_fetch_source`). The readback that follows this call reads the store,
+    # so the write has to have landed; it shares what is left of the budget.
+    writes = [landed[s.url] for s in sources if not s.from_snippet and s.url in landed]
+    if writes:
+        await asyncio.wait(writes, timeout=left())
+
+    def in_store(s: _Source) -> bool:
+        if s.from_snippet:
+            return False
+        write = landed.get(s.url)
+        if write is None:
+            return True  # a fresh stored copy, or a reader that stores nothing
+        return write.done() and not write.cancelled() and write.exception() is None
+
+    stored = sum(1 for s in sources if in_store(s))
 
     # Index synchronously HERE, unlike the streaming path: the caller is about
     # to read the corpus back, so a write-behind index would mean answering
@@ -2327,23 +2401,28 @@ async def fetch_for_freshness(
     # a user's deadline for work nobody is waiting on. The repair belongs to
     # the worker, which has nobody waiting on it; this call still stamps the
     # current chunker on what it writes.
-    # BOUNDED (2026-09-28). This await had no timeout of any kind and was
-    # measured at max 4,305 ms inside a single 8,432 ms pre-pass — the second
-    # largest contributor to that path's tail, in front of the first token.
-    # On a timeout the pages are already STORED; only the vector index lags,
-    # and the next turn's `index_pending` picks them up, which is what
-    # "pending" means. The readback then answers from what the store already
-    # held rather than from the newest page: less fresh, but an answer.
+    # BOUNDED (2026-09-28) by index_pending_timeout_ms, and since 2026-09-29
+    # also by what is left of the caller's budget (measured 3-688 ms). On a
+    # timeout the pages are already STORED; only the vector index lags, and
+    # the next turn's `index_pending` picks them up, which is what "pending"
+    # means. The readback still finds a stored page through its lexical half.
+    index_budget = max(0.0, float(getattr(settings, "index_pending_timeout_ms", 6000)) / 1000.0)
+    remaining = left()
+    if remaining is not None:
+        index_budget = min(index_budget, remaining)
+    started = time.perf_counter()
     try:
-        await asyncio.wait_for(
-            web_index.index_pending(repair_stale_chunks=False),
-            timeout=max(0.0, float(getattr(settings, "index_pending_timeout_ms", 6000)) / 1000.0),
-        )
+        if index_budget <= 0.0:
+            raise asyncio.TimeoutError
+        async with asyncio.timeout(index_budget):
+            await web_index.index_pending(repair_stale_chunks=False)
+        _lookup_stage("index", started, "ok")
     except asyncio.TimeoutError:
+        _lookup_stage("index", started, "deadline")
         metrics.inc("search_stage_timeout_total", stage="index_pending", where="fetch_for_freshness")
         log.info("index_pending exceeded its budget; the new pages index on the next turn")
     except Exception:  # noqa: BLE001 — evidence is stored; indexing retries
-        pass
+        _lookup_stage("index", started, "error")
 
     # The pages themselves entered the store through the same _fetch_sources
     # a full search uses, so their origin stays 'search' — a page read on this
@@ -2359,7 +2438,94 @@ async def fetch_for_freshness(
             conversation_id,
         )
     )
-    return len(sources)
+    return stored
+
+
+def _lookup_stage(stage: str, started: float, outcome: str) -> None:
+    metrics.knowledge_fast_lookup(time.perf_counter() - started, stage=stage, outcome=outcome)
+
+
+async def _read_within(
+    picked: List[SearchResult],
+    question: str,
+    verdict: Optional[Verdict],
+    landed: dict,
+    left: Callable[[], Optional[float]],
+    *,
+    user_id: Optional[int],
+    conversation_id: str,
+) -> List[_Source]:
+    """The Fast lookup's page reads, each its own task, kept as they land.
+
+    Waits for every page until `left()` says the budget is spent; a page still
+    being read then is cancelled and the ones that landed are returned. With
+    FRESHNESS_FAST_SECOND_SOURCE_GRACE_S > 0 (opt-in) the wait also ends that
+    long after the first page was read. Either way the lag from the first
+    page to the second is recorded as stage="second_source_lag", so the grace
+    can be judged on data before anyone switches it on.
+    """
+    loop = asyncio.get_running_loop()
+
+    async def one(r: SearchResult) -> Optional[_Source]:
+        got = await _fetch_sources(
+            [r], question, user_id=user_id, conversation_id=conversation_id,
+            verdict=verdict, landed=landed,
+        )
+        return got[0] if got else None
+
+    tasks = {asyncio.ensure_future(one(r)): i for i, r in enumerate(picked)}
+    read: dict = {}
+    grace = max(0.0, float(getattr(settings, "freshness_fast_second_source_grace_s", 0.0) or 0.0))
+    first_at: Optional[float] = None
+    lag_seen = False
+    budget_cut = False
+    pending = set(tasks)
+    started = time.perf_counter()
+    try:
+        while pending:
+            timeout = left()
+            if grace > 0.0 and first_at is not None:
+                until = max(0.0, first_at + grace - loop.time())
+                timeout = until if timeout is None else min(timeout, until)
+            done, pending = await asyncio.wait(
+                pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                # The budget, or (opt-in) the grace after the first page.
+                remaining = left()
+                budget_cut = remaining is not None and remaining <= 0.005
+                break
+            for task in done:
+                try:
+                    source = task.result()
+                except Exception:  # noqa: BLE001 — a failed read is a miss
+                    source = None
+                if source is None:
+                    continue
+                read[tasks[task]] = source
+                if source.from_snippet:
+                    continue
+                if first_at is None:
+                    first_at = loop.time()
+                elif not lag_seen:
+                    lag_seen = True
+                    metrics.knowledge_fast_lookup(
+                        loop.time() - first_at, stage="second_source_lag", outcome="ok"
+                    )
+    finally:
+        for task in pending:
+            task.cancel()
+    _lookup_stage("page", started, "deadline" if (pending and budget_cut) else "ok")
+    if first_at is not None and not lag_seen and len(picked) > 1:
+        metrics.knowledge_fast_lookup(
+            loop.time() - first_at,
+            stage="second_source_lag",
+            outcome="deadline" if pending else "skipped",
+        )
+    sources = [read[i] for i in sorted(read)]
+    for n, s in enumerate(sources, start=1):
+        s.n = n
+    return sources
 
 
 def _conditional_headers(etag: str, last_modified: str) -> dict:

@@ -911,7 +911,11 @@ def test_think_and_max_still_ask_the_router_first_and_wait_for_slow_grounding(mo
     monkeypatch.setattr(lk, "retrieve", slow_recording)
     prepared = run(_prepare("hello, how are you?", effort=effort))
     assert order == ["router", "retrieve"], "no pre-check, no speculation, router first"
-    assert kwargs == [{"level": Freshness.STATIC, "top_k": 4}], "the exact call Think/Max always made"
+    # Plus, once web_memory.retrieve offers it, the dense-first topical exit
+    # (2026-09-29): this retrieval's only use is the topical gate.
+    assert kwargs == [{"level": Freshness.STATIC, "top_k": 4, **lk._topical_gate()}], (
+        "the exact call Think/Max always made"
+    )
     assert prepared.verdict.reason == "router"
     assert prepared.retrieval is not None and prepared.degraded == ""
     assert prepared.decision == "static_model"

@@ -1,0 +1,526 @@
+{
+ "followup-bare-pronoun": {
+  "decision": "static_topical",
+  "lookups": [],
+  "rerank_distinct": [
+   [
+    "583e911055bd02e0",
+    "139cf54d96f34b2b",
+    "e7d468db0ee87704",
+    "eb86f0dde21833fd",
+    "db8ca18bf3a17686",
+    "a3a94a55726c689b",
+    "de9521615547f1ef",
+    "8340662821234b47",
+    "28eefeb7fa6c1109"
+   ]
+  ],
+  "retrieved": [
+   [
+    "and its score? models ranked benchlm reasoning leaderboard",
+    "static",
+    4
+   ]
+  ],
+  "router_asked": [
+   "and its score? models ranked benchlm reasoning leaderboard"
+  ],
+  "sources": [
+   [
+    1,
+    "https://eval0.example.org/leaderboard.html",
+    "BenchLM Reasoning Leaderboard \u2014 March 2026",
+    "697745128a68fba7"
+   ],
+   [
+    2,
+    "https://filler5.example.net/notes",
+    "Background notes 5",
+    "7e1635a8b7ef93e6"
+   ],
+   [
+    3,
+    "https://eval3.example.org/leaderboard_long.html",
+    "BenchLM Reasoning Leaderboard \u2014 methodology and ranking",
+    "697745128a68fba7"
+   ],
+   [
+    4,
+    "https://eval2.example.org/leaderboard_cards.html",
+    "BenchLM Reasoning Leaderboard (card view) \u2014 March 2026",
+    "6b9e3ca7c1c7ba94"
+   ]
+  ],
+  "verdict": [
+   "static",
+   "router"
+  ]
+ },
+ "followup-exact-variant": {
+  "decision": "static_topical",
+  "lookups": [],
+  "rerank_distinct": [
+   [
+    "28eefeb7fa6c1109",
+    "21e6b90dc75a5897",
+    "443068641d32355b",
+    "86f1dcaf2d1c4d53",
+    "98a64aacaac31a9c",
+    "eb86f0dde21833fd",
+    "eef823206b0c51a0",
+    "e7d468db0ee87704",
+    "a4e0cd692c4ab29d",
+    "f159efcbac81d9da"
+   ]
+  ],
+  "retrieved": [
+   [
+    "what about 5.2? gpt-5 benchlm reasoning",
+    "static",
+    4
+   ]
+  ],
+  "router_asked": [
+   "what about 5.2? gpt-5 benchlm reasoning"
+  ],
+  "sources": [
+   [
+    1,
+    "https://filler15.example.net/notes",
+    "Background notes 15",
+    "9bd507af9a397312"
+   ],
+   [
+    2,
+    "https://filler9.example.net/notes",
+    "Background notes 9",
+    "5efff1e193101c25"
+   ],
+   [
+    3,
+    "https://eval2.example.org/leaderboard_cards.html",
+    "BenchLM Reasoning Leaderboard (card view) \u2014 March 2026",
+    "6b9e3ca7c1c7ba94"
+   ],
+   [
+    4,
+    "https://filler7.example.net/notes",
+    "Background notes 7",
+    "efc499288c56aeab"
+   ]
+  ],
+  "verdict": [
+   "static",
+   "router"
+  ]
+ },
+ "followup-price-today": {
+  "decision": "fast_lookup_failed",
+  "lookups": [
+   "and the price today? h100 cost per gpu-hour orbital compute"
+  ],
+  "rerank_distinct": [
+   [
+    "ef9b24baf1388175",
+    "fbadee3f3c532a00",
+    "db8ca18bf3a17686",
+    "236a6bdade7f9f78",
+    "af8718fddc53816d",
+    "1ed63303990fbbcd",
+    "5a621c28349cad3b",
+    "de9521615547f1ef",
+    "6c5312f18c4957f7",
+    "e34c65dfab641ee1",
+    "13e9b7ca84b628c1",
+    "eef823206b0c51a0"
+   ]
+  ],
+  "retrieved": [
+   [
+    "and the price today? h100 cost per gpu-hour orbital compute",
+    "recent",
+    5
+   ]
+  ],
+  "router_asked": [],
+  "sources": [
+   [
+    1,
+    "https://eval0.example.org/pricing_v1.html",
+    "Orbital Compute \u2014 GPU pricing",
+    "5eaf2b985e5b92e1"
+   ],
+   [
+    2,
+    "https://filler2.example.net/notes",
+    "Background notes 2",
+    "9f835689dc324e4b"
+   ],
+   [
+    3,
+    "https://filler9.example.net/notes",
+    "Background notes 9",
+    "d10a242a1555db8b"
+   ],
+   [
+    4,
+    "https://filler1.example.net/notes",
+    "Background notes 1",
+    "e942bf8af4f85b26"
+   ],
+   [
+    5,
+    "https://filler4.example.net/notes",
+    "Background notes 4",
+    "fd06d0526aa9448e"
+   ]
+  ],
+  "verdict": [
+   "recent",
+   "lexical:recent"
+  ]
+ },
+ "followup-weak-these-days": {
+  "decision": "static_model",
+  "lookups": [],
+  "rerank_distinct": [],
+  "retrieved": [
+   [
+    "is it still the best one these days?",
+    "static",
+    4
+   ]
+  ],
+  "router_asked": [
+   "is it still the best one these days?"
+  ],
+  "sources": [],
+  "verdict": [
+   "static",
+   "router"
+  ]
+ },
+ "followup-weak-today-rome": {
+  "decision": "static_model",
+  "lookups": [],
+  "rerank_distinct": [],
+  "retrieved": [
+   [
+    "which of those three is most accepted today?",
+    "static",
+    4
+   ]
+  ],
+  "router_asked": [
+   "which of those three is most accepted today?"
+  ],
+  "sources": [],
+  "verdict": [
+   "static",
+   "router"
+  ]
+ },
+ "followup-what-about-now": {
+  "decision": "local",
+  "lookups": [],
+  "rerank_distinct": [
+   [
+    "fbadee3f3c532a00",
+    "db8ca18bf3a17686",
+    "13e9b7ca84b628c1",
+    "9382dfa17c45c78e",
+    "ef9b24baf1388175",
+    "1fe0c462daefa47e",
+    "5a621c28349cad3b",
+    "8966d11f300f4eb2",
+    "799c825e067b4c03",
+    "71c53f700378e2da",
+    "2b58f85f3694b080",
+    "42730e5a232f6728",
+    "236a6bdade7f9f78"
+   ]
+  ],
+  "retrieved": [
+   [
+    "what about now? h100 cost per gpu-hour orbital compute",
+    "recent",
+    5
+   ]
+  ],
+  "router_asked": [],
+  "sources": [
+   [
+    1,
+    "https://eval1.example.org/pricing_v2.html",
+    "Orbital Compute \u2014 GPU pricing",
+    "6ab344fc89e1bd83"
+   ],
+   [
+    2,
+    "https://eval0.example.org/pricing_v1.html",
+    "Orbital Compute \u2014 GPU pricing",
+    "79616a47b18d6813"
+   ],
+   [
+    3,
+    "https://eval5.example.org/leaderboard_long.html",
+    "BenchLM Reasoning Leaderboard \u2014 methodology and ranking",
+    "80e72b7c8472a879"
+   ],
+   [
+    4,
+    "https://filler2.example.net/notes",
+    "Background notes 2",
+    "9f835689dc324e4b"
+   ]
+  ],
+  "verdict": [
+   "recent",
+   "lexical:recent"
+  ]
+ },
+ "paste-agreement-clause-question": {
+  "decision": "static_model",
+  "lookups": [],
+  "rerank_distinct": [],
+  "retrieved": [
+   [
+    "what does clause 3 mean?",
+    "static",
+    4
+   ]
+  ],
+  "router_asked": [],
+  "sources": [],
+  "verdict": [
+   "static",
+   "lexical:static"
+  ]
+ },
+ "paste-agreement-no-ask": {
+  "decision": "static_model",
+  "lookups": [],
+  "rerank_distinct": [],
+  "retrieved": [],
+  "router_asked": [],
+  "sources": [],
+  "verdict": [
+   "static",
+   "pasted_no_ask"
+  ]
+ },
+ "paste-email-own-price-question": {
+  "decision": "fast_lookup_failed",
+  "lookups": [
+   "What does an H100 cost per GPU-hour on Orbital Compute?"
+  ],
+  "rerank_distinct": [
+   [
+    "ef9b24baf1388175",
+    "db8ca18bf3a17686",
+    "1fe0c462daefa47e",
+    "8bdea4fab798bdce",
+    "71c53f700378e2da",
+    "5a621c28349cad3b",
+    "8966d11f300f4eb2",
+    "13e9b7ca84b628c1",
+    "4602fb8237cdfe5a",
+    "1ed63303990fbbcd",
+    "98a64aacaac31a9c",
+    "443068641d32355b",
+    "236a6bdade7f9f78"
+   ]
+  ],
+  "retrieved": [
+   [
+    "What does an H100 cost per GPU-hour on Orbital Compute?",
+    "recent",
+    5
+   ]
+  ],
+  "router_asked": [],
+  "sources": [
+   [
+    1,
+    "https://filler3.example.net/notes",
+    "Background notes 3",
+    "6bee8cdf73f86896"
+   ],
+   [
+    2,
+    "https://filler4.example.net/notes",
+    "Background notes 4",
+    "fd06d0526aa9448e"
+   ],
+   [
+    3,
+    "https://eval5.example.org/leaderboard_long.html",
+    "BenchLM Reasoning Leaderboard \u2014 methodology and ranking",
+    "80e72b7c8472a879"
+   ],
+   [
+    4,
+    "https://eval1.example.org/pricing_v2.html",
+    "Orbital Compute \u2014 GPU pricing",
+    "6ab344fc89e1bd83"
+   ],
+   [
+    5,
+    "https://filler2.example.net/notes",
+    "Background notes 2",
+    "9f835689dc324e4b"
+   ]
+  ],
+  "verdict": [
+   "recent",
+   "lexical:recent"
+  ]
+ },
+ "paste-notes-still-current": {
+  "decision": "fast_lookup_failed",
+  "lookups": [
+   "is this price still current?"
+  ],
+  "rerank_distinct": [
+   [
+    "6f5d274aff7dfe2d",
+    "71d4a334f54c95a9",
+    "fbadee3f3c532a00",
+    "1fe0c462daefa47e",
+    "db8ca18bf3a17686",
+    "1ed63303990fbbcd",
+    "5f36077b5b1f12f3",
+    "13e9b7ca84b628c1",
+    "76636822aa26c720",
+    "8340662821234b47",
+    "86f1dcaf2d1c4d53",
+    "443068641d32355b",
+    "5ff1866dfb038a9d"
+   ]
+  ],
+  "retrieved": [
+   [
+    "is this price still current?",
+    "recent",
+    5
+   ]
+  ],
+  "router_asked": [],
+  "sources": [
+   [
+    1,
+    "https://filler1.example.net/notes",
+    "Background notes 1",
+    "e942bf8af4f85b26"
+   ],
+   [
+    2,
+    "https://filler0.example.net/notes",
+    "Background notes 0",
+    "6d96cb9838e950b4"
+   ],
+   [
+    3,
+    "https://filler3.example.net/notes",
+    "Background notes 3",
+    "6bee8cdf73f86896"
+   ],
+   [
+    4,
+    "https://filler6.example.net/notes",
+    "Background notes 6",
+    "ef91498af8baeec8"
+   ],
+   [
+    5,
+    "https://filler2.example.net/notes",
+    "Background notes 2",
+    "9f835689dc324e4b"
+   ]
+  ],
+  "verdict": [
+   "recent",
+   "lexical:recent"
+  ]
+ },
+ "paste-transform-ask": {
+  "decision": "static_model",
+  "lookups": [],
+  "rerank_distinct": [],
+  "retrieved": [],
+  "router_asked": [],
+  "sources": [],
+  "verdict": [
+   "static",
+   "pasted_transform"
+  ]
+ },
+ "typed-multi-line-question": {
+  "decision": "fast_lookup_failed",
+  "lookups": [
+   "I need the current street prices of the H100 PCIe and the RTX 6000 Blackwell in 2026."
+  ],
+  "rerank_distinct": [
+   [
+    "5ff1866dfb038a9d",
+    "a3a94a55726c689b",
+    "28eefeb7fa6c1109",
+    "5862bb66bbea1c70",
+    "443068641d32355b",
+    "3c629da3017d32cd",
+    "236a6bdade7f9f78",
+    "bedbee9dc694db11",
+    "eb86f0dde21833fd",
+    "eef823206b0c51a0",
+    "b1f58a035012ccee",
+    "9713f72982a24629",
+    "f159efcbac81d9da",
+    "21e6b90dc75a5897"
+   ]
+  ],
+  "retrieved": [
+   [
+    "I run a small ML lab and we are choosing hardware this quarter.\nOur budget is about 50,000 US dollars in total, including power work.\nWe mostly fine-tune 7B and 13B models, with some 70B inference.\nThe room is limited to about 3 kW of power and has no liquid cooling.\nI need the current street prices of the H100 PCIe and the RTX 6000 Blackwell in 2026.",
+    "recent",
+    5
+   ]
+  ],
+  "router_asked": [],
+  "sources": [
+   [
+    1,
+    "https://eval2.example.org/leaderboard_cards.html",
+    "BenchLM Reasoning Leaderboard (card view) \u2014 March 2026",
+    "6b9e3ca7c1c7ba94"
+   ],
+   [
+    2,
+    "https://eval0.example.org/hosting_costs.html",
+    "Nimbus Cloud \u2014 accelerator price list",
+    "bd1003762c6e0114"
+   ],
+   [
+    3,
+    "https://eval1.example.org/leaderboard.html",
+    "BenchLM Reasoning Leaderboard \u2014 March 2026",
+    "c187ba9a3c10095c"
+   ],
+   [
+    4,
+    "https://filler6.example.net/notes",
+    "Background notes 6",
+    "ef91498af8baeec8"
+   ],
+   [
+    5,
+    "https://filler8.example.net/notes",
+    "Background notes 8",
+    "1ba1744282ab1c91"
+   ]
+  ],
+  "verdict": [
+   "recent",
+   "year:2026"
+  ]
+ }
+}

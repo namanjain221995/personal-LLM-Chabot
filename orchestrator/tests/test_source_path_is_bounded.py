@@ -130,9 +130,16 @@ def test_a_page_that_times_out_is_still_cited_from_its_snippet():
 
 def test_index_pending_is_bounded_and_named_in_the_metric():
     source = SEARCH_PY.read_text(encoding="utf-8")
-    block = source[source.index("await asyncio.wait_for(\n            web_index.index_pending"):]
-    block = block[:600]
+    # Since 2026-09-29 the bound is `asyncio.timeout` (Python 3.11 CI rule:
+    # `wait_for` can swallow a same-pass cancel) and it is also cut to what is
+    # left of the Fast lookup's budget (tests/test_fast_lookup_budget.py).
+    body = source[source.index("async def fetch_for_freshness("):]
+    body = body[: body.index("\ndef ", 1)]
+    at = body.index("await web_index.index_pending(repair_stale_chunks=False)")
+    block = body[at - 500 : at + 500]
     assert "index_pending_timeout_ms" in block
+    assert "async with asyncio.timeout(index_budget):" in block
+    assert "asyncio.wait_for" not in block
     assert 'stage="index_pending"' in block
     # The pages are already stored: a timeout must NOT be treated as an error
     # that loses them.
