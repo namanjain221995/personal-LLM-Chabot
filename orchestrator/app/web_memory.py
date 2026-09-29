@@ -25,15 +25,18 @@ from __future__ import annotations
 import asyncio
 import bisect
 import functools
+import heapq
+import itertools
 import logging
 import math
 import re
+import threading
 import time
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
 
 from . import db, metrics, rerank, web_index
@@ -451,6 +454,17 @@ def _dense_score(distance: float) -> float:
     return max(0.0, min(1.0, 1.0 - (distance / max(web_index.MAX_DISTANCE, 1e-6))))
 
 
+#: The dense score a STATIC candidate needs before it can ground a timeless
+#: answer. Two rules read it and must agree: the STATIC rerank pre-gate in
+#: `_answerability` (no cross-encoder call below it), and
+#: living_knowledge._topical's hit rule (vector agreement AND the question's
+#: words, or a cross-encoder verdict, which the pre-gate only allows above
+#: it). So when no dense hit reaches it, no STATIC candidate can become a
+#: topical hit, and `retrieve(..., topical_gate=True)` stops there
+#: (tests/test_web_memory_topical_gate.py pins the three to one value).
+TOPICAL_DENSE_FLOOR = 0.35
+
+
 #: A token is a run of letters/digits that MAY carry INTERNAL separators, so a
 #: version or a variant survives whole: "gpt-5.2", "3.14.5", "v2.1", "oc-h1".
 #: It used to be plain `[a-z0-9]+`, which split "GPT-5.2" into ['gpt','5','2']
@@ -783,6 +797,93 @@ def _best_window(
         prefix = header + joiner
         best = prefix + best[: max(0, width - len(prefix))]
     return best
+
+
+class _WindowMemo:
+    """A bounded, thread-safe LRU of lexical windows (2026-09-29).
+
+    WHY. A Fast lookup's readback retrieves the same question seconds after
+    the pre-fetch retrieval did, and a level mismatch after the router
+    re-retrieves it too. Both re-window the same full-text lexical rows (4.7
+    MB of page text at p50), which measured 105-167 ms of a 273-337 ms
+    readback (n=3), all of it in the single retrieval CPU slot.
+
+    WHY THE KEY IS SAFE. `_best_window` reads the page text, the question only
+    through `set(_terms(question))`, the width and `keep_lines`; nothing else.
+    The text is named by (page id, content_hash, length): every writer of
+    `web_pages` stores `content_hash` as the SHA-256 of the text it stores,
+    and a refetch that changes the text changes the hash, so a refetched page
+    never serves the old page's window. The length is a cheap second check
+    against a writer that ever stored text without re-hashing it. A row
+    without a content_hash (or an id) is never memoised.
+
+    SIZE. Each value is one window of at most `_WINDOW_CHARS` (3,200) chars,
+    so 512 entries hold about 1.6 MB inside the orchestrator process.
+    KNOWLEDGE_WINDOW_MEMO_ENTRIES=0 switches it off.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._data: "OrderedDict[tuple, str]" = OrderedDict()
+
+    def get(self, key: tuple) -> Optional[str]:
+        with self._lock:
+            value = self._data.get(key)
+            if value is not None:
+                self._data.move_to_end(key)
+            return value
+
+    def put(self, key: tuple, value: str, limit: int) -> None:
+        with self._lock:
+            self._data[key] = value
+            self._data.move_to_end(key)
+            while len(self._data) > limit:
+                self._data.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+
+_window_memo = _WindowMemo()
+
+
+def _window_memo_limit() -> int:
+    try:
+        return max(0, int(getattr(settings, "knowledge_window_memo_entries", 512)))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _lexical_window(row: Dict[str, Any], query: str, terms: FrozenSet[str]) -> str:
+    """`_best_window(row["text"], query)` for one lexical row, through the
+    memo when the row names its content (see `_WindowMemo`). `terms` is
+    `frozenset(_terms(query))`, computed once per merge by the caller."""
+    text = row.get("text") or ""
+    digest = row.get("content_hash") or ""
+    page_id = row.get("id")
+    limit = _window_memo_limit()
+    if not digest or not page_id or limit <= 0:
+        return _best_window(text, query)
+    key = (int(page_id), str(digest), len(text), terms, _WINDOW_CHARS, False)
+    window = _window_memo.get(key)
+    if window is not None:
+        metrics.inc("knowledge_window_memo_total", _WINDOW_MEMO_HELP, result="hit")
+        return window
+    window = _best_window(text, query)
+    _window_memo.put(key, window, limit)
+    metrics.inc("knowledge_window_memo_total", _WINDOW_MEMO_HELP, result="miss")
+    return window
+
+
+_WINDOW_MEMO_HELP = (
+    "Lexical rows whose question-centred window came from the window memo "
+    "(hit) or was computed (miss); rows without a content_hash are not counted"
+)
 
 
 #: What an omitted stretch of a page looks like in a prompt. Visible on
@@ -1290,7 +1391,7 @@ def _lexical_candidates(query: str, limit: int) -> List[Dict[str, Any]]:
              )
              SELECT p.id, p.url, p.title, p.text, p.domain,
                     p.authority, p.fetched_at, p.published_at, p.modified_at,
-                    p.source_type, p.origin, picked.rank, picked.dn
+                    p.source_type, p.origin, p.content_hash, picked.rank, picked.dn
                FROM picked JOIN web_pages p ON p.id = picked.id
               WHERE NOT (p.id = ANY(%s::bigint[]))
               ORDER BY picked.ord"""
@@ -1352,10 +1453,13 @@ def _merge_candidates(
 ) -> Dict[str, Evidence]:
     """Dense hits and lexical rows merged by PAGE, each lexical row cut to its
     question-centred window. Pure CPU; `retrieve` runs it via _run_cpu so
-    windowing a large page never stalls the event loop."""
+    windowing a large page never stalls the event loop. A window already
+    computed for the same page content and question terms comes from the
+    window memo (`_lexical_window`)."""
     # Merge by PAGE, not by URL string: PostgreSQL rewrites `url` on refetch
     # and dedupes on url_key, so a dense hit and a lexical row for the same
     # page can spell the URL differently.
+    wanted = frozenset(_terms(query))
     by_key: Dict[str, Evidence] = {}
     for hit in dense_hits:
         url = hit.get("url") or ""
@@ -1379,16 +1483,14 @@ def _merge_candidates(
             continue
         key = f"id:{row['id']}" if row.get("id") else url
         existing = by_key.get(key) or by_key.get(url)
-        window = _best_window(row.get("text") or "", query)
+        window = _lexical_window(row, query, wanted)
         if existing is not None:
             # Found by both halves. The dense CHUNK is the nearest by meaning;
             # the lexical WINDOW carries the most question words. Keep the
             # one the question's words point at when it beats the chunk —
             # for an entity question that is the leadership section, not the
             # "about" paragraph the embedding sat closest to.
-            if len(set(_terms(window)) & set(_terms(query))) > len(
-                set(_terms(existing.text)) & set(_terms(query))
-            ):
+            if len(set(_terms(window)) & wanted) > len(set(_terms(existing.text)) & wanted):
                 existing.text = window
             continue
         by_key[key] = Evidence(
@@ -1432,21 +1534,134 @@ def _rank_candidates(query: str, candidates: List[Evidence], level: Freshness) -
 #: (3,644 / 6,164 ms). Its own limiter also keeps these jobs from taking
 #: slots in anyio's default one (40), which the sync routes and every
 #: db.run_in_thread share.
+#:
+#: RANK JOBS GO FIRST (2026-09-29). Each retrieve takes the slot twice: once
+#: to merge (window 24 full-text lexical rows, p50 158 ms / p95 214 ms CPU on
+#: the live store) and once to rank (p50 22 ms). First come, first served, a
+#: turn's short rank job queued behind every other turn's merge, so at 8
+#: simultaneous turns even the first one finished near the end of the serial
+#: block. Admitting a queued rank job before queued merges, still one job at a
+#: time, measured p50 853 -> 674 ms and mean 815 -> 682 ms per retrieve at 8
+#: concurrent (scratchpad ccN/convoy_ab.py, n=40 per arm, same questions,
+#: order alternated). KNOWLEDGE_CPU_RANK_FIRST=false restores plain FIFO.
 _CPU_SLOTS = 1
+_CPU_RANK = 0
+_CPU_MERGE = 1
 _cpu_limiters: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
 
-async def _run_cpu(fn, *args):
+class _CpuSlot:
+    """At most `slots` retrieval CPU jobs at a time on one event loop.
+
+    A waiter with a lower priority number is admitted first; equal priorities
+    are admitted in arrival order. A waiter cancelled while queued leaves the
+    queue; one cancelled after it was admitted but before it could start
+    passes the slot to the next waiter, so a cancelled speculative retrieval
+    can never leak it.
+    """
+
+    def __init__(self, slots: int) -> None:
+        self._free = max(1, int(slots))
+        self._order = itertools.count()
+        self._queue: List[Tuple[int, int, "asyncio.Future[None]"]] = []
+
+    async def acquire(self, priority: int) -> None:
+        if self._free > 0 and not self._queue:
+            self._free -= 1
+            return
+        fut: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+        entry = (int(priority), next(self._order), fut)
+        heapq.heappush(self._queue, entry)
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                self.release()  # admitted, then cancelled: hand it on
+            else:
+                try:
+                    self._queue.remove(entry)
+                    heapq.heapify(self._queue)
+                except ValueError:
+                    pass
+            raise
+
+    def release(self) -> None:
+        while self._queue:
+            _, _, fut = heapq.heappop(self._queue)
+            if not fut.done():
+                fut.set_result(None)
+                return
+        self._free += 1
+
+
+def _cpu_rank_first() -> bool:
+    return bool(getattr(settings, "knowledge_cpu_rank_first", True))
+
+
+async def _run_cpu(fn, *args, job: int = _CPU_MERGE):
     """Run pure-CPU retrieval work in a worker thread, at most _CPU_SLOTS at a
-    time per event loop (a limiter is bound to the loop that made it)."""
+    time per event loop (the slot and the thread limiter are bound to the loop
+    that made them). `job=_CPU_RANK` is admitted ahead of queued merges.
+
+    The slot is released only after the thread has finished: anyio does not
+    abandon a running thread on cancellation, it delivers the cancellation
+    when the thread returns, so a cancelled caller never lets a second job
+    start beside one still running."""
     import anyio
 
     loop = asyncio.get_running_loop()
-    limiter = _cpu_limiters.get(loop)
-    if limiter is None:
-        limiter = anyio.CapacityLimiter(_CPU_SLOTS)
-        _cpu_limiters[loop] = limiter
-    return await anyio.to_thread.run_sync(functools.partial(fn, *args), limiter=limiter)
+    pair = _cpu_limiters.get(loop)
+    if pair is None:
+        pair = (_CpuSlot(_CPU_SLOTS), anyio.CapacityLimiter(_CPU_SLOTS))
+        _cpu_limiters[loop] = pair
+    slot, limiter = pair
+    priority = _CPU_RANK if (job == _CPU_RANK and _cpu_rank_first()) else _CPU_MERGE
+    await slot.acquire(priority)
+    try:
+        return await anyio.to_thread.run_sync(functools.partial(fn, *args), limiter=limiter)
+    finally:
+        slot.release()
+
+
+_TOPICAL_GATE_HELP = (
+    "STATIC topical retrievals that stopped after the dense half because no "
+    "hit reached TOPICAL_DENSE_FLOOR (exit), or ran in full (pass)"
+)
+
+#: Cancelled lexical tasks whose DB thread is still finishing. Held so the
+#: task object outlives the retrieve that dropped it.
+_draining: Set["asyncio.Future[Any]"] = set()
+
+
+def _keep_until_done(task: "asyncio.Future[Any]") -> None:
+    _draining.add(task)
+    task.add_done_callback(_draining.discard)
+
+
+def _dense_reaches_floor(dense_hits: Sequence[dict]) -> bool:
+    """Could any dense hit become a candidate with dense >= the floor?
+
+    Read exactly as `_merge_candidates` reads a hit: a hit without a URL never
+    becomes a candidate, a missing score is the maximum distance. A candidate's
+    `dense` comes from one of its page's hits and from nothing else, so if no
+    hit reaches the floor, no candidate does."""
+    for hit in dense_hits:
+        if not hit.get("url"):
+            continue
+        if _dense_score(float(hit.get("score", web_index.MAX_DISTANCE))) >= TOPICAL_DENSE_FLOOR:
+            return True
+    return False
+
+
+def _notify_candidates(
+    hook: Optional[Callable[[Sequence[Evidence]], None]], candidates: Sequence[Evidence]
+) -> None:
+    if hook is None:
+        return
+    try:
+        hook(tuple(candidates))
+    except Exception:  # noqa: BLE001 — an observer never breaks retrieval
+        log.debug("on_candidates hook failed", exc_info=True)
 
 
 async def retrieve(
@@ -1458,6 +1673,8 @@ async def retrieve(
     effort: str = "fast",
     verdict: Optional[Any] = None,
     cache_store: bool = True,
+    topical_gate: bool = False,
+    on_candidates: Optional[Callable[[Sequence[Evidence]], None]] = None,
 ) -> Retrieval:
     """Best local evidence for `query`, ranked for the freshness it needs.
 
@@ -1473,6 +1690,26 @@ async def retrieve(
     writes it: for a speculative run whose verdict is still a guess
     (living_knowledge.prepare, which stores a reused result itself through
     `cache_result`).
+
+    `topical_gate=True` is for a caller that reads a STATIC result ONLY for a
+    topical hit (living_knowledge's timeless branch). When no dense hit
+    reaches TOPICAL_DENSE_FLOOR no candidate can become one (see that
+    constant), so the lexical half is cancelled and an empty result comes
+    back at once: no merge, meta, rank or rerank, never cached, no demand
+    bump, `_judged` empty for a `cache_store=False` caller. Ignored at other
+    levels. Measured on the live store (n=40 timeless questions, interleaved
+    A/B): prepare p50 263.6 -> 88.0 ms, the best dense score under the floor
+    on 37 of 40, and 0 decision or grounding differences.
+
+    `on_candidates` is called at most once, synchronously on the event loop,
+    with the merged candidates after `_page_meta` has filled in their stored
+    dates and dropped quarantined pages, and BEFORE rank and rerank; with an
+    empty sequence when neither half found anything. It is not called when
+    the result comes from the cache or the topical gate exits. It must be
+    cheap and must not mutate what it is given; an exception from it is
+    logged and ignored. (For living_knowledge's early lookup: once the
+    candidates' fetch dates are known, "nothing stored is fresh enough" can
+    be certain before the rerank runs.)
     """
     out = Retrieval(query=query, freshness=level)
     if not settings.web_memory_enabled or not (query or "").strip():
@@ -1508,7 +1745,28 @@ async def retrieve(
         finally:
             metrics.observe("knowledge_stage_seconds", time.perf_counter() - started, stage="lexical")
 
-    dense_hits, lexical_rows = await asyncio.gather(_dense(), _lexical())
+    if topical_gate and level is Freshness.STATIC:
+        # Both halves still start together, so a question that passes the
+        # gate waits no longer than it did before it existed.
+        lexical_task = asyncio.ensure_future(_lexical())
+        try:
+            dense_hits = await _dense()
+        except BaseException:
+            lexical_task.cancel()
+            raise
+        if not _dense_reaches_floor(dense_hits):
+            # The lexical query's thread finishes on its own (anyio does not
+            # abandon a running thread); nothing waits for it.
+            lexical_task.cancel()
+            _keep_until_done(lexical_task)
+            metrics.inc("knowledge_topical_gate_total", _TOPICAL_GATE_HELP, outcome="exit")
+            if not cache_store:
+                out._judged = []  # type: ignore[attr-defined]
+            return out
+        metrics.inc("knowledge_topical_gate_total", _TOPICAL_GATE_HELP, outcome="pass")
+        lexical_rows = await lexical_task
+    else:
+        dense_hits, lexical_rows = await asyncio.gather(_dense(), _lexical())
 
     # Merging runs in a worker thread (2026-09-13, plan item 3b): it windows
     # up to 24 lexical rows of up to 200,000 chars each, which on the event
@@ -1517,6 +1775,7 @@ async def retrieve(
     by_key = await _run_cpu(_merge_candidates, query, dense_hits, lexical_rows)
 
     if not by_key:
+        _notify_candidates(on_candidates, [])
         if not cache_store:
             # Nothing to judge: the salvage in living_knowledge.prepare may
             # re-partition this (empty) list under the real verdict.
@@ -1555,10 +1814,11 @@ async def retrieve(
             # A member-shared page may be cited, never trusted above neutral.
             ev.authority = min(ev.authority, AUTHORITY_NEUTRAL)
         candidates.append(ev)
+    _notify_candidates(on_candidates, candidates)
 
     # Scoring tokenises title + 4,000 chars per candidate and the duplicate
     # collapse shingles every passage: off the loop too (plan item 3b).
-    ranked = await _run_cpu(_rank_candidates, query, candidates, level)
+    ranked = await _run_cpu(_rank_candidates, query, candidates, level, job=_CPU_RANK)
     #: Set by _answerability when an opt-in Fast rerank limit left part of the
     #: head unjudged. The cache key has no effort, so such a result must never
     #: be served to a later Think or Max turn as a fully judged one.
@@ -1763,7 +2023,7 @@ async def _answerability(
                 limits.add("weak_gate")
             return ranked, ""
     if level is Freshness.STATIC:
-        pre = [e for e in ranked if e.dense >= 0.35 and e.lexical >= 0.34]
+        pre = [e for e in ranked if e.dense >= TOPICAL_DENSE_FLOOR and e.lexical >= 0.34]
         if not pre:
             return ranked, ""
         n = min(8, max(1, int(settings.knowledge_rerank_candidates)))
@@ -1948,6 +2208,7 @@ def _cache_put(key: str, value: Retrieval) -> None:
 
 def cache_clear() -> None:
     _cache.clear()
+    _window_memo.clear()
 
 
 def _bump_retrieval(page_ids: Sequence[int]) -> None:

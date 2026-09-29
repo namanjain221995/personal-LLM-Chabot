@@ -1217,6 +1217,16 @@ class Settings:
         # users; the TTL is far below every freshness window.
         self.knowledge_evidence_cache_ttl_s: float = _float("KNOWLEDGE_EVIDENCE_CACHE_TTL_S", 60.0)
         self.knowledge_evidence_cache_size: int = _int("KNOWLEDGE_EVIDENCE_CACHE_SIZE", 256)
+        # Lexical windows already computed for the same page content and the
+        # same question terms (web_memory._WindowMemo): at most this many, one
+        # window of <= 3,200 chars each (~1.6 MB at 512). The Fast lookup's
+        # readback re-windowed the same rows seconds later (merge 105-167 ms
+        # of a 273-337 ms readback, n=3). 0 = off.
+        self.knowledge_window_memo_entries: int = _int("KNOWLEDGE_WINDOW_MEMO_ENTRIES", 512)
+        # The retrieval CPU slot admits a queued rank job before queued merge
+        # jobs, still one job at a time (web_memory._run_cpu). 8 concurrent
+        # retrieves: p50 853 -> 674 ms (n=40 per arm). false = plain FIFO.
+        self.knowledge_cpu_rank_first: bool = _bool("KNOWLEDGE_CPU_RANK_FIRST", True)
         # Cross-chat recall of the assistant's OWN earlier answers for a
         # question that needs evidence (an office holder, a price, a release).
         # Off (default): only what the USER said in earlier chats is recalled
