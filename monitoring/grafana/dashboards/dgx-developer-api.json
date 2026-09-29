@@ -4007,7 +4007,7 @@
       "id": 58,
       "type": "timeseries",
       "title": "Event lag p50 / p95 by event [pending]",
-      "description": "PENDING — emitted by the live dictation gateway (orchestrator/app/voice_live.py, job orchestrator), written on a branch and not deployed on 2026-09-29; this panel is empty until it is. The newest sample an event covers arriving at the gateway, to that event written to the browser: how far the live text trails the audio, for partials and finals. High lag while the engine's real-time factor is low puts the delay between the engine and the browser: the orchestrator's event loop, or the network to the worker.",
+      "description": "PENDING — emitted by the live dictation gateway (orchestrator/app/voice_live.py, job orchestrator), written on a branch and not deployed on 2026-09-29; this panel is empty until it is. The newest sample an event covers arriving at the gateway, to that event written to the browser: how far the live text trails the audio, for partials and finals. Read a high lag against the engine real-time factor panel. The engine charges every stream in a decode batch the batch's wall time, so the factor reaches 1.0 exactly when a decode worker falls behind: lag with the factor near 0.8 or above is the engine, and lag with the factor well below it is outside the decoder, in the orchestrator's event loop or the network to the worker. The factor is a 5-minute average per profile; the decode step panel shows one slow decode worker that the average can hide.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -4098,7 +4098,7 @@
       "id": 59,
       "type": "timeseries",
       "title": "Engine real-time factor by profile [pending]",
-      "description": "PENDING — emitted by the live dictation engine on the worker (compose/stt-stream, job stt-stream), written on a branch and not deployed on 2026-09-29; this panel is empty until it is. Decode seconds per second of audio on each profile, 5-minute rate; an idle profile has no line. VoiceStreamEngineFallingBehind fires above 0.8 (red line) with at least half a real-time stream on the profile. 1.0 means falling behind only if the engine charges every stream in a decode batch the batch's wall time (monitoring/developer-api/README.md, live dictation); the decode step panel is the direct headroom.",
+      "description": "PENDING — emitted by the live dictation engine on the worker (compose/stt-stream, job stt-stream), written on a branch and not deployed on 2026-09-29; this panel is empty until it is. Decode seconds charged per second of audio on each profile, 5-minute rate; an idle profile has no line. Every decode_streams call charges each stream in its batch the call's wall time, so the factor is a decode step's time over the chunk it decodes: 1.0 means a decode worker needs a whole chunk's length per chunk and its streams fall behind, and a saturated engine reads exactly 1.0 however far behind it falls (the latency panels show how far). VoiceStreamEngineFallingBehind fires above 0.8 (red line) with at least half a real-time stream on the profile. The decode step panel is the per-call headroom.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -4182,7 +4182,7 @@
       "id": 60,
       "type": "timeseries",
       "title": "Live streams ended by outcome, 15m [pending]",
-      "description": "PENDING — emitted by the live dictation gateway (orchestrator/app/voice_live.py, job orchestrator), written on a branch and not deployed on 2026-09-29; this panel is empty until it is. Every admitted stream ends exactly once. completed (Stop, last words back) and client_closed (the browser closed it) are normal. disconnected, idle and superseded are drops: VoiceStreamDisconnectsAbnormal fires when they are over 25% for 10 minutes. engine_unavailable and error are server-side failures: VoiceStreamErrorRatioHigh fires over 10%. rejected is a refusal after the stream was admitted. A reconnect starts a new stream, so one dropped recording shows a drop and then a completion.",
+      "description": "PENDING — emitted by the live dictation gateway (orchestrator/app/voice_live.py, job orchestrator), written on a branch and not deployed on 2026-09-29; this panel is empty until it is. Every admitted stream ends exactly once. completed (Stop, last words back) and client_closed (the browser closed it) are normal, and so is idle (no audio for 120 s with the socket open, as when a phone's screen turns off while recording): it is shown here and counted by no alert. disconnected and superseded are drops: VoiceStreamDisconnectsAbnormal fires when they are over 25% for 10 minutes. engine_unavailable and error are server-side failures: VoiceStreamErrorRatioHigh fires over 10%. rejected is a refusal after the stream was admitted. A reconnect starts a new stream, so one dropped recording shows a drop and then a completion.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -4342,7 +4342,7 @@
       "id": 62,
       "type": "timeseries",
       "title": "Refused streams by reason, 15m [pending]",
-      "description": "PENDING — emitted by the live dictation gateway (orchestrator/app/voice_live.py, job orchestrator) and engine (compose/stt-stream on the worker, job stt-stream), written on branches and not deployed on 2026-09-29; this panel is empty until they are. Gateway refusals, at the handshake or later: origin, signed_out, voice_off, unavailable (live dictation not configured), not_found, rate_limited (too many connects a minute, or audio arriving faster than speech), capacity, protocol, frame_too_large. A gateway capacity refusal is either its own VOICE_LIVE_MAX_STREAMS or an engine that answered capacity; the engine's own capacity line says which. VoiceStreamEngineFallingBehind fires on 3 gateway capacity refusals in 10 minutes.",
+      "description": "PENDING — emitted by the live dictation gateway (orchestrator/app/voice_live.py, job orchestrator) and engine (compose/stt-stream on the worker, job stt-stream), written on branches and not deployed on 2026-09-29; this panel is empty until they are. Gateway refusals, at the handshake or later: origin, signed_out, voice_off, unavailable (live dictation not configured), not_found, rate_limited (too many connects a minute, or audio arriving faster than speech), capacity, protocol, frame_too_large. Engine refusals: unauthorized, not_ready, protocol, language, capacity, other. A gateway capacity refusal is either its own VOICE_LIVE_MAX_STREAMS or an engine that answered capacity; the engine's own capacity line says which. VoiceStreamEngineFallingBehind fires when every 5-minute window holds at least 3 gateway capacity refusals for 5 minutes: refusals that keep coming, not a burst that is over within a minute.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"

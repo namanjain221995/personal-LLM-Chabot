@@ -470,9 +470,9 @@ weeks of real use.
 | --- | --- | --- |
 | VoiceStreamFirstPartialSlow | first-words p95 over 1.5 s, with at least 20 utterances per 5 minutes | 10m |
 | VoiceStreamFinalSlow | final p95 over 2 s, with at least 20 finals per 5 minutes | 10m |
-| VoiceStreamEngineFallingBehind | `cause="decode_rtf"`: a profile's real-time factor over 0.8 with at least half a real-time stream on it; `cause="capacity_refusals"`: 3 or more capacity refusals in 10 minutes | 5m |
+| VoiceStreamEngineFallingBehind | `cause="decode_rtf"`: a profile's real-time factor over 0.8 with at least half a real-time stream on it; `cause="capacity_refusals"`: at least 3 capacity refusals in every 5-minute window | 5m |
 | VoiceStreamErrorRatioHigh | over 10% of the streams that ran ended `engine_unavailable` or `error`, with at least 3 per 5 minutes | 10m |
-| VoiceStreamDisconnectsAbnormal | over 25% ended `disconnected`, `idle` or `superseded`, with at least 5 per 5 minutes | 10m |
+| VoiceStreamDisconnectsAbnormal | over 25% ended `disconnected` or `superseded`, with at least 5 per 5 minutes (`idle` is normal use) | 10m |
 | VoiceStreamEngineDown | the engine's scrape fails and the gateway failed to reach an engine in the last 15 minutes | 2m |
 
 Every one names `scripts/stt-stream.sh status` as its safe command: the engine
@@ -492,9 +492,7 @@ clock:
   0.6 s of silence (`STT_ENDPOINT_S`) before it commits, and finals measured
   0.68-0.83 s at p50 on the worker. An overflow stream on a 560 ms profile can
   wait one chunk more, about 1.3 s at worst by that arithmetic, which is why
-  the final line is at 2 s. The histogram is meant for an utterance's
-  first final. If the engine's second, refining pass is timed into it too, its
-  re-decode delay lands here and the 2 s line needs a second look.
+  the final line is at 2 s.
 
 The floor, 20 per 5 minutes, is about one person dictating steadily. Below it,
 a p95 is one or two utterances. The 10 minutes are for reconnects. A browser
@@ -512,11 +510,14 @@ cause.
 2. `VoiceStreamDisconnectsAbnormal` is firing too: this is replayed audio. Fix
    the drops.
 3. Neither: compare the event lag panel with the engine's real-time factor and
-   decode step panels. High lag with a low real-time factor puts the delay
-   between the engine and the browser: the orchestrator's event loop (one
+   decode step panels. The factor reaches 1.0 exactly when a decode worker
+   falls behind (next section), so high lag with the factor well under 0.8
+   puts the delay outside the decoder: the orchestrator's event loop (one
    CPU-bound handler stalls every stream at once), or the network to the
-   worker. The browser capture-to-render panel adds the path from the browser
-   to the orchestrator: the tunnel and the frontend relay.
+   worker. The factor is a 5-minute average per profile; a decode step p95
+   near the chunk budget shows one slow decode worker that the average hides.
+   The browser capture-to-render panel adds the path from the browser to the
+   orchestrator: the tunnel and the frontend relay.
 
 ### Live dictation engine
 
@@ -537,24 +538,46 @@ must also list 30009 among the ports the head may reach, or the scrape and
 live dictation fail together.
 
 **The real-time factor** is `stt_stream_compute_seconds_total` divided by
-`stt_stream_audio_seconds_total`, per profile, over 5 minutes. The 0.8 line
-assumes the engine charges every stream in a `decode_streams` batch the
-batch's wall time. Then 1.0 means decoding takes as long as the audio, and the
-streams fall behind. If the engine adds each call's wall time once per batch
-instead, the ratio at full load is decode workers divided by streams (0.5 with
-4 workers and 8 streams), and this branch stays silent exactly when it
-matters. The latency alerts still see the result. The decode step panel is the
-headroom either way: one `decode_streams` call against the chunk budget
-(160 ms on the fast profiles, 560 ms on the wide ones), measured at p95
-99-102 ms with 12 streams on the worker.
+`stt_stream_audio_seconds_total`, per profile, over 5 minutes. The engine
+charges every stream in a `decode_streams` batch the batch's wall time: each
+call adds `elapsed x batch size` to the compute counter, and the audio counter
+adds the seconds of audio received (build spec section 11). The factor is
+then a decode step's wall time over the chunk it decodes, weighted by batch
+size:
+
+* **1.0 means falling behind.** A decode worker needs a whole chunk's length
+  to decode one chunk, so every stream on it slips behind real time.
+  `VoiceStreamEngineFallingBehind` warns above 0.8, a fifth of the budget
+  short of that.
+* **A saturated engine reads exactly 1.0; it does not climb with the
+  backlog.** Its streams are in every batch, the worker never idles, and their
+  audio keeps arriving at real time, so the backlog grows while the ratio
+  stays put. How far behind it is shows in the latency alerts, not here. A
+  promtool case pins this shape: compute equal to audio fires.
+* **Charged once per batch instead,** a full profile would top out at decode
+  workers divided by streams (0.25 with 2 workers and 8 streams) and the
+  alert could never fire. That is why the definition is part of the contract
+  (`metrics-contract.json`).
+
+The decode step panel is the per-call headroom: one `decode_streams` call
+against the chunk budget (160 ms on the fast profiles, 560 ms on the wide
+ones), measured at p95 99-102 ms with 12 streams on the worker, 0.62-0.64 of
+the budget.
 
 **Capacity refusals.** The gateway refuses with `capacity` both at its own
 `VOICE_LIVE_MAX_STREAMS` (64) and when every engine profile for the stream's
 language is full. By default that is 8 + 8 streams on 160 ms chunks and
 12 + 12 on 560 ms chunks; `en` can use all four profiles, `auto` and `hi` the
 two multilingual ones. The refusals panel shows the engine's own count beside
-the gateway's. A refused browser retries with backoff while it records, so
-three refusals in 10 minutes is one person turned away for a few seconds.
+the gateway's. A refused browser retries while it records (0.5, 1, 2, 4, 8 s,
+then every 15 s), so one person turned away for half a minute is a burst of
+about six refusals, all in the first 30 s. The alert counts refusals over 5
+minutes and must hold for 5 minutes, so it needs at least 3 in every 5-minute
+window across that time. The last of those windows opens when the first three
+were counted, so it takes three more after them: a burst that is over within
+about a minute leaves the window before the alert can fire, and refusals that
+keep coming hold it (a promtool case pins each). With a 10-minute window, one
+person turned away for 4 s fired it five minutes later.
 
 **More capacity trades against chat.** The engine runs on the worker's CPU,
 held to eight cores, because chat is tensor-parallel across both Sparks: 12
@@ -576,7 +599,7 @@ them.
 | `completed` | Stop, and the last words came back | normal |
 | `client_closed` | the browser closed the socket: cancel, discard, a closing tab | normal |
 | `disconnected` | the socket closed with no close frame: a network drop, or a relay destroyed at a frontend deploy | drop |
-| `idle` | no audio for `VOICE_LIVE_IDLE_S` (120 s) with the socket open | drop |
+| `idle` | no audio for `VOICE_LIVE_IDLE_S` (120 s) with the socket open. A phone whose screen turns off mid-recording stops sending audio and ends this way (the recorder says "Recording paused while the screen was off"), so it is normal use: shown on the outcomes panel, and in the drop ratio's denominator only | normal |
 | `superseded` | a newer connection took the recording over, usually a reconnect before the old socket was noticed dead | drop |
 | `engine_unavailable` | no engine answered, or it went away mid-stream | failure |
 | `error` | the gateway failed | failure |
@@ -609,10 +632,11 @@ python3 monitoring/developer-api/check_metrics.py            # needs Prometheus 
 
 Run the promtool containers on the worker, from a copy of
 `monitoring/prometheus`: nothing new may use the head's memory. The live
-dictation promtool cases were also checked by mutation (2026-09-29): 15
-deliberate breaks of `voice-stream.yml` (a threshold, a floor, a window, the
-engine-down gate, the real-time factor's zero guard, a wrong job or reason),
-and every one made `test rules` fail.
+dictation promtool cases were also checked by mutation (2026-09-29, and again
+after its review): 28 deliberate breaks of `voice-stream.yml` (a threshold, a
+floor, a window, a `for`, the engine-down gate and each reason it reads, each
+outcome of the two ratios and where `idle` is counted, the real-time factor's
+zero guard, a wrong job or reason), and every one made `test rules` fail.
 
 The offline Python tests run in CI (the launcher job's monitoring step); the
 promtool tests do not.

@@ -446,6 +446,16 @@ def _expected_job(metric):
     return next(job for prefix, job in VOICE_JOBS.items() if metric.startswith(prefix))
 
 
+def _declared_labels(contract, metric):
+    """{label: values} of a contract entry, with "as <metric>" resolved."""
+    labels = {}
+    for label, values in contract[metric].get("labels", {}).items():
+        while isinstance(values, str):
+            values = contract[values[3:]]["labels"][label]
+        labels[label] = values
+    return labels
+
+
 @unittest.skipUnless(HAVE_YAML, "PyYAML not installed")
 class VoiceStreamRuleTests(unittest.TestCase):
     """monitoring/prometheus/rules/voice-stream.yml under developer-api.yml's
@@ -526,6 +536,25 @@ class VoiceStreamRuleTests(unittest.TestCase):
                 self.assertIn(job, jobs, f"{where}: no scrape job {job!r}")
             for metric, matchers in _voice_selectors(expr):
                 self.assertIn(f'job="{_expected_job(metric)}"', matchers, f"{where}: {metric}")
+
+    def test_idle_closes_are_not_counted_as_drops(self):
+        # A phone whose screen turns off mid-recording stops sending audio,
+        # and the gateway closes that stream `idle` after 120 s: normal use,
+        # kept as `idle` by the build spec (section 11). Only closes nobody
+        # asked for are drops.
+        rule = next(r for r in self.alerts if r["alert"] == "VoiceStreamDisconnectsAbnormal")
+        drops = re.findall(r'outcome=~"([^"]*)"', rule["expr"])
+        self.assertEqual(len(drops), 2, "the ratio's numerator and its floor")
+        for alternatives in drops:
+            self.assertEqual(set(alternatives.split("|")), {"disconnected", "superseded"})
+
+    def test_a_capacity_burst_leaves_its_window_before_the_alert_can_fire(self):
+        # A window longer than `for` turns `for` into a delay, not a
+        # debounce: with 10 minutes held 5, one person turned away for 4 s
+        # fired five minutes later (review, 2026-09-29).
+        rule = next(r for r in self.alerts if r["alert"] == "VoiceStreamEngineFallingBehind")
+        [window] = re.findall(r'reason="capacity"\}\[(\d+)m\]', rule["expr"])
+        self.assertLessEqual(int(window), int(rule["for"].removesuffix("m")))
 
 
 @unittest.skipUnless(HAVE_YAML, "PyYAML not installed")
@@ -617,6 +646,36 @@ class VoiceStreamDashboardTests(unittest.TestCase):
         self.assertTrue(names)
         for name in names:
             self.assertEqual(_contract()[name]["status"], "pending", name)
+
+    @unittest.skipUnless(HAVE_YAML, "PyYAML not installed")
+    def test_every_label_the_row_and_the_rules_read_is_a_declared_closed_set(self):
+        # A value outside the set (reason="at_capacity") leaves a rule inert
+        # with no error anywhere, and a label grouped on without a declared
+        # set holds the emitter to nothing: the engine's refusals panel
+        # grouped by an undeclared `reason` (review, 2026-09-29).
+        contract = _contract()
+        exprs = self._exprs() + [expr for _, expr in check_metrics.rule_exprs(VOICE_RULES)]
+        for expr in exprs:
+            grouped = {label.strip() for group in re.findall(r"\bby\s*\(([^)]*)\)", expr) for label in group.split(",")}
+            grouped -= {"le", ""}
+            for metric, matchers in _voice_selectors(expr):
+                declared = _declared_labels(contract, check_metrics.base_name(metric, contract))
+                for label in grouped:
+                    self.assertIn(label, declared, f"{metric} grouped by {label}: {expr}")
+                for label, op, value in re.findall(r'(\w+)\s*(=~|!~|!=|=)\s*"([^"]*)"', matchers):
+                    if label == "job":
+                        continue
+                    self.assertIn(label, declared, f"{metric}{matchers}")
+                    for one in value.split("|") if op in ("=~", "!~") else [value]:
+                        self.assertIn(one, declared[label], f"{metric}{matchers}")
+
+    def test_the_engines_refusal_reasons_are_the_set_the_engine_folds_to(self):
+        # Build spec section 11: anything else the engine refuses for is
+        # counted as "other".
+        self.assertEqual(
+            _declared_labels(_contract(), "stt_stream_rejections_total").get("reason"),
+            ["unauthorized", "not_ready", "protocol", "language", "capacity", "other"],
+        )
 
 
 if __name__ == "__main__":

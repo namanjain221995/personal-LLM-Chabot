@@ -16,10 +16,13 @@
 # zero, so the first event after a restart is visible to increase().
 #
 # Every "does not fire" case is a shape the design produces with nothing
-# wrong: one reconnect replaying its buffered audio, one quiet dictation, the
-# wide-profile final latency, a one-minute engine restart, a frontend deploy,
-# people cancelling recordings, live dictation switched off, a near-idle
-# profile, a tail decoded after its audio stopped, one person refused twice.
+# wrong: one reconnect replaying its buffered audio, a quiet dictation (slow
+# first words, slow finals), the wide-profile final latency, a one-minute
+# engine restart, a frontend deploy, people cancelling recordings, a phone
+# whose screen turned off, one flaky network under the drop floor, live
+# dictation switched off, a near-idle profile, a tail decoded after its audio
+# stopped, one person refused twice, one person turned away at capacity for
+# half a minute.
 
 rule_files:
   - ../rules/voice-stream.yml
@@ -331,6 +334,24 @@ tests:
         alertname: VoiceStreamFinalSlow
         exp_alerts: []
 
+  - name: A quiet dictation with slow finals is below the floor
+    interval: 15s
+    input_series:
+      # One final a minute, every one slow: about 5 per 5 minutes, and the
+      # alert needs 20 before a p95 means anything.
+      - series: 'voice_stream_final_seconds_bucket{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",le="2.0"}'
+        values: '0x100'
+      - series: 'voice_stream_final_seconds_bucket{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",le="3.0"}'
+        values: '0+0.25x100'
+      - series: 'voice_stream_final_seconds_bucket{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",le="+Inf"}'
+        values: '0+0.25x100'
+      - series: 'voice_stream_final_seconds_count{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0+0.25x100'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: VoiceStreamFinalSlow
+        exp_alerts: []
+
   # ====================================== VoiceStreamEngineFallingBehind
   - name: A profile decoding at 0.9 of real time for 5 minutes warns for that profile only
     interval: 15s
@@ -358,17 +379,71 @@ tests:
             exp_annotations:
               summary: "Live dictation engine: profile en-fast spends 0.90 s decoding per second of audio"
               description: >-
-                decode_rtf: a profile has needed more than 0.8 s of decoding per
-                second of audio for 5 minutes; one more stream can push it past
-                real time, and then every stream on it falls behind.
-                capacity_refusals: streams were refused because every engine
-                profile for their language was full, or the gateway reached
-                VOICE_LIVE_MAX_STREAMS; the refusals panel shows the engine's own
-                count beside the gateway's. The engine is held to eight of the
-                worker's cores so that chat does not pay for it: 12 streams cost
-                chat nothing measurable, while 48 streams with every core busy cost
-                it 11-16% of its decode speed. More capacity trades against chat
-                and is the owner's decision.
+                decode_rtf: for 5 minutes a profile has been charged more than
+                0.8 s of decoding per second of its audio, every stream in a
+                decode batch being charged the batch's time. At 1.0 its decode
+                workers need a whole chunk's length per chunk and every stream
+                on them falls behind; a saturated engine reads exactly 1.0, and
+                how far behind it is shows in the latency alerts, not here.
+                capacity_refusals: for 5 minutes, every 5-minute window held at
+                least 3 streams refused because every engine profile for their
+                language was full, or the gateway reached VOICE_LIVE_MAX_STREAMS;
+                the refusals panel shows the engine's own count beside the
+                gateway's. The engine is held to eight of the worker's cores so
+                that chat does not pay for it: 12 streams cost chat nothing
+                measurable, while 48 streams with every core busy cost it 11-16%
+                of its decode speed. More capacity trades against chat and is the
+                owner's decision.
+              runbook: monitoring/developer-api/README.md#live-dictation-engine
+              safe_command: "scripts/stt-stream.sh status"
+
+  - name: A saturated profile reads exactly 1.0 and warns
+    interval: 15s
+    input_series:
+      # multi-fast full: 8 streams on 2 decode workers, 4 in every batch, both
+      # workers busy all the time. Each worker charges its 15 s of wall time
+      # to each of its 4 streams, 120 s per 15 s in all, and the 8 streams
+      # send 120 s of audio: compute equals audio however far behind they
+      # fall. Charged once per batch, this read 0.25 and never fired.
+      - series: 'stt_stream_compute_seconds_total{instance="worker:30009",job="stt-stream",node="spark-2",role="worker",service="stt-stream",profile="multi-fast"}'
+        values: '0+120x100'
+      - series: 'stt_stream_audio_seconds_total{instance="worker:30009",job="stt-stream",node="spark-2",role="worker",service="stt-stream",profile="multi-fast"}'
+        values: '0+120x100'
+      - series: 'voice_stream_rejections_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",reason="capacity"}'
+        values: '0x100'
+    promql_expr_test:
+      - expr: round(profile:stt_stream_real_time_factor:ratio_rate5m, 0.0001)
+        eval_time: 6m
+        exp_samples:
+          - labels: '{profile="multi-fast"}'
+            value: 1
+    alert_rule_test:
+      # Eight streams read 0.5 audio-s/s by 30 s: pending from there.
+      - eval_time: 5m15s
+        alertname: VoiceStreamEngineFallingBehind
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: VoiceStreamEngineFallingBehind
+        exp_alerts:
+          - exp_labels: { severity: warning, service: stt-stream, profile: multi-fast, cause: decode_rtf }
+            exp_annotations:
+              summary: "Live dictation engine: profile multi-fast spends 1.00 s decoding per second of audio"
+              description: >-
+                decode_rtf: for 5 minutes a profile has been charged more than
+                0.8 s of decoding per second of its audio, every stream in a
+                decode batch being charged the batch's time. At 1.0 its decode
+                workers need a whole chunk's length per chunk and every stream
+                on them falls behind; a saturated engine reads exactly 1.0, and
+                how far behind it is shows in the latency alerts, not here.
+                capacity_refusals: for 5 minutes, every 5-minute window held at
+                least 3 streams refused because every engine profile for their
+                language was full, or the gateway reached VOICE_LIVE_MAX_STREAMS;
+                the refusals panel shows the engine's own count beside the
+                gateway's. The engine is held to eight of the worker's cores so
+                that chat does not pay for it: 12 streams cost chat nothing
+                measurable, while 48 streams with every core busy cost it 11-16%
+                of its decode speed. More capacity trades against chat and is the
+                owner's decision.
               runbook: monitoring/developer-api/README.md#live-dictation-engine
               safe_command: "scripts/stt-stream.sh status"
 
@@ -391,21 +466,49 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning, service: stt-stream, cause: capacity_refusals }
             exp_annotations:
-              summary: "Live dictation refused 28 stream(s) at capacity in 10 minutes"
+              summary: "Live dictation refused 20 stream(s) at capacity in 5 minutes"
               description: >-
-                decode_rtf: a profile has needed more than 0.8 s of decoding per
-                second of audio for 5 minutes; one more stream can push it past
-                real time, and then every stream on it falls behind.
-                capacity_refusals: streams were refused because every engine
-                profile for their language was full, or the gateway reached
-                VOICE_LIVE_MAX_STREAMS; the refusals panel shows the engine's own
-                count beside the gateway's. The engine is held to eight of the
-                worker's cores so that chat does not pay for it: 12 streams cost
-                chat nothing measurable, while 48 streams with every core busy cost
-                it 11-16% of its decode speed. More capacity trades against chat
-                and is the owner's decision.
+                decode_rtf: for 5 minutes a profile has been charged more than
+                0.8 s of decoding per second of its audio, every stream in a
+                decode batch being charged the batch's time. At 1.0 its decode
+                workers need a whole chunk's length per chunk and every stream
+                on them falls behind; a saturated engine reads exactly 1.0, and
+                how far behind it is shows in the latency alerts, not here.
+                capacity_refusals: for 5 minutes, every 5-minute window held at
+                least 3 streams refused because every engine profile for their
+                language was full, or the gateway reached VOICE_LIVE_MAX_STREAMS;
+                the refusals panel shows the engine's own count beside the
+                gateway's. The engine is held to eight of the worker's cores so
+                that chat does not pay for it: 12 streams cost chat nothing
+                measurable, while 48 streams with every core busy cost it 11-16%
+                of its decode speed. More capacity trades against chat and is the
+                owner's decision.
               runbook: monitoring/developer-api/README.md#live-dictation-engine
               safe_command: "scripts/stt-stream.sh status"
+
+  - name: One person turned away at capacity for half a minute does not warn
+    interval: 15s
+    input_series:
+      # Refused, then retried at the 0.5, 1, 2, 4, 8 and 15 s backoff and let
+      # in on the seventh try, about 30 s later: five refusals in the first
+      # scrape, one in the next, none after. The burst leaves the 5-minute
+      # window at 5m, before `for` can complete at 5m15s. With a 10-minute
+      # window it fired at 5m15s and stayed for four and a half minutes.
+      - series: 'voice_stream_rejections_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",reason="capacity"}'
+        values: '0 5 6x78'
+    alert_rule_test:
+      - eval_time: 4m30s
+        alertname: VoiceStreamEngineFallingBehind
+        exp_alerts: []
+      - eval_time: 5m15s
+        alertname: VoiceStreamEngineFallingBehind
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: VoiceStreamEngineFallingBehind
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: VoiceStreamEngineFallingBehind
+        exp_alerts: []
 
   - name: A near-idle profile, a healthy busy one and one person refused twice do not warn
     interval: 15s
@@ -472,6 +575,40 @@ tests:
         alertname: VoiceStreamDisconnectsAbnormal
         exp_alerts: []
 
+  - name: Streams the gateway itself fails count as server-side failures
+    interval: 15s
+    input_series:
+      # The engine answers; the gateway fails every other stream (outcome
+      # error) while engine_unavailable stays at zero.
+      - series: 'voice_stream_sessions_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",outcome="error"}'
+        values: '0+1x100'
+      - series: 'voice_stream_sessions_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",outcome="engine_unavailable"}'
+        values: '0x100'
+      - series: 'voice_stream_sessions_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",outcome="completed"}'
+        values: '0+1x100'
+    alert_rule_test:
+      # Three failures by 45 s, so pending from there.
+      - eval_time: 10m30s
+        alertname: VoiceStreamErrorRatioHigh
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: VoiceStreamErrorRatioHigh
+        exp_alerts:
+          - exp_labels: { severity: warning, service: stt-stream }
+            exp_annotations:
+              summary: "Live dictation: 50% of live streams failed on the server side (5 minutes)"
+              description: >-
+                Streams ending engine_unavailable (no engine answered, or it went
+                away mid-stream) or error (the gateway failed), over 10% of the
+                streams that ran with at least 3 per 5 minutes, for 10 minutes.
+                Browsers retry these with backoff while recording, so one broken
+                engine is a steady stream of failures; an engine restart of a
+                minute is not. People still get the transcript after Stop; they
+                lose the live words. The errors-by-reason panel says which side
+                failed.
+              runbook: monitoring/developer-api/README.md#live-dictation-failures-and-drops
+              safe_command: "scripts/stt-stream.sh status"
+
   - name: A one-minute engine restart does not warn about failed streams
     interval: 15s
     input_series:
@@ -529,15 +666,17 @@ tests:
         exp_alerts:
           - exp_labels: { severity: warning, service: stt-stream }
             exp_annotations:
-              summary: "Live dictation: 50% of live streams dropped (disconnected, idle or superseded, 5 minutes)"
+              summary: "Live dictation: 50% of live streams dropped (disconnected or superseded, 5 minutes)"
               description: >-
                 Over a quarter of the streams that ran ended without either side
-                closing them, went silent, or were taken over by a reconnect, with
-                at least 5 per 5 minutes, for 10 minutes. A deploy drops every open
-                stream once and does not hold that long. The metrics name no
-                person, so one person's bad network and a broken tunnel look alike
-                here; the gateway's per-stream close log line (outcome, reconnect)
-                and the frontend relay's ws_close lines tell them apart.
+                closing them, or were taken over by a reconnect, with at least 5
+                per 5 minutes, for 10 minutes. A deploy drops every open stream
+                once and does not hold that long. Idle closes (no audio for 120 s,
+                as when a phone's screen turns off while recording) are normal
+                use and not counted. The metrics name no person, so one person's
+                bad network and a broken tunnel look alike here; the gateway's
+                per-stream close log line (outcome, reconnect) and the frontend
+                relay's ws_close lines tell them apart.
               runbook: monitoring/developer-api/README.md#live-dictation-failures-and-drops
               safe_command: "scripts/stt-stream.sh status"
       - eval_time: 11m
@@ -555,6 +694,53 @@ tests:
         values: '0+0.25x100'
     alert_rule_test:
       - eval_time: 8m
+        alertname: VoiceStreamDisconnectsAbnormal
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: VoiceStreamDisconnectsAbnormal
+        exp_alerts: []
+
+  - name: A phone whose screen turned off closes idle, and that is not a drop
+    interval: 15s
+    input_series:
+      # Two streams in five end idle: the recorder pauses while the screen is
+      # off, no audio arrives for 120 s and the gateway closes the socket.
+      # One in five drops for real: 20%, under the 25% line. Counted as drops,
+      # the idle closes would make it 60% and fire at 10m30s; left out of the
+      # streams that ran, 33%, firing at 11m15s.
+      - series: 'voice_stream_sessions_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",outcome="idle"}'
+        values: '0+2x100'
+      - series: 'voice_stream_sessions_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",outcome="completed"}'
+        values: '0+2x100'
+      - series: 'voice_stream_sessions_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",outcome="disconnected"}'
+        values: '0+1x100'
+      - series: 'voice_stream_sessions_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",outcome="superseded"}'
+        values: '0x100'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: VoiceStreamDisconnectsAbnormal
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: VoiceStreamDisconnectsAbnormal
+        exp_alerts: []
+
+  - name: Four real drops in 5 minutes stay under the floor however many phones go idle
+    interval: 15s
+    input_series:
+      # One person's flaky network drops 4 streams per 5 minutes: a third of
+      # the streams that ran, but under the floor of 5 real drops. The idle
+      # closes beside them must not lift the floor; counted there, 8 per 5
+      # minutes would fire at about 13m.
+      - series: 'voice_stream_sessions_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",outcome="disconnected"}'
+        values: '0+0.2x100'
+      - series: 'voice_stream_sessions_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",outcome="idle"}'
+        values: '0+0.2x100'
+      - series: 'voice_stream_sessions_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",outcome="completed"}'
+        values: '0+0.2x100'
+      - series: 'voice_stream_sessions_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",outcome="superseded"}'
+        values: '0x100'
+    alert_rule_test:
+      - eval_time: 15m
         alertname: VoiceStreamDisconnectsAbnormal
         exp_alerts: []
       - eval_time: 20m
@@ -588,6 +774,38 @@ tests:
         values: '0+1x40'
       - series: 'voice_stream_errors_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",reason="engine_timeout"}'
         values: '0x40'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: VoiceStreamEngineDown
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: VoiceStreamEngineDown
+        exp_alerts:
+          - exp_labels: { severity: warning, service: stt-stream, instance: "worker:30009", job: stt-stream, node: spark-2, role: worker }
+            exp_annotations:
+              summary: "Live dictation engine on spark-2 is not answering, and the orchestrator failed to reach it"
+              description: >-
+                Prometheus cannot scrape the engine's /metrics, and the gateway
+                counted engine_unavailable or engine_timeout in the last 15
+                minutes: live dictation is configured, in use, and gives nobody
+                live words. Recordings still transcribe after Stop, since whisper
+                does not depend on this engine. Starting or recreating it is an
+                operator's decision; it never involves the main model.
+              runbook: monitoring/developer-api/README.md#live-dictation-engine
+              safe_command: "scripts/stt-stream.sh status"
+
+  - name: The engine unscrapeable while every gateway attempt times out warns
+    interval: 15s
+    input_series:
+      # A hung engine rather than a refusing one: the gateway's connects run
+      # into VOICE_LIVE_ENGINE_CONNECT_S and count engine_timeout, while
+      # engine_unavailable stays at zero.
+      - series: 'up{instance="worker:30009",job="stt-stream",node="spark-2",role="worker",service="stt-stream"}'
+        values: '0x40'
+      - series: 'voice_stream_errors_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",reason="engine_unavailable"}'
+        values: '0x40'
+      - series: 'voice_stream_errors_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",reason="engine_timeout"}'
+        values: '0+1x40'
     alert_rule_test:
       - eval_time: 2m
         alertname: VoiceStreamEngineDown

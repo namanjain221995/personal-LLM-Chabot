@@ -65,9 +65,9 @@ groups:
             sum by (le) (rate(voice_stream_final_seconds_bucket{job="orchestrator"}[5m])))
 
       # Arrival of the newest sample an event covers to that event written,
-      # per event (partial, final). High lag with a low engine RTF puts the
-      # delay between the engine and the browser: the orchestrator's event
-      # loop, or the network to the worker.
+      # per event (partial, final). High lag with the engine's real-time
+      # factor (defined below) well under 0.8 puts the delay outside the
+      # decoder: the orchestrator's event loop, or the network to the worker.
       - record: event:voice_stream_event_lag_seconds:p95_5m
         expr: >-
           histogram_quantile(0.95,
@@ -90,10 +90,21 @@ groups:
       - record: profile:stt_stream_audio_seconds:rate5m
         expr: sum by (profile) (rate(stt_stream_audio_seconds_total{job="stt-stream"}[5m]))
 
-      # REAL-TIME FACTOR: decode seconds per second of audio. The `> 0` on the
-      # denominator leaves an idle profile with no sample instead of NaN, and
-      # instead of +Inf when a tail is decoded after its audio stopped: +Inf
-      # compares greater than any threshold.
+      # REAL-TIME FACTOR: decode seconds charged per second of audio received.
+      # The engine charges EVERY stream in a decode_streams batch the batch's
+      # wall time (stt_stream_compute_seconds_total += elapsed x streams in
+      # the batch; build spec section 11), so the factor is a decode step's
+      # wall time over the chunk it decodes, weighted by batch size. 1.0 is a
+      # decode worker that needs a whole chunk's length to decode one chunk:
+      # every stream on it falls behind real time. A saturated worker reads
+      # exactly 1.0: its streams are in every batch, it never idles, and their
+      # audio keeps arriving at real time, so the backlog grows while the
+      # ratio stays put. Charged once per batch instead, a full profile would
+      # top out at workers / streams (0.25 for 2 workers and 8 streams) and
+      # never reach the alert line.
+      # The `> 0` on the denominator leaves an idle profile with no sample
+      # instead of NaN, and instead of +Inf when a tail is decoded after its
+      # audio stopped: +Inf compares greater than any threshold.
       - record: profile:stt_stream_real_time_factor:ratio_rate5m
         expr: >-
           sum by (profile) (rate(stt_stream_compute_seconds_total{job="stt-stream"}[5m]))
@@ -149,21 +160,27 @@ groups:
       - alert: VoiceStreamEngineFallingBehind
         # Two causes, told apart by the `cause` label.
         #
-        # decode_rtf: RTF above 0.8 on a profile carrying at least half a
-        # real-time stream. 1.0 means decoding takes as long as the audio,
-        # which is only "behind" if stt_stream_compute_seconds_total charges
-        # EVERY stream of a decode_streams batch the batch's wall time.
-        # Charged once per batch, the ratio saturates at workers / streams per
-        # profile (0.5 for 4 workers and 8 streams) and this branch stays
-        # silent at full load; the latency alerts above still see the result.
+        # decode_rtf: the real-time factor (defined on its recording rule
+        # above: every stream in a decode batch is charged the batch's wall
+        # time) over 0.8 on a profile carrying at least half a real-time
+        # stream. 1.0 is a decode worker that needs a whole chunk's length per
+        # chunk, and a saturated one reads exactly 1.0, so 0.8 leaves a fifth
+        # of the budget. The 12-stream measurement on the worker had a decode
+        # tick p95 of 99-102 ms, 0.62-0.64 of the 160 ms chunk.
         #
         # capacity_refusals: the gateway's own count of streams it refused
         # with `capacity`, which covers both an engine with every profile for
         # the language full (the engine answers `capacity` and the gateway
         # relays it) and the gateway's VOICE_LIVE_MAX_STREAMS. It does not
         # depend on the new scrape path to the worker. A refused browser
-        # retries with backoff while it records, so three in 10 minutes is one
-        # person turned away for a few seconds.
+        # retries while it records (0.5, 1, 2, 4, 8 s, then every 15 s), so
+        # one person turned away for half a minute is a burst of about six,
+        # all in the first 30 s. The window is no longer than `for`, so the
+        # last window the alert must hold in opens when the first three were
+        # counted: it takes three more after them. A burst that is over within
+        # about a minute leaves the window first; refusals that keep coming
+        # warn. A 10-minute window held 5 minutes fired on one person turned
+        # away for 4 s (review, 2026-09-29).
         expr: >-
           label_replace(
             (profile:stt_stream_real_time_factor:ratio_rate5m > 0.8)
@@ -171,24 +188,28 @@ groups:
             "cause", "decode_rtf", "", "")
           or
           label_replace(
-            sum(increase(voice_stream_rejections_total{job="orchestrator", reason="capacity"}[10m])) >= 3,
+            sum(increase(voice_stream_rejections_total{job="orchestrator", reason="capacity"}[5m])) >= 3,
             "cause", "capacity_refusals", "", "")
         for: 5m
         labels: { severity: warning, service: stt-stream }
         annotations:
-          summary: '{{ if eq $labels.cause "decode_rtf" }}Live dictation engine: profile {{ $labels.profile }} spends {{ $value | printf "%.2f" }} s decoding per second of audio{{ else }}Live dictation refused {{ $value | printf "%.0f" }} stream(s) at capacity in 10 minutes{{ end }}'
+          summary: '{{ if eq $labels.cause "decode_rtf" }}Live dictation engine: profile {{ $labels.profile }} spends {{ $value | printf "%.2f" }} s decoding per second of audio{{ else }}Live dictation refused {{ $value | printf "%.0f" }} stream(s) at capacity in 5 minutes{{ end }}'
           description: >-
-            decode_rtf: a profile has needed more than 0.8 s of decoding per
-            second of audio for 5 minutes; one more stream can push it past
-            real time, and then every stream on it falls behind.
-            capacity_refusals: streams were refused because every engine
-            profile for their language was full, or the gateway reached
-            VOICE_LIVE_MAX_STREAMS; the refusals panel shows the engine's own
-            count beside the gateway's. The engine is held to eight of the
-            worker's cores so that chat does not pay for it: 12 streams cost
-            chat nothing measurable, while 48 streams with every core busy cost
-            it 11-16% of its decode speed. More capacity trades against chat
-            and is the owner's decision.
+            decode_rtf: for 5 minutes a profile has been charged more than
+            0.8 s of decoding per second of its audio, every stream in a
+            decode batch being charged the batch's time. At 1.0 its decode
+            workers need a whole chunk's length per chunk and every stream
+            on them falls behind; a saturated engine reads exactly 1.0, and
+            how far behind it is shows in the latency alerts, not here.
+            capacity_refusals: for 5 minutes, every 5-minute window held at
+            least 3 streams refused because every engine profile for their
+            language was full, or the gateway reached VOICE_LIVE_MAX_STREAMS;
+            the refusals panel shows the engine's own count beside the
+            gateway's. The engine is held to eight of the worker's cores so
+            that chat does not pay for it: 12 streams cost chat nothing
+            measurable, while 48 streams with every core busy cost it 11-16%
+            of its decode speed. More capacity trades against chat and is the
+            owner's decision.
           runbook: monitoring/developer-api/README.md#live-dictation-engine
           safe_command: "scripts/stt-stream.sh status"
 
@@ -221,26 +242,33 @@ groups:
 
       - alert: VoiceStreamDisconnectsAbnormal
         # disconnected: the socket closed with no close frame (a network drop,
-        # a relay destroyed at a frontend deploy). idle: no audio for
-        # VOICE_LIVE_IDLE_S while the socket stayed open. superseded: a newer
+        # a relay destroyed at a frontend deploy). superseded: a newer
         # connection took the recording over, usually a reconnect that
         # arrived before the old socket was noticed dead.
+        # NOT idle (no audio for VOICE_LIVE_IDLE_S, 120 s, with the socket
+        # open): a phone whose screen turns off mid-recording stops sending
+        # audio and closes exactly that way in normal use (the recorder then
+        # says "Recording paused while the screen was off"), and the build
+        # spec keeps that close as `idle` (section 11). Idle stays on the
+        # outcomes panel, and in the denominator: those streams ran.
         expr: >-
-          100 * sum(increase(voice_stream_sessions_total{job="orchestrator", outcome=~"disconnected|idle|superseded"}[5m]))
+          100 * sum(increase(voice_stream_sessions_total{job="orchestrator", outcome=~"disconnected|superseded"}[5m]))
             / sum(increase(voice_stream_sessions_total{job="orchestrator", outcome!="rejected"}[5m])) > 25
-          and on() sum(increase(voice_stream_sessions_total{job="orchestrator", outcome=~"disconnected|idle|superseded"}[5m])) >= 5
+          and on() sum(increase(voice_stream_sessions_total{job="orchestrator", outcome=~"disconnected|superseded"}[5m])) >= 5
         for: 10m
         labels: { severity: warning, service: stt-stream }
         annotations:
-          summary: "Live dictation: {{ $value | printf \"%.0f\" }}% of live streams dropped (disconnected, idle or superseded, 5 minutes)"
+          summary: "Live dictation: {{ $value | printf \"%.0f\" }}% of live streams dropped (disconnected or superseded, 5 minutes)"
           description: >-
             Over a quarter of the streams that ran ended without either side
-            closing them, went silent, or were taken over by a reconnect, with
-            at least 5 per 5 minutes, for 10 minutes. A deploy drops every open
-            stream once and does not hold that long. The metrics name no
-            person, so one person's bad network and a broken tunnel look alike
-            here; the gateway's per-stream close log line (outcome, reconnect)
-            and the frontend relay's ws_close lines tell them apart.
+            closing them, or were taken over by a reconnect, with at least 5
+            per 5 minutes, for 10 minutes. A deploy drops every open stream
+            once and does not hold that long. Idle closes (no audio for 120 s,
+            as when a phone's screen turns off while recording) are normal
+            use and not counted. The metrics name no person, so one person's
+            bad network and a broken tunnel look alike here; the gateway's
+            per-stream close log line (outcome, reconnect) and the frontend
+            relay's ws_close lines tell them apart.
           runbook: monitoring/developer-api/README.md#live-dictation-failures-and-drops
           safe_command: "scripts/stt-stream.sh status"
 
