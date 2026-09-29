@@ -335,3 +335,153 @@ def test_a_retried_create_is_answered_even_at_the_ceiling(voice, login_client, m
     assert again.status_code in (200, 201), again.text
     assert again.json()["session_id"] == first.json()["session_id"]
     assert create(login_client("bob")).status_code == 503
+
+
+# -- D. noise windows: asked with the gate, judged per VAD-speech second ----
+
+
+class _RealEngine:
+    """What compose/whisper/server.py answers, measured live 2026-09-29: with
+    the gate OFF no_speech_prob is 0.0 for everything; with it ON it is the
+    real number (0.0525 for pink noise at -30 dBFS, which passes the gate).
+    Every window here is room noise that decodes as a stock phrase."""
+
+    name = "whisper"
+    model = "whisper-test"
+
+    def __init__(self, *, gated_nsp: float = 0.0525, gate_empties: bool = False, words: str = "Thank you for watching."):
+        self.gated_nsp = gated_nsp
+        self.gate_empties = gate_empties
+        self.words = words
+        self.asked: List[bool] = []
+
+    async def transcribe_window(self, audio, *, filename, content_type, timeout_s=None, no_speech_check=False):
+        self.asked.append(bool(no_speech_check))
+        seconds = (len(audio) - 44) / (2 * 16000)
+        nsp = self.gated_nsp if no_speech_check else 0.0
+        if no_speech_check and self.gate_empties:
+            segments = ()
+        else:
+            segments = ({"start": 0.0, "end": min(seconds, 29.98), "text": self.words, "language": "en"},)
+        transcript = asr.TranscriptSegments(
+            text=" ".join(s["text"] for s in segments), language="English", language_code="en",
+            provider="whisper", model="whisper-test", engine_ms=5, segments=segments,
+        )
+        return asr.WindowReply(transcript, nsp)
+
+    async def health(self):
+        return True
+
+
+def test_a_noise_window_that_decodes_as_a_stock_phrase_is_dropped(voice, login_client):
+    """Live, window 108 of an hour (11 s of pink noise) came back "Thank you
+    for watching." and stayed in the transcript: the session asked with the
+    gate off, where the engine reports no_speech_prob 0.0, so no rule fired."""
+    engine = _RealEngine()
+    asr.set_provider(engine)
+    _script, data = recording(voice.tmp, 40.0, seed=31)
+    alice = login_client("alice")
+    sid = _store_and_finish(alice, data)
+    done = wait_done(alice, sid, timeout=60)
+    assert "watching" not in (done["text"] or "").lower(), done
+    assert done["gaps"] and all(g["reason"] == "dropped_as_noise" for g in done["gaps"]), done
+    assert engine.asked and engine.asked[0] is True, "each window is asked WITH the gate first"
+
+
+def test_a_window_the_gate_empties_is_asked_again_and_dense_speech_is_kept(voice, login_client):
+    """The first-30-s gate emptied real dictation that opened quietly
+    (2026-09-24); a gated window VAD heard speech in is asked again without
+    the gate, and words as dense as speech stand."""
+    words = " ".join(["alpha bravo charlie delta echo foxtrot golf hotel"] * 12) + "."
+    engine = _RealEngine(gated_nsp=0.83, gate_empties=True, words=words)
+    asr.set_provider(engine)
+    _script, data = recording(voice.tmp, 40.0, seed=32)
+    alice = login_client("alice")
+    sid = _store_and_finish(alice, data)
+    done = wait_done(alice, sid, timeout=60)
+    assert True in engine.asked and False in engine.asked, engine.asked
+    assert done["outcome"] == "transcribed", done
+    assert "foxtrot" in done["text"]
+
+
+# -- I. the legacy words-per-second floor ----------------------------------
+
+
+def test_a_stock_phrase_over_the_quiet_opening_does_not_sink_real_speech():
+    """Live: 60 s, 32 s of quiet then 28 s of speech. The ungated decode heard
+    52 words, but a hallucinated "Thank you." covering 0-29.98 s made it 52
+    words over 53.6 covered seconds, 0.97/s, under the 1.0 floor: the person
+    was told nothing was said."""
+    words = " ".join(["word"] * 50) + "."
+    segments = [
+        {"start": 0.0, "end": 29.98, "text": "Thank you."},
+        {"start": 30.0, "end": 53.6, "text": words},
+    ]
+    text = "Thank you. " + words
+    assert asr.speech_is_plausible(text, 60.0, segments, engine_heard_speech=False)
+    # Noise that is nothing but stock phrases still goes.
+    only_stock = [{"start": 0.0, "end": 29.98, "text": "Thank you."}, {"start": 30.0, "end": 59.0, "text": "Thanks for watching!"}]
+    assert not asr.speech_is_plausible("Thank you. Thanks for watching!", 60.0, only_stock, engine_heard_speech=False)
+    # And sparse invented words with a stock phrase beside them still go.
+    sparse = [{"start": 0.0, "end": 20.0, "text": "Thank you."}, {"start": 20.0, "end": 59.0, "text": "Stabilization is very good."}]
+    assert not asr.speech_is_plausible("Thank you. Stabilization is very good.", 60.0, sparse, engine_heard_speech=False)
+
+
+# -- F. two stopped backlogs no longer freeze everybody's live preview -----
+
+
+def test_a_live_window_is_not_starved_by_two_stopped_backlogs():
+    """_SessionGate granted urgent (stopped) windows strictly first; with two
+    stopped backlogs one was always waiting at each release, so a live
+    talker's first window waited for the first backlog to drain."""
+
+    async def run() -> List[str]:
+        gate = asr._SessionGate()
+        order: List[str] = []
+        live_done = asyncio.Event()
+
+        async def session(name: str, urgent: bool, windows: int) -> None:
+            for _ in range(windows):
+                if name == "live" and live_done.is_set():
+                    return
+                await gate.acquire(urgent=urgent)
+                order.append(name)
+                await asyncio.sleep(0.01)
+                gate.release()
+                if name == "live":
+                    live_done.set()
+                    return
+                await asyncio.sleep(0)
+
+        await gate.acquire(urgent=True)  # a window already decoding
+        tasks = [
+            asyncio.create_task(session("stopped-a", True, 30)),
+            asyncio.create_task(session("stopped-b", True, 30)),
+        ]
+        await asyncio.sleep(0.01)
+        tasks.append(asyncio.create_task(session("live", False, 1)))
+        await asyncio.sleep(0.01)
+        gate.release()
+        await asyncio.gather(*tasks)
+        return order
+
+    order = asyncio.run(run())
+    assert "live" in order
+    # Before: every window of both backlogs (60) went first.
+    assert order.index("live") <= 2, order
+
+
+# -- /v1 yields to session dictation too ------------------------------------
+
+
+def test_public_audio_yields_to_a_session_window_as_to_a_legacy_dictation(monkeypatch):
+    """capacity.dictation_is_busy counted only the legacy POOL, so a public
+    clip started beside a decoding session window on a two-replica fleet."""
+    from app.publicapi import capacity
+
+    monkeypatch.setattr(settings, "asr_base_urls", ("http://asr-worker:1/v1", "http://asr-head:1/v1"))
+    monkeypatch.setattr(asr.POOL, "active", 0, raising=False)
+    monkeypatch.setattr(asr.SESSION_GATE, "active", 0)
+    assert capacity.dictation_is_busy() is False
+    monkeypatch.setattr(asr.SESSION_GATE, "active", 1)
+    assert capacity.dictation_is_busy() is True

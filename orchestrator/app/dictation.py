@@ -2284,6 +2284,8 @@ class _Live:
 
         reply = None
         reason = None
+        gated = False
+        vad_speech_s = self._vad_speech_s(w)
         for attempt in range(1, _WINDOW_ATTEMPTS + 1):
             if self.status == STATUS_CANCELLED:
                 return
@@ -2291,13 +2293,30 @@ class _Live:
             clip = await _io(self._clip, w)
             self._set_waiting("engine")
             try:
+                # WITH the engine's gate first: without it the engine reports
+                # no_speech_prob 0.0 for everything, so noise windows came
+                # back as "Thank you for watching." and were kept (live,
+                # 2026-09-29). A window the gate empties although VAD heard
+                # a real stretch of speech in it is asked again without it.
                 reply = await asr.transcribe_session_window(
                     clip,
                     filename=f"s{w.i:05d}.wav",
                     urgent=lambda: not self.recording_class(),
                     short=self.is_short,
                     on_admitted=lambda: self._set_waiting("none"),
+                    no_speech_check=True,
                 )
+                if asr.window_was_gated(reply) and vad_speech_s >= asr._RETRY_MIN_SECONDS:
+                    gated = True
+                    self._set_waiting("engine")
+                    reply = await asr.transcribe_session_window(
+                        clip,
+                        filename=f"s{w.i:05d}.wav",
+                        urgent=lambda: not self.recording_class(),
+                        short=self.is_short,
+                        on_admitted=lambda: self._set_waiting("none"),
+                        no_speech_check=False,
+                    )
                 break
             except asr.ASRRejected as exc:
                 log.info("voice session %s window %d refused by the engine: %s", self.id, w.i, exc)
@@ -2347,26 +2366,26 @@ class _Live:
             seconds = w.end_s - w.start_s
             w.language = code
             nsp = reply.no_speech_prob
-            # EACH WINDOW IS JUDGED ON ITS OWN, the way dictation judges a
-            # clip: the engine still REPORTS its no-speech probability with
-            # the gate off. Where it would NOT have gated this window, its
-            # words stand (only a lone stock phrase it was unsure of goes);
-            # where it would have, the words must be as dense as speech, the
-            # rule asr.py applies to its ungated second decode. Applying the
+            # EACH WINDOW IS JUDGED ON ITS OWN (asr.window_is_plausible), on
+            # the probability the engine reports WITH its gate (with it off
+            # the real engine reports 0.0, so these rules never fired). Where
+            # the gate let the window through, its words stand (a lone stock
+            # phrase it was unsure of must be as dense as speech over what VAD
+            # heard); where it gated it, the ungated words must be as dense as
+            # speech, the rule asr.py applies to its second decode. Applying the
             # density rule to every window, as first built, dropped a real
             # sentence: LibriVox reading the chapter title "Chapter III, The
             # Stock-Broker's Clerk" slowly came back as 5 words in one 12.52 s
             # segment (0.40 words/s) with no_speech_prob 0.0 (live worker
             # engine, 2026-09-29, 3 of 3 runs).
-            heard = nsp is None or nsp <= asr._ENGINE_NO_SPEECH_THRESHOLD
-            if text and not asr.speech_is_plausible(
-                text, seconds, segments, engine_heard_speech=heard, no_speech_prob=nsp
+            if text and not asr.window_is_plausible(
+                text, seconds, segments, vad_speech_s=vad_speech_s, gated=gated, no_speech_prob=nsp,
             ):
                 w.status, w.reason, w.segments = "dropped", "dropped_as_noise", []
                 w.dropped = segments
             else:
                 w.status, w.segments = "done", segments
-                w.low = asr._reply_confidence(text, seconds, nsp) == asr.CONFIDENCE_LOW
+                w.low = gated or asr._reply_confidence(text, seconds, nsp) == asr.CONFIDENCE_LOW
         if self.status == STATUS_CANCELLED:
             return
         _append_line(
@@ -2380,6 +2399,15 @@ class _Live:
             },
         )
         metrics.inc("voice_session_windows_total", "recording-session windows finished", result=w.status)
+
+    @staticmethod
+    def _vad_speech_s(w: _WindowState) -> float:
+        """Seconds of the window voice-activity detection called speech (the
+        whole window when the plan carries no regions)."""
+        total = 0.0
+        for a, b in w.regions or ():
+            total += max(0.0, min(b, w.end_s) - max(a, w.start_s))
+        return total if w.regions else max(0.0, w.end_s - w.start_s)
 
     def _stitch(self, w: _WindowState) -> None:
         emitted = self.stitcher.feed_window(

@@ -72,7 +72,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Protocol, Sequence
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 from . import metrics
 from .config import settings
@@ -618,9 +618,12 @@ class VLLMAudioProvider:
         filename: str,
         content_type: str,
         timeout_s: Optional[float] = None,
+        no_speech_check: bool = False,
     ) -> WindowReply:
         """One recording-session window -> segments and the engine's
-        no-speech probability, with the engine's silence gate OFF.
+        no-speech probability, with the engine's silence gate OFF unless
+        `no_speech_check` (then the probability is a real one: with the gate
+        off compose/whisper/server.py reports 0.0 for everything).
 
         The gate judges the FIRST 30 s of a clip, and a session window is a
         stretch of audio that voice-activity detection already found speech
@@ -633,7 +636,7 @@ class VLLMAudioProvider:
             filename,
             content_type,
             segments=True,
-            no_speech_check=False,
+            no_speech_check=no_speech_check,
             timeout_s=timeout_s,
         )
         assert isinstance(result, TranscriptSegments)
@@ -819,6 +822,50 @@ def _only_stock_phrases(text: str) -> bool:
     return bool(parts) and all(part in _STOCK_PHRASES for part in parts)
 
 
+def window_was_gated(reply: "WindowReply") -> bool:
+    """A session window asked WITH the gate came back empty because the gate
+    fired (its no-speech probability is over the engine's threshold)."""
+    return (
+        not (reply.transcript.text or "").strip()
+        and reply.no_speech_prob is not None
+        and reply.no_speech_prob > _ENGINE_NO_SPEECH_THRESHOLD
+    )
+
+
+def window_is_plausible(
+    text: str,
+    seconds: float,
+    segments: Sequence[Dict[str, Any]],
+    *,
+    vad_speech_s: float,
+    gated: bool,
+    no_speech_prob: Optional[float],
+) -> bool:
+    """A recording-session window's words are speech rather than invention.
+
+    Asked WITH the gate (2026-09-29): the no-speech probability is then a
+    real one. Gated windows were decoded again without it and their words
+    must be as dense as speech over what voice-activity detection heard, and
+    not only a stock phrase. A window the gate let through keeps its words
+    (`speech_is_plausible`), except a lone stock phrase the engine was not
+    sure of, which must be as dense as speech over the VAD-speech seconds:
+    live, 11 s of pink noise at -30 dBFS decoded as "Thank you for watching."
+    (4 words over 11 s of what VAD called speech, 0.36 words/s) while a real
+    "Thank you." is a second of speech (2 words/s)."""
+    units = _speech_units(text)
+    if units == 0:
+        return False
+    density = units / max(float(vad_speech_s), 1.0)
+    if gated:
+        return density >= _GATED_MIN_WORDS_PER_S and not _only_stock_phrases(text)
+    heard = no_speech_prob is None or no_speech_prob <= _ENGINE_NO_SPEECH_THRESHOLD
+    if not speech_is_plausible(text, seconds, segments, engine_heard_speech=heard, no_speech_prob=no_speech_prob):
+        return False
+    if _only_stock_phrases(text) and (no_speech_prob is None or no_speech_prob >= _CONFIDENT_SPEECH_NSP):
+        return density >= _GATED_MIN_WORDS_PER_S
+    return True
+
+
 def speech_is_plausible(
     text: str,
     seconds: float,
@@ -844,6 +891,15 @@ def speech_is_plausible(
         if no_speech_prob is not None and no_speech_prob < _CONFIDENT_SPEECH_NSP:
             return True
         return not (seconds >= _STOCK_PHRASE_MIN_SECONDS and _only_stock_phrases(text))
+    # A stock phrase that is not all of the text is the decoder filling a
+    # quiet stretch: live, a 60 s dictation (32 s quiet, then 52 words of real
+    # speech) came back with "Thank you." spanning 0-29.98 s, which made it
+    # 0.97 words per covered second and 'Nothing was said' (2026-09-29
+    # review). The density is judged on the other segments.
+    real = [s for s in segments or () if not _only_stock_phrases(str(s.get("text") or ""))]
+    if real and len(real) < len(segments or ()):
+        units = sum(_speech_units(str(s.get("text") or "")) for s in real)
+        segments = real
     covered = _covered_seconds(segments) or seconds
     return units / max(covered, 1.0) >= _GATED_MIN_WORDS_PER_S
 
@@ -1054,6 +1110,7 @@ class RoutedProvider:
         filename: str,
         content_type: str,
         timeout_s: Optional[float] = None,
+        no_speech_check: bool = False,
     ) -> WindowReply:
         return await self._routed(
             "transcribe_window",
@@ -1061,6 +1118,7 @@ class RoutedProvider:
             filename=filename,
             content_type=content_type,
             timeout_s=timeout_s,
+            no_speech_check=no_speech_check,
         )
 
     async def _routed(self, method: str, audio: bytes, **kwargs: Any):
@@ -1440,6 +1498,8 @@ class _SessionGate:
         #: whether the engine is back.
         self.timeouts_in_a_row = 0
         self.opened_at = 0.0
+        #: urgent windows granted in a row (`_grant`'s anti-starvation)
+        self.urgent_streak = 0
 
     def breaker_open(self) -> bool:
         """True while windows must not be sent. Claims the half-open probe:
@@ -1496,14 +1556,25 @@ class _SessionGate:
         metrics.set_gauge("asr_session_gate_waiting", self.waiting, "session windows waiting for the engine")
 
     def _grant(self) -> None:
+        def key(w: _SessionWaiter) -> Tuple[int, int, float, int]:
+            return (0 if w.is_short() else 1, 0 if w.is_urgent() else 1, w.ready, w.seq)
+
         while self.active < self._size() and self._waiters:
-            best = min(
-                self._waiters,
-                key=lambda w: (0 if w.is_short() else 1, 0 if w.is_urgent() else 1, w.ready, w.seq),
-            )
+            best = min(self._waiters, key=key)
+            if best.is_urgent() and not best.is_short() and self.urgent_streak >= _URGENT_STREAK_MAX:
+                # NO STARVATION. With two stopped backlogs, one of them was
+                # always waiting at each release, so nobody's live preview
+                # was granted until the first backlog drained (review T2:
+                # first text 3.0-3.3 s instead of 0.1 s; about 45 min under
+                # chat for two one-hour backlogs). After _URGENT_STREAK_MAX
+                # urgent windows in a row, a waiting live window goes next.
+                live = [w for w in self._waiters if not w.is_urgent() and not w.future.done()]
+                if live:
+                    best = min(live, key=key)
             self._waiters.remove(best)
             if best.future.done():  # its task was cancelled while waiting
                 continue
+            self.urgent_streak = self.urgent_streak + 1 if best.is_urgent() else 0
             self.active += 1
             best.future.set_result(None)
 
@@ -1545,10 +1616,14 @@ class _SessionGate:
         self.last_unavailable = 0.0
         self.timeouts_in_a_row = 0
         self.opened_at = 0.0
+        self.urgent_streak = 0
 
 
 #: Session windows timed out in a row before the breaker opens.
 _BREAKER_TIMEOUTS = 2
+#: Urgent (stopped) session windows granted in a row before a waiting live
+#: window goes: a live preview gets at least one slot in three.
+_URGENT_STREAK_MAX = 2
 
 SESSION_GATE = _SessionGate()
 
@@ -1560,6 +1635,7 @@ async def transcribe_session_window(
     urgent: Any = False,
     short: Any = False,
     on_admitted: Optional[Any] = None,
+    no_speech_check: bool = False,
 ) -> WindowReply:
     """One recording-session window (WAV bytes) -> segments, under the
     session gate, with the engine's first-30-s silence gate OFF.
@@ -1592,7 +1668,7 @@ async def transcribe_session_window(
             # A stand-in provider without the session method: the same
             # request, without the no-speech probability.
             result = await engine.transcribe_segments(
-                audio, filename=filename, content_type="audio/wav", no_speech_check=False
+                audio, filename=filename, content_type="audio/wav", no_speech_check=no_speech_check
             )
             reply = WindowReply(result, None)
         else:
@@ -1601,6 +1677,7 @@ async def transcribe_session_window(
                 filename=filename,
                 content_type="audio/wav",
                 timeout_s=settings.voice_session_window_timeout_s,
+                no_speech_check=no_speech_check,
             )
     except ASRTimeout:
         SESSION_GATE.last_unavailable = time.monotonic()

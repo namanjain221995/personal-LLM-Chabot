@@ -217,8 +217,8 @@ def test_a_recording_whose_first_30_seconds_are_quiet_returns_every_word(voice, 
     120 s of speech. The legacy path sends it whole; the engine judges the
     quiet opening, empties the clip, and at 150 s (> the 120 s retry bound)
     nobody asks again: empty, 'unclear', the microphone sentence. The session
-    sends only what voice-activity detection found speech in, with the gate
-    off, and must return every word, at its time.
+    sends only what voice-activity detection found speech in, so the gate
+    judges speech, and must return every word, at its time.
     """
     script, data = recording(voice.tmp, 120.0, quiet_s=30.0, opening=opening)
     alice = login_client("alice")
@@ -240,7 +240,11 @@ def test_a_recording_whose_first_30_seconds_are_quiet_returns_every_word(voice, 
     assert done["text"].split()[0].lower().strip(".") == script.words[0].text
     print(json.dumps({"opening": opening, "words": verdict["words"], "windows": len(voice.fake.calls) - legacy_calls, "clip_s": [round(c["seconds"], 1) for c in voice.fake.calls[legacy_calls:]], "first_start": all_segments(alice, sid)[0]["start_ms"], "outcome": done["outcome"], "speech_ms": done["speech_ms"], "audio_ms": done["audio_ms"]}))
     session_calls = voice.gate_flags[legacy_calls:]
-    assert session_calls and not any(session_calls), "every session window goes with the gate OFF"
+    # Each window is asked WITH the gate (round 2, 2026-09-29: with it off the
+    # real engine reports no_speech_prob 0.0 and noise was kept); the gate now
+    # judges a window VAD found speech in, not the quiet opening, and one it
+    # empties anyway is asked again without it.
+    assert session_calls and session_calls[0] is True, "a session window is asked with the gate first"
     # Nothing from the quiet opening was sent: the first clip starts on speech.
     assert all(call["seconds"] <= settings.voice_session_window_max_s + 0.01 for call in voice.fake.calls[legacy_calls:])
 
@@ -876,7 +880,9 @@ def test_two_hours_transcribe_word_for_word_with_no_ceiling_and_flat_memory(voic
     assert report["stitcher"]["seams_aligned"] >= 10, "continuous speech really was split with overlaps"
     assert all(call["seconds"] <= settings.voice_session_window_max_s + 0.01 for call in voice.fake.calls)
     assert voice.fleet.peak_in_flight == 1
-    assert not any(voice.gate_flags), "no window of two hours asked for the engine's silence gate"
+    # Every window is asked WITH the gate (round 2): speech windows pass it,
+    # so two hours of speech cost no second decode.
+    assert voice.gate_flags and all(voice.gate_flags), "a speech window was gated and decoded twice"
     assert long_peak - warm_peak < 16 * 1024 * 1024, (warm_peak, long_peak)
 
 
@@ -994,7 +1000,7 @@ class _SparseEngine:
     def __init__(self, no_speech_prob):
         self.no_speech_prob = no_speech_prob
 
-    async def transcribe_window(self, audio, *, filename, content_type, timeout_s=None):
+    async def transcribe_window(self, audio, *, filename, content_type, timeout_s=None, no_speech_check=False):
         seconds = (len(audio) - 44) / (2 * SR)
         segments = ({"start": 0.0, "end": seconds, "text": "Chapter three, the stockbroker's clerk.", "language": "en"},)
         transcript = asr.TranscriptSegments(
