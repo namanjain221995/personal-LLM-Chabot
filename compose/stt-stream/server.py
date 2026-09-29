@@ -330,12 +330,14 @@ class Settings:
     #: 11.5 cores of decode against the container's 8. Sized from the
     #: worker's measurements (build spec sections 7 and 11): the 8-core
     #: cpuset decodes ~16 streams at 160 ms in real time (0.41 core each,
-    #: 6.6 cores), which is 32 units at 2 units a stream; the same 32 units
-    #: hold 32 streams at 560 ms (~0.2 core each, 6.5 cores). Both leave
-    #: ~1.4 cores for the event loop, feature extraction and the p95 of a
-    #: decode step. A flat stream count could not say that: 16 streams would
-    #: refuse the 17th with three cores idle when the overflow sits on the
-    #: cheap 560 ms profiles.
+    #: 6.6 cores), which is 32 units at 2 units a stream; a 560 ms stream
+    #: costs 1 (~0.2 core). That leaves ~1.4 cores for the event loop,
+    #: feature extraction and the p95 of a decode step. A flat stream count
+    #: could not say that: 16 streams would refuse the 17th with cores idle
+    #: when the overflow sits on the cheap 560 ms profiles. With the shipped
+    #: profiles the per-profile caps bind before the budget for 'auto'
+    #: traffic (20 streams, 28 units) and at most 24 streams fit in any mix;
+    #: capacity() still reports the budget's 32 (docs/voice/REALTIME.md).
     max_cost: int = 32
     idle_s: float = 60.0
     start_timeout_s: float = 10.0

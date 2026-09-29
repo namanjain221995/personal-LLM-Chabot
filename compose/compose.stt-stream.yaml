@@ -62,10 +62,14 @@ services:
       # THE DECODE BUDGET, across all four profiles: a 160 ms stream costs 2
       # units and a 560 ms stream 1 ("cost" below; measured: 0.41 core per
       # 160 ms stream, half that at 560 ms). 32 units are the ~16 real-time
-      # 160 ms streams the 8 cores decode (6.6 cores), or 32 at 560 ms,
-      # leaving ~1.4 cores of headroom. The profiles' own max_streams add up
-      # to 56 units, so this is what refuses first under load (capacity, a
-      # retryable 4429) instead of every stream falling behind.
+      # 160 ms streams the 8 cores decode (6.6 cores), leaving ~1.4 cores of
+      # headroom. With these profiles the engine admits 20 'auto' streams
+      # (multi-fast 8 + multi-wide 12, 28 units: the profile caps refuse
+      # first), 16 'en' streams (en-fast 8 + multi-fast 8: the budget refuses
+      # first) and at most 24 in any mix, never 32 (docs/voice/REALTIME.md,
+      # "How many streams fit"). Refusals are a retryable 4429. Measured at
+      # the cap, 16 x 160 ms on the production container (2026-09-30):
+      # WER 3.83 %, first partial p50 673 / p90 1,603 ms, 0 errors.
       STT_MAX_COST: "${STT_MAX_COST:-32}"
       STT_IDLE_S: "${STT_IDLE_S:-60}"
       # Silence in front of every new stream (build spec 8C): Nemotron 3.5
