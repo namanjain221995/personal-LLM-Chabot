@@ -402,3 +402,26 @@ def test_a_window_the_gate_empties_is_asked_again_and_dense_speech_is_kept(voice
     assert True in engine.asked and False in engine.asked, engine.asked
     assert done["outcome"] == "transcribed", done
     assert "foxtrot" in done["text"]
+
+
+# -- I. the legacy words-per-second floor ----------------------------------
+
+
+def test_a_stock_phrase_over_the_quiet_opening_does_not_sink_real_speech():
+    """Live: 60 s, 32 s of quiet then 28 s of speech. The ungated decode heard
+    52 words, but a hallucinated "Thank you." covering 0-29.98 s made it 52
+    words over 53.6 covered seconds, 0.97/s, under the 1.0 floor: the person
+    was told nothing was said."""
+    words = " ".join(["word"] * 50) + "."
+    segments = [
+        {"start": 0.0, "end": 29.98, "text": "Thank you."},
+        {"start": 30.0, "end": 53.6, "text": words},
+    ]
+    text = "Thank you. " + words
+    assert asr.speech_is_plausible(text, 60.0, segments, engine_heard_speech=False)
+    # Noise that is nothing but stock phrases still goes.
+    only_stock = [{"start": 0.0, "end": 29.98, "text": "Thank you."}, {"start": 30.0, "end": 59.0, "text": "Thanks for watching!"}]
+    assert not asr.speech_is_plausible("Thank you. Thanks for watching!", 60.0, only_stock, engine_heard_speech=False)
+    # And sparse invented words with a stock phrase beside them still go.
+    sparse = [{"start": 0.0, "end": 20.0, "text": "Thank you."}, {"start": 20.0, "end": 59.0, "text": "Stabilization is very good."}]
+    assert not asr.speech_is_plausible("Thank you. Stabilization is very good.", 60.0, sparse, engine_heard_speech=False)

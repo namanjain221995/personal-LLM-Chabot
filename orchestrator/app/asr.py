@@ -891,6 +891,15 @@ def speech_is_plausible(
         if no_speech_prob is not None and no_speech_prob < _CONFIDENT_SPEECH_NSP:
             return True
         return not (seconds >= _STOCK_PHRASE_MIN_SECONDS and _only_stock_phrases(text))
+    # A stock phrase that is not all of the text is the decoder filling a
+    # quiet stretch: live, a 60 s dictation (32 s quiet, then 52 words of real
+    # speech) came back with "Thank you." spanning 0-29.98 s, which made it
+    # 0.97 words per covered second and 'Nothing was said' (2026-09-29
+    # review). The density is judged on the other segments.
+    real = [s for s in segments or () if not _only_stock_phrases(str(s.get("text") or ""))]
+    if real and len(real) < len(segments or ()):
+        units = sum(_speech_units(str(s.get("text") or "")) for s in real)
+        segments = real
     covered = _covered_seconds(segments) or seconds
     return units / max(covered, 1.0) >= _GATED_MIN_WORDS_PER_S
 
