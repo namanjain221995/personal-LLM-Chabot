@@ -469,11 +469,55 @@ def _names_something(question: str) -> bool:
     return False
 
 
-def router_would_be_asked(question: str, *, now_year: int) -> bool:
+def router_would_be_asked(
+    question: str, *, now_year: int, weak_time_undecided: bool = False
+) -> bool:
     """True when `classify` would consult the router for this question: the
     deterministic pass could not decide. Lets a caller start work that does
-    not depend on the answer BEFORE the round trip, instead of after it."""
-    return _deterministic(question, now_year) is None
+    not depend on the answer BEFORE the round trip, instead of after it.
+    `weak_time_undecided` is `classify`'s argument of the same name."""
+    if _deterministic(question, now_year) is None:
+        return True
+    return weak_time_undecided and weak_time_only(question, now_year=now_year)
+
+
+# --------------------------------------------------------------------------
+# A weak time word inside a conversation (2026-09-29).
+#
+# "which of those three is most accepted today?", asked in a thread about the
+# fall of Rome, matched lexical:recent on "today" alone. The Fast pre-pass
+# then read the web with that subject-less sentence as the query (4.3 s before
+# the first token, 7.1k characters of unrelated pages in the prompt). In the
+# middle of a conversation "today", "now", "nowadays" and "these days" are as
+# often discourse as a request for a live value, so when one of them is the
+# ONLY signal the verdict rests on, the router is asked instead, exactly as
+# for any question the regex pass cannot settle. Every other signal keeps its
+# verdict with no router call: latest, current, right now, today's, a year,
+# an office, a price, a version, and every volatile word (rate, score,
+# stock, status, schedule, release). A question with no earlier turns is
+# never affected, so no standalone verdict moves.
+# --------------------------------------------------------------------------
+
+_WEAK_TIME = re.compile(r"(?:today|now|nowadays|these days)", re.I)
+_WEAK_TIME_WORD = re.compile(r"\b(?:today|now|nowadays|these days)\b", re.I)
+#: A message longer than this states its own subject; it is not the terse
+#: follow-up this rule is for, and the regex pass is not run on it twice.
+_WEAK_TIME_MAX_CHARS = 500
+
+
+def weak_time_only(question: str, *, now_year: int) -> bool:
+    """The deterministic verdict is lexical:recent and its only signal is a
+    weak time word (today, now, nowadays, these days)."""
+    q = question or ""
+    if len(q) > _WEAK_TIME_MAX_CHARS or not _WEAK_TIME_WORD.search(q):
+        return False
+    verdict = _deterministic(q, now_year)
+    if verdict is None or verdict.reason != "lexical:recent":
+        return False
+    if _STRONG_RECENT.search(q) or _VOLATILE.search(q):
+        return False
+    hits = [m.group(0) for m in _RECENT.finditer(q)]
+    return bool(hits) and all(_WEAK_TIME.fullmatch(h) for h in hits)
 
 
 # --------------------------------------------------------------------------
@@ -611,13 +655,31 @@ def static_timeless_task() -> Verdict:
     return Verdict(Freshness.STATIC, _MAX_AGE[Freshness.STATIC], TIMELESS_TASK_REASON)
 
 
-async def classify(question: str, *, now_year: int, allow_router: bool = True) -> Verdict:
+async def classify(
+    question: str,
+    *,
+    now_year: int,
+    allow_router: bool = True,
+    weak_time_undecided: bool = False,
+) -> Verdict:
     """How fresh must the evidence behind this answer be?
 
     `now_year` is passed in rather than read here so callers share ONE notion
     of "now" for a request — the same value that goes into the prompt.
+
+    `weak_time_undecided` (a turn inside a conversation, see `weak_time_only`):
+    a verdict whose only signal is a weak time word goes to the router. If the
+    router cannot answer, the deterministic verdict stands, as it did before.
     """
     verdict = _deterministic(question, now_year)
+    held: Optional[Verdict] = None
+    if (
+        verdict is not None
+        and allow_router
+        and weak_time_undecided
+        and weak_time_only(question, now_year=now_year)
+    ):
+        held, verdict = verdict, None
     if verdict is not None:
         return _with_volatility(verdict, question)
     if allow_router:
@@ -633,6 +695,8 @@ async def classify(question: str, *, now_year: int, allow_router: bool = True) -
             metrics.observe("freshness_router_seconds", time.perf_counter() - started, outcome="error")
         if asked is not None:
             return _with_volatility(asked, question)
+    if held is not None:
+        return _with_volatility(held, question)
     # Unclassifiable and no router: treat as RECENT. The failure this module
     # exists to prevent is answering a live question from stale weights, so an
     # unnecessary cache lookup is the cheaper mistake than a wrong fact.

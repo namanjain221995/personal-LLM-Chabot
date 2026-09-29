@@ -340,7 +340,9 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
         "outcome": set(STEP_OUTCOMES),
     },
     "knowledge_fast_lookup_seconds": {
-        "stage": {"fetch", "readback"},
+        # search / page / index / second_source_lag are the fetch's own
+        # sub-stages (engines/search.fetch_for_freshness, 2026-09-29).
+        "stage": {"fetch", "readback", "search", "page", "index", "second_source_lag"},
         "outcome": set(STEP_OUTCOMES),
     },
     # The route is not known yet while the context is assembled; `mode` is
@@ -551,6 +553,9 @@ def knowledge_fast_lookup(seconds: float, *, stage: str, outcome: str) -> None:
     p95 6,267 ms for the whole `fetch`, inside a pre-pass of p50 4,072 ms.
     `stage` is "fetch" (search + robots + page reads + extraction + index) or
     "readback" (the second retrieval, which is NOT inside the fetch deadline).
+    Inside the fetch, since 2026-09-29: "search" (the provider call), "page"
+    (the page reads), "index" (index_pending) and "second_source_lag" (from
+    the first page read to the second).
     """
     observe(
         "knowledge_fast_lookup_seconds",

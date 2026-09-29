@@ -30,6 +30,7 @@ answers exactly as it does today.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import os
@@ -52,6 +53,7 @@ from .freshness import (
     clearly_timeless,
     router_would_be_asked,
     static_timeless_task,
+    weak_time_only,
 )
 from . import web_memory as _web_memory
 
@@ -198,6 +200,56 @@ def source_floor_enabled() -> bool:
     return bool(getattr(settings, "knowledge_source_floor", False))
 
 
+def paste_own_words() -> bool:
+    """KNOWLEDGE_PASTE_OWN_WORDS (default on): see the paste branch of `prepare`."""
+    return bool(getattr(settings, "knowledge_paste_own_words", True))
+
+
+def followup_weak_time_router() -> bool:
+    """FRESHNESS_FOLLOWUP_WEAK_TIME_ROUTER (default on): freshness.weak_time_only."""
+    return bool(getattr(settings, "freshness_followup_weak_time_router", True))
+
+
+def fast_early_lookup() -> bool:
+    """KNOWLEDGE_FAST_EARLY_LOOKUP (default on): see `_EarlyLookup`."""
+    return bool(getattr(settings, "knowledge_fast_early_lookup", True))
+
+
+def _accepts(fn: Callable, name: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _retrieve_option(name: str, value) -> dict:
+    """`{name: value}` when the retrieval takes that keyword, else `{}`.
+
+    `topical_gate` and `on_candidates` are web_memory.retrieve keywords that
+    land in a separate change (fast-TTFT track B, merged first). Until then
+    they are not passed, so this module works on either side of that merge;
+    the retrieval actually called (possibly a wrapper around the real one)
+    must take the keyword too."""
+    if _accepts(_web_memory.retrieve, name) and _accepts(retrieve, name):
+        return {name: value}
+    return {}
+
+
+def _topical_gate() -> dict:
+    """The dense-first exit for a retrieval whose only use is the topical
+    gate (web_memory.retrieve(topical_gate=True)): it returns nothing, and
+    does no lexical, merge, rank or rerank work, when no dense hit reaches
+    TOPICAL_DENSE_FLOOR — the dense score `_topical_hit` needs anyway."""
+    return _retrieve_option("topical_gate", True)
+
+
+def _topical_dense_floor() -> float:
+    """The dense floor of the topical gate, shared with web_memory's STATIC
+    rerank pre-gate (TOPICAL_DENSE_FLOOR there once track B has landed)."""
+    return float(getattr(_web_memory, "TOPICAL_DENSE_FLOOR", 0.35))
+
+
 def _quiet(fut: "asyncio.Future") -> "asyncio.Future":
     """Mark an abandoned future's outcome as read, so a speculative run that
     failed after it stopped mattering does not log 'exception never retrieved'."""
@@ -281,6 +333,10 @@ class Prepared:
 FAST_QUERIES = 1
 FAST_SOURCES = 2
 FAST_DEADLINE_S = 8.0
+#: How far past its own budget the fetch may run before `_fast_lookup` gives
+#: up on it. Every wait inside the fetch is bounded by what is left of the
+#: budget, so this fires only on a bug or a stalled event loop.
+FAST_BACKSTOP_S = 0.5
 
 
 def _join(*parts: str) -> str:
@@ -857,7 +913,7 @@ async def _fast_topical_retrieval(
     # computes. The speculative run is issued at top_k=4 for exactly this
     # reason, so its over-fetch (`want`) matches too.
     task = inflight if inflight is not None else asyncio.ensure_future(
-        retrieve(question, level=Freshness.STATIC, top_k=4)
+        retrieve(question, level=Freshness.STATIC, top_k=4, **_topical_gate())
     )
     pre: Optional[asyncio.Future] = None
     if fast_topical_precheck():
@@ -958,7 +1014,7 @@ async def _topical(
             return out
         result = fetched
     else:
-        result = await retrieve(question, level=Freshness.STATIC, top_k=4)
+        result = await retrieve(question, level=Freshness.STATIC, top_k=4, **_topical_gate())
     out.retrieval = result
     # BOTH signals, not a high blend. Measured on the live corpus
     # (2026-09-02): the right documentation page scored 0.44-0.61 — a dense
@@ -967,13 +1023,15 @@ async def _topical(
     # A single blended threshold high enough to exclude the latter excluded
     # the former; requiring vector agreement AND lexical overlap separates
     # them cleanly, and the score floor only guards against junk.
+    dense_floor = _topical_dense_floor()
+
     def _topical_hit(e) -> bool:
         # The cross-encoder's verdict, when it ran (ADR-0001 D4): a passage
         # that probably answers is topical whatever its vector distance.
         if e.scored and e.answer >= float(settings.knowledge_answer_threshold):
             return True
         return (
-            e.dense >= 0.35
+            e.dense >= dense_floor
             and e.lexical >= _TOPICAL_LEXICAL_FLOOR
             and e.score >= settings.living_knowledge_topical_min_score
         )
@@ -1000,6 +1058,138 @@ def _decided(out: "Prepared", decision: str) -> None:
     metrics.inc("knowledge_decision_total", decision=decision, freshness=level)
 
 
+def _one_block(text: str) -> bool:
+    """No blank line between the first and the last line of `text`."""
+    return all(line.strip() for line in (text or "").strip().splitlines())
+
+
+def _in_conversation(history: Sequence[dict]) -> bool:
+    """Is there an earlier turn the person could be talking about?"""
+    from .engines import conversation_turns
+
+    return bool(conversation_turns(history or (), 1))
+
+
+def _claim_fresh(row: dict, verdict: Verdict, now: datetime) -> bool:
+    """A resolved research claim fresh as a RECORD (the run is recent) and
+    as a FACT (its as_of is not past the level's stale cutoff — a claim true
+    in 2023 is not evidence for who holds the office now)."""
+    made = row.get("created_at")
+    if not made or (now - made).total_seconds() > verdict.max_age_seconds:
+        return False
+    as_of = row.get("as_of")
+    cutoff = _stale_after(verdict.requirement)
+    if as_of and cutoff:
+        if not isinstance(as_of, datetime):
+            as_of = datetime.combine(as_of, datetime.min.time(), tzinfo=timezone.utc)
+        if (now - as_of).total_seconds() > cutoff:
+            return False
+    return True
+
+
+async def _lookup_status(emit: Optional[Emit]) -> None:
+    if emit is not None:
+        try:
+            await emit("status", {"text": "Checking recent sources…"})
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class _EarlyLookup:
+    """The Fast lookup, started as soon as it is certain (2026-09-29).
+
+    Measured before this: a Fast turn that needed the web waited for the
+    router, the retrieval, the rerank of 12-17 passages and the claims read
+    (430-990 ms one turn at a time) before the lookup started, although the
+    outcome was often certain much earlier. `Retrieval.sufficient` needs
+    `newest_age <= max_age`, and `newest_age` is the smallest `age_seconds`
+    (seconds since the page was READ) among the evidence it keeps, all of
+    which comes from the candidates. Ages only grow. So once the candidates'
+    dates are known and none is new enough, no ranking, rerank or partition
+    can make the result sufficient; only a fresh resolved claim still could.
+
+    `retrieve` reports its candidates through `on_candidates` after their
+    dates are filled in and before rank and rerank. When none is new enough
+    and the claims (read beside the retrieval) hold no fresh one, the status
+    line goes out and the lookup starts, while the local judgement finishes
+    beside it. Every decision is the one the old sequence makes:
+
+      the judgement comes back rerank_busy  -> degraded_busy; the lookup is
+                                               cancelled (`prepare`'s finally)
+      the lookup fails                      -> fast_lookup_failed, with the
+                                               local stale grounding
+      the proof never fires (a fresh page, a cache hit, no candidates)
+                                            -> the old sequence runs
+
+    Armed only on the full, level-matching retrieval: never on the
+    speculative STATIC one, whose candidate set is smaller.
+    """
+
+    def __init__(
+        self,
+        question: str,
+        verdict: Verdict,
+        now: datetime,
+        *,
+        emit: Optional[Emit],
+        user_id: Optional[int],
+        conversation_id: str,
+    ) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._question = question
+        self._verdict = verdict
+        self._now = now
+        self._emit = emit
+        self._user_id = user_id
+        self._conversation_id = conversation_id
+        self._proven = asyncio.Event()
+        self.claims: "asyncio.Future" = _quiet(
+            asyncio.ensure_future(db.run_in_thread(claims_for, question))
+        )
+        self._task: "asyncio.Future" = _quiet(asyncio.ensure_future(self._run()))
+
+    def on_candidates(self, candidates: Sequence) -> None:
+        """`retrieve`'s hook. Synchronous; safe from a worker thread."""
+        try:
+            limit = self._verdict.max_age_seconds
+            stale = not any(c.age_seconds <= limit for c in candidates)
+        except Exception:  # noqa: BLE001 — no proof: the old sequence runs
+            return
+        if stale:
+            try:
+                self._loop.call_soon_threadsafe(self._proven.set)
+            except RuntimeError:  # the loop is closing
+                pass
+
+    @property
+    def proven(self) -> bool:
+        return self._proven.is_set()
+
+    async def _run(self) -> Optional[Retrieval]:
+        await self._proven.wait()
+        try:
+            rows = await self.claims
+        except Exception:  # noqa: BLE001 — as `prepare` reads a failed claims query
+            rows = []
+        if any(_claim_fresh(r, self._verdict, self._now) for r in rows):
+            return None  # the local path answers; `prepare` will say so
+        await _lookup_status(self._emit)
+        return await _fast_lookup(
+            self._question,
+            self._verdict,
+            user_id=self._user_id,
+            conversation_id=self._conversation_id,
+        )
+
+    async def result(self) -> Optional[Retrieval]:
+        return await self._task
+
+    def cancel(self) -> None:
+        for fut in (self._task, self.claims):
+            if not fut.done():
+                fut.cancel()
+
+
 async def prepare(
     question: str,
     *,
@@ -1019,6 +1209,40 @@ async def prepare(
     also the offline path: stale evidence still answers, but it is labelled.
     `emit` lets the one slow branch (the live lookup) say what it is doing.
     """
+    # An early Fast lookup (`_EarlyLookup`) runs beside the local judgement;
+    # whatever `_prepare` decides, it never outlives this call.
+    early: List["_EarlyLookup"] = []
+    try:
+        return await _prepare(
+            question,
+            effort=effort,
+            mode=mode,
+            web_search_pref=web_search_pref,
+            allow_network=allow_network,
+            emit=emit,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            history=history,
+            early=early,
+        )
+    finally:
+        for lookup in early:
+            lookup.cancel()
+
+
+async def _prepare(
+    question: str,
+    *,
+    effort: str,
+    mode: str,
+    web_search_pref: str,
+    allow_network: bool,
+    emit: Optional[Emit],
+    user_id: Optional[int],
+    conversation_id: str,
+    history: Sequence[dict],
+    early: List["_EarlyLookup"],
+) -> Prepared:
     out = Prepared()
     if not settings.web_memory_enabled or not (question or "").strip():
         return out
@@ -1042,6 +1266,31 @@ async def prepare(
         out.verdict = Verdict(Freshness.STATIC, _MAX_AGE[Freshness.STATIC], "pasted_transform")
         _decided(out, "static_model")
         return out
+    if paste_own_words() and pasted.is_paste(question):
+        # A QUESTION about pasted text (2026-09-29). Everything below reads the
+        # person's own words, never the material: the freshness rule, the
+        # router, the topical pre-check, every retrieval and the claims. The
+        # model still receives the whole message (this changes only what is
+        # looked up). Measured on 8 pastes of ~5,000 words: 3 were ruled
+        # lexical:office on words inside the pasted text and spent a 6.1-9.1 s
+        # web lookup that put ~7.2k characters of unrelated pages into the
+        # prompt; the other 5 spent 1.4-2.8 s windowing 24 stored pages
+        # against a ~730-term query. All 8 had a question of the person's own
+        # set apart from the paste, which is what `pasted.own_words` reads.
+        own = pasted.own_words(question)
+        if own.strip():
+            question = own
+        elif _one_block(question):
+            # One block of lines with no blank line between them is how a
+            # person TYPES a long question (review 2026-09-19, R2): all of it
+            # is theirs, and it is read whole, as before.
+            pass
+        else:
+            # Material with nothing of the person's own set apart from it:
+            # the answer is made from the paste, as for a transform ask.
+            out.verdict = Verdict(Freshness.STATIC, _MAX_AGE[Freshness.STATIC], "pasted_no_ask")
+            _decided(out, "static_model")
+            return out
     # A terse follow-up is resolved BEFORE retrieval, freshness classification
     # or any escalation decision — every one of them reads the question, and
     # all of them were reading a phrase with its subject missing.
@@ -1050,6 +1299,17 @@ async def prepare(
     now = datetime.now(timezone.utc)
     fast = effort == "fast"
     router_on = bool(settings.freshness_router_enabled)
+    # Inside a conversation a weak time word alone ("…most accepted today?")
+    # does not settle the verdict; the router reads the resolved text
+    # (freshness.weak_time_only). A question with no earlier turn is never
+    # affected, and every other question classifies with the same call as
+    # before.
+    weak_time = (
+        followup_weak_time_router()
+        and _in_conversation(history)
+        and weak_time_only(question, now_year=now.year)
+    )
+    undecided_kw = {"weak_time_undecided": True} if weak_time else {}
     prepare_started = time.perf_counter()
     # A time-sensitive retrieval started while the router decides (Fast only).
     speculative: Optional[asyncio.Future] = None
@@ -1058,7 +1318,7 @@ async def prepare(
     speculative_started: Optional[float] = None
     started = time.perf_counter()
     try:
-        if fast and router_on and router_would_be_asked(question, now_year=now.year):
+        if fast and router_on and router_would_be_asked(question, now_year=now.year, **undecided_kw):
             if fast_skip_router() and clearly_timeless(question, now_year=now.year):
                 # OPT-IN (FRESHNESS_FAST_SKIP_ROUTER, default off). A timeless
                 # task with no live-value signal in it ("write me a haiku",
@@ -1092,7 +1352,10 @@ async def prepare(
                     # never have computed could otherwise be served to a later
                     # turn whose router timed out ('default', no supersession).
                     # A reused result is cached below, under the real verdict.
+                    # A weak-time follow-up is undecided in the same way as
+                    # the 'default' population, so it gets the same guess.
                     _offline = classify_offline(question, now_year=now.year)
+                    _undecided = _offline.reason == "default" or weak_time
                     speculative_verdict = (
                         replace(
                             _offline,
@@ -1100,7 +1363,7 @@ async def prepare(
                             max_age_seconds=_MAX_AGE[Freshness.STATIC],
                             reason="router",
                         )
-                        if (speculate_static() and _offline.reason == "default")
+                        if (speculate_static() and _undecided)
                         else replace(_offline, reason="router")
                     )
                     # top_k 4 for a STATIC guess, 5 otherwise: the ONLY
@@ -1122,11 +1385,17 @@ async def prepare(
                             effort=effort,
                             verdict=speculative_verdict,
                             cache_store=False,
+                            # A STATIC guess is used only by the topical gate.
+                            **(
+                                _topical_gate()
+                                if speculative_verdict.requirement is Freshness.STATIC
+                                else {}
+                            ),
                         )
                     ))
-                verdict = await classify(question, now_year=now.year, allow_router=True)
+                verdict = await classify(question, now_year=now.year, allow_router=True, **undecided_kw)
         else:
-            verdict = await classify(question, now_year=now.year, allow_router=router_on)
+            verdict = await classify(question, now_year=now.year, allow_router=router_on, **undecided_kw)
         verdict = realtime_clamped(verdict)
         out.verdict = verdict
         metrics.freshness_classified(verdict.requirement.value, verdict.reason)
@@ -1191,8 +1460,24 @@ async def prepare(
                 # The call Think/Max always made. A cancelled or diverging
                 # speculative run never wrote the cache, so reading it is safe.
                 started = time.perf_counter()
+                hook: dict = {}
+                if (
+                    fast
+                    and allow_network
+                    and web_search_pref != "off"
+                    and settings.freshness_fast_lookup
+                    and fast_early_lookup()
+                    and _retrieve_option("on_candidates", None)
+                ):
+                    lookup = _EarlyLookup(
+                        question, verdict, now, emit=emit,
+                        user_id=user_id, conversation_id=conversation_id,
+                    )
+                    early.append(lookup)
+                    hook = {"on_candidates": lookup.on_candidates}
                 result = await retrieve(
-                    question, level=verdict.requirement, top_k=5, effort=effort, verdict=verdict
+                    question, level=verdict.requirement, top_k=5, effort=effort, verdict=verdict,
+                    **hook,
                 )
     finally:
         if speculative is not None and not speculative.done():
@@ -1208,30 +1493,19 @@ async def prepare(
     # Facts an earlier Deep Research run RESOLVED — dated, sourced, already
     # judged against contradicting pages. Cheap (one tsvector query) and
     # the strongest local evidence there is for a live fact.
+    # Read beside the retrieval when an early lookup was armed.
+    lookup = early[0] if early else None
     claim_rows: List[dict] = []
     try:
-        claim_rows = await db.run_in_thread(claims_for, question)
+        if lookup is not None:
+            claim_rows = await lookup.claims
+        else:
+            claim_rows = await db.run_in_thread(claims_for, question)
     except Exception:  # noqa: BLE001
         claim_rows = []
     claims_text = claims_block(claim_rows)
 
-    def _claim_fresh(r: dict) -> bool:
-        # Fresh as a RECORD (the run is recent) and as a FACT (its as_of is
-        # not past the level's stale cutoff — a claim true in 2023 is not
-        # evidence for who holds the office now).
-        made = r.get("created_at")
-        if not made or (now - made).total_seconds() > verdict.max_age_seconds:
-            return False
-        as_of = r.get("as_of")
-        cutoff = _stale_after(verdict.requirement)
-        if as_of and cutoff:
-            if not isinstance(as_of, datetime):
-                as_of = datetime.combine(as_of, datetime.min.time(), tzinfo=timezone.utc)
-            if (now - as_of).total_seconds() > cutoff:
-                return False
-        return True
-
-    claims_fresh = any(_claim_fresh(r) for r in claim_rows)
+    claims_fresh = any(_claim_fresh(r, verdict, now) for r in claim_rows)
     metrics.inc(
         "knowledge_verdict_total",
         verdict=(
@@ -1330,14 +1604,15 @@ async def prepare(
 
     # Fast mode, time-sensitive question, nothing fresh locally: the one case
     # that justifies spending network in a mode whose whole promise is speed.
-    if emit is not None:
-        try:
-            await emit("status", {"text": "Checking recent sources…"})
-        except Exception:  # noqa: BLE001
-            pass
-    fresh = await _fast_lookup(
-        question, verdict, user_id=user_id, conversation_id=conversation_id
-    )
+    if lookup is not None and lookup.proven:
+        # Already running, or about to: the candidate dates proved this
+        # branch before the rerank finished (`_EarlyLookup`).
+        fresh = await lookup.result()
+    else:
+        await _lookup_status(emit)
+        fresh = await _fast_lookup(
+            question, verdict, user_id=user_id, conversation_id=conversation_id
+        )
     if fresh is not None and fresh.found:
         out.searched = True
         if any(e.relevant for e in fresh.evidence):
@@ -1518,8 +1793,15 @@ async def _fast_lookup(
     query = pasted.web_query(question)
     if not query:
         return None
-    deadline = float(getattr(settings, "freshness_fast_deadline_s", FAST_DEADLINE_S) or FAST_DEADLINE_S)
+    budget = float(getattr(settings, "freshness_fast_deadline_s", FAST_DEADLINE_S) or FAST_DEADLINE_S)
     sources = int(getattr(settings, "freshness_fast_sources", FAST_SOURCES) or FAST_SOURCES)
+    # THE BUDGET GOES TO THE FETCH, THE TIMEOUT IS A BACKSTOP (2026-09-29).
+    # `fetch_for_freshness` bounds its search, page reads, store writes and
+    # index by what is left of `budget` and returns the pages that landed. The
+    # timeout below used to be the only bound, and it discarded everything:
+    # 3 of 10 measured lookups hit it at 8.0 s with pages already stored. It
+    # now fires only if the fetch overruns its own budget.
+    deadline = budget + FAST_BACKSTOP_S
     # TIMED, BOTH STAGES (2026-09-28). This function had no histogram of its
     # own while being the most expensive thing in front of the first token on a
     # turn that needs sources: the fetch measured p50 3,014 ms / p95 6,267 ms,
@@ -1535,6 +1817,7 @@ async def _fast_lookup(
                 max_sources=sources,
                 user_id=user_id,
                 conversation_id=conversation_id,
+                budget_s=budget,
             )
     except asyncio.TimeoutError:
         metrics.knowledge_fast_lookup(

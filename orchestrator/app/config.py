@@ -1239,6 +1239,32 @@ class Settings:
         # waits before it starts; a lookup that has not landed two pages in
         # eight seconds is not going to make the answer better.
         self.freshness_fast_deadline_s: float = _float("FRESHNESS_FAST_DEADLINE_S", 8.0)
+        # FRESHNESS_FAST_SECOND_SOURCE_GRACE_S — OPT-IN, 0 = off. Once the Fast
+        # lookup has stored its first page, wait at most this long for the
+        # second before reading back. Off, the lookup waits for every page up
+        # to the deadline, as before; knowledge_fast_lookup_seconds
+        # {stage="second_source_lag"} records the lag either way, so the
+        # trade (one fresh source for a shorter wait) can be judged on data.
+        self.freshness_fast_second_source_grace_s: float = _float(
+            "FRESHNESS_FAST_SECOND_SOURCE_GRACE_S", 0.0
+        )
+        # KNOWLEDGE_PASTE_OWN_WORDS (2026-09-29). When a message is a paste,
+        # the freshness verdict, the router and every retrieval read the
+        # person's own words (core/pasted.own_words), not the pasted
+        # material; the model still receives the whole message. 3 of 8
+        # measured pastes were sent to the web because of "head of" inside a
+        # pasted text. Off restores reading the whole message.
+        self.knowledge_paste_own_words: bool = _bool("KNOWLEDGE_PASTE_OWN_WORDS", True)
+        # FRESHNESS_FOLLOWUP_WEAK_TIME_ROUTER (2026-09-29). Inside a
+        # conversation, a verdict whose only signal is today / now / nowadays /
+        # these days goes to the router (freshness.weak_time_only).
+        self.freshness_followup_weak_time_router: bool = _bool(
+            "FRESHNESS_FOLLOWUP_WEAK_TIME_ROUTER", True
+        )
+        # KNOWLEDGE_FAST_EARLY_LOOKUP (2026-09-29). Start the Fast lookup as
+        # soon as the candidate dates prove no stored page is new enough,
+        # instead of after the rerank. Every decision is the same either way.
+        self.knowledge_fast_early_lookup: bool = _bool("KNOWLEDGE_FAST_EARLY_LOOKUP", True)
         # How much locally-read evidence a grounded answer may carry. 900
         # characters was one paragraph — "a large amount of information from
         # the site" (owner, 2026-09-03) needs several passages, and ~1k
