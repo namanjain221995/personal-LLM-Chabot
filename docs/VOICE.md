@@ -359,9 +359,9 @@ error rate, lower is better:
 |---|---:|---:|---:|
 | MUCS Hindi-English lectures, 34 min, script set aside | 40.2 % | **19.4 %** | 69.9 % |
 | MUCS, script-sensitive | 55.8 % | **41.7 %** | 80.0 % |
-| FLEURS Hindi (40) | 41.9 % | **10.9 %** | – |
+| FLEURS Hindi (40) | 41.9 % | **10.9 %** (hi) / 11.8 % (auto) | – |
 | LibriSpeech test-clean (60) | 4.21 % | 6.23 % | **4.13 %** |
-| FLEURS English (40) | **6.81 %** | 13.3 % | 10.2 % |
+| FLEURS English (40) | **6.81 %** | 13.3 % (en) | 10.2 % |
 
 **On English, whisper is the best system here.** It is best on FLEURS English
 and level with the English streaming model on read speech, so English

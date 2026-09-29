@@ -278,9 +278,13 @@ end_ms, text}`. The write is careful in four ways:
   repeating it.
 - **Echo stays out:** echo finals are never saved.
 
-`GET /api/audio/sessions/{id}` returns them as `live_segments`: sorted by
-start, one per `(source, u)`, the last saved winning. They are returned once
-the meeting is done or failed, or while it records when asked with `?live=1`.
+`GET /api/audio/sessions/{id}` returns them as `live_segments`, sorted by
+start. Within one connection the last line of an utterance wins, and a resume
+replaces that source's lines from its resume point on. Lines from before the
+resume point stay, even when the resumed connection reuses their utterance
+numbers. So `(source, u)` may repeat across a resume, and consumers key rows by
+position, not by `(source, u)`. They are returned once the meeting is done or
+failed, or while it records when asked with `?live=1`.
 They are left out of every other answer, so a two-hour meeting's transcript,
 about 1 MB, is not re-read at each of the recorder's long-polls. Only the owner
 can read them, like the segments. The super admin's audited transcript read

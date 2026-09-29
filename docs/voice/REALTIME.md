@@ -91,13 +91,13 @@ before and opens no socket.
                     back up the same sockets            (the long-poll answers)
 ```
 
-**One microphone, one AudioContext, two consumers.** The level meter, the PCM
-tap (`frontend/public/voice/pcm-capture-worklet.js`) and the recorder all read
-from one `MediaStreamAudioSourceNode`. The live path cannot record something
-the stored recording did not, and neither path can take the microphone from the
-other. Public users arrive through the Cloudflare tunnel, and on the office LAN
-the frontend's port is reached directly. Either way, the browser only ever
-talks to the frontend.
+**One microphone, one AudioContext, two consumers.** The level meter and the
+PCM tap (`frontend/public/voice/pcm-capture-worklet.js`) read one
+`MediaStreamAudioSourceNode`, and MediaRecorder records the same `getUserMedia`
+stream directly. The live path cannot record something the stored recording
+did not, and neither path can take the microphone from the other. Public users
+arrive through the Cloudflare tunnel, and on the office LAN the frontend's port
+is reached directly. Either way, the browser only ever talks to the frontend.
 
 **Nothing new runs on the head.** The engine runs on the worker, because the
 head's memory is spoken for (owner rule, 2026-09-16). It has its own Compose
@@ -195,10 +195,10 @@ script. The exception is a foreign or missing Origin, which gets a bare HTTP
 | 4401 | `signed_out` | not signed in, or signed out since (the re-check) | stops |
 | 4403 | `voice_off` | `VOICE_INPUT` is off, now or since | stops |
 | 4404 | `live_unavailable`, `not_found`, `session_closed` | no live path here; not the caller's recording (the same answer as an unknown id); the recording is no longer recording | stops |
-| 4408 | `idle` | no audio frame for `VOICE_LIVE_IDLE_S` (120 s) | reconnects while still recording |
+| 4408 | `idle` | no audio frame for about 60 s: the engine's `STT_IDLE_S` (60 s) closes the stream first, and the gateway's `VOICE_LIVE_IDLE_S` (120 s) is a backstop | reconnects while still recording |
 | 4409 | `superseded` | a newer connection took this recording over | stops |
 | 4413 | `frame_too_large` | a frame over `VOICE_LIVE_MAX_FRAME_BYTES` | stops |
-| 4429 | `rate_limited`, `capacity` | over `VOICE_LIVE_CONNECTS_PER_MIN`; audio or messages faster than the clock allows; the gateway or every engine profile for the language is full | backs off and retries |
+| 4429 | `rate_limited`, `capacity` | over `VOICE_LIVE_CONNECTS_PER_MIN`; audio or messages faster than the clock allows; the gateway is full, or no engine has room for the language (every profile for it is full, or the decode budget is spent) | backs off and retries |
 | 4500 | `internal` | the gateway failed | backs off and retries |
 | 4503 | `engine_unavailable` | no engine answered, or the engine went away mid-stream | backs off and retries |
 
@@ -243,9 +243,12 @@ differences:
   `mode` is `dictation` or `meeting`. An optional `frame_ms` (40 when absent)
   sizes the engine's message ceiling. The engine answers `ready`, which names
   the profile it chose.
-- **events:** partials and finals also carry `compute_ms`, the CPU time spent
-  since the previous event. Finals carry `endpoint_ms`, the trailing silence
-  that decided the endpoint. The gateway drops both fields, and the profile.
+- **events:** partials and finals also carry `compute_ms`: the decode wall time
+  charged to the stream since its previous event, not CPU time. Every stream in
+  a `decode_streams` batch is charged the whole call, the rule the real-time
+  factor uses ([Monitoring](#monitoring)). Finals carry `endpoint_ms`,
+  the trailing silence that decided the endpoint. The gateway drops both
+  fields, and the profile.
 - **refusals:** 4400 for a protocol error or an unsupported language or mode;
   4408 idle (`STT_IDLE_S`, 60 s); 4413 frame too large; 4429 capacity (a
   profile or the engine's decode budget is full) or arrival rate; 4500
@@ -361,8 +364,9 @@ reports the language used. Choosing English or हिन्दी in the bar ove
 first words are recognised. It ends on the recognizer's own endpoint rule:
 trailing silence after text. Every chunk is decoded, speech or silence, so an
 open stream costs the same whether or not anyone is talking, and capacity is
-counted in open streams. The research's Silero gate, measured at about 0.1 of a
-core per 100 streams, was meant to keep silence off a GPU. It is not built.
+counted in open streams. The research's Silero gate, measured at about
+0.1-0.25 of one core per 100 streams, was meant to keep silence off a GPU. It
+is not built.
 
 ### Segmentation never resets mid-speech
 
@@ -397,11 +401,15 @@ its characters are already committed:
   | off | 15.78 % | 3.97 % |
   | at every 0.6 s endpoint | 13.78 % | 6.20 % |
   | after 1.2 s of silence | 12.22 % | 4.96 % |
-  | **after 2.0 s of silence (the default)** | **12.44 %** | **4.47 %** |
+  | after 2.0 s of silence | 12.44 % | 4.47 % |
+  | **after 2.0 s of silence, with the level check (the default)** | **12.89 %** | **4.47 %** |
 
   At 0.6 s every short pause inside a sentence renews the stream, and errors on
   first words rose from 3 to 8 in English. The build spec asked for 0.6 s; 2.0 s
-  keeps nearly all of the Hindi gain at half a point of English.
+  keeps most of the Hindi gain at half a point of English. The level check
+  skips a renewal when the newest audio already stands out from the pause: a
+  word has begun, and its first token is not out yet. Without it, English first
+  partials came about 250 ms later (p50 543 to 792 ms).
 
 Two more measured fixes:
 
@@ -537,7 +545,7 @@ removal or voice being switched off ends the stream within a minute.
 | message rate | never more messages, audio or text, than (wall seconds + 65) × 50 at 40 ms frames; this is what stops a flood of 2-byte frames or pings, which each cost the shared event loop about what a real frame costs | 4429 |
 | text message | 16,384 characters; nesting too deep to parse is a protocol error | 4400 |
 | start | within 10 s of accept | 4400 |
-| silence of the socket | no audio frame for 120 s | 4408 |
+| silence of the socket | no audio frame for about 60 s: the engine's `STT_IDLE_S` closes first, and the gateway's `VOICE_LIVE_IDLE_S` (120 s) is a backstop | 4408 |
 | text in an event | 4,000 characters; the gateway drops a longer one | — |
 
 **The engine** authenticates the gateway with its own token, which is 32 random
@@ -600,7 +608,7 @@ recordings forever. Removing a member deletes nothing.
 | where | limit | default |
 |---|---|---|
 | engine, per profile | `max_streams` in `STT_PROFILES` | 8, 8, 12, 12 |
-| engine, all profiles together | `STT_MAX_COST` decode budget: a 160 ms stream costs 2 units and a 560 ms stream 1 | 32 units: 16 streams at 160 ms, or 32 at 560 ms |
+| engine, all profiles together | `STT_MAX_COST` decode budget: a 160 ms stream costs 2 units and a 560 ms stream 1 | 32 units, the cost of 16 streams at 160 ms; with the shipped profiles, 20 `auto` streams or 16 `en` ones (below) |
 | engine, threads | `STT_WORKERS` decode threads per profile × `STT_THREADS` ONNX Runtime threads each | 2 × 2 (the compose file) |
 | gateway, per orchestrator process | `VOICE_LIVE_MAX_STREAMS` | 64 |
 | gateway, per person | `VOICE_LIVE_CONNECTS_PER_MIN`; one stream per recording (per source in a meeting) | 30 a minute |
@@ -609,11 +617,30 @@ recordings forever. Removing a member deletes nothing.
 **Where the numbers come from.** Twelve 160 ms streams kept 4.93 cores busy on
 the worker, which is 0.41 of a core each. One four-thread decode loop held
 about 7 real-time streams at 160 ms and about 14 at 560 ms, so a 560 ms stream
-costs half as much. Eight cores at 0.41 each is about 16 streams at 160 ms, or
-6.6 cores, leaving about 1.4 cores for the event loop, feature extraction and
-the p95 of a decode step. The per-profile caps add up to 40 streams, about 11.5
-cores of decode. That is why the engine-wide budget, not the profile caps, is
-what refuses first under load.
+costs half as much. Sixteen streams at 160 ms, at 0.41 of a core each, take 6.6
+of the eight cores and leave about 1.4 for the event loop, feature extraction
+and the p95 of a decode step. At 2 units a stream, those sixteen are the
+32-unit budget. The per-profile caps add up to 40 streams, about 11.5 cores of
+decode, so the caps alone would admit more than the cores can decode.
+
+**How many streams fit.** Both limits apply at once. A stream takes the first
+profile in the list that allows its language, has a free slot and still fits
+the budget. So a language's 560 ms profiles take streams only when its 160 ms
+profiles are full, or when the budget has one unit left. The engine's own
+admission code, run with the shipped `STT_PROFILES` and `STT_MAX_COST=32`
+(2026-09-30), admits:
+
+| traffic | streams | where they sit | what refuses the next one |
+|---|---:|---|---|
+| all `auto` (or all `hi`), the default | 20 | `multi-fast` 8, `multi-wide` 12: 28 of the 32 units | the profile caps: both profiles for the language are full |
+| all `en` | 16 | `en-fast` 8, `multi-fast` 8: all 32 units | the budget: `en-wide` never gets a stream |
+| `auto` first, then `en` | 22 | `multi-fast` 8, `multi-wide` 12, `en-fast` 2 | the budget |
+
+No mix of languages gets past 22 while streams only open. Streams closing and
+reopening in a particular order can hold 24. Nothing reaches 32 streams,
+although `/health` reports a `capacity` of 32 (the budget divided by the
+cheapest profile's cost). So for the default language it is the profile caps,
+not the budget, that refuse first; for English it is the budget.
 
 Each profile loads one recognizer, and all of that profile's decode threads
 share it. Four threads decoding different streams through one recognizer gave
@@ -879,8 +906,10 @@ chunks, endpoint 0.6 s, 2026-09-29):
 | Nemotron 3.5, on Hindi | 720 ms | 710 / 1,223 ms |
 
 The first-partial figure includes the time it takes to say the first word. A
-freshly renewed stream shows its first Hindi partial about 200 ms later (p50
-555 to 770 ms).
+freshly renewed stream shows its first Hindi partial about 230 ms later.
+Through the engine's socket on the worker (`stream_bench.py`, 2026-09-30), the
+Hindi first-partial p50 was 571 ms with renewal off and 801 ms with it on (p90
+1,181 ms).
 
 ### Accuracy
 
@@ -928,11 +957,12 @@ The English composer text, which is the full pass, scored 4.44 %.
   suspended. Chromium on the desktop was measured, and a headless Chromium is
   not a phone. Whether a mobile browser keeps capturing in a background tab is
   also unverified. A screen that turns off stops the audio, and the stream
-  closes `idle` after 120 s.
-- **CPU capacity is finite, and it is the chat model's CPU too.** About 16
-  streams at 160 ms, or 32 at 560 ms, fit the eight-core budget. More people
-  than that get the session's own preview and retry. Raising the caps is the
-  owner's trade against chat speed.
+  closes `idle` after about 60 s.
+- **CPU capacity is finite, and it is the chat model's CPU too.** The engine
+  takes 20 streams in the default `auto` language, 16 if everyone chose
+  English, and at most 24 in any mix, not the 32 its `/health` reports
+  ([Capacity](#capacity)). More people than that get the session's own preview
+  and retry. Raising the caps is the owner's trade against chat speed.
 - **The engine answers the office LAN until the host guard is reinstalled as
   root.** The stream needs the token. `/health` and `/metrics` do not, and they
   carry model labels and counts but no ids and no text.
