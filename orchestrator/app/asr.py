@@ -147,6 +147,12 @@ class ASRUnavailable(Exception):
     """The engine could not be reached, or refused. Retryable."""
 
 
+class ASRBreakerOpen(ASRUnavailable):
+    """A session window was not sent: the last session windows timed out and
+    the engine has not answered one since (`_SessionGate`'s breaker). The
+    window is a gap to transcribe later, not a request to make now."""
+
+
 class ASRTimeout(ASRUnavailable):
     """The engine HAS the clip and did not answer within ASR_TIMEOUT_S.
 
@@ -1425,6 +1431,31 @@ class _SessionGate:
         #: found no engine (ASRUnavailable, which includes a timeout)
         self.last_ok = 0.0
         self.last_unavailable = 0.0
+        #: THE BREAKER. Session windows that timed out in a row with none
+        #: answered since; at _BREAKER_TIMEOUTS the breaker opens and windows
+        #: fail at once (ASRBreakerOpen) instead of each waiting
+        #: VOICE_SESSION_WINDOW_TIMEOUT_S on a hung engine, which projected to
+        #: about 480 s per window, 20 h for an hour's recording (2026-09-29
+        #: review). Every VOICE_ENGINE_STALL_S one window goes through to see
+        #: whether the engine is back.
+        self.timeouts_in_a_row = 0
+        self.opened_at = 0.0
+
+    def breaker_open(self) -> bool:
+        """True while windows must not be sent. Claims the half-open probe:
+        the first caller after the cool-down gets False, and restarts it."""
+        if self.timeouts_in_a_row < _BREAKER_TIMEOUTS:
+            return False
+        now = time.monotonic()
+        if now - self.opened_at < float(settings.voice_engine_stall_s):
+            return True
+        self.opened_at = now  # this caller is the probe
+        return False
+
+    def note_timeout(self) -> None:
+        self.timeouts_in_a_row += 1
+        if self.timeouts_in_a_row >= _BREAKER_TIMEOUTS:
+            self.opened_at = time.monotonic()
 
     @property
     def waiting(self) -> int:
@@ -1455,6 +1486,8 @@ class _SessionGate:
         if any(now - t > stall for t in list(self.inflight.values())):
             return "unavailable"
         if self.last_unavailable > self.last_ok:
+            return "unavailable"
+        if self.timeouts_in_a_row >= _BREAKER_TIMEOUTS:
             return "unavailable"
         return "busy"
 
@@ -1510,7 +1543,12 @@ class _SessionGate:
         self.inflight = {}
         self.last_ok = 0.0
         self.last_unavailable = 0.0
+        self.timeouts_in_a_row = 0
+        self.opened_at = 0.0
 
+
+#: Session windows timed out in a row before the breaker opens.
+_BREAKER_TIMEOUTS = 2
 
 SESSION_GATE = _SessionGate()
 
@@ -1531,7 +1569,16 @@ async def transcribe_session_window(
     VOICE_SHORT_SESSION_S. `on_admitted` is called once the gate lets the
     window through, so the session can tell the person it is no longer
     waiting for the engine."""
+    if SESSION_GATE.breaker_open():
+        SESSION_GATE.last_unavailable = time.monotonic()
+        metrics.inc("asr_session_windows_total", "recording-session windows sent to the engine", result="breaker")
+        raise ASRBreakerOpen("the speech engine timed out on the last session windows")
     await SESSION_GATE.acquire(urgent=urgent, short=short)
+    if SESSION_GATE.breaker_open():  # it opened while this window waited
+        SESSION_GATE.release()
+        SESSION_GATE.last_unavailable = time.monotonic()
+        metrics.inc("asr_session_windows_total", "recording-session windows sent to the engine", result="breaker")
+        raise ASRBreakerOpen("the speech engine timed out on the last session windows")
     started = time.perf_counter()
     SESSION_GATE._token += 1
     token = SESSION_GATE._token
@@ -1555,6 +1602,11 @@ async def transcribe_session_window(
                 content_type="audio/wav",
                 timeout_s=settings.voice_session_window_timeout_s,
             )
+    except ASRTimeout:
+        SESSION_GATE.last_unavailable = time.monotonic()
+        SESSION_GATE.note_timeout()
+        metrics.inc("asr_session_windows_total", "recording-session windows sent to the engine", result="timeout")
+        raise
     except ASRUnavailable:
         SESSION_GATE.last_unavailable = time.monotonic()
         metrics.inc("asr_session_windows_total", "recording-session windows sent to the engine", result="fail")
@@ -1566,6 +1618,7 @@ async def transcribe_session_window(
         SESSION_GATE.inflight.pop(token, None)
         SESSION_GATE.release()
     SESSION_GATE.last_ok = time.monotonic()
+    SESSION_GATE.timeouts_in_a_row = 0
     metrics.inc("asr_session_windows_total", "recording-session windows sent to the engine", result="ok")
     metrics.observe(
         "asr_session_window_duration_seconds",
