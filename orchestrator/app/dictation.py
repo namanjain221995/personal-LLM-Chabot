@@ -371,6 +371,19 @@ def _update(
     return dict(row) if row else None
 
 
+def _admit_live(con: Any, refusal: str) -> None:
+    """VOICE_SESSION_MAX_ACTIVE, checked and taken in ONE transaction: the
+    count and the write that makes a session live happen under one advisory
+    lock, so two at once cannot both see room for one (with max_active=1,
+    23 of 25 simultaneous pairs were both admitted, 2026-09-29 review)."""
+    con.execute("SELECT pg_advisory_xact_lock(hashtextextended('voice_sessions:live', 0))")
+    row = con.execute(
+        "SELECT count(*) AS n FROM voice_sessions WHERE status IN ('recording', 'finishing')"
+    ).fetchone()
+    if int(row["n"] if row else 0) >= settings.voice_session_max_active:
+        raise SessionError(503, "capacity_full", refusal)
+
+
 def _create_row(
     user_id: int, client_key: str, mime: str, ext: str, continues: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], bool]:
@@ -391,6 +404,12 @@ def _create_row(
         audio_since = min(now, prev.get("last_part_at") or prev.get("created_at") or now)
     try:
         with db.connection() as con:
+            existing = con.execute(
+                "SELECT 1 FROM voice_sessions WHERE user_id = %s AND client_key = %s",
+                (int(user_id), client_key),
+            ).fetchone()
+            if existing is None:  # a retried create is answered below, never refused
+                _admit_live(con, "Too many people are recording right now.")
             row = con.execute(
                 f"""INSERT INTO voice_sessions (id, user_id, client_key, status, mime_type, ext,
                         created_at, lease_owner, lease_expires_at, continues_session_id, audio_since)
@@ -1310,6 +1329,8 @@ _FREE_CHECK_BYTES = 64 * 1024 * 1024
 #: The largest read fed to a decoder at once: bounds the PCM one feed can
 #: produce before the next flush (16 kb/s Opus decodes 256 KiB to ~4 MB).
 _FEED_BYTES = 256 * 1024
+#: A decoder that dies is started again from byte 0 this many times.
+_DECODER_RESTARTS = 2
 #: Reads that came back empty although the row acknowledges more (0.2 s
 #: apart, the row re-read each time) before the rest counts as unreadable.
 _EMPTY_READS_MAX = 25
@@ -1489,6 +1510,12 @@ class _Live:
         self.bytes_stored = 0
         self.next_part = 0
         self.fed = 0
+        #: Decoders that died and were started again from byte 0.
+        self.decoder_restarts = 0
+        #: The stored audio no decoder could read, as gaps: a decoder that
+        #: dies for good part way leaves the rest of the recording
+        #: untranscribed, and the outcome must say so.
+        self.unread_gaps: List[Dict[str, Any]] = []
         self.pcm_bytes = 0
         self.pcm_file: Optional[Any] = None
         self.planner: Optional[Planner] = None
@@ -1622,7 +1649,7 @@ class _Live:
             {"start_ms": int(w.start_s * 1000), "end_ms": int(w.end_s * 1000), "reason": w.reason}
             for w in self.windows
             if w.status in ("failed", "dropped")
-        ]
+        ] + list(self.unread_gaps)
 
     def _waiting_on_locked(self) -> str:
         """Why the backlog exists right now. 'engine' is a BUSY engine (or a
@@ -1885,6 +1912,41 @@ class _Live:
         self.fed = 0
         self._skip_left = self._prefix_pcm + self.pcm_bytes
 
+    async def _decoder_died(self) -> None:
+        """The decoder stopped before its input ended. A decoder that was
+        killed (the OOM killer, a crash) says nothing about the audio, so it
+        is started again from byte 0, up to _DECODER_RESTARTS times; one that
+        keeps stopping is reading bytes that are not this container, and the
+        rest of the recording is undecodable (and reported as a gap)."""
+        if self.decoder_restarts >= _DECODER_RESTARTS:
+            raise _Undecodable("the decoder stopped: the rest is not audio in the declared format")
+        self.decoder_restarts += 1
+        log.warning(
+            "voice session %s: the decoder stopped at byte %d; starting it again (%d of %d)",
+            self.id, self.fed, self.decoder_restarts, _DECODER_RESTARTS,
+        )
+        metrics.inc("voice_decoder_restarts_total", "session decoders that died and were started again")
+        if self._decoder is not None:
+            await self._decoder.kill()
+            self._decoder = None
+        DECODERS.release(self)
+        self._restart_from_zero()
+
+    def _note_unread(self) -> None:
+        """Decoding stopped for good with stored audio left unread: that audio
+        is a gap from where the PCM ends to where the recording is estimated
+        to end (the unread bytes at the rate the read ones decoded at)."""
+        own_fed = max(0, self.fed - self._prefix_bytes)
+        own_total = int(self.bytes_stored)
+        own_pcm = max(0, self.pcm_bytes)
+        if own_total <= own_fed or own_pcm <= 0 or own_fed <= 0:
+            return
+        start_ms = self.audio_ms()
+        end_ms = start_ms + int((own_total - own_fed) * (own_pcm / own_fed) * 1000 / PCM_BYTES_PER_S)
+        with self.lock:
+            self.unread_gaps = [{"start_ms": start_ms, "end_ms": max(start_ms + 1, end_ms), "reason": "undecodable"}]
+            self.rev += 1
+
     async def _yield_decoder(self) -> None:
         if self._decoder is not None:
             await self._decoder.kill()
@@ -1983,7 +2045,8 @@ class _Live:
                 if self.fatal is not None:
                     raise _Undecodable(self.decode_error or self.fatal)
                 if self._decoder is not None and self._decoder.dead:
-                    raise _Undecodable("the decoder stopped: the rest is not audio in the declared format")
+                    await self._decoder_died()
+                    continue
                 if self._decoder is not None and DECODERS.must_yield(self):
                     await self._yield_decoder()
                     continue
@@ -2018,6 +2081,10 @@ class _Live:
                         self._wav_failed = True
                         self._restart_from_zero()
                         continue
+                    if self._decoder.dead:
+                        # It stopped before taking this chunk: not fed.
+                        await self._decoder_died()
+                        continue
                     self.fed += len(chunk)
                     own_fed = self.fed - self._prefix_bytes
                     threshold = getattr(self._decoder, "progressive_after_bytes", 0)
@@ -2031,7 +2098,8 @@ class _Live:
                         if self.pcm_bytes == 0:
                             raise _Undecodable(f"no audio came out of the first {own_fed} bytes")
                     if self._decoder.dead:
-                        raise _Undecodable("the decoder stopped: the rest is not audio in the declared format")
+                        await self._decoder_died()
+                        continue
                     if len(self._pcm_buf) >= _PCM_FLUSH_BYTES:
                         await self._flush_pcm()
                     await asyncio.sleep(0)  # let the decoder's reader run
@@ -2060,6 +2128,7 @@ class _Live:
             self.decode_error = str(exc)
             if self.fatal is None:
                 self.fatal = "undecodable"
+            self._note_unread()
             await self._end_recording("storage_full" if self.fatal == "storage_full" else "undecodable")
         await self._flush_pcm()
         if self.planner is not None and not self.planner.closed:
@@ -2226,6 +2295,19 @@ class _Live:
                 log.info("voice session %s window %d refused by the engine: %s", self.id, w.i, exc)
                 reason = "engine_refused"
                 break
+            except asr.ASRTimeout as exc:
+                # NEVER SENT AGAIN NOW. The engine still has this window and
+                # keeps decoding it (asr.ASRTimeout); a re-send went to the
+                # other replica once the gate was free, so both nodes decoded
+                # session audio at once (2026-09-29 review, test_B). It is a
+                # gap, which "retranscribe gaps" sends again later.
+                log.info("voice session %s window %d timed out: %s", self.id, w.i, exc)
+                reason = "engine_timeout"
+                break
+            except asr.ASRBreakerOpen as exc:
+                log.info("voice session %s window %d not sent: %s", self.id, w.i, exc)
+                reason = "engine_unavailable"
+                break
             except (asr.ASRUnavailable, asr.ASRBusy) as exc:
                 reason = "engine_unavailable"
                 log.info("voice session %s window %d: %s (attempt %d of %d)", self.id, w.i, exc, attempt, _WINDOW_ATTEMPTS)
@@ -2384,6 +2466,10 @@ class _Live:
         if (self.pcm_bytes == 0 and self.decode_error) or self.fatal == "pcm_ceiling":
             status, outcome = STATUS_FAILED, "undecodable"
             error = {"reason": "undecodable", "detail": "The server couldn't read the audio in this recording."}
+        elif self.unread_gaps:
+            # The decoder stopped for good part way: whatever was heard, the
+            # rest of the recording was never transcribed.
+            outcome = "transcribed_with_gaps"
         elif speech_ms == 0 or not self.windows:
             outcome = "no_speech"
         elif len(failed) == len(self.windows):
@@ -3051,7 +3137,10 @@ def retranscribe(user_id: int, session_id: str, scope: str) -> Tuple[Dict[str, A
         raise SessionError(409, "session_busy", "This recording is still being transcribed.")
     if row.get("audio_deleted_at") is not None or not os.path.exists(source_path(row)):
         raise SessionError(410, "audio_deleted", "This recording's audio has been deleted.")
-    if scope == "gaps" and row["status"] == STATUS_DONE and not int(row.get("windows_failed") or 0):
+    if (
+        scope == "gaps" and row["status"] == STATUS_DONE and not int(row.get("windows_failed") or 0)
+        and row.get("outcome") != "transcribed_with_gaps"  # an unread tail is a gap with no failed window
+    ):
         return row, False
     with _keyed_lock(f"u:{int(user_id)}"):
         busy = _retranscribe_in_flight(user_id)
@@ -3073,6 +3162,7 @@ def retranscribe(user_id: int, session_id: str, scope: str) -> Tuple[Dict[str, A
                 with contextlib.suppress(OSError):
                     os.unlink(_path(row["user_id"], row["id"], name))
         with db.connection() as con:
+            _admit_live(con, "Too many recordings are being transcribed right now.")
             updated = con.execute(
                 f"""UPDATE voice_sessions SET status = 'finishing', retranscribe = %s, outcome = NULL,
                         error = NULL, finished_at = NULL, finish_requested_at = %s, rev = rev + 1
