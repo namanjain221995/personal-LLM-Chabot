@@ -12,11 +12,17 @@
  * clamped); the layout itself was checked in a real Chromium against the dev
  * server when this changed (the newest words inside the box, the oldest cut
  * at its top).
+ *
+ * Also here (2026-09-30): the live transcript's language control on the
+ * panel's last row, and the follow-up line after a recording, whose actions
+ * now wrap under the message instead of squeezing it (both measured in
+ * headless Chromium with the app's compiled CSS at 375, 390 and 800 px).
  */
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { VoiceBar } from '@/components/VoiceBar';
-import type { SessionProgress } from '@/lib/voice';
+import { VoiceBar, VoiceFollowUpLine } from '@/components/VoiceBar';
+import { VOICE_MESSAGES, type SessionProgress } from '@/lib/voice';
+import { LIVE_INSERT_PARTIAL_LABEL, type VoiceLanguage } from '@/lib/voiceLive';
 
 afterEach(() => cleanup());
 
@@ -127,5 +133,144 @@ describe('the transcript above the recording bar', () => {
     expect(screen.queryByTestId('voice-transcript')).toBeNull();
     const view = bar(null);
     expect(view.container.querySelector('[data-testid="voice-transcript"]')).toBeNull();
+  });
+});
+
+describe('the language control above the recording bar', () => {
+  function withLanguage(
+    language: VoiceLanguage | null,
+    state: 'recording' | 'finishing' | 'requesting' = 'recording',
+    p: SessionProgress | null = progress(),
+  ) {
+    const onLanguage = vi.fn();
+    const view = render(
+      <VoiceBar
+        state={state}
+        levels={[]}
+        elapsedMs={65_000}
+        maxMs={null}
+        progress={p}
+        language={language}
+        onLanguage={onLanguage}
+        onCancel={vi.fn()}
+        onStop={vi.fn()}
+      />,
+    );
+    return { onLanguage, view };
+  }
+
+  it('is one labelled group of three radio buttons, each language named in itself, the current one checked', () => {
+    withLanguage('en');
+    const group = screen.getByRole('radiogroup', { name: 'Language of the live transcript' });
+    const radios = within(group).getAllByRole('radio') as HTMLInputElement[];
+    expect(radios.map((r) => r.labels?.[0]?.textContent)).toEqual(['Auto', 'English', 'हिन्दी']);
+    expect(radios.map((r) => r.checked)).toEqual([false, true, false]);
+    expect(new Set(radios.map((r) => r.name)).size).toBe(1);
+    expect(screen.getByText('हिन्दी').getAttribute('lang')).toBe('hi');
+  });
+
+  it('says the choice, and only a new one', () => {
+    const { onLanguage } = withLanguage('auto');
+    fireEvent.click(screen.getByRole('radio', { name: 'हिन्दी' }));
+    expect(onLanguage).toHaveBeenCalledWith('hi');
+    onLanguage.mockClear();
+    fireEvent.click(screen.getByRole('radio', { name: 'Auto' }));
+    expect(onLanguage).not.toHaveBeenCalled();
+  });
+
+  it('is outside the status row, the one live region', () => {
+    withLanguage('auto');
+    const group = screen.getByRole('radiogroup');
+    expect(group.closest('[aria-live]')).toBeNull();
+    expect(screen.getByRole('status').contains(group)).toBe(false);
+  });
+
+  it('shares its row with the saved line, and needs no transcript to be drawn', () => {
+    withLanguage('auto', 'recording', progress({ savedMs: 5000 }));
+    const group = screen.getByRole('radiogroup');
+    const saved = screen.getByText(/^Saved to your account/).closest('p')!;
+    expect(saved.parentElement).toBe(group.parentElement);
+    cleanup();
+    withLanguage('auto', 'recording', null);
+    expect(screen.getByRole('radiogroup')).toBeTruthy();
+  });
+
+  it('uses the theme tokens, with no opacity modifier on them', () => {
+    withLanguage('hi');
+    const group = screen.getByRole('radiogroup');
+    const classes = [group, ...group.querySelectorAll('*')].flatMap((el) => (el.getAttribute('class') ?? '').split(' '));
+    expect(classes.filter((c) => /\/\d+$/.test(c))).toEqual([]);
+    const chosen = screen.getByText('हिन्दी');
+    expect(chosen.className.split(' ')).toEqual(
+      expect.arrayContaining(['peer-checked:bg-surface-2', 'peer-checked:text-ink', 'peer-focus-visible:ring-2']),
+    );
+  });
+
+  it('is drawn only while recording, and only with a language', () => {
+    withLanguage('auto', 'finishing');
+    expect(screen.queryByRole('radiogroup')).toBeNull();
+    cleanup();
+    withLanguage('auto', 'requesting', null);
+    expect(screen.queryByRole('radiogroup')).toBeNull();
+    cleanup();
+    withLanguage(null);
+    expect(screen.queryByRole('radiogroup')).toBeNull();
+  });
+});
+
+describe('the follow-up line after a recording', () => {
+  // Measured in Chromium at 390 px (311 px of composer), 2026-09-30: with
+  // Retry and the partial-insert label beside it at full width, the message
+  // was 0 px wide, one letter per line, 2,300 px tall, and the second button
+  // ran off the edge. jsdom has no layout, so the construction is held here.
+  it('keeps the message readable at any width: the actions wrap under it, and a long label inside its button', () => {
+    render(
+      <VoiceFollowUpLine
+        followUp={{
+          message: VOICE_MESSAGES.engineUnavailable('1:05'),
+          tone: 'error',
+          actionLabel: VOICE_MESSAGES.retry,
+          busy: false,
+          run: vi.fn(),
+          dismiss: vi.fn(),
+          secondaryLabel: LIVE_INSERT_PARTIAL_LABEL,
+          runSecondary: vi.fn(),
+        }}
+      />,
+    );
+    const message = screen.getByText(VOICE_MESSAGES.engineUnavailable('1:05'));
+    expect(message.className.split(' ')).toEqual(expect.arrayContaining(['flex-1', 'min-w-[min(12rem,100%)]']));
+    const row = message.parentElement!;
+    expect(row.className.split(' ')).toEqual(expect.arrayContaining(['flex', 'flex-wrap', 'min-w-0', 'flex-1']));
+    const actions = screen.getByTestId('voice-follow-up-actions');
+    expect(actions.parentElement).toBe(row);
+    expect(actions.className.split(' ')).toEqual(expect.arrayContaining(['flex', 'flex-wrap', 'max-w-full']));
+    for (const label of [VOICE_MESSAGES.retry, LIVE_INSERT_PARTIAL_LABEL]) {
+      const button = screen.getByText(label).closest('button')!;
+      expect(actions.contains(button)).toBe(true);
+      expect(button.className.split(' ')).toEqual(expect.arrayContaining(['max-w-full', 'text-left']));
+      expect(button.className.split(' ')).not.toContain('shrink-0');
+    }
+    // The dismiss stays at the top right, outside the row that wraps.
+    const dismiss = screen.getByLabelText('Dismiss');
+    expect(dismiss.parentElement).toBe(row.parentElement);
+    expect(dismiss.className.split(' ')).toContain('shrink-0');
+  });
+
+  it('runs each action, and draws no action row when there is nothing to press', () => {
+    const run = vi.fn();
+    const runSecondary = vi.fn();
+    const view = render(
+      <VoiceFollowUpLine
+        followUp={{ message: 'x', tone: 'info', actionLabel: 'Use the other one', busy: false, run, dismiss: vi.fn(), secondaryLabel: 'Other', runSecondary }}
+      />,
+    );
+    fireEvent.click(screen.getByText('Use the other one'));
+    fireEvent.click(screen.getByText('Other'));
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(runSecondary).toHaveBeenCalledTimes(1);
+    view.unmount();
+    render(<VoiceFollowUpLine followUp={{ message: 'y', tone: 'info', actionLabel: null, busy: false, run, dismiss: vi.fn() }} />);
+    expect(screen.queryByTestId('voice-follow-up-actions')).toBeNull();
   });
 });

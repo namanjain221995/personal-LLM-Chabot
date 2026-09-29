@@ -7,11 +7,18 @@
  * promise of it:
  *   - `start` first, with the whole contract, then binary 40 ms frames only
  *     after `ready`, replayed from sample 0 so the opening words are heard;
- *   - a drop reconnects on 0.5, 1, 2, 4, 8, then 15 s (±20%), resumes where
- *     the last final ended with the numbering carried on, and never retries a
- *     refusal retrying cannot fix;
+ *   - a drop reconnects on 0.5, 1, 2, 4, 8, then 15 s (±20%), starting over
+ *     only once a connection brought words back or stayed up 10 s, resumes
+ *     where the last final ended with the numbering carried on, and never
+ *     retries a refusal retrying cannot fix;
+ *   - the resume point keeps 15 s of the ring behind it, so the frames that
+ *     arrive during the handshake never overwrite it (the review's endless
+ *     reconnect, 2026-09-30), and an overwrite that happens anyway backs off;
+ *   - whether the live words are the whole recording (done, no gap, nothing
+ *     skipped), and a language chosen mid-recording (a new stream from the
+ *     last committed word);
  *   - backpressure at 256 KiB queued, released below 64 KiB, and a ring that
- *     overflowed meanwhile is resumed from its oldest sample;
+ *     overflowed meanwhile starts again after the backoff;
  *   - Stop: the rest of the audio, then `flush`, nothing after it, `done`
  *     closes; never longer than the 3 s budget;
  *   - cancel closes at once with 1000; ping, pong timeout, client_stats;
@@ -23,6 +30,8 @@ import { parseLiveConfig } from '@/lib/voice';
 import {
   CaptureClock,
   LIVE_FINISH_BUDGET_MS,
+  LIVE_RESUME_HEADROOM_SECONDS,
+  LIVE_RING_SECONDS,
   LIVE_SUBPROTOCOL,
   LiveCapture,
   LiveStream,
@@ -174,7 +183,11 @@ describe('the words that come back', () => {
 });
 
 describe('a dropped connection', () => {
-  it('reconnects after 0.5, 1, 2, 4, 8 and then every 15 s, and starts over once one is ready', () => {
+  // Until 2026-09-30 this ended "starts over once one is ready": `ready`
+  // alone reset the backoff, which let a stream refused right after every
+  // ready reconnect twice a second for the whole recording (review finding 5,
+  // held by 'backs off to 15 s when every stream fails right after ready').
+  it('reconnects after 0.5, 1, 2, 4, 8 and then every 15 s, and starts over once one brought words back', () => {
     const { push } = setup();
     push(0);
     const expected = [500, 1000, 2000, 4000, 8000, 15_000, 15_000];
@@ -187,10 +200,47 @@ describe('a dropped connection', () => {
       expect(FakeWebSocket.instances.length).toBe(before + 1);
     }
     FakeWebSocket.last.handshake();
+    FakeWebSocket.last.say({ type: 'partial', u: 0, text: 'hello', start_sample: 0, end_sample: 640 });
     const before = FakeWebSocket.instances.length;
     FakeWebSocket.last.hangUp(1006);
     vi.advanceTimersByTime(500);
     expect(FakeWebSocket.instances.length).toBe(before + 1);
+  });
+
+  it('backs off to 15 s when every stream fails right after ready (the review’s flapping engine)', () => {
+    const { push } = setup();
+    push(0);
+    for (const wait of [500, 1000, 2000, 4000, 8000, 15_000, 15_000]) {
+      const ws = FakeWebSocket.last;
+      ws.handshake();
+      ws.say({ type: 'error', code: 'engine_unavailable', message: 'x', retryable: true });
+      ws.hangUp(4503);
+      const before = FakeWebSocket.instances.length;
+      vi.advanceTimersByTime(wait - 1);
+      expect(FakeWebSocket.instances.length).toBe(before);
+      vi.advanceTimersByTime(1);
+      expect(FakeWebSocket.instances.length).toBe(before + 1);
+    }
+  });
+
+  it('starts the backoff over after a connection stayed up 10 s, and not after 9 s', () => {
+    const run = (upMs: number) => {
+      resetLiveFakes();
+      const { push } = setup();
+      push(0);
+      FakeWebSocket.last.hangUp(1006); // attempt 1: 0.5 s
+      vi.advanceTimersByTime(500);
+      FakeWebSocket.last.hangUp(1006); // attempt 2: 1 s
+      vi.advanceTimersByTime(1000);
+      FakeWebSocket.last.handshake();
+      vi.advanceTimersByTime(upMs); // no words: silence, or a speaker thinking
+      const before = FakeWebSocket.instances.length;
+      FakeWebSocket.last.hangUp(1006);
+      vi.advanceTimersByTime(500);
+      return FakeWebSocket.instances.length - before;
+    };
+    expect(run(10_000)).toBe(1); // proven: 0.5 s again
+    expect(run(9_000)).toBe(0); // not yet: the third wait, 2 s
   });
 
   it.each([
@@ -229,12 +279,34 @@ describe('a dropped connection', () => {
     expect(transcript.text()).toBe('One two. Three four.');
   });
 
-  it('resumes from the oldest sample still held when the last final is older than that', () => {
-    const { push } = setup({ ring: new PcmRing(1) });
-    push(0, 75); // 3 s into a 1 s ring
+  // Until 2026-09-30 a reconnect resumed from the ring's OLDEST sample here,
+  // which the next frame overwrites before `ready` (review finding 1): the
+  // resume point now keeps LIVE_RESUME_HEADROOM_SECONDS of the ring behind it.
+  it('resumes a minute back when the last final is older than that, with the headroom behind it', () => {
+    const { push, ring } = setup({ ring: new PcmRing(LIVE_RING_SECONDS) });
+    push(0, 2000); // 80 s, no final: the 75 s ring has dropped the first 5 s
     FakeWebSocket.last.hangUp(1006);
     vi.advanceTimersByTime(500);
-    expect(FakeWebSocket.last.handshake().resume_from_sample).toBe(48_000 - 16_000);
+    const resume = FakeWebSocket.last.handshake().resume_from_sample as number;
+    expect(resume).toBe(80 * 16_000 - 60 * 16_000);
+    expect(resume - ring.start).toBe(LIVE_RESUME_HEADROOM_SECONDS * 16_000);
+    expectPcmFrom(FakeWebSocket.last, resume, 60 * 16_000);
+  });
+
+  it('keeps a quarter of a ring shorter than the headroom behind the resume point', () => {
+    const { push } = setup({ ring: new PcmRing(1) });
+    push(0, 75); // 3 s into a 1 s ring: it holds [32,000, 48,000)
+    FakeWebSocket.last.hangUp(1006);
+    vi.advanceTimersByTime(500);
+    expect(FakeWebSocket.last.handshake().resume_from_sample).toBe(32_000 + 4_000);
+  });
+
+  it('never resumes further back than resume_max_s', () => {
+    const { push } = setup({ ring: new PcmRing(LIVE_RING_SECONDS), resumeMaxS: 20 });
+    push(0, 1000); // 40 s
+    FakeWebSocket.last.hangUp(1006);
+    vi.advanceTimersByTime(500);
+    expect(FakeWebSocket.last.handshake().resume_from_sample).toBe(40 * 16_000 - 20 * 16_000);
   });
 
   it.each([4400, 4401, 4403, 4404, 4409, 4413])('does not retry close %i, and stops showing live words', (code) => {
@@ -291,6 +363,228 @@ describe('a dropped connection', () => {
   });
 });
 
+/** Every sample `ws` sent is the next of `length` samples from `from` (a loop: toEqual on a minute of PCM is slow). */
+function expectPcmFrom(ws: FakeWebSocket, from: number, length: number) {
+  const pcm = ws.pcm;
+  expect(pcm.length).toBe(length);
+  for (let i = 0; i < length; i += 1) {
+    if (pcm[i] !== (from + i) % 30000) throw new Error(`sample ${from + i} was sent as ${pcm[i]}`);
+  }
+}
+
+describe('a reconnect whose resume point the handshake could overwrite (review, 2026-09-30)', () => {
+  /**
+   * The review's shape: the speaker says something at 2 s, then thinks for a
+   * minute and a half with no final, and the network blips. The reconnect's
+   * resume point is chosen when its socket opens, and the microphone keeps
+   * adding 40 ms frames until the server's `ready`.
+   */
+  function blipAMinuteAfterTheLastFinal(ring: PcmRing) {
+    const s = setup({ ring, resumeMaxS: 60 });
+    let next = 0;
+    const more = (count: number) => {
+      s.push(next, count);
+      next += count * 640;
+    };
+    more(1);
+    FakeWebSocket.last.handshake();
+    more(50);
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'hello there', start_sample: 0, end_sample: 32_000 });
+    more(2200); // 88 s more, and no final
+    FakeWebSocket.last.hangUp(1006);
+    vi.advanceTimersByTime(500);
+    return { ...s, more };
+  }
+
+  it('streams again, on one socket, in the review’s 20-round probe (a 60 s ring, resume_max_s 60)', () => {
+    const { stream, more } = blipAMinuteAfterTheLastFinal(new PcmRing(60));
+    const sockets = FakeWebSocket.instances.length;
+    let audioSent = 0;
+    for (let round = 0; round < 20; round += 1) {
+      const ws = FakeWebSocket.last;
+      ws.accept(); // `start` goes out with the resume point
+      const start = ws.texts[0]!;
+      more(1); // 40 ms later a frame lands, before `ready`
+      ws.say({ type: 'ready', v: 1, resume_from_sample: start.resume_from_sample, next_u: start.next_u });
+      audioSent += ws.frames.length;
+      if (ws.frames.length > 0) break;
+    }
+    // Before the fix: 21 sockets, 0 frames, 20 gaps.
+    expect(audioSent).toBeGreaterThan(0);
+    expect(FakeWebSocket.instances.length).toBe(sockets);
+    expect(stream.gaps).toBe(0);
+  });
+
+  it('replays a full minute from the production ring, with the headroom behind it', () => {
+    const { ring, stream, more } = blipAMinuteAfterTheLastFinal(new PcmRing(LIVE_RING_SECONDS));
+    const ws = FakeWebSocket.last;
+    ws.accept();
+    const start = ws.texts[0]!;
+    const resume = start.resume_from_sample as number;
+    more(1);
+    ws.say({ type: 'ready', v: 1, resume_from_sample: resume, next_u: start.next_u });
+    expect(resume).toBe(2251 * 640 - 60 * 16_000);
+    expectPcmFrom(ws, resume, ring.end - resume);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(stream.gaps).toBe(0);
+  });
+
+  it('backs off, never reconnecting at once, when a handshake outlasts the headroom anyway', () => {
+    const { push, stream } = setup({ ring: new PcmRing(1) }); // headroom: a quarter second
+    push(0, 75);
+    FakeWebSocket.last.hangUp(1006); // never ready: the first wait, 0.5 s
+    vi.advanceTimersByTime(500);
+    let next = 75 * 640;
+    for (const wait of [1000, 2000]) {
+      const ws = FakeWebSocket.last;
+      ws.accept();
+      const start = ws.texts[0]!;
+      push(next, 10); // 0.4 s of frames before ready: past the headroom
+      next += 10 * 640;
+      ws.say({ type: 'ready', v: 1, resume_from_sample: start.resume_from_sample, next_u: start.next_u });
+      expect(ws.frames).toHaveLength(0);
+      expect(ws.closedWith).toBe(1000);
+      expect(FakeWebSocket.last).toBe(ws); // not at once
+      vi.advanceTimersByTime(wait - 1);
+      expect(FakeWebSocket.last).toBe(ws);
+      vi.advanceTimersByTime(1);
+      expect(FakeWebSocket.last).not.toBe(ws);
+    }
+    expect(stream.gaps).toBe(2);
+  });
+});
+
+describe('whether the live transcript is the whole recording', () => {
+  async function finishWithDone(stream: LiveStream) {
+    void stream.finish();
+    FakeWebSocket.last.say({ type: 'done' });
+    await vi.advanceTimersByTimeAsync(0);
+  }
+
+  it('is, once done came after the flush, with no gap and nothing skipped', async () => {
+    const { push, stream } = setup();
+    push(0, 50);
+    FakeWebSocket.last.handshake();
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'All of it.', start_sample: 0, end_sample: 32_000 });
+    expect(stream.complete).toBe(false); // not before the end
+    await finishWithDone(stream);
+    expect(stream.end).toBe('done');
+    expect(stream.complete).toBe(true);
+  });
+
+  it('still is after a reconnect that resumed where the last final ended', async () => {
+    const { push, stream } = setup();
+    push(0, 100);
+    FakeWebSocket.last.handshake();
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'One.', start_sample: 0, end_sample: 32_000 });
+    FakeWebSocket.last.hangUp(1006);
+    vi.advanceTimersByTime(500);
+    expect(FakeWebSocket.last.handshake().resume_from_sample).toBe(32_000);
+    await finishWithDone(stream);
+    expect(stream.complete).toBe(true);
+  });
+
+  it('is not when a reconnect had to start after audio no final covered', async () => {
+    const { push, stream } = setup({ ring: new PcmRing(LIVE_RING_SECONDS) });
+    push(0);
+    FakeWebSocket.last.handshake();
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'Early words.', start_sample: 0, end_sample: 16_000 });
+    push(640, 1999); // 80 s in all, nothing final after the first second
+    FakeWebSocket.last.hangUp(1006);
+    vi.advanceTimersByTime(500);
+    expect(FakeWebSocket.last.handshake().resume_from_sample).toBe(20 * 16_000);
+    await finishWithDone(stream);
+    expect(stream.end).toBe('done');
+    expect(stream.complete).toBe(false);
+  });
+
+  it('is not when the ring lost audio before it could be sent', async () => {
+    const { push, stream } = setup({ ring: new PcmRing(1) });
+    push(0);
+    FakeWebSocket.last.bufferedAmount = 300 * 1024;
+    FakeWebSocket.last.holdBuffer = true;
+    FakeWebSocket.last.handshake();
+    push(640, 49);
+    vi.advanceTimersByTime(500);
+    FakeWebSocket.last.handshake();
+    await finishWithDone(stream);
+    expect(stream.gaps).toBe(1);
+    expect(stream.complete).toBe(false);
+  });
+
+  it('is not when refused for good, nor when done never came', async () => {
+    const refused = setup();
+    refused.push(0);
+    FakeWebSocket.last.handshake();
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'Heard.', start_sample: 0, end_sample: 640 });
+    FakeWebSocket.last.say({ type: 'error', code: 'session_closed', message: 'x', retryable: false });
+    FakeWebSocket.last.hangUp(4404);
+    expect(refused.stream.end).toBe('refused');
+    expect(refused.stream.complete).toBe(false);
+
+    resetLiveFakes();
+    const late = setup();
+    late.push(0);
+    FakeWebSocket.last.handshake();
+    void late.stream.finish();
+    await vi.advanceTimersByTimeAsync(LIVE_FINISH_BUDGET_MS);
+    expect(late.stream.end).toBe('timeout');
+    expect(late.stream.complete).toBe(false);
+  });
+});
+
+describe('a language chosen mid-recording', () => {
+  it('starts again at once in the new language, from the last committed word, losing and repeating nothing', async () => {
+    const { push, stream, transcript } = setup({ language: 'auto' });
+    push(0, 100); // 4 s
+    const first = FakeWebSocket.last;
+    first.handshake();
+    first.say({ type: 'final', u: 0, text: 'Hello everyone.', start_sample: 0, end_sample: 32_000 });
+    first.say({ type: 'partial', u: 1, text: 'aaj hum', start_sample: 33_000, end_sample: 60_000 });
+    stream.setLanguage('hi');
+    expect(first.closedWith).toBe(1000);
+    expect(FakeWebSocket.instances).toHaveLength(2); // at once: no backoff for a choice
+    const second = FakeWebSocket.last;
+    expect(second.handshake()).toMatchObject({ language: 'hi', resume_from_sample: 32_000, next_u: 1 });
+    // The utterance under way is heard again, in Hindi; the committed one is not sent again.
+    expectPcmFrom(second, 32_000, 64_000 - 32_000);
+    // Whatever the old connection still says is not this stream's any more.
+    first.say({ type: 'final', u: 1, text: 'aaj hum', start_sample: 33_000, end_sample: 60_000 });
+    expect(transcript.text()).toBe('Hello everyone. aaj hum');
+    second.say({ type: 'partial', u: 1, text: 'आज हम', start_sample: 33_000, end_sample: 60_000 });
+    expect(transcript.text()).toBe('Hello everyone. आज हम');
+    second.say({ type: 'final', u: 1, text: 'आज हम बात करेंगे।', start_sample: 33_000, end_sample: 64_000 });
+    expect(transcript.committed.map((u) => u.text)).toEqual(['Hello everyone.', 'आज हम बात करेंगे।']);
+    void stream.finish();
+    second.say({ type: 'done' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stream.complete).toBe(true);
+    expect(stream.currentLanguage).toBe('hi');
+  });
+
+  it('is said by the next attempt when a reconnect is waiting out its backoff, and not sooner', () => {
+    const { push, stream } = setup();
+    push(0);
+    FakeWebSocket.last.hangUp(1006);
+    stream.setLanguage('en');
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    vi.advanceTimersByTime(500);
+    expect(FakeWebSocket.last.handshake().language).toBe('en');
+  });
+
+  it('changes nothing for the language already in use, or after Stop', () => {
+    const { push, stream } = setup({ language: 'en' });
+    push(0);
+    FakeWebSocket.last.handshake();
+    stream.setLanguage('en');
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    void stream.finish();
+    stream.setLanguage('hi');
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(FakeWebSocket.last.closedWith).toBeNull();
+  });
+});
+
 describe('backpressure', () => {
   it('stops handing frames over past 256 KiB queued and resumes below 64 KiB', () => {
     const { push } = setup();
@@ -311,7 +605,11 @@ describe('backpressure', () => {
     expect(ws.pcm).toEqual([...samplesAt(0, 300 * 640)]);
   });
 
-  it('resumes from the oldest sample held when the ring overflowed meanwhile, and counts the gap', () => {
+  // Until 2026-09-30 the new connection was opened at once; an overwrite that
+  // recurs on every handshake then reconnected in a tight loop (review finding
+  // 1), so it goes through the backoff now, and the resume point keeps its
+  // headroom (a quarter of this 1 s ring).
+  it('starts again after the backoff when the ring overflowed meanwhile, and counts the gap', () => {
     const { push, stream } = setup({ ring: new PcmRing(1) });
     push(0);
     const first = FakeWebSocket.last;
@@ -319,12 +617,15 @@ describe('backpressure', () => {
     first.bufferedAmount = 300 * 1024; // the uplink is stuck
     first.handshake();
     expect(first.frames).toHaveLength(0);
-    push(640, 49); // 2 s more into a 1 s ring
+    push(640, 49); // 2 s more into a 1 s ring: it holds [16,000, 32,000)
     expect(stream.gaps).toBe(1);
     expect(first.closedWith).toBe(1000);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    vi.advanceTimersByTime(500);
     const second = FakeWebSocket.last;
     expect(second).not.toBe(first);
-    expect(second.handshake().resume_from_sample).toBe(32_000 - 16_000);
+    expect(second.handshake().resume_from_sample).toBe(32_000 - 16_000 + 4_000);
+    expect(second.pcm).toEqual([...samplesAt(20_000, 12_000)]);
   });
 });
 
@@ -643,6 +944,60 @@ describe('the capture on the meter’s context', () => {
     expect(views.length).toBeGreaterThanOrEqual(9);
     expect(views.length).toBeLessThanOrEqual(11);
     expect(views[views.length - 1]!.partial!.text).toBe('word 100');
+  });
+
+  it('keeps the handshake’s headroom in the ring it builds itself (the production wiring)', async () => {
+    const { capture, node } = await attached();
+    node!.started(48000);
+    node!.frames(0, 1);
+    openOn(capture); // resume_max_s 60, as the orchestrator sends it
+    FakeWebSocket.last.handshake();
+    node!.frames(640, 50);
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'hello there', start_sample: 0, end_sample: 32_000 });
+    node!.frames(51 * 640, 2200);
+    FakeWebSocket.last.hangUp(1006);
+    vi.advanceTimersByTime(500);
+    const ws = FakeWebSocket.last;
+    ws.accept();
+    const start = ws.texts[0]!;
+    node!.frame(2251 * 640); // before ready
+    ws.say({ type: 'ready', v: 1, resume_from_sample: start.resume_from_sample, next_u: start.next_u });
+    expect(capture.ring.capacity).toBe(LIVE_RING_SECONDS * 16_000);
+    expect(ws.frames.length).toBeGreaterThan(0);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+
+  it('says whether its words are the whole recording, and hears the rest in another language', async () => {
+    const { capture, node } = await attached();
+    node!.frames(0, 25);
+    expect(capture.language).toBeNull(); // no stream yet
+    openOn(capture);
+    expect(capture.language).toBe('auto');
+    FakeWebSocket.last.handshake();
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'Hi.', start_sample: 0, end_sample: 8_000 });
+    capture.setLanguage('en');
+    expect(capture.language).toBe('en');
+    const second = FakeWebSocket.last;
+    expect(second.handshake()).toMatchObject({ language: 'en', resume_from_sample: 8_000, next_u: 1 });
+    expect(capture.complete()).toBe(false); // not before its end
+    const { done } = capture.finish();
+    node!.flushed(16_000);
+    await vi.advanceTimersByTimeAsync(0);
+    second.say({ type: 'done' });
+    await done;
+    expect(capture.complete()).toBe(true);
+    expect(capture.text()).toBe('Hi.');
+  });
+
+  it('has no language once refused for good, and is not complete', async () => {
+    const { capture, node } = await attached();
+    node!.frames(0, 2);
+    openOn(capture);
+    FakeWebSocket.last.handshake();
+    FakeWebSocket.last.say({ type: 'error', code: 'voice_off', message: 'x', retryable: false });
+    FakeWebSocket.last.hangUp(4403);
+    expect(capture.language).toBeNull();
+    expect(capture.complete()).toBe(false);
   });
 
   it('draws nothing until there are words, and the words it has once there are', async () => {

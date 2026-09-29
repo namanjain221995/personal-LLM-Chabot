@@ -12,17 +12,28 @@
  *   - the capture clock is not fooled by a main thread that stalls.
  */
 import { describe, expect, it } from 'vitest';
-import { parseLiveConfig, parseSessionConfig, type SessionProgress } from '@/lib/voice';
+import {
+  describeOutcome,
+  parseLiveConfig,
+  parseSessionConfig,
+  parseSessionState,
+  type SessionProgress,
+} from '@/lib/voice';
 import {
   CaptureClock,
+  HINDI_SHARE,
   LiveTranscript,
   PcmRing,
   VOICE_LANGUAGE_KEY,
+  chooseFinalText,
+  devanagariShare,
   getVoiceLanguage,
+  isHindiSession,
   liveSocketUrl,
   mergeLiveTranscript,
   setVoiceLanguage,
   spaceBetween,
+  swapInDraft,
   withLiveWords,
   type LiveUtterance,
   type LiveView,
@@ -375,6 +386,180 @@ describe('the durable preview and the live words, as one text', () => {
     expect(m.live.length).toBeLessThanOrEqual(120);
     expect(m.live.endsWith('word399 again.')).toBe(true);
     expect(m.live.startsWith('word')).toBe(true);
+  });
+
+  // The review's probe (2026-09-30): the tail was cut up to the first space,
+  // and Japanese has none, so twelve Japanese utterances and "OK thanks" came
+  // out as "OK thanks" (9 characters) where four lines of speech belonged.
+  it('keeps a tail of Japanese, which has no spaces to cut at', () => {
+    const japanese = '今日は会議の資料を確認してから午後の打ち合わせに参加します。明日の予定も共有してください。よろしくお願いします';
+    const said = Array.from({ length: 12 }, (_, i) => u(i, japanese, i * 2000, i * 2000 + 1800));
+    said.push(u(12, 'OK thanks', 24_000, 25_000));
+    const m = mergeLiveTranscript(progress(), view(said));
+    expect(m.live.length).toBe(600);
+    expect(m.live.endsWith(`${japanese} OK thanks`)).toBe(true);
+  });
+
+  it('does not drop a whole word the cut did not fall inside, nor split an emoji', () => {
+    // "we met today" cut to its last 9 characters lands exactly on the start
+    // of "met": nothing more is dropped (the old trim left "today").
+    const words = [u(0, 'we met', 0, 1000), u(1, 'today', 1000, 2000)];
+    expect(mergeLiveTranscript(progress(), view(words), 'met today'.length).live).toBe('met today');
+    // Inside a word, its short fragment still goes.
+    expect(mergeLiveTranscript(progress(), view(words), 'et today'.length).live).toBe('today');
+    // Forty utterances of sixteen emoji, 32 UTF-16 units each: the tail never
+    // starts on the second half of a surrogate pair.
+    const faces = Array.from({ length: 40 }, (_, i) => u(i, '😀'.repeat(16), i * 1000, i * 1000 + 800));
+    for (const max of [599, 600, 601]) {
+      const first = mergeLiveTranscript(progress(), view(faces), max).live.charCodeAt(0);
+      expect(first >= 0xdc00 && first <= 0xdfff).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Which transcript goes into the draft at Stop (build spec section 10)
+// ---------------------------------------------------------------------------
+
+describe('which transcript goes into the draft', () => {
+  const HINGLISH = 'मैं आज office जा रहा हूँ, meeting दस बजे है।';
+  const ENGLISH = 'I am going to the office today, the meeting is at ten.';
+  /** What whisper-large-v3 made of HINGLISH: Urdu script, as it did for 73 of 364 lecture segments. */
+  const WHISPER_URDU = 'میں آج آفس جا رہا ہوں، میٹنگ دس بجے ہے۔';
+
+  it('measures Devanagari among the letters, leaving vowel signs out of both counts', () => {
+    expect(devanagariShare('')).toBe(0);
+    expect(devanagariShare('1, 2, 3!')).toBe(0);
+    expect(devanagariShare(ENGLISH)).toBe(0);
+    expect(devanagariShare('नमस्ते')).toBe(1);
+    // न म स त are letters; the virama and the vowel sign are marks.
+    expect(devanagariShare('नमस्ते abcd')).toBe(0.5);
+    expect(devanagariShare(HINGLISH)).toBeGreaterThanOrEqual(HINDI_SHARE);
+    expect(devanagariShare(WHISPER_URDU)).toBe(0);
+  });
+
+  it('is the full pass for an English session, as before live dictation', () => {
+    for (const whisperLanguage of ['en', 'English', null, undefined]) {
+      expect(chooseFinalText({ liveText: ENGLISH, liveComplete: true, userLanguage: 'auto', whisperLanguage })).toBe(
+        'durable',
+      );
+    }
+    expect(chooseFinalText({ liveText: ENGLISH, liveComplete: true, userLanguage: 'en', whisperLanguage: 'en' })).toBe(
+      'durable',
+    );
+  });
+
+  it('is the live one once a fifth of its letters are Devanagari, whatever whisper heard', () => {
+    expect(
+      chooseFinalText({ liveText: HINGLISH, liveComplete: true, userLanguage: 'auto', whisperLanguage: 'en' }),
+    ).toBe('live');
+    // Just under a fifth is not enough on its own.
+    const mostlyEnglish = `${'a'.repeat(81)} ${'क'.repeat(19)}`;
+    expect(devanagariShare(mostlyEnglish)).toBe(0.19);
+    expect(
+      chooseFinalText({ liveText: mostlyEnglish, liveComplete: true, userLanguage: 'auto', whisperLanguage: 'en' }),
+    ).toBe('durable');
+    const oneFifth = `${'a'.repeat(80)} ${'क'.repeat(20)}`;
+    expect(chooseFinalText({ liveText: oneFifth, liveComplete: true, userLanguage: 'auto', whisperLanguage: null })).toBe(
+      'live',
+    );
+  });
+
+  it('is the live one when the person chose Hindi, even for words the live model wrote in Latin', () => {
+    expect(
+      chooseFinalText({ liveText: 'aaj hum office jayenge', liveComplete: true, userLanguage: 'hi', whisperLanguage: 'en' }),
+    ).toBe('live');
+  });
+
+  it('is the live one when whisper heard Hindi or Urdu, as its Urdu-script answer to Hinglish shows', () => {
+    for (const whisperLanguage of ['hi', 'ur', 'Hindi', 'Urdu', ' UR ']) {
+      expect(
+        chooseFinalText({ liveText: 'aaj hum office jayenge', liveComplete: true, userLanguage: 'auto', whisperLanguage }),
+      ).toBe('live');
+    }
+    expect(isHindiSession({ liveText: HINGLISH, userLanguage: 'auto', whisperLanguage: 'ur' })).toBe(true);
+  });
+
+  it('is the full pass when the live transcript missed part of the recording, or has no words', () => {
+    expect(
+      chooseFinalText({ liveText: HINGLISH, liveComplete: false, userLanguage: 'hi', whisperLanguage: 'ur' }),
+    ).toBe('durable');
+    expect(chooseFinalText({ liveText: '  ', liveComplete: true, userLanguage: 'hi', whisperLanguage: 'hi' })).toBe(
+      'durable',
+    );
+  });
+
+  it('is the full pass for any language it was not measured on', () => {
+    expect(
+      chooseFinalText({ liveText: 'Bonjour à tous', liveComplete: true, userLanguage: 'auto', whisperLanguage: 'fr' }),
+    ).toBe('durable');
+  });
+
+  it('is the full pass when the person chose English and whisper heard Hindi: the English model cannot write it', () => {
+    for (const whisperLanguage of ['hi', 'ur']) {
+      expect(
+        chooseFinalText({ liveText: 'Main aaj office ja raha hoon', liveComplete: true, userLanguage: 'en', whisperLanguage }),
+      ).toBe('durable');
+    }
+    // Devanagari in the live words still decides: they came from the multilingual model before a switch to English.
+    expect(chooseFinalText({ liveText: HINGLISH, liveComplete: true, userLanguage: 'en', whisperLanguage: 'hi' })).toBe(
+      'live',
+    );
+  });
+});
+
+describe('swapping the other transcript in', () => {
+  const DRAFT = 'Notes: we met on monday. Thanks';
+  const span = { start: 7, end: 24 }; // "we met on monday."
+
+  it('replaces exactly the words that went in, and says where the new ones are', () => {
+    expect(DRAFT.slice(span.start, span.end)).toBe('we met on monday.');
+    const swapped = swapInDraft(DRAFT, span, 'we met on monday.', 'हम सोमवार को मिले।')!;
+    expect(swapped.text).toBe('Notes: हम सोमवार को मिले। Thanks');
+    expect(swapped.text.slice(swapped.span.start, swapped.span.end)).toBe('हम सोमवार को मिले।');
+    // And back again, from where the first swap left it.
+    expect(swapInDraft(swapped.text, swapped.span, 'हम सोमवार को मिले।', 'we met on monday.')!.text).toBe(DRAFT);
+  });
+
+  it('swaps nothing once the words were changed, and never merges edits into the other text', () => {
+    const edited = 'Notes: we met on Monday. Thanks';
+    expect(swapInDraft(edited, span, 'we met on monday.', 'हम सोमवार को मिले।')).toBeNull();
+  });
+
+  it('swaps nothing without a place, or without words', () => {
+    expect(swapInDraft(DRAFT, null, 'we met on monday.', 'x')).toBeNull();
+    expect(swapInDraft(DRAFT, { start: 7, end: 99 }, 'we met on monday.', 'x')).toBeNull();
+    expect(swapInDraft(DRAFT, span, 'we met on monday.', '  ')).toBeNull();
+  });
+});
+
+describe('the language the full pass heard, on its result', () => {
+  const done = (over: Record<string, unknown>) =>
+    describeOutcome(
+      parseSessionState({
+        session_id: SID,
+        status: 'done',
+        outcome: 'transcribed',
+        text: 'میں آج آفس جا رہا ہوں',
+        segments: [],
+        gaps: [],
+        ...over,
+      })!,
+    );
+
+  it('carries the session’s language and code when the server said', () => {
+    expect(done({ language: 'Urdu', language_code: 'ur' })).toMatchObject({
+      kind: 'text',
+      language: 'Urdu',
+      languageCode: 'ur',
+    });
+  });
+
+  it('carries nothing when it did not', () => {
+    const result = done({});
+    expect(result.kind).toBe('text');
+    expect('language' in result).toBe(false);
+    expect('languageCode' in result).toBe(false);
   });
 });
 

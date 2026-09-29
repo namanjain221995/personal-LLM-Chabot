@@ -1454,9 +1454,31 @@ export type VoiceOffer =
     };
 
 export type SessionResult =
-  | { kind: 'text'; text: string; notices: string[]; offer: VoiceOffer | null; sessionId: string }
+  | {
+      kind: 'text';
+      text: string;
+      notices: string[];
+      offer: VoiceOffer | null;
+      sessionId: string;
+      /**
+       * The language the full pass heard, when the server said: `language`
+       * as its name ("Hindi"), `languageCode` as its code ("hi"). Which
+       * transcript goes into the draft depends on it (lib/voiceLive.ts
+       * `chooseFinalText`: whisper writes a fifth of Hinglish in Urdu script).
+       */
+      language?: string;
+      languageCode?: string;
+    }
   | { kind: 'error'; error: VoiceError; offer: VoiceOffer | null }
   | { kind: 'withdrawn' };
+
+/** The full pass's language as a text result carries it: only what the server said. */
+function languageOf(state: SessionState): { language?: string; languageCode?: string } {
+  return {
+    ...(state.language ? { language: state.language } : {}),
+    ...(state.languageCode ? { languageCode: state.languageCode } : {}),
+  };
+}
 
 /** Whether a result leaves anything for the person to act on later. */
 function offerKeepsRecord(offer: VoiceOffer | null): boolean {
@@ -1529,7 +1551,7 @@ export function describeOutcome(
         )
       : null;
   if (offer && offer.kind === 'retranscribe') offer.replaces = text;
-  return { kind: 'text', text, notices, offer, sessionId: state.sessionId };
+  return { kind: 'text', text, notices, offer, sessionId: state.sessionId, ...languageOf(state) };
 }
 
 // ---------------------------------------------------------------------------
@@ -3545,12 +3567,16 @@ export class VoiceSession {
       return results.find((r) => r.kind === 'error' && r.offer !== null) ?? last;
     }
     const offers = results.map((r) => (r.kind === 'withdrawn' ? null : r.offer));
+    // The language of the session that holds most of the words speaks for the whole.
+    const most = texts.reduce((a, b) => (b.text.length > a.text.length ? b : a));
     return {
       kind: 'text',
       text: texts.reduce((acc, r) => mergeTranscript(acc, r.text), ''),
       notices: [...new Set(texts.flatMap((r) => r.notices))],
       offer: offers.find((o) => o?.kind === 'retranscribe') ?? null,
       sessionId: this.sessionId,
+      ...(most.language ? { language: most.language } : {}),
+      ...(most.languageCode ? { languageCode: most.languageCode } : {}),
     };
   }
 }

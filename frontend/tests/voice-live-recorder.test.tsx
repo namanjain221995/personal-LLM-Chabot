@@ -15,12 +15,18 @@
  *   - cancel and pagehide close the socket at once with 1000;
  *   - the live path is best effort: whatever it does, the stored recording
  *     and its transcript are exactly what they would have been without it;
- *   - when the stored transcript cannot be had, the live words are OFFERED;
+ *   - when the stored transcript cannot be had, the live words are OFFERED,
+ *     and said to be part of the recording when the stream missed some;
  *   - the live words redraw at most ten times a second;
  *   - a second Stop inside the stop event's delay no longer strands the
- *     recording (the audit's stop() race).
+ *     recording (the audit's stop() race);
+ *   - at Stop the full pass goes in for English and the complete live
+ *     transcript for Hindi or Hinglish (spec section 10), one quiet line says
+ *     which, and its button swaps the other in over the untouched words;
+ *   - the bar's language control starts the live stream again in the chosen
+ *     language, from the last committed word.
  */
-import { act, cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, renderHook, screen, within } from '@testing-library/react';
 import { Blob as NodeBlob } from 'node:buffer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Composer } from '@/components/Composer';
@@ -564,6 +570,70 @@ describe('when the stored transcript cannot be had', () => {
     expect(ctx.view.result.current.followUp).toBeNull();
   });
 
+  // The review's probe (2026-09-30): the stream was refused a few seconds in,
+  // thirty more seconds were recorded, and "First minute only." was offered as
+  // "Insert live transcript" beside "no words could be made out".
+  it('says the live words are only part of the recording when the stream was refused mid-way', async () => {
+    useServer({ finalState: () => ({ outcome: 'no_words', text: null }) });
+    const ctx = await startRecording();
+    const ws = await goLive(25);
+    await act(async () => {
+      ws.say({ type: 'final', u: 0, text: 'First minute only.', start_sample: 0, end_sample: 16_000 });
+      ws.say({ type: 'error', code: 'session_closed', message: 'x', retryable: false });
+      ws.hangUp(4404);
+    });
+    await talk(ctx, 6); // 30 s more that the live path never heard
+    await act(async () => {
+      ctx.view.result.current.stop();
+    });
+    await act(async () => {
+      FakeWorkletNode.last.flushed(16_000);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await untilWithClock(() => ctx.view.result.current.followUp !== null, 'the follow-up');
+    const followUp = ctx.view.result.current.followUp!;
+    expect(followUp.actionLabel).toBe('Insert what was heard live (part of the recording)');
+    expect(followUp.message).toBe(
+      'Sound was detected, but no words could be made out. It may have been background noise or music. The recording is saved.',
+    );
+    expect(ctx.onTranscript).not.toHaveBeenCalled();
+    await act(async () => followUp.run());
+    expect(ctx.onTranscript).toHaveBeenCalledWith('First minute only.', null);
+  });
+
+  it('says so beside Retry too, when a reconnect had to skip audio no final covered', async () => {
+    useServer({ finalState: () => ({ outcome: 'engine_unavailable', text: null }) });
+    const ctx = await startRecording();
+    const ws = await goLive(25);
+    await act(async () => {
+      ws.say({ type: 'final', u: 0, text: 'Before the gap.', start_sample: 0, end_sample: 8_000 });
+      ws.hangUp(1006);
+      // Eighty seconds of the tap while the connection is down: more than the
+      // minute a reconnect replays. (The hook's backoff is jittered: 0.4-0.6 s.)
+      FakeWorkletNode.last.frames(16_000, 2000);
+      await vi.advanceTimersByTimeAsync(600);
+    });
+    const second = FakeWebSocket.last;
+    expect(second).not.toBe(ws);
+    await act(async () => {
+      expect(second.handshake().resume_from_sample).toBe(16_000 + 2000 * 640 - 60 * 16_000);
+      second.say({ type: 'final', u: 1, text: 'After the gap.', start_sample: 400_000, end_sample: 420_000 });
+    });
+    await talk(ctx, 1);
+    await act(async () => {
+      ctx.view.result.current.stop();
+    });
+    await act(async () => {
+      FakeWorkletNode.last.flushed(16_000 + 2000 * 640);
+      await vi.advanceTimersByTimeAsync(0);
+      second.say({ type: 'done' });
+    });
+    await untilWithClock(() => ctx.view.result.current.followUp !== null, 'the Retry offer');
+    const followUp = ctx.view.result.current.followUp!;
+    expect(followUp.actionLabel).toBe('Retry');
+    expect(followUp.secondaryLabel).toBe('Insert what was heard live (part of the recording)');
+  });
+
   it('says what it always said when there are no live words to offer', async () => {
     useServer({ finalState: () => ({ outcome: 'no_words', text: null }) });
     const ctx = await startRecording();
@@ -705,5 +775,289 @@ describe('a second Stop before the stop event (the audit’s stop() race)', () =
     // what the server already has.
     await untilWithClock(() => ctx.onTranscript.mock.calls.length > 0, 'the words delivered');
     expect(ctx.onTranscript).toHaveBeenCalledWith('w0', null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Which transcript goes in at Stop (build spec section 10, 2026-09-30)
+// ---------------------------------------------------------------------------
+
+/** Nemotron's kind of Hinglish: Devanagari with the English words in Latin. */
+const HINGLISH = 'मैं आज office जा रहा हूँ, meeting दस बजे है।';
+/** What whisper-large-v3 made of such speech in a fifth of the lecture segments: Urdu script. */
+const WHISPER_URDU = 'میں آج آفس جا رہا ہوں، میٹنگ دس بجے ہے۔';
+
+/** Stop, the worklet's last frame, and the live stream's `done`: the end on both paths. */
+async function stopWithLiveDone(ctx: Ctx, ws: FakeWebSocket) {
+  await act(async () => {
+    ctx.view.result.current.stop();
+  });
+  await act(async () => {
+    FakeWorkletNode.last.flushed(16_000);
+    await vi.advanceTimersByTimeAsync(0);
+  });
+  await act(async () => {
+    ws.say({ type: 'done' });
+  });
+  await untilWithClock(() => ctx.onTranscript.mock.calls.length > 0, 'the words delivered');
+}
+
+/** Record one slice with these live words, and stop. */
+async function dictate(liveWords: string, options: { language?: string } = {}) {
+  if (options.language) window.localStorage.setItem('techsara-voice-language', options.language);
+  const ctx = await startRecording();
+  const ws = await goLive(25);
+  await talk(ctx, 1);
+  await act(async () => {
+    ws.say({ type: 'final', u: 0, text: liveWords, start_sample: 0, end_sample: 16_000 });
+  });
+  await stopWithLiveDone(ctx, ws);
+  return { ...ctx, ws };
+}
+
+describe('which transcript goes in at Stop', () => {
+  it('is the full pass for an English session, said in one quiet line that offers the live one', async () => {
+    const ctx = await dictate('Hello there, this came in live.');
+    expect(ctx.onTranscript).toHaveBeenCalledTimes(1);
+    expect(ctx.onTranscript).toHaveBeenCalledWith('w0 w1', null);
+    const line = ctx.view.result.current.followUp!;
+    expect(line).toMatchObject({
+      message: 'Inserted the full-pass transcript.',
+      tone: 'info',
+      actionLabel: 'Use the other one',
+      busy: false,
+    });
+    await act(async () => line.run());
+    // The live one, over the span the full pass went into, and only if untouched.
+    expect(ctx.onTranscript).toHaveBeenLastCalledWith('Hello there, this came in live.', null, 'w0 w1', true);
+    expect(ctx.view.result.current.followUp).toMatchObject({
+      message: 'Inserted the live transcript.',
+      actionLabel: 'Use the other one',
+    });
+    await act(async () => ctx.view.result.current.followUp!.run());
+    expect(ctx.onTranscript).toHaveBeenLastCalledWith('w0 w1', null, 'Hello there, this came in live.', true);
+  });
+
+  it('is the live one for a Hinglish session: at least a fifth of its letters Devanagari', async () => {
+    const ctx = await dictate(HINGLISH);
+    expect(ctx.onTranscript).toHaveBeenCalledTimes(1);
+    expect(ctx.onTranscript).toHaveBeenCalledWith(HINGLISH, null);
+    expect(ctx.view.result.current.followUp).toMatchObject({
+      message: 'Inserted the live transcript.',
+      actionLabel: 'Use the other one',
+    });
+  });
+
+  it('is the live one when the person chose Hindi, whatever script the live words came in', async () => {
+    const ctx = await dictate('aaj hum office jayenge', { language: 'hi' });
+    expect(ctx.ws.texts[0]!.language).toBe('hi');
+    expect(ctx.onTranscript).toHaveBeenCalledWith('aaj hum office jayenge', null);
+  });
+
+  it('is the live one, not whisper’s Urdu script, when whisper heard Urdu in Hinglish', async () => {
+    useServer({ finalState: () => ({ text: WHISPER_URDU, language: 'Urdu', language_code: 'ur' }) });
+    // Mostly Latin: under a fifth Devanagari, so whisper's language decides.
+    const live = 'Main aaj office ja raha hoon, meeting दस baje hai.';
+    const ctx = await dictate(live);
+    expect(ctx.onTranscript).toHaveBeenCalledTimes(1);
+    expect(ctx.onTranscript).toHaveBeenCalledWith(live, null);
+    const line = ctx.view.result.current.followUp!;
+    expect(line.message).toBe('Inserted the live transcript.');
+    await act(async () => line.run());
+    expect(ctx.onTranscript).toHaveBeenLastCalledWith(WHISPER_URDU, null, live, true);
+  });
+
+  it('falls back to the full pass when the Hindi live transcript missed part of the recording', async () => {
+    window.localStorage.setItem('techsara-voice-language', 'hi');
+    const ctx = await startRecording();
+    const ws = await goLive(25);
+    await act(async () => {
+      ws.say({ type: 'final', u: 0, text: 'आज की बैठक', start_sample: 0, end_sample: 16_000 });
+      ws.say({ type: 'error', code: 'session_closed', message: 'x', retryable: false });
+      ws.hangUp(4404);
+    });
+    // Refused for good: there is nothing left for a language control to change.
+    expect(ctx.view.result.current.language).toBeNull();
+    await talk(ctx, 2);
+    await act(async () => {
+      ctx.view.result.current.stop();
+    });
+    await act(async () => {
+      FakeWorkletNode.last.flushed(16_000);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await untilWithClock(() => ctx.onTranscript.mock.calls.length > 0, 'the words delivered');
+    expect(ctx.onTranscript).toHaveBeenCalledWith('w0 w1 w2', null);
+    expect(ctx.view.result.current.followUp).toMatchObject({
+      message: 'Inserted the full-pass transcript.',
+      actionLabel: 'Use what was heard live (part of the recording)',
+    });
+  });
+
+  it('keeps the full pass’s Retry on the same line, and the Retry follows the transcript in the draft', async () => {
+    useServer({
+      finalState: (_words, s) =>
+        s.retranscribes === 0
+          ? { outcome: 'transcribed_with_gaps', gaps: [{ start_ms: 5000, end_ms: 10_000, reason: 'engine_unavailable' }] }
+          : {},
+    });
+    const ctx = await dictate(HINGLISH);
+    expect(ctx.onTranscript).toHaveBeenCalledWith(HINGLISH, null);
+    const line = ctx.view.result.current.followUp!;
+    expect(line.message).toBe(
+      "Inserted the live transcript. The speech engine couldn't transcribe 1 part (0:05–0:10). The audio is saved. Press Retry to transcribe them.",
+    );
+    expect(line.actionLabel).toBe('Retry');
+    expect(line.secondaryLabel).toBe('Use the other one');
+    await act(async () => line.runSecondary!());
+    expect(ctx.onTranscript).toHaveBeenLastCalledWith('w0 w1', null, HINGLISH, true);
+    const swapped = ctx.view.result.current.followUp!;
+    expect(swapped.message.startsWith('Inserted the full-pass transcript. ')).toBe(true);
+    // Retry now replaces the full pass's words, which are the ones in the draft.
+    await act(async () => swapped.run());
+    await untilWithClock(() => ctx.onTranscript.mock.calls.length === 3, 'the Retry delivered');
+    expect(ctx.onTranscript.mock.calls[2]!.slice(0, 3)).toEqual(['w0 w1', null, 'w0 w1']);
+    expect(server.retranscribes).toBe(1);
+  });
+
+  it('draws no line when there were no live words, as before', async () => {
+    const ctx = await startRecording();
+    await talk(ctx, 1);
+    await act(async () => {
+      ctx.view.result.current.stop();
+    });
+    await untilWithClock(() => ctx.onTranscript.mock.calls.length > 0, 'the words delivered');
+    expect(ctx.onTranscript).toHaveBeenCalledWith('w0 w1', null);
+    expect(ctx.view.result.current.followUp).toBeNull();
+  });
+});
+
+describe('the swap in the composer', () => {
+  it('puts the other transcript where the first went, back again, and never over words the person changed', async () => {
+    render(
+      <Composer streaming={false} prefs={DEFAULT_PREFS} onPrefsChange={vi.fn()} onSend={vi.fn()} onStop={vi.fn()} />,
+    );
+    const box = screen.getByLabelText('Message') as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: 'Draft:' } });
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Start voice input'));
+    });
+    await until(() => FakeRecorder.last?.state === 'recording', 'recording started');
+    const rec = FakeRecorder.last!;
+    const ws = await goLive(25);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+      rec.emit();
+    });
+    await until(() => server.appendedSlices.length >= 1, 'slice 0 on the server');
+    await act(async () => {
+      ws.say({ type: 'final', u: 0, text: 'Live words here.', start_sample: 0, end_sample: 16_000 });
+      fireEvent.click(screen.getByLabelText('Stop recording and transcribe'));
+    });
+    await act(async () => {
+      FakeWorkletNode.last.flushed(16_000);
+      await vi.advanceTimersByTimeAsync(0);
+      ws.say({ type: 'done' });
+    });
+    await untilWithClock(() => box.value === 'Draft: w0 w1', 'the full pass in the draft');
+    expect(screen.getByText('Inserted the full-pass transcript.')).toBeTruthy();
+
+    // Typing AFTER the dictated words leaves them untouched.
+    fireEvent.change(box, { target: { value: 'Draft: w0 w1 and then some' } });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Use the other one'));
+    });
+    expect(box.value).toBe('Draft: Live words here. and then some');
+    expect(screen.getByText('Inserted the live transcript.')).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(screen.getByText('Use the other one'));
+    });
+    expect(box.value).toBe('Draft: w0 w1 and then some');
+
+    // Changed inside: nothing is swapped, and the swap is not offered again.
+    fireEvent.change(box, { target: { value: 'Draft: w0 W1 and then some' } });
+    await act(async () => {
+      fireEvent.click(screen.getByText('Use the other one'));
+    });
+    expect(box.value).toBe('Draft: w0 W1 and then some');
+    expect(screen.getByText('The inserted words have been edited, so they were left as they are.')).toBeTruthy();
+    expect(screen.queryByText('Use the other one')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The language control in the bar
+// ---------------------------------------------------------------------------
+
+describe('the language control in the recording bar', () => {
+  async function recordInComposer() {
+    render(
+      <Composer streaming={false} prefs={DEFAULT_PREFS} onPrefsChange={vi.fn()} onSend={vi.fn()} onStop={vi.fn()} />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Start voice input'));
+    });
+    await until(() => FakeRecorder.last?.state === 'recording', 'recording started');
+  }
+
+  it('offers Auto, English and हिन्दी outside the live region, and hears the rest in the one chosen', async () => {
+    await recordInComposer();
+    const ws = await goLive(25);
+    await act(async () => {
+      ws.say({ type: 'final', u: 0, text: 'Hello everyone.', start_sample: 0, end_sample: 8_000 });
+      ws.say({ type: 'partial', u: 1, text: 'aaj hum', start_sample: 8_000, end_sample: 16_000 });
+    });
+    const group = screen.getByRole('radiogroup', { name: 'Language of the live transcript' });
+    expect(group.closest('[aria-live]')).toBeNull();
+    expect(group.closest('[role="status"]')).toBeNull();
+    const radios = within(group).getAllByRole('radio') as HTMLInputElement[];
+    expect(radios.map((r) => r.value)).toEqual(['auto', 'en', 'hi']);
+    // Native radio buttons with one name: one Tab stop, and the arrow keys move the choice.
+    expect(new Set(radios.map((r) => r.name)).size).toBe(1);
+    expect(radios.every((r) => r.type === 'radio' && r.tabIndex === 0)).toBe(true);
+    expect((screen.getByRole('radio', { name: 'Auto' }) as HTMLInputElement).checked).toBe(true);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('radio', { name: 'हिन्दी' }));
+    });
+    expect(window.localStorage.getItem('techsara-voice-language')).toBe('hi');
+    expect((screen.getByRole('radio', { name: 'हिन्दी' }) as HTMLInputElement).checked).toBe(true);
+    // A new stream in Hindi from the last committed word; the old one is closed.
+    expect(ws.closedWith).toBe(1000);
+    const next = FakeWebSocket.last;
+    expect(next).not.toBe(ws);
+    expect(next.handshake()).toMatchObject({ language: 'hi', resume_from_sample: 8_000, next_u: 1 });
+    expect(next.pcm).toHaveLength(16_000 - 8_000);
+    // The committed words stay; the utterance under way is heard again.
+    await act(async () => {
+      next.say({ type: 'final', u: 1, text: 'आज हम', start_sample: 8_000, end_sample: 16_000 });
+    });
+    await redraw();
+    expect(screen.getByTestId('voice-transcript').textContent).toBe('Hello everyone. आज हम');
+  });
+
+  it('is gone once the live stream is refused for good', async () => {
+    await recordInComposer();
+    const ws = await goLive(5);
+    expect(screen.getByRole('radiogroup', { name: 'Language of the live transcript' })).toBeTruthy();
+    await act(async () => {
+      ws.say({ type: 'error', code: 'voice_off', message: 'x', retryable: false });
+      ws.hangUp(4403);
+    });
+    expect(screen.queryByRole('radiogroup')).toBeNull();
+  });
+
+  it('is not drawn on a server whose sessions have no live path', async () => {
+    useServer({}, null);
+    await recordInComposer();
+    expect(screen.queryByRole('radiogroup')).toBeNull();
+  });
+
+  it('starts the next recording in the language chosen last', async () => {
+    window.localStorage.setItem('techsara-voice-language', 'en');
+    await recordInComposer();
+    const ws = await goLive(2);
+    expect(ws.texts[0]!.language).toBe('en');
+    expect((screen.getByRole('radio', { name: 'English' }) as HTMLInputElement).checked).toBe(true);
   });
 });

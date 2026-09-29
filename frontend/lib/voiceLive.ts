@@ -4,28 +4,33 @@
  * THE STORED RECORDING STAYS THE TRUTH. A session recording (lib/voice.ts)
  * uploads Opus in 5 s parts and whisper transcribes it in windows cut at
  * pauses, so its preview arrives in steps of five seconds or more, paced by
- * the server's voice-activity detector and by chat. That path is untouched
- * and still decides the text that goes into the draft. This module is a
- * second, disposable channel beside it: the same microphone, tapped by an
- * AudioWorklet (public/voice/pcm-capture-worklet.js) as 16 kHz PCM, streamed
- * over one WebSocket to a streaming recogniser that answers with a PARTIAL
- * hypothesis a few hundred milliseconds after the words, and a FINAL one per
- * utterance once the speaker pauses. Anything here may fail at any moment;
- * the recording, its upload and its transcript do not notice.
+ * the server's voice-activity detector and by chat. That path is untouched,
+ * and its transcript is what goes into the draft, except for a Hindi or
+ * Hinglish session whose live transcript heard all of it (chooseFinalText:
+ * whisper transcribes those twice as badly). This module is a second,
+ * disposable channel beside it: the same microphone, tapped by an AudioWorklet
+ * (public/voice/pcm-capture-worklet.js) as 16 kHz PCM, streamed over one
+ * WebSocket to a streaming recogniser that answers with a PARTIAL hypothesis a
+ * few hundred milliseconds after the words, and a FINAL one per utterance once
+ * the speaker pauses. Anything here may fail at any moment; the recording, its
+ * upload and its transcript do not notice.
  *
  * WHAT IS HERE, IN ORDER.
  *   - the language preference the start message carries;
- *   - PcmRing: the last 60 s of PCM, so a dropped connection resumes with the
- *     words spoken while it was down instead of losing them;
+ *   - PcmRing: the last 75 s of PCM (a minute of replay and its headroom), so
+ *     a dropped connection resumes with the words spoken while it was down
+ *     instead of losing them;
  *   - CaptureClock: when a sample was captured, for the clock offset that
  *     maps live samples onto the stored recording, and for the capture-to-
  *     screen latency the server is told about;
  *   - LiveTranscript: what has been heard (a partial replaces, a final
  *     commits, late and repeated events are ignored);
  *   - mergeLiveTranscript: the durable preview and the live words as one text;
+ *   - chooseFinalText: which of the two transcripts goes into the draft at
+ *     Stop (the live one for Hindi and Hinglish, when it heard everything);
  *   - attachPcmTap: the worklet on the meter's own AudioContext;
  *   - LiveStream: the socket (subprotocol techsara.voice.v1, reconnect with
- *     resume, backpressure, ping, client_stats);
+ *     resume, backpressure, ping, client_stats, a language change);
  *   - LiveCapture: the one object the recorder hook holds.
  *
  * Pure TypeScript with no React, like lib/voice.ts, so every rule above is
@@ -33,7 +38,7 @@
  * time: the composer renders on the server too.
  */
 
-import { joinPreview, type LiveConfig, type SessionProgress } from '@/lib/voice';
+import { joinPreview, type DraftSpan, type LiveConfig, type SessionProgress } from '@/lib/voice';
 
 /** The engine's rate and the wire's: 16 samples per millisecond. */
 export const LIVE_SAMPLE_RATE = 16000;
@@ -44,8 +49,26 @@ export const LIVE_SUBPROTOCOL = 'techsara.voice.v1';
 /** Served from frontend/public as it is: a worklet module is loaded by URL. */
 export const LIVE_WORKLET_URL = '/voice/pcm-capture-worklet.js';
 export const LIVE_PROCESSOR = 'techsara-pcm-capture';
-/** How much PCM the browser keeps for a reconnect to replay (1.9 MB). */
-export const LIVE_RING_SECONDS = 60;
+/**
+ * The furthest back a reconnect replays: the server's resume_max_s, which its
+ * arrival ceiling (resume_max_s + 5 s of audio ahead of the wall clock) is
+ * built on. A smaller resume_max_s from the config is honoured.
+ */
+export const LIVE_RESUME_MAX_SECONDS = 60;
+/**
+ * THE RING IS LONGER THAN THE REPLAY (review, 2026-09-30). The resume point is
+ * chosen when the socket opens and read when `ready` comes back, and the
+ * microphone keeps filling the ring in between. With the ring exactly as long
+ * as the replay (60 s each), a reconnect a minute after the last final chose
+ * the ring's OLDEST sample, the next 40 ms frame overwrote it, and the stream
+ * reconnected at once, forever: in headless Chromium 117 sockets and 0 audio
+ * frames in 20 s, with each attempt admitted by the gateway as an engine
+ * stream. These 15 s behind the resume point cover the handshake (the engine
+ * connect alone may take 5 s) many times over.
+ */
+export const LIVE_RESUME_HEADROOM_SECONDS = 15;
+/** How much PCM the browser keeps: the longest replay and its headroom (2.4 MB). */
+export const LIVE_RING_SECONDS = LIVE_RESUME_MAX_SECONDS + LIVE_RESUME_HEADROOM_SECONDS;
 /**
  * Backpressure. Past 256 KiB queued in the socket (about 8 s of PCM) nothing
  * more is handed to it; the frames wait in the ring, and sending resumes once
@@ -62,6 +85,14 @@ export const LIVE_STATS_INTERVAL_MS = 5000;
 export const LIVE_PING_INTERVAL_MS = 10_000;
 /** A ping answered by nothing at all for this long: the connection is dead. */
 export const LIVE_PONG_TIMEOUT_MS = 10_000;
+/**
+ * A connection has proven itself once it brought back words or stayed up this
+ * long; only then does the reconnect backoff start over. Resetting it on
+ * `ready` alone let a gateway that accepts every stream and fails it at once
+ * (4503 right after ready) be retried every 0.4-0.6 s for the whole
+ * recording: 94 connections in a minute in the review's probe.
+ */
+export const LIVE_PROVEN_AFTER_MS = 10_000;
 /** The panel redraws the live words at most ten times a second. */
 export const LIVE_RENDER_INTERVAL_MS = 100;
 /** At most this many latencies per list in one client_stats message. */
@@ -84,9 +115,26 @@ const TERMINAL_CLOSES: ReadonlySet<number> = new Set([4400, 4401, 4403, 4404, 44
 const MAX_EVENT_TEXT = 4000;
 /**
  * The button that puts the live words into the draft when the stored
- * recording's transcript could not be had (components/useVoiceRecorder.ts).
+ * recording's transcript could not be had (components/useVoiceRecorder.ts),
+ * when they are the whole recording (`LiveCapture.complete`).
  */
 export const LIVE_INSERT_LABEL = 'Insert live transcript';
+/**
+ * The same button when the live stream missed part of the recording: refused
+ * mid-way, a hole in the ring, or a resume that skipped audio. The review
+ * inserted "First minute only." out of a recording twice that long under the
+ * plain label, beside a line saying no words could be made out.
+ */
+export const LIVE_INSERT_PARTIAL_LABEL = 'Insert what was heard live (part of the recording)';
+/** The quiet line after Stop that says which of the two transcripts went in. */
+export const LIVE_INSERTED_LIVE = 'Inserted the live transcript.';
+export const LIVE_INSERTED_FULL_PASS = 'Inserted the full-pass transcript.';
+/** Its button: the other transcript, in the same place. */
+export const LIVE_SWAP_LABEL = 'Use the other one';
+/** Its button when the other one is a live transcript that missed part of the recording. */
+export const LIVE_SWAP_PARTIAL_LABEL = 'Use what was heard live (part of the recording)';
+/** Said instead of swapping once the person has changed the inserted words. */
+export const LIVE_SWAP_EDITED = 'The inserted words have been edited, so they were left as they are.';
 
 // ---------------------------------------------------------------------------
 // The language the engine is asked for
@@ -97,8 +145,8 @@ export const LIVE_INSERT_LABEL = 'Insert live transcript';
  * "en" routes to an English-only model, which transcribed LibriSpeech at
  * 4.13% WER against 6.23% for the multilingual one; "auto" and "hi" need the
  * multilingual one. Gujarati is not offered: neither model can transcribe it
- * (FLEURS-gu WER 104%, measured 2026-09-29). There is no selector yet; these
- * helpers are what it will call.
+ * (FLEURS-gu WER 104%, measured 2026-09-29). The recording bar's language
+ * control (components/VoiceBar.tsx) reads and writes it through these.
  */
 export type VoiceLanguage = 'auto' | 'en' | 'hi';
 export const VOICE_LANGUAGES: readonly VoiceLanguage[] = ['auto', 'en', 'hi'];
@@ -425,6 +473,38 @@ function midpointMs(u: LiveUtterance, offsetMs: number): number {
 }
 
 /**
+ * The piece of a word the tail drops to start on a whole one: at most 24
+ * characters (longer than any word the panel's tail needs to lose), then the
+ * space after it.
+ */
+const TAIL_FRAGMENT = /^\S{1,24}\s+/;
+
+/**
+ * The last `max` characters of `text`, starting on a whole word where the
+ * script has words.
+ *
+ * It used to drop everything up to the first space after the cut. Chinese,
+ * Japanese and Thai are written without spaces, so twelve 55-character
+ * Japanese utterances followed by "OK thanks" left a tail of 9 characters:
+ * the panel showed one line where four lines of speech belonged (measured in
+ * Chromium at 390 px, review 2026-09-30). Now only a SHORT fragment is dropped,
+ * and only when the cut really fell inside it; nor is a surrogate pair (an
+ * emoji, a rare CJK character) cut in half.
+ */
+function tailOf(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let from = text.length - max;
+  const unit = text.charCodeAt(from);
+  if (unit >= 0xdc00 && unit <= 0xdfff) from += 1;
+  let cut = text.slice(from);
+  if (/\S/.test(text[from - 1] ?? '')) {
+    const fragment = TAIL_FRAGMENT.exec(cut);
+    if (fragment) cut = cut.slice(fragment[0].length);
+  }
+  return cut.trimStart();
+}
+
+/**
  * The durable text covers the recording up to `transcribed_ms`; a live
  * utterance is shown only if its middle lies after that, so a sentence whisper
  * has already written is not written twice, and one it has not reached yet is
@@ -454,7 +534,7 @@ export function mergeLiveTranscript(
   }
   let text = '';
   for (let i = pieces.length - 1; i >= 0; i -= 1) text = joinPreview(text, pieces[i]!);
-  if (text.length > tailChars) text = text.slice(text.length - tailChars).replace(/^\S*\s+/, '');
+  text = tailOf(text, tailChars);
   const partial = live.partial && shown(live.partial) ? live.partial.text : '';
   return { settled, held, live: text, partial };
 }
@@ -501,6 +581,117 @@ export function withLiveWords(
 export function spaceBetween(left: string, right: string): string {
   if (!left || !right) return '';
   return joinPreview(left, right).length > left.length + right.length ? ' ' : '';
+}
+
+// ---------------------------------------------------------------------------
+// Which transcript goes into the draft at Stop
+// ---------------------------------------------------------------------------
+
+/** The two transcripts a recording with a live stream ends with. */
+export type TranscriptSource = 'live' | 'durable';
+
+/**
+ * A live transcript at least this Devanagari is a Hindi or Hinglish session
+ * (build spec section 10).
+ */
+export const HINDI_SHARE = 0.2;
+const LETTER = /\p{L}/u;
+const DEVANAGARI = /\p{Script=Devanagari}/u;
+/** Whisper's language for Hindi, by code or by the name the session state also carries. */
+const WHISPER_HINDI = new Set(['hi', 'ur', 'hindi', 'urdu']);
+
+/**
+ * Devanagari's share of the LETTERS in `text`. Vowel signs and viramas are
+ * combining marks, not letters, and are left out of both counts, so a word
+ * weighs the same whichever script it is written in.
+ */
+export function devanagariShare(text: string): number {
+  let letters = 0;
+  let devanagari = 0;
+  for (const ch of text) {
+    if (!LETTER.test(ch)) continue;
+    letters += 1;
+    if (DEVANAGARI.test(ch)) devanagari += 1;
+  }
+  return letters === 0 ? 0 : devanagari / letters;
+}
+
+/**
+ * THE FINAL-TEXT POLICY (build spec section 10, which keeps 9B). Which
+ * transcript goes into the draft once the full pass is done.
+ *
+ * Measured 2026-09-29 on 34 minutes of Hindi-English lectures (MUCS), same
+ * normaliser: whisper-large-v3, the full pass, 40.2% document WER with script
+ * set aside, against 19.4% for the live Nemotron stream; whisper also wrote 73
+ * of 364 segments in Urdu script and 5 in English. On English the two are
+ * close on read speech (LibriSpeech 4.21% against 4.13% for the English live
+ * model) and the full pass is clearly ahead on FLEURS-en (6.81% against
+ * 10.16%).
+ *
+ * So a Hindi or Hinglish session (the live words are at least 20% Devanagari
+ * letters, the person chose Hindi, or whisper heard Hindi or Urdu while the
+ * person had not chosen English: `isHindiSession`) gets the
+ * LIVE transcript, but only a complete one: a live stream that missed part of
+ * the recording never stands in for the whole of it. Everything else — English
+ * above all, and any language this was not measured on — gets the full pass,
+ * as before live dictation existed.
+ */
+export function chooseFinalText(input: {
+  liveText: string;
+  liveComplete: boolean;
+  /** The language the live stream was asked for at the end (the bar's control). */
+  userLanguage: VoiceLanguage | null;
+  /** The full pass's language, as the session state's language_code (or its name). */
+  whisperLanguage: string | null | undefined;
+}): TranscriptSource {
+  if (!input.liveText.trim() || !input.liveComplete) return 'durable';
+  return isHindiSession(input) ? 'live' : 'durable';
+}
+
+/**
+ * Section 10's test for a Hindi or Hinglish session, with one refinement:
+ * whisper hearing Hindi or Urdu does not count when the person chose English.
+ * "en" puts the live stream on the English-only model (spec section 8A),
+ * which cannot write Hindi at all, and the 19.4% above was measured on the
+ * multilingual one; the full pass is then the only transcript that tried.
+ */
+export function isHindiSession(input: {
+  liveText: string;
+  userLanguage: VoiceLanguage | null;
+  whisperLanguage: string | null | undefined;
+}): boolean {
+  const whisper = (input.whisperLanguage ?? '').trim().toLowerCase();
+  return (
+    input.userLanguage === 'hi' ||
+    (input.userLanguage !== 'en' && WHISPER_HINDI.has(whisper)) ||
+    devanagariShare(input.liveText) >= HINDI_SHARE
+  );
+}
+
+/**
+ * Put the recording's OTHER transcript where the first one went in (the
+ * swap after Stop), or null. Only over the exact words that went in: once the
+ * person has changed them, nothing is swapped. The Retry path
+ * (lib/voice.ts `placeRetranscript`) merges a person's edits into a new
+ * transcript; two different recognisers' texts share too little for that, so
+ * the swap never tries.
+ */
+export function swapInDraft(
+  draft: string,
+  span: DraftSpan | null,
+  current: string,
+  other: string,
+): { text: string; span: DraftSpan } | null {
+  const base = current.trim();
+  const fresh = other.trim();
+  if (!base || !fresh || !span) return null;
+  if (span.start < 0 || span.end > draft.length || span.start >= span.end) return null;
+  const region = draft.slice(span.start, span.end);
+  if (region !== base && region.trim() !== base) return null;
+  return {
+    text: draft.slice(0, span.start) + fresh + draft.slice(span.end),
+    span: { start: span.start, end: span.start + fresh.length },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -652,6 +843,7 @@ export interface LiveStreamOptions {
   transcript: LiveTranscript;
   /** performance.now() when MediaRecorder.start() ran: the stored recording's zero. */
   recorderStartedAt: number;
+  /** The language the first `start` asks for; `setLanguage` changes it later. */
   language: VoiceLanguage;
   /** How far back a reconnect may replay (config.live.resume_max_s). */
   resumeMaxS: number;
@@ -672,13 +864,15 @@ const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isI
  * A connection sends `start`, waits for `ready`, then sends PCM from the
  * resume point: sample 0 the first time (the ring holds what was spoken
  * before the session existed), and after a drop the later of the last final's
- * end and the oldest sample still held, with `next_u` continuing the
- * numbering. So an outage shorter than a minute loses no words, and the words
- * already committed are not sent again.
+ * end and a minute back (never closer to the ring's oldest sample than its
+ * headroom), with `next_u` continuing the numbering. So an outage shorter
+ * than a minute loses no words, and the words already committed are not sent
+ * again.
  *
  * It never gives up while the recording lasts, except on the refusals that
  * retrying cannot fix (TERMINAL_CLOSES, or an error the server marked not
- * retryable).
+ * retryable). Every other failure goes through the backoff, which starts over
+ * only once a connection has proven itself (LIVE_PROVEN_AFTER_MS).
  */
 export class LiveStream {
   private readonly opts: LiveStreamOptions;
@@ -688,10 +882,17 @@ export class LiveStream {
   private ws: WebSocket | null = null;
   private phase: LivePhase = 'waiting';
   private ready = false;
+  /** When this connection's `ready` came; it has proven itself LIVE_PROVEN_AFTER_MS later. */
+  private readyAt: number | null = null;
   /** The next sample to send on this connection. */
   private sent = 0;
   private paused = false;
   private attempt = 0;
+  /** What the next `start` asks for; the bar's control changes it mid-recording. */
+  private language: VoiceLanguage;
+  /** A connection started after audio no final covered: those words were never heard. */
+  private skipped = false;
+  private ended: LiveEnd | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private drainTimer: ReturnType<typeof setTimeout> | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -716,6 +917,7 @@ export class LiveStream {
 
   constructor(opts: LiveStreamOptions) {
     this.opts = opts;
+    this.language = opts.language;
     this.WS = opts.WebSocketImpl ?? (globalThis as { WebSocket: typeof WebSocket }).WebSocket;
     this.now = opts.now ?? (() => performance.now());
     this.random = opts.random ?? Math.random;
@@ -729,6 +931,49 @@ export class LiveStream {
   /** True until a refusal retrying cannot fix. */
   get active(): boolean {
     return this.phase !== 'failed';
+  }
+
+  /** How the stream ended, or null while it lasts. */
+  get end(): LiveEnd | null {
+    return this.ended;
+  }
+
+  /** The language the stream asks the engine for now. */
+  get currentLanguage(): VoiceLanguage {
+    return this.language;
+  }
+
+  /**
+   * True when the live transcript covers the whole recording: the stream
+   * ended with the server's `done` after the flush (so it was never refused
+   * for good, and the last words arrived), no audio fell out of the ring
+   * before it was sent, and no connection resumed past audio that no final
+   * covered. Anything less is part of the recording, and is never offered or
+   * inserted as if it were all of it.
+   */
+  get complete(): boolean {
+    return this.ended === 'done' && this.gaps === 0 && !this.skipped;
+  }
+
+  /**
+   * The person picked another language mid-recording. The engine reads the
+   * language once, at `start`, so a new stream in the new language takes over,
+   * through the same resume a dropped connection uses: it starts where the last
+   * final ended, so the committed words stay as they are and the utterance
+   * being spoken is heard again, in the new language. Whatever the old
+   * connection still sends is ignored (it is no longer this.ws), and `next_u`
+   * carries the numbering on, so no word is lost or shown twice. Waiting out a
+   * backoff, the next attempt simply says the new language; after Stop it no
+   * longer matters.
+   */
+  setLanguage(language: VoiceLanguage): void {
+    if (language === this.language) return;
+    this.language = language;
+    if (this.finishing) return;
+    if (this.phase === 'connecting' || this.phase === 'streaming') {
+      this.drop();
+      this.connect();
+    }
   }
 
   /**
@@ -824,10 +1069,18 @@ export class LiveStream {
     return this.opts.clock.running && this.opts.ring.end > this.opts.ring.start;
   }
 
-  /** The later of the last final's end and the oldest sample a replay may start from. */
+  /**
+   * The later of the last final's end and the oldest sample a replay may
+   * start from. The replay reaches back at most resume_max_s, and never so far
+   * that the frames arriving before `ready` could overwrite where it starts:
+   * LIVE_RESUME_HEADROOM_SECONDS of the ring stay behind it (a quarter of a
+   * ring shorter than that, which only tests build).
+   */
   private resumePoint(): number {
     const { ring, transcript, resumeMaxS } = this.opts;
-    const window = Math.floor(Math.min(LIVE_RING_SECONDS, Math.max(0, resumeMaxS)) * LIVE_SAMPLE_RATE);
+    const asked = Math.floor(Math.min(LIVE_RESUME_MAX_SECONDS, Math.max(0, resumeMaxS)) * LIVE_SAMPLE_RATE);
+    const headroom = Math.min(LIVE_RESUME_HEADROOM_SECONDS * LIVE_SAMPLE_RATE, Math.floor(ring.capacity / 4));
+    const window = Math.min(asked, ring.capacity - headroom);
     const oldest = Math.max(ring.start, ring.end - window);
     return Math.min(ring.end, Math.max(transcript.committedUntil, oldest));
   }
@@ -845,6 +1098,7 @@ export class LiveStream {
     this.connects += 1;
     this.ws = ws;
     this.ready = false;
+    this.readyAt = null;
     this.paused = false;
     this.flushSent = false;
     this.errorRetryable = null;
@@ -883,7 +1137,7 @@ export class LiveStream {
       resume_from_sample: resume,
       next_u: this.opts.transcript.nextU,
       clock_offset_ms: this.clockOffsetMs,
-      language: this.opts.language,
+      language: this.language,
     };
   }
 
@@ -922,9 +1176,13 @@ export class LiveStream {
   private onReady(msg: Record<string, unknown>): void {
     if (this.ready) return;
     this.ready = true;
-    this.attempt = 0;
+    // The backoff is NOT reset here: see LIVE_PROVEN_AFTER_MS.
+    this.readyAt = this.now();
     const echoed = msg.resume_from_sample;
     if (isCount(echoed) && echoed >= this.opts.ring.start && echoed <= this.opts.ring.end) this.sent = echoed;
+    // Audio after the last final and before this point reached no decoder
+    // that committed it: whatever was said there is missing from the text.
+    if (this.sent > this.opts.transcript.committedUntil) this.skipped = true;
     this.phase = 'streaming';
     this.pump();
   }
@@ -932,6 +1190,8 @@ export class LiveStream {
   private onWords(kind: 'partial' | 'final', msg: Record<string, unknown>): void {
     const { u, text } = msg;
     if (!isCount(u) || typeof text !== 'string') return;
+    // Words back from the engine: this connection works.
+    this.attempt = 0;
     const start = isCount(msg.start_sample) ? msg.start_sample : 0;
     const end = isCount(msg.end_sample) ? Math.max(start, msg.end_sample) : start;
     const words = text.length > MAX_EVENT_TEXT ? text.slice(0, MAX_EVENT_TEXT) : text;
@@ -1022,14 +1282,17 @@ export class LiveStream {
 
   /**
    * Audio the ring overwrote before it could be sent (the uplink was slower
-   * than the microphone for a minute). Nothing can be sent across that hole
-   * on this connection — the server counts samples — so a new one starts at
-   * the oldest sample still here, and the hole is counted.
+   * than the microphone for a minute, or a handshake outlasted the resume
+   * headroom). Nothing can be sent across that hole on this connection — the
+   * server counts samples — so a new one starts from the ring as it is then,
+   * and the hole is counted. Through the backoff, never at once: an overwrite
+   * that happens during every handshake would otherwise reconnect in a tight
+   * loop, each attempt an engine stream on the worker.
    */
   private resync(): void {
     this.gaps += 1;
     this.drop();
-    this.connect();
+    this.retry();
   }
 
   private armDrain(): void {
@@ -1072,6 +1335,10 @@ export class LiveStream {
     const ws = this.ws;
     if (!ws || ws.readyState !== OPEN) return;
     const now = this.now();
+    if (this.ready && this.readyAt !== null && now - this.readyAt >= LIVE_PROVEN_AFTER_MS) {
+      // Up this long: whatever failed before is behind us.
+      this.attempt = 0;
+    }
     if (this.lastPingAt > this.lastMessageAt) {
       // A ping is out and nothing at all has come back since. Open by the
       // browser's account, silent by the server's: a phone that changed
@@ -1134,6 +1401,7 @@ export class LiveStream {
   private close(end: LiveEnd): void {
     if (this.phase === 'closed' || this.phase === 'failed') return;
     this.phase = 'closed';
+    this.ended = end;
     this.settle();
     this.opts.onEnd?.(end);
   }
@@ -1141,6 +1409,7 @@ export class LiveStream {
   private fail(): void {
     if (this.phase === 'closed' || this.phase === 'failed') return;
     this.phase = 'failed';
+    this.ended = 'refused';
     this.settle();
     this.opts.onEnd?.('refused');
     this.opts.onChange?.();
@@ -1157,6 +1426,8 @@ export interface LiveCaptureDeps {
    * (the last change always lands), with what the panel should draw now.
    */
   onChange?: (view: LiveView | null) => void;
+  /** The stream ended: at Stop, on cancel, or refused for good mid-recording ('refused'). */
+  onEnd?: (end: LiveEnd) => void;
   WebSocketImpl?: typeof WebSocket;
   AudioWorkletNodeImpl?: typeof AudioWorkletNode;
   now?: () => number;
@@ -1284,6 +1555,7 @@ export class LiveCapture {
       language: opts.language,
       resumeMaxS: opts.config.resumeMaxS,
       onChange: () => this.scheduleRender(),
+      onEnd: (end) => this.deps.onEnd?.(end),
       WebSocketImpl: this.deps.WebSocketImpl,
       now: this.deps.now,
       random: this.deps.random,
@@ -1343,9 +1615,26 @@ export class LiveCapture {
     this.liveStream?.rendered(at);
   }
 
-  /** Everything heard so far, for the fallback insert. */
+  /** Everything heard so far: the fallback insert, and the Hindi transcript at Stop. */
   text(): string {
     return this.transcript.text();
+  }
+
+  /** Whether `text()` is the whole recording (LiveStream.complete); false with no stream at all. */
+  complete(): boolean {
+    return this.liveStream?.complete ?? false;
+  }
+
+  /** The language the stream asks for now; null with no stream, or one refused for good. */
+  get language(): VoiceLanguage | null {
+    const stream = this.liveStream;
+    return stream && stream.active ? stream.currentLanguage : null;
+  }
+
+  /** Hear the rest in another language (LiveStream.setLanguage). */
+  setLanguage(language: VoiceLanguage): void {
+    if (this.done) return;
+    this.liveStream?.setLanguage(language);
   }
 
   /** What the panel draws, or null while there is nothing to draw. */

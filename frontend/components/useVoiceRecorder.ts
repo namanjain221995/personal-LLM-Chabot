@@ -38,11 +38,18 @@
  * the browser has an AudioWorklet, the same microphone is also tapped as
  * 16 kHz PCM on the meter's own AudioContext and streamed to a streaming
  * recogniser (lib/voiceLive.ts); its words appear in the bar while they are
- * spoken. It is a preview beside the session, never instead of it: the stored
+ * spoken. It runs beside the session, never instead of it: the stored
  * recording and its transcript are exactly what they were, and any failure of
  * the live path leaves them untouched. The AudioContext is therefore built at
  * the permission grant, not once the recorder runs, so the tap hears the
  * opening words while the session is still being created.
+ *
+ * WHICH TEXT GOES IN (2026-09-30). At Stop both transcripts are kept, and the
+ * one put into the draft is the full pass's, except for a Hindi or Hinglish
+ * session whose live transcript heard the whole recording (lib/voiceLive.ts
+ * `chooseFinalText`: on Hinglish lectures whisper had twice Nemotron's word
+ * error rate and wrote a fifth of it in Urdu script). A quiet line says which
+ * went in and swaps the other in on request.
  *
  * The transitions live in lib/voice.ts and are unit-tested without a DOM.
  * What is here is the part that genuinely needs the browser.
@@ -94,11 +101,21 @@ import {
   type VoiceState,
 } from '@/lib/voice';
 import {
+  LIVE_INSERTED_FULL_PASS,
+  LIVE_INSERTED_LIVE,
   LIVE_INSERT_LABEL,
+  LIVE_INSERT_PARTIAL_LABEL,
+  LIVE_SWAP_EDITED,
+  LIVE_SWAP_LABEL,
+  LIVE_SWAP_PARTIAL_LABEL,
   LiveCapture,
+  chooseFinalText,
   getVoiceLanguage,
+  setVoiceLanguage,
   withLiveWords,
   type LiveView,
+  type TranscriptSource,
+  type VoiceLanguage,
 } from '@/lib/voiceLive';
 
 /**
@@ -155,6 +172,17 @@ export interface VoiceRecorder {
   /** Something that happened while recording, e.g. the screen went off. */
   warning: string | null;
   followUp: VoiceFollowUp | null;
+  /**
+   * The language the live transcript is heard in, while this recording has
+   * one; null otherwise (no live path, the legacy road, or the stream was
+   * refused for good). The bar's language control is drawn only then.
+   */
+  language: VoiceLanguage | null;
+  /**
+   * Choose that language: remembered for this browser, and the live stream
+   * starts again in it from the last committed word.
+   */
+  setLanguage: (language: VoiceLanguage) => void;
 }
 
 type WakeLockLike = { release: () => Promise<void> };
@@ -163,11 +191,16 @@ type WakeLockLike = { release: () => Promise<void> };
  * `false` from the composer means a re-transcribed text could not be put where
  * the first one went (the person edited it in a way the new words cannot be
  * merged into), and nothing was changed: the recorder then asks.
+ *
+ * `exact` is the swap between a recording's two transcripts (live and full
+ * pass): `replaces` is replaced only where it went in and only while it is
+ * exactly as it went in; edits are never merged into the other transcript.
  */
 export type TranscriptSink = (
   text: string,
   notice: string | null,
   replaces?: string | null,
+  exact?: boolean,
 ) => boolean | void;
 
 /** The signed-in account's stable key (`u<id>`), or null when it cannot be told. */
@@ -184,6 +217,33 @@ async function whoIsSignedIn(): Promise<string | null> {
 interface Backing {
   outbox: OutboxStore;
   sessionId: string;
+}
+
+/** What stays in the outbox once `text` of a recording with this offer is in the draft. */
+function keepForOffer(offer: VoiceOffer | null, text: string) {
+  if (offer?.kind === 'retranscribe') {
+    return {
+      deliveredText: text,
+      offer: { scope: offer.scope, replaces: text, message: offer.message, audioMs: offer.audioMs },
+    };
+  }
+  if (offer?.kind === 'upload_rest') return { deliveredText: text };
+  return null;
+}
+
+/**
+ * A finished recording's two transcripts, both kept for the swap after Stop:
+ * which one is in the draft, and what the full pass left to do (a Retry for
+ * its gaps, "Upload the rest").
+ */
+interface TwoTranscripts {
+  shown: TranscriptSource;
+  live: string;
+  durable: string;
+  /** The live one is the whole recording (LiveCapture.complete). */
+  liveComplete: boolean;
+  offer: VoiceOffer | null;
+  backing: Backing;
 }
 
 export function useVoiceRecorder({
@@ -276,6 +336,8 @@ export function useVoiceRecorder({
   const live = useRef<LiveCapture | null>(null);
   /** What the panel draws of it; set at most ten times a second (LiveCapture throttles). */
   const [liveView, setLiveView] = useState<LiveView | null>(null);
+  /** The live stream's language while it lasts: the bar's control shows it. */
+  const [liveLanguage, setLiveLanguage] = useState<VoiceLanguage | null>(null);
   /** The recording's stop handler while its stop event is still owed; a second Stop defers to it. */
   const pendingStop = useRef<(() => void) | null>(null);
   const stopFallback = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -414,7 +476,10 @@ export function useVoiceRecorder({
       } else {
         capture.abort();
         live.current = null;
-        if (alive.current) setLiveView(null);
+        if (alive.current) {
+          setLiveView(null);
+          setLiveLanguage(null);
+        }
       }
     }
     if (context && context.state !== 'closed') {
@@ -569,18 +634,8 @@ export function useVoiceRecorder({
   // -------------------------------------------------------------------------
 
   /** What stays in the outbox once a text result is in the draft. */
-  const keepFor = (result: SessionResult, text: string) => {
-    if (result.kind === 'withdrawn') return null;
-    const offer = result.offer;
-    if (offer?.kind === 'retranscribe') {
-      return {
-        deliveredText: text,
-        offer: { scope: offer.scope, replaces: text, message: offer.message, audioMs: offer.audioMs },
-      };
-    }
-    if (offer?.kind === 'upload_rest') return { deliveredText: text };
-    return null;
-  };
+  const keepFor = (result: SessionResult, text: string) =>
+    result.kind === 'withdrawn' ? null : keepForOffer(result.offer, text);
 
   // `present` and the follow-ups call each other; the ref breaks the cycle
   // without re-creating either on every render.
@@ -827,21 +882,22 @@ export function useVoiceRecorder({
   presentRef.current = present;
 
   /**
-   * THE LIVE TRANSCRIPT AS A FALLBACK (2026-09-29). The stored recording's
-   * transcript stays the one that goes into the draft. When it cannot be had
-   * (the engine was down, nothing came back) but the live stream heard words,
-   * the person is offered those words, never given them unasked: they were
-   * not checked by the final transcription. After a Retry or "Upload the
-   * rest" offer they are the secondary button, and once inserted that offer
-   * REPLACES them in place when it succeeds, as it replaces any first
-   * transcript, so the draft never holds both.
+   * THE LIVE TRANSCRIPT AS A FALLBACK (2026-09-29). When the stored
+   * recording's transcript cannot be had (the engine was down, nothing came
+   * back) but the live stream heard words, the person is offered those words,
+   * never given them unasked: they were not checked by the final
+   * transcription. After a Retry or "Upload the rest" offer they are the
+   * secondary button, and once inserted that offer REPLACES them in place when
+   * it succeeds, as it replaces any first transcript, so the draft never holds
+   * both. A live transcript that missed part of the recording says so on the
+   * button (LIVE_INSERT_PARTIAL_LABEL).
    */
   const withLiveInsert = useCallback(
-    (line: VoiceFollowUp, offer: VoiceOffer, text: string, backing: Backing): VoiceFollowUp => {
+    (line: VoiceFollowUp, offer: VoiceOffer, text: string, backing: Backing, complete: boolean): VoiceFollowUp => {
       if (offer.kind !== 'retranscribe' && offer.kind !== 'upload_rest') return line;
       return {
         ...line,
-        secondaryLabel: LIVE_INSERT_LABEL,
+        secondaryLabel: complete ? LIVE_INSERT_LABEL : LIVE_INSERT_PARTIAL_LABEL,
         runSecondary: () => {
           if (onTranscriptRef.current(text, null) === false) return;
           const next: VoiceOffer = { ...offer, replaces: text };
@@ -862,27 +918,107 @@ export function useVoiceRecorder({
     [offerLine, setFollowUp],
   );
 
+  /**
+   * WHICH TRANSCRIPT WENT IN (build spec section 10, 2026-09-30). A recording
+   * with a live stream ends with two transcripts, and `chooseFinalText` put one
+   * of them in the draft. One quiet line says which, and its button swaps in
+   * the other, in the same place, for as long as the person has not changed
+   * the words that went in (the composer checks: `exact`). What the full pass
+   * left to do — a Retry for its gaps, "Upload the rest" — stays on the same
+   * line and follows whichever text is in the draft, so a Retry that succeeds
+   * replaces that one.
+   */
+  const transcriptLineRef = useRef<(two: TwoTranscripts) => VoiceFollowUp>(() => {
+    throw new Error('transcriptLine is not ready');
+  });
+  const transcriptLine = useCallback(
+    (two: TwoTranscripts): VoiceFollowUp => {
+      const current = two.shown === 'live' ? two.live : two.durable;
+      const other = two.shown === 'live' ? two.durable : two.live;
+      const said = two.shown === 'live' ? LIVE_INSERTED_LIVE : LIVE_INSERTED_FULL_PASS;
+      const swapLabel = two.shown === 'durable' && !two.liveComplete ? LIVE_SWAP_PARTIAL_LABEL : LIVE_SWAP_LABEL;
+      const offer: VoiceOffer | null =
+        two.offer?.kind === 'retranscribe' || two.offer?.kind === 'upload_rest'
+          ? { ...two.offer, replaces: current }
+          : null;
+      const holding = offer ? two.backing : null;
+      const swap = () => {
+        if (onTranscriptRef.current(other, null, current, true) === false) {
+          // Changed since it went in: nothing is swapped, and it is not offered again.
+          if (offer) {
+            const line = offerLine(offer, 'info', two.backing);
+            setFollowUp({ ...line, message: `${LIVE_SWAP_EDITED} ${line.message}` }, holding);
+          } else {
+            setFollowUp({
+              message: LIVE_SWAP_EDITED,
+              tone: 'info',
+              actionLabel: null,
+              busy: false,
+              run: () => undefined,
+              dismiss: () => setFollowUp(null),
+            });
+          }
+          return;
+        }
+        if (offer) void settleRecord(two.backing.outbox, two.backing.sessionId, keepForOffer(offer, other));
+        setFollowUp(transcriptLineRef.current({ ...two, shown: two.shown === 'live' ? 'durable' : 'live' }), holding);
+      };
+      if (offer) {
+        const line = offerLine(offer, 'info', two.backing);
+        return { ...line, message: `${said} ${line.message}`, secondaryLabel: swapLabel, runSecondary: swap };
+      }
+      return {
+        message: said,
+        tone: 'info',
+        actionLabel: swapLabel,
+        busy: false,
+        run: swap,
+        dismiss: () => setFollowUp(null),
+      };
+    },
+    [offerLine, setFollowUp],
+  );
+  transcriptLineRef.current = transcriptLine;
+
   /** Show what a finished session came to, from `finishing`. */
   const deliver = useCallback(
     (result: SessionResult, backing: Backing, capture: LiveCapture | null = null) => {
       if (!alive.current) return;
-      // The recording is over, and so is its live stream: the words it heard
-      // are kept only for the fallback below.
-      const liveText = result.kind === 'error' && capture ? capture.text() : '';
+      // The recording is over, and so is its live stream. What it heard is
+      // kept for the choice below and for the fallback: the words, whether
+      // they are the whole recording, and the language it was last asked for.
+      const liveText = capture ? capture.text() : '';
+      const liveComplete = capture ? capture.complete() : false;
+      const userLanguage = capture?.language ?? getVoiceLanguage();
       if (capture) {
         capture.abort();
         if (live.current === capture) live.current = null;
       }
       setLiveView(null);
+      setLiveLanguage(null);
       if (result.kind === 'withdrawn') {
         move('idle');
         return;
       }
       if (result.kind === 'text') {
         move('idle');
-        onTranscriptRef.current(result.text, result.notices.join(' ') || null);
-        void settleRecord(backing.outbox, backing.sessionId, keepFor(result, result.text));
-        if (result.offer) setFollowUp(offerLine(result.offer, 'info', backing), backing);
+        const shown = chooseFinalText({
+          liveText,
+          liveComplete,
+          userLanguage,
+          whisperLanguage: result.languageCode ?? result.language,
+        });
+        const inserted = shown === 'live' ? liveText : result.text;
+        onTranscriptRef.current(inserted, result.notices.join(' ') || null);
+        void settleRecord(backing.outbox, backing.sessionId, keepFor(result, inserted));
+        if (liveText) {
+          setFollowUp(
+            transcriptLine({ shown, live: liveText, durable: result.text, liveComplete, offer: result.offer, backing }),
+            result.offer ? backing : null,
+          );
+        } else if (result.offer) {
+          setFollowUp(offerLine(result.offer, 'info', backing), backing);
+        }
         return;
       }
       if (result.offer) {
@@ -900,7 +1036,7 @@ export function useVoiceRecorder({
           });
         }
         const line = offerLine(result.offer, 'error', backing);
-        setFollowUp(liveText ? withLiveInsert(line, result.offer, liveText, backing) : line, backing);
+        setFollowUp(liveText ? withLiveInsert(line, result.offer, liveText, backing, liveComplete) : line, backing);
         return;
       }
       if (liveText) {
@@ -910,7 +1046,7 @@ export function useVoiceRecorder({
         setFollowUp({
           message: result.error.message,
           tone: 'error',
-          actionLabel: LIVE_INSERT_LABEL,
+          actionLabel: liveComplete ? LIVE_INSERT_LABEL : LIVE_INSERT_PARTIAL_LABEL,
           busy: false,
           run: () => {
             setFollowUp(null);
@@ -923,7 +1059,7 @@ export function useVoiceRecorder({
       setError(result.error);
       move('error');
     },
-    [move, offerLine, setFollowUp, withLiveInsert],
+    [move, offerLine, setFollowUp, transcriptLine, withLiveInsert],
   );
 
   /**
@@ -1015,10 +1151,11 @@ export function useVoiceRecorder({
         peakLevel: meterRan.current ? peakLevel.current : null,
       });
       if (session.current !== s) return; // discarded, or superseded
-      // Before offering the live words instead, let them finish arriving:
-      // the stream's last final comes within LIVE_FINISH_BUDGET_MS of Stop,
-      // normally long before the stored recording's own finish.
-      if (result.kind === 'error' && capture) await capture.settled();
+      // Before choosing between the two transcripts, or offering the live
+      // words instead, let them finish arriving: the stream's last final and
+      // its `done` come within LIVE_FINISH_BUDGET_MS of Stop, normally long
+      // before the stored recording's own finish, which never waited for them.
+      if (capture) await capture.settled();
       if (session.current !== s) return;
       session.current = null;
       deliver(result, { outbox, sessionId: s.sessionId }, capture);
@@ -1217,6 +1354,7 @@ export function useVoiceRecorder({
     setWarning(null);
     setProgress(null);
     setLiveView(null);
+    setLiveLanguage(null);
     setMode(null);
     modeRef.current = null;
 
@@ -1296,6 +1434,11 @@ export function useVoiceRecorder({
             const own: LiveCapture = new LiveCapture({
               onChange: (view) => {
                 if (alive.current && live.current === own) setLiveView(view);
+              },
+              // Refused for good (voice off, no live path, the session closed):
+              // a language control would change nothing any more.
+              onEnd: (end) => {
+                if (end === 'refused' && alive.current && live.current === own) setLiveLanguage(null);
               },
             });
             capture = own;
@@ -1655,15 +1798,18 @@ export function useVoiceRecorder({
       // created are heard too. Everything else keeps no live path.
       if (capture && live.current === capture) {
         const liveConfig = onSessionRoad && s ? opened.config.live : null;
+        const language = getVoiceLanguage();
         const openedLive =
           liveConfig !== null &&
           capture.open({
             config: liveConfig,
             sessionId: opened.kind === 'session' ? opened.sessionId : '',
             recorderStartedAt,
-            language: getVoiceLanguage(),
+            language,
           });
-        if (!openedLive) {
+        if (openedLive) {
+          setLiveLanguage(language);
+        } else {
           capture.detach();
           live.current = null;
         }
@@ -1794,6 +1940,21 @@ export function useVoiceRecorder({
     setState('idle');
   }, []);
 
+  /**
+   * The bar's language control. The choice is remembered for this browser
+   * (the next recording starts in it), and a recording under way hears the
+   * rest in it: the live stream starts again from the last committed word
+   * (LiveStream.setLanguage). The stored recording and its full pass are not
+   * touched; whisper always detects the language itself.
+   */
+  const setLanguage = useCallback((language: VoiceLanguage) => {
+    setVoiceLanguage(language);
+    const capture = live.current;
+    if (!capture || capture.language === null || current.current !== 'recording') return;
+    capture.setLanguage(language);
+    setLiveLanguage(language);
+  }, []);
+
   // The legacy road's ceiling. Enforced here rather than only on the server
   // so the person sees a finished recording instead of a rejected upload.
   // The session road has none: nothing is armed, however long they talk.
@@ -1867,5 +2028,7 @@ export function useVoiceRecorder({
     hint,
     warning,
     followUp,
+    language: liveLanguage,
+    setLanguage,
   };
 }
