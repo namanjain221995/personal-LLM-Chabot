@@ -1634,8 +1634,11 @@ class _Live:
             self._pcm_lock = asyncio.Lock()
             with self.lock:
                 self.status = row["status"]
-                self.bytes_stored = int(row["bytes_stored"] or 0)
-                self.next_part = int(row["next_part"] or 0)
+                # max, not assignment: a part stored while the lease was being
+                # claimed has already raised these through `poke`, and the
+                # row the claim read may be from before that part.
+                self.bytes_stored = max(self.bytes_stored, int(row["bytes_stored"] or 0))
+                self.next_part = max(self.next_part, int(row["next_part"] or 0))
                 self.rev = max(self.rev, int(row["rev"] or 0))
             self.started = True
             renew = asyncio.get_running_loop().create_task(self._renew())
@@ -1711,13 +1714,14 @@ class _Live:
         left: the committed plan and the finished windows. The source is cut
         back to what the row acknowledged, and the PCM, which is derived, is
         decoded again from byte 0."""
-        src = source_path(self.row)
-        with contextlib.suppress(OSError):
-            if os.path.getsize(src) > self.bytes_stored:
-                # A crash between the append and the row update: the file is
-                # longer than anything acknowledged, the safe direction.
-                with open(src, "r+b") as fh:
-                    fh.truncate(self.bytes_stored)
+        try:
+            acknowledged = await db.run_in_thread(_cut_unacknowledged_tail, self.row)
+        except Exception as exc:  # noqa: BLE001 — the next append cuts the tail too
+            log.warning("voice session %s: start-up tail cut skipped: %s", self.id, exc)
+            acknowledged = None
+        if acknowledged is not None:
+            with self.lock:
+                self.bytes_stored = max(self.bytes_stored, acknowledged)
         retranscribe = self.row.get("retranscribe")
         results: Dict[int, Dict[str, Any]] = {}
         for line in _read_lines(self._p("results.jsonl")):
@@ -2940,6 +2944,38 @@ def finish(user_id: int, session_id: str, *, last_part: Optional[int], ended_by:
     started = before["status"] == STATUS_RECORDING and row["status"] == STATUS_FINISHING
     RUNNER.notify(session_id, status=row["status"], ended_by=row.get("ended_by"), rev=row["rev"])
     return row, started
+
+
+def _cut_unacknowledged_tail(row: Dict[str, Any]) -> Optional[int]:
+    """Cut the source back to what the row acknowledges NOW, and return that.
+
+    A crash between a part's append and its row update leaves the file
+    longer than anything acknowledged; a worker starting up cuts that tail.
+    It must hold the append lock and read the row afresh while holding it:
+    the worker's own copy of the row is from its lease claim, and a part
+    stored since (or being stored right now, file written and row not yet)
+    would otherwise be cut off, after which every later part is refused
+    with 503 storage_unavailable because the file is shorter than the row.
+    Blocking; run it in a thread."""
+    with _session_lock(row["id"]):
+        with db.connection() as con:
+            fresh = con.execute("SELECT bytes_stored FROM voice_sessions WHERE id = %s", (row["id"],)).fetchone()
+        if fresh is None:
+            return None
+        acknowledged = int(fresh["bytes_stored"] or 0)
+        try:
+            fd = os.open(source_path(row), os.O_RDWR)
+        except OSError:
+            return acknowledged
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if os.fstat(fd).st_size > acknowledged:
+                os.ftruncate(fd, acknowledged)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+        return acknowledged
 
 
 def _cancel_sync(row: Dict[str, Any]) -> None:

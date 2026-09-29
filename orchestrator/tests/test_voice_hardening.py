@@ -746,6 +746,44 @@ def test_audio_held_offline_past_the_idle_close_continues_in_a_linked_session(vo
     assert listing[second]["continues_session_id"] == first and listing[first]["continues_session_id"] is None
 
 
+def test_a_part_stored_while_the_worker_claims_its_lease_is_not_cut_off(voice, login_client, monkeypatch):
+    """The worker starts when the session is created and reads the row when
+    it claims its lease. A part stored after that read and before the
+    worker's start-up tail cut was truncated away (the worker trusted its
+    stale copy of bytes_stored), and every later part was then refused with
+    503 storage_unavailable, because the file was shorter than the row. Seen
+    once under load in the voice suite (the continuation test above, whose
+    held parts arrive right after create); here the claim is held open so the
+    order is certain."""
+    _script, data = recording(voice.tmp, 20.0, seed=5)
+    parts = parts_of(data)
+    claimed, proceed = threading.Event(), threading.Event()
+    real_claim = dictation._claim_lease
+
+    def slow_claim(session_id: str):
+        row = real_claim(session_id)
+        claimed.set()
+        proceed.wait(15)
+        return row
+
+    monkeypatch.setattr(dictation, "_claim_lease", slow_claim)
+    alice = login_client("alice")
+    sid = create(alice).json()["session_id"]
+    assert claimed.wait(15), "the worker never claimed its lease"
+    assert put(alice, sid, 0, parts[0]).status_code == 200
+    proceed.set()
+    until(lambda: getattr(dictation.RUNNER.get(sid), "started", False))
+    time.sleep(0.3)
+    for seq, part in enumerate(parts[1:], start=1):
+        r = put(alice, sid, seq, part)
+        assert r.status_code == 200, (seq, r.status_code, r.text)
+    assert os.path.getsize(dictation.source_path(row_of(sid))) == len(data)
+    assert finish(alice, sid, len(parts) - 1).status_code == 202
+    done = wait_done(alice, sid)
+    assert done["outcome"] == "transcribed", done
+    assert abs(done["audio_ms"] - 20_000) <= 5, done["audio_ms"]
+
+
 def test_only_an_idle_closed_session_of_your_own_can_be_continued_and_only_once(voice, login_client, monkeypatch):
     monkeypatch.setattr(settings, "voice_max_bits_per_second", 256_000, raising=False)
     monkeypatch.setattr(settings, "voice_rate_slack_s", 10.0, raising=False)
