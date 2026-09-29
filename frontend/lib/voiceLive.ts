@@ -1,0 +1,1389 @@
+/**
+ * Live dictation: the words while they are being spoken (2026-09-29).
+ *
+ * THE STORED RECORDING STAYS THE TRUTH. A session recording (lib/voice.ts)
+ * uploads Opus in 5 s parts and whisper transcribes it in windows cut at
+ * pauses, so its preview arrives in steps of five seconds or more, paced by
+ * the server's voice-activity detector and by chat. That path is untouched
+ * and still decides the text that goes into the draft. This module is a
+ * second, disposable channel beside it: the same microphone, tapped by an
+ * AudioWorklet (public/voice/pcm-capture-worklet.js) as 16 kHz PCM, streamed
+ * over one WebSocket to a streaming recogniser that answers with a PARTIAL
+ * hypothesis a few hundred milliseconds after the words, and a FINAL one per
+ * utterance once the speaker pauses. Anything here may fail at any moment;
+ * the recording, its upload and its transcript do not notice.
+ *
+ * WHAT IS HERE, IN ORDER.
+ *   - the language preference the start message carries;
+ *   - PcmRing: the last 60 s of PCM, so a dropped connection resumes with the
+ *     words spoken while it was down instead of losing them;
+ *   - CaptureClock: when a sample was captured, for the clock offset that
+ *     maps live samples onto the stored recording, and for the capture-to-
+ *     screen latency the server is told about;
+ *   - LiveTranscript: what has been heard (a partial replaces, a final
+ *     commits, late and repeated events are ignored);
+ *   - mergeLiveTranscript: the durable preview and the live words as one text;
+ *   - attachPcmTap: the worklet on the meter's own AudioContext;
+ *   - LiveStream: the socket (subprotocol techsara.voice.v1, reconnect with
+ *     resume, backpressure, ping, client_stats);
+ *   - LiveCapture: the one object the recorder hook holds.
+ *
+ * Pure TypeScript with no React, like lib/voice.ts, so every rule above is
+ * unit-testable without a DOM. Nothing touches a browser global at import
+ * time: the composer renders on the server too.
+ */
+
+import { joinPreview, type LiveConfig, type SessionProgress } from '@/lib/voice';
+
+/** The engine's rate and the wire's: 16 samples per millisecond. */
+export const LIVE_SAMPLE_RATE = 16000;
+const SAMPLES_PER_MS = LIVE_SAMPLE_RATE / 1000;
+/** One message: 40 ms. */
+export const LIVE_FRAME_SAMPLES = 640;
+export const LIVE_SUBPROTOCOL = 'techsara.voice.v1';
+/** Served from frontend/public as it is: a worklet module is loaded by URL. */
+export const LIVE_WORKLET_URL = '/voice/pcm-capture-worklet.js';
+export const LIVE_PROCESSOR = 'techsara-pcm-capture';
+/** How much PCM the browser keeps for a reconnect to replay (1.9 MB). */
+export const LIVE_RING_SECONDS = 60;
+/**
+ * Backpressure. Past 256 KiB queued in the socket (about 8 s of PCM) nothing
+ * more is handed to it; the frames wait in the ring, and sending resumes once
+ * the queue is below 64 KiB. Without a ceiling a slow uplink would queue the
+ * whole recording inside the socket, where a reconnect cannot replay it from.
+ */
+export const LIVE_HIGH_WATER_BYTES = 256 * 1024;
+export const LIVE_LOW_WATER_BYTES = 64 * 1024;
+/** After Stop, the live stream gets this long to deliver its last words. */
+export const LIVE_FINISH_BUDGET_MS = 3000;
+/** How long the worklet may take to hand over its last partial frame. */
+export const LIVE_TAP_FLUSH_MS = 300;
+export const LIVE_STATS_INTERVAL_MS = 5000;
+export const LIVE_PING_INTERVAL_MS = 10_000;
+/** A ping answered by nothing at all for this long: the connection is dead. */
+export const LIVE_PONG_TIMEOUT_MS = 10_000;
+/** The panel redraws the live words at most ten times a second. */
+export const LIVE_RENDER_INTERVAL_MS = 100;
+/** At most this many latencies per list in one client_stats message. */
+const STATS_MAX = 64;
+/** Reconnect schedule: 0.5, 1, 2, 4, 8 s, then every 15 s, each ±20%. */
+const RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000, 8000];
+const RECONNECT_CEILING_MS = 15_000;
+const DRAIN_CHECK_MS = 50;
+const TICK_MS = 1000;
+/** WebSocket.OPEN, spelled out so a test double need not carry the constant. */
+const OPEN = 1;
+/**
+ * Closes that retrying cannot fix: bad protocol, signed out, voice off, no
+ * such session or no live path, superseded by another connection, a frame too
+ * large. Every other close (1006 dropped, 1012 server restart, 4408 idle,
+ * 4429 busy, 4500, 4503) is retried with backoff while the recording lasts.
+ */
+const TERMINAL_CLOSES: ReadonlySet<number> = new Set([4400, 4401, 4403, 4404, 4409, 4413]);
+/** Text the server may send per event; longer is cut, never trusted. */
+const MAX_EVENT_TEXT = 4000;
+/**
+ * The button that puts the live words into the draft when the stored
+ * recording's transcript could not be had (components/useVoiceRecorder.ts).
+ */
+export const LIVE_INSERT_LABEL = 'Insert live transcript';
+
+// ---------------------------------------------------------------------------
+// The language the engine is asked for
+// ---------------------------------------------------------------------------
+
+/**
+ * Per browser, not per account: it describes the person at this microphone.
+ * "en" routes to an English-only model, which transcribed LibriSpeech at
+ * 4.13% WER against 6.23% for the multilingual one; "auto" and "hi" need the
+ * multilingual one. Gujarati is not offered: neither model can transcribe it
+ * (FLEURS-gu WER 104%, measured 2026-09-29). There is no selector yet; these
+ * helpers are what it will call.
+ */
+export type VoiceLanguage = 'auto' | 'en' | 'hi';
+export const VOICE_LANGUAGES: readonly VoiceLanguage[] = ['auto', 'en', 'hi'];
+export const VOICE_LANGUAGE_KEY = 'techsara-voice-language';
+
+type PrefStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+
+function localPrefs(): PrefStorage | null {
+  try {
+    return typeof window !== 'undefined' && window.localStorage ? window.localStorage : null;
+  } catch {
+    return null; // a sandboxed frame throws on the property itself
+  }
+}
+
+function asVoiceLanguage(value: unknown): VoiceLanguage | null {
+  if (typeof value !== 'string') return null;
+  const v = value.trim().toLowerCase();
+  return (VOICE_LANGUAGES as readonly string[]).includes(v) ? (v as VoiceLanguage) : null;
+}
+
+/** The stored preference; anything unreadable or unknown is "auto". */
+export function getVoiceLanguage(storage: PrefStorage | null = localPrefs()): VoiceLanguage {
+  try {
+    return asVoiceLanguage(storage?.getItem(VOICE_LANGUAGE_KEY)) ?? 'auto';
+  } catch {
+    return 'auto';
+  }
+}
+
+/** Remember a preference; "auto" (or anything unknown) removes it. */
+export function setVoiceLanguage(language: string, storage: PrefStorage | null = localPrefs()): void {
+  try {
+    if (!storage) return;
+    const known = asVoiceLanguage(language);
+    if (known && known !== 'auto') storage.setItem(VOICE_LANGUAGE_KEY, known);
+    else storage.removeItem(VOICE_LANGUAGE_KEY);
+  } catch {
+    /* quota, or a private window: the preference is a convenience */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The socket's address
+// ---------------------------------------------------------------------------
+
+/** The one path shape the frontend's WebSocket relay forwards. */
+const RELAYED_PATH = /^\/api\/audio\/sessions\/[A-Za-z0-9_-]{1,64}\/live$/;
+
+/**
+ * `ws(s)://<this host><path>` for a session, or null. Same origin only: the
+ * page's CSP allows a socket to 'self' and nothing else, and the relay owns
+ * exactly RELAYED_PATH, so a config pointing anywhere else cannot work and is
+ * not tried.
+ */
+export function liveSocketUrl(
+  config: LiveConfig,
+  sessionId: string,
+  where: { protocol: string; host: string } | null = typeof location !== 'undefined' ? location : null,
+): string | null {
+  if (!where || !where.host) return null;
+  const path = config.path.split('{id}').join(encodeURIComponent(sessionId));
+  if (!RELAYED_PATH.test(path)) return null;
+  return `${where.protocol === 'https:' ? 'wss' : 'ws'}://${where.host}${path}`;
+}
+
+// ---------------------------------------------------------------------------
+// The last minute of PCM
+// ---------------------------------------------------------------------------
+
+/**
+ * A circular buffer of 16 kHz samples addressed by their absolute index
+ * (sample 0 is the first the worklet produced). `start` is the oldest index
+ * still held and `end` one past the newest.
+ */
+export class PcmRing {
+  readonly capacity: number;
+  private buf: Int16Array;
+  start = 0;
+  end = 0;
+  /** Samples written over before anything read them: the ring overflowed. */
+  overwritten = 0;
+
+  constructor(seconds = LIVE_RING_SECONDS) {
+    this.capacity = Math.max(LIVE_FRAME_SAMPLES, Math.round(seconds * LIVE_SAMPLE_RATE));
+    this.buf = new Int16Array(this.capacity);
+  }
+
+  /** Add samples that start at `index`. The worklet's indices are contiguous. */
+  push(index: number, samples: Int16Array): void {
+    if (this.buf.length === 0) return; // cleared: this recording has no live path
+    let from = index;
+    let data = samples;
+    if (from < this.end) {
+      // Overlap (a repeated frame): keep what is already held.
+      const skip = this.end - from;
+      if (skip >= data.length) return;
+      data = data.subarray(skip);
+      from = this.end;
+    } else if (from > this.end) {
+      // A hole: nothing before it can be sent contiguously with what follows.
+      this.start = from;
+      this.end = from;
+    }
+    if (data.length > this.capacity) {
+      from += data.length - this.capacity;
+      data = data.subarray(data.length - this.capacity);
+      this.start = from;
+    }
+    const pos = from % this.capacity;
+    const first = Math.min(data.length, this.capacity - pos);
+    this.buf.set(data.subarray(0, first), pos);
+    if (first < data.length) this.buf.set(data.subarray(first), 0);
+    this.end = from + data.length;
+    if (this.end - this.start > this.capacity) {
+      this.overwritten += this.end - this.capacity - this.start;
+      this.start = this.end - this.capacity;
+    }
+  }
+
+  /** A copy of up to `max` samples from `from`, or null when `from` is no longer held. */
+  read(from: number, max: number): Int16Array | null {
+    if (this.buf.length === 0 || from < this.start || from > this.end) return null;
+    const n = Math.max(0, Math.min(max, this.end - from));
+    const out = new Int16Array(n);
+    const pos = from % this.capacity;
+    const first = Math.min(n, this.capacity - pos);
+    out.set(this.buf.subarray(pos, pos + first));
+    if (first < n) out.set(this.buf.subarray(0, n - first), first);
+    return out;
+  }
+
+  /** Let the audio go (no live stream on this recording after all, or it ended). */
+  clear(): void {
+    this.buf = new Int16Array(0);
+    this.start = this.end;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// When a sample was captured
+// ---------------------------------------------------------------------------
+
+/** How far back the clock looks for its best estimate: ten seconds of frames. */
+const CLOCK_WINDOW_MS = 10_000;
+
+/**
+ * performance.now() of a sample, from when the frames arrived.
+ *
+ * A frame is posted when its last sample leaves the worklet, about one render
+ * quantum (128 samples, 2.7 ms at 48 kHz) after that sample was captured, and
+ * arrives a moment later unless the page's main thread was busy. So every
+ * frame implies a time for sample 0 that is never too EARLY, and a stalled
+ * frame implies one that is late by the stall. The clock keeps the earliest
+ * such time of the last ten seconds (a sliding minimum): a render that froze
+ * the page for half a second does not move it, and the audio clock's drift
+ * against performance.now() (well under a millisecond in ten seconds) is
+ * forgotten as the window moves. Good to a few milliseconds, which both uses
+ * need: the clock offset places utterances (seconds long) against the stored
+ * recording, and latencies are reported in tens of milliseconds.
+ */
+export class CaptureClock {
+  private quantumMs: number;
+  /** Increasing `zero` values with their arrival times: the window's minimum is first. */
+  private readonly window: Array<{ zero: number; at: number }> = [];
+
+  constructor(contextRate = 48000) {
+    this.quantumMs = (128 / contextRate) * 1000;
+  }
+
+  /** The context's real rate, once the worklet has said it. */
+  setRate(contextRate: number): void {
+    if (contextRate > 0 && Number.isFinite(contextRate)) this.quantumMs = (128 / contextRate) * 1000;
+  }
+
+  note(index: number, length: number, arrivedAt: number): void {
+    if (length <= 0 || !Number.isFinite(arrivedAt)) return;
+    const zero = arrivedAt - this.quantumMs - (index + length - 1) / SAMPLES_PER_MS;
+    const w = this.window;
+    while (w.length > 0 && w[w.length - 1]!.zero >= zero) w.pop();
+    w.push({ zero, at: arrivedAt });
+    while (w.length > 1 && w[0]!.at < arrivedAt - CLOCK_WINDOW_MS) w.shift();
+  }
+
+  /** True once a frame has been timed. */
+  get running(): boolean {
+    return this.window.length > 0;
+  }
+
+  /** When `sample` was captured, or null before the first frame. */
+  timeOf(sample: number): number | null {
+    const best = this.window[0];
+    return best ? best.zero + sample / SAMPLES_PER_MS : null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// What has been heard
+// ---------------------------------------------------------------------------
+
+export interface LiveUtterance {
+  u: number;
+  text: string;
+  startSample: number;
+  endSample: number;
+}
+
+/**
+ * The live transcript: committed utterances in u order, and at most one
+ * partial. A partial is the WHOLE current hypothesis of its utterance, so it
+ * replaces (never appends). A final commits its utterance and clears that
+ * partial. Anything for an utterance already committed is late or repeated
+ * (a replay after a reconnect) and is ignored, so no word is shown twice.
+ */
+export class LiveTranscript {
+  private readonly list: LiveUtterance[] = [];
+  partial: LiveUtterance | null = null;
+  /** The highest utterance committed; -1 before the first. */
+  lastU = -1;
+  /** One past the last sample a final covered: where a resume starts. */
+  committedUntil = 0;
+  /** Bumped on every change, so a view can tell it is stale. */
+  version = 0;
+
+  get committed(): readonly LiveUtterance[] {
+    return this.list;
+  }
+
+  /** The number the next utterance takes, carried across reconnects. */
+  get nextU(): number {
+    return this.lastU + 1;
+  }
+
+  final(u: number, text: string, startSample: number, endSample: number): boolean {
+    if (u <= this.lastU) return false;
+    const words = text.trim();
+    // "An utterance with no words produces no final"; one that says so anyway
+    // still moves the numbering on.
+    if (words) this.list.push({ u, text: words, startSample, endSample });
+    this.lastU = u;
+    this.committedUntil = Math.max(this.committedUntil, endSample);
+    if (this.partial && this.partial.u <= u) this.partial = null;
+    this.version += 1;
+    return true;
+  }
+
+  partialUpdate(u: number, text: string, startSample: number, endSample: number): boolean {
+    if (u <= this.lastU) return false;
+    if (this.partial && u < this.partial.u) return false;
+    const words = text.trim();
+    const next = words ? { u, text: words, startSample, endSample } : null;
+    if (
+      next &&
+      this.partial &&
+      this.partial.u === u &&
+      this.partial.text === words &&
+      this.partial.endSample === endSample
+    ) {
+      return false;
+    }
+    if (!next && !this.partial) return false;
+    this.partial = next;
+    this.version += 1;
+    return true;
+  }
+
+  /** Everything heard, as one text: what "Insert live transcript" puts in the draft. */
+  text(): string {
+    let out = '';
+    for (const utterance of this.list) out = joinPreview(out, utterance.text);
+    if (this.partial) out = joinPreview(out, this.partial.text);
+    return out.trim();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The durable preview and the live words, as one text
+// ---------------------------------------------------------------------------
+
+/** What the panel draws from the live stream. */
+export interface LiveView {
+  utterances: readonly LiveUtterance[];
+  partial: LiveUtterance | null;
+  /**
+   * Milliseconds from the stored recording's zero (MediaRecorder.start) to
+   * live sample 0: an utterance at samples [a, b) sits at
+   * (a + b) / 32 + clockOffsetMs in the recording's time.
+   */
+  clockOffsetMs: number;
+  /** False once the stream failed for good: the panel then shows the durable preview alone. */
+  active: boolean;
+  version: number;
+}
+
+export interface MergedTranscript {
+  /** The durable preview (final segments). */
+  settled: string;
+  /** The durable text the server still holds back. */
+  held: string;
+  /** Committed live utterances after what the durable text covers. */
+  live: string;
+  /** The live utterance still being heard. */
+  partial: string;
+}
+
+/** Enough live text for the tail the panel shows (four lines), with room to spare. */
+export const LIVE_TAIL_CHARS = 600;
+
+/**
+ * How much of the recording the durable text covers. A `transcribed_ms` of 0
+ * beside durable text is a server that did not send the field (it parses as
+ * 0), not one that has transcribed nothing: trusting it would show every live
+ * word a second time after whisper's. Audio minus backlog is the same number
+ * by another route.
+ */
+function coveredMs(progress: SessionProgress | null): number {
+  if (!progress) return 0;
+  if (progress.transcribedMs !== undefined && progress.transcribedMs > 0) return progress.transcribedMs;
+  return Math.max(0, progress.audioMs - progress.backlogMs);
+}
+
+function midpointMs(u: LiveUtterance, offsetMs: number): number {
+  return (u.startSample + u.endSample) / 2 / SAMPLES_PER_MS + offsetMs;
+}
+
+/**
+ * The durable text covers the recording up to `transcribed_ms`; a live
+ * utterance is shown only if its middle lies after that, so a sentence whisper
+ * has already written is not written twice, and one it has not reached yet is
+ * not missing. Before the durable path has any text, the live words are all
+ * there is. A stream that failed for good is not shown at all: the panel is
+ * then exactly what it was before live dictation existed.
+ */
+export function mergeLiveTranscript(
+  progress: SessionProgress | null,
+  live: LiveView | null,
+  tailChars = LIVE_TAIL_CHARS,
+): MergedTranscript {
+  const settled = progress?.preview ?? '';
+  const held = progress?.tentative ?? '';
+  if (!live || !live.active) return { settled, held, live: '', partial: '' };
+  const durable = Boolean(settled.trim() || held.trim());
+  const covered = coveredMs(progress);
+  const shown = (u: LiveUtterance) => !durable || midpointMs(u, live.clockOffsetMs) > covered;
+  const pieces: string[] = [];
+  let chars = 0;
+  for (let i = live.utterances.length - 1; i >= 0 && chars < tailChars; i -= 1) {
+    const u = live.utterances[i]!;
+    // In time order: once one is covered, every earlier one is too.
+    if (!shown(u)) break;
+    pieces.push(u.text);
+    chars += u.text.length + 1;
+  }
+  let text = '';
+  for (let i = pieces.length - 1; i >= 0; i -= 1) text = joinPreview(text, pieces[i]!);
+  if (text.length > tailChars) text = text.slice(text.length - tailChars).replace(/^\S*\s+/, '');
+  const partial = live.partial && shown(live.partial) ? live.partial.text : '';
+  return { settled, held, live: text, partial };
+}
+
+/** The progress a session reports before its first answer (lib/voice.ts VoiceSession). */
+function blankProgress(): SessionProgress {
+  return {
+    preview: '',
+    tentative: '',
+    audioMs: 0,
+    transcribedMs: 0,
+    backlogMs: 0,
+    waitingOn: 'none',
+    pendingParts: 0,
+    pendingMs: 0,
+    savedMs: 0,
+    offline: false,
+    offlineLong: false,
+    storageTrouble: false,
+    lastAckAt: null,
+    retentionDays: null,
+    progressive: true,
+  };
+}
+
+/**
+ * The progress the bar draws: the session's own, with the live words after
+ * it. The live words can come before the session's first answer (5 s of
+ * audio at the earliest), so they then stand on a blank progress, which draws
+ * nothing else: savedMs 0 hides "Saved to your account" until the server
+ * says so.
+ */
+export function withLiveWords(
+  progress: SessionProgress | null,
+  live: LiveView | null,
+): SessionProgress | null {
+  if (!live) return progress;
+  const merged = mergeLiveTranscript(progress, live);
+  if (!merged.live && !merged.partial) return progress;
+  return { ...(progress ?? blankProgress()), live: { committed: merged.live, partial: merged.partial } };
+}
+
+/** The separator the preview puts between two pieces ('' between two CJK or Thai runs). */
+export function spaceBetween(left: string, right: string): string {
+  if (!left || !right) return '';
+  return joinPreview(left, right).length > left.length + right.length ? ' ' : '';
+}
+
+// ---------------------------------------------------------------------------
+// The worklet
+// ---------------------------------------------------------------------------
+
+export interface PcmTap {
+  /** Ask the worklet for the samples still inside it; resolves once posted, or after `timeoutMs`. */
+  flush(timeoutMs: number): Promise<void>;
+  /** Take the worklet out of the graph. Idempotent. */
+  stop(): void;
+}
+
+export interface TapSink {
+  frame(index: number, samples: Int16Array, arrivedAt: number): void;
+  /** The worklet's first quantum: the context's real rate. */
+  started?(contextRate: number): void;
+}
+
+function asInt16(data: unknown): Int16Array | null {
+  if (data instanceof Int16Array) return data;
+  if (ArrayBuffer.isView(data)) {
+    return new Int16Array(data.buffer, data.byteOffset, Math.floor(data.byteLength / 2));
+  }
+  if (data && typeof (data as ArrayBuffer).byteLength === 'number') {
+    try {
+      return new Int16Array(data as ArrayBuffer, 0, Math.floor((data as ArrayBuffer).byteLength / 2));
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Put the capture worklet on `context`, fed by `source` (the node the level
+ * meter reads, so there is one microphone and one context). Null when this
+ * browser has no AudioWorklet, which leaves the recording exactly as it was.
+ */
+export async function attachPcmTap(
+  context: BaseAudioContext,
+  source: AudioNode,
+  sink: TapSink,
+  deps: {
+    AudioWorkletNodeImpl?: typeof AudioWorkletNode;
+    url?: string;
+    now?: () => number;
+    /** Checked after the module loads: the recording may have ended meanwhile. */
+    stale?: () => boolean;
+  } = {},
+): Promise<PcmTap | null> {
+  const NodeImpl =
+    deps.AudioWorkletNodeImpl ?? (globalThis as { AudioWorkletNode?: typeof AudioWorkletNode }).AudioWorkletNode;
+  const worklet = (context as { audioWorklet?: AudioWorklet }).audioWorklet;
+  if (!worklet || typeof worklet.addModule !== 'function' || typeof NodeImpl !== 'function') return null;
+  await worklet.addModule(deps.url ?? LIVE_WORKLET_URL);
+  if (deps.stale?.() || context.state === 'closed') return null;
+  const node = new NodeImpl(context, LIVE_PROCESSOR, {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    outputChannelCount: [1],
+    // The browser mixes the microphone down to mono before the worklet sees
+    // it; the worklet averages anything that still arrives with more.
+    channelCount: 1,
+    channelCountMode: 'explicit',
+    channelInterpretation: 'speakers',
+  });
+  const now = deps.now ?? (() => performance.now());
+  let onFlushed: (() => void) | null = null;
+  node.port.onmessage = (event: MessageEvent) => {
+    const data = event.data as { type?: unknown; index?: unknown; samples?: unknown; sampleRate?: unknown } | null;
+    if (!data) return;
+    if (data.type === 'frame' && typeof data.index === 'number') {
+      const samples = asInt16(data.samples);
+      if (samples && samples.length > 0) sink.frame(data.index, samples, now());
+    } else if (data.type === 'start' && typeof data.sampleRate === 'number') {
+      sink.started?.(data.sampleRate);
+    } else if (data.type === 'flushed') {
+      onFlushed?.();
+    }
+  };
+  // An AudioWorkletNode that reaches no destination is not run by every
+  // engine (Safari was the open question). Through a gain of zero it runs
+  // everywhere and makes no sound.
+  const mute = context.createGain();
+  mute.gain.value = 0;
+  source.connect(node);
+  node.connect(mute);
+  mute.connect(context.destination);
+  let stopped = false;
+  return {
+    flush(timeoutMs) {
+      if (stopped) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        const done = () => {
+          clearTimeout(timer);
+          onFlushed = null;
+          resolve();
+        };
+        const timer = setTimeout(done, timeoutMs);
+        onFlushed = done;
+        try {
+          node.port.postMessage({ type: 'flush' });
+        } catch {
+          done();
+        }
+      });
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      onFlushed?.();
+      try {
+        node.port.postMessage({ type: 'stop' });
+      } catch {
+        /* the context is already gone */
+      }
+      node.port.onmessage = null;
+      const cuts = [() => source.disconnect(node), () => node.disconnect(), () => mute.disconnect()];
+      for (const cut of cuts) {
+        try {
+          cut();
+        } catch {
+          /* already disconnected, or the context is closed */
+        }
+      }
+      try {
+        node.port.close();
+      } catch {
+        /* nothing to close */
+      }
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The socket
+// ---------------------------------------------------------------------------
+
+/** How a live stream ended: its done, the finish budget, the person, a refusal, or no audio at all. */
+export type LiveEnd = 'done' | 'timeout' | 'aborted' | 'refused' | 'nothing';
+
+export type LivePhase = 'waiting' | 'connecting' | 'streaming' | 'backoff' | 'closed' | 'failed';
+
+export interface LiveStreamOptions {
+  url: string;
+  ring: PcmRing;
+  clock: CaptureClock;
+  transcript: LiveTranscript;
+  /** performance.now() when MediaRecorder.start() ran: the stored recording's zero. */
+  recorderStartedAt: number;
+  language: VoiceLanguage;
+  /** How far back a reconnect may replay (config.live.resume_max_s). */
+  resumeMaxS: number;
+  onChange?: () => void;
+  onEnd?: (end: LiveEnd) => void;
+  WebSocketImpl?: typeof WebSocket;
+  /** performance.now, injectable. */
+  now?: () => number;
+  random?: () => number;
+}
+
+const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+
+/**
+ * One live stream for one recording session, across as many connections as
+ * it takes.
+ *
+ * A connection sends `start`, waits for `ready`, then sends PCM from the
+ * resume point: sample 0 the first time (the ring holds what was spoken
+ * before the session existed), and after a drop the later of the last final's
+ * end and the oldest sample still held, with `next_u` continuing the
+ * numbering. So an outage shorter than a minute loses no words, and the words
+ * already committed are not sent again.
+ *
+ * It never gives up while the recording lasts, except on the refusals that
+ * retrying cannot fix (TERMINAL_CLOSES, or an error the server marked not
+ * retryable).
+ */
+export class LiveStream {
+  private readonly opts: LiveStreamOptions;
+  private readonly WS: typeof WebSocket;
+  private readonly now: () => number;
+  private readonly random: () => number;
+  private ws: WebSocket | null = null;
+  private phase: LivePhase = 'waiting';
+  private ready = false;
+  /** The next sample to send on this connection. */
+  private sent = 0;
+  private paused = false;
+  private attempt = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private drainTimer: ReturnType<typeof setTimeout> | null = null;
+  private tickTimer: ReturnType<typeof setInterval> | null = null;
+  private finishTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastMessageAt = 0;
+  private lastPingAt = 0;
+  private lastStatsAt = 0;
+  private finishing = false;
+  private flushSent = false;
+  private finished: Promise<void> | null = null;
+  private resolveFinished: (() => void) | null = null;
+  /** `retryable` of the last error message, or null when there was none. */
+  private errorRetryable: boolean | null = null;
+  private clockOffset: number | null = null;
+  private pendingPartialEnd: number | null = null;
+  private pendingFinalEnds: number[] = [];
+  private partialMs: number[] = [];
+  private finalMs: number[] = [];
+  /** Connections opened, and times the ring overwrote audio before it could be sent. */
+  connects = 0;
+  gaps = 0;
+
+  constructor(opts: LiveStreamOptions) {
+    this.opts = opts;
+    this.WS = opts.WebSocketImpl ?? (globalThis as { WebSocket: typeof WebSocket }).WebSocket;
+    this.now = opts.now ?? (() => performance.now());
+    this.random = opts.random ?? Math.random;
+  }
+
+  /** Where the stream stands; for tests and the view. */
+  get state(): LivePhase {
+    return this.phase;
+  }
+
+  /** True until a refusal retrying cannot fix. */
+  get active(): boolean {
+    return this.phase !== 'failed';
+  }
+
+  /**
+   * Milliseconds from the recorder's start to sample 0: negative when the tap
+   * started first, which it normally does (it starts at the permission grant,
+   * the recorder only once the session exists). Fixed at the first connection
+   * so every start message and the panel's merge agree; bounded to ±60 s as
+   * the server bounds it.
+   */
+  get clockOffsetMs(): number {
+    if (this.clockOffset === null) {
+      const zero = this.opts.clock.timeOf(0);
+      if (zero === null) return 0;
+      const raw = Math.round(zero - this.opts.recorderStartedAt);
+      this.clockOffset = Math.max(-60_000, Math.min(60_000, raw));
+    }
+    return this.clockOffset;
+  }
+
+  /** Begin: connect as soon as there is audio to send. */
+  start(): void {
+    if (this.phase === 'waiting' && this.hasAudio()) this.connect();
+  }
+
+  /** A frame landed in the ring. */
+  audioArrived(): void {
+    if (this.phase === 'waiting') {
+      if (this.hasAudio()) this.connect();
+      return;
+    }
+    if (this.phase === 'streaming') this.pump();
+  }
+
+  /**
+   * Stop was pressed and every sample is in the ring: send the rest and
+   * `flush`, wait for `done`, close. Never longer than `budgetMs`, and never
+   * in the way of the stored recording's own finish, which does not wait.
+   */
+  finish(budgetMs = LIVE_FINISH_BUDGET_MS): Promise<void> {
+    if (this.finished) return this.finished;
+    this.finished = new Promise<void>((resolve) => {
+      this.resolveFinished = resolve;
+    });
+    if (this.phase === 'closed' || this.phase === 'failed') {
+      this.resolveFinished!();
+      return this.finished;
+    }
+    this.finishing = true;
+    this.finishTimer = setTimeout(() => this.close('timeout'), budgetMs);
+    if (this.phase === 'waiting') {
+      if (this.hasAudio()) this.connect();
+      else this.close('nothing');
+    } else if (this.phase === 'backoff') {
+      this.connect();
+    } else {
+      this.pump();
+    }
+    return this.finished;
+  }
+
+  /** Cancel, discard, page going away: close now (1000), and never again. */
+  abort(): void {
+    this.close('aborted');
+  }
+
+  /** The browser is back online: a reconnect waiting out its backoff goes now. */
+  nudge(): void {
+    if (this.phase !== 'backoff') return;
+    this.connect();
+  }
+
+  /**
+   * The panel has just drawn what arrived since its last draw: the latency of
+   * each final, and of the partial on screen (the ones it replaced were never
+   * seen), from the capture of the last sample it covers to now.
+   */
+  rendered(at: number = this.now()): void {
+    const measure = (end: number, into: number[]) => {
+      const captured = this.opts.clock.timeOf(Math.max(0, end - 1));
+      if (captured === null) return;
+      into.push(Math.max(0, Math.min(60_000, Math.round(at - captured))));
+      if (into.length > STATS_MAX) into.splice(0, into.length - STATS_MAX);
+    };
+    for (const end of this.pendingFinalEnds) measure(end, this.finalMs);
+    if (this.pendingPartialEnd !== null) measure(this.pendingPartialEnd, this.partialMs);
+    this.pendingFinalEnds = [];
+    this.pendingPartialEnd = null;
+  }
+
+  // -- connection -----------------------------------------------------------
+
+  private hasAudio(): boolean {
+    return this.opts.clock.running && this.opts.ring.end > this.opts.ring.start;
+  }
+
+  /** The later of the last final's end and the oldest sample a replay may start from. */
+  private resumePoint(): number {
+    const { ring, transcript, resumeMaxS } = this.opts;
+    const window = Math.floor(Math.min(LIVE_RING_SECONDS, Math.max(0, resumeMaxS)) * LIVE_SAMPLE_RATE);
+    const oldest = Math.max(ring.start, ring.end - window);
+    return Math.min(ring.end, Math.max(transcript.committedUntil, oldest));
+  }
+
+  private connect(): void {
+    this.clearReconnect();
+    let ws: WebSocket;
+    try {
+      ws = new this.WS(this.opts.url, [LIVE_SUBPROTOCOL]);
+    } catch {
+      // A URL or a policy the browser refused outright: the same as a drop.
+      this.retry();
+      return;
+    }
+    this.connects += 1;
+    this.ws = ws;
+    this.ready = false;
+    this.paused = false;
+    this.flushSent = false;
+    this.errorRetryable = null;
+    this.phase = 'connecting';
+    try {
+      ws.binaryType = 'arraybuffer';
+    } catch {
+      /* only affects what we receive, and the server sends text */
+    }
+    ws.onopen = () => {
+      if (this.ws !== ws) return;
+      this.lastMessageAt = this.now();
+      this.lastPingAt = this.lastMessageAt;
+      this.lastStatsAt = this.lastMessageAt;
+      // Decided now, not when the socket was asked for: a ring that kept
+      // overflowing while it connected has moved its oldest sample since.
+      const resume = this.resumePoint();
+      this.sent = resume;
+      this.send(ws, JSON.stringify(this.startMessage(resume)));
+      this.startTicking();
+    };
+    ws.onmessage = (event: MessageEvent) => this.onMessage(ws, event.data);
+    ws.onerror = () => undefined; // the close that follows decides
+    ws.onclose = (event: CloseEvent) => this.onClose(ws, event.code);
+  }
+
+  private startMessage(resume: number): Record<string, unknown> {
+    return {
+      type: 'start',
+      v: 1,
+      encoding: 'pcm_s16le',
+      sample_rate: LIVE_SAMPLE_RATE,
+      channels: 1,
+      frame_ms: 40,
+      source: 'mic',
+      resume_from_sample: resume,
+      next_u: this.opts.transcript.nextU,
+      clock_offset_ms: this.clockOffsetMs,
+      language: this.opts.language,
+    };
+  }
+
+  private onMessage(ws: WebSocket, data: unknown): void {
+    if (this.ws !== ws) return;
+    this.lastMessageAt = this.now();
+    if (typeof data !== 'string') return;
+    let msg: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(data);
+      if (typeof parsed !== 'object' || parsed === null) return;
+      msg = parsed as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    switch (msg.type) {
+      case 'ready':
+        this.onReady(msg);
+        return;
+      case 'partial':
+      case 'final':
+        this.onWords(msg.type, msg);
+        return;
+      case 'done':
+        this.close('done');
+        return;
+      case 'error':
+        this.errorRetryable = msg.retryable === true ? true : msg.retryable === false ? false : null;
+        return;
+      default:
+        // pong, speech, and whatever a newer server adds.
+        return;
+    }
+  }
+
+  private onReady(msg: Record<string, unknown>): void {
+    if (this.ready) return;
+    this.ready = true;
+    this.attempt = 0;
+    const echoed = msg.resume_from_sample;
+    if (isCount(echoed) && echoed >= this.opts.ring.start && echoed <= this.opts.ring.end) this.sent = echoed;
+    this.phase = 'streaming';
+    this.pump();
+  }
+
+  private onWords(kind: 'partial' | 'final', msg: Record<string, unknown>): void {
+    const { u, text } = msg;
+    if (!isCount(u) || typeof text !== 'string') return;
+    const start = isCount(msg.start_sample) ? msg.start_sample : 0;
+    const end = isCount(msg.end_sample) ? Math.max(start, msg.end_sample) : start;
+    const words = text.length > MAX_EVENT_TEXT ? text.slice(0, MAX_EVENT_TEXT) : text;
+    const { transcript } = this.opts;
+    const changed =
+      kind === 'final'
+        ? transcript.final(u, words, start, end)
+        : transcript.partialUpdate(u, words, start, end);
+    if (!changed) return;
+    if (kind === 'final') {
+      this.pendingFinalEnds.push(end);
+      if (this.pendingFinalEnds.length > STATS_MAX) this.pendingFinalEnds.shift();
+    } else {
+      this.pendingPartialEnd = end;
+    }
+    this.opts.onChange?.();
+  }
+
+  private onClose(ws: WebSocket, code: number): void {
+    if (this.ws !== ws) return;
+    this.ws = null;
+    this.ready = false;
+    this.paused = false;
+    this.stopTicking();
+    this.clearDrain();
+    if (this.phase === 'closed' || this.phase === 'failed') return;
+    if (TERMINAL_CLOSES.has(code) || this.errorRetryable === false) {
+      this.fail();
+      return;
+    }
+    this.retry();
+  }
+
+  private retry(): void {
+    if (this.phase === 'closed' || this.phase === 'failed') return;
+    const base =
+      this.attempt < RECONNECT_DELAYS_MS.length ? RECONNECT_DELAYS_MS[this.attempt]! : RECONNECT_CEILING_MS;
+    this.attempt += 1;
+    // ±20%, so a room of browsers that lost the same Wi-Fi does not return in step.
+    const delay = Math.round(base * (0.8 + 0.4 * this.random()));
+    this.phase = 'backoff';
+    this.clearReconnect();
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, delay);
+  }
+
+  // -- sending --------------------------------------------------------------
+
+  private send(ws: WebSocket, data: string | ArrayBuffer): boolean {
+    try {
+      ws.send(data);
+      return true;
+    } catch {
+      return false; // closing under us; its close event decides what next
+    }
+  }
+
+  /** Hand the socket everything the ring holds past `sent`, within the backpressure bounds. */
+  private pump(): void {
+    const ws = this.ws;
+    // Nothing after `flush`: the server finalises on it, and a frame behind
+    // it would be audio past the end it was told about.
+    if (!ws || !this.ready || this.flushSent || ws.readyState !== OPEN) return;
+    const { ring } = this.opts;
+    while (this.sent < ring.end) {
+      if (this.sent < ring.start) {
+        this.resync();
+        return;
+      }
+      const queued = ws.bufferedAmount;
+      if (this.paused ? queued >= LIVE_LOW_WATER_BYTES : queued > LIVE_HIGH_WATER_BYTES) {
+        this.paused = true;
+        this.armDrain();
+        return;
+      }
+      this.paused = false;
+      const chunk = ring.read(this.sent, LIVE_FRAME_SAMPLES);
+      if (!chunk || chunk.length === 0) break;
+      if (!this.send(ws, chunk.buffer as ArrayBuffer)) return;
+      this.sent += chunk.length;
+    }
+    if (this.finishing && this.sent >= ring.end) {
+      if (this.send(ws, JSON.stringify({ type: 'flush' }))) this.flushSent = true;
+    }
+  }
+
+  /**
+   * Audio the ring overwrote before it could be sent (the uplink was slower
+   * than the microphone for a minute). Nothing can be sent across that hole
+   * on this connection — the server counts samples — so a new one starts at
+   * the oldest sample still here, and the hole is counted.
+   */
+  private resync(): void {
+    this.gaps += 1;
+    this.drop();
+    this.connect();
+  }
+
+  private armDrain(): void {
+    if (this.drainTimer !== null) return;
+    this.drainTimer = setTimeout(() => {
+      this.drainTimer = null;
+      this.pump();
+    }, DRAIN_CHECK_MS);
+  }
+
+  private clearDrain(): void {
+    if (this.drainTimer !== null) {
+      clearTimeout(this.drainTimer);
+      this.drainTimer = null;
+    }
+  }
+
+  private clearReconnect(): void {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  // -- liveness and statistics ----------------------------------------------
+
+  private startTicking(): void {
+    this.stopTicking();
+    this.tickTimer = setInterval(() => this.tick(), TICK_MS);
+  }
+
+  private stopTicking(): void {
+    if (this.tickTimer !== null) {
+      clearInterval(this.tickTimer);
+      this.tickTimer = null;
+    }
+  }
+
+  private tick(): void {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== OPEN) return;
+    const now = this.now();
+    if (this.lastPingAt > this.lastMessageAt) {
+      // A ping is out and nothing at all has come back since. Open by the
+      // browser's account, silent by the server's: a phone that changed
+      // networks keeps such a socket for minutes. Start again. (A second ping
+      // is not sent meanwhile: it would restart the wait it is timing.)
+      if (now - this.lastPingAt > LIVE_PONG_TIMEOUT_MS) {
+        this.drop();
+        this.retry();
+        return;
+      }
+    } else if (now - this.lastPingAt >= LIVE_PING_INTERVAL_MS) {
+      this.lastPingAt = now;
+      this.send(ws, JSON.stringify({ type: 'ping', t: Math.round(now) }));
+    }
+    if (this.ready && now - this.lastStatsAt >= LIVE_STATS_INTERVAL_MS) {
+      this.lastStatsAt = now;
+      if (this.partialMs.length || this.finalMs.length) {
+        this.send(
+          ws,
+          JSON.stringify({ type: 'client_stats', partial_ms: this.partialMs, final_ms: this.finalMs }),
+        );
+        this.partialMs = [];
+        this.finalMs = [];
+      }
+    }
+  }
+
+  // -- ending ---------------------------------------------------------------
+
+  /** Close this connection without a reconnect decision (its close event is ignored). */
+  private drop(): void {
+    const ws = this.ws;
+    this.ws = null;
+    this.ready = false;
+    this.paused = false;
+    this.stopTicking();
+    this.clearDrain();
+    if (!ws) return;
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onerror = null;
+    ws.onclose = null;
+    try {
+      ws.close(1000);
+    } catch {
+      /* already closing */
+    }
+  }
+
+  private settle(): void {
+    this.clearReconnect();
+    if (this.finishTimer !== null) {
+      clearTimeout(this.finishTimer);
+      this.finishTimer = null;
+    }
+    this.drop();
+    this.resolveFinished?.();
+  }
+
+  private close(end: LiveEnd): void {
+    if (this.phase === 'closed' || this.phase === 'failed') return;
+    this.phase = 'closed';
+    this.settle();
+    this.opts.onEnd?.(end);
+  }
+
+  private fail(): void {
+    if (this.phase === 'closed' || this.phase === 'failed') return;
+    this.phase = 'failed';
+    this.settle();
+    this.opts.onEnd?.('refused');
+    this.opts.onChange?.();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// What the recorder hook holds
+// ---------------------------------------------------------------------------
+
+export interface LiveCaptureDeps {
+  /**
+   * The live words changed. Called at most every LIVE_RENDER_INTERVAL_MS
+   * (the last change always lands), with what the panel should draw now.
+   */
+  onChange?: (view: LiveView | null) => void;
+  WebSocketImpl?: typeof WebSocket;
+  AudioWorkletNodeImpl?: typeof AudioWorkletNode;
+  now?: () => number;
+  random?: () => number;
+  workletUrl?: string;
+}
+
+/**
+ * One recording's live path: the worklet on the meter's context, the ring
+ * it fills, and the stream once the session is known.
+ *
+ *   attach()  right after getUserMedia, so the opening words are in the ring
+ *             before the session even exists;
+ *   open()    once the recorder has started on a session whose config has a
+ *             live path; the stream replays from sample 0;
+ *   detach()  when the recording turned out to have no live path;
+ *   finish()  at Stop, before the AudioContext closes; `tapDone` resolves when
+ *             the worklet no longer needs the context, with its last frames
+ *             AND the flush already handed to the socket;
+ *   abort()   on cancel, discard, unmount and pagehide.
+ */
+export class LiveCapture {
+  readonly ring = new PcmRing(LIVE_RING_SECONDS);
+  readonly clock = new CaptureClock();
+  readonly transcript = new LiveTranscript();
+  private readonly deps: LiveCaptureDeps;
+  private tap: PcmTap | null = null;
+  private liveStream: LiveStream | null = null;
+  /** Detached or aborted: nothing more happens. */
+  private done = false;
+  /** The worklet has handed over its last frame: later frames are not this recording's. */
+  private sealed = false;
+  private finishing: { tapDone: Promise<void>; done: Promise<void> } | null = null;
+  private renderTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastRenderAt = -Infinity;
+
+  constructor(deps: LiveCaptureDeps = {}) {
+    this.deps = deps;
+  }
+
+  /** Whether this browser can do any of it: an AudioWorklet and a WebSocket. */
+  static supported(context: BaseAudioContext | null | undefined, deps: LiveCaptureDeps = {}): boolean {
+    const WS = deps.WebSocketImpl ?? (globalThis as { WebSocket?: typeof WebSocket }).WebSocket;
+    const NodeImpl =
+      deps.AudioWorkletNodeImpl ?? (globalThis as { AudioWorkletNode?: typeof AudioWorkletNode }).AudioWorkletNode;
+    const worklet = context ? (context as { audioWorklet?: AudioWorklet }).audioWorklet : undefined;
+    return (
+      Boolean(worklet && typeof worklet.addModule === 'function') &&
+      typeof NodeImpl === 'function' &&
+      typeof WS === 'function'
+    );
+  }
+
+  /** The stream, once opened; for tests and diagnostics. */
+  get stream(): LiveStream | null {
+    return this.liveStream;
+  }
+
+  private get now(): () => number {
+    return this.deps.now ?? (() => performance.now());
+  }
+
+  /** Start the worklet. False when it cannot run here; the recording is unaffected either way. */
+  async attach(context: BaseAudioContext, source: AudioNode): Promise<boolean> {
+    try {
+      const tap = await attachPcmTap(
+        context,
+        source,
+        {
+          frame: (index, samples, at) => this.onFrame(index, samples, at),
+          started: (rate) => this.clock.setRate(rate),
+        },
+        {
+          AudioWorkletNodeImpl: this.deps.AudioWorkletNodeImpl,
+          url: this.deps.workletUrl,
+          now: this.deps.now,
+          stale: () => this.done || this.finishing !== null,
+        },
+      );
+      if (!tap) return false;
+      if (this.done || this.finishing) {
+        tap.stop();
+        return false;
+      }
+      this.tap = tap;
+      return true;
+    } catch {
+      // No module (a 404, a CSP refusal), or a processor that would not
+      // construct: no live words, and the recording carries on as before.
+      return false;
+    }
+  }
+
+  private onFrame(index: number, samples: Int16Array, at: number): void {
+    if (this.done || this.sealed) return;
+    this.ring.push(index, samples);
+    this.clock.note(index, samples.length, at);
+    this.liveStream?.audioArrived();
+  }
+
+  /**
+   * Open the stream for a session. False, and the capture detached, when the
+   * config names no socket this page can reach. Idempotent.
+   */
+  open(opts: {
+    config: LiveConfig;
+    sessionId: string;
+    recorderStartedAt: number;
+    language: VoiceLanguage;
+    location?: { protocol: string; host: string } | null;
+  }): boolean {
+    if (this.done) return false;
+    if (this.liveStream) return true;
+    const url = liveSocketUrl(opts.config, opts.sessionId, opts.location);
+    if (!url) {
+      this.detach();
+      return false;
+    }
+    this.liveStream = new LiveStream({
+      url,
+      ring: this.ring,
+      clock: this.clock,
+      transcript: this.transcript,
+      recorderStartedAt: opts.recorderStartedAt,
+      language: opts.language,
+      resumeMaxS: opts.config.resumeMaxS,
+      onChange: () => this.scheduleRender(),
+      WebSocketImpl: this.deps.WebSocketImpl,
+      now: this.deps.now,
+      random: this.deps.random,
+    });
+    this.liveStream.start();
+    return true;
+  }
+
+  /** This recording has no live path: the worklet and its audio go. */
+  detach(): void {
+    if (this.done) return;
+    this.done = true;
+    this.tap?.stop();
+    this.tap = null;
+    this.ring.clear();
+    this.cancelRender();
+  }
+
+  /** Stop pressed. See the class comment for the order this guarantees. */
+  finish(): { tapDone: Promise<void>; done: Promise<void> } {
+    if (this.finishing) return this.finishing;
+    const tap = this.done ? null : this.tap;
+    this.tap = null;
+    let streamDone: Promise<void> = Promise.resolve();
+    const tapDone = (tap ? tap.flush(LIVE_TAP_FLUSH_MS) : Promise.resolve()).then(() => {
+      tap?.stop();
+      this.sealed = true;
+      // Every sample is in the ring now. The rest and the flush go to the
+      // socket here, synchronously, before whoever awaits `tapDone` closes the
+      // context.
+      if (this.liveStream && !this.done) streamDone = this.liveStream.finish();
+    });
+    this.finishing = { tapDone, done: tapDone.then(() => streamDone) };
+    return this.finishing;
+  }
+
+  /** Resolves once a finish has run its course (at most LIVE_FINISH_BUDGET_MS after the tap). */
+  settled(): Promise<void> {
+    return this.finishing?.done ?? Promise.resolve();
+  }
+
+  abort(): void {
+    this.done = true;
+    this.tap?.stop();
+    this.tap = null;
+    this.liveStream?.abort();
+    this.ring.clear();
+    this.cancelRender();
+  }
+
+  nudge(): void {
+    this.liveStream?.nudge();
+  }
+
+  /** The panel drew the latest view (for the capture-to-screen latency). */
+  rendered(at?: number): void {
+    this.liveStream?.rendered(at);
+  }
+
+  /** Everything heard so far, for the fallback insert. */
+  text(): string {
+    return this.transcript.text();
+  }
+
+  /** What the panel draws, or null while there is nothing to draw. */
+  view(): LiveView | null {
+    const stream = this.liveStream;
+    if (!stream) return null;
+    const { transcript } = this;
+    if (transcript.committed.length === 0 && !transcript.partial) return null;
+    return {
+      // A copy: the list grows in place, and a view drawn later must not show
+      // a final beside the older partial it replaced.
+      utterances: transcript.committed.slice(),
+      partial: transcript.partial,
+      clockOffsetMs: stream.clockOffsetMs,
+      active: stream.active,
+      version: transcript.version,
+    };
+  }
+
+  /**
+   * At most one redraw per LIVE_RENDER_INTERVAL_MS. A partial can arrive every
+   * decode step (160 ms per stream on the engine, faster during a replay);
+   * the panel draws the newest one, and the last change always lands.
+   */
+  private scheduleRender(): void {
+    if (this.renderTimer !== null || !this.deps.onChange) return;
+    const wait = Math.max(0, this.lastRenderAt + LIVE_RENDER_INTERVAL_MS - this.now());
+    this.renderTimer = setTimeout(() => {
+      this.renderTimer = null;
+      this.lastRenderAt = this.now();
+      this.deps.onChange?.(this.view());
+    }, wait);
+  }
+
+  private cancelRender(): void {
+    if (this.renderTimer !== null) {
+      clearTimeout(this.renderTimer);
+      this.renderTimer = null;
+    }
+  }
+}

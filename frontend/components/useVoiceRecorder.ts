@@ -34,11 +34,21 @@
  * browser has an outbox or an owed discard at all. The legacy road and an
  * empty browser make no extra request.
  *
+ * LIVE WORDS (2026-09-29). When the session's config offers a live socket and
+ * the browser has an AudioWorklet, the same microphone is also tapped as
+ * 16 kHz PCM on the meter's own AudioContext and streamed to a streaming
+ * recogniser (lib/voiceLive.ts); its words appear in the bar while they are
+ * spoken. It is a preview beside the session, never instead of it: the stored
+ * recording and its transcript are exactly what they were, and any failure of
+ * the live path leaves them untouched. The AudioContext is therefore built at
+ * the permission grant, not once the recorder runs, so the tap hears the
+ * opening words while the session is still being created.
+ *
  * The transitions live in lib/voice.ts and are unit-tested without a DOM.
  * What is here is the part that genuinely needs the browser.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { fetchMe, userScopeKey } from '@/lib/auth';
 import {
   AUDIO_CONSTRAINTS,
@@ -83,6 +93,21 @@ import {
   type VoiceOffer,
   type VoiceState,
 } from '@/lib/voice';
+import {
+  LIVE_INSERT_LABEL,
+  LiveCapture,
+  getVoiceLanguage,
+  withLiveWords,
+  type LiveView,
+} from '@/lib/voiceLive';
+
+/**
+ * How long a second Stop waits for the stop event a first one already
+ * caused before finishing the recording itself (see `stop`). Chromium fires
+ * it 11.2 ms after rec.stop() (measured 2026-09-29); this covers a browser
+ * that never does.
+ */
+const STOP_EVENT_GRACE_MS = 2000;
 
 /** A line beside the composer that the person can act on, or dismiss. */
 export interface VoiceFollowUp {
@@ -120,7 +145,10 @@ export interface VoiceRecorder {
   mode: 'session' | 'legacy' | null;
   /** The ceiling in force, or null on the session road, which has none. */
   limitMs: number | null;
-  /** Upload and transcript progress on the session road; null otherwise. */
+  /**
+   * Upload and transcript progress on the session road; null otherwise. Its
+   * `live` carries the live transcript's words when the recording has them.
+   */
   progress: SessionProgress | null;
   /** One sentence about the road itself, e.g. why this one stops at 10:00. */
   hint: string | null;
@@ -244,6 +272,13 @@ export function useVoiceRecorder({
   const abandoning = useRef<Promise<void> | null>(null);
   const discardTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const discardAttempt = useRef(0);
+  /** This recording's live transcript, or null: no live path, or not in this browser. */
+  const live = useRef<LiveCapture | null>(null);
+  /** What the panel draws of it; set at most ten times a second (LiveCapture throttles). */
+  const [liveView, setLiveView] = useState<LiveView | null>(null);
+  /** The recording's stop handler while its stop event is still owed; a second Stop defers to it. */
+  const pendingStop = useRef<(() => void) | null>(null);
+  const stopFallback = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const storeFor = useCallback((who: string | null): Promise<OutboxStore> => {
     if (!who) return Promise.resolve((memoryStore.current ??= createMemoryOutbox()));
@@ -328,8 +363,15 @@ export function useVoiceRecorder({
   /**
    * Release EVERYTHING. Idempotent, and called from every path out of
    * recording — including unmount, where React gives no second chance.
+   *
+   * `finish` is Stop on a recording that will be transcribed: the live
+   * path's worklet is asked for its last partial frame, and the socket gets
+   * the rest of the audio and its `flush`, BEFORE the context closes (the
+   * worklet dies with the context). Only the context waits for that, at most
+   * LIVE_TAP_FLUSH_MS; the microphone is released at once as always. Every
+   * other exit drops the live path on the spot.
    */
-  const release = useCallback(() => {
+  const release = useCallback((how: 'finish' | 'drop' = 'drop') => {
     if (frame.current !== null) {
       cancelAnimationFrame(frame.current);
       frame.current = null;
@@ -337,6 +379,10 @@ export function useVoiceRecorder({
     if (clockTimer.current !== null) {
       clearInterval(clockTimer.current);
       clockTimer.current = null;
+    }
+    if (stopFallback.current !== null) {
+      clearTimeout(stopFallback.current);
+      stopFallback.current = null;
     }
     const rec = recorder.current;
     recorder.current = null;
@@ -360,8 +406,23 @@ export function useVoiceRecorder({
     stream.current = null;
     const context = audioContext.current;
     audioContext.current = null;
+    let closeAfter: Promise<void> | null = null;
+    const capture = live.current;
+    if (capture) {
+      if (how === 'finish') {
+        closeAfter = capture.finish().tapDone;
+      } else {
+        capture.abort();
+        live.current = null;
+        if (alive.current) setLiveView(null);
+      }
+    }
     if (context && context.state !== 'closed') {
-      void context.close().catch(() => undefined);
+      const close = () => {
+        if (context.state !== 'closed') void context.close().catch(() => undefined);
+      };
+      if (closeAfter) void closeAfter.then(close, close);
+      else close();
     }
     releaseWakeLock();
   }, [releaseWakeLock]);
@@ -765,10 +826,54 @@ export function useVoiceRecorder({
   );
   presentRef.current = present;
 
+  /**
+   * THE LIVE TRANSCRIPT AS A FALLBACK (2026-09-29). The stored recording's
+   * transcript stays the one that goes into the draft. When it cannot be had
+   * (the engine was down, nothing came back) but the live stream heard words,
+   * the person is offered those words, never given them unasked: they were
+   * not checked by the final transcription. After a Retry or "Upload the
+   * rest" offer they are the secondary button, and once inserted that offer
+   * REPLACES them in place when it succeeds, as it replaces any first
+   * transcript, so the draft never holds both.
+   */
+  const withLiveInsert = useCallback(
+    (line: VoiceFollowUp, offer: VoiceOffer, text: string, backing: Backing): VoiceFollowUp => {
+      if (offer.kind !== 'retranscribe' && offer.kind !== 'upload_rest') return line;
+      return {
+        ...line,
+        secondaryLabel: LIVE_INSERT_LABEL,
+        runSecondary: () => {
+          if (onTranscriptRef.current(text, null) === false) return;
+          const next: VoiceOffer = { ...offer, replaces: text };
+          void settleRecord(
+            backing.outbox,
+            backing.sessionId,
+            offer.kind === 'retranscribe'
+              ? {
+                  deliveredText: text,
+                  offer: { scope: offer.scope, replaces: text, message: offer.message, audioMs: offer.audioMs },
+                }
+              : { deliveredText: text },
+          );
+          setFollowUp(offerLine(next, 'error', backing), backing);
+        },
+      };
+    },
+    [offerLine, setFollowUp],
+  );
+
   /** Show what a finished session came to, from `finishing`. */
   const deliver = useCallback(
-    (result: SessionResult, backing: Backing) => {
+    (result: SessionResult, backing: Backing, capture: LiveCapture | null = null) => {
       if (!alive.current) return;
+      // The recording is over, and so is its live stream: the words it heard
+      // are kept only for the fallback below.
+      const liveText = result.kind === 'error' && capture ? capture.text() : '';
+      if (capture) {
+        capture.abort();
+        if (live.current === capture) live.current = null;
+      }
+      setLiveView(null);
       if (result.kind === 'withdrawn') {
         move('idle');
         return;
@@ -794,13 +899,31 @@ export function useVoiceRecorder({
             },
           });
         }
-        setFollowUp(offerLine(result.offer, 'error', backing), backing);
+        const line = offerLine(result.offer, 'error', backing);
+        setFollowUp(liveText ? withLiveInsert(line, result.offer, liveText, backing) : line, backing);
+        return;
+      }
+      if (liveText) {
+        // The same reasoning as an offer: a button the person may want to
+        // press stays beside the composer rather than in a passing toast.
+        move('idle');
+        setFollowUp({
+          message: result.error.message,
+          tone: 'error',
+          actionLabel: LIVE_INSERT_LABEL,
+          busy: false,
+          run: () => {
+            setFollowUp(null);
+            onTranscriptRef.current(liveText, null);
+          },
+          dismiss: () => setFollowUp(null),
+        });
         return;
       }
       setError(result.error);
       move('error');
     },
-    [move, offerLine, setFollowUp],
+    [move, offerLine, setFollowUp, withLiveInsert],
   );
 
   /**
@@ -885,15 +1008,20 @@ export function useVoiceRecorder({
 
   /** SESSION ROAD: upload what is left, finish, wait for the words. */
   const finishSession = useCallback(
-    async (s: VoiceSession, durationMs: number, outbox: OutboxStore) => {
+    async (s: VoiceSession, durationMs: number, outbox: OutboxStore, capture: LiveCapture | null) => {
       if (!move('finishing')) return;
       const result = await s.end(endReason.current, durationMs, {
         notices: notices.current,
         peakLevel: meterRan.current ? peakLevel.current : null,
       });
       if (session.current !== s) return; // discarded, or superseded
+      // Before offering the live words instead, let them finish arriving:
+      // the stream's last final comes within LIVE_FINISH_BUDGET_MS of Stop,
+      // normally long before the stored recording's own finish.
+      if (result.kind === 'error' && capture) await capture.settled();
+      if (session.current !== s) return;
       session.current = null;
-      deliver(result, { outbox, sessionId: s.sessionId });
+      deliver(result, { outbox, sessionId: s.sessionId }, capture);
     },
     [deliver, move],
   );
@@ -1023,13 +1151,17 @@ export function useVoiceRecorder({
     const onOnline = () => {
       session.current?.nudge();
       for (const s of adopted.current) s.nudge();
+      // A live stream waiting out its reconnect backoff goes now.
+      live.current?.nudge();
       void flushDiscards();
     };
     // The page is going away: tell the server now instead of holding a slot
-    // for its 600 s idle close. The outbox stays for a reopened tab.
+    // for its 600 s idle close. The outbox stays for a reopened tab. The live
+    // socket is closed at once; it holds nothing the recording needs.
     const onPageHide = () => {
       session.current?.beacon();
       for (const s of adopted.current) s.beacon();
+      live.current?.abort();
     };
     window.addEventListener('online', onOnline);
     window.addEventListener('pagehide', onPageHide);
@@ -1084,6 +1216,7 @@ export function useVoiceRecorder({
     setHint(null);
     setWarning(null);
     setProgress(null);
+    setLiveView(null);
     setMode(null);
     modeRef.current = null;
 
@@ -1126,6 +1259,56 @@ export function useVoiceRecorder({
         return;
       }
       stream.current = media;
+
+      // THE AUDIO GRAPH IS BUILT AT THE GRANT (2026-09-29). It used to be
+      // built after the session, the account lookup and the outbox, with the
+      // recorder already running: a PCM tap there would miss the opening words
+      // that the stored recording keeps. One context and ONE source node feed
+      // the meter and the live tap alike, so there is one microphone and one
+      // context per recording (tests/voice-waveform.test.tsx holds that).
+      let analyser: AnalyserNode | null = null;
+      let capture: LiveCapture | null = null;
+      try {
+        const Ctx =
+          window.AudioContext ??
+          (window as unknown as { webkitAudioContext?: typeof AudioContext })
+            .webkitAudioContext;
+        if (Ctx) {
+          const context = new Ctx();
+          audioContext.current = context;
+          // Made after the permission prompt, well after the click, a context
+          // can start suspended (autoplay rules; Safari was the open question
+          // in the audit). A suspended context delivers no samples: the meter
+          // would lie flat and the tap would hear nothing.
+          if (context.state === 'suspended' && typeof context.resume === 'function') {
+            void context.resume().catch(() => undefined);
+          }
+          const source = context.createMediaStreamSource(media);
+          analyser = context.createAnalyser();
+          // 1024 samples is ~21 ms at 48 kHz: long enough for a stable RMS,
+          // short enough that the meter tracks syllables rather than phrases.
+          analyser.fftSize = 1024;
+          analyser.smoothingTimeConstant = 0.6;
+          source.connect(analyser);
+          // Feature-detected: without an AudioWorklet (older Safari, the
+          // webkit context) there are no live words and nothing else changes.
+          if (LiveCapture.supported(context)) {
+            const own: LiveCapture = new LiveCapture({
+              onChange: (view) => {
+                if (alive.current && live.current === own) setLiveView(view);
+              },
+            });
+            capture = own;
+            live.current = own;
+            void own.attach(context, source);
+          }
+        }
+      } catch {
+        // No meter and no live words. The recording itself is unaffected,
+        // and the bar falls back to a flat trace rather than failing the
+        // dictation.
+        analyser = null;
+      }
 
       // A browser with none of our preferred containers: build the recorder
       // first so the session can be told what it actually records.
@@ -1326,9 +1509,19 @@ export function useVoiceRecorder({
       const onStopped = () => {
         if (stopped) return;
         stopped = true;
+        if (pendingStop.current === onStopped) pendingStop.current = null;
         const durationMs = Date.now() - startedAt.current;
         recordedMs.current = durationMs;
-        release();
+        // Only a recording that is about to be transcribed lets its live
+        // stream deliver its last words; every other end drops it at once.
+        const transcribing =
+          s !== null &&
+          outcome.current !== 'cancel' &&
+          alive.current &&
+          session.current === s &&
+          durationMs >= MIN_RECORDING_MS;
+        const liveOfThis = transcribing && capture !== null && live.current === capture ? capture : null;
+        release(liveOfThis ? 'finish' : 'drop');
         if (s) {
           if (outcome.current === 'cancel') {
             if (session.current === s) session.current = null;
@@ -1352,7 +1545,7 @@ export function useVoiceRecorder({
             move('error');
             return;
           }
-          void finishSession(s, durationMs, outbox!);
+          void finishSession(s, durationMs, outbox!, liveOfThis);
           return;
         }
         const parts = chunks.current;
@@ -1423,6 +1616,9 @@ export function useVoiceRecorder({
       }
 
       recorder.current = rec;
+      // The stored recording's zero, on the clock the live tap's frames are
+      // timed with: it maps live samples onto the recording (clock_offset_ms).
+      const recorderStartedAt = performance.now();
       try {
         // The session road's timeslice is the server's part size (5 s): each
         // slice is uploaded as it arrives. The legacy road keeps 1 s.
@@ -1451,31 +1647,31 @@ export function useVoiceRecorder({
         release();
         return;
       }
+      pendingStop.current = onStopped;
       void takeWakeLock();
 
-      let metered = false;
-      try {
-        const Ctx =
-          window.AudioContext ??
-          (window as unknown as { webkitAudioContext?: typeof AudioContext })
-            .webkitAudioContext;
-        if (Ctx) {
-          const context = new Ctx();
-          audioContext.current = context;
-          const analyser = context.createAnalyser();
-          // 1024 samples is ~21 ms at 48 kHz: long enough for a stable RMS,
-          // short enough that the meter tracks syllables rather than phrases.
-          analyser.fftSize = 1024;
-          analyser.smoothingTimeConstant = 0.6;
-          context.createMediaStreamSource(media).connect(analyser);
-          runMeter(analyser);
-          metered = true;
+      // The live stream opens now that the session exists: it replays the
+      // ring from sample 0, so the words spoken while the session was being
+      // created are heard too. Everything else keeps no live path.
+      if (capture && live.current === capture) {
+        const liveConfig = onSessionRoad && s ? opened.config.live : null;
+        const openedLive =
+          liveConfig !== null &&
+          capture.open({
+            config: liveConfig,
+            sessionId: opened.kind === 'session' ? opened.sessionId : '',
+            recorderStartedAt,
+            language: getVoiceLanguage(),
+          });
+        if (!openedLive) {
+          capture.detach();
+          live.current = null;
         }
-      } catch {
-        // No meter. The recording itself is unaffected, and the bar falls
-        // back to a flat trace rather than failing the dictation.
       }
-      if (!metered) {
+
+      if (analyser) {
+        runMeter(analyser);
+      } else {
         // The meter also drives the clock; without it the clock ticks here.
         clockTimer.current = setInterval(() => {
           if (alive.current && current.current === 'recording') {
@@ -1507,12 +1703,32 @@ export function useVoiceRecorder({
     outcome.current = 'stop';
     const rec = recorder.current;
     if (!rec || rec.state === 'inactive') {
+      // THE SECOND STOP (2026-09-29). rec.stop() makes the recorder inactive
+      // at once, but its last slice and its stop event come later: 11.2 ms in
+      // Chromium, measured, and longer under load (this comment used to say
+      // "synchronously"). A second press in that window — or a Stop just after
+      // an interrupt or the legacy auto-stop stopped the recorder — took this
+      // branch, released and went idle, and the stop event that followed could
+      // no longer move idle to finishing: the session was never finished and
+      // a legacy recording was dropped. While this recording's stop event is
+      // still owed it does the work; a timer covers a browser that never
+      // fires it.
+      const owed = pendingStop.current;
+      if (owed) {
+        if (stopFallback.current === null) {
+          stopFallback.current = setTimeout(() => {
+            stopFallback.current = null;
+            if (pendingStop.current === owed) owed();
+          }, STOP_EVENT_GRACE_MS);
+        }
+        return;
+      }
       release();
       move('idle');
       return;
     }
-    // The microphone is closed by `release()` inside onstop, which fires
-    // synchronously after this in every browser that implements the spec.
+    // The microphone is closed by `release()` inside onstop, which the
+    // recorder fires after its last slice, a few milliseconds from now.
     try {
       rec.stop();
     } catch {
@@ -1624,6 +1840,17 @@ export function useVoiceRecorder({
     };
   }, [state, takeWakeLock]);
 
+  // The live words ride on the session's progress, so the bar draws them
+  // where it already draws the transcript so far, and the composer passes
+  // nothing new. Recomputed only when either side changed.
+  const shownProgress = useMemo(() => withLiveWords(progress, liveView), [progress, liveView]);
+
+  // The panel has drawn the newest live words: that moment ends the
+  // capture-to-screen latency the stream reports (client_stats).
+  useEffect(() => {
+    if (liveView) live.current?.rendered();
+  }, [liveView]);
+
   return {
     state,
     levels,
@@ -1636,7 +1863,7 @@ export function useVoiceRecorder({
     dismissError,
     mode,
     limitMs: mode === 'session' ? null : legacyStopMs,
-    progress,
+    progress: shownProgress,
     hint,
     warning,
     followUp,

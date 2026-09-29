@@ -739,6 +739,22 @@ export type SessionOutcome =
 export type WaitingOn = 'none' | 'chat' | 'engine' | 'engine_unavailable';
 export type EndedBy = 'person' | 'recorder_error' | 'lost_parts' | 'page_hidden';
 
+/**
+ * The live-transcript socket a session offers (2026-09-29), or none: the
+ * server sends `"live": null` when the live path is off, and the legacy road
+ * never has one. lib/voiceLive.ts is the client.
+ */
+export interface LiveConfig {
+  /** The socket's path on this origin, with `{id}` where the session id goes. */
+  path: string;
+  /** Always 16000: the only rate the browser tap produces. */
+  sampleRate: number;
+  /** Always 40: one 640-sample frame per message. */
+  frameMs: number;
+  /** How much buffered audio a reconnect may replay, in seconds. */
+  resumeMaxS: number;
+}
+
 export interface SessionConfig {
   /** The timeslice the recorder MUST use. */
   partMs: number;
@@ -747,6 +763,8 @@ export interface SessionConfig {
   bitsPerSecond: number | null;
   idleCloseS: number;
   longPollMaxS: number;
+  /** The live-transcript socket, or null when the server has none. */
+  live: LiveConfig | null;
 }
 
 export const DEFAULT_SESSION_CONFIG: SessionConfig = {
@@ -755,7 +773,29 @@ export const DEFAULT_SESSION_CONFIG: SessionConfig = {
   bitsPerSecond: null,
   idleCloseS: 600,
   longPollMaxS: 25,
+  live: null,
 };
+
+/**
+ * The `live` block of a session's config, or null for anything this client
+ * cannot honour. The browser tap produces exactly 16 kHz in 40 ms frames, so a
+ * server asking for another rate or frame size gets no live stream rather
+ * than audio it would misread; the path must name the session with `{id}`
+ * (lib/voiceLive.ts `liveSocketUrl` checks what it becomes). The orchestrator
+ * also sends the path as `path_template`; either name is read.
+ */
+export function parseLiveConfig(raw: unknown): LiveConfig | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const path = typeof r.path === 'string' ? r.path : r.path_template;
+  if (typeof path !== 'string' || !path.startsWith('/') || !path.includes('{id}')) return null;
+  if ((r.sample_rate ?? 16000) !== 16000 || (r.frame_ms ?? 40) !== 40) return null;
+  const resume =
+    typeof r.resume_max_s === 'number' && Number.isFinite(r.resume_max_s) && r.resume_max_s >= 0
+      ? r.resume_max_s
+      : 60;
+  return { path, sampleRate: 16000, frameMs: 40, resumeMaxS: resume };
+}
 
 export interface SessionSegment {
   i: number;
@@ -894,6 +934,7 @@ export function parseSessionConfig(body: unknown): SessionConfig {
       typeof c.bits_per_second === 'number' && c.bits_per_second > 0 ? c.bits_per_second : null,
     idleCloseS: positive(c.idle_close_s, DEFAULT_SESSION_CONFIG.idleCloseS),
     longPollMaxS: positive(c.long_poll_max_s, DEFAULT_SESSION_CONFIG.longPollMaxS),
+    live: parseLiveConfig(c.live),
   };
 }
 
@@ -2076,6 +2117,20 @@ export interface SessionProgress {
   /** Held-back text that may still change; replaced on every answer. */
   tentative: string;
   audioMs: number;
+  /**
+   * The server's `transcribed_ms`: audio before this point is in `preview`
+   * and `tentative` (or is silence). The live transcript shows only what it
+   * heard after it (lib/voiceLive.ts `mergeLiveTranscript`). Absent on
+   * progress built by hand, where `audioMs - backlogMs` is the same number.
+   */
+  transcribedMs?: number;
+  /**
+   * The live transcript's words after what `preview` and `tentative` cover:
+   * committed utterances, then the one still being heard. Set by the
+   * recorder hook (lib/voiceLive.ts `withLiveWords`), never by VoiceSession;
+   * absent when the recording has no live stream.
+   */
+  live?: { committed: string; partial: string } | null;
   backlogMs: number;
   waitingOn: WaitingOn;
   /** Slices recorded but not yet acknowledged by the server. */
@@ -2330,6 +2385,7 @@ export class VoiceSession {
       preview: '',
       tentative: '',
       audioMs: 0,
+      transcribedMs: 0,
       backlogMs: 0,
       waitingOn: 'none',
       pendingParts: 0,
@@ -2817,6 +2873,7 @@ export class VoiceSession {
       preview,
       tentative: state.tentative,
       audioMs: state.audioMs,
+      transcribedMs: state.transcribedMs,
       backlogMs: state.backlogMs,
       waitingOn: state.waitingOn,
       progressive: state.progressive,

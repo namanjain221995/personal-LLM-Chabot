@@ -44,6 +44,7 @@ import {
   idleWords,
 } from '@/lib/voice';
 import type { SessionProgress, VoiceState } from '@/lib/voice';
+import { spaceBetween } from '@/lib/voiceLive';
 import type { VoiceFollowUp } from './useVoiceRecorder';
 
 /**
@@ -180,23 +181,49 @@ function SessionPanel({
       lines.push({ key: 'engine', text: VOICE_MESSAGES.engineUnavailableLive, tone: 'warn' });
     }
   }
-  const words = progress ? `${progress.preview}` : '';
-  const tentative = progress?.tentative ?? '';
-  if (!lines.length && !words && !tentative && !progress) return null;
+  // In the order they were spoken: the server's final segments, the text it
+  // still holds back, then the live transcript's committed utterances and
+  // the one being heard now (lib/voiceLive.ts drops what the first two
+  // already cover). Committed words in ink; words that may still change in
+  // muted.
+  const pieces: Array<{ key: string; text: string; settled: boolean }> = [
+    { key: 'preview', text: progress?.preview ?? '', settled: true },
+    { key: 'tentative', text: progress?.tentative ?? '', settled: false },
+    { key: 'live', text: progress?.live?.committed ?? '', settled: true },
+    { key: 'partial', text: progress?.live?.partial ?? '', settled: false },
+  ].filter((piece) => piece.text);
+  if (!lines.length && !pieces.length && !progress) return null;
   return (
     <div className="flex flex-col gap-1 px-3 pt-1 text-xs" data-testid="voice-session-panel">
-      {(words || tentative) && (
-        // The newest words at the bottom edge, older ones scrolling off the
-        // top: three lines is enough to see the sentence being heard.
-        <p className="line-clamp-3 break-words text-sm leading-5 text-ink" dir="auto">
-          {words}
-          {tentative && (
-            <span className="text-muted">
-              {words ? ' ' : ''}
-              {tentative}
-            </span>
-          )}
-        </p>
+      {pieces.length > 0 && (
+        // THE TAIL, NOT THE HEAD (2026-09-29). This was `line-clamp-3`, which
+        // keeps the FIRST three lines: past three lines (the preview holds up
+        // to 600 characters) the words being spoken now were the ones cut,
+        // while this comment said the opposite. Measured in Chromium: the
+        // newest words sat at y=356 in a box that ended at y=74. The box is
+        // now anchored to its bottom edge (a column justified to its end, four
+        // lines at most, the overflow hidden), so older lines leave by the top
+        // and the newest words are always the ones in view: seven lines of
+        // text in the 80 px box, measured the same way, put the last line at
+        // 614-632 inside a box spanning 553-633 and the first three above it.
+        <div className="flex max-h-20 flex-col justify-end overflow-hidden" data-testid="voice-transcript">
+          <p className="break-words text-sm leading-5 text-ink" dir="auto">
+            {pieces.map((piece, index) => {
+              const before = index > 0 ? spaceBetween(pieces[index - 1]!.text, piece.text) : '';
+              return piece.settled ? (
+                <span key={piece.key}>
+                  {before}
+                  {piece.text}
+                </span>
+              ) : (
+                <span key={piece.key} className="text-muted">
+                  {before}
+                  {piece.text}
+                </span>
+              );
+            })}
+          </p>
+        </div>
       )}
       {lines.map((line) => (
         <p key={line.key} className={line.tone === 'warn' ? 'text-warn' : 'text-muted'}>
