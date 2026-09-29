@@ -47,8 +47,14 @@ def test_a_stream_admitted_during_a_neighbours_replay_gets_done_in_time():
             while metric(client, 'stt_stream_audio_seconds_total{profile="fast"}') < len(speech(backlog)) / 16000 - 1e-6:
                 assert time.monotonic() < deadline
                 time.sleep(0.01)
+            already = len(recognizer.batches)
             recognizer.permits.release(5)
-            time.sleep(0.2)
+            # Wait for those 5 steps to be taken, so the count below starts
+            # after them (under load they could land after it: 64 > 60).
+            deadline = time.monotonic() + 5
+            while len(recognizer.batches) < already + 5:
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
             with connect(client) as y:          # admitted during the replay
                 start(y)
                 y_parts = [0.32, "delta", "echo", 0.32]
