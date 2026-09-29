@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import re
+import sys
+import types
 
 import pytest
 
@@ -32,10 +34,13 @@ def test_a_complete_environment_loads_with_the_spec_defaults(model_dir):
     settings = server.Settings.from_env(env_for(model_dir))
     assert (settings.port, settings.workers, settings.threads) == (30009, 4, 2)
     assert (settings.endpoint_s, settings.max_utterance_s, settings.idle_s) == (0.6, 30.0, 60.0)
+    assert (settings.meeting_endpoint_s, settings.meeting_max_utterance_s) == (0.9, 25.0)
+    assert (settings.max_cost, settings.renew_silence_s, settings.renew_seed_s) == (32, 2.0, 2.0)
     assert settings.lead_pad_ms == 160
     profile = settings.profiles[0]
     assert profile.flush_pad_ms == server.default_flush_pad_ms(160) == 800
     assert profile.model == os.path.basename(model_dir)
+    assert profile.cost == 2
     assert server.default_flush_pad_ms(560) == 1520
 
 
@@ -59,7 +64,8 @@ def test_the_bind_is_one_literal_address(model_dir, bind):
 @pytest.mark.parametrize("key,value", [
     ("STT_WORKERS", "0"), ("STT_WORKERS", "x"), ("STT_THREADS", "99"), ("STT_ENDPOINT_S", "nan"),
     ("STT_MAX_UTTERANCE_S", "1"), ("STT_IDLE_S", "-1"), ("STT_PORT", "80"), ("STT_LEAD_PAD_MS", "5000"),
-    ("STT_RESUME_MAX_S", "inf"),
+    ("STT_RESUME_MAX_S", "inf"), ("STT_MAX_COST", "0"), ("STT_MAX_COST", "1.5"), ("STT_RENEW_SILENCE_S", "-1"),
+    ("STT_RENEW_SILENCE_S", "nan"), ("STT_MEETING_ENDPOINT_S", "nan"), ("STT_MEETING_MAX_UTTERANCE_S", "1"),
 ])
 def test_numbers_out_of_range_refuse_to_start(model_dir, key, value):
     with pytest.raises(server.ConfigError, match=key):
@@ -82,6 +88,10 @@ def test_numbers_out_of_range_refuse_to_start(model_dir, key, value):
     (lambda p: [dict(p, languages=["en", "EN"])], "twice"),
     (lambda p: [dict(p, flush_pad_ms=-1)], "flush_pad_ms"),
     (lambda p: [dict(p, model="../etc")], "'model'"),
+    (lambda p: [dict(p, cost=0)], "'cost'"),
+    (lambda p: [dict(p, cost=65)], "'cost'"),
+    (lambda p: [dict(p, cost=True)], "'cost'"),
+    (lambda p: [dict(p, cost=2.5)], "'cost'"),
 ])
 def test_profiles_are_validated_strictly(model_dir, mutate, problem):
     base = {"id": "fast", "dir": model_dir, "chunk_ms": 160, "max_streams": 12, "languages": ["auto", "en"]}
@@ -89,6 +99,59 @@ def test_profiles_are_validated_strictly(model_dir, mutate, problem):
     raw = mutated if isinstance(mutated, str) else json.dumps(mutated)
     with pytest.raises(server.ConfigError, match=re.escape(problem)):
         server.Settings.from_env(env_for(model_dir, STT_PROFILES=raw))
+
+
+def test_a_meeting_endpoint_shorter_than_the_recognizers_is_refused(model_dir):
+    # The recognizer's rule 2 fires first for every stream; a meeting stream
+    # can only wait longer than that.
+    with pytest.raises(server.ConfigError, match="STT_MEETING_ENDPOINT_S"):
+        server.Settings.from_env(env_for(model_dir, STT_ENDPOINT_S="0.8", STT_MEETING_ENDPOINT_S="0.7"))
+    settings = server.Settings.from_env(env_for(model_dir, STT_ENDPOINT_S="0.8", STT_MEETING_ENDPOINT_S="0.8"))
+    assert settings.meeting_endpoint_s == settings.endpoint_s == 0.8
+
+
+def test_a_profile_that_costs_more_than_the_whole_budget_is_refused(model_dir):
+    # It could never admit a stream: a typo, not a configuration.
+    profiles = [{"id": "fast", "dir": model_dir, "chunk_ms": 160, "max_streams": 4, "languages": ["en"], "cost": 9}]
+    with pytest.raises(server.ConfigError, match="STT_MAX_COST"):
+        server.Settings.from_env(env_for(model_dir, STT_PROFILES=json.dumps(profiles), STT_MAX_COST="8"))
+    settings = server.Settings.from_env(env_for(model_dir, STT_PROFILES=json.dumps(profiles), STT_MAX_COST="9"))
+    assert settings.profiles[0].cost == 9
+
+
+def test_a_profile_costs_what_its_chunk_size_was_measured_to_cost():
+    # 160 ms: 0.41 core a stream; 560 ms: half that (build spec section 7).
+    assert (server.default_cost(160), server.default_cost(560)) == (2, 1)
+    assert (server.default_cost(80), server.default_cost(1120)) == (4, 1)
+    profile = server.Profile("x", "/models/x", 160, 4, ("en",), 800, "m")
+    assert profile.cost == 2  # derived when not given
+
+
+def test_the_real_recognizer_is_built_with_rule_3_out_of_reach(monkeypatch):
+    """build_sherpa_recognizer against a stand-in sherpa_onnx: what the
+    deployed engine asks of the real recognizer. sherpa-onnx counts rule 3
+    from the stream's creation and nothing resets it, so a rule 3 inside a
+    session would hold the endpoint for the rest of it (review finding: the
+    old 3600 s was one hour of dictation)."""
+    captured = {}
+
+    class OnlineRecognizer:
+        @staticmethod
+        def from_transducer(**kwargs):
+            captured.update(kwargs)
+            return "a recognizer"
+
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", types.SimpleNamespace(OnlineRecognizer=OnlineRecognizer))
+    from conftest import make_profile, make_settings
+
+    settings = make_settings(endpoint_s=0.7, threads=3)
+    assert server.build_sherpa_recognizer(make_profile("fast"), settings) == "a recognizer"
+    assert captured["enable_endpoint_detection"] is True
+    assert captured["rule1_min_trailing_silence"] == 2.4
+    assert captured["rule2_min_trailing_silence"] == 0.7
+    assert captured["rule3_min_utterance_length"] >= 100 * 24 * 3600  # 100 days of one stream
+    assert captured["num_threads"] == 3 and captured["provider"] == "cpu"
+    assert captured["encoder"] == "/models/fast/encoder.int8.onnx"
 
 
 def test_profiles_are_required(model_dir):
@@ -141,12 +204,14 @@ def test_the_compose_files_profiles_are_the_amended_four_in_admission_order():
     a typo in it would only show up as a restart loop on the worker."""
     _, service = _compose_service()
     profiles = server.parse_profiles(service["environment"]["STT_PROFILES"], check_files=False)
-    assert [(p.id, p.chunk_ms, p.max_streams, p.languages) for p in profiles] == [
-        ("en-fast", 160, 8, ("en",)),
-        ("multi-fast", 160, 8, ("auto", "hi", "en")),
-        ("en-wide", 560, 12, ("en",)),
-        ("multi-wide", 560, 12, ("auto", "hi", "en")),
+    assert [(p.id, p.chunk_ms, p.max_streams, p.languages, p.cost) for p in profiles] == [
+        ("en-fast", 160, 8, ("en",), 2),
+        ("multi-fast", 160, 8, ("auto", "hi", "en"), 2),
+        ("en-wide", 560, 12, ("en",), 1),
+        ("multi-wide", 560, 12, ("auto", "hi", "en"), 1),
     ]
+    # The costs are the measured ones, written out, not left to the default.
+    assert all(f'"cost": {p.cost}' in service["environment"]["STT_PROFILES"] for p in profiles)
     engine = server.Engine(server.Settings(profiles=profiles, token=TOKEN), lambda p, s: None)
     first_choice = {language: engine.admit(language)[0] for language in ("auto", "en", "hi", "gu")}
     assert {k: (v.profile.id if v else None) for k, v in first_choice.items()} == {
@@ -175,3 +240,15 @@ def test_the_compose_file_keeps_the_placement_promises():
     workers = int(re.search(r":-(\d+)\}", environment["STT_WORKERS"]).group(1))
     profiles = server.parse_profiles(environment["STT_PROFILES"], check_files=False)
     assert len(profiles) * workers <= service["cpus"]
+    # THE BUDGET BINDS: the profiles' slots would take 56 units, and 32 is
+    # the 16 real-time 160 ms streams the 8 cores decode (0.41 core each).
+    budget = int(re.search(r":-(\d+)\}", environment["STT_MAX_COST"]).group(1))
+    assert budget == 32 < sum(p.max_streams * p.cost for p in profiles)
+    assert budget // 2 * 0.41 <= service["cpus"] - 1.0
+    # A hard memory limit, measured (3.58 GB loaded, 4.08 GB with 12
+    # streams): the one deliberate exception test_oom_score_adj.py allows.
+    assert service["mem_limit"] == "8g"
+    # The renewal threshold the compose file passes is the engine's own
+    # default, the measured one (Settings.renew_silence_s).
+    renew = float(re.search(r":-([0-9.]+)\}", environment["STT_RENEW_SILENCE_S"]).group(1))
+    assert renew == server.Settings(profiles=profiles, token=TOKEN).renew_silence_s == 2.0

@@ -17,7 +17,8 @@ ASR Streaming 0.6B int8 on sherpa-onnx decodes a 160 ms chunk in 31.6 ms on two
 threads, four decode workers hold 12 real-time streams on about five cores, and
 chat decode did not move (107.0-107.9 against a 107.2-108.9 baseline). All
 twenty cores saturated DID cost chat 11-16%, which is why the container is
-pinned to a cpuset and every profile refuses streams above its capacity.
+pinned to a cpuset, every profile refuses streams above its capacity, and the
+engine refuses any stream its decode budget (STT_MAX_COST) cannot pay for.
 
 WHISPER STAYS AUTHORITATIVE. The stored recording and its whisper transcript
 are the record; this is a preview that may fail at any moment without losing
@@ -34,11 +35,12 @@ the overflow, at 560 ms. Gujarati is not offered: both models read it at 104%
 WER.
 
 PROTOCOL (the gateway speaks it; build spec section 3). The upgrade carries
-`Authorization: Bearer <STT_TOKEN>` or is refused with HTTP 401 before accept.
-Then:
+`Authorization: Bearer <STT_TOKEN>` or is refused BEFORE accept: the handler
+closes without accepting, which uvicorn answers with a bare HTTP 403. Then:
 
     -> {"type":"start","sample_rate":16000,"encoding":"pcm_s16le",
-        "first_sample":N,"first_u":K,"mode":"dictation","language":"auto"}
+        "first_sample":N,"first_u":K,"mode":"dictation"|"meeting",
+        "language":"auto","frame_ms":40}
     <- {"type":"ready",...}
     -> binary frames: little-endian int16 mono PCM at 16 kHz, even length,
        2..16384 bytes
@@ -51,10 +53,26 @@ Then:
 A partial is the WHOLE current hypothesis of utterance k (replace, never
 append); a final commits it. Samples are absolute session positions: the
 stream's first sample is `first_sample`, so a reconnect that resumes from the
-browser's ring buffer keeps one time base. Refusals and failures send one
-`{"type":"error","code","message","retryable"}` and close: 4400 protocol or
-unsupported language, 4408 idle, 4413 frame too large, 4429 capacity or
-arrival rate, 4500 internal, 4503 still loading.
+browser's ring buffer keeps one time base. An endpoint final's `end_sample`
+lies inside the silence that closed it, so a reconnect that resumes from the
+largest `end_sample` it saw neither repeats the utterance's last word nor
+clips the next one's first. `mode` "meeting" waits longer for the end of an
+utterance (STT_MEETING_ENDPOINT_S) and forces one out sooner
+(STT_MEETING_MAX_UTTERANCE_S) than "dictation". `frame_ms` (optional, 40 when
+absent) is the sender's frame length; it sizes the message ceiling below.
+Refusals and failures send one `{"type":"error","code","message","retryable"}`
+and close: 4400 protocol, unsupported language or mode, 4408 idle, 4413 frame
+too large, 4429 capacity (a profile, or the engine's decode budget, is full)
+or arrival rate (samples or messages), 4500 internal, 4503 still loading.
+
+UTTERANCE TEXT, FOR CONSUMERS. The model decides how a sentence ends only
+once it hears how the next one begins, so an utterance's text can START with
+the closing mark of the previous one: ", and I was told", "। लेकिन". That mark
+is kept (it is the previous sentence's comma or danda, and a Hindi transcript
+without it is wrong). A consumer that joins utterances must therefore join
+one whose text starts with a character of CLOSING_PUNCTUATION to the previous
+utterance WITHOUT a space ("told" + ", and" -> "told, and"), and every other
+one with a single space.
 
 SEGMENTATION IS THE HEART OF IT, AND IT NEVER CUTS SPEECH. See `Segmenter`.
 
@@ -92,7 +110,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 log = logging.getLogger("stt-stream")
@@ -116,11 +134,34 @@ SUBPROTOCOL = "techsara.voice.v1"
 MODEL_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt")
 
 #: Endpoint rules other than rule 2 (STT_ENDPOINT_S). Rule 1 closes an
-#: utterance after 2.4 s of silence even with no text; rule 3 would close one
-#: after N seconds whatever is being said, which is exactly the mid-speech cut
-#: this engine exists to avoid, so it is set out of reach (build spec section 7).
+#: utterance after 2.4 s of silence even with no text. Rule 3 closes one after
+#: N seconds whatever is being said, which is exactly the mid-speech cut this
+#: engine exists to avoid, so it is set out of reach. OUT OF REACH MEANS
+#: NEVER, not "an hour": sherpa-onnx measures rule 3 from the stream's
+#: creation (GetNumProcessedFrames; only Reset clears it) and this engine
+#: never resets a stream, so a stream that reached it would hold is_endpoint
+#: true for good -- no endpoint finals, no speech edges, no renewal (a forced
+#: final always leaves words pending) -- for the rest of a dictation the owner
+#: wants to run for hours. 1e7 s is 115 days of audio on ONE recognizer stream.
 RULE1_TRAILING_S = 2.4
-RULE3_UTTERANCE_S = 3600.0
+RULE3_UTTERANCE_S = 1e7
+
+#: The message ceiling, the gateway's (orchestrator/app/voice_live.py): every
+#: message after the start counts, audio or text, and a stream may have sent
+#: at most MESSAGES_FACTOR times the frames its elapsed time holds, plus the
+#: resume allowance. The frame length is the start's frame_ms clamped to
+#: [MIN_FRAME_MS, FRAME_MS]: 50 messages a second at 40 ms after a 65 s head
+#: start with the defaults.
+FRAME_MS = 40
+MIN_FRAME_MS = 10
+MESSAGES_FACTOR = 2
+#: The arrival ceilings' head start on top of STT_RESUME_MAX_S.
+ARRIVAL_SLACK_S = 5.0
+
+#: What a stream is for. "meeting" waits longer before it closes an utterance
+#: (people pause mid-thought when they talk to each other) and forces a long
+#: one out sooner.
+MODES = ("dictation", "meeting")
 
 #: Words held back from a forced final (spec section 7): the newest tokens may
 #: still be a word in progress ("sau" before "ce"), and committing half a word
@@ -142,7 +183,7 @@ class ConfigError(ValueError):
 # Configuration. Everything is read and validated ONCE, before anything loads.
 # --------------------------------------------------------------------------
 
-_PROFILE_KEYS = {"id", "dir", "chunk_ms", "max_streams", "languages", "flush_pad_ms", "model"}
+_PROFILE_KEYS = {"id", "dir", "chunk_ms", "max_streams", "languages", "flush_pad_ms", "model", "cost"}
 _PROFILE_ID = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 #: "auto" or a code the model's tokenizer knows: en, hi, en-US, hi-IN, ...
 _LANGUAGE = re.compile(r"^(auto|[a-z]{2,3}(-[a-z]{2})?)$", re.IGNORECASE)
@@ -167,6 +208,13 @@ class Profile:
     flush_pad_ms: int
     #: What /health calls the model. A label, never a path.
     model: str
+    #: Units of the engine's decode budget (STT_MAX_COST) one stream of this
+    #: profile holds; 0 means "derive it from chunk_ms" (default_cost).
+    cost: int = 0
+
+    def __post_init__(self) -> None:
+        if self.cost <= 0:
+            object.__setattr__(self, "cost", default_cost(self.chunk_ms))
 
     def supports(self, language: str) -> Optional[str]:
         """The allow-list's own spelling of `language`, or None."""
@@ -179,6 +227,19 @@ class Profile:
 
 def default_flush_pad_ms(chunk_ms: int) -> int:
     return max(800, 2 * chunk_ms + 400)
+
+
+def default_cost(chunk_ms: int) -> int:
+    """Budget units one stream costs, by chunk size: 2 at 160 ms, 1 at 560 ms.
+
+    MEASURED on the worker (build spec section 7), for those two sizes only:
+    twelve 160 ms streams kept 4.93 cores busy (0.41 core each), and one
+    4-thread decode loop holds ~7 real-time streams at 160 ms but ~14 at
+    560 ms, so a 560 ms stream costs half as much. A smaller chunk pays the
+    per-step overhead more often, hence the inverse scaling; any other size is
+    an estimate, and a profile using one should set "cost" after measuring.
+    """
+    return max(1, round(320 / chunk_ms))
 
 
 def _int_field(item: Mapping[str, Any], key: str, where: str, lo: int, hi: int) -> int:
@@ -237,7 +298,8 @@ def parse_profiles(raw: str, *, check_files: bool = True) -> Tuple[Profile, ...]
         model = item.get("model", os.path.basename(os.path.normpath(directory)))
         if not isinstance(model, str) or not _MODEL_LABEL.match(model):
             raise ConfigError(f"{where}: 'model' must match {_MODEL_LABEL.pattern}")
-        profiles.append(Profile(pid, directory, chunk_ms, max_streams, tuple(languages), flush_pad_ms, model))
+        cost = _int_field(item, "cost", where, 1, 64) if "cost" in item else default_cost(chunk_ms)
+        profiles.append(Profile(pid, directory, chunk_ms, max_streams, tuple(languages), flush_pad_ms, model, cost))
     return tuple(profiles)
 
 
@@ -255,6 +317,26 @@ class Settings:
     threads: int = 2
     endpoint_s: float = 0.6
     max_utterance_s: float = 30.0
+    #: start.mode "meeting": the trailing silence that closes an utterance and
+    #: the length that forces one out (build spec section 11). The meeting
+    #: endpoint is enforced by the engine ON TOP of the recognizer's rule 2
+    #: (endpoint_s), which is per recognizer, not per stream, so it can only
+    #: be longer.
+    meeting_endpoint_s: float = 0.9
+    meeting_max_utterance_s: float = 25.0
+    #: THE ENGINE'S DECODE BUDGET, in the units Profile.cost counts: a stream
+    #: is admitted only while the units of every open stream plus its own fit.
+    #: Per-profile max_streams alone admitted 40 streams (8+8+12+12), about
+    #: 11.5 cores of decode against the container's 8. Sized from the
+    #: worker's measurements (build spec sections 7 and 11): the 8-core
+    #: cpuset decodes ~16 streams at 160 ms in real time (0.41 core each,
+    #: 6.6 cores), which is 32 units at 2 units a stream; the same 32 units
+    #: hold 32 streams at 560 ms (~0.2 core each, 6.5 cores). Both leave
+    #: ~1.4 cores for the event loop, feature extraction and the p95 of a
+    #: decode step. A flat stream count could not say that: 16 streams would
+    #: refuse the 17th with three cores idle when the overflow sits on the
+    #: cheap 560 ms profiles.
+    max_cost: int = 32
     idle_s: float = 60.0
     start_timeout_s: float = 10.0
     #: Mirrors the gateway's VOICE_LIVE_RESUME_MAX_S: a reconnect replays up
@@ -266,13 +348,43 @@ class Settings:
     #: first word survived 4/30 times with no padding, 11/30 with 80 ms and
     #: 27/30 with 160 ms. Positions sent to the gateway never include it.
     lead_pad_ms: int = 160
-    #: Housekeeping renewals (see Segmenter and DecodeWorker._renew). Not
-    #: environment knobs: they are part of the no-word-loss argument, not
-    #: tuning.
+    #: RENEWAL AT EVERY SAFE POINT (build spec section 11): right after an
+    #: endpoint final, once the silence since the stream's last token reaches
+    #: this, the stream is swapped for a fresh one. A long-lived stream drops
+    #: whole clauses; a fresh one sometimes drops the first word after it. So
+    #: the threshold decides, measured on the worker 2026-09-30 (real models,
+    #: 4 sessions x 5 utterances, 2.5 s between utterances, WER):
+    #:
+    #:     renewal              FLEURS Hindi   LibriSpeech (English model)
+    #:     off                     15.78          3.97
+    #:     every endpoint 0.6 s    13.78          6.20   (47 renewals)
+    #:     1.2 s                   12.22          4.96
+    #:     2.0 s                   12.44          4.47   (20: one per pause)
+    #:
+    #: At 0.6 s every short pause inside a sentence renews, and errors on an
+    #: utterance's first word rose from 3 to 8 in English (dropped "who",
+    #: "old", "thus"); from 1.2 s up the renewals fall between utterances.
+    #: 2.0 s keeps nearly all of the Hindi gain at almost no English cost,
+    #: and loses fewer words than never renewing (deletions: Hindi 14 -> 4,
+    #: English 3 -> 1). With the level check in DecodeWorker._still_silent it
+    #: measured 12.89% / 4.47% there, and 12.44% / 4.22% against 13.33% /
+    #: 4.22% unrenewed with 1.2 s between utterances. (Build spec section 11
+    #: asked for 0.6; these numbers are why not.) A fresh stream's first
+    #: Hindi partial comes ~200 ms later (p50 571 -> 801 ms; English
+    #: unchanged). 0 switches it off (the backstops below remain).
+    renew_silence_s: float = 2.0
+    #: The backstops (see Segmenter._should_renew). Not environment knobs:
+    #: they are part of the no-word-loss argument, not tuning.
     renew_chars: int = 2000
     renew_hold_s: float = 1.5
-    renew_seed_s: float = 1.2
     renew_after_s: float = 1800.0
+    #: The newest client audio each stream keeps for a renewal to re-decode.
+    #: A renewal re-decodes from the last final's end (inside the silence
+    #: that closed it); this bounds how far back that can be when a renewal
+    #: had to wait for the decoder to catch up. It covers the undecoded tail
+    #: (under 0.27 s at 160 ms and 0.67 s at 560 ms, measured) plus more than
+    #: a chunk for an onset whose first token the model has not emitted yet.
+    renew_seed_s: float = 2.0
     #: How long a flush may take before the stream is failed instead.
     flush_timeout_s: float = 10.0
 
@@ -297,6 +409,16 @@ class Settings:
             # Host networking: a wildcard would put an engine that decodes on
             # demand onto the office LAN, the tailnet and the RoCE rails.
             raise ConfigError("STT_BIND must be one address, never a wildcard")
+        endpoint_s = _env_float(env, "STT_ENDPOINT_S", 0.6, 0.2, 5.0)
+        meeting_endpoint_s = _env_float(env, "STT_MEETING_ENDPOINT_S", 0.9, 0.2, 5.0)
+        if meeting_endpoint_s < endpoint_s:
+            # The recognizer's own rule 2 (endpoint_s) fires first for every
+            # stream; the engine can only wait longer than that, never less.
+            raise ConfigError("STT_MEETING_ENDPOINT_S must be at least STT_ENDPOINT_S")
+        max_cost = _env_int(env, "STT_MAX_COST", 32, 1, 4096)
+        for profile in profiles:
+            if profile.cost > max_cost:
+                raise ConfigError(f"profile {profile.id!r} costs {profile.cost} units, more than all of STT_MAX_COST ({max_cost})")
         return cls(
             profiles=profiles,
             token=token,
@@ -304,12 +426,16 @@ class Settings:
             port=_env_int(env, "STT_PORT", 30009, 1024, 65535),
             workers=_env_int(env, "STT_WORKERS", 4, 1, 16),
             threads=_env_int(env, "STT_THREADS", 2, 1, 8),
-            endpoint_s=_env_float(env, "STT_ENDPOINT_S", 0.6, 0.2, 5.0),
+            endpoint_s=endpoint_s,
             max_utterance_s=_env_float(env, "STT_MAX_UTTERANCE_S", 30.0, 5.0, 300.0),
+            meeting_endpoint_s=meeting_endpoint_s,
+            meeting_max_utterance_s=_env_float(env, "STT_MEETING_MAX_UTTERANCE_S", 25.0, 5.0, 300.0),
+            max_cost=max_cost,
             idle_s=_env_float(env, "STT_IDLE_S", 60.0, 5.0, 3600.0),
             start_timeout_s=_env_float(env, "STT_START_TIMEOUT_S", 10.0, 1.0, 120.0),
             resume_max_s=_env_float(env, "STT_RESUME_MAX_S", 60.0, 0.0, 600.0),
             lead_pad_ms=_env_int(env, "STT_LEAD_PAD_MS", 160, 0, 1000),
+            renew_silence_s=_env_float(env, "STT_RENEW_SILENCE_S", 2.0, 0.0, 30.0),
         )
 
 
@@ -345,8 +471,10 @@ def _env_float(env: Mapping[str, str], key: str, default: float, lo: float, hi: 
 
 #: How a stream that was admitted ended.
 OUTCOMES = ("completed", "disconnected", "idle", "protocol", "rate_limited", "error", "shutdown")
-#: Why a connection was refused before a stream was admitted.
-REJECT_REASONS = ("unauthorized", "not_ready", "protocol", "language", "capacity")
+#: Why a connection was refused before a stream was admitted. Closed and
+#: complete: anything else counts as "other", which exists from the start
+#: like the rest (build spec section 11).
+REJECT_REASONS = ("unauthorized", "not_ready", "protocol", "language", "capacity", "other")
 #: What was sent to the gateway. The three finals are counted apart because
 #: the ratio of forced to endpoint finals is the segmentation's health signal.
 EVENT_KINDS = ("partial", "final", "final_forced", "final_flush", "speech", "done", "error")
@@ -358,12 +486,17 @@ _HELP = {
     "stt_stream_ready": ("gauge", "1 once every profile's recognizer is loaded and warm."),
     "stt_stream_active_streams": ("gauge", "Streams admitted and open now."),
     "stt_stream_capacity_streams": ("gauge", "Streams a profile admits before refusing with capacity."),
+    "stt_stream_cost_budget_units": ("gauge", "The engine's decode budget (STT_MAX_COST); admission refuses beyond it."),
+    "stt_stream_cost_in_use_units": ("gauge", "Budget units the open streams hold."),
     "stt_stream_streams_total": ("counter", "Admitted streams by how they ended."),
     "stt_stream_audio_seconds_total": ("counter", "Seconds of client audio received."),
-    "stt_stream_compute_seconds_total": ("counter", "Wall seconds spent in decode steps (RTF = compute / audio)."),
+    "stt_stream_compute_seconds_total": ("counter", "Decode wall seconds charged to streams: every stream of a "
+                                                    "decode_streams call is charged the call's wall time, so RTF = "
+                                                    "compute / audio reaches 1 when decoding stops keeping up."),
     "stt_stream_rejections_total": ("counter", "Connections refused before a stream was admitted."),
     "stt_stream_events_total": ("counter", "Events sent to the gateway, by kind."),
-    "stt_stream_renewals_total": ("counter", "Housekeeping stream renewals, each inside a held silence."),
+    "stt_stream_renewals_total": ("counter", "Stream renewals, each at a safe point: right after an endpoint final, "
+                                             "inside its silence."),
     "stt_stream_decode_step_seconds": ("histogram", "Wall time of one decode_streams call; the budget is one chunk."),
     "stt_stream_batch_size": ("histogram", "Streams decoded together in one decode_streams call."),
 }
@@ -424,10 +557,17 @@ class Metrics:
         self._inc("stt_stream_events_total", (("kind", kind),), 1.0)
 
     def decode_step(self, profile: str, seconds: float, batch: int) -> None:
+        """One decode_streams call that took `seconds` of wall time for
+        `batch` streams. Every one of those streams waited the whole call, so
+        each is charged all of it: RTF = compute / audio is then the fraction
+        of real time a stream's decoding takes, and it reaches 1.0 when
+        decoding stops keeping up (a per-stream SHARE of the call reported
+        1/batch of that, so an alert at 0.8 could never fire while a batch of
+        four fell behind). The step histogram keeps the call's own wall time."""
         labels = (("profile", self._profile(profile)),)
         with self._lock:
             key = ("stt_stream_compute_seconds_total", labels)
-            self._counters[key] = self._counters.get(key, 0.0) + seconds
+            self._counters[key] = self._counters.get(key, 0.0) + seconds * batch
             for name, buckets, value in (("stt_stream_decode_step_seconds", _STEP_BUCKETS, seconds),
                                          ("stt_stream_batch_size", _BATCH_BUCKETS, float(batch))):
                 h = self._hists.setdefault((name, labels), [0.0] * (len(buckets) + 2))
@@ -493,24 +633,29 @@ def has_words(text: str) -> bool:
     return any(ch.isalnum() for ch in text)
 
 
-#: Sentence punctuation, Latin, Devanagari and CJK.
-_CLOSING_PUNCTUATION = ".,;:!?\u2026\u0964\u0965\u3002\uff0c\u3001\uff01\uff1f\uff1b\uff1a"
+#: Sentence punctuation that CLOSES something, Latin, Devanagari and CJK. An
+#: utterance whose text starts with one of these continues the previous
+#: utterance's sentence: consumers join it WITHOUT a space (see the module
+#: docstring, "UTTERANCE TEXT, FOR CONSUMERS").
+CLOSING_PUNCTUATION = ".,;:!?\u2026\u0964\u0965\u3002\uff0c\u3001\uff01\uff1f\uff1b\uff1a"
 
 
 def utterance_text(raw: str) -> str:
-    """What an utterance shows: whitespace collapsed, and no punctuation in
-    front of its first word.
+    """What an utterance shows: its text with whitespace runs collapsed.
 
+    NOTHING IS DROPPED, including punctuation in front of the first word.
     The model decides how a sentence ENDS only once it hears how the next one
     begins, so the comma or full stop of an utterance that was already
-    committed arrives as the first token of the next one: measured on the
-    worker, 5 of 40 LibriSpeech finals and 11 of 40 FLEURS Hindi finals began
-    ", and ..." or "। ...". A final is never retracted, so that mark cannot
-    rejoin its sentence; and every consumer joins utterances with a space, so
-    keeping it would only print " , and". Opening punctuation (quotes,
-    brackets, an inverted question mark) is kept: it belongs to this one.
+    committed often arrives as the first token of the next one: measured on
+    the worker, 5 of 40 LibriSpeech finals and 11 of 40 FLEURS Hindi finals
+    began ", and ..." or "। ...". A final is never retracted, so the mark
+    stays where it arrived, and the consumer puts it back against its
+    sentence by joining such an utterance without a space ("told" + ", and"
+    -> "told, and"). Deleting it instead cost the live Hindi transcript,
+    which is the text inserted for Hindi sessions, the danda of about one
+    sentence in four.
     """
-    return clean_text(raw).lstrip(_CLOSING_PUNCTUATION + " ")
+    return clean_text(raw)
 
 
 class TokenTimes:
@@ -589,7 +734,7 @@ class Segmenter:
     5.86% -> 13.71% (12.94% with a lead pad after each reset): a 0.6 s pause is
     a short one, the next word's onset is often already inside the encoder's
     context, and a reset throws that context away. So the recognizer is NEVER
-    restarted while speech may be pending. It keeps decoding one ever-growing
+    restarted while speech may be pending. It keeps decoding one growing
     hypothesis and this class keeps `committed`, the number of its characters
     already emitted as finals:
 
@@ -599,20 +744,32 @@ class Segmenter:
       final(u), committed moves to the end, u += 1;
     * pending that has run past max_utterance_s of audio (or MAX_PENDING_CHARS)
       is forced out as a final, all but its last KEEP_WORDS words;
-    * the stream is RENEWED only as housekeeping, so strings (and the O(n)
-      read of every token on every step) stay small in an hour-long session:
-      when the endpoint has held for renew_hold_s with nothing worded pending,
-      and the text is past renew_chars or renew_after_s of audio has gone by
-      since the last renewal. The hold is stricter than the spec's "pending
-      empty AND endpoint": a restart right AT an endpoint is the moment that
-      lost words, while 1.5 s further into the same silence nobody is
-      mid-word. The time trigger keeps rule 3 (one hour of stream) from ever
-      latching the endpoint on in a quiet session. DecodeWorker._renew says
-      why a renewal is a fresh stream rather than recognizer.reset().
+    * the stream is RENEWED -- swapped for a fresh one -- at SAFE POINTS only:
+      the endpoint holds, nothing worded is pending, and a final has been
+      committed from this stream, i.e. right after an endpoint final, in the
+      silence that produced it, once that silence has lasted renew_silence_s
+      (build spec section 11: a long-lived stream drops whole clauses;
+      renewing after 2 s pauses lowered FLEURS Hindi WER from 15.78% to
+      12.4-12.9% and lost fewer words than never renewing --
+      Settings.renew_silence_s has the numbers).
+      What differs from the reset that lost words is WHERE the fresh stream
+      starts: not at the endpoint but at the final's end, inside the
+      silence, with the audio from there on re-decoded (DecodeWorker._renew),
+      which is exactly what a reconnect does. Two backstops renew in a held
+      silence (renew_hold_s) when the text is past renew_chars or
+      renew_after_s of audio has gone by, so strings (and the O(n) read of
+      every token on every step) stay small even with renewals switched off.
 
     The recognizer's text only ever grows at the end (greedy transducer
     decoding never retracts a token), so a character offset stays valid until
     the next renewal.
+
+    THE ENDPOINT. The recognizer's rule 2 is one value for every stream it
+    serves (the engine's STT_ENDPOINT_S). A stream whose own endpoint_s is
+    longer -- start.mode "meeting" -- takes the recognizer's endpoint only once
+    the silence since its last token has also reached endpoint_s, measured
+    from the token times the way sherpa-onnx measures rule 2 (from the step
+    that grew the text, without them).
 
     POSITIONS are in the client's time base. `now` is how far into the
     client's audio the DECODER has got (not how much audio has arrived: a
@@ -622,15 +779,23 @@ class Segmenter:
     away any silence the engine inserted. Events carry first_sample plus that.
     With token times the positions come from the tokens themselves; without
     them, the spec's fallback: an utterance starts one chunk before its first
-    partial appeared and a final ends endpoint_s before the step that closed
-    it. An utterance never starts before the previous final ended.
+    partial appeared. An ENDPOINT final ends inside the silence that closed
+    it, half the endpoint's silence before the step that closed it (and never
+    before its last token): the browser resumes a dropped stream from the
+    largest end_sample it saw, and a token time is when the model emitted the
+    word, a median 100 ms (p90 286 ms) before the word ended -- resuming from
+    there re-decoded the word's tail as a new first word in 6 of 60 real
+    reconnects. A forced final keeps its last token's time: speech goes on,
+    and there is no silence to aim into. An utterance never starts before the
+    previous final ended.
 
     Pure: no I/O, no clock, no recognizer. The decode worker hands it one
     observation per decode step and does what it says.
     """
 
     def __init__(self, *, first_sample: int, first_u: int, chunk_samples: int, endpoint_s: float,
-                 max_utterance_s: float, renew_chars: int, renew_hold_s: float, renew_after_s: float,
+                 max_utterance_s: float, renew_silence_s: float, renew_chars: int, renew_hold_s: float,
+                 renew_after_s: float, recognizer_endpoint_s: Optional[float] = None,
                  sample_rate: int = SAMPLE_RATE):
         self.first_sample = first_sample
         self.u = first_u
@@ -638,7 +803,14 @@ class Segmenter:
         self.sample_rate = sample_rate
         self.endpoint_ms = int(round(endpoint_s * 1000))
         self.endpoint_samples = int(round(endpoint_s * sample_rate))
+        # Whether this stream waits longer than the recognizer's own rule 2.
+        base = endpoint_s if recognizer_endpoint_s is None else recognizer_endpoint_s
+        self._longer_endpoint = endpoint_s > base + 1e-9
         self.max_utterance = int(round(max_utterance_s * sample_rate))
+        #: Samples of silence past the endpoint before a safe-point renewal,
+        #: or None when those are switched off (renew_silence_s 0).
+        self.renew_wait: Optional[int] = (
+            None if renew_silence_s <= 0 else max(0, int(round((renew_silence_s - endpoint_s) * sample_rate))))
         self.renew_chars = renew_chars
         self.renew_hold = int(round(renew_hold_s * sample_rate))
         self.renew_after = int(round(renew_after_s * sample_rate))
@@ -652,6 +824,14 @@ class Segmenter:
         self._quiet_since: Optional[int] = None
         self._renewed_at = 0
         self._floor = 0                       # where the previous final ended
+        self._text: Optional[str] = None      # the text at the last observation...
+        self._grew_at = 0                     # ...and the position of the step that last changed it
+
+    @property
+    def floor(self) -> int:
+        """Client position where the last final ended (0 before the first):
+        a renewal re-decodes from here, and nothing before it is pending."""
+        return self._floor
 
     # -- the three entry points --------------------------------------------
 
@@ -663,6 +843,11 @@ class Segmenter:
             # The text never shrinks between renewals; if a binding ever makes
             # it, re-emitting nothing is better than slicing garbage.
             self.committed = len(text)
+        if text != self._text:
+            self._text = text
+            self._grew_at = now
+        if endpoint and self._longer_endpoint and text and now - self._last_token_at(timing) < self.endpoint_samples:
+            endpoint = False
         raw = text[self.committed:]
         rising = endpoint and not self._was_endpoint
         self._was_endpoint = endpoint
@@ -689,6 +874,8 @@ class Segmenter:
         self._seen = None
         self._quiet_since = None
         self._renewed_at = now
+        self._text = None
+        self._grew_at = now
 
     def finish(self, text: str, now: int, timing: Optional[TokenTimes] = None) -> List[dict]:
         """Flush: whatever is still pending becomes the last final."""
@@ -700,6 +887,13 @@ class Segmenter:
 
     # -- internals -----------------------------------------------------------
 
+    def _last_token_at(self, timing: Optional[TokenTimes]) -> int:
+        """Client position of the stream's newest token: its time when the
+        binding gives token times, else the step that last changed the text."""
+        if timing is not None and timing.positions:
+            return timing.positions[-1]
+        return self._grew_at
+
     def _bounds(self, c0: int, c1: int, now: int, timing: Optional[TokenTimes], kind: str) -> Tuple[int, int]:
         """Client positions (not yet offset by first_sample) of text[c0:c1]."""
         span = timing.span(c0, c1) if timing is not None else None
@@ -707,8 +901,12 @@ class Segmenter:
             start, end = span
         else:
             seen = self._seen if self._seen is not None else now
-            start = seen - self.chunk
-            end = now - self.endpoint_samples if kind == "final" else now
+            start, end = seen - self.chunk, now
+        if kind == "final":
+            # An endpoint final: into the silence that closed it (see the
+            # class docstring, POSITIONS), never before its last token.
+            half = now - self.endpoint_samples // 2
+            end = max(end, half) if span is not None else half
         start = min(max(start, self._floor, 0), now)
         end = min(max(end, start), now)
         return start, end
@@ -770,12 +968,21 @@ class Segmenter:
         return cut if cut > 0 and has_words(raw[:cut]) else 0
 
     def _should_renew(self, text: str, endpoint: bool, now: int) -> bool:
+        """Whether this is a safe point to renew the stream at.
+
+        SAFE: the endpoint holds and nothing worded is pending, so the last
+        commit was an endpoint final and everything since is silence the
+        decoder has heard (a forced final always leaves words pending).
+        """
         if not endpoint or has_words(text[self.committed:]):
             self._quiet_since = None
             return False
         if self._quiet_since is None:
             self._quiet_since = now
-        if now - self._quiet_since < self.renew_hold:
+        quiet = now - self._quiet_since
+        if self.renew_wait is not None and self.committed > 0 and quiet >= self.renew_wait:
+            return True  # the default: right after a final from this stream
+        if quiet < self.renew_hold:
             return False
         return len(text) > self.renew_chars or now - self._renewed_at >= self.renew_after
 
@@ -786,6 +993,33 @@ class Segmenter:
 
 _FLUSH = object()
 _CLOSE = object()
+
+
+#: A renewal's last check (DecodeWorker._still_silent): the pause must still
+#: be a pause. Levels are the RMS of 20 ms windows of float PCM; the newest
+#: audio is an onset when one of its windows stands above max(ONSET_FLOOR,
+#: ONSET_RATIO x the pause's 20th-percentile window) -- the rule the
+#: streaming benchmark uses to find where speech starts in its references.
+ONSET_WINDOW = SAMPLE_RATE // 50
+ONSET_FLOOR = 0.01
+ONSET_RATIO = 3.0
+
+
+def onset_after(pause: np.ndarray, newest: np.ndarray) -> bool:
+    """Whether `newest` holds a sound that stands out of `pause`."""
+    def levels(audio: np.ndarray) -> np.ndarray:
+        n = len(audio) // ONSET_WINDOW
+        if n == 0:
+            return np.zeros(0, dtype=np.float32)
+        frames = audio[:n * ONSET_WINDOW].reshape(n, ONSET_WINDOW)
+        return np.sqrt(np.mean(frames * frames, axis=1))
+
+    loud = levels(newest)
+    if not len(loud):
+        return False
+    quiet = levels(pause)
+    floor = float(np.percentile(quiet, 20)) if len(quiet) else 0.0
+    return bool(loud.max() > max(ONSET_FLOOR, ONSET_RATIO * floor))
 
 
 class Ring:
@@ -1013,7 +1247,11 @@ class DecodeWorker:
         # Audio is moved into the streams on EVERY pass, not once per pump: a
         # reconnect's replay can keep this loop decoding for seconds, and the
         # other streams on this worker must not wait that long for their
-        # newest audio to be decoded (or their events to be delivered).
+        # newest audio to be decoded (or their events to be delivered). The
+        # same goes for a Stop: a flushed stream is finished after EVERY
+        # pass, not once the loop runs dry -- a neighbour's 60 s replay, or an
+        # overload that never lets it run dry, would otherwise hold its last
+        # final and `done` past the gateway's 5 s wait.
         while not self._stopping:
             self._feed()
             ready = [s for s in self._slots if recognizer.is_ready(s.stream)]
@@ -1029,12 +1267,19 @@ class DecodeWorker:
                 continue
             elapsed = time.perf_counter() - started
             self.metrics.decode_step(self.profile.id, elapsed, len(ready))
-            share = elapsed / len(ready)
             for slot in ready:
                 slot.steps += 1
-                slot.compute_s += share
+                # Every stream of the batch waited the whole call (see
+                # Metrics.decode_step): compute_ms and the counter agree.
+                slot.compute_s += elapsed
                 self._observe(slot)
+            self._finish_flushed()
+        self._finish_flushed()
 
+    def _finish_flushed(self) -> None:
+        """Send the last final and `done` of every flushed stream that has
+        nothing left to decode, and let it go."""
+        recognizer = self.recognizer
         for slot in list(self._slots):
             if slot.flushing and not recognizer.is_ready(slot.stream):
                 text, result = read_result(recognizer, slot.stream)
@@ -1083,27 +1328,62 @@ class DecodeWorker:
         # and only a short tail is inside the seed. During a replay backlog
         # the renewal simply waits; the silence that asked for it is still
         # there when the decoder reaches the live edge.
-        if renew and not slot.flush_requested and not recognizer.is_ready(slot.stream):
+        if (renew and not slot.flush_requested and not recognizer.is_ready(slot.stream)
+                and self._still_silent(slot)):
             self._renew(slot)
 
+    @staticmethod
+    def _still_silent(slot: Slot) -> bool:
+        """Whether the newest audio is still the pause the renewal is for.
+
+        The recognizer says "endpoint, nothing pending" until the next
+        utterance's first token is EMITTED, which is a step or two after it
+        begins. A renewal in that gap loses nothing (the seed carries the
+        onset), but the fresh stream must first re-decode its whole seed, up
+        to renew_seed_s: measured on the worker with pauses near the 2 s
+        threshold, the first partial's p50 rose from 543 to 792 ms (English)
+        and 571 to 850 ms (Hindi). So a renewal waits for the next pause when
+        the undecoded tail, or the last chunk decoded, already sounds louder
+        than the pause behind it. It can only hold a renewal back; it never
+        decides what is decoded.
+        """
+        audio = slot.recent.last(slot.recent.filled)
+        start = slot.fed - len(audio)                      # client position of audio[0]
+        newest = slot.position() - max(slot.chunk, SAMPLE_RATE // 5)
+        split = min(len(audio), max(0, newest - start))
+        pause_from = min(split, max(0, slot.segmenter.floor - start))
+        return not onset_after(audio[pause_from:split], audio[split:])
+
     def _renew(self, slot: Slot) -> None:
-        """Swap the slot onto a fresh stream, deep inside a silence.
+        """Swap the slot onto a fresh stream at a safe point.
 
         A FRESH STREAM, NOT recognizer.reset(). For these models reset() also
         re-initialises the encoder's cache, so it is no gentler than a new
         stream, and it keeps the audio already queued but not yet decoded: the
         lead pad a restarted model needs (8C) could then only go AFTER that
         tail, in the middle of whatever it holds. A fresh stream gets the pad
-        first and then a seed of the newest client audio (1.2 s), which covers
-        that undecoded tail -- the renewal waits until the stream has caught
-        up, so the tail is less than one step plus the right context: 0.27 s
-        at 160 ms, 0.67 s at 560 ms, measured -- and any onset in it. The seed
-        cannot reach back into a committed word either: the decoder has heard
-        the hold (1.5 s) of silence on top of the endpoint's 0.6 s since the
-        last token, so that token ended at least 2.1 s before the decoder's
-        position, and the seed starts at most 1.2 s before it.
+        and the stream's language first (_new_stream), then a SEED: the client
+        audio from where the last final ended up to the newest sample.
+
+        WHERE THE SEED STARTS is the no-loss argument. At a safe point nothing
+        worded is pending, so the last final was an endpoint final (a forced
+        one always leaves words pending), and an endpoint final ends inside
+        the silence that closed it, half the endpoint's silence past its last
+        token (Segmenter._bounds). Re-decoding from there cannot repeat a
+        committed word, and it covers everything after it: the rest of the
+        silence, the undecoded tail the old stream takes with it (the renewal
+        waits until the stream has caught up, so that tail is under one step
+        plus the right context: 0.27 s at 160 ms, 0.67 s at 560 ms, measured)
+        and any onset inside that tail. It is the point a reconnect resumes
+        from, where it was measured on the real models: 0 of 120 English and
+        0 of 80 Hindi resumes repeated a committed word, and no English one
+        clipped the next utterance's first word. When the renewal had to wait
+        for the decoder and the silence outgrew the ring, the newest
+        renew_seed_s (2 s) of it are the seed: still more than the tail plus
+        a chunk.
         """
-        seed = slot.recent.last(len(slot.recent.buf))
+        keep = min(slot.recent.filled, max(0, slot.fed - slot.segmenter.floor))
+        seed = slot.recent.last(keep)
         try:
             stream = self._new_stream(slot)
             if len(seed):
@@ -1122,8 +1402,9 @@ class DecodeWorker:
 
     @staticmethod
     def _stamp(slot: Slot, events: List[dict]) -> List[dict]:
-        """compute_ms: decode wall time spent on this stream since its
-        previous event (a batch's time is shared evenly across the batch)."""
+        """compute_ms: decode wall time this stream waited on since its
+        previous event (every stream of a batch is charged the whole call,
+        as stt_stream_compute_seconds_total is)."""
         out: List[dict] = []
         for event in events:
             if event["type"] in ("partial", "final"):
@@ -1215,6 +1496,9 @@ class Engine:
         self.ready = False
         self.error: Optional[str] = None
         self.load_seconds: Optional[float] = None
+        #: Budget units the open streams hold (Settings.max_cost). Admission
+        #: and release both run on the event loop, so it needs no lock.
+        self.cost_in_use = 0
         self._lock = threading.Lock()
         self._stopped = False
 
@@ -1276,11 +1560,16 @@ class Engine:
         return hmac.compare_digest(credential.strip().encode("utf-8"), self.settings.token.encode("utf-8"))
 
     def admit(self, language: str) -> Tuple[Optional[ProfileRuntime], Optional[str], str]:
-        """(runtime, allow-list spelling of the language, refusal reason).
+        """(runtime, allow-list spelling of the language, refusal reason),
+        with the stream's place RESERVED when a runtime is returned: the
+        caller must hand it back with release().
 
-        The first profile in list order that allows the language and has room.
-        A language no profile allows is a client error; one whose profiles are
-        all full is capacity, worth a retry.
+        The first profile in list order that allows the language, has a free
+        slot, and whose cost still fits the engine's budget. A wide-chunk
+        profile after a full fast one is therefore where a nearly spent
+        budget still has room (it costs half as much). A language no profile
+        allows is a client error; one whose profiles are all full, or whose
+        streams no longer fit the budget, is capacity, worth a retry.
         """
         allowed = False
         for runtime in self.runtimes:
@@ -1288,20 +1577,36 @@ class Engine:
             if spelled is None:
                 continue
             allowed = True
-            if runtime.active < runtime.profile.max_streams:
+            if (runtime.active < runtime.profile.max_streams
+                    and self.cost_in_use + runtime.profile.cost <= self.settings.max_cost):
+                runtime.active += 1
+                self.cost_in_use += runtime.profile.cost
                 return runtime, spelled, ""
         return None, None, "capacity" if allowed else "language"
+
+    def release(self, runtime: ProfileRuntime) -> None:
+        """Give back what admit() reserved for one stream."""
+        runtime.active -= 1
+        self.cost_in_use -= runtime.profile.cost
+
+    def capacity(self) -> int:
+        """The most streams the engine could hold at once: its slots, or as
+        many of the cheapest profile's streams as the budget pays for."""
+        slots = sum(r.profile.max_streams for r in self.runtimes)
+        cheapest = min(r.profile.cost for r in self.runtimes)
+        return min(slots, self.settings.max_cost // cheapest)
 
     def health(self) -> dict:
         models = list(dict.fromkeys(r.profile.model for r in self.runtimes))
         return {
             "ready": self.ready,
             "streams": sum(r.active for r in self.runtimes),
-            "capacity": sum(r.profile.max_streams for r in self.runtimes),
+            "capacity": self.capacity(),
+            "cost": {"budget": self.settings.max_cost, "in_use": self.cost_in_use},
             "model": ",".join(models),
             "profiles": [
                 {"id": r.profile.id, "model": r.profile.model, "chunk_ms": r.profile.chunk_ms,
-                 "active": r.active, "max_streams": r.profile.max_streams,
+                 "active": r.active, "max_streams": r.profile.max_streams, "cost": r.profile.cost,
                  "languages": list(r.profile.languages)}
                 for r in self.runtimes
             ],
@@ -1312,7 +1617,11 @@ class Engine:
         }
 
     def gauges(self) -> List[Tuple[str, Tuple[Tuple[str, str], ...], float]]:
-        rows: List[Tuple[str, Tuple[Tuple[str, str], ...], float]] = [("stt_stream_ready", (), 1.0 if self.ready else 0.0)]
+        rows: List[Tuple[str, Tuple[Tuple[str, str], ...], float]] = [
+            ("stt_stream_ready", (), 1.0 if self.ready else 0.0),
+            ("stt_stream_cost_budget_units", (), float(self.settings.max_cost)),
+            ("stt_stream_cost_in_use_units", (), float(self.cost_in_use)),
+        ]
         for runtime in self.runtimes:
             labels = (("profile", runtime.profile.id),)
             rows.append(("stt_stream_active_streams", labels, float(runtime.active)))
@@ -1330,13 +1639,18 @@ class Start:
     first_sample: int
     first_u: int
     language: str
+    mode: str = "dictation"
+    #: The sender's frame length, as sent (the message ceiling clamps it).
+    frame_ms: float = float(FRAME_MS)
 
 
 def parse_start(text: str) -> Tuple[Optional[Start], str]:
     """The start message, or why it is not one."""
     try:
         message = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError, not ValueError, is how json gives up on a few
+        # thousand nested brackets, which fit in one message.
         return None, "the first message must be a JSON start message"
     if not isinstance(message, dict) or message.get("type") != "start":
         return None, "the first message must be start"
@@ -1346,24 +1660,44 @@ def parse_start(text: str) -> Tuple[Optional[Start], str]:
         return None, "only pcm_s16le at 16000 Hz is accepted"
     if message.get("channels", 1) != 1:
         return None, "only mono is accepted"
-    if message.get("mode", "dictation") != "dictation":
-        return None, "only dictation mode is supported"
+    mode = message.get("mode", "dictation")
+    if not isinstance(mode, str) or mode not in MODES:
+        return None, "mode must be dictation or meeting"
     numbers = {}
     for key, ceiling in (("first_sample", 1 << 40), ("first_u", 1 << 30)):
         value = message.get(key, 0)
         if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < ceiling:
             return None, f"{key} must be a non-negative integer"
         numbers[key] = value
+    frame_ms = message.get("frame_ms", FRAME_MS)
+    if isinstance(frame_ms, bool) or not isinstance(frame_ms, (int, float)) or (
+            isinstance(frame_ms, float) and not math.isfinite(frame_ms)):
+        return None, "frame_ms must be a finite number"
     language = message.get("language", "auto")
     if language is None or language == "":
         language = "auto"
     if not isinstance(language, str) or not _LANGUAGE.match(language):
         return None, "language must be 'auto' or a code like en, hi or en-US"
-    return Start(numbers["first_sample"], numbers["first_u"], language), ""
+    return Start(numbers["first_sample"], numbers["first_u"], language, mode, float(frame_ms)), ""
+
+
+def message_rate(frame_ms: float) -> float:
+    """Messages a second the message ceiling allows after its head start:
+    MESSAGES_FACTOR frames a second of frame_ms, clamped to [MIN_FRAME_MS,
+    FRAME_MS] -- a shorter frame buys more messages, a longer one no fewer
+    than the browser's own 40 ms."""
+    return MESSAGES_FACTOR * 1000.0 / min(max(frame_ms, MIN_FRAME_MS), FRAME_MS)
 
 
 def _dumps(event: dict) -> str:
-    return json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+    # allow_nan=False: NaN and Infinity are not JSON, and a peer's strict
+    # parser would drop the stream over them.
+    return json.dumps(event, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+#: What a send to a peer that has gone raises: starlette's disconnect, its
+#: RuntimeError for a socket already closed, or the transport's OSError.
+_PEER_GONE = (WebSocketDisconnect, RuntimeError, OSError)
 
 
 class Connection:
@@ -1381,6 +1715,8 @@ class Connection:
         self.close_code: Optional[int] = None
         self.language = "auto"
         self.samples = 0
+        self.messages = 0
+        self.message_rate = message_rate(FRAME_MS)
         self.flushed = False
 
     async def refuse(self, reason: str, code: str, message: str, retryable: bool, close: int) -> None:
@@ -1405,33 +1741,43 @@ class Connection:
                 await self.refuse("language", "unsupported_language",
                                   "no profile on this engine transcribes that language", False, 4400)
             else:
-                await self.refuse("capacity", "capacity", "every profile for that language is full", True, 4429)
+                await self.refuse("capacity", "capacity",
+                                  "no profile for that language has room (its streams, or the engine's decode "
+                                  "budget, are full)", True, 4429)
             return
+        try:
+            await self._stream(start, runtime, language)
+        finally:
+            self.engine.release(runtime)
+
+    async def _stream(self, start: Start, runtime: ProfileRuntime, language: str) -> None:
+        """An admitted stream, from ready to close."""
         profile = runtime.profile
+        chunk = profile.chunk_ms * SAMPLE_RATE // 1000
+        meeting = start.mode == "meeting"
         segmenter = Segmenter(
-            first_sample=start.first_sample, first_u=start.first_u,
-            chunk_samples=profile.chunk_ms * SAMPLE_RATE // 1000,
-            endpoint_s=self.settings.endpoint_s, max_utterance_s=self.settings.max_utterance_s,
-            renew_chars=self.settings.renew_chars, renew_hold_s=self.settings.renew_hold_s,
-            renew_after_s=self.settings.renew_after_s,
+            first_sample=start.first_sample, first_u=start.first_u, chunk_samples=chunk,
+            endpoint_s=self.settings.meeting_endpoint_s if meeting else self.settings.endpoint_s,
+            recognizer_endpoint_s=self.settings.endpoint_s,
+            max_utterance_s=self.settings.meeting_max_utterance_s if meeting else self.settings.max_utterance_s,
+            renew_silence_s=self.settings.renew_silence_s, renew_chars=self.settings.renew_chars,
+            renew_hold_s=self.settings.renew_hold_s, renew_after_s=self.settings.renew_after_s,
         )
-        # The seed is never longer than the hold: see DecodeWorker._renew.
-        seed_s = min(self.settings.renew_seed_s, self.settings.renew_hold_s)
-        slot = Slot(language=language, segmenter=segmenter, chunk=profile.chunk_ms * SAMPLE_RATE // 1000,
+        slot = Slot(language=language, segmenter=segmenter, chunk=chunk,
                     flush_pad=profile.flush_pad_ms * SAMPLE_RATE // 1000,
                     lead_pad=self.settings.lead_pad_ms * SAMPLE_RATE // 1000,
-                    seed=int(round(seed_s * SAMPLE_RATE)),
+                    seed=int(round(self.settings.renew_seed_s * SAMPLE_RATE)),
                     deliver=self._deliver, loop=asyncio.get_running_loop())
         worker = runtime.pick_worker()
         self.runtime, self.language, self.worker, self.slot = runtime, language, worker, slot
+        self.message_rate = message_rate(start.frame_ms)
         self.queue.put_nowait({
-            "type": "ready", "v": 1, "sample_rate": SAMPLE_RATE, "frame_ms": 40,
+            "type": "ready", "v": 1, "sample_rate": SAMPLE_RATE, "frame_ms": FRAME_MS,
             "max_frame_bytes": MAX_FRAME_BYTES, "resume_from_sample": start.first_sample,
             "next_u": start.first_u, "first_sample": start.first_sample, "first_u": start.first_u,
-            "profile": profile.id, "chunk_ms": profile.chunk_ms, "language": language,
+            "profile": profile.id, "chunk_ms": profile.chunk_ms, "language": language, "mode": start.mode,
         })
         started = time.monotonic()
-        runtime.active += 1
         worker.active += 1
         worker.adopt(slot)
         sender = asyncio.create_task(self._send_loop())
@@ -1449,13 +1795,12 @@ class Connection:
                 sender.cancel()
             slot.inbox.append(_CLOSE)
             worker.notify()
-            runtime.active -= 1
             worker.active -= 1
             outcome = self.outcome or "disconnected"
             self.engine.metrics.stream_closed(profile.id, outcome)
             log.info("stream closed %s", _dumps({
-                "profile": profile.id, "language": language, "outcome": outcome, "code": self.close_code,
-                "duration_s": round(time.monotonic() - started, 1),
+                "profile": profile.id, "language": language, "mode": start.mode, "outcome": outcome,
+                "code": self.close_code, "duration_s": round(time.monotonic() - started, 1),
                 "audio_s": round(self.samples / SAMPLE_RATE, 1),
                 "finals": segmenter.finals, "renewals": segmenter.renewals,
             }))
@@ -1502,7 +1847,7 @@ class Connection:
         #: No audio for idle_s closes the stream -- until a flush, after which
         #: no audio is expected and only the flush's own deadline applies.
         deadline = loop.time() + self.settings.idle_s
-        ceiling_slack = self.settings.resume_max_s + 5.0
+        ceiling_slack = self.settings.resume_max_s + ARRIVAL_SLACK_S
         while True:
             try:
                 async with asyncio.timeout_at(deadline):
@@ -1524,6 +1869,15 @@ class Connection:
                 return False
             if self.close_code is not None or self.outcome is not None:
                 continue  # closing: drain until the peer's close arrives
+            # THE MESSAGE CEILING, before the message is looked at: counting
+            # samples never bounded MESSAGES (2-byte frames, pings), and each
+            # costs this event loop, which every stream shares, about what a
+            # 40 ms frame costs. The gateway's rule (build spec section 11).
+            self.messages += 1
+            if self.messages > (time.monotonic() - started + ceiling_slack) * self.message_rate:
+                self._fail("rate_limited", "rate_limited", "messages are arriving faster than a live stream sends them",
+                           True, 4429)
+                return True
             data = message.get("bytes")
             if data is not None:
                 if self.flushed:
@@ -1560,13 +1914,16 @@ class Connection:
         """A text message after start; returns a protocol problem or ""."""
         try:
             message = json.loads(text or "")
-        except ValueError:
+        except (ValueError, RecursionError):
             return "text messages are JSON"
         kind = message.get("type") if isinstance(message, dict) else None
         if kind == "ping":
             stamp = message.get("t")
-            if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
-                return "ping carries a number t"
+            if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or (
+                    isinstance(stamp, float) and not math.isfinite(stamp)):
+                # NaN and Infinity parse (Python's json accepts them) but would
+                # go back out as a pong no strict parser reads.
+                return "ping carries a finite number t"
             self.queue.put_nowait({"type": "pong", "t": stamp})
             return ""
         if kind == "flush":
@@ -1588,10 +1945,23 @@ class Connection:
             for event in coalesce(batch):
                 close = event.pop("_close", None)
                 kind = event.pop("_kind", None)
+                try:
+                    payload = _dumps(event)
+                except (TypeError, ValueError) as exc:
+                    # A bug, not the peer. Say so (the event's type and the
+                    # error's, never its text) and fail the stream: skipping
+                    # the event would leave the stream running with events
+                    # silently missing, and stopping would leave it running
+                    # with none at all.
+                    log.error("a %s event could not be encoded (%s); the stream is closed with 4500",
+                              event.get("type"), type(exc).__name__)
+                    payload = _dumps({"type": "error", "code": "internal", "message": "the engine could not encode an event",
+                                      "retryable": True})
+                    kind, close = "error", 4500
                 if kind == "error" and self.outcome is None:
                     self.outcome = "error"
                 try:
-                    await self.ws.send_text(_dumps(event))
+                    await self.ws.send_text(payload)
                     if kind is not None:
                         metrics.event(kind)
                     if event.get("type") == "done":
@@ -1601,13 +1971,30 @@ class Connection:
                         self.close_code = close
                         await self.ws.close(close)
                         return
-                except Exception:  # noqa: BLE001 - the peer went away mid-send
+                except _PEER_GONE as exc:
+                    log.debug("stopped sending: the peer went away (%s)", type(exc).__name__)
+                    return
+                except Exception:  # noqa: BLE001 - logged: a stream whose events stop must say why
+                    log.exception("stopped sending: the send failed unexpectedly")
                     return
 
 
 # --------------------------------------------------------------------------
 # The application.
 # --------------------------------------------------------------------------
+
+
+async def _deny(ws: WebSocket) -> None:
+    """Refuse the upgrade BEFORE accept: a close before accept, which uvicorn
+    answers with a bare HTTP 403. Not send_denial_response: uvicorn's
+    websockets-sansio never marks that handshake complete and logs "ASGI
+    callable returned without completing handshake" at ERROR for every
+    refusal (0.46 and 0.54, measured 2026-09-29), and 0.46 wrote clients an
+    invalid HTTP response -- a wrong token would fill the error log."""
+    try:
+        await ws.close(code=1008)
+    except Exception:  # noqa: BLE001 - the peer may already be gone
+        pass
 
 
 def create_app(settings: Settings, recognizer_factory: Optional[RecognizerFactory] = None) -> FastAPI:
@@ -1641,10 +2028,7 @@ def create_app(settings: Settings, recognizer_factory: Optional[RecognizerFactor
     async def stream(ws: WebSocket) -> None:
         if not engine.authorized(ws.headers.get("authorization")):
             engine.metrics.reject("unauthorized")
-            try:
-                await ws.send_denial_response(PlainTextResponse("unauthorized\n", status_code=401))
-            except RuntimeError:
-                await ws.close(1008)  # a server without the denial extension answers 403
+            await _deny(ws)
             return
         offered = ws.scope.get("subprotocols") or []
         await ws.accept(subprotocol=SUBPROTOCOL if SUBPROTOCOL in offered else None)

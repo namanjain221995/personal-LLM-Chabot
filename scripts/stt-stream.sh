@@ -15,7 +15,10 @@
 #             candidate test: the engine runs, but the production orchestrator
 #             is not pointed at it on its next recreate. The token then comes
 #             from STT_TOKEN_FILE (a 0600 file holding it) or from a
-#             VOICE_LIVE_ENGINE_TOKEN secrets.env already has.
+#             VOICE_LIVE_ENGINE_TOKEN secrets.env already has. STT_TOKEN_FILE
+#             is refused WITHOUT --no-env: the orchestrator authenticates with
+#             the secrets.env token, so an engine given any other one would
+#             refuse every live stream it is pointed at.
 #
 # WHAT IT IS. compose/stt-stream/server.py: Nemotron streaming ASR on
 # sherpa-onnx, on the CPU, behind the orchestrator's live-dictation WebSocket
@@ -192,12 +195,25 @@ sync_files() {
   check_pass "engine synced"
 }
 
+# STT_TOKEN_FILE names a CANDIDATE engine's token, so it goes with --no-env
+# only. Without --no-env, `up` records this engine in .env, and after the next
+# `./techsara up` the orchestrator dials it with VOICE_LIVE_ENGINE_TOKEN from
+# .runtime/secrets.env: an engine holding a different token would refuse every
+# live stream, and the gateway would keep standing it down. Checked before
+# anything is fetched or started.
+refuse_token_file_without_no_env() {
+  [ -z "${STT_TOKEN_FILE:-}" ] || [ "$NO_ENV" = 1 ] \
+    || die "STT_TOKEN_FILE is for --no-env candidate runs only: without --no-env this engine is recorded in .env, and the orchestrator would dial it with the VOICE_LIVE_ENGINE_TOKEN in .runtime/secrets.env, not this one. Unset STT_TOKEN_FILE (the secrets.env token is used, or minted), or add --no-env."
+}
+
 # The token, printed on stdout (every message goes to stderr). In order: the
-# file an operator names in STT_TOKEN_FILE, the one .runtime/secrets.env
-# already holds, a new one -- minted ONCE, 32 random bytes, and appended to
-# secrets.env (0600), which is not allowed under --no-env.
+# file an operator names in STT_TOKEN_FILE (--no-env only), the one
+# .runtime/secrets.env already holds, a new one -- minted ONCE, 32 random
+# bytes, and appended to secrets.env (0600), which is not allowed under
+# --no-env.
 stt_token() {
   local token
+  refuse_token_file_without_no_env
   if [ -n "${STT_TOKEN_FILE:-}" ]; then
     token="$(tr -d '[:space:]' <"$STT_TOKEN_FILE")" || die "could not read STT_TOKEN_FILE ($STT_TOKEN_FILE)"
     [ "${#token}" -ge 16 ] || die "the token in STT_TOKEN_FILE is shorter than 16 characters"
@@ -388,6 +404,7 @@ done
 case "$action" in
   up)
     require_worker
+    refuse_token_file_without_no_env
     bind="$(stt_bind_address)"
     log_info "bringing the live dictation engine up on the worker ($CLUSTER_WORKER_SSH) at $bind:$STT_PORT"
     ensure_models

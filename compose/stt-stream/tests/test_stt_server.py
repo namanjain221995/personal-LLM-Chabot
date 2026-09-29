@@ -15,11 +15,12 @@ import time
 import numpy as np
 import pytest
 from starlette.testclient import WebSocketDenialResponse
+from starlette.websockets import WebSocketDisconnect
 
-from conftest import (AUTH, TOKEN, Closed, drain, finals, make_profile, make_settings, metrics_value, recv_json,
-                      running, send_pcm, server, start, wait_ready, words_of)
+from conftest import (AUTH, TOKEN, drain, finals, make_profile, make_settings, metrics_value, recv_json, running,
+                      send_pcm, server, start, wait_ready, words_of)
 from stt_fakes import TOKEN as TOKEN_SAMPLES
-from stt_fakes import WORDS, FakeRecognizer, fake_factory, positions, speech
+from stt_fakes import VALUE, WORDS, FakeRecognizer, fake_factory, positions, speech
 
 LEAD = 2560  # the default 160 ms of silence in front of every stream
 
@@ -76,13 +77,17 @@ def test_health_names_profiles_models_and_capacity_but_never_a_path():
     assert "/models" not in json.dumps(body)
 
 
-def test_the_upgrade_is_refused_with_401_without_the_right_token():
+def test_the_upgrade_is_refused_before_accept_without_the_right_token():
+    # A close BEFORE accept, which uvicorn answers with a bare 403. Not a
+    # denial response: under websockets-sansio every one of those logged an
+    # ERROR ("ASGI callable returned without completing handshake").
     with running() as client:
         for headers in ({}, {"authorization": "Bearer wrong-key-1-wrong-key-1"}, {"authorization": TOKEN}):
-            with pytest.raises(WebSocketDenialResponse) as denied:
+            with pytest.raises(WebSocketDisconnect) as denied:
                 with connect(client, headers=headers):
                     pass
-            assert denied.value.status_code == 401
+            assert not isinstance(denied.value, WebSocketDenialResponse)
+            assert denied.value.code == 1008
         assert metrics_value(client, 'stt_stream_rejections_total{reason="unauthorized"}') == 3
         with connect(client, headers={"authorization": f"bearer {TOKEN}"}) as ws:
             assert start(ws)["type"] == "ready"
@@ -104,7 +109,7 @@ def test_ready_describes_the_stream_in_both_spellings_of_the_resume_point():
         ready = start(ws, first_sample=320000, first_u=9)
     assert ready == {"type": "ready", "v": 1, "sample_rate": 16000, "frame_ms": 40, "max_frame_bytes": 16384,
                      "resume_from_sample": 320000, "next_u": 9, "first_sample": 320000, "first_u": 9,
-                     "profile": "fast", "chunk_ms": 160, "language": "auto"}
+                     "profile": "fast", "chunk_ms": 160, "language": "auto", "mode": "dictation"}
 
 
 # -- refusals --------------------------------------------------------------------
@@ -119,9 +124,15 @@ def test_ready_describes_the_stream_in_both_spellings_of_the_resume_point():
     start_message(first_sample=-1),
     start_message(first_u="3"),
     start_message(first_sample=True),
-    start_message(mode="meeting"),
+    start_message(mode="lecture"),
+    start_message(mode=None),
     start_message(v=2),
     start_message(language="english"),
+    start_message(frame_ms="40"),
+    start_message(frame_ms=True),
+    start_message(frame_ms=float("nan")),       # json.dumps writes NaN, which Python's json reads back
+    start_message(frame_ms=float("inf")),
+    "[" * 5000 + "]" * 5000,                    # RecursionError in json, not ValueError
 ])
 def test_a_bad_start_is_refused_with_4400(first):
     with running() as client:
@@ -226,7 +237,9 @@ def test_one_recognizer_per_profile_is_shared_by_its_decode_threads():
             assert code == 1000
             ws.__exit__(None, None, None)
     streams = client_streams(made)
-    assert len(streams) == 3 and all(s in made[0].streams for s in streams)
+    # Three streams, plus the fresh one each renewal (after each final) puts
+    # on the same slot and so the same worker.
+    assert len(streams) >= 3 and all(s in made[0].streams for s in streams)
     threads = [s.decoded_by for s in streams]
     assert all(len(t) == 1 for t in threads)  # a stream is only ever decoded by its own worker
     assert len(set().union(*threads)) == 3    # and three streams went to three workers
@@ -242,7 +255,8 @@ def test_every_stream_starts_with_the_lead_silence_and_positions_do_not_count_it
     assert not stream.audio[:LEAD].any() and stream.audio[LEAD] != 0
     (final,) = finals(events)
     assert final["text"] == "alpha bravo" and final["start_sample"] == 16000
-    assert final["end_sample"] == 16000 + TOKEN_SAMPLES
+    # It ends in the silence after "bravo" (2 tokens), not at bravo's time.
+    assert 16000 + 2 * TOKEN_SAMPLES <= final["end_sample"] <= 16000 + 2 * TOKEN_SAMPLES + 12800
 
 
 def test_the_lead_silence_is_configurable_down_to_none():
@@ -282,11 +296,14 @@ def test_partials_replace_and_finals_commit_in_order():
 
 @pytest.mark.parametrize("with_timestamps", [True, False])
 def test_no_word_is_lost_across_many_utterances(with_timestamps):
+    # Pauses of at least 0.8 s: an endpoint needs 0.6 s of silence as the
+    # decoder's 160 ms steps see it, which a pause of 0.6 s + one step always
+    # holds whatever the alignment (and every renewal shifts the alignment).
     rng = random.Random(7)
     parts, spoken, utterances = [0.32], [], []
     for _ in range(25):
         words = [rng.choice(WORDS[:-1]) for _ in range(rng.randint(1, 6))]
-        parts += words + [rng.choice([0.64, 0.8, 1.12, 1.6, 2.72])]
+        parts += words + [rng.choice([0.8, 0.96, 1.12, 1.6, 2.72])]
         spoken += words
         utterances.append(words)
     with running(factory=fake_factory(with_timestamps=with_timestamps)) as client:
@@ -300,14 +317,17 @@ def test_no_word_is_lost_across_many_utterances(with_timestamps):
     assert starts == sorted(starts) and all(s >= 320000 for s in starts)
     ends = [f["end_sample"] for f in fs]
     assert all(e <= s for e, s in zip(ends, starts[1:]))  # utterances never overlap
-    if with_timestamps:
-        # Exact: the token times ARE the positions the client sent them at.
-        at = [p for _, p in positions(parts)]
-        index = 0
-        for f, words in zip(fs, utterances):
+    at = [p for _, p in positions(parts)] + [len(speech(parts))]
+    index = 0
+    for f, words in zip(fs, utterances):
+        if with_timestamps:
+            # Exact: the token times ARE the positions the client sent them at.
             assert f["start_sample"] == 320000 + at[index]
-            assert f["end_sample"] == 320000 + at[index + len(words) - 1]
-            index += len(words)
+        # Every final ends in the silence after its last word, before the
+        # next word: the point a reconnect resumes from.
+        last = at[index + len(words) - 1]
+        assert 320000 + last + TOKEN_SAMPLES <= f["end_sample"] <= 320000 + at[index + len(words)]
+        index += len(words)
 
 
 def test_flush_pads_silence_so_the_last_word_survives():
@@ -350,16 +370,26 @@ def test_long_speech_is_forced_out_without_losing_or_repeating_a_word():
 
 def wait_for(client, series, at_least, timeout=5.0):
     deadline = time.monotonic() + timeout
-    while metrics_value(client, series) < at_least:
+    while metrics_value(client, series) < at_least - 1e-6:  # a sum of float seconds may land a hair under
         assert time.monotonic() < deadline, f"{series} never reached {at_least}"
         time.sleep(0.01)
 
 
-def test_renewals_happen_only_inside_long_silences_and_lose_nothing():
+def wait_all_audio_in(client, *scripts, profile="fast"):
+    """Until the engine has queued every sample of these scripts: each frame
+    is counted right after it goes into its stream's inbox."""
+    wait_for(client, f'stt_stream_audio_seconds_total{{profile="{profile}"}}',
+             sum(len(speech(parts)) for parts in scripts) / 16000)
+
+
+def test_the_backstop_renewals_happen_only_inside_long_silences_and_lose_nothing():
+    # Safe-point renewals off: only the text backstop (renew_chars) renews,
+    # after the backstop's 1.5 s hold.
     made = []
     renewals = 'stt_stream_renewals_total{profile="fast"}'
     parts = [0.32]
-    with running(make_settings(renew_chars=40), fake_factory(made=made)) as client, connect(client) as ws:
+    settings = make_settings(renew_chars=40, renew_silence_s=0)
+    with running(settings, fake_factory(made=made)) as client, connect(client) as ws:
         start(ws, first_sample=16000)
         send_pcm(ws, speech([0.32]))
         for i in range(12):
@@ -398,13 +428,18 @@ def test_renewals_happen_only_inside_long_silences_and_lose_nothing():
 def test_a_word_already_arriving_at_the_renewal_is_decoded_from_the_seed():
     # The decoder is held back while a long silence and the first word after
     # it queue up, so it reaches the live edge -- and renews -- with that word
-    # still undecoded in the old stream's tail. The seed must carry it over.
+    # still undecoded in the old stream's tail. The word is too soft for the
+    # renewal's level check to hear (a loud one holds the renewal back: see
+    # the next test), so the seed must carry it over.
     made = []
-    parts = [0.32, "alpha", "bravo", "charlie", 2.56, "delta"]
-    with running(make_settings(renew_chars=5), fake_factory(made=made)) as client, connect(client) as ws:
+    parts = [0.32, "alpha", "bravo", "charlie", 2.56, "hush"]
+    with running(factory=fake_factory(made=made)) as client, connect(client) as ws:
         start(ws)
         made[0].gate = threading.Event()
         send_pcm(ws, speech(parts))
+        # Every frame is in the stream's inbox before the decoder may start,
+        # so it cannot catch up (and renew) before it reaches "delta".
+        wait_all_audio_in(client, parts)
         made[0].gate.set()
         wait_for(client, 'stt_stream_renewals_total{profile="fast"}', 1)
         renewed = client_streams(made)[1]
@@ -414,9 +449,42 @@ def test_a_word_already_arriving_at_the_renewal_is_decoded_from_the_seed():
         ws.send_text('{"type":"flush"}')
         events, code = drain(ws)
     assert code == 1000
-    assert [f["text"] for f in finals(events)] == ["alpha bravo charlie", "delta echo"]
+    assert [f["text"] for f in finals(events)] == ["alpha bravo charlie", "hush echo"]
     at = dict(positions(parts + ["echo"]))
-    assert finals(events)[1]["start_sample"] == at["delta"]
+    assert finals(events)[1]["start_sample"] == at["hush"]
+
+
+def test_a_renewal_waits_for_the_next_pause_when_the_next_word_has_begun():
+    # The same backlog with a LOUD word in the undecoded tail: the recognizer
+    # still says "endpoint, nothing pending" (the word's first token is not
+    # out yet), but the level check hears the onset, so the renewal is left
+    # for the next pause instead of making the fresh stream re-decode 2 s of
+    # seed before that word can show.
+    made = []
+    renewals = 'stt_stream_renewals_total{profile="fast"}'
+    parts = [0.32, "alpha", "bravo", "charlie", 2.56, "delta"]
+    with running(factory=fake_factory(made=made)) as client, connect(client) as ws:
+        start(ws)
+        made[0].gate = threading.Event()
+        send_pcm(ws, speech(parts))
+        wait_all_audio_in(client, parts)
+        made[0].gate.set()
+        read_until(ws, lambda e: e["type"] == "final")
+        stream = client_streams(made)[0]
+        deadline = time.monotonic() + 5
+        while made[0].is_ready(stream):  # the decoder reaches the live edge...
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        time.sleep(0.1)  # ...and decides there
+        assert metrics_value(client, renewals) == 0
+        send_pcm(ws, speech(["echo", 2.72]))
+        wait_for(client, renewals, 1)  # the next pause, a quiet one, renews
+        ws.send_text('{"type":"flush"}')
+        events, code = drain(ws)
+    assert code == 1000
+    assert [f["text"] for f in finals(events)] == ["delta echo"]
+    renewed = client_streams(made)[1]
+    assert VALUE["delta"] not in renewed.audio and VALUE["echo"] not in renewed.audio
 
 
 def test_a_replayed_backlog_never_renews_before_the_decoder_catches_up():
@@ -434,10 +502,12 @@ def test_a_replayed_backlog_never_renews_before_the_decoder_catches_up():
     assert [f["start_sample"] for f in finals(events)] == at[::2]
 
 
-def test_punctuation_after_an_endpoint_never_opens_the_next_utterance():
+def test_punctuation_after_an_endpoint_leads_the_next_utterance():
+    # Kept, not deleted: the consumer joins ". charlie, delta" to "alpha
+    # bravo" without a space.
     with running() as client:
         _, events, _ = session(client, ["alpha", "bravo", 0.8, ".", 0.8, "charlie", ",", "delta", 0.8])
-    assert [f["text"] for f in finals(events)] == ["alpha bravo", "charlie, delta"]
+    assert [f["text"] for f in finals(events)] == ["alpha bravo", ". charlie, delta"]
 
 
 def test_word_pieces_join_into_one_word():
@@ -556,6 +626,9 @@ def test_metrics_text_uses_closed_label_sets_only():
         assert metrics_value(client, 'stt_stream_events_total{kind="final"}') == 1
         assert metrics_value(client, 'stt_stream_events_total{kind="done"}') == 1
         assert metrics_value(client, 'stt_stream_audio_seconds_total{profile="fast"}') == pytest.approx(0.32 + 0.8)
+        # Every rejection reason, "other" included, is a series from the start.
+        for reason in ("unauthorized", "not_ready", "protocol", "language", "capacity", "other"):
+            assert metrics_value(client, f'stt_stream_rejections_total{{reason="{reason}"}}') == 0
     allowed = {
         "profile": {"fast"}, "outcome": set(server.OUTCOMES), "reason": set(server.REJECT_REASONS),
         "kind": set(server.EVENT_KINDS), "le": None,
@@ -591,7 +664,7 @@ def test_no_transcript_audio_or_token_reaches_the_logs(caplog):
     with caplog.at_level(logging.DEBUG):
         with running() as client:
             _, events, _ = session(client, ["secretword", "alpha", 0.8])
-            with pytest.raises(WebSocketDenialResponse):
+            with pytest.raises(WebSocketDisconnect):
                 with connect(client, headers={"authorization": "Bearer wrong-key-1-wrong-key-1"}):
                     pass
     assert [f["text"] for f in finals(events)] == ["secretword alpha"]
@@ -599,3 +672,294 @@ def test_no_transcript_audio_or_token_reaches_the_logs(caplog):
     assert "stream closed" in logged
     for secret in ("secretword", "alpha", TOKEN, "wrong-key-1"):
         assert secret not in logged
+
+
+# -- the resume point (review finding M1) ---------------------------------------------
+
+def test_a_reconnect_that_resumes_from_the_last_finals_end_repeats_no_word():
+    # The browser keeps the last 60 s of PCM and, after a drop, resumes from
+    # committedUntil = the largest end_sample of the finals it saw
+    # (frontend/lib/voiceLive.ts resumePoint). The socket drops 0.32 s into
+    # the second utterance, after the first one's final.
+    parts = [0.32, "alpha", "bravo", "charlie", 0.8, "delta", "echo", "foxtrot", 0.8]
+    pcm = speech(parts)
+    cut = len(speech(parts[:6]))
+    with running() as client:
+        with connect(client) as ws:
+            start(ws)
+            send_pcm(ws, pcm[:cut])
+            first = finals(read_until(ws, lambda e: e["type"] == "final"))
+        resume = max(f["end_sample"] for f in first)
+        with connect(client) as ws:
+            start(ws, first_sample=resume, first_u=first[-1]["u"] + 1)
+            send_pcm(ws, pcm[resume:])
+            ws.send_text('{"type":"flush"}')
+            events, code = drain(ws)
+    second = finals(events)
+    assert code == 1000
+    heard = [w for f in first + second for w in f["text"].split()]
+    assert heard == ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
+    assert second[0]["u"] == 1 and second[0]["start_sample"] == dict(positions(parts))["delta"]
+
+
+# -- a Stop is not held behind a neighbour (review finding M2) ------------------------
+
+def test_a_stop_gets_done_while_a_neighbours_replay_is_still_decoding():
+    # Two streams on ONE decode worker. X replays a 60 s backlog, as a
+    # reconnect does; Y says two words and stops. The decoder is then given
+    # 40 steps: enough for all of Y, a tenth of X. Y's last final and `done`
+    # must arrive inside those 40 steps -- the gateway waits 5 s for `done`,
+    # and under overload the decode loop never runs dry at all.
+    made = []
+    with running(make_settings(workers=1), fake_factory(made=made)) as client:
+        recognizer = made[0]
+        recognizer.permits = threading.Semaphore(0)
+        backlog = []
+        while len(speech(backlog)) < 60 * 16000:
+            backlog += ["alpha", "bravo", "charlie", 0.8]
+        y_parts = [0.32, "delta", "echo", 0.32]
+        with connect(client) as x, connect(client) as y:
+            start(x, first_sample=16000 * 600)
+            start(y)
+            send_pcm(x, speech(backlog), frame=8192)
+            send_pcm(y, speech(y_parts))
+            y.send_text('{"type":"flush"}')
+            y.send_text('{"type":"ping","t":1}')
+            assert recv_json(y) == {"type": "pong", "t": 1}  # the flush is in Y's inbox
+            wait_all_audio_in(client, backlog, y_parts)
+            before = len(recognizer.batches)
+            recognizer.permits.release(40)
+            events = read_until(y, lambda e: e["type"] == "done", timeout=5)
+            assert [f["text"] for f in finals(events)] == ["delta echo"]
+            assert len(recognizer.batches) - before <= 40  # X's backlog is nowhere near decoded
+            recognizer.permits.release(100_000)
+            x.send_text('{"type":"flush"}')
+            x_events, code = drain(x, timeout=30)
+    assert code == 1000 and words_of(x_events) == [w for w in backlog if isinstance(w, str)]
+
+
+# -- the engine's decode budget (review finding M3) -------------------------------------
+
+def test_admission_refuses_beyond_the_engines_decode_budget():
+    # fast (160 ms) costs 2 units, wide (560 ms) 1, and the budget is 5: two
+    # fast streams and one wide one fill it although both profiles have
+    # slots left. A nearly spent budget sends a stream to the cheap profile.
+    settings = make_settings(profiles=(make_profile("fast", 160, 4), make_profile("wide", 560, 8)), max_cost=5)
+    with running(settings) as client:
+        assert client.get("/health").json()["capacity"] == 5
+        with connect(client) as a, connect(client) as b, connect(client) as c:
+            assert start(a)["profile"] == "fast"
+            assert start(b)["profile"] == "fast"
+            assert start(c)["profile"] == "wide"
+            with connect(client) as d:
+                d.send_text(start_message())
+                events, code = drain(d)
+            assert code == 4429 and (events[0]["code"], events[0]["retryable"]) == ("capacity", True)
+            body = client.get("/health").json()
+            assert body["streams"] == 3 and body["cost"] == {"budget": 5, "in_use": 5}
+            assert [p["cost"] for p in body["profiles"]] == [2, 1]
+            assert metrics_value(client, "stt_stream_cost_in_use_units") == 5
+            assert metrics_value(client, "stt_stream_cost_budget_units") == 5
+        # Every place is handed back when its stream closes.
+        assert client.get("/health").json()["cost"]["in_use"] == 0
+        with connect(client) as e:
+            assert start(e)["profile"] == "fast"
+        assert metrics_value(client, 'stt_stream_rejections_total{reason="capacity"}') == 1
+
+
+# -- renewal at every safe point, the default (spec section 11) ---------------------------
+
+def test_renewing_right_after_every_final_loses_nothing():
+    # The most aggressive setting (0.6 s: AT every endpoint) puts a fresh
+    # stream's seam after every utterance, so it tests the seam hardest.
+    made = []
+    renewals = 'stt_stream_renewals_total{profile="fast"}'
+    parts, seen = [0.32], []
+    with running(make_settings(renew_silence_s=0.6), fake_factory(made=made)) as client, connect(client) as ws:
+        start(ws, first_sample=16000, language="hi")
+        send_pcm(ws, speech([0.32]))
+        for i in range(6):
+            segment = [WORDS[(2 * i + k) % 26] for k in range(2)] + [1.12]
+            parts += segment
+            send_pcm(ws, speech(segment))
+            seen += finals(read_until(ws, lambda e: e["type"] == "final"))
+            wait_for(client, renewals, i + 1)  # right after the final, in its silence
+        ws.send_text('{"type":"flush"}')
+        events, code = drain(ws)
+    assert code == 1000 and not finals(events)
+    spoken = [p for p in parts if isinstance(p, str)]
+    assert [f["text"].split() for f in seen] == [spoken[k:k + 2] for k in range(0, 12, 2)]
+    at = [p for _, p in positions(parts)]
+    assert [f["start_sample"] for f in seen] == [16000 + at[k] for k in range(0, 12, 2)]
+    streams = client_streams(made)
+    assert len(streams) == 7 and made[0].resets == 0
+    for index, stream in enumerate(streams[1:]):
+        # A fresh stream gets the language again, the lead silence, and a
+        # seed from where the last final ended: in its silence, so the first
+        # sound in it is the NEXT utterance's first word, never a committed one.
+        assert stream.options == {"language": "hi"}
+        assert not stream.audio[:LEAD + 4800].any()
+        voiced = np.flatnonzero(stream.audio)
+        if index + 1 < 6:
+            assert stream.audio[voiced[0]] == VALUE[spoken[2 * (index + 1)]]
+
+
+def test_by_default_a_stream_renews_after_a_pause_between_thoughts_not_inside_one():
+    # Settings.renew_silence_s: 2.0 s of silence since the last token. Short
+    # pauses (1.12 s) end utterances without a renewal; a long one renews.
+    renewals = 'stt_stream_renewals_total{profile="fast"}'
+    parts, seen = [0.32], []
+    with running() as client, connect(client) as ws:
+        start(ws)
+        send_pcm(ws, speech([0.32]))
+        for i, pause in enumerate([1.12, 1.12, 2.72, 1.12]):
+            segment = [WORDS[(2 * i + k) % 26] for k in range(2)] + [pause]
+            parts += segment
+            send_pcm(ws, speech(segment))
+            seen += finals(read_until(ws, lambda e: e["type"] == "final"))
+            if pause > 2:
+                wait_for(client, renewals, 1)
+            else:
+                assert metrics_value(client, renewals) == (1 if i > 2 else 0)
+        ws.send_text('{"type":"flush"}')
+        rest, code = drain(ws)
+        assert metrics_value(client, renewals) == 1
+    assert code == 1000 and not finals(rest)
+    assert [w for f in seen for w in f["text"].split()] == [p for p in parts if isinstance(p, str)]
+
+
+def test_renewal_at_every_final_keeps_a_recognizers_rule_3_from_latching():
+    # Scaled down: a recognizer whose rule 3 fires 6 s into a stream (the
+    # real one counts from the stream's creation and nothing resets it). A
+    # stream that reached it would hold the endpoint for good: no endpoint
+    # finals after it. Renewing at every final restarts the stream's clock.
+    renewals = 'stt_stream_renewals_total{profile="fast"}'
+    settings = make_settings(max_utterance_s=10.0, renew_silence_s=0.6)
+    with running(settings, fake_factory(rule3_s=6.0)) as client, connect(client) as ws:
+        start(ws)
+        seen = []
+        for i in range(10):  # 10 x 1.6 s: rule 3 would latch in the fourth
+            segment = [WORDS[(3 * i + k) % 26] for k in range(3)] + [1.12]
+            send_pcm(ws, speech(segment))
+            seen += finals(read_until(ws, lambda e: e["type"] == "final", timeout=3))
+            wait_for(client, renewals, i + 1)
+        ws.send_text('{"type":"flush"}')
+        rest, code = drain(ws)
+    assert code == 1000 and not finals(rest)
+    assert [(f["u"], f["endpoint_ms"], len(f["text"].split())) for f in seen] == [(i, 600, 3) for i in range(10)]
+
+
+# -- start.mode "meeting" (spec section 11) -----------------------------------------------
+
+def test_a_meeting_stream_holds_an_utterance_through_a_pause_that_ends_one_in_dictation():
+    parts = [0.32, "alpha", "bravo", 0.64, "charlie", "delta", 1.6]
+    with running() as client:
+        _, dictation, _ = session(client, parts)
+        ready, meeting, code = session(client, parts, mode="meeting")
+    assert ready["mode"] == "meeting" and code == 1000
+    assert [f["text"] for f in finals(dictation)] == ["alpha bravo", "charlie delta"]
+    assert [(f["text"], f["endpoint_ms"]) for f in finals(meeting)] == [("alpha bravo charlie delta", 900)]
+
+
+def test_a_meeting_stream_forces_a_long_utterance_out_at_its_own_cap():
+    words = [WORDS[i % 26] for i in range(40)]  # 6.4 s with no pause
+    settings = make_settings(max_utterance_s=30.0, meeting_max_utterance_s=2.0)
+    with running(settings) as client:
+        _, events, code = session(client, words + [1.6], mode="meeting")
+        _, plain, _ = session(client, words + [1.6])
+    assert code == 1000 and words_of(events) == words
+    forced = [f for f in finals(events) if f["endpoint_ms"] == 0]
+    assert len(forced) >= 2 and all((f["end_sample"] - f["start_sample"]) / 16000 <= 2.2 for f in forced)
+    assert finals(events)[-1]["endpoint_ms"] == 900
+    assert [f["endpoint_ms"] for f in finals(plain)] == [600]  # dictation's cap is its own 30 s
+
+
+# -- robustness (review finding L3) ---------------------------------------------------------
+
+@pytest.mark.parametrize("text", ["[" * 5000 + "]" * 5000, '{"a":' * 3000 + "1" + "}" * 3000])
+def test_deeply_nested_json_after_start_is_a_protocol_error(text):
+    with running() as client, connect(client) as ws:
+        start(ws)
+        ws.send_text(text)
+        events, code = drain(ws)
+    assert code == 4400 and (events[-1]["code"], events[-1]["retryable"]) == ("protocol", False)
+
+
+@pytest.mark.parametrize("stamp", ["NaN", "Infinity", "-Infinity", "1e999"])
+def test_a_ping_must_carry_a_finite_number(stamp):
+    with running() as client, connect(client) as ws:
+        start(ws)
+        ws.send_text('{"type":"ping","t":%s}' % stamp)
+        events, code = drain(ws)
+    assert code == 4400 and events[-1]["code"] == "protocol"
+    assert not [e for e in events if e["type"] == "pong"]
+
+
+def test_an_event_that_cannot_be_encoded_fails_the_stream_and_says_so(monkeypatch, caplog):
+    encode = server._dumps
+
+    def broken(event):
+        if event.get("type") == "partial":
+            raise ValueError("Out of range float values are not JSON compliant")
+        return encode(event)
+
+    monkeypatch.setattr(server, "_dumps", broken)
+    with caplog.at_level(logging.DEBUG), running() as client, connect(client) as ws:
+        start(ws)
+        send_pcm(ws, speech(["secretword", "alpha", 0.8]))
+        events, code = drain(ws, timeout=5)
+    assert code == 4500 and (events[-1]["code"], events[-1]["retryable"]) == ("internal", True)
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "a partial event could not be encoded (ValueError)" in logged
+    assert "secretword" not in logged
+
+
+# -- the message ceiling (spec section 11) ---------------------------------------------------
+
+def test_a_flood_of_tiny_frames_is_refused_by_the_message_ceiling():
+    # One sample a frame: the SAMPLE ceiling never notices them. With no
+    # resume allowance the message ceiling is (elapsed + 5 s) x 50 a second.
+    with running(make_settings(resume_max_s=0.0)) as client:
+        with connect(client) as ws:
+            start(ws)
+            for _ in range(1000):
+                ws.send_bytes(b"\x00\x00")
+            ws.send_text('{"type":"flush"}')
+            events, code = drain(ws)
+        assert metrics_value(client, 'stt_stream_streams_total{profile="fast",outcome="rate_limited"}') == 1
+    assert code == 4429 and (events[-1]["code"], events[-1]["retryable"]) == ("rate_limited", True)
+
+
+def test_a_flood_of_pings_is_refused_by_the_same_ceiling():
+    with running(make_settings(resume_max_s=0.0)) as client, connect(client) as ws:
+        start(ws)
+        for i in range(1000):
+            ws.send_text('{"type":"ping","t":%d}' % i)
+        ws.send_text('{"type":"flush"}')
+        events, code = drain(ws)
+    assert code == 4429 and events[-1]["code"] == "rate_limited"
+    assert 0 < len([e for e in events if e["type"] == "pong"]) < 1000
+
+
+def test_a_shorter_frame_buys_more_messages_and_a_longer_one_no_fewer():
+    assert (server.message_rate(40), server.message_rate(20), server.message_rate(10)) == (50, 100, 200)
+    assert (server.message_rate(5), server.message_rate(100), server.message_rate(-3)) == (200, 50, 200)
+    with running(make_settings(resume_max_s=0.0)) as client, connect(client) as ws:
+        start(ws, frame_ms=10)  # 1,000 messages at the start instead of 250
+        for _ in range(600):
+            ws.send_bytes(b"\x00\x00")
+        ws.send_text('{"type":"flush"}')
+        events, code = drain(ws)
+    assert code == 1000 and events[-1] == {"type": "done"}
+
+
+# -- the compute counter (spec section 11) ----------------------------------------------------
+
+def test_every_stream_of_a_decode_call_is_charged_the_whole_call():
+    metrics = server.Metrics(["p"])
+    metrics.decode_step("p", 0.25, 3)
+    metrics.decode_step("p", 0.5, 1)
+    values = dict(line.rsplit(" ", 1) for line in metrics.render([]).splitlines() if not line.startswith("#"))
+    assert float(values['stt_stream_compute_seconds_total{profile="p"}']) == 0.25 * 3 + 0.5
+    assert float(values['stt_stream_decode_step_seconds_sum{profile="p"}']) == 0.75
+    assert float(values['stt_stream_batch_size_sum{profile="p"}']) == 4

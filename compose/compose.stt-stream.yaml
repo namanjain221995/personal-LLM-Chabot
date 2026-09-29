@@ -17,7 +17,8 @@
 # measured 2026-09-29, 12 streams on ~5 cores left chat decode unchanged, but
 # all 20 cores saturated cost chat 11-16%. So the container gets the ten
 # Cortex-X925 cores as its cpuset, at most 8 cores' worth of time within
-# them, and every profile refuses streams above its capacity.
+# them; every profile refuses streams above its capacity, and the engine
+# refuses any stream its decode budget (STT_MAX_COST) cannot pay for.
 #
 # BINDING. The management address only (STT_BIND, required, no default),
 # never 0.0.0.0 and never a 10.100.x RoCE address; the process binds it
@@ -52,6 +53,20 @@ services:
       # live final lands 0.68-0.83 s (p50) after the speaker stops.
       STT_ENDPOINT_S: "${STT_ENDPOINT_S:-0.6}"
       STT_MAX_UTTERANCE_S: "${STT_MAX_UTTERANCE_S:-30}"
+      # A fresh recognizer stream after every final whose silence reaches
+      # this (0 = never): measured, renewing after 2.0 s took FLEURS Hindi
+      # from 15.78% to 12.4-12.9% WER for at most 0.5 points of English,
+      # where renewing at every 0.6 s endpoint cost English 2.2 (server.py,
+      # Settings.renew_silence_s).
+      STT_RENEW_SILENCE_S: "${STT_RENEW_SILENCE_S:-2.0}"
+      # THE DECODE BUDGET, across all four profiles: a 160 ms stream costs 2
+      # units and a 560 ms stream 1 ("cost" below; measured: 0.41 core per
+      # 160 ms stream, half that at 560 ms). 32 units are the ~16 real-time
+      # 160 ms streams the 8 cores decode (6.6 cores), or 32 at 560 ms,
+      # leaving ~1.4 cores of headroom. The profiles' own max_streams add up
+      # to 56 units, so this is what refuses first under load (capacity, a
+      # retryable 4429) instead of every stream falling behind.
+      STT_MAX_COST: "${STT_MAX_COST:-32}"
       STT_IDLE_S: "${STT_IDLE_S:-60}"
       # Silence in front of every new stream (build spec 8C): Nemotron 3.5
       # drops the first word without it (27/30 kept with 160 ms, 4/30 with 0).
@@ -68,13 +83,13 @@ services:
       # offered: both models read it at 104% WER. Changing a profile is an
       # edit to this file, reviewed, not an environment knob.
       STT_PROFILES: >-
-        [{"id": "en-fast", "dir": "/models/en-160", "chunk_ms": 160, "max_streams": 8,
+        [{"id": "en-fast", "dir": "/models/en-160", "chunk_ms": 160, "max_streams": 8, "cost": 2,
           "model": "nemotron-speech-streaming-en-0.6b-160ms-int8", "languages": ["en"]},
-         {"id": "multi-fast", "dir": "/models/multi-160", "chunk_ms": 160, "max_streams": 8,
+         {"id": "multi-fast", "dir": "/models/multi-160", "chunk_ms": 160, "max_streams": 8, "cost": 2,
           "model": "nemotron-3.5-asr-streaming-0.6b-160ms-int8", "languages": ["auto", "hi", "en"]},
-         {"id": "en-wide", "dir": "/models/en-560", "chunk_ms": 560, "max_streams": 12,
+         {"id": "en-wide", "dir": "/models/en-560", "chunk_ms": 560, "max_streams": 12, "cost": 1,
           "model": "nemotron-speech-streaming-en-0.6b-560ms-int8", "languages": ["en"]},
-         {"id": "multi-wide", "dir": "/models/multi-560", "chunk_ms": 560, "max_streams": 12,
+         {"id": "multi-wide", "dir": "/models/multi-560", "chunk_ms": 560, "max_streams": 12, "cost": 1,
           "model": "nemotron-3.5-asr-streaming-0.6b-560ms-int8", "languages": ["auto", "hi", "en"]}]
     volumes:
       # The pinned revisions in the cluster's model cache, read-only, one
@@ -100,15 +115,15 @@ services:
     network_mode: host
     cpuset: "5-9,15-19"
     cpus: 8
-    # NO mem_limit YET, although the build spec asks for 8g. Four recognizers,
-    # ONE per profile shared by its decode threads (build spec 8B), measured
-    # on the worker 2026-09-29: 3.58 GB of RSS loaded, 4.08 GB with twelve
-    # streams open. Unlike the GPU engines this memory IS charged to the
-    # cgroup, so a limit would mean something here; but the repository takes
-    # a hard limit only as a deliberate, measured exception in
-    # launcher/tests/test_oom_score_adj.py (NoServiceGainsAHardMemoryLimitTests),
-    # so the 8g goes in there and here together. Until then oom_score_adj
-    # below keeps the engine first in the kernel's line.
+    # A HARD MEMORY LIMIT, the one deliberate exception in the repository
+    # (launcher/tests/test_oom_score_adj.py, NoServiceGainsAHardMemoryLimitTests).
+    # Four recognizers, ONE per profile shared by its decode threads (build
+    # spec 8B), measured on the worker 2026-09-29: 3.58 GB of RSS loaded,
+    # 4.08 GB with twelve streams open. Unlike the GPU engines this memory IS
+    # charged to the container's cgroup, so the limit bounds the whole engine;
+    # 8g is twice the measured peak, and a leak ends in a restart of this
+    # preview rather than in the kernel choosing among the node's processes.
+    mem_limit: 8g
     # FIRST IN LINE FOR THE KERNEL'S OOM KILLER, beside the OCR engine
     # (OPERATIONS.md section 14): an optional preview whose loss costs nothing
     # (whisper stays authoritative) and whose restart is clean. Set at CREATE

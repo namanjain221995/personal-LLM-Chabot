@@ -51,6 +51,9 @@ for _i, _w in enumerate(WORDS):
 PIECES = {" sau": 3000, "ce": 3016, ",": 3032, ".": 3048}
 for _p, _v in PIECES.items():
     VOCAB[_v] = _p
+#: A word spoken so softly (int16 160, -46 dBFS) that no level rule hears its
+#: onset: the recognizer still does.
+VOCAB[160] = " hush"
 VALUE: Dict[str, int] = {tok.strip(): v for v, tok in VOCAB.items()}
 
 
@@ -128,6 +131,9 @@ class FakeRecognizer:
         #: When set, decode_streams waits for it: a test holds the decoder
         #: back while audio queues up, to reach a state on purpose.
         self.gate: Optional[threading.Event] = None
+        #: When set, every decode_streams call first takes one permit: a test
+        #: grants N decode steps and the decoder stops after them, mid-backlog.
+        self.permits: Optional[threading.Semaphore] = None
         self.streams: List[FakeStream] = []
         self.batches: List[int] = []
         self.resets = 0
@@ -150,6 +156,8 @@ class FakeRecognizer:
     def decode_streams(self, streams: Sequence[FakeStream]) -> None:
         if self.gate is not None:
             assert self.gate.wait(10), "the test never opened the gate"
+        if self.permits is not None:
+            assert self.permits.acquire(timeout=10), "the test never granted another decode step"
         if self.fail_decode:
             raise RuntimeError("fake decode failure")
         with self._lock:
@@ -209,13 +217,13 @@ class FakeRecognizer:
 
 
 def fake_factory(*, lookahead_ms: int = 160, with_timestamps: bool = True, fail_decode: bool = False,
-                 made: Optional[List[FakeRecognizer]] = None):
+                 rule3_s: float = 3600.0, made: Optional[List[FakeRecognizer]] = None):
     """A recognizer factory for create_app: the engine calls it once per profile."""
 
     def build(profile, settings) -> FakeRecognizer:
         recognizer = FakeRecognizer(chunk_ms=profile.chunk_ms, lookahead_ms=lookahead_ms,
-                                    rule2_s=settings.endpoint_s, with_timestamps=with_timestamps,
-                                    fail_decode=fail_decode)
+                                    rule2_s=settings.endpoint_s, rule3_s=rule3_s,
+                                    with_timestamps=with_timestamps, fail_decode=fail_decode)
         if made is not None:
             made.append(recognizer)
         return recognizer
