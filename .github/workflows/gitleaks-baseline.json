@@ -96,9 +96,23 @@
     "    git rebase + ff    -> they blame a rewritten commit     -> 3 new, 3 stale, exit 1",
     "  A true fast-forward is impossible today in any case: the merge base is 1f80aa3a,",
     "  so `git merge-base --is-ancestor origin/dev <branch>` is FALSE and the only safe",
-    "  route is a real merge commit."
+    "  route is a real merge commit.",
+    "",
+    "2026-09-29 (reviewed, one entropy hit from the voice recorder, not a credential):",
+    "  * frontend/tests/voice-session-messages.test.ts, commit 1795546, line 68",
+    "                            - the clientKey a recording-session test opens with: a",
+    "                              fabricated v4 UUID the browser generates per recording",
+    "                              so a retried POST /audio/sessions is idempotent. It is",
+    "                              a request label, the same shape as the Idempotency-Key",
+    "                              entries above, and authorises nothing.",
+    "  FOUND BY: gitleaks in `git` mode over a clone holding origin's branches plus the",
+    "  voice integration head, before its first push. Commit 1795546 is ALREADY on",
+    "  origin (feat/voice-recordings-page, fix/voice-recorder-edges), and the security",
+    "  job checks out with fetch-depth 0, so without this entry every run fails on it,",
+    "  not only the voice integration. The same rule as fd71830: merge, never squash",
+    "  and never rebase the recorder commit."
   ],
-  "reviewed": "2026-09-27",
+  "reviewed": "2026-09-29",
   "findings": [
     {
       "fingerprint": "187d950902882905b969149fdd2ffc8f24eb73d5:docs/_evidence/sync-worker.md:generic-api-key:230",
@@ -249,6 +263,12 @@
       "rule": "generic-api-key",
       "file": "e2e/ci/tests/redact.test.js",
       "line": 25
+    },
+    {
+      "fingerprint": "17955462478af991c3c17e28d565eec2a4613eb7:frontend/tests/voice-session-messages.test.ts:generic-api-key:68",
+      "rule": "generic-api-key",
+      "file": "frontend/tests/voice-session-messages.test.ts",
+      "line": 68
     }
   ]
 }
