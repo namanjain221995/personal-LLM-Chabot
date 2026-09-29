@@ -19,7 +19,9 @@
  *    start while this one still runs.
  *
  * A preload is the one place that runs before Next without forking it.
- * Nothing here changes a response, a header or a route.
+ * Nothing in this file changes a response, a header or a route. The one thing
+ * it installs that does, server-ws-relay.cjs (point 4), owns a single
+ * WebSocket path and states its own contract.
  *
  * WHAT IT DOES
  *
@@ -53,12 +55,31 @@
  *        text/event-stream answer) are destroyed at +FRONTEND_DRAIN_SSE_S
  *        (15 s): the browser re-attaches to the answer the orchestrator is
  *        still producing;
+ *      · WebSocket relays, and upgrades nobody answered, are destroyed at
+ *        +FRONTEND_DRAIN_WS_S (2 s), and no new relay starts (point 4);
  *      · everything else — uploads above all — is left to finish, up to
  *        compose's 5-minute stop_grace_period, because an upload cut here is
  *        work the user has to redo;
  *      · each connection is closed as soon as its response ends, so Next's
  *        `server.close()` resolves, and the process exits, the moment the last
  *        upload is done.
+ *
+ * 4. Upgrades (2026-09-29, real-time dictation). A WebSocket handshake is an
+ *    'upgrade' event, never a 'request', so nothing above ever sees one, and
+ *    Next's `server.close()` waits for every upgraded socket. Two things
+ *    cover that:
+ *      · server-ws-relay.cjs, installed on the server here, owns the live
+ *        dictation path and relays it to the orchestrator. It is required
+ *        fail-soft: live dictation is a best-effort preview beside the stored
+ *        recording, and a relay that cannot load must not take the site down
+ *        with it (the load failure is logged, `ws_relay_unavailable`);
+ *      · every other upgrade that nothing has answered after
+ *        FRONTEND_WS_STRAY_S (10 s) is destroyed. Next leaves an upgrade on a
+ *        path it has no route for open with no answer, and one such socket
+ *        held a deploy's SIGTERM exit for as long as its client liked
+ *        (measured 2026-09-29 against a 16.3.3 standalone build). An upgrade
+ *        that was answered — something wrote to it and did not end it — is
+ *        left alone.
  *
  * DECLINED (design, "declined sub-fixes"): `server.maxConnections`. A fixed
  * cap would refuse chat under load; the body-idle guard is what addresses a
@@ -81,16 +102,28 @@ const SERVER_TIMERS = Object.freeze({
 });
 
 function settings() {
+  const stray = envSeconds('FRONTEND_WS_STRAY_S', 10);
   return {
     bodyIdleMs: envSeconds('FRONTEND_BODY_IDLE_S', 60) * 1000,
     v1AbortMs: envSeconds('FRONTEND_DRAIN_V1_S', 2) * 1000,
     sseAbortMs: envSeconds('FRONTEND_DRAIN_SSE_S', 15) * 1000,
+    wsAbortMs: envSeconds('FRONTEND_DRAIN_WS_S', 2) * 1000,
+    // The stray guard cannot be turned off: 0 means the default, not "never".
+    strayUpgradeMs: (stray > 0 ? stray : 10) * 1000,
   };
 }
 
 function log(event, fields = {}) {
   // One JSON line, like the gateway's, so both edges grep the same way.
   process.stdout.write(`${JSON.stringify({ component: 'server-preload', event, ...fields })}\n`);
+}
+
+// Point 4. Beside this file in the image (frontend/Dockerfile copies both).
+let wsRelay = null;
+try {
+  wsRelay = require('./server-ws-relay.cjs');
+} catch (err) {
+  log('ws_relay_unavailable', { error: String((err && (err.code || err.name)) || 'load_failed') });
 }
 
 /** `v1`, `sse` or `other`, from the path alone (the response can upgrade it). */
@@ -109,13 +142,66 @@ function isEventStream(value) {
 const servers = new Set();
 let draining = false;
 
+/**
+ * Nobody has answered this upgrade: nothing was written to it, or it was only
+ * ended (Next `socket.end()`s one on a route's path, and a client that never
+ * closes its side would keep that half-open socket). A socket something wrote
+ * to and did not end is somebody's live upgrade, and is not this file's.
+ */
+function isUnanswered(socket) {
+  return !socket.destroyed && (socket.bytesWritten === 0 || socket.writableEnded);
+}
+
+/**
+ * Point 4's stray guard. Registered before the relay is installed, so it sees
+ * every upgrade; the relay's own paths it leaves to the relay — when a relay
+ * is installed on this server, and otherwise they are strays like any other.
+ */
+function guardStrayUpgrades(server, strayMs) {
+  const strays = new Set();
+  server.on('upgrade', (req, socket) => {
+    if (server.wsRelay && wsRelay.ownedSessionId(req.url) !== null) return;
+    // Node took its own 'error' listener off this socket when it emitted
+    // 'upgrade', and Next adds none to a path it ignores: without one, a
+    // reset on a socket nobody answered is an uncaught exception.
+    socket.on('error', () => socket.destroy());
+    const entry = { socket, path: String(req.url ?? '').split('?')[0].slice(0, 128), since: Date.now(), timer: null };
+    const release = () => {
+      clearTimeout(entry.timer);
+      strays.delete(entry);
+    };
+    entry.timer = setTimeout(() => {
+      release();
+      if (!isUnanswered(socket)) return;
+      log('upgrade_unanswered', { path: entry.path, waited_ms: Date.now() - entry.since });
+      socket.destroy();
+    }, strayMs);
+    entry.timer.unref();
+    strays.add(entry);
+    socket.once('close', release);
+  });
+  return strays;
+}
+
 function track(server) {
   if (servers.has(server)) return;
   servers.add(server);
   Object.assign(server, SERVER_TIMERS);
-  const { bodyIdleMs } = settings();
+  const { bodyIdleMs, strayUpgradeMs } = settings();
   const inflight = new Set();
   server.inflight = inflight;
+
+  // Point 4. The guard first and the relay second: the relay prepends its own
+  // listener, and wraps every 'upgrade' listener added after it — Next's — so
+  // that its path never reaches one.
+  server.strayUpgrades = guardStrayUpgrades(server, strayUpgradeMs);
+  if (wsRelay) {
+    try {
+      server.wsRelay = wsRelay.install(server);
+    } catch (err) {
+      log('ws_relay_unavailable', { error: String((err && (err.code || err.name)) || 'install_failed') });
+    }
+  }
 
   // prependListener: tracking must be in place before the application's own
   // listener runs, or a handler that writes its head synchronously would be
@@ -206,11 +292,26 @@ function destroyKind(kind) {
   if (count) log('drain_abort', { kind, count });
 }
 
+/** WebSocket relays and unanswered upgrades: server.close() waits for each. */
+function destroyUpgrades() {
+  let count = 0;
+  for (const server of servers) {
+    if (server.wsRelay) count += server.wsRelay.destroyAll('drain');
+    for (const entry of [...(server.strayUpgrades ?? [])]) {
+      if (!isUnanswered(entry.socket)) continue;
+      entry.socket.destroy();
+      count += 1;
+    }
+  }
+  if (count) log('drain_abort', { kind: 'ws', count });
+}
+
 function onTerminate(signal) {
   if (draining) return;
   draining = true;
-  const { v1AbortMs, sseAbortMs } = settings();
+  const { v1AbortMs, sseAbortMs, wsAbortMs } = settings();
   let inflight = 0;
+  let upgrades = 0;
   // Idle keep-alive connections are closed by Next's own server.close(), which
   // on Node 20 calls closeIdleConnections() (measured: tests/server-preload.test.ts).
   for (const server of servers) {
@@ -224,10 +325,25 @@ function onTerminate(signal) {
         }
       }
     }
+    // A relay started now would outlive the drain below; the browser retries
+    // and reaches the new container instead.
+    if (server.wsRelay) {
+      server.wsRelay.beginDrain();
+      upgrades += server.wsRelay.size;
+    }
+    upgrades += server.strayUpgrades ? server.strayUpgrades.size : 0;
   }
-  log('drain_start', { signal, inflight, v1_abort_ms: v1AbortMs, sse_abort_ms: sseAbortMs });
+  log('drain_start', {
+    signal,
+    inflight,
+    upgrades,
+    v1_abort_ms: v1AbortMs,
+    sse_abort_ms: sseAbortMs,
+    ws_abort_ms: wsAbortMs,
+  });
   setTimeout(() => destroyKind('v1'), v1AbortMs).unref();
   setTimeout(() => destroyKind('sse'), sseAbortMs).unref();
+  setTimeout(destroyUpgrades, wsAbortMs).unref();
 }
 
 // Registered before Next's own handler (a preload runs first), and it never
