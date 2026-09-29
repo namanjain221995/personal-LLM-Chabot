@@ -618,9 +618,12 @@ class VLLMAudioProvider:
         filename: str,
         content_type: str,
         timeout_s: Optional[float] = None,
+        no_speech_check: bool = False,
     ) -> WindowReply:
         """One recording-session window -> segments and the engine's
-        no-speech probability, with the engine's silence gate OFF.
+        no-speech probability, with the engine's silence gate OFF unless
+        `no_speech_check` (then the probability is a real one: with the gate
+        off compose/whisper/server.py reports 0.0 for everything).
 
         The gate judges the FIRST 30 s of a clip, and a session window is a
         stretch of audio that voice-activity detection already found speech
@@ -633,7 +636,7 @@ class VLLMAudioProvider:
             filename,
             content_type,
             segments=True,
-            no_speech_check=False,
+            no_speech_check=no_speech_check,
             timeout_s=timeout_s,
         )
         assert isinstance(result, TranscriptSegments)
@@ -817,6 +820,50 @@ def _only_stock_phrases(text: str) -> bool:
     ]
     parts = [part for part in parts if part]
     return bool(parts) and all(part in _STOCK_PHRASES for part in parts)
+
+
+def window_was_gated(reply: "WindowReply") -> bool:
+    """A session window asked WITH the gate came back empty because the gate
+    fired (its no-speech probability is over the engine's threshold)."""
+    return (
+        not (reply.transcript.text or "").strip()
+        and reply.no_speech_prob is not None
+        and reply.no_speech_prob > _ENGINE_NO_SPEECH_THRESHOLD
+    )
+
+
+def window_is_plausible(
+    text: str,
+    seconds: float,
+    segments: Sequence[Dict[str, Any]],
+    *,
+    vad_speech_s: float,
+    gated: bool,
+    no_speech_prob: Optional[float],
+) -> bool:
+    """A recording-session window's words are speech rather than invention.
+
+    Asked WITH the gate (2026-09-29): the no-speech probability is then a
+    real one. Gated windows were decoded again without it and their words
+    must be as dense as speech over what voice-activity detection heard, and
+    not only a stock phrase. A window the gate let through keeps its words
+    (`speech_is_plausible`), except a lone stock phrase the engine was not
+    sure of, which must be as dense as speech over the VAD-speech seconds:
+    live, 11 s of pink noise at -30 dBFS decoded as "Thank you for watching."
+    (4 words over 11 s of what VAD called speech, 0.36 words/s) while a real
+    "Thank you." is a second of speech (2 words/s)."""
+    units = _speech_units(text)
+    if units == 0:
+        return False
+    density = units / max(float(vad_speech_s), 1.0)
+    if gated:
+        return density >= _GATED_MIN_WORDS_PER_S and not _only_stock_phrases(text)
+    heard = no_speech_prob is None or no_speech_prob <= _ENGINE_NO_SPEECH_THRESHOLD
+    if not speech_is_plausible(text, seconds, segments, engine_heard_speech=heard, no_speech_prob=no_speech_prob):
+        return False
+    if _only_stock_phrases(text) and (no_speech_prob is None or no_speech_prob >= _CONFIDENT_SPEECH_NSP):
+        return density >= _GATED_MIN_WORDS_PER_S
+    return True
 
 
 def speech_is_plausible(
@@ -1054,6 +1101,7 @@ class RoutedProvider:
         filename: str,
         content_type: str,
         timeout_s: Optional[float] = None,
+        no_speech_check: bool = False,
     ) -> WindowReply:
         return await self._routed(
             "transcribe_window",
@@ -1061,6 +1109,7 @@ class RoutedProvider:
             filename=filename,
             content_type=content_type,
             timeout_s=timeout_s,
+            no_speech_check=no_speech_check,
         )
 
     async def _routed(self, method: str, audio: bytes, **kwargs: Any):
@@ -1560,6 +1609,7 @@ async def transcribe_session_window(
     urgent: Any = False,
     short: Any = False,
     on_admitted: Optional[Any] = None,
+    no_speech_check: bool = False,
 ) -> WindowReply:
     """One recording-session window (WAV bytes) -> segments, under the
     session gate, with the engine's first-30-s silence gate OFF.
@@ -1592,7 +1642,7 @@ async def transcribe_session_window(
             # A stand-in provider without the session method: the same
             # request, without the no-speech probability.
             result = await engine.transcribe_segments(
-                audio, filename=filename, content_type="audio/wav", no_speech_check=False
+                audio, filename=filename, content_type="audio/wav", no_speech_check=no_speech_check
             )
             reply = WindowReply(result, None)
         else:
@@ -1601,6 +1651,7 @@ async def transcribe_session_window(
                 filename=filename,
                 content_type="audio/wav",
                 timeout_s=settings.voice_session_window_timeout_s,
+                no_speech_check=no_speech_check,
             )
     except ASRTimeout:
         SESSION_GATE.last_unavailable = time.monotonic()

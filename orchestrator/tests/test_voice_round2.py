@@ -335,3 +335,70 @@ def test_a_retried_create_is_answered_even_at_the_ceiling(voice, login_client, m
     assert again.status_code in (200, 201), again.text
     assert again.json()["session_id"] == first.json()["session_id"]
     assert create(login_client("bob")).status_code == 503
+
+
+# -- D. noise windows: asked with the gate, judged per VAD-speech second ----
+
+
+class _RealEngine:
+    """What compose/whisper/server.py answers, measured live 2026-09-29: with
+    the gate OFF no_speech_prob is 0.0 for everything; with it ON it is the
+    real number (0.0525 for pink noise at -30 dBFS, which passes the gate).
+    Every window here is room noise that decodes as a stock phrase."""
+
+    name = "whisper"
+    model = "whisper-test"
+
+    def __init__(self, *, gated_nsp: float = 0.0525, gate_empties: bool = False, words: str = "Thank you for watching."):
+        self.gated_nsp = gated_nsp
+        self.gate_empties = gate_empties
+        self.words = words
+        self.asked: List[bool] = []
+
+    async def transcribe_window(self, audio, *, filename, content_type, timeout_s=None, no_speech_check=False):
+        self.asked.append(bool(no_speech_check))
+        seconds = (len(audio) - 44) / (2 * 16000)
+        nsp = self.gated_nsp if no_speech_check else 0.0
+        if no_speech_check and self.gate_empties:
+            segments = ()
+        else:
+            segments = ({"start": 0.0, "end": min(seconds, 29.98), "text": self.words, "language": "en"},)
+        transcript = asr.TranscriptSegments(
+            text=" ".join(s["text"] for s in segments), language="English", language_code="en",
+            provider="whisper", model="whisper-test", engine_ms=5, segments=segments,
+        )
+        return asr.WindowReply(transcript, nsp)
+
+    async def health(self):
+        return True
+
+
+def test_a_noise_window_that_decodes_as_a_stock_phrase_is_dropped(voice, login_client):
+    """Live, window 108 of an hour (11 s of pink noise) came back "Thank you
+    for watching." and stayed in the transcript: the session asked with the
+    gate off, where the engine reports no_speech_prob 0.0, so no rule fired."""
+    engine = _RealEngine()
+    asr.set_provider(engine)
+    _script, data = recording(voice.tmp, 40.0, seed=31)
+    alice = login_client("alice")
+    sid = _store_and_finish(alice, data)
+    done = wait_done(alice, sid, timeout=60)
+    assert "watching" not in (done["text"] or "").lower(), done
+    assert done["gaps"] and all(g["reason"] == "dropped_as_noise" for g in done["gaps"]), done
+    assert engine.asked and engine.asked[0] is True, "each window is asked WITH the gate first"
+
+
+def test_a_window_the_gate_empties_is_asked_again_and_dense_speech_is_kept(voice, login_client):
+    """The first-30-s gate emptied real dictation that opened quietly
+    (2026-09-24); a gated window VAD heard speech in is asked again without
+    the gate, and words as dense as speech stand."""
+    words = " ".join(["alpha bravo charlie delta echo foxtrot golf hotel"] * 12) + "."
+    engine = _RealEngine(gated_nsp=0.83, gate_empties=True, words=words)
+    asr.set_provider(engine)
+    _script, data = recording(voice.tmp, 40.0, seed=32)
+    alice = login_client("alice")
+    sid = _store_and_finish(alice, data)
+    done = wait_done(alice, sid, timeout=60)
+    assert True in engine.asked and False in engine.asked, engine.asked
+    assert done["outcome"] == "transcribed", done
+    assert "foxtrot" in done["text"]
