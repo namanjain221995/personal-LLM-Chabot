@@ -7,6 +7,7 @@ the GPU, or any model runtime.
 from __future__ import annotations
 
 import os
+import sys
 
 from .core.exports import EXPORT_ROW_CAP, PREVIEW_ROW_CAP
 from .model_capabilities import (
@@ -1316,6 +1317,27 @@ class Settings:
         # long before the answer proceeds without it. A wedged sidecar costs
         # a request this budget, never the generation wall clock.
         self.knowledge_prepare_deadline_s: float = _float("KNOWLEDGE_PREPARE_DEADLINE_S", 12.0)
+        # KNOWLEDGE_WARM_ON_START — after the lifespan has started, one
+        # background task (app/core/knowledge_warm.py) runs a dense query, the
+        # topical page-vocabulary build and the reranker canary, so the first
+        # turns after a deploy do not pay for them. Measured cold on 2026-09-29:
+        # the first Fast turn took 2.5-3.7 s against about 0.7 s warm (dense
+        # table open 2.0-3.1 s, vocabulary build 3.9-6.6 s). Never awaited by
+        # start-up; failures are logged. Default on, except in a pytest
+        # process: the suite starts the lifespan hundreds of times and a
+        # warm-up there would dial the embedder and read the test database
+        # behind the tests' backs. Tests of the warm-up turn it on themselves.
+        self.knowledge_warm_on_start: bool = _bool(
+            "KNOWLEDGE_WARM_ON_START", "pytest" not in sys.modules
+        )
+        # CHAT_PREPASS_BESIDE_DECIDE — at Think and Max, dispatch the knowledge
+        # pre-pass BEFORE the orchestrate router call instead of after it,
+        # whenever every dispatch gate except "the plan wants the agent"
+        # already holds; the task is cancelled unread when the plan does pick
+        # the agent. decide() measured p50 555/655 ms and p95 1,057/1,324 ms
+        # (Think/Max, live traces, 14 days) in series before the dispatch.
+        # Fast is unaffected: its decide() makes no router call.
+        self.chat_prepass_beside_decide: bool = _bool("CHAT_PREPASS_BESIDE_DECIDE", True)
         # --- Fast pre-pass budget (performance plan item 2, 2026-09-13) ----
         # Measured over the 7 days before: Fast/chat time to first token p50
         # 1.46 s / p95 6.16 s against an engine TTFT of 0.05-0.2 s. The
