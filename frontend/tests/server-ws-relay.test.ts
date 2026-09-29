@@ -284,6 +284,13 @@ async function startUpstream(): Promise<Upstream> {
       socket.end(`HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`);
       return;
     }
+    if (mode === 'kick') {
+      // uvicorn's close after accept: 101, a close frame (4401), then the
+      // transport goes at once, without waiting for the client's close.
+      const code = Buffer.from([0x11, 0x31]);
+      socket.end(Buffer.concat([Buffer.from(switching), encodeFrame(0x8, code, false)]));
+      return;
+    }
     if (mode === 'silent') {
       // Reads (so a dropped connection is noticed) and never answers.
       socket.resume();
@@ -530,7 +537,8 @@ describe('same-origin, as the relay judges it', () => {
 
   it.each<[string, string, boolean]>([
     ['ai.example', 'https://ai.example', true],
-    ['ai.example', 'http://ai.example', true],
+    // No port means the TLS tunnel, so the page must be https as well.
+    ['ai.example', 'http://ai.example', false],
     ['ai.example:443', 'https://ai.example', true],
     ['AI.Example', 'https://ai.example', true],
     ['ai.example:8443', 'https://ai.example:8443', true],
@@ -831,9 +839,8 @@ describe('refused before any upstream connection exists', () => {
     ['Sec-Fetch-Site: none', (p: number) => browser(p, { 'Sec-Fetch-Site': 'none' })],
     ['no Sec-Fetch-Site at all', (p: number) => browser(p, { 'Sec-Fetch-Site': undefined })],
     ['a Host with no port and an https Origin', () => browser(0, { Host: 'app.test', Origin: 'https://app.test' })],
-    ['a Host with no port and an http Origin', () => browser(0, { Host: 'app.test', Origin: 'http://app.test' })],
     ['a Host and Origin on port 8443', () => browser(0, { Host: 'app.test:8443', Origin: 'https://app.test:8443' })],
-    ['an upper-case Host', () => browser(0, { Host: 'APP.test', Origin: 'http://app.test' })],
+    ['an upper-case Host', () => browser(0, { Host: 'APP.test', Origin: 'https://app.test' })],
     ['an Origin on FRONTEND_WS_ALLOWED_ORIGINS', (p: number) => browser(p, { Origin: 'https://allowed.example' })],
     ['a listed Origin written loosely in the setting', (p: number) => browser(p, { Origin: 'https://other.example:8443' })],
   ])('lets through %s', async (_what, headersFor) => {
@@ -841,6 +848,14 @@ describe('refused before any upstream connection exists', () => {
     const ws = handshake(app.port, PATH, headersFor(app.port));
     expect((await ws.answer).status).toBe(101);
     expect(upstream.seen.length).toBe(before + 1);
+    ws.socket.destroy();
+  });
+
+  it('refuses an http page for a Host with no port: that Host only comes through the TLS tunnel', async () => {
+    const before = upstream.seen.length;
+    const ws = handshake(app.port, PATH, browser(0, { Host: 'app.test', Origin: 'http://app.test' }));
+    expect((await ws.answer).status).toBe(403);
+    expect(upstream.seen.length).toBe(before);
     ws.socket.destroy();
   });
 
@@ -935,6 +950,27 @@ describe('limits', () => {
     const third = handshake(app.port, '/api/audio/sessions/echo-9/live', browser(app.port));
     expect((await third.answer).status).toBe(101);
     third.socket.destroy();
+    app.child.kill('SIGKILL');
+  });
+
+  it('gives a slot back as soon as the orchestrator closes its side, not after the close grace', async () => {
+    const app = await start({ ORCHESTRATOR_URL: `http://127.0.0.1:${upstream.port}`, FRONTEND_WS_MAX_RELAYS: '1' });
+    // A client that keeps its side half-open and never reads, while the
+    // orchestrator refuses it (101, close 4401, hang up). Its relay then sits
+    // in its close grace; it must not keep the only slot for all of it.
+    const raw = net.connect({ port: app.port, host: '127.0.0.1', allowHalfOpen: true });
+    raw.on('error', () => undefined);
+    const head = Object.entries(browser(app.port))
+      .filter(([, v]) => v !== undefined)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join('\r\n');
+    raw.write(`GET /api/audio/sessions/kick-1/live HTTP/1.1\r\n${head}\r\n\r\n`);
+    raw.pause();
+    await waitFor(() => upstream.seen.find((s) => s.url.includes('kick-1'))?.closed, 'the upstream to hang up');
+    const next = handshake(app.port, '/api/audio/sessions/echo-11/live', browser(app.port));
+    expect((await next.answer).status).toBe(101);
+    next.socket.destroy();
+    raw.destroy();
     app.child.kill('SIGKILL');
   });
 
@@ -1098,6 +1134,25 @@ describe('on SIGTERM', () => {
     expect(drain.find((e) => e.event === 'drain_start')).toMatchObject({ upgrades: 2, ws_abort_ms: 2_000 });
     expect(drain.find((e) => e.event === 'drain_abort')).toMatchObject({ kind: 'ws', count: 2 });
     expect(events(app.output()).find((e) => e.event === 'ws_close')).toMatchObject({ reason: 'drain' });
+  }, 15_000);
+
+  it('does not let a bare connection or a half-sent header block hold the exit', async () => {
+    const app = await start({ ORCHESTRATOR_URL: `http://127.0.0.1:${upstream.port}` });
+    const bare = net.connect(app.port, '127.0.0.1');
+    const partial = net.connect(app.port, '127.0.0.1', () =>
+      partial.write('GET /api/audio/sessions/echo-22/live HTTP/1.1\r\nHost: 127.0.0.1\r\n'),
+    );
+    for (const s of [bare, partial]) s.on('error', () => undefined);
+    await sleep(300);
+    const termAt = Date.now();
+    app.child.kill('SIGTERM');
+    const exit = await app.exited;
+    expect(exit.code).toBe(143);
+    expect(exit.at - termAt).toBeLessThan(4_000);
+    const drain = events(app.output(), 'server-preload');
+    expect(drain.find((e) => e.event === 'drain_abort' && e.kind === 'unrequested')).toMatchObject({ count: 2 });
+    bare.destroy();
+    partial.destroy();
   }, 15_000);
 
   it('follows FRONTEND_DRAIN_WS_S', async () => {

@@ -190,6 +190,14 @@ function track(server) {
   const { bodyIdleMs, strayUpgradeMs } = settings();
   const inflight = new Set();
   server.inflight = inflight;
+  // Every connection, for the drain: a socket that never finished a request
+  // (a bare connect, or headers still arriving) must not hold the exit.
+  const conns = new Set();
+  server.on('connection', (socket) => {
+    conns.add(socket);
+    socket.once('close', () => conns.delete(socket));
+  });
+  server.conns = conns;
 
   // Point 4. The guard first and the relay second: the relay prepends its own
   // listener, and wraps every 'upgrade' listener added after it — Next's — so
@@ -304,6 +312,18 @@ function destroyUpgrades() {
     }
   }
   if (count) log('drain_abort', { kind: 'ws', count });
+  // A connection that never finished a request (a bare connect,
+  // or headers still arriving) is timed out by nothing once Next's
+  // server.close() has stopped Node's headersTimeout checker.
+  let unrequested = 0;
+  for (const server of servers) {
+    for (const socket of [...(server.conns ?? [])]) {
+      if (socket.destroyed || !socket.parser || socket._httpMessage) continue;
+      socket.destroy();
+      unrequested += 1;
+    }
+  }
+  if (unrequested) log('drain_abort', { kind: 'unrequested', count: unrequested });
 }
 
 function onTerminate(signal) {

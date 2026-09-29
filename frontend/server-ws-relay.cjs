@@ -288,6 +288,12 @@ function hostMatchesOrigin(hostHeader, origin) {
     return false;
   }
   if (hostname !== origin.hostname) return false;
+  // A Host without a port only arrives through the TLS tunnel, so the page must
+  // be https too: an http:// page on the same hostname (served by anyone able to
+  // intercept plain http) is not the same origin as wss:// on it. LAN and dev
+  // traffic always carries :3000 and is compared by port below; a plain-http
+  // front end on port 80 belongs in FRONTEND_WS_ALLOWED_ORIGINS.
+  if (host.port === null && origin.protocol !== 'https:') return false;
   const defaultPort = DEFAULT_PORT[origin.protocol];
   const originPort = origin.port === '' ? defaultPort : Number(origin.port);
   return (host.port ?? defaultPort) === originPort;
@@ -430,6 +436,9 @@ function install(server, env = process.env, options = {}) {
   const config = settings(env);
   const target = upstreamTarget(config.orchestratorUrl);
   const relays = new Set();
+  // Relays whose first side has closed: off the cap (a closing relay must not
+  // hold a slot for its whole grace), still destroyed by the drain.
+  const closing = new Set();
   let draining = false;
   let sequence = 0;
 
@@ -466,6 +475,7 @@ function install(server, env = process.env, options = {}) {
       clearTimeout(deadline);
       clearTimeout(graceTimer);
       relays.delete(record);
+      closing.delete(record);
       if (reply) answer(socket, reply.status, reply);
       else socket.destroy();
       if (upstream) upstream.destroy();
@@ -489,6 +499,7 @@ function install(server, env = process.env, options = {}) {
     function sideClosed(side) {
       if (phase !== 'open') return;
       firstClosed ??= side;
+      if (relays.delete(record)) closing.add(record);
       const reason = firstClosed === 'client' ? 'client_closed' : 'upstream_closed';
       if (socket.destroyed && upstream.destroyed) {
         finish(reason);
@@ -660,7 +671,7 @@ function install(server, env = process.env, options = {}) {
       draining = true;
     },
     destroyAll(reason = 'drain') {
-      const open = [...relays];
+      const open = [...relays, ...closing];
       for (const record of open) record.close(reason);
       return open.length;
     },
