@@ -273,3 +273,20 @@ def test_the_speculative_static_run_never_carries_the_hook(monkeypatch):
     asyncio.run(stage.prepare(question="tell me about the rupee"))
     assert (Freshness.STATIC, False, False) in calls, "the speculative STATIC guess, unhooked"
     assert (Freshness.RECENT, True, True) in calls, "the full, level-matching retrieval, hooked"
+
+
+def test_the_early_lookup_is_opt_in(monkeypatch):
+    """Off unless KNOWLEDGE_FAST_EARLY_LOOKUP is set: a live A/B on the tree
+    with the retrieval track's hook showed no earlier lookup start (p50 ~0.6 s
+    both ways), so the extra search it can spend is not bought by default."""
+    from app.config import Settings
+
+    monkeypatch.delenv("KNOWLEDGE_FAST_EARLY_LOOKUP", raising=False)
+    assert Settings().knowledge_fast_early_lookup is False
+    stage = _Stage(monkeypatch, [_ev(3600)])
+    monkeypatch.delattr(settings, "knowledge_fast_early_lookup", raising=False)
+    assert lk.fast_early_lookup() is False
+    stage.release.set()
+    p = asyncio.run(stage.prepare())
+    assert stage.hooked == [False]
+    assert p.decision == "fast_lookup"
