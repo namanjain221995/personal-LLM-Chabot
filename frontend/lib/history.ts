@@ -1647,4 +1647,14 @@ export async function clearActiveUserData(): Promise<void> {
   if (typeof window === 'undefined') return;
   await getHistoryStore().wipeLocal();
   browserStore = null;
+  // Voice dictation's outbox holds raw audio not yet uploaded (2026-09-29):
+  // it goes with the rest of the account's local data. Pending discards are
+  // kept — they hold only a session id, and are what still gets the
+  // person's discarded recording deleted from the server next time.
+  try {
+    const { wipeVoiceOutboxes } = await import('./voice');
+    await wipeVoiceOutboxes();
+  } catch {
+    // best-effort, like the rest of the wipe
+  }
 }

@@ -16,7 +16,7 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 export async function POST(req: Request): Promise<Response> {
-  return forwardSession(req, '/audio/sessions');
+  return forwardSession(req, '/audio/sessions', { json: true });
 }
 
 export async function GET(req: Request): Promise<Response> {

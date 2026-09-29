@@ -99,6 +99,13 @@ export const MIN_RECORDING_MS = 350;
  * refuses anything over 600 s; the session road has no ceiling at all.
  */
 export const LEGACY_MAX_MS = 10 * 60 * 1000;
+/**
+ * The legacy recorder stops this long before its ceiling. Stopping AT 10:00
+ * posted duration_ms=600002 (the stop lands a few ms late) and the server's
+ * 413 "longer than 10 minutes" threw the recording away (backend verifier
+ * afadf78ca3614dad5, item J).
+ */
+export const LEGACY_STOP_EARLY_MS = 5000;
 
 /**
  * Capture constraints.
@@ -212,19 +219,18 @@ export function mergeTranscript(draft: string, transcript: string): string {
 }
 
 /**
- * Put a re-transcribed recording where its first transcript went.
+ * Put a re-transcribed recording where its first transcript went, without
+ * knowing where that was: only a verbatim, unique match is replaced, and
+ * otherwise the draft is returned UNCHANGED — never with a second copy.
  *
- * "Retry" on a transcript with gaps re-reads the STORED audio and returns the
- * whole text again, gaps filled. The first version is already in the draft,
- * so appending would duplicate most of it. When the draft still contains the
- * first version verbatim it is replaced in place; when the person has edited
- * it since, their edits win and the new text is added after them instead.
+ * It used to append the new text when the person had edited the first one
+ * even by one character: a 9,000-word draft with one word re-capitalised went
+ * from 79,889 to 159,786 characters (measured by the verifier on 74ad85e2).
+ * The composer uses `placeRetranscript` with the span it tracked, which also
+ * merges the person's edits, and asks when it cannot place the text.
  */
 export function replaceTranscript(draft: string, previous: string, next: string): string {
-  const old = previous.trim();
-  const spoken = next.trim();
-  if (old && spoken && draft.includes(old)) return draft.replace(old, spoken);
-  return mergeTranscript(draft, next);
+  return placeRetranscript(draft, null, previous, next)?.text ?? draft;
 }
 
 /**
@@ -336,10 +342,20 @@ const LEGACY_RETRY_MAX_MS = 120_000;
 export const LEGACY_EMPTY_MESSAGES = {
   silent: 'Nothing was said in that recording.',
   unclear: "That recording wasn't clear enough to transcribe. Try again, closer to the microphone.",
-  low: "That recording wasn't clear enough to transcribe. Try again, closer to the microphone.",
+  // 'low' is the server's word for "there IS a draft and it may be invented"
+  // (orchestrator/app/asr.py CONFIDENCE_LOW). An EMPTY draft marked 'low' is
+  // not a judgement that the audio was unclear, so it does not get the
+  // microphone sentence (2026-09-29): it got it until then.
+  low: 'No words came back, and the server did not say why.',
   unknown: 'No words came back, and the server did not say why.',
+  // 'unclear' over two minutes (2026-09-29, backend verifier item K): the
+  // server says it for three different things — the gate on the first 30 s
+  // emptied the clip, the engine heard speech and its words were judged
+  // invented, or the decoder returned nothing with the gate open. Only what
+  // is true of all three is stated; the first-30-seconds rule is given as
+  // what CAN happen, with what to do about it.
   gatedLong:
-    'The first 30 seconds of that recording sounded silent, so the rest of it was not transcribed. Start speaking right away, or attach long recordings as a file.',
+    'No words came back for that recording, and the server could not tell whether anything was said. A recording this long is judged by its first 30 seconds, so a quiet start can empty all of it: start speaking right away, or attach long recordings as a file.',
 } as const;
 
 /**
@@ -432,7 +448,9 @@ export async function transcribe(
   },
 ): Promise<TranscriptionResult | TranscribeFailure> {
   const query = new URLSearchParams({
-    duration_ms: String(Math.round(options.durationMs)),
+    // Never over the ceiling the server refuses at: the recorder's own clock
+    // runs a few ms past its stop.
+    duration_ms: String(Math.round(Math.min(options.durationMs, LEGACY_MAX_MS))),
     language: 'auto',
   });
 
@@ -533,15 +551,17 @@ export function voiceSupported(): boolean {
  */
 export const VOICE_MESSAGES = {
   signedOutAtStart: 'You were signed out, so nothing was recorded. Sign in and try again.',
+  // "…first." since 2026-09-29: the outbox of an account is deleted when
+  // another account signs in on the same browser (security review item 10).
   signedOutKept: (t: string) =>
-    `You were signed out. Everything up to ${t} is saved on the server; the last few seconds are kept on this device and will upload when you sign in again.`,
+    `You were signed out. Everything up to ${t} is saved on the server; the last few seconds are kept on this device and will upload when you sign in again, unless someone else signs in on this browser first.`,
   signedOutLost: (t: string) =>
     `You were signed out. Everything up to ${t} is saved on the server; the last few seconds will be lost if you close this tab.`,
   signedOutNothingPending: (t: string) =>
     `You were signed out. Everything up to ${t} is saved on the server.`,
   voiceOff: 'Voice input is turned off for your account. Ask an administrator.',
   voiceUnavailable: "Voice input isn't available on this server right now.",
-  legacyHint: "Long recordings aren't enabled here, so this one stops at 10 minutes.",
+  legacyHint: "Long recordings aren't enabled here, so this one stops just before 10 minutes.",
   notFound: 'This recording is no longer on the server. It was discarded or has expired.',
   sessionActive:
     "You're already recording in another tab or on another device. End that recording first.",
@@ -596,12 +616,28 @@ export const VOICE_MESSAGES = {
     retentionDays && retentionDays > 0
       ? `Saved to your account · kept ${retentionDays} days`
       : 'Saved to your account',
+  // Said only once the server has acknowledged audio (2026-09-29): it was
+  // drawn whenever progress existed, under "Connection lost…" with 0 bytes on
+  // the server (backend verifier afadf78ca3614dad5, item H).
+  savedSoFar: (saved: string, onDevice: string | null, retentionDays: number | null) =>
+    `Saved to your account: ${saved}${onDevice ? ` · ${onDevice} still on this device` : ''}${
+      retentionDays && retentionDays > 0 ? ` · kept ${retentionDays} days` : ''
+    }`,
+  // J: the legacy road keeps a refused recording.
+  legacyKept: 'The recording is kept here: try again, or save it as a file.',
+  legacyRetry: 'Try again',
+  legacySave: 'Save it',
+  // 'engine' is the server saying the engine is BUSY; 'engine_unavailable'
+  // (fix/voice-server-hardening) that it cannot be reached. Until the server
+  // told them apart, an outage read as other people's recordings.
   behind: (t: string, waitingOn: WaitingOn) =>
     waitingOn === 'chat'
       ? `Transcript ${t} behind — paused while someone is waiting for a chat answer`
       : waitingOn === 'engine'
         ? `Transcript ${t} behind — the speech engine is busy with other recordings`
-        : `Transcript ${t} behind`,
+        : waitingOn === 'engine_unavailable'
+          ? `Transcript ${t} behind — the speech service is unavailable right now; your audio is saved and will be transcribed when it is back`
+          : `Transcript ${t} behind`,
   finishingTail: (t: string) => `Finishing the last ${t} of audio…`,
   finishing: 'Finishing the transcript…',
   notProgressive: 'This browser’s recording can only be transcribed once you stop. It is being saved as you talk.',
@@ -616,10 +652,70 @@ export const VOICE_MESSAGES = {
     'You were signed out, so the recording was not transcribed again. Sign in and try again.',
   retryGeneric: 'Something went wrong on the server. Your recording is saved.',
   tooShort: 'That was too short to transcribe. Hold the button and speak.',
+  // --- 2026-09-29, fix/voice-recorder-edges ---------------------------------
+  // A discard is never reported done before the server said so.
+  discardPending:
+    "Couldn't delete the recording from the server yet — will retry. Nothing of it is kept on this device.",
+  discardPendingVolatile:
+    "Couldn't delete the recording from the server yet — will retry while this tab stays open. Nothing of it is kept on this device.",
+  discardDone: 'The discarded recording is deleted from the server.',
+  discardTryNow: 'Try now',
+  discardAction: 'Discard',
+  sessionActiveDiscarded:
+    "A recording you discarded couldn't be deleted from the server yet, and it blocks a new one. Delete it now?",
+  // Audio the server would not take is kept on this device, never deleted.
+  heldIdle: (idle: string, saved: string, held: string) =>
+    `This recording was closed after ${idle} with no audio arriving. Everything up to ${saved} is saved on the server. The last ${held} is kept on this device, because the server would not take it after that. You're not being recorded now.`,
+  heldElsewhere: (held: string) =>
+    `This recording was ended from another tab. What reached the server is saved; the last ${held} is kept on this device, because the server would not take it after that.`,
+  heldStorageFull: (saved: string, held: string) =>
+    `The server ran out of space, so recording stopped at ${saved}. Everything up to then is saved and is being transcribed; the last ${held} is kept on this device.`,
+  heldVoiceOff: (sentence: string, held: string) =>
+    `${sentence} The last ${held} of this recording is kept on this device.`,
+  heldGeneric: (saved: string, held: string) =>
+    `Something went wrong on the server. Your recording up to ${saved} is saved there; the last ${held} is kept on this device.`,
+  heldUndecodable: (held: string) =>
+    `The server couldn't read the audio of this recording, so it stopped taking more of it. What arrived is saved exactly as it arrived; the last ${held} is kept on this device.`,
+  retranscribeBusy: 'Another recording of yours is being transcribed again right now. Try this one when it is done.',
+  retranscribeRateLimited: 'Recordings were transcribed again too often in the last hour. Try again later.',
+  heldStill: (held: string) =>
+    `The server still won't take the last ${held} of this recording, so it stays on this device.`,
+  heldFound: (held: string) =>
+    `The last ${held} of an earlier recording is on this device, because the server would not take it.`,
+  uploadRest: 'Upload the rest',
+  offlineLong: (idle: string) =>
+    `Connection lost for over ${idle}. Still recording on this device; the server stops waiting after ${idle}, so what it missed stays here until it can be uploaded.`,
+  // Retry never doubles the draft: it replaces its own earlier text, or asks.
+  retryUnplaced:
+    'The transcript in your message was changed in a way the new one could not be merged into, so it was not put in.',
+  // Asked before an explicit logout.
+  logoutHeld: (t: string) =>
+    `${t} of a recording on this browser hasn't reached the server yet. Signing out deletes it from this browser. Sign out anyway?`,
+  // Server capacity (2026-09-29, with fix/voice-server-hardening).
+  quotaAtStart:
+    "Your recordings have used all the space your account has, so this one didn't start. Delete some on the Recordings page (/recordings) to record again.",
+  quotaMid: (t: string) =>
+    `Your recordings have used all the space your account has, so recording stopped at ${t}. Everything up to then is saved and is being transcribed. Delete some on the Recordings page (/recordings) to record again.`,
+  heldQuota: (saved: string, held: string) =>
+    `Your recordings have used all the space your account has, so recording stopped at ${saved}. Everything up to then is saved; the last ${held} is kept on this device. Delete some on the Recordings page (/recordings), then press Upload the rest.`,
+  capacityLegacyHint:
+    "Too many people are recording right now, so this recording isn't saved to your account and stops just before 10 minutes.",
+  engineUnavailableLive:
+    'The speech service is unavailable right now; your audio is saved and will be transcribed when it is back.',
+  retryConfirm: (t: string) =>
+    `Transcribe ${t} of this recording again? The speech engine works on it for a while, and replies are slower for everyone meanwhile.`,
+  logoutDiscardPending:
+    "A recording you discarded hasn't been deleted from the server yet (it couldn't be reached). It will be deleted the next time you sign in on this browser. Sign out anyway?",
 } as const;
 
 /** Past this, discarding a recording asks first (the contract's 60 s). */
 export const DISCARD_CONFIRM_AFTER_MS = 60_000;
+/**
+ * Past this much audio, Retry asks first: it re-decodes that audio at finish
+ * priority, and while it runs chat was measured at about 53 tok/s against
+ * about 106 (or 69) idle (2026-09-28, the cost verdict on this branch).
+ */
+export const RETRY_CONFIRM_AFTER_MS = 5 * 60_000;
 /** The live preview keeps this many characters; the full text comes at the end. */
 export const PREVIEW_CHARS = 600;
 /** How far behind the transcript may run before the bar says so. */
@@ -640,7 +736,7 @@ export type SessionOutcome =
   | 'no_words'
   | 'engine_unavailable'
   | 'undecodable';
-export type WaitingOn = 'none' | 'chat' | 'engine';
+export type WaitingOn = 'none' | 'chat' | 'engine' | 'engine_unavailable';
 export type EndedBy = 'person' | 'recorder_error' | 'lost_parts' | 'page_hidden';
 
 export interface SessionConfig {
@@ -764,7 +860,8 @@ export function parseSessionState(body: unknown): SessionState | null {
     audioMs: num(b.audio_ms),
     transcribedMs: num(b.transcribed_ms),
     backlogMs: num(b.backlog_ms),
-    waitingOn: waiting === 'chat' || waiting === 'engine' ? waiting : 'none',
+    waitingOn:
+      waiting === 'chat' || waiting === 'engine' || waiting === 'engine_unavailable' ? waiting : 'none',
     progressive: b.progressive !== false,
     cursor: num(b.cursor),
     segments,
@@ -826,7 +923,8 @@ export function describeGaps(gaps: SessionGap[]): string {
   return rest > 0 ? `${shown.join(', ')} and ${rest} more` : shown.join(', ');
 }
 
-function idleWords(seconds: number): string {
+/** "10 minutes", from the server's idle close in seconds. */
+export function idleWords(seconds: number): string {
   if (seconds >= 60 && seconds % 60 === 0) {
     const minutes = seconds / 60;
     return `${minutes} minute${minutes === 1 ? '' : 's'}`;
@@ -855,33 +953,111 @@ export type Reply =
       body: Record<string, unknown>;
       retryAfterMs: number | null;
     }
-  | { kind: 'unreachable'; status: number | null }
+  /**
+   * `timedOut`: no answer inside the request's own deadline. `restarted`: the
+   * browser came back online while it was in flight, so it was abandoned to be
+   * sent again at once.
+   */
+  | { kind: 'unreachable'; status: number | null; timedOut?: boolean; restarted?: boolean }
   | { kind: 'aborted' };
 
 const PROXY_REASONS = new Set(['proxy_unreachable', 'proxy_timeout']);
+
+/**
+ * Deadlines for the session requests (2026-09-29).
+ *
+ * NOTHING TIMED A REQUEST OUT before, and one PUT whose socket died without a
+ * FIN or RST (a phone changing networks, a NAT that forgot the flow) never
+ * settled: every later part queued behind it. Measured in
+ * tests/voice-session-edges.test.ts with a fetch that never answers: eleven
+ * minutes of recording plus an `online` event made 7 PUTs and stored 6 of 138
+ * slices. A timed-out request is a network failure like any other and is sent
+ * again, byte for byte, on the backoff schedule.
+ *
+ * A part's deadline grows with its size, so a slow link is not mistaken for a
+ * dead one: 20 s plus one second per 32 KiB, which assumes 256 kb/s, twice
+ * the 128.7 kb/s Chrome records at (a link slower than that cannot keep up
+ * with the recording anyway). An 80 KB part gets 23 s; an 8 MiB part coalesced
+ * after an outage gets 276 s. Each consecutive time-out of the SAME part
+ * doubles its deadline (to 8x), so a link that is merely slow still finishes
+ * it — the part cannot be cut smaller instead, because it may already be on
+ * the server under its sequence number, and a replay must be byte-identical.
+ */
+export const REQUEST_TIMEOUT_MS = 30_000;
+/** Added to the long-poll's own `wait_s`: the server answers at wait_s at the latest. */
+export const LONG_POLL_SLACK_MS = 15_000;
+const PART_FLOOR_BYTES_PER_S = 32 * 1024;
+
+export function partTimeoutMs(bytes: number, timeoutsSoFar = 0): number {
+  const base = 20_000 + Math.ceil(bytes / PART_FLOOR_BYTES_PER_S) * 1000;
+  return base * 2 ** Math.min(Math.max(0, timeoutsSoFar), 3);
+}
+
+/**
+ * The request a session has in flight, so the browser's `online` event can
+ * abort it and send it again at once: a request started on the network that
+ * just went away will not come back by itself.
+ */
+export interface InflightSlot {
+  current: (() => void) | null;
+}
 
 export async function callSessionApi(
   fetchImpl: typeof fetch,
   url: string,
   init: RequestInit,
+  opts: { timeoutMs?: number; slot?: InflightSlot } = {},
 ): Promise<Reply> {
+  const outer = init.signal ?? undefined;
+  if (outer?.aborted) return { kind: 'aborted' };
+  const controller = new AbortController();
+  let expired = false;
+  let restarted = false;
+  const cut = () => {
+    expired = true;
+    controller.abort();
+  };
+  const restart = () => {
+    restarted = true;
+    controller.abort();
+  };
+  const onOuterAbort = () => controller.abort();
+  outer?.addEventListener('abort', onOuterAbort);
+  const timer = opts.timeoutMs ? setTimeout(cut, opts.timeoutMs) : null;
+  if (opts.slot) opts.slot.current = restart;
+  const settle = () => {
+    if (timer !== null) clearTimeout(timer);
+    outer?.removeEventListener('abort', onOuterAbort);
+    if (opts.slot && opts.slot.current === restart) opts.slot.current = null;
+  };
+  // An abort of our own (the deadline, or `online`) is a network failure to
+  // send again; only the caller's own signal is a withdrawal.
+  const failed = (err: unknown, status: number | null): Reply => {
+    if (outer?.aborted) return { kind: 'aborted' };
+    if (restarted) return { kind: 'unreachable', status, restarted: true };
+    if (expired) return { kind: 'unreachable', status, timedOut: true };
+    if (isAbort(err)) return { kind: 'aborted' };
+    return { kind: 'unreachable', status };
+  };
   let response: Response;
   try {
-    response = await fetchImpl(url, { ...init, cache: 'no-store' });
+    response = await fetchImpl(url, { ...init, signal: controller.signal, cache: 'no-store' });
   } catch (err) {
-    if (isAbort(err, init.signal ?? undefined)) return { kind: 'aborted' };
-    return { kind: 'unreachable', status: null };
+    settle();
+    return failed(err, null);
   }
   let raw = '';
   try {
+    // The deadline still runs: a socket can also die half-way through a body.
     raw =
       typeof response.text === 'function'
         ? await response.text()
         : JSON.stringify(await (response as Response).json());
   } catch (err) {
-    if (isAbort(err, init.signal ?? undefined)) return { kind: 'aborted' };
-    return { kind: 'unreachable', status: response.status };
+    settle();
+    return failed(err, response.status);
   }
+  settle();
   let body: Record<string, unknown> | null = null;
   if (raw.trim()) {
     try {
@@ -992,7 +1168,8 @@ function doSleep(ms: number, wake: { current: (() => void) | null }): Promise<vo
 /** What opening a session came to. */
 export type OpenResult =
   | { kind: 'session'; sessionId: string; config: SessionConfig; state: SessionState }
-  | { kind: 'legacy' }
+  /** `capacity_full`: the server has no room for another stored recording right now. */
+  | { kind: 'legacy'; reason?: 'capacity_full' }
   | { kind: 'active'; sessionId: string | null; audioMs: number }
   | { kind: 'error'; error: VoiceError }
   | { kind: 'aborted' };
@@ -1017,17 +1194,22 @@ export async function openSession(
   const random = deps.random ?? Math.random;
   const wake = { current: null as (() => void) | null };
   for (let attempt = 0; ; attempt += 1) {
-    const reply = await callSessionApi(fetchImpl, SESSIONS_URL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        client_key: input.clientKey,
-        mime_type: input.mimeType,
-        language: 'auto',
-        part_ms: input.partMs ?? DEFAULT_SESSION_CONFIG.partMs,
-      }),
-      signal: deps.signal,
-    });
+    const reply = await callSessionApi(
+      fetchImpl,
+      SESSIONS_URL,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          client_key: input.clientKey,
+          mime_type: input.mimeType,
+          language: 'auto',
+          part_ms: input.partMs ?? DEFAULT_SESSION_CONFIG.partMs,
+        }),
+        signal: deps.signal,
+      },
+      { timeoutMs: REQUEST_TIMEOUT_MS },
+    );
     if (reply.kind === 'aborted') return { kind: 'aborted' };
     if (reply.kind === 'ok') {
       const state = parseSessionState(reply.body);
@@ -1085,7 +1267,16 @@ function openRefusal(reply: Extract<Reply, { kind: 'refused' }>): OpenResult {
     return { kind: 'error', error: { message: VOICE_MESSAGES.rateLimitedCreate, retryable: true } };
   }
   if (status === 503 && reason === 'capacity_full') {
-    return { kind: 'error', error: { message: VOICE_MESSAGES.capacityFull, retryable: true } };
+    // The legacy road has its own pool: a short dictation still works, and
+    // the recorder says it is not stored (fix/voice-server-hardening decision).
+    return { kind: 'legacy', reason: 'capacity_full' };
+  }
+  if (status === 507 && (reason === 'quota_full' || reason === 'quota_exceeded')) {
+    return { kind: 'error', error: { message: VOICE_MESSAGES.quotaAtStart, retryable: false } };
+  }
+  if (status === 415 && reason === 'bad_content_type') {
+    // Our own request was malformed; the audio format was never judged.
+    return { kind: 'error', error: { message: VOICE_MESSAGES.genericAtStart, retryable: true } };
   }
   if (status === 503 && reason === 'storage_unavailable') {
     return {
@@ -1099,22 +1290,40 @@ function openRefusal(reply: Extract<Reply, { kind: 'refused' }>): OpenResult {
   return { kind: 'error', error: { message: VOICE_MESSAGES.genericAtStart, retryable: true } };
 }
 
+/**
+ * What one DELETE came to. `gone` is the server's 204, or its 404 for an id
+ * in THIS account's own outbox or tombstones (the outbox is per account, so a
+ * 404 there cannot be someone else's recording). `later` is everything that
+ * may go through if sent again: no network, a 5xx, a sign-out (the cookie of
+ * the account that recorded it will come back), a voice feature turned off.
+ */
+export type DeleteOutcome = 'gone' | 'later';
+
+export async function deleteSessionOnce(
+  sessionId: string,
+  deps: SessionDeps = {},
+): Promise<DeleteOutcome> {
+  const reply = await callSessionApi(
+    deps.fetchImpl ?? fetch,
+    `${SESSIONS_URL}/${sessionId}`,
+    { method: 'DELETE' },
+    { timeoutMs: REQUEST_TIMEOUT_MS },
+  );
+  if (reply.kind === 'ok') return 'gone';
+  if (reply.kind === 'refused' && reply.status === 404) return 'gone';
+  return 'later';
+}
+
 /** DELETE a session: the person's discard, or a session that never got audio. */
 export async function deleteSession(
   sessionId: string,
-  deps: SessionDeps = {},
+  deps: SessionDeps & { attempts?: number } = {},
 ): Promise<boolean> {
-  const fetchImpl = deps.fetchImpl ?? fetch;
   const wake = { current: null as (() => void) | null };
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const reply = await callSessionApi(fetchImpl, `${SESSIONS_URL}/${sessionId}`, {
-      method: 'DELETE',
-    });
-    if (reply.kind === 'ok') return true;
-    if (reply.kind === 'refused' && reply.status === 404) return true;
-    if (reply.kind === 'refused' && !partRetryable(reply)) return false;
-    if (reply.kind === 'aborted') return false;
-    await doSleep(backoffMs(attempt, deps.random ?? Math.random), wake);
+  const attempts = deps.attempts ?? 4;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if ((await deleteSessionOnce(sessionId, deps)) === 'gone') return true;
+    if (attempt + 1 < attempts) await doSleep(backoffMs(attempt, deps.random ?? Math.random), wake);
   }
   return false;
 }
@@ -1127,11 +1336,16 @@ export async function endOtherSession(
   sessionId: string,
   deps: SessionDeps = {},
 ): Promise<VoiceError | null> {
-  const reply = await callSessionApi(deps.fetchImpl ?? fetch, `${SESSIONS_URL}/${sessionId}/finish`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ last_part: null, duration_ms: 0, ended_by: 'person' }),
-  });
+  const reply = await callSessionApi(
+    deps.fetchImpl ?? fetch,
+    `${SESSIONS_URL}/${sessionId}/finish`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ last_part: null, duration_ms: 0, ended_by: 'person' }),
+    },
+    { timeoutMs: REQUEST_TIMEOUT_MS },
+  );
   if (reply.kind === 'ok') return null;
   if (reply.kind === 'refused' && reply.status === 404) return null;
   if (reply.kind === 'refused' && reply.status === 401) {
@@ -1160,14 +1374,53 @@ export type VoiceOffer =
       replaces: string | null;
       message: string;
       label: string;
+      /**
+       * How much audio a Retry sends to the engine again: the whole recording
+       * after engine_unavailable, the gaps otherwise. Past five minutes the
+       * person is asked first (it slows chat for everyone meanwhile).
+       */
+      audioMs?: number;
     }
   | { kind: 'end_other'; sessionId: string; message: string; label: string }
-  | { kind: 'insert'; text: string; message: string; label: string };
+  /**
+   * A 409 session_active for a recording THIS browser was told to discard and
+   * could not yet delete: the button deletes it, rather than finishing (and
+   * so keeping) what the person threw away.
+   */
+  | { kind: 'discard_other'; sessionId: string; message: string; label: string }
+  /** The server refused the rest of a recording; it is kept on this device. */
+  | {
+      kind: 'upload_rest';
+      sessionId: string;
+      /** The text already put into the draft from this recording, which the full one replaces. */
+      replaces: string | null;
+      message: string;
+      label: string;
+    }
+  /** A discard whose DELETE has not been confirmed; the button tries again now. */
+  | { kind: 'discard_pending'; sessionId: string; message: string; label: string }
+  | {
+      kind: 'insert';
+      text: string;
+      message: string;
+      label: string;
+      /** The recording it came from, so its outbox record goes once the text is in. */
+      sessionId?: string;
+      /** Set when this text should replace an earlier transcript of the same recording. */
+      replaces?: string | null;
+      /** What to offer once the text is in (a Retry for gaps, "Upload the rest"). */
+      then?: VoiceOffer | null;
+    };
 
 export type SessionResult =
   | { kind: 'text'; text: string; notices: string[]; offer: VoiceOffer | null; sessionId: string }
   | { kind: 'error'; error: VoiceError; offer: VoiceOffer | null }
   | { kind: 'withdrawn' };
+
+/** Whether a result leaves anything for the person to act on later. */
+function offerKeepsRecord(offer: VoiceOffer | null): boolean {
+  return offer !== null && (offer.kind === 'retranscribe' || offer.kind === 'upload_rest');
+}
 
 /**
  * Turn a settled session state into what the person sees. Every outcome the
@@ -1188,13 +1441,15 @@ export function describeOutcome(
   const notices = [...(context.notices ?? [])];
   const text = (state.text ?? '').trim();
   const lowSeen = context.lowSeen || state.segments.some((s) => s.low);
-  const retry = (message: string): VoiceOffer => ({
+  const unheardGaps = state.gaps.filter((g) => g.reason !== 'dropped_as_noise');
+  const retry = (message: string, audioMs: number): VoiceOffer => ({
     kind: 'retranscribe',
     sessionId: state.sessionId,
     scope: 'gaps',
     replaces: context.replaces ?? null,
     message,
     label: VOICE_MESSAGES.retry,
+    audioMs,
   });
   const failure = (message: string, retryable: boolean, offer: VoiceOffer | null = null): SessionResult => ({
     kind: 'error',
@@ -1204,7 +1459,11 @@ export function describeOutcome(
 
   if (state.outcome === 'engine_unavailable') {
     const message = VOICE_MESSAGES.engineUnavailable(t);
-    return { kind: 'error', error: { message, retryable: true }, offer: retry(message) };
+    return {
+      kind: 'error',
+      error: { message, retryable: true },
+      offer: retry(message, state.audioMs || context.durationMs || 0),
+    };
   }
   if (state.outcome === 'undecodable') return failure(VOICE_MESSAGES.undecodable, false);
   if (state.status === 'failed') return failure(VOICE_MESSAGES.generic(t), true);
@@ -1220,10 +1479,13 @@ export function describeOutcome(
   if (!text) return failure(VOICE_MESSAGES.generic(t), true);
 
   if (lowSeen) notices.unshift(VOICE_MESSAGES.lowSegments);
-  const unheard = state.gaps.filter((g) => g.reason !== 'dropped_as_noise');
+  const unheard = unheardGaps;
   const offer =
     unheard.length > 0
-      ? retry(VOICE_MESSAGES.gaps(unheard.length, describeGaps(unheard)))
+      ? retry(
+          VOICE_MESSAGES.gaps(unheard.length, describeGaps(unheard)),
+          unheard.reduce((ms, g) => ms + Math.max(0, g.endMs - g.startMs), 0),
+        )
       : null;
   if (offer && offer.kind === 'retranscribe') offer.replaces = text;
   return { kind: 'text', text, notices, offer, sessionId: state.sessionId };
@@ -1267,12 +1529,48 @@ export interface OutboxRecord {
   durationMs: number;
   /** Recorder clock at the end of the last acknowledged slice. */
   ackedMs: number;
+  /**
+   * The server accepted the finish. Nothing is left to upload; the record
+   * stays until the transcript is in the composer, because the finish wait can
+   * be minutes (a backlog, chat pacing, an engine outage) and that is exactly
+   * when people reload. Before 2026-09-29 it was dropped here and a reload
+   * found nothing to offer back.
+   */
+  finished?: boolean;
+  /**
+   * The server would not take the rest (the session was closed: idle, another
+   * tab, storage full). The slices it never stored stay here, and the person is
+   * offered "Upload the rest", instead of this device deleting them.
+   */
+  held?: { reason: SessionInterrupt['kind']; endedBy: string | null } | null;
+  /** Text from this recording already put into the draft, which a later full transcript replaces. */
+  deliveredText?: string | null;
+  /** The Retry the person has not acted on yet (transcript with gaps, engine unavailable). */
+  offer?: { scope: 'gaps' | 'all'; replaces: string | null; message: string; audioMs?: number } | null;
+  /**
+   * CONTINUATION (2026-09-29). The container's init segment, from the first
+   * slice, so the rest of a recording the server closed (idle, page closed)
+   * can go into a new session that starts as a valid stream.
+   */
+  init?: ArrayBuffer | null;
+  /** Every server session this recording has used, in order; the first is `sessionId`. */
+  chain?: string[];
+  /** The session parts go to now, when it is a continuation: its first slice and the front of its part 0. */
+  target?: { sessionId: string; firstSlice: number; prefix: ArrayBuffer | null } | null;
+  /** A continuation being opened: its client_key, reused on every retry so only one is made. */
+  opening?: { clientKey: string; firstSlice: number; linked?: boolean } | null;
 }
 
 export interface StoredSlice {
   idx: number;
   endMs: number;
   bytes: Uint8Array;
+  /**
+   * What a new stream starting at this slice needs after the init segment
+   * (WebmCutTracker.lead), so the rest of a closed recording can continue in
+   * a new session; null where it is not known.
+   */
+  lead?: Uint8Array | null;
 }
 
 /**
@@ -1287,7 +1585,9 @@ export interface OutboxStore {
   listRecords(): Promise<OutboxRecord[]>;
   /** Take a stale record for this tab, atomically; null if it is live or gone. */
   claim(sessionId: string, staleBefore: number, now: number): Promise<OutboxRecord | null>;
-  putSlice(sessionId: string, idx: number, endMs: number, data: Blob): Promise<void>;
+  /** Mark a record as held by a live tab, so no other tab adopts it meanwhile. */
+  touch(sessionId: string, now: number): Promise<void>;
+  putSlice(sessionId: string, idx: number, endMs: number, data: Blob, lead?: Uint8Array | null): Promise<void>;
   readSlices(sessionId: string, first: number, last: number): Promise<StoredSlice[]>;
   dropSlices(sessionId: string, first: number, last: number): Promise<void>;
   drop(sessionId: string): Promise<void>;
@@ -1298,7 +1598,7 @@ export interface OutboxStore {
 /** The outbox without IndexedDB: memory, and only for what is unacknowledged. */
 export function createMemoryOutbox(): OutboxStore {
   const records = new Map<string, OutboxRecord>();
-  const slices = new Map<string, Map<number, { endMs: number; data: Blob }>>();
+  const slices = new Map<string, Map<number, { endMs: number; data: Blob; lead: Uint8Array | null }>>();
   let held = 0;
   return {
     persistent: false,
@@ -1316,12 +1616,16 @@ export function createMemoryOutbox(): OutboxStore {
       // Memory dies with the tab, so nothing here is ever another tab's.
       return null;
     },
-    async putSlice(id, idx, endMs, data) {
+    async touch(id, now) {
+      const r = records.get(id);
+      if (r) records.set(id, { ...r, aliveAt: now });
+    },
+    async putSlice(id, idx, endMs, data, lead = null) {
       let m = slices.get(id);
       if (!m) slices.set(id, (m = new Map()));
       const prev = m.get(idx);
       if (prev) held -= prev.data.size;
-      m.set(idx, { endMs, data });
+      m.set(idx, { endMs, data, lead });
       held += data.size;
     },
     async readSlices(id, first, last) {
@@ -1329,7 +1633,7 @@ export function createMemoryOutbox(): OutboxStore {
       const out: StoredSlice[] = [];
       for (let i = first; i <= last; i += 1) {
         const s = m?.get(i);
-        if (s) out.push({ idx: i, endMs: s.endMs, bytes: await blobBytes(s.data) });
+        if (s) out.push({ idx: i, endMs: s.endMs, bytes: await blobBytes(s.data), lead: s.lead });
       }
       return out;
     },
@@ -1354,9 +1658,280 @@ export function createMemoryOutbox(): OutboxStore {
   };
 }
 
-const OUTBOX_DB = 'techsara-voice-outbox';
+/**
+ * ONE DATABASE PER ACCOUNT (2026-09-29): `techsara-voice-outbox:u<id>`, named
+ * with lib/auth's `userScopeKey` exactly as the history cache is
+ * (lib/idbCache.ts `userDbName`). Until then every account on a browser shared
+ * one origin-wide database, and on a shared computer the next person's
+ * composer adopted the previous person's unsent audio, got the server's 404
+ * for someone else's recording, and deleted it
+ * (tests/voice-session-edges.test.ts). Separate names mean another account's
+ * recordings are never opened at all; the wipe on logout and on an account
+ * switch (below) means they do not stay on the machine for devtools either.
+ *
+ * The bare name is the pre-2026-09-29 shared database. It never shipped; it is
+ * still deleted with the rest.
+ */
+export const OUTBOX_DB = 'techsara-voice-outbox';
+export function outboxDbName(owner: string): string {
+  return `${OUTBOX_DB}:${owner}`;
+}
+/** localStorage: which accounts have an outbox database on this browser. */
+const OUTBOX_OWNERS_KEY = 'techsara-voice-outbox-owners';
 const RECORD_STORE = 'records';
 const SLICE_STORE = 'slices';
+
+type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> & {
+  readonly length?: number;
+  key?: (index: number) => string | null;
+};
+
+function browserStorage(): StorageLike | null {
+  try {
+    return typeof window !== 'undefined' && window.localStorage ? window.localStorage : null;
+  } catch {
+    return null; // a sandboxed frame throws on the property itself
+  }
+}
+
+function readJson<T>(storage: StorageLike | null, key: string, fallback: T): T {
+  if (!storage) return fallback;
+  try {
+    const raw = storage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(storage: StorageLike | null, key: string, value: unknown): void {
+  if (!storage) return;
+  try {
+    storage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* quota or a private window: the index is a convenience, the wipe also asks indexedDB.databases() */
+  }
+}
+
+/** Accounts with an outbox database on this browser, from the index. */
+export function outboxOwners(storage: StorageLike | null = browserStorage()): string[] {
+  const list = readJson<unknown>(storage, OUTBOX_OWNERS_KEY, []);
+  return Array.isArray(list) ? list.filter((o): o is string => typeof o === 'string' && o !== '') : [];
+}
+
+function deleteDb(factory: IDBFactory, name: string): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      const req = factory.deleteDatabase(name);
+      req.onsuccess = () => resolve();
+      req.onerror = () => resolve();
+      // Blocked means a connection elsewhere has not closed yet. Every
+      // connection this module opens closes itself on `versionchange`, so the
+      // deletion completes as soon as they do; nothing to wait for here.
+      req.onblocked = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
+}
+
+/** Every outbox database name on this browser: the index, plus what the browser lists. */
+async function outboxDbNames(factory: IDBFactory, storage: StorageLike | null): Promise<string[]> {
+  const names = new Set(outboxOwners(storage).map(outboxDbName));
+  names.add(OUTBOX_DB);
+  const f = factory as IDBFactory & { databases?: () => Promise<Array<{ name?: string }>> };
+  if (typeof f.databases === 'function') {
+    try {
+      for (const db of await f.databases()) {
+        if (db.name === OUTBOX_DB || db.name?.startsWith(`${OUTBOX_DB}:`)) names.add(db.name);
+      }
+    } catch {
+      /* not every engine lists databases; the index covers them */
+    }
+  }
+  return [...names];
+}
+
+/**
+ * An account switch on this browser: delete every OTHER account's outbox,
+ * including audio that account never uploaded. That is deliberate (security
+ * review 2026-09-29, item 10): raw speech of person A must not stay readable
+ * on a shared profile once person B signs in. Person A was told so when the
+ * sign-out happened (VOICE_MESSAGES.signedOutKept), and is asked before an
+ * explicit logout (voiceLogoutCheck).
+ */
+export async function wipeOtherOutboxes(
+  owner: string,
+  factory: IDBFactory | undefined = typeof indexedDB !== 'undefined' ? indexedDB : undefined,
+  storage: StorageLike | null = browserStorage(),
+): Promise<string[]> {
+  if (!factory) return [];
+  const keep = outboxDbName(owner);
+  const wiped: string[] = [];
+  for (const name of await outboxDbNames(factory, storage)) {
+    if (name === keep) continue;
+    await deleteDb(factory, name);
+    wiped.push(name);
+  }
+  writeJson(storage, OUTBOX_OWNERS_KEY, outboxOwners(storage).filter((o) => o === owner));
+  return wiped;
+}
+
+/** Logout, or an account whose access ended: every outbox on this browser goes. */
+export async function wipeVoiceOutboxes(
+  factory: IDBFactory | undefined = typeof indexedDB !== 'undefined' ? indexedDB : undefined,
+  storage: StorageLike | null = browserStorage(),
+): Promise<void> {
+  if (factory) for (const name of await outboxDbNames(factory, storage)) await deleteDb(factory, name);
+  try {
+    storage?.removeItem(OUTBOX_OWNERS_KEY);
+  } catch {
+    /* best-effort */
+  }
+}
+
+/**
+ * The outbox database of one account. Registers the account in the index
+ * first, so a wipe can find the database even where the browser cannot list
+ * them.
+ */
+export async function openOwnerOutbox(
+  owner: string,
+  factory: IDBFactory | undefined = typeof indexedDB !== 'undefined' ? indexedDB : undefined,
+  storage: StorageLike | null = browserStorage(),
+): Promise<OutboxStore> {
+  const owners = outboxOwners(storage);
+  if (!owners.includes(owner)) writeJson(storage, OUTBOX_OWNERS_KEY, [...owners, owner]);
+  return openOutbox(factory, outboxDbName(owner));
+}
+
+// ---------------------------------------------------------------------------
+// Tombstones: discards the server has not confirmed yet
+// ---------------------------------------------------------------------------
+
+/**
+ * A discard the server has not confirmed. Pressing X while the server could
+ * not be reached used to try DELETE four times over about 15 s and then drop
+ * everything on this device anyway, so the recording the person threw away
+ * stayed on the server, was transcribed, and was kept for good
+ * (tests/voice-session-edges.test.ts: 4 DELETEs, server still recording with
+ * 1,930,488 bytes, 0 outbox records left).
+ *
+ * The tombstone holds no audio, only the session id, and lives in
+ * localStorage under the account that recorded it. So it survives a reload, a
+ * logout and another person's session on the same browser, and is sent again
+ * the next time that account is here, until the server answers 204 or 404.
+ */
+export interface Tombstone {
+  sessionId: string;
+  at: number;
+}
+
+export interface TombstoneStore {
+  readonly durable: boolean;
+  list(): Tombstone[];
+  add(sessionId: string, now: number): void;
+  remove(sessionId: string): void;
+  has(sessionId: string): boolean;
+}
+
+const TOMBSTONE_PREFIX = 'techsara-voice-discards:';
+const volatileTombstones = new Map<string, Map<string, Tombstone>>();
+
+/**
+ * The tombstones of one account. `owner` null (the account could not be
+ * identified) keeps them in this tab's memory only, and `durable` says so, so
+ * the person is told to keep the tab open rather than promised a retry after
+ * a reload that would not happen.
+ */
+export function tombstonesFor(
+  owner: string | null,
+  storage: StorageLike | null = browserStorage(),
+): TombstoneStore {
+  const key = owner ? `${TOMBSTONE_PREFIX}${owner}` : null;
+  const durable = Boolean(key && storage);
+  const memKey = owner ?? '';
+  const mem = volatileTombstones.get(memKey) ?? new Map<string, Tombstone>();
+  volatileTombstones.set(memKey, mem);
+  const read = (): Tombstone[] => {
+    if (!durable) return [...mem.values()];
+    const list = readJson<unknown>(storage, key!, []);
+    return Array.isArray(list)
+      ? list.filter(
+          (t): t is Tombstone =>
+            typeof t === 'object' && t !== null && isSessionId((t as Tombstone).sessionId),
+        )
+      : [];
+  };
+  const write = (list: Tombstone[]) => {
+    if (!durable) {
+      mem.clear();
+      for (const t of list) mem.set(t.sessionId, t);
+      return;
+    }
+    if (list.length === 0) {
+      try {
+        storage!.removeItem(key!);
+      } catch {
+        /* best-effort */
+      }
+      return;
+    }
+    writeJson(storage, key!, list);
+  };
+  return {
+    durable,
+    list: read,
+    add(sessionId, now) {
+      const list = read().filter((t) => t.sessionId !== sessionId);
+      write([...list, { sessionId, at: now }]);
+    },
+    remove(sessionId) {
+      write(read().filter((t) => t.sessionId !== sessionId));
+    },
+    has: (sessionId) => read().some((t) => t.sessionId === sessionId),
+  };
+}
+
+/** Whether any account has a tombstone on this browser (so the page must look up who it is). */
+export function anyTombstones(storage: StorageLike | null = browserStorage()): boolean {
+  if (!storage || typeof storage.key !== 'function' || typeof storage.length !== 'number') return false;
+  try {
+    for (let i = 0; i < storage.length; i += 1) {
+      if (storage.key(i)?.startsWith(TOMBSTONE_PREFIX)) return true;
+    }
+  } catch {
+    /* unreadable storage has no tombstones we could act on */
+  }
+  return false;
+}
+
+/**
+ * Send every pending discard of this account again. A tombstone goes only on
+ * the server's 204 or 404; anything else keeps it for the next try.
+ */
+export async function flushTombstones(
+  tombstones: TombstoneStore,
+  deps: SessionDeps = {},
+): Promise<{ deleted: string[]; pending: string[] }> {
+  const deleted: string[] = [];
+  const pending: string[] = [];
+  for (const t of tombstones.list()) {
+    if ((await deleteSessionOnce(t.sessionId, deps)) === 'gone') {
+      tombstones.remove(t.sessionId);
+      deleted.push(t.sessionId);
+    } else {
+      pending.push(t.sessionId);
+    }
+  }
+  return { deleted, pending };
+}
+
+/** Bytes as an ArrayBuffer of exactly their length: what every IndexedDB engine clones the same way. */
+function toBuffer(bytes: Uint8Array | null | undefined): ArrayBuffer | null {
+  if (!bytes) return null;
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
 
 function idbRequest<T>(req: IDBRequest<T>): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -1387,12 +1962,13 @@ function idbDone(tx: IDBTransaction): Promise<void> {
  */
 export async function openOutbox(
   factory: IDBFactory | undefined = typeof indexedDB !== 'undefined' ? indexedDB : undefined,
+  dbName: string = OUTBOX_DB,
 ): Promise<OutboxStore> {
   if (!factory) return createMemoryOutbox();
   let db: IDBDatabase;
   try {
     db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = factory.open(OUTBOX_DB, 1);
+      const req = factory.open(dbName, 1);
       req.onupgradeneeded = () => {
         const d = req.result;
         if (!d.objectStoreNames.contains(RECORD_STORE)) {
@@ -1409,10 +1985,22 @@ export async function openOutbox(
   } catch {
     return createMemoryOutbox();
   }
+  // A wipe (logout, another account signing in) deletes this database from
+  // another tab or from this one; an open connection would block it until the
+  // tab closed. Close on request: later calls then fail, and every caller
+  // already treats a failing outbox as the safety net it is.
+  db.onversionchange = () => db.close();
   const range = (id: string, first: number, last: number) =>
     IDBKeyRange.bound([id, first], [id, last]);
   return {
     persistent: true,
+    async touch(id, now) {
+      const tx = db.transaction(RECORD_STORE, 'readwrite');
+      const store = tx.objectStore(RECORD_STORE);
+      const r = await idbRequest(store.get(id) as IDBRequest<OutboxRecord | undefined>);
+      if (r) store.put({ ...r, aliveAt: now });
+      await idbDone(tx);
+    },
     async saveRecord(record) {
       const tx = db.transaction(RECORD_STORE, 'readwrite');
       tx.objectStore(RECORD_STORE).put(record);
@@ -1441,21 +2029,26 @@ export async function openOutbox(
       await idbDone(tx);
       return taken;
     },
-    async putSlice(id, idx, endMs, data) {
+    async putSlice(id, idx, endMs, data, lead = null) {
       const bytes = await blobBytes(data);
       const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
       const tx = db.transaction(SLICE_STORE, 'readwrite');
-      tx.objectStore(SLICE_STORE).put({ sessionId: id, idx, endMs, bytes: buffer });
+      tx.objectStore(SLICE_STORE).put({ sessionId: id, idx, endMs, bytes: buffer, lead: toBuffer(lead) });
       await idbDone(tx);
     },
     async readSlices(id, first, last) {
       const tx = db.transaction(SLICE_STORE, 'readonly');
       const rows = await idbRequest(
         tx.objectStore(SLICE_STORE).getAll(range(id, first, last)) as IDBRequest<
-          Array<{ idx: number; endMs: number; bytes: ArrayBuffer }>
+          Array<{ idx: number; endMs: number; bytes: ArrayBuffer; lead?: ArrayBuffer | null }>
         >,
       );
-      return rows.map((r) => ({ idx: r.idx, endMs: r.endMs, bytes: new Uint8Array(r.bytes) }));
+      return rows.map((r) => ({
+        idx: r.idx,
+        endMs: r.endMs,
+        bytes: new Uint8Array(r.bytes),
+        lead: r.lead ? new Uint8Array(r.lead) : null,
+      }));
     },
     async dropSlices(id, first, last) {
       const tx = db.transaction(SLICE_STORE, 'readwrite');
@@ -1489,7 +2082,17 @@ export interface SessionProgress {
   pendingParts: number;
   /** Recording time not yet acknowledged. */
   pendingMs: number;
+  /** Recording time the server has acknowledged (stored); what "Saved to your account" may claim. */
+  savedMs?: number;
   offline: boolean;
+  /**
+   * Offline for longer than the server waits (idle_close_s): the server has
+   * probably closed this recording, and "it will upload when the connection is
+   * back" is no longer a promise the bar can make.
+   */
+  offlineLong?: boolean;
+  /** The server's idle close, for the sentence above. */
+  idleCloseS?: number;
   /** Storage refused for over a minute; the banner, not an error. */
   storageTrouble: boolean;
   lastAckAt: number | null;
@@ -1505,9 +2108,36 @@ export type SessionInterrupt =
   | { kind: 'part_conflict' }
   | { kind: 'session_closed'; endedBy: string | null }
   | { kind: 'storage_full' }
+  | { kind: 'quota_exceeded' }
   | { kind: 'unsupported_format'; detail: string | null }
   | { kind: 'lost_parts' }
   | { kind: 'generic' };
+
+/**
+ * Interrupts after which the audio this device still has is KEPT, and offered
+ * as "Upload the rest". The server stopped taking parts, but nothing says the
+ * audio is unwanted or undecodable: the session was closed by its idle timer
+ * or from another tab, the disk was full, the feature was switched off, or the
+ * server refused in a way this client does not know. Until 2026-09-29 every one
+ * of them deleted the outbox: 11 minutes offline kept 24 of 156 slices, and the
+ * 132 recorded offline were deleted from IndexedDB on reconnect.
+ *
+ * The others do delete: `not_found` (the account's own recording is gone from
+ * the server — the outbox is per account, so this is never someone else's),
+ * `part_conflict` (another tab is uploading the same audio), and
+ * `unsupported_format` (the server cannot decode the container).
+ */
+const HOLDS_AUDIO: ReadonlySet<SessionInterrupt['kind']> = new Set([
+  'session_closed',
+  'storage_full',
+  'quota_exceeded',
+  'voice_off',
+  'generic',
+]);
+
+function keepsSlices(interrupt: SessionInterrupt | null): boolean {
+  return interrupt === null || interrupt.kind === 'signed_out' || HOLDS_AUDIO.has(interrupt.kind);
+}
 
 interface QueuedSlice {
   idx: number;
@@ -1515,6 +2145,8 @@ interface QueuedSlice {
   endMs: number;
   /** Kept only when the store could not take it; null once it is stored. */
   data: Blob | null;
+  /** The front a continuation starting here needs (see WebmCutTracker); undefined when not read yet. */
+  lead?: Uint8Array | null;
 }
 
 export interface SessionStats {
@@ -1542,6 +2174,8 @@ export interface SessionStats {
  * meanwhile. When the uploader has fallen behind it sends several slices as
  * one part, up to the server's part limit, so coming back after an outage
  * costs a few requests rather than hundreds against a 120-a-minute limit.
+ * Every request has a deadline (`partTimeoutMs`, `REQUEST_TIMEOUT_MS`), and
+ * the browser's `online` event restarts the one in flight.
  *
  * NEVER THE WHOLE RECORDING. The tab holds only what the server has not yet
  * acknowledged — normally one 5 s slice of about 80 KB — and with IndexedDB
@@ -1550,6 +2184,11 @@ export interface SessionStats {
  * minutes of 128.7 kb/s slices, measured 2026-09-29 by driving the origin/dev
  * hook in a test harness. tests/voice-session-recorder.test.tsx holds an hour
  * of the same slices to at most two held at once (160,874 bytes).
+ *
+ * NEVER DELETE WHAT THE SERVER HAS NOT STORED (2026-09-29), except when the
+ * person discards the recording. The outbox record also outlives the finish:
+ * it goes only when the transcript is in the composer (`settleRecord`), so a
+ * reload during a long finish can still offer the words back.
  */
 export class VoiceSession {
   readonly sessionId: string;
@@ -1558,6 +2197,7 @@ export class VoiceSession {
 
   private readonly fetchImpl: typeof fetch;
   private readonly store: OutboxStore;
+  private readonly tombstones: TombstoneStore;
   private readonly now: () => number;
   private readonly random: () => number;
   private readonly sha: (bytes: Uint8Array) => Promise<string>;
@@ -1566,6 +2206,8 @@ export class VoiceSession {
 
   private readonly abort = new AbortController();
   private readonly wake = { current: null as (() => void) | null };
+  /** The request in flight, which `nudge` restarts. */
+  private readonly slot: InflightSlot = { current: null };
   private queue: QueuedSlice[] = [];
   /** Slices handed to the store and not yet written. */
   private readonly writing = new Set<QueuedSlice>();
@@ -1573,6 +2215,8 @@ export class VoiceSession {
   /** The slices of the formed part, in order; their bytes are in the store. */
   private formedSlices: QueuedSlice[] | null = null;
   private formedBody: { bytes: Uint8Array; sha: string; endMs: number } | null = null;
+  /** Consecutive deadlines the formed part has missed; each doubles the next one. */
+  private formedTimeouts = 0;
   private splitLimit: number | null = null;
   private nextSeq = 0;
   private nextSlice = 0;
@@ -1586,9 +2230,48 @@ export class VoiceSession {
   private writeChain: Promise<void> = Promise.resolve();
   private pumping: Promise<void> | null = null;
   private lastTouch = 0;
-  /** The outbox record is gone (finished or discarded); never write it again. */
+  /** The outbox record is gone (discarded, or nothing left to do); never write it again. */
   private outboxDropped = false;
   private keepAlive: ReturnType<typeof setInterval> | null = null;
+  /** The server accepted the finish. */
+  private finishSent = false;
+  /** The pagehide finish went out. */
+  private beaconSent = false;
+  private heldState: OutboxRecord['held'] = null;
+  /** A Retry the record carries (settleRecord wrote it); kept through this session's own writes. */
+  private offerState: OutboxRecord['offer'] = null;
+  /** Set on adoption: the record was already held once, so a second refusal says "still". */
+  private heldBefore = false;
+  private deliveredText: string | null = null;
+  private offlineSince: number | null = null;
+  /** Where the recorder's container can be cut to start a new stream (WebM only). */
+  private readonly cuts: ContainerCuts | null;
+  /** The container's init segment, from the first slice. */
+  private init: Uint8Array | null = null;
+  /**
+   * CONTINUATION (2026-09-29). Every server session this recording has used,
+   * in order. It grows when the server closes the session while this device
+   * still has audio for it (its idle close after 600 s without a part, or the
+   * pagehide finish of a tab that was closed): the rest goes into a NEW
+   * session opened with `continues`, and the transcripts are joined in order.
+   * Until then the 132 slices recorded during an 11-minute outage were
+   * deleted from this device on reconnect.
+   */
+  private chain: string[];
+  /** Where parts go now; for a continuation, its first slice and part 0's front. */
+  private target: { sessionId: string; firstSlice: number; prefix: Uint8Array | null };
+  /**
+   * A continuation being opened; its client_key makes a retried create find
+   * the same one. `linked`: it `continues` an idle-closed session and its
+   * parts are the held slices byte for byte (the server decodes them after
+   * the bytes they continue). Otherwise it is a new recording of its own,
+   * whose part 0 must open as a stream (init segment + lead).
+   */
+  private continuing: { clientKey: string; firstSlice: number; linked: boolean } | null = null;
+  /** Who closed the session that is being continued (for the message if it cannot be). */
+  private closedBy: string | null = null;
+  /** "Upload the rest": a closed session is continued whoever closed it. */
+  private continueAnyClose = false;
 
   private cursor = 0;
   private rev = -1;
@@ -1614,7 +2297,12 @@ export class VoiceSession {
       config: SessionConfig;
       state?: SessionState | null;
     },
-    deps: SessionDeps & { store: OutboxStore },
+    deps: SessionDeps & {
+      store: OutboxStore;
+      tombstones?: TombstoneStore;
+      /** The container tracker for a mime type; tests supply their own. */
+      cuts?: (mimeType: string) => ContainerCuts | null;
+    },
     handlers: {
       onProgress?: (p: SessionProgress) => void;
       onInterrupt?: (i: SessionInterrupt) => void;
@@ -1623,12 +2311,16 @@ export class VoiceSession {
     this.sessionId = init.sessionId;
     this.mimeType = init.mimeType;
     this.config = init.config;
+    this.cuts = (deps.cuts ?? cutsFor)(init.mimeType);
+    this.chain = [init.sessionId];
+    this.target = { sessionId: init.sessionId, firstSlice: 0, prefix: null };
     // Bound now, not looked up per call: a session finishing in the
     // background after its component unmounted keeps talking to the fetch it
     // started with. `bind` also keeps browsers from calling fetch with this
     // object as its receiver, which they refuse as an illegal invocation.
     this.fetchImpl = deps.fetchImpl ?? fetch.bind(globalThis);
     this.store = deps.store;
+    this.tombstones = deps.tombstones ?? tombstonesFor(null);
     this.now = deps.now ?? (() => Date.now());
     this.random = deps.random ?? Math.random;
     this.sha = deps.sha256 ?? sha256Hex;
@@ -1642,7 +2334,10 @@ export class VoiceSession {
       waitingOn: 'none',
       pendingParts: 0,
       pendingMs: 0,
+      savedMs: 0,
       offline: false,
+      offlineLong: false,
+      idleCloseS: this.config.idleCloseS,
       storageTrouble: false,
       lastAckAt: null,
       retentionDays: null,
@@ -1655,6 +2350,11 @@ export class VoiceSession {
   async open(): Promise<void> {
     await this.persist(true);
     this.startKeepAlive();
+  }
+
+  /** Whether the outbox survives a reload (IndexedDB), which decides what the person is promised. */
+  get persistent(): boolean {
+    return this.store.persistent;
   }
 
   /**
@@ -1686,11 +2386,18 @@ export class VoiceSession {
   /**
    * Adopt a recording another tab left behind (a reload, a crash, a sign-out):
    * the slices still in the outbox are sent, then the session is finished.
+   * A record whose finish was already accepted only waits for the transcript;
+   * a held one tries its refused slices again ("Upload the rest").
    */
   static async adopt(
     record: OutboxRecord,
-    deps: SessionDeps & { store: OutboxStore },
+    deps: SessionDeps & {
+      store: OutboxStore;
+      tombstones?: TombstoneStore;
+      cuts?: (mimeType: string) => ContainerCuts | null;
+    },
     handlers: { onProgress?: (p: SessionProgress) => void } = {},
+    opts: { continueAnyClose?: boolean } = {},
   ): Promise<VoiceSession> {
     const session = new VoiceSession(
       {
@@ -1712,12 +2419,30 @@ export class VoiceSession {
     session.durationMs = record.durationMs;
     session.ackedMs = record.ackedMs;
     session.endedBy = record.endedBy;
+    session.finishSent = record.finished === true;
+    session.heldBefore = Boolean(record.held);
+    session.heldState = record.held ?? null;
+    session.offerState = record.offer ?? null;
+    session.deliveredText = record.deliveredText ?? null;
+    session.init = record.init ? new Uint8Array(record.init) : null;
+    session.chain = record.chain && record.chain.length > 0 ? [...record.chain] : [record.sessionId];
+    if (record.target) {
+      session.target = {
+        sessionId: record.target.sessionId,
+        firstSlice: record.target.firstSlice,
+        prefix: record.target.prefix ? new Uint8Array(record.target.prefix) : null,
+      };
+    }
+    session.continuing = record.opening
+      ? { ...record.opening, linked: record.opening.linked !== false }
+      : null;
+    session.continueAnyClose = opts.continueAnyClose === true;
     session.lastTouch = 0;
     // What still has to go is every stored slice from the first one not yet
     // acknowledged. Their bytes stay on disk; only the sizes are kept here.
     const from = session.firstUnacked;
     const stored =
-      record.nextSlice > from
+      !session.finishSent && record.nextSlice > from
         ? await deps.store.readSlices(record.sessionId, from, record.nextSlice - 1)
         : [];
     if (from > 0) {
@@ -1728,7 +2453,7 @@ export class VoiceSession {
     const meta = stored
       .filter((s) => s.idx >= from)
       .map((s) => ({ idx: s.idx, size: s.bytes.byteLength, endMs: s.endMs, data: null }));
-    if (record.formed) {
+    if (record.formed && !session.finishSent) {
       const f = record.formed;
       session.formed = f;
       session.formedSlices = meta.filter((s) => s.idx >= f.first && s.idx <= f.last);
@@ -1742,10 +2467,12 @@ export class VoiceSession {
   /** A timeslice from the recorder. Never blocks; the write and the upload follow. */
   addSlice(data: Blob, endMs: number): void {
     if (this.ended || this.discarded) return;
-    // Signed out mid-recording: nothing more can upload, but the last few
-    // seconds are still kept for when the person signs in again. Every other
-    // interrupt means the server will not take them.
-    if (this.interrupt && this.interrupt.kind !== 'signed_out') return;
+    // After a sign-out, and after the server closed the session, the last
+    // seconds are still KEPT: for when the person signs in again, or for
+    // "Upload the rest". The interrupts that mean the server can never take
+    // them (another tab has the same audio, an undecodable format, a
+    // recording that is gone) take nothing more.
+    if (!keepsSlices(this.interrupt)) return;
     if (!data || data.size === 0) return;
     const slice: QueuedSlice = { idx: this.nextSlice, size: data.size, endMs, data };
     this.nextSlice += 1;
@@ -1759,8 +2486,23 @@ export class VoiceSession {
         this.writing.delete(slice);
         return;
       }
+      // Where this slice cuts the container, for a continuation that might
+      // have to start here (read before the slice is fed: the tracker's state
+      // is then exactly the cut between the previous slice and this one).
+      let lead: Uint8Array | null = null;
+      if (this.cuts) {
+        try {
+          const bytes = await blobBytes(data);
+          lead = slice.idx === 0 ? null : this.cuts.lead();
+          this.cuts.feed(bytes);
+          if (!this.init && this.cuts.init) this.init = this.cuts.init;
+        } catch {
+          /* a slice this tab cannot read still uploads; it just cannot start a continuation */
+        }
+      }
+      slice.lead = lead;
       try {
-        await this.store.putSlice(this.sessionId, slice.idx, slice.endMs, data);
+        await this.store.putSlice(this.sessionId, slice.idx, slice.endMs, data, lead);
         // Stored: the store holds it now (on disk for IndexedDB), not us.
         slice.data = null;
       } catch {
@@ -1776,8 +2518,13 @@ export class VoiceSession {
     });
   }
 
-  /** Stop waiting and try now — the browser just said it is back online. */
+  /**
+   * The browser just said it is back online: stop waiting, and abandon the
+   * request in flight, which was started on the network that went away and
+   * may never answer. It is sent again at once, byte for byte.
+   */
   nudge(): void {
+    this.slot.current?.();
     this.wake.current?.();
   }
 
@@ -1786,8 +2533,70 @@ export class VoiceSession {
   }
 
   /**
+   * The page is going away (pagehide) with this recording unfinished. The
+   * server would otherwise hold its slot, one of VOICE_SESSION_MAX_ACTIVE
+   * fleet-wide plus the person's own single live recording, until its
+   * 600 s idle close. `keepalive` lets the request outlive the page (and
+   * sendBeacon where fetch cannot). The outbox is left exactly as it is: a
+   * reopened tab uploads whatever this device still has.
+   *
+   * `last_part` is the last acknowledged part when nothing is waiting, and
+   * null ("end at what you hold") when something is: those parts then go up
+   * later as late parts, which the server accepts only with the change
+   * described in the report for this fix (without it they are kept on this
+   * device and offered as "Upload the rest").
+   */
+  beacon(): boolean {
+    if (this.finishSent || this.discarded || this.beaconSent || this.outboxDropped) return false;
+    // With parts still waiting on this device the session stays open: the
+    // server continues only a session IT closed for silence, so a session
+    // closed here would leave those parts with nowhere to go. A reopened tab
+    // uploads them into it, and if none comes the server's idle close
+    // (600 s) finishes it and a later tab continues it.
+    const pending = this.queue.length > 0 || this.formed !== null || this.writing.size > 0;
+    if (pending) return false;
+    const lastPart = this.nextSeq === 0 ? null : this.nextSeq - 1;
+    const body = JSON.stringify({
+      last_part: lastPart,
+      duration_ms: Math.round(this.durationMs),
+      ended_by: 'page_hidden',
+    });
+    const url = `${SESSIONS_URL}/${this.target.sessionId}/finish`;
+    let sent = false;
+    try {
+      void Promise.resolve(
+        this.fetchImpl(url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body,
+          keepalive: true,
+          credentials: 'same-origin',
+        }),
+      ).catch(() => undefined);
+      sent = true;
+    } catch {
+      sent = false;
+    }
+    if (!sent && typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+      try {
+        sent = navigator.sendBeacon(url, new Blob([body], { type: 'application/json' }));
+      } catch {
+        sent = false;
+      }
+    }
+    this.beaconSent = sent;
+    this.endedBy = this.endedBy ?? 'page_hidden';
+    void this.persist(true);
+    return sent;
+  }
+
+  /**
    * The recorder has stopped. Upload whatever is left, finish, and wait for
    * the transcript. Resolves with what the person should see.
+   *
+   * The outbox record is NOT dropped here when there are words to deliver or
+   * something to act on: the caller calls `settleRecord` once the words are in
+   * the composer.
    */
   async end(
     endedBy: EndedBy,
@@ -1797,9 +2606,8 @@ export class VoiceSession {
     try {
       return await this.endInner(endedBy, durationMs, context);
     } finally {
-      // Whatever the record still holds now (a sign-out's unsent seconds, a
-      // finish refused for a sign-out) is left for adoption, which needs it
-      // to go stale first.
+      // Whatever the record still holds now is left for `settleRecord`, or
+      // for adoption, which needs it to go stale first.
       this.stopKeepAlive();
     }
   }
@@ -1812,31 +2620,78 @@ export class VoiceSession {
     this.ended = true;
     this.endedBy = this.endedBy ?? endedBy;
     this.durationMs = Math.max(this.durationMs, durationMs);
+    const notices = [...(context.notices ?? [])];
+    if (this.finishSent) {
+      // Adopted after the finish was accepted: only the words are missing.
+      return this.waitForResult(notices, context.peakLevel ?? null, null);
+    }
     await this.writeChain;
     await this.persist(true);
     this.kick();
     while (this.pumping) await this.pumping;
     if (this.discarded) return { kind: 'withdrawn' };
-    const notices = [...(context.notices ?? [])];
     if (this.interrupt) return this.afterInterrupt(this.interrupt, notices, context.peakLevel);
     const lastPart = this.nextSeq - 1;
+    if (lastPart < 0 && this.chain.length > 1) {
+      // A continuation that never received a part: it goes, and the words
+      // come from the sessions before it, which the server closed itself.
+      const empty = this.chain.pop()!;
+      this.tombstones.add(empty, this.now());
+      if (await deleteSession(empty, { fetchImpl: this.fetchImpl, random: this.random })) {
+        this.tombstones.remove(empty);
+      }
+      this.target = { sessionId: this.chain[this.chain.length - 1]!, firstSlice: 0, prefix: null };
+      this.lastState = null;
+      this.cursor = 0;
+      this.rev = -1;
+      this.finishSent = true;
+      await this.persist(true);
+      return this.waitForResult(notices, context.peakLevel ?? null, null);
+    }
     if (lastPart < 0) {
-      // The recorder produced nothing at all. There is no audio to keep.
-      await deleteSession(this.sessionId, { fetchImpl: this.fetchImpl, random: this.random });
+      // The recorder produced nothing at all. There is no audio to keep, but
+      // the empty session holds this person's one live-recording slot until
+      // it idles out, so its delete is kept until the server confirms it.
+      this.tombstones.add(this.sessionId, this.now());
+      if (await deleteSession(this.sessionId, { fetchImpl: this.fetchImpl, random: this.random })) {
+        this.tombstones.remove(this.sessionId);
+      }
       await this.dropOutbox();
       return { kind: 'error', error: { message: VOICE_MESSAGES.tooShort, retryable: true }, offer: null };
     }
     return this.finishAndWait(lastPart, this.endedBy ?? endedBy, notices, context.peakLevel ?? null);
   }
 
-  /** The person's discard: stop everything and delete the recording on the server. */
-  async discard(): Promise<void> {
+  /**
+   * The person's discard: stop everything and delete the recording on the
+   * server. Resolves `deleted` only on the server's 204 or 404. Otherwise it
+   * is `pending`: a tombstone keeps the DELETE owed (flushTombstones sends it
+   * again on the next `online`, mic press and page load) and the caller must
+   * not tell the person it is gone.
+   */
+  async discard(): Promise<'deleted' | 'pending'> {
     this.discarded = true;
     this.abort.abort();
     this.nudge();
-    await deleteSession(this.sessionId, { fetchImpl: this.fetchImpl, random: this.random });
+    // The intent first, where a reload will find it; then this device's copy,
+    // which the person no longer wants; then the server's.
+    // Every server session of the recording goes: a continuation is the
+    // same recording.
+    const ids = [...this.chain];
+    for (const id of ids) this.tombstones.add(id, this.now());
     await this.writeChain.catch(() => undefined);
     await this.dropOutbox();
+    let all = true;
+    for (const id of ids) {
+      const gone = await deleteSession(id, {
+        fetchImpl: this.fetchImpl,
+        random: this.random,
+        attempts: 2,
+      });
+      if (gone) this.tombstones.remove(id);
+      else all = false;
+    }
+    return all ? 'deleted' : 'pending';
   }
 
   // -- internals ------------------------------------------------------------
@@ -1889,6 +2744,21 @@ export class VoiceSession {
       endedBy: this.endedBy,
       durationMs: this.durationMs,
       ackedMs: this.ackedMs,
+      finished: this.finishSent,
+      held: this.heldState,
+      deliveredText: this.deliveredText,
+      offer: this.offerState,
+      init: toBuffer(this.init),
+      chain: this.chain,
+      target:
+        this.chain.length > 1
+          ? {
+              sessionId: this.target.sessionId,
+              firstSlice: this.target.firstSlice,
+              prefix: toBuffer(this.target.prefix),
+            }
+          : null,
+      opening: this.continuing,
     };
     try {
       await this.store.saveRecord(record);
@@ -1897,18 +2767,37 @@ export class VoiceSession {
     }
   }
 
+  private pendingSlices(): number {
+    return (
+      this.queue.length +
+      (this.formed ? this.formed.last - this.formed.first + 1 : 0) +
+      this.writing.size
+    );
+  }
+
   private emit(): void {
-    const pendingSlices =
-      this.queue.length + (this.formed ? this.formed.last - this.formed.first + 1 : 0);
+    const now = this.now();
     this.progress = {
       ...this.progress,
-      pendingParts: pendingSlices,
+      pendingParts: this.pendingSlices() - this.writing.size,
       pendingMs: Math.max(0, this.durationMs - this.ackedMs),
+      savedMs: this.ackedMs,
+      offlineLong:
+        this.progress.offline &&
+        this.offlineSince !== null &&
+        now - this.offlineSince > this.config.idleCloseS * 1000,
+      idleCloseS: this.config.idleCloseS,
       storageTrouble:
         this.storageTroubleSince !== null &&
-        this.now() - this.storageTroubleSince > STORAGE_TROUBLE_AFTER_MS,
+        now - this.storageTroubleSince > STORAGE_TROUBLE_AFTER_MS,
     };
     this.onProgress({ ...this.progress });
+  }
+
+  private setOffline(offline: boolean): void {
+    if (offline) this.offlineSince ??= this.now();
+    else this.offlineSince = null;
+    this.progress = { ...this.progress, offline };
   }
 
   /** Fold a session state into the preview. Segments are final and append-only. */
@@ -1950,10 +2839,31 @@ export class VoiceSession {
   private async pump(): Promise<void> {
     let attempt = 0;
     while (!this.discarded && !this.interrupt) {
+      if (this.continuing) {
+        const next = await this.continueInNewSession();
+        if (this.discarded) return;
+        if (next === 'opened') {
+          attempt = 0;
+          continue;
+        }
+        if (next === 'retry') {
+          this.emit();
+          await this.persist();
+          await this.sleep(backoffMs(attempt, this.random));
+          attempt += 1;
+          continue;
+        }
+        this.continuing = null;
+        await this.persist(true);
+        this.stop(next === 'refused' ? { kind: 'session_closed', endedBy: this.closedBy } : next);
+        return;
+      }
       if (!this.formed) {
         if (this.queue.length === 0) return;
-        // Coalesce whatever has queued up, to the server's part limit.
-        const limit = this.config.partLimitBytes;
+        // Coalesce whatever has queued up, to the server's part limit (less
+        // the front a continuation's part 0 carries).
+        const front = this.nextSeq === 0 ? this.target.prefix?.byteLength ?? 0 : 0;
+        const limit = Math.max(1, this.config.partLimitBytes - front);
         const cap = this.splitLimit ?? Number.MAX_SAFE_INTEGER;
         let bytes = 0;
         let count = 0;
@@ -1968,6 +2878,7 @@ export class VoiceSession {
         const taken = this.queue.splice(0, count);
         this.formed = { seq: this.nextSeq, first: taken[0]!.idx, last: taken[taken.length - 1]!.idx };
         this.formedSlices = taken;
+        this.formedTimeouts = 0;
         await this.persist(true);
       }
       if (!this.formedBody) {
@@ -1985,7 +2896,7 @@ export class VoiceSession {
       this.stat.putRequests += 1;
       const reply = await callSessionApi(
         this.fetchImpl,
-        `${SESSIONS_URL}/${this.sessionId}/parts/${seq}?cursor=${this.cursor}`,
+        `${SESSIONS_URL}/${this.target.sessionId}/parts/${seq}?cursor=${this.cursor}`,
         {
           method: 'PUT',
           headers: {
@@ -1996,6 +2907,7 @@ export class VoiceSession {
           body: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer,
           signal: this.abort.signal,
         },
+        { timeoutMs: partTimeoutMs(bytes.byteLength, this.formedTimeouts), slot: this.slot },
       );
       if (reply.kind === 'aborted' || this.discarded) return;
 
@@ -2004,7 +2916,8 @@ export class VoiceSession {
         const state = parseSessionState(reply.body);
         if (state) this.apply(state);
         await this.acknowledge();
-        this.progress = { ...this.progress, offline: false, lastAckAt: this.now() };
+        this.setOffline(false);
+        this.progress = { ...this.progress, lastAckAt: this.now() };
         this.storageTroubleSince = null;
         this.emit();
         continue;
@@ -2022,6 +2935,23 @@ export class VoiceSession {
           this.formedBody = null;
           continue;
         }
+        if (reply.status === 409 && reason === 'session_closed') {
+          const endedBy = str(reply.body.ended_by);
+          // The server continues only a session it closed itself for silence
+          // (fix/voice-server-hardening `_continuation_of`): that is done at
+          // once, recording on. Any other close is continued only when the
+          // person presses "Upload the rest", as a new recording.
+          if (endedBy === 'idle' || (this.continueAnyClose && endedBy !== 'undecodable')) {
+            this.closedBy = endedBy;
+            this.continuing = {
+              clientKey: newClientKey(),
+              firstSlice: this.formed.first,
+              linked: endedBy === 'idle',
+            };
+            await this.persist(true);
+            continue;
+          }
+        }
         if (reply.status === 409 && reason === 'out_of_order') {
           // The server is missing parts this device already let go of: they
           // were acknowledged once, so this is the server's loss, not ours.
@@ -2036,7 +2966,12 @@ export class VoiceSession {
           this.storageTroubleSince ??= this.now();
         }
       } else {
-        this.progress = { ...this.progress, offline: true };
+        if (reply.restarted) {
+          // `online` fired under this request: send it again now.
+          continue;
+        }
+        if (reply.timedOut) this.formedTimeouts += 1;
+        this.setOffline(true);
       }
       this.emit();
       await this.persist();
@@ -2073,14 +3008,112 @@ export class VoiceSession {
       parts.push(s.bytes);
       endMs = s.endMs;
     }
-    const total = parts.reduce((n, p) => n + p.byteLength, 0);
-    const bytes = new Uint8Array(total);
-    let offset = 0;
-    for (const p of parts) {
-      bytes.set(p, offset);
-      offset += p.byteLength;
+    // Part 0 of a continuation starts with the front that makes it a stream
+    // of its own. It is fixed when the continuation opens, so a replay of
+    // this part is byte-identical.
+    if (f.seq === 0 && this.target.prefix && this.target.prefix.byteLength > 0) {
+      parts.unshift(this.target.prefix);
     }
+    const bytes = concatBytes(parts);
     return { bytes, sha: await this.sha(bytes), endMs };
+  }
+
+  /**
+   * Open the session the rest of this recording continues in, and move the
+   * slices the closed one refused over to it. Returns what the pump should
+   * do: go on, try again later, give up (the rest is then held on this
+   * device), or stop for a sign-out.
+   */
+  private async continueInNewSession(): Promise<'opened' | 'retry' | 'refused' | SessionInterrupt> {
+    if (this.formed) {
+      // The closed session stored nothing under this part number.
+      this.queue.unshift(...(this.formedSlices ?? []));
+      this.formed = null;
+      this.formedSlices = null;
+      this.formedBody = null;
+      this.formedTimeouts = 0;
+      this.splitLimit = null;
+    }
+    const first = this.queue[0];
+    if (!first) return 'refused';
+    const opening = (this.continuing ??= { clientKey: newClientKey(), firstSlice: first.idx, linked: true });
+    let prefix: Uint8Array | null;
+    if (opening.linked || first.idx === 0) {
+      // Byte for byte: the server decodes a linked continuation after the
+      // bytes it continues, and slice 0 opens the stream itself.
+      prefix = new Uint8Array(0);
+    } else {
+      // A recording of its own must open as a stream (WebmCutTracker).
+      let lead = first.lead;
+      if (lead === undefined) {
+        const stored = await this.store.readSlices(this.sessionId, first.idx, first.idx).catch(() => []);
+        lead = stored[0]?.lead ?? null;
+      }
+      prefix = this.init && lead ? concatBytes([this.init, lead]) : null;
+    }
+    if (!prefix) return 'refused';
+    const reply = await callSessionApi(
+      this.fetchImpl,
+      SESSIONS_URL,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          client_key: opening.clientKey,
+          mime_type: this.mimeType,
+          language: 'auto',
+          part_ms: this.config.partMs,
+          ...(opening.linked ? { continues: this.target.sessionId } : {}),
+        }),
+        signal: this.abort.signal,
+      },
+      { timeoutMs: REQUEST_TIMEOUT_MS, slot: this.slot },
+    );
+    if (reply.kind === 'aborted') return 'retry';
+    if (reply.kind === 'unreachable') {
+      if (!reply.restarted) this.setOffline(true);
+      return 'retry';
+    }
+    let sessionId: string | null = null;
+    let state: SessionState | null = null;
+    if (reply.kind === 'refused') {
+      if (reply.status === 401) return { kind: 'signed_out' };
+      if (reply.status === 409 && reply.reason === 'already_continued' && isSessionId(reply.body.session_id)) {
+        // Continued already (by a create whose answer was lost): use that one.
+        // Its part 0 is replayed byte for byte, so the server tells a
+        // duplicate from a conflict by SHA-256 as for any part.
+        sessionId = reply.body.session_id;
+      } else if (reply.status === 409 && reply.reason === 'not_continuable' && opening.linked) {
+        // The server will not link it; the rest can still go up as a
+        // recording of its own if it can open as a stream.
+        this.continuing = { clientKey: newClientKey(), firstSlice: first.idx, linked: false };
+        await this.persist(true);
+        return this.continueInNewSession();
+      } else if (reply.status === 429 || (reply.status >= 500 && reply.status !== 507)) {
+        // Busy, rate-limited or briefly unable to store: the slices wait here.
+        return 'retry';
+      } else {
+        // Another live recording of this person, storage or quota full, voice
+        // turned off: the rest is held on this device, and offered.
+        return 'refused';
+      }
+    } else {
+      state = parseSessionState(reply.body);
+      if (!state) return 'retry';
+      sessionId = state.sessionId;
+    }
+    if (!this.chain.includes(sessionId)) this.chain.push(sessionId);
+    this.target = { sessionId, firstSlice: first.idx, prefix };
+    this.continuing = null;
+    this.nextSeq = 0;
+    this.cursor = 0;
+    this.rev = -1;
+    this.lastState = null;
+    if (state) this.apply(state);
+    this.setOffline(false);
+    await this.persist(true);
+    this.emit();
+    return 'opened';
   }
 
   private async acknowledge(): Promise<void> {
@@ -2093,9 +3126,12 @@ export class VoiceSession {
     this.formed = null;
     this.formedSlices = null;
     this.formedBody = null;
+    this.formedTimeouts = 0;
     this.splitLimit = null;
     this.nextSeq += 1;
     this.firstUnacked = f.last + 1;
+    // The server took a part after refusing one: whatever was held is moving.
+    if (this.heldState && this.pendingSlices() === 0) this.heldState = null;
     // The record first, then the bytes: a crash between the two leaves
     // acknowledged slices behind, which adoption skips by `firstUnacked`.
     // The other order would leave a record naming a part whose bytes are
@@ -2117,6 +3153,7 @@ export class VoiceSession {
     if (status === 409 && reason === 'session_closed') {
       return { kind: 'session_closed', endedBy: str(reply.body.ended_by) };
     }
+    if (status === 507 && (reason === 'quota_full' || reason === 'quota_exceeded')) return { kind: 'quota_exceeded' };
     if (status === 507) return { kind: 'storage_full' };
     if (status === 415) return { kind: 'unsupported_format', detail: reply.detail };
     return { kind: 'generic' };
@@ -2137,7 +3174,12 @@ export class VoiceSession {
       error: { message, retryable },
       offer: null,
     });
-    const pending = this.queue.length + (this.formed ? 1 : 0);
+    // Everything recorded has already been written to the store by now
+    // (end() awaited the write chain), so this is what the server lacks.
+    const pending = this.pendingSlices();
+    if (HOLDS_AUDIO.has(interrupt.kind) && pending > 0) {
+      return this.holdTheRest(interrupt, notices, peakLevel ?? null);
+    }
     switch (interrupt.kind) {
       case 'signed_out': {
         const t = formatElapsed(this.ackedMs);
@@ -2167,7 +3209,6 @@ export class VoiceSession {
           false,
         );
       case 'session_closed': {
-        await this.dropOutbox();
         const message =
           interrupt.endedBy === 'idle'
             ? VOICE_MESSAGES.closedIdle(idleWords(this.config.idleCloseS))
@@ -2177,20 +3218,99 @@ export class VoiceSession {
         return this.waitForResult([message, ...notices], peakLevel ?? null, message);
       }
       case 'storage_full': {
-        await this.dropOutbox();
         const message = VOICE_MESSAGES.storageFullMid(this.t());
+        return this.waitForResult([message, ...notices], peakLevel ?? null, message);
+      }
+      case 'quota_exceeded': {
+        const message = VOICE_MESSAGES.quotaMid(this.t());
         return this.waitForResult([message, ...notices], peakLevel ?? null, message);
       }
       case 'lost_parts': {
         const t = formatElapsed(this.ackedMs);
-        await this.dropOutbox();
+        // Out of order: the server lost parts this device had already been
+        // told were stored. What follows cannot be appended after the hole
+        // (the contract numbers parts contiguously), so it ends here.
+        if (this.nextSlice > 0) {
+          await this.store.dropSlices(this.sessionId, 0, this.nextSlice - 1).catch(() => undefined);
+        }
+        this.queue = [];
         return this.finishAndWait(null, 'lost_parts', [VOICE_MESSAGES.lostParts(t), ...notices], peakLevel ?? null);
       }
-      default: {
-        await this.dropOutbox();
+      default:
         return this.finishAndWait(null, 'lost_parts', [VOICE_MESSAGES.generic(this.t()), ...notices], peakLevel ?? null);
-      }
     }
+  }
+
+  /**
+   * The server stopped taking parts while this device still had some. They
+   * are KEPT (record `held`), the person is told exactly that, and offered
+   * "Upload the rest". Whatever the server did store is still transcribed and
+   * delivered as usual.
+   */
+  private async holdTheRest(
+    interrupt: SessionInterrupt,
+    notices: string[],
+    peakLevel: number | null,
+  ): Promise<SessionResult> {
+    const heldMs = Math.max(0, this.durationMs - this.ackedMs);
+    const held = formatElapsed(heldMs);
+    const saved = formatElapsed(this.ackedMs);
+    this.heldState = {
+      reason: interrupt.kind,
+      endedBy: interrupt.kind === 'session_closed' ? interrupt.endedBy : null,
+    };
+    await this.persist(true);
+    let message: string;
+    if (this.heldBefore) message = VOICE_MESSAGES.heldStill(held);
+    else if (interrupt.kind === 'session_closed') {
+      message =
+        interrupt.endedBy === 'idle'
+          ? VOICE_MESSAGES.heldIdle(idleWords(this.config.idleCloseS), saved, held)
+          : interrupt.endedBy === 'quota_full'
+            ? VOICE_MESSAGES.heldQuota(saved, held)
+            : interrupt.endedBy === 'storage_full'
+              ? VOICE_MESSAGES.heldStorageFull(saved, held)
+              : interrupt.endedBy === 'undecodable'
+                ? VOICE_MESSAGES.heldUndecodable(held)
+                : VOICE_MESSAGES.heldElsewhere(held);
+    } else if (interrupt.kind === 'storage_full') message = VOICE_MESSAGES.heldStorageFull(saved, held);
+    else if (interrupt.kind === 'quota_exceeded') message = VOICE_MESSAGES.heldQuota(saved, held);
+    else if (interrupt.kind === 'voice_off') {
+      message = VOICE_MESSAGES.heldVoiceOff(interrupt.detail || VOICE_MESSAGES.voiceOff, held);
+    } else message = VOICE_MESSAGES.heldGeneric(saved, held);
+    const offer = (replaces: string | null): VoiceOffer => ({
+      kind: 'upload_rest',
+      sessionId: this.sessionId,
+      replaces,
+      message,
+      label: VOICE_MESSAGES.uploadRest,
+    });
+
+    let result: SessionResult;
+    if (interrupt.kind === 'voice_off') {
+      // Nothing of this session can be read back while the feature is off.
+      result = { kind: 'error', error: { message, retryable: false }, offer: null };
+    } else if (interrupt.kind === 'generic') {
+      result = await this.finishAndWait(null, 'lost_parts', [message, ...notices], peakLevel, true);
+    } else {
+      result = await this.waitForResult([message, ...notices], peakLevel, message, true);
+    }
+    if (result.kind === 'withdrawn') return result;
+    // The server could not decode the stream; the rest of the same stream
+    // cannot help it. Kept here (it is never deleted unasked), not offered.
+    const uploadable = !(interrupt.kind === 'session_closed' && interrupt.endedBy === 'undecodable');
+    if (result.kind === 'text') {
+      return {
+        ...result,
+        notices: result.notices.includes(message) ? result.notices : [message, ...result.notices],
+        offer: uploadable ? offer(this.deliveredText ?? result.text) : null,
+      };
+    }
+    return {
+      kind: 'error',
+      error: { message, retryable: uploadable },
+      offer: uploadable ? offer(this.deliveredText) : null,
+    };
   }
 
   private async finishAndWait(
@@ -2198,30 +3318,39 @@ export class VoiceSession {
     endedBy: EndedBy,
     notices: string[],
     peakLevel: number | null,
+    keepRecord = false,
   ): Promise<SessionResult> {
     let attempt = 0;
     let last = lastPart;
     let by = endedBy;
     for (;;) {
       if (this.discarded) return { kind: 'withdrawn' };
-      const reply = await callSessionApi(this.fetchImpl, `${SESSIONS_URL}/${this.sessionId}/finish`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          last_part: last,
-          duration_ms: Math.round(this.durationMs),
-          ended_by: by,
-        }),
-        signal: this.abort.signal,
-      });
+      const reply = await callSessionApi(
+        this.fetchImpl,
+        `${SESSIONS_URL}/${this.target.sessionId}/finish`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            last_part: last,
+            duration_ms: Math.round(this.durationMs),
+            ended_by: by,
+          }),
+          signal: this.abort.signal,
+        },
+        { timeoutMs: REQUEST_TIMEOUT_MS, slot: this.slot },
+      );
       if (reply.kind === 'aborted' || this.discarded) return { kind: 'withdrawn' };
       if (reply.kind === 'ok') {
         const state = parseSessionState(reply.body);
         if (state) this.apply(state);
-        // Finish is accepted: nothing on this device is needed any more.
-        await this.dropOutbox();
+        // Finish is accepted: nothing is left to upload, but the record stays
+        // until the words are in the composer (settleRecord).
+        this.finishSent = true;
+        this.setOffline(false);
+        await this.persist(true);
         this.emit();
-        return this.waitForResult(notices, peakLevel, null);
+        return this.waitForResult(notices, peakLevel, null, keepRecord);
       }
       if (reply.kind === 'refused') {
         if (reply.status === 409 && reply.reason === 'parts_missing') {
@@ -2232,9 +3361,11 @@ export class VoiceSession {
           notices = [VOICE_MESSAGES.lostParts(formatElapsed(this.ackedMs)), ...notices];
           continue;
         }
-        if (!partRetryable(reply)) return this.refusalAfterStop(reply);
+        if (!partRetryable(reply)) return this.refusalAfterStop(reply, keepRecord);
+      } else if (reply.restarted) {
+        continue;
       }
-      this.progress = { ...this.progress, offline: reply.kind === 'unreachable' };
+      this.setOffline(reply.kind === 'unreachable');
       this.emit();
       await this.persist();
       await this.sleep(backoffMs(attempt, this.random));
@@ -2242,7 +3373,10 @@ export class VoiceSession {
     }
   }
 
-  private refusalAfterStop(reply: Extract<Reply, { kind: 'refused' }>): SessionResult {
+  private async refusalAfterStop(
+    reply: Extract<Reply, { kind: 'refused' }>,
+    keepRecord = false,
+  ): Promise<SessionResult> {
     const fail = (message: string, retryable: boolean): SessionResult => ({
       kind: 'error',
       error: { message, retryable },
@@ -2252,8 +3386,9 @@ export class VoiceSession {
       // The record stays: once signed in again, adoption finishes it.
       return fail(VOICE_MESSAGES.signedOutNothingPending(this.t()), false);
     }
-    // Every other refusal is final, and nothing on this device can change it.
-    void this.dropOutbox();
+    // Every other refusal is final, and nothing on this device can change it
+    // — except audio the server never stored, which stays held.
+    if (!keepRecord) await this.dropOutbox();
     if (reply.status === 403) return fail(reply.detail || VOICE_MESSAGES.voiceOff, false);
     if (reply.status === 404) return fail(VOICE_MESSAGES.notFound, false);
     return fail(VOICE_MESSAGES.generic(this.t()), true);
@@ -2263,43 +3398,120 @@ export class VoiceSession {
    * Long-poll until the session is done or failed. Every request returns
    * within 25 s, under Cloudflare's 125 s first-byte limit, so there is no
    * heartbeat to keep and no ceiling on how long the whole wait may be.
+   *
+   * An error with nothing left to act on drops the record here; words, and
+   * a Retry to offer, keep it for `settleRecord`.
    */
   private async waitForResult(
     notices: string[],
     peakLevel: number | null,
     failureMessage: string | null,
+    keepRecord = false,
   ): Promise<SessionResult> {
+    this.startKeepAlive();
     const settled = await pollSession(
-      this.sessionId,
+      this.target.sessionId,
       { cursor: this.cursor, rev: this.rev, state: this.lastState },
       {
         fetchImpl: this.fetchImpl,
         random: this.random,
         signal: this.abort.signal,
         wake: this.wake,
+        slot: this.slot,
         waitS: this.config.longPollMaxS,
         onState: (state) => {
           this.apply(state);
           this.emit();
         },
         onOffline: (offline) => {
-          this.progress = { ...this.progress, offline };
+          this.setOffline(offline);
           this.emit();
         },
       },
     );
     if (this.discarded || settled.kind === 'aborted') return { kind: 'withdrawn' };
     if (settled.kind === 'refused') {
-      if (failureMessage) return { kind: 'error', error: { message: failureMessage, retryable: false }, offer: null };
-      return this.refusalAfterStop(settled.reply);
+      if (settled.reply.status === 401) {
+        // Signed out while waiting: the finished record stays, and the words
+        // are offered back after sign-in.
+        return this.refusalAfterStop(settled.reply, true);
+      }
+      if (failureMessage) {
+        if (!keepRecord) await this.dropOutbox();
+        return { kind: 'error', error: { message: failureMessage, retryable: false }, offer: null };
+      }
+      return this.refusalAfterStop(settled.reply, keepRecord);
     }
-    return describeOutcome(settled.state, {
+    let result = describeOutcome(settled.state, {
       lowSeen: this.lowSeen,
       notices,
       peakLevel,
       durationMs: this.durationMs,
     });
+    if (this.chain.length > 1) result = await this.joinChain(result);
+    if (result.kind === 'error' && !offerKeepsRecord(result.offer) && !keepRecord) {
+      await this.dropOutbox();
+    }
+    return result;
   }
+
+  /**
+   * A continued recording's words: every session's transcript, in the order
+   * they were recorded, as one text. The sessions the server closed finish
+   * by themselves; they are only waited for here.
+   */
+  private async joinChain(last: SessionResult): Promise<SessionResult> {
+    if (last.kind === 'withdrawn') return last;
+    const results: SessionResult[] = [];
+    for (const id of this.chain.slice(0, -1)) {
+      const settled = await pollSession(
+        id,
+        { cursor: 0, rev: -1, state: null },
+        {
+          fetchImpl: this.fetchImpl,
+          random: this.random,
+          signal: this.abort.signal,
+          wake: this.wake,
+          slot: this.slot,
+          waitS: this.config.longPollMaxS,
+        },
+      );
+      if (settled.kind === 'aborted' || this.discarded) return { kind: 'withdrawn' };
+      if (settled.kind === 'refused') continue; // gone from the server: nothing to deliver
+      results.push(describeOutcome(settled.state, {}));
+    }
+    results.push(last);
+    const texts = results.filter(
+      (r): r is Extract<SessionResult, { kind: 'text' }> => r.kind === 'text',
+    );
+    if (texts.length === 0) {
+      return results.find((r) => r.kind === 'error' && r.offer !== null) ?? last;
+    }
+    const offers = results.map((r) => (r.kind === 'withdrawn' ? null : r.offer));
+    return {
+      kind: 'text',
+      text: texts.reduce((acc, r) => mergeTranscript(acc, r.text), ''),
+      notices: [...new Set(texts.flatMap((r) => r.notices))],
+      offer: offers.find((o) => o?.kind === 'retranscribe') ?? null,
+      sessionId: this.sessionId,
+    };
+  }
+}
+
+/**
+ * ONE LONG-POLL PER TAB. The server answers a third concurrent long-poll of a
+ * person with 429 too_many_polls (fix/voice-server-hardening: at most two,
+ * each one holds a Postgres-polling loop). A tab can have several sessions
+ * waiting at once — its own recording, one adopted from a closed tab, the
+ * sessions of a continued recording — so their GETs take turns here.
+ */
+let pollQueue: Promise<void> = Promise.resolve();
+function pollTurn(): Promise<() => void> {
+  let release!: () => void;
+  const mine = new Promise<void>((resolve) => (release = resolve));
+  const before = pollQueue;
+  pollQueue = before.then(() => mine);
+  return before.then(() => release);
 }
 
 type PollResult =
@@ -2316,6 +3528,7 @@ export async function pollSession(
     random?: () => number;
     signal?: AbortSignal;
     wake?: { current: (() => void) | null };
+    slot?: InflightSlot;
     waitS?: number;
     onState?: (state: SessionState) => void;
     onOffline?: (offline: boolean) => void;
@@ -2326,18 +3539,28 @@ export async function pollSession(
     return { kind: 'settled', state: from.state };
   }
   const wake = opts.wake ?? { current: null };
+  const waitS = Math.min(25, Math.max(0, opts.waitS ?? 25));
   let attempt = 0;
   for (;;) {
     if (opts.signal?.aborted) return { kind: 'aborted' };
     const query = new URLSearchParams({
       cursor: String(cursor),
       since_rev: String(rev),
-      wait_s: String(Math.min(25, Math.max(0, opts.waitS ?? 25))),
+      wait_s: String(waitS),
     });
-    const reply = await callSessionApi(opts.fetchImpl, `${SESSIONS_URL}/${sessionId}?${query}`, {
-      method: 'GET',
-      signal: opts.signal,
-    });
+    const done = await pollTurn();
+    let reply: Reply;
+    try {
+      reply = await callSessionApi(
+        opts.fetchImpl,
+        `${SESSIONS_URL}/${sessionId}?${query}`,
+        { method: 'GET', signal: opts.signal },
+        // The server answers by wait_s; past that plus slack the socket is dead.
+        { timeoutMs: waitS * 1000 + LONG_POLL_SLACK_MS, slot: opts.slot },
+      );
+    } finally {
+      done();
+    }
     if (reply.kind === 'aborted') return { kind: 'aborted' };
     if (reply.kind === 'ok') {
       attempt = 0;
@@ -2366,6 +3589,7 @@ export async function pollSession(
       continue;
     }
     if (reply.kind === 'refused' && !partRetryable(reply)) return { kind: 'refused', reply };
+    if (reply.kind === 'unreachable' && reply.restarted) continue;
     opts.onOffline?.(reply.kind === 'unreachable');
     await doSleep(backoffMs(attempt, opts.random), wake);
     attempt += 1;
@@ -2382,12 +3606,17 @@ export async function retranscribeSession(
   deps: SessionDeps & { signal?: AbortSignal } = {},
 ): Promise<SessionResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
-  const reply = await callSessionApi(fetchImpl, `${SESSIONS_URL}/${offer.sessionId}/retranscribe`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ scope: offer.scope }),
-    signal: deps.signal,
-  });
+  const reply = await callSessionApi(
+    fetchImpl,
+    `${SESSIONS_URL}/${offer.sessionId}/retranscribe`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ scope: offer.scope }),
+      signal: deps.signal,
+    },
+    { timeoutMs: REQUEST_TIMEOUT_MS },
+  );
   const fail = (message: string, retryable: boolean, again: VoiceOffer | null = null): SessionResult => ({
     kind: 'error',
     error: { message, retryable },
@@ -2396,6 +3625,10 @@ export async function retranscribeSession(
   if (reply.kind === 'aborted') return { kind: 'withdrawn' };
   if (reply.kind === 'unreachable') return fail(VOICE_MESSAGES.retryUnreachable, true, offer);
   if (reply.kind === 'refused') {
+    if (reply.status === 409 && reply.reason === 'retranscribe_busy') {
+      return fail(VOICE_MESSAGES.retranscribeBusy, true, offer);
+    }
+    if (reply.status === 429) return fail(VOICE_MESSAGES.retranscribeRateLimited, true, offer);
     if (reply.status === 409) return fail(VOICE_MESSAGES.sessionBusy, true);
     if (reply.status === 410) return fail(VOICE_MESSAGES.audioDeleted, false);
     if (reply.status === 404) return fail(VOICE_MESSAGES.notFound, false);
@@ -2426,4 +3659,591 @@ export async function retranscribeSession(
     return fail(settled.reply.status === 404 ? VOICE_MESSAGES.notFound : VOICE_MESSAGES.retryGeneric, false);
   }
   return describeOutcome(settled.state, { replaces: offer.replaces, lowSeen });
+}
+
+/**
+ * The words of a recording have reached the person (or the person dismissed
+ * them): its outbox record goes, unless something is still owed — a Retry
+ * the person has not pressed, or audio held on this device. `deliveredText`
+ * is what now stands in the draft, which a later full transcript replaces.
+ */
+export async function settleRecord(
+  store: OutboxStore,
+  sessionId: string,
+  keep: {
+    deliveredText?: string | null;
+    offer?: OutboxRecord['offer'];
+  } | null,
+): Promise<void> {
+  try {
+    const record = await store.loadRecord(sessionId);
+    if (!record) return;
+    if (!keep && !record.held) {
+      await store.drop(sessionId);
+      return;
+    }
+    await store.saveRecord({
+      ...record,
+      deliveredText: keep?.deliveredText !== undefined ? keep.deliveredText : record.deliveredText ?? null,
+      offer: keep?.offer !== undefined ? keep.offer : record.held ? record.offer ?? null : null,
+    });
+  } catch {
+    /* the outbox is a safety net */
+  }
+}
+
+/** Recording time held on this device across a store's records (for the logout question). */
+export async function heldOnDeviceMs(store: OutboxStore): Promise<number> {
+  let ms = 0;
+  let records: OutboxRecord[] = [];
+  try {
+    records = await store.listRecords();
+  } catch {
+    return 0;
+  }
+  for (const r of records) {
+    if (r.finished) continue;
+    let slices: StoredSlice[] = [];
+    try {
+      slices = await store.readSlices(r.sessionId, r.firstUnacked ?? 0, Math.max(0, r.nextSlice - 1));
+    } catch {
+      slices = [];
+    }
+    if (slices.length > 0) ms += Math.max(r.partMs * slices.length, r.durationMs - r.ackedMs);
+  }
+  return ms;
+}
+
+/**
+ * Before an explicit logout. Sends every pending discard while the cookie is
+ * still valid, then asks the person if anything would be lost or left behind:
+ * audio this browser never uploaded is deleted by the logout (it must not stay
+ * readable for the next person on a shared computer), and a discard the
+ * server has not confirmed stays owed until they sign in here again.
+ *
+ * Resolves false when the person chose to stay signed in.
+ */
+export async function voiceLogoutCheck(
+  owner: string | null,
+  deps: {
+    fetchImpl?: typeof fetch;
+    confirm?: (message: string) => boolean;
+    factory?: IDBFactory;
+    storage?: StorageLike | null;
+  } = {},
+): Promise<boolean> {
+  const storage = deps.storage === undefined ? browserStorage() : deps.storage;
+  const factory = deps.factory ?? (typeof indexedDB !== 'undefined' ? indexedDB : undefined);
+  const ask = deps.confirm ?? ((m: string) => (typeof window !== 'undefined' ? window.confirm(m) : true));
+  let pendingDiscards = 0;
+  if (owner) {
+    const { pending } = await flushTombstones(tombstonesFor(owner, storage), {
+      fetchImpl: deps.fetchImpl,
+    });
+    pendingDiscards = pending.length;
+  }
+  let heldMs = 0;
+  if (factory) {
+    for (const o of outboxOwners(storage)) {
+      const store = await openOutbox(factory, outboxDbName(o));
+      heldMs += await heldOnDeviceMs(store);
+    }
+  }
+  const questions: string[] = [];
+  if (heldMs > 0) questions.push(VOICE_MESSAGES.logoutHeld(formatElapsed(heldMs)));
+  if (pendingDiscards > 0) questions.push(VOICE_MESSAGES.logoutDiscardPending);
+  if (questions.length === 0) return true;
+  return ask(questions.join('\n\n'));
+}
+
+// ---------------------------------------------------------------------------
+// Putting a re-transcribed recording where its first transcript went
+// ---------------------------------------------------------------------------
+
+/** Where in the draft a transcript was put: [start, end) in UTF-16 units. */
+export interface DraftSpan {
+  start: number;
+  end: number;
+}
+
+/** `mergeTranscript`, also saying where the transcript landed. */
+export function mergeTranscriptAt(
+  draft: string,
+  transcript: string,
+): { text: string; span: DraftSpan | null } {
+  const spoken = transcript.trim();
+  if (!spoken) return { text: draft, span: null };
+  const text = mergeTranscript(draft, spoken);
+  const start = text.length - spoken.length;
+  return { text, span: { start, end: text.length } };
+}
+
+/**
+ * Follow a span through one edit of the draft. An edit before the span moves
+ * it, one after leaves it, one inside (or across its edge) grows or shrinks
+ * it: the transcript region is then "the transcript as the person edited it".
+ * Null when nothing of it is left.
+ */
+export function shiftSpan(span: DraftSpan | null, before: string, after: string): DraftSpan | null {
+  if (!span || before === after) return span;
+  let a = 0;
+  const min = Math.min(before.length, after.length);
+  while (a < min && before.charCodeAt(a) === after.charCodeAt(a)) a += 1;
+  let b = 0;
+  while (
+    b < min - a &&
+    before.charCodeAt(before.length - 1 - b) === after.charCodeAt(after.length - 1 - b)
+  ) {
+    b += 1;
+  }
+  const oldEnd = before.length - b;
+  const delta = after.length - before.length;
+  let next: DraftSpan;
+  if (oldEnd <= span.start) next = { start: span.start + delta, end: span.end + delta };
+  else if (a >= span.end) next = span;
+  else next = { start: Math.min(span.start, a), end: Math.max(span.end, oldEnd) + delta };
+  if (next.start < 0 || next.end > after.length || next.start >= next.end) return null;
+  return next;
+}
+
+function tokens(text: string): string[] {
+  return text.match(/\s+|\S+/g) ?? [];
+}
+
+interface Hunk {
+  /** base[a0, a1) is replaced by `ins`. */
+  a0: number;
+  a1: number;
+  ins: string[];
+}
+
+/** Past this many token edits a merge is not attempted: the person is asked. */
+const MAX_MERGE_EDITS = 400;
+
+/**
+ * Myers' O(ND) diff over tokens, as replace-hunks against `base`. Null when
+ * the two differ by more than MAX_MERGE_EDITS tokens. Common prefix and suffix
+ * are cut first, so a 9,000-word transcript with a few edits costs almost
+ * nothing.
+ */
+function diffHunks(base: string[], other: string[]): Hunk[] | null {
+  let pre = 0;
+  while (pre < base.length && pre < other.length && base[pre] === other[pre]) pre += 1;
+  let suf = 0;
+  while (
+    suf < base.length - pre &&
+    suf < other.length - pre &&
+    base[base.length - 1 - suf] === other[other.length - 1 - suf]
+  ) {
+    suf += 1;
+  }
+  const A = base.slice(pre, base.length - suf);
+  const B = other.slice(pre, other.length - suf);
+  const N = A.length;
+  const M = B.length;
+  if (N === 0 && M === 0) return [];
+  if (N === 0) return [{ a0: pre, a1: pre, ins: B }];
+  if (M === 0) return [{ a0: pre, a1: pre + N, ins: [] }];
+  const limit = Math.min(N + M, MAX_MERGE_EDITS);
+  const off = limit + 1;
+  const v = new Int32Array(2 * limit + 3);
+  const trace: Int32Array[] = [];
+  let found = -1;
+  for (let d = 0; d <= limit && found < 0; d += 1) {
+    for (let k = -d; k <= d; k += 2) {
+      let x =
+        k === -d || (k !== d && v[off + k - 1]! < v[off + k + 1]!) ? v[off + k + 1]! : v[off + k - 1]! + 1;
+      let y = x - k;
+      while (x < N && y < M && A[x] === B[y]) {
+        x += 1;
+        y += 1;
+      }
+      v[off + k] = x;
+      if (x >= N && y >= M) {
+        found = d;
+        break;
+      }
+    }
+    trace.push(v.slice(off - d, off + d + 1));
+  }
+  if (found < 0) return null;
+  // Walk back from (N, M), collecting the edit steps in reverse.
+  type Step = { op: 'eq' | 'del' | 'ins'; a: number; b: number };
+  const steps: Step[] = [];
+  let x = N;
+  let y = M;
+  for (let d = found; d > 0; d -= 1) {
+    const prev = trace[d - 1]!; // index k + (d - 1)
+    const at = (k: number) => prev[k + d - 1]!;
+    const k = x - y;
+    const down = k === -d || (k !== d && at(k - 1) < at(k + 1));
+    const pk = down ? k + 1 : k - 1;
+    const px = at(pk);
+    const py = px - pk;
+    while (x > px + (down ? 0 : 1) && y > py + (down ? 1 : 0)) {
+      x -= 1;
+      y -= 1;
+      steps.push({ op: 'eq', a: x, b: y });
+    }
+    if (down) {
+      y -= 1;
+      steps.push({ op: 'ins', a: x, b: y });
+    } else {
+      x -= 1;
+      steps.push({ op: 'del', a: x, b: y });
+    }
+  }
+  while (x > 0 && y > 0) {
+    x -= 1;
+    y -= 1;
+    steps.push({ op: 'eq', a: x, b: y });
+  }
+  steps.reverse();
+  const hunks: Hunk[] = [];
+  let open: Hunk | null = null;
+  for (const s of steps) {
+    if (s.op === 'eq') {
+      if (open) hunks.push(open);
+      open = null;
+      continue;
+    }
+    open ??= { a0: s.a + pre, a1: s.a + pre, ins: [] };
+    if (s.op === 'del') open.a1 = s.a + pre + 1;
+    else open.ins.push(B[s.b]!);
+  }
+  if (open) hunks.push(open);
+  return hunks;
+}
+
+/**
+ * Three-way merge of token edits: `mine` (the person's edits to the first
+ * transcript) and `theirs` (the new transcript) against `base` (the first
+ * transcript). Null on a conflict — the same stretch changed on both sides —
+ * or when either side changed too much to merge safely.
+ */
+export function mergeEdits(base: string, mine: string, theirs: string): string | null {
+  const b = tokens(base);
+  const hm = diffHunks(b, tokens(mine));
+  const ht = diffHunks(b, tokens(theirs));
+  if (!hm || !ht) return null;
+  for (const x of hm) {
+    for (const y of ht) {
+      const xEmpty = x.a0 === x.a1;
+      const yEmpty = y.a0 === y.a1;
+      if (xEmpty && yEmpty) {
+        if (x.a0 === y.a0) return null; // both insert at the same point
+      } else if (xEmpty) {
+        if (y.a0 < x.a0 && x.a0 < y.a1) return null;
+      } else if (yEmpty) {
+        if (x.a0 < y.a0 && y.a0 < x.a1) return null;
+      } else if (x.a0 < y.a1 && y.a0 < x.a1) {
+        return null;
+      }
+    }
+  }
+  // Apply both, in base order; at one point an insertion goes before a replacement.
+  const all = [...hm, ...ht].sort((p, q) => p.a0 - q.a0 || (p.a1 - p.a0) - (q.a1 - q.a0));
+  const out: string[] = [];
+  let i = 0;
+  for (const h of all) {
+    while (i < h.a0) out.push(b[i++]!);
+    out.push(...h.ins);
+    i = Math.max(i, h.a1);
+  }
+  while (i < b.length) out.push(b[i++]!);
+  return out.join('');
+}
+
+/**
+ * Put a re-transcribed recording where its first transcript went, or say it
+ * cannot (null) — never append a second copy.
+ *
+ * Until 2026-09-29 `replaceTranscript` looked for the first transcript
+ * verbatim and, when the person had changed one character of it, appended the
+ * whole new transcript after it: a 9,000-word draft with one word
+ * re-capitalised went from 79,889 to 159,786 characters. Now the composer
+ * tracks where the transcript went (`span`, kept up to date by `shiftSpan`):
+ * an untouched region is replaced; an edited one gets the new words merged
+ * into the person's edits (`mergeEdits`); and if they collide, or the span is
+ * lost and the text cannot be found verbatim, the caller asks.
+ */
+export function placeRetranscript(
+  draft: string,
+  span: DraftSpan | null,
+  previous: string,
+  next: string,
+): { text: string; span: DraftSpan } | null {
+  const base = previous.trim();
+  const fresh = next.trim();
+  if (!fresh) return null;
+  const splice = (start: number, end: number, replacement: string) => ({
+    text: draft.slice(0, start) + replacement + draft.slice(end),
+    span: { start, end: start + replacement.length },
+  });
+  if (span && span.start >= 0 && span.end <= draft.length && span.start < span.end) {
+    const region = draft.slice(span.start, span.end);
+    if (region === base || region.trim() === base) return splice(span.start, span.end, fresh);
+    if (!base) return null;
+    const merged = mergeEdits(base, region, fresh);
+    return merged === null ? null : splice(span.start, span.end, merged);
+  }
+  if (!base) return null;
+  const at = draft.indexOf(base);
+  if (at < 0 || draft.indexOf(base, at + 1) >= 0) return null;
+  return splice(at, at + base.length, fresh);
+}
+
+// ---------------------------------------------------------------------------
+// Continuing a recording in a new session: where each slice cuts the stream
+// ---------------------------------------------------------------------------
+
+/**
+ * WHY A SLICE CANNOT START A STREAM BY ITSELF, measured 2026-09-29 in Chrome
+ * 151 (MediaRecorder, audio/webm;codecs=opus, the fake-microphone device, 62 s
+ * at a 5 s timeslice and 9.5 s at 1 s): every slice after the first begins ONE
+ * BYTE INTO a SimpleBlock. The block's ID byte (0xA3) ends the previous slice,
+ * its 2-byte size and 963-byte payload open the next, and a new Cluster starts
+ * 965 bytes later. The first 146 bytes are the init segment (EBML header,
+ * Segment, Info, Tracks); clusters come every 5,040 ms (1,020 ms at 1 s).
+ *
+ * So when the server closes a recording and the rest has to go into a new
+ * session (`continues`), the held slices need a front: the init segment, a
+ * Cluster header carrying the timecode of the cluster the cut fell in, and the
+ * bytes of the element the cut went through. Decoded by Chrome from the same
+ * recording, cut at slice 6 (expected 31.80 s of the 61.98 s):
+ *   init + held slices                         31.74 s (the demuxer skips to
+ *                                              the next Cluster: 60 ms lost)
+ *   init + Cluster(25,200 ms) + 0xA3 + held    31.80 s, every block kept
+ * This tracker reads each slice as it is recorded and says, for the slice
+ * about to come, exactly that front (`lead`). It is kept with the slice, so a
+ * reopened tab can build the continuation long after the earlier slices left
+ * this device.
+ *
+ * Safari records audio/mp4, whose fragments were not measured (no Safari run
+ * exists); for any container but WebM there is no lead, and the rest of a
+ * closed recording is held on this device and offered as "Upload the rest".
+ */
+const EBML_HEADER_ID = 0x1a45dfa3;
+const SEGMENT_ID = 0x18538067;
+const CLUSTER_ID = 0x1f43b675;
+const TIMECODE_ID = 0xe7;
+/** Elements that live directly under Segment; seen inside an unknown-size Cluster, they end it. */
+const LEVEL1_IDS = new Set([
+  0x114d9b74, // SeekHead
+  0x1549a966, // Info
+  0x1654ae6b, // Tracks
+  CLUSTER_ID,
+  0x1c53bb6b, // Cues
+  0x1043a770, // Chapters
+  0x1254c367, // Tags
+  0x1941a469, // Attachments
+]);
+/** More init than this is not a recorder's init segment. */
+const MAX_INIT_BYTES = 256 * 1024;
+/** An element straddling a cut is at most one block; a lead bigger than this is not trusted. */
+const MAX_LEAD_BYTES = 256 * 1024;
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((n, p) => n + p.byteLength, 0);
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const p of parts) {
+    out.set(p, at);
+    at += p.byteLength;
+  }
+  return out;
+}
+
+/** A Cluster of unknown size (live mode, as Chrome writes them) with its Timecode. */
+export function clusterHeader(timecodeMs: number): Uint8Array {
+  const tc: number[] = [];
+  let v = Math.max(0, Math.floor(timecodeMs));
+  do {
+    tc.unshift(v & 0xff);
+    v = Math.floor(v / 256);
+  } while (v > 0);
+  return new Uint8Array([
+    0x1f, 0x43, 0xb6, 0x75, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xe7, 0x80 | tc.length, ...tc,
+  ]);
+}
+
+/** An EBML element header: [id, size or null for unknown, header length], or null if incomplete. */
+function readHeader(h: number[]): { id: number; size: number | null } | null {
+  if (h.length === 0) return null;
+  const first = h[0]!;
+  let idLen = 1;
+  while (idLen <= 4 && !(first & (0x80 >> (idLen - 1)))) idLen += 1;
+  if (idLen > 4) throw new Error('bad id');
+  if (h.length < idLen + 1) return null;
+  let id = 0;
+  for (let i = 0; i < idLen; i += 1) id = id * 256 + h[i]!;
+  const s0 = h[idLen]!;
+  let sizeLen = 1;
+  while (sizeLen <= 8 && !(s0 & (0x80 >> (sizeLen - 1)))) sizeLen += 1;
+  if (sizeLen > 8) throw new Error('bad size');
+  if (h.length < idLen + sizeLen) return null;
+  let size = s0 & (0xff >> sizeLen);
+  let allOnes = size === 0xff >> sizeLen;
+  for (let i = 1; i < sizeLen; i += 1) {
+    const b = h[idLen + i]!;
+    if (b !== 0xff) allOnes = false;
+    size = size * 256 + b;
+  }
+  return { id, size: allOnes ? null : size };
+}
+
+/** What the container tracking needs from a tracker; tests supply their own. */
+export interface ContainerCuts {
+  /** The bytes every new stream of this recording must start with, once known. */
+  readonly init: Uint8Array | null;
+  /** The front a stream starting at the next fed byte needs after `init`, or null if unknown. */
+  lead(): Uint8Array | null;
+  feed(bytes: Uint8Array): void;
+}
+
+export class WebmCutTracker implements ContainerCuts {
+  init: Uint8Array | null = null;
+  private broken = false;
+  private seen: Uint8Array[] = [];
+  private seenLen = 0;
+  private pos = 0;
+  private level: 'top' | 'segment' | 'cluster' = 'top';
+  private hdr: number[] = [];
+  private hdrStart = 0;
+  /** Bytes of the element open right now, from its first header byte. */
+  private unit: Uint8Array[] = [];
+  private unitLen = 0;
+  private skip = 0;
+  private tcBytes: number[] | null = null;
+  private tcLeft = 0;
+  /** The header of a Cluster whose Timecode has not arrived yet. */
+  private clusterHead: Uint8Array | null = null;
+  private clusterTc: number | null = null;
+
+  lead(): Uint8Array | null {
+    if (this.broken || !this.init || this.level === 'top') return null;
+    if (this.unitLen > MAX_LEAD_BYTES) return null;
+    const partial = concatBytes(this.unit);
+    if (this.level === 'cluster') {
+      if (this.clusterTc === null) return this.clusterHead ? concatBytes([this.clusterHead, partial]) : null;
+      return concatBytes([clusterHeader(this.clusterTc), partial]);
+    }
+    return partial;
+  }
+
+  feed(bytes: Uint8Array): void {
+    if (this.broken) return;
+    if (!this.init) {
+      this.seen.push(bytes.slice());
+      this.seenLen += bytes.byteLength;
+      if (this.seenLen > MAX_INIT_BYTES * 4) this.broken = true;
+    }
+    try {
+      this.parse(bytes);
+    } catch {
+      this.broken = true;
+    }
+  }
+
+  private take(chunk: Uint8Array): void {
+    if (this.unitLen <= MAX_LEAD_BYTES) this.unit.push(chunk.slice());
+    this.unitLen += chunk.byteLength;
+  }
+
+  private endUnit(): void {
+    this.unit = [];
+    this.unitLen = 0;
+  }
+
+  private parse(b: Uint8Array): void {
+    let i = 0;
+    while (i < b.length && !this.broken) {
+      if (this.skip > 0) {
+        const n = Math.min(this.skip, b.length - i);
+        this.take(b.subarray(i, i + n));
+        this.skip -= n;
+        i += n;
+        this.pos += n;
+        if (this.skip === 0) this.endUnit();
+        continue;
+      }
+      if (this.tcBytes) {
+        const byte = b[i]!;
+        this.take(b.subarray(i, i + 1));
+        i += 1;
+        this.pos += 1;
+        this.tcBytes.push(byte);
+        this.tcLeft -= 1;
+        if (this.tcLeft === 0) {
+          this.clusterTc = this.tcBytes.reduce((v, x) => v * 256 + x, 0);
+          this.clusterHead = null;
+          this.tcBytes = null;
+          this.endUnit();
+        }
+        continue;
+      }
+      if (this.hdr.length === 0) this.hdrStart = this.pos;
+      this.hdr.push(b[i]!);
+      this.take(b.subarray(i, i + 1));
+      i += 1;
+      this.pos += 1;
+      if (this.hdr.length > 12) {
+        this.broken = true;
+        return;
+      }
+      const head = readHeader(this.hdr);
+      if (!head) continue;
+      this.hdr = [];
+      this.element(head.id, head.size);
+    }
+  }
+
+  private element(id: number, size: number | null): void {
+    if (this.level === 'top') {
+      if (id === SEGMENT_ID) {
+        this.level = 'segment';
+        this.endUnit();
+        return;
+      }
+      if (id !== EBML_HEADER_ID || size === null) {
+        this.broken = true;
+        return;
+      }
+      this.skip = size;
+      if (size === 0) this.endUnit();
+      return;
+    }
+    if (id === CLUSTER_ID) {
+      if (!this.init) {
+        const all = concatBytes(this.seen);
+        this.init = all.slice(0, this.hdrStart);
+        this.seen = [];
+        this.seenLen = 0;
+      }
+      this.level = 'cluster';
+      this.clusterHead = concatBytes(this.unit);
+      this.clusterTc = null;
+      this.endUnit();
+      return;
+    }
+    const clusterChild = this.level === 'cluster' && !LEVEL1_IDS.has(id);
+    if (!clusterChild) this.level = 'segment';
+    if (size === null) {
+      this.broken = true; // only Segment and Cluster may be of unknown size here
+      return;
+    }
+    if (clusterChild && id === TIMECODE_ID && size > 0 && size <= 8) {
+      this.tcBytes = [];
+      this.tcLeft = size;
+      return;
+    }
+    this.skip = size;
+    if (size === 0) this.endUnit();
+  }
+}
+
+/** The tracker for a recorder's container, or null where continuing is not supported. */
+export function cutsFor(mimeType: string): ContainerCuts | null {
+  return /^audio\/webm/i.test(mimeType) || /^video\/webm/i.test(mimeType) ? new WebmCutTracker() : null;
 }

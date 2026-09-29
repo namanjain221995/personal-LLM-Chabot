@@ -27,6 +27,7 @@ import {
   VoiceSession,
   createMemoryOutbox,
   openOutbox,
+  settleRecord,
   type OutboxStore,
   type SessionInterrupt,
   type SessionProgress,
@@ -368,6 +369,14 @@ describe('the outbox on disk (IndexedDB)', () => {
     expect(first.server.appendedSlices).toEqual(range(11));
     expect(first.server.finishBody).toMatchObject({ ended_by: 'page_hidden' });
     expect(settled.kind).toBe('text');
+    // Since 2026-09-29 the record outlives the finish, holding no audio, until
+    // the words are in the composer: a reload during a long finish can still
+    // offer them back. Delivering them (settleRecord) is what removes it.
+    const kept = await store.listRecords();
+    expect(kept).toHaveLength(1);
+    expect(kept[0]).toMatchObject({ finished: true });
+    expect(await store.readSlices(SESSION_ID, 0, 100)).toEqual([]);
+    await settleRecord(store, SESSION_ID, null);
     expect(await store.listRecords()).toEqual([]);
   });
 

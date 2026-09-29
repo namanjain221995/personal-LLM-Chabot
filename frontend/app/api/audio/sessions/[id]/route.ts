@@ -17,7 +17,7 @@ type Context = { params: Promise<{ id: string }> };
 async function forward(req: Request, { params }: Context): Promise<Response> {
   const { id } = await params;
   if (!SESSION_ID.test(id)) return notFound();
-  return forwardSession(req, `/audio/sessions/${id}`);
+  return forwardSession(req, `/audio/sessions/${id}`, { kind: req.method === 'GET' ? 'poll' : 'plain' });
 }
 
 export { forward as GET, forward as DELETE };

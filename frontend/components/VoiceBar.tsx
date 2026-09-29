@@ -41,6 +41,7 @@ import {
   LEVEL_BARS,
   VOICE_MESSAGES,
   formatElapsed,
+  idleWords,
 } from '@/lib/voice';
 import type { SessionProgress, VoiceState } from '@/lib/voice';
 import type { VoiceFollowUp } from './useVoiceRecorder';
@@ -151,8 +152,12 @@ function SessionPanel({
     if (progress.offline) {
       lines.push({
         key: 'offline',
-        text:
-          state === 'finishing'
+        // Past the server's idle close the audio no longer simply "uploads
+        // when the connection is back": the server has closed the recording,
+        // and what it missed waits on this device (2026-09-29).
+        text: progress.offlineLong
+          ? VOICE_MESSAGES.offlineLong(idleWords(progress.idleCloseS ?? 600))
+          : state === 'finishing'
             ? VOICE_MESSAGES.offlineFinishing(formatElapsed(progress.pendingMs))
             : VOICE_MESSAGES.offlineRecording,
         tone: 'warn',
@@ -168,6 +173,11 @@ function SessionPanel({
         text: VOICE_MESSAGES.behind(formatElapsed(progress.backlogMs), progress.waitingOn),
         tone: 'muted',
       });
+    }
+    // An engine that cannot be reached is said at once, whatever the backlog:
+    // it is not "behind", and the audio being saved is what matters now.
+    if (progress.waitingOn === 'engine_unavailable' && !lines.some((l) => l.key === 'behind')) {
+      lines.push({ key: 'engine', text: VOICE_MESSAGES.engineUnavailableLive, tone: 'warn' });
     }
   }
   const words = progress ? `${progress.preview}` : '';
@@ -193,8 +203,27 @@ function SessionPanel({
           {line.text}
         </p>
       ))}
-      {progress && (
-        <p className="text-faint">{VOICE_MESSAGES.saved(progress.retentionDays)}</p>
+      {progress && progress.savedMs !== 0 && (
+        <p className="text-faint">
+          {/* Where the stored recordings are (feat/voice-recordings-page). A
+              new tab: leaving this page while recording would end the
+              recording. Drawn only once the server has acknowledged audio,
+              and it says how much, and how much is still only on this device. */}
+          <a
+            href="/recordings"
+            target="_blank"
+            rel="noopener"
+            className="underline-offset-2 hover:text-muted hover:underline"
+          >
+            {progress.savedMs === undefined
+              ? VOICE_MESSAGES.saved(progress.retentionDays)
+              : VOICE_MESSAGES.savedSoFar(
+                  formatElapsed(progress.savedMs),
+                  progress.pendingMs > 0 ? formatElapsed(progress.pendingMs) : null,
+                  progress.retentionDays,
+                )}
+          </a>
+        </p>
       )}
     </div>
   );
@@ -346,6 +375,16 @@ export function VoiceFollowUpLine({ followUp }: { followUp: VoiceFollowUp }) {
           className="shrink-0 rounded-lg px-2 py-0.5 font-medium text-accent transition-colors duration-ts hover:bg-surface-2 disabled:cursor-wait disabled:opacity-60"
         >
           {followUp.busy ? <Loader size={12} /> : followUp.actionLabel}
+        </button>
+      )}
+      {followUp.secondaryLabel && followUp.runSecondary && (
+        <button
+          type="button"
+          onClick={followUp.runSecondary}
+          disabled={followUp.busy}
+          className="shrink-0 rounded-lg px-2 py-0.5 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink disabled:opacity-60"
+        >
+          {followUp.secondaryLabel}
         </button>
       )}
       <button
