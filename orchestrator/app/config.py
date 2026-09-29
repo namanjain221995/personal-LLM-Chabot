@@ -1261,10 +1261,17 @@ class Settings:
         self.freshness_followup_weak_time_router: bool = _bool(
             "FRESHNESS_FOLLOWUP_WEAK_TIME_ROUTER", True
         )
-        # KNOWLEDGE_FAST_EARLY_LOOKUP (2026-09-29). Start the Fast lookup as
-        # soon as the candidate dates prove no stored page is new enough,
-        # instead of after the rerank. Every decision is the same either way.
-        self.knowledge_fast_early_lookup: bool = _bool("KNOWLEDGE_FAST_EARLY_LOOKUP", True)
+        # KNOWLEDGE_FAST_EARLY_LOOKUP (2026-09-29) — OPT-IN, default off. Start
+        # the Fast lookup as soon as the candidate dates prove no stored page
+        # is new enough, instead of after the rerank. Every decision is the
+        # same either way. It needs web_memory.retrieve(on_candidates=), which
+        # lands with the retrieval track. Measured on that combined tree in the
+        # container (10 matched realtime pairs, host load 14): the lookup
+        # started at p50 ~0.6 s with it on and with it off, because a page the
+        # other half of the pair had just stored was fresh enough to withhold
+        # the proof. No gain shown, so it stays off until a clean measurement
+        # shows one.
+        self.knowledge_fast_early_lookup: bool = _bool("KNOWLEDGE_FAST_EARLY_LOOKUP", False)
         # How much locally-read evidence a grounded answer may carry. 900
         # characters was one paragraph — "a large amount of information from
         # the site" (owner, 2026-09-03) needs several passages, and ~1k

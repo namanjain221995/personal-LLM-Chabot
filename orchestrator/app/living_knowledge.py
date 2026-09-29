@@ -211,8 +211,8 @@ def followup_weak_time_router() -> bool:
 
 
 def fast_early_lookup() -> bool:
-    """KNOWLEDGE_FAST_EARLY_LOOKUP (default on): see `_EarlyLookup`."""
-    return bool(getattr(settings, "knowledge_fast_early_lookup", True))
+    """KNOWLEDGE_FAST_EARLY_LOOKUP (opt-in, default off): see `_EarlyLookup`."""
+    return bool(getattr(settings, "knowledge_fast_early_lookup", False))
 
 
 def _accepts(fn: Callable, name: str) -> bool:
