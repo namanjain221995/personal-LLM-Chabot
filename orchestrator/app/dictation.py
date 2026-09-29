@@ -3044,6 +3044,20 @@ def append_part(user_id: int, session_id: str, seq: int, body: bytes, sha: str) 
                 (seq + 1, bytes_stored + len(body), _now(), session_id, seq),
             ).fetchone()
         if updated is None:
+            # Two ways the guarded UPDATE matches nothing. The server closed
+            # the recording while this part was being written (the decoder's
+            # `_end_recording`, the idle close, storage/quota): `_finish_sync`
+            # does not take this lock, so the status read above can be stale.
+            # That is `session_closed` with its `ended_by`, which the browser
+            # answers by waiting for the words; `part_conflict` would make it
+            # give up on a recording the server is still transcribing. Only
+            # a row still recording means another tab moved next_part.
+            current = _row(session_id)
+            if current is not None and current["status"] != STATUS_RECORDING:
+                raise SessionError(
+                    409, "session_closed", "This recording is no longer accepting audio.",
+                    status=current["status"], ended_by=current.get("ended_by"),
+                )
             raise SessionError(409, "part_conflict", "This recording is also being uploaded from another tab.", next_part=next_part)
         metrics.inc("voice_session_parts_total", "recording-session parts stored")
         return dict(updated), False

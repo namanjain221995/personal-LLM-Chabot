@@ -329,6 +329,37 @@ def test_decoded_audio_longer_than_the_recording_has_existed_fails_undecodable(v
     assert done["audio_ms"] <= 12_000 + 5_000, done["audio_ms"]
 
 
+def test_a_part_that_races_the_server_closing_the_recording_is_told_session_closed(voice, login_client, monkeypatch):
+    """The decoder's `_end_recording` (and the idle close) finish a session
+    through `_finish_sync`, which does not take the part route's lock. A part
+    whose status check ran before that close and whose guarded UPDATE ran
+    after it matched nothing, and was answered 409 `part_conflict` ("another
+    tab"), which the browser treats as fatal. The recording is closed, not
+    contended: the answer is `session_closed` with its `ended_by`, the one the
+    browser waits for the words on. Found as a load-dependent failure of the
+    test above under Python 3.11 with three shards running (2026-09-29)."""
+    _script, data = recording(voice.tmp, 12.0)
+    alice = login_client("alice")
+    sid = create(alice).json()["session_id"]
+    real_append_line = dictation._append_line
+    closed = []
+
+    def close_first(path, payload):
+        # Between the status check and the guarded UPDATE: exactly where the
+        # decoder thread lands when it loses the race.
+        if not closed and str(path).endswith("parts.jsonl"):
+            closed.append(dictation._finish_sync(sid, None, "undecodable", None))
+        return real_append_line(path, payload)
+
+    monkeypatch.setattr(dictation, "_append_line", close_first)
+    r = put(alice, sid, 0, parts_of(data)[0])
+    assert closed, "the close did not run inside the part's write"
+    assert r.status_code == 409, r.text
+    assert r.json()["reason"] == "session_closed", r.text
+    assert r.json()["ended_by"] == "undecodable", r.text
+    assert row_of(sid)["next_part"] == 0, "a part the row never acknowledged is not counted"
+
+
 def test_free_space_is_checked_while_decoding(voice, login_client, monkeypatch):
     monkeypatch.setattr(dictation, "_FREE_CHECK_BYTES", 64 * 1024, raising=False)
     monkeypatch.setattr(settings, "voice_min_free_bytes", 10 * GiB)
