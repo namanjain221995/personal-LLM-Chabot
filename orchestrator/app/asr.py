@@ -72,7 +72,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Protocol, Sequence
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 from . import metrics
 from .config import settings
@@ -1498,6 +1498,8 @@ class _SessionGate:
         #: whether the engine is back.
         self.timeouts_in_a_row = 0
         self.opened_at = 0.0
+        #: urgent windows granted in a row (`_grant`'s anti-starvation)
+        self.urgent_streak = 0
 
     def breaker_open(self) -> bool:
         """True while windows must not be sent. Claims the half-open probe:
@@ -1554,14 +1556,25 @@ class _SessionGate:
         metrics.set_gauge("asr_session_gate_waiting", self.waiting, "session windows waiting for the engine")
 
     def _grant(self) -> None:
+        def key(w: _SessionWaiter) -> Tuple[int, int, float, int]:
+            return (0 if w.is_short() else 1, 0 if w.is_urgent() else 1, w.ready, w.seq)
+
         while self.active < self._size() and self._waiters:
-            best = min(
-                self._waiters,
-                key=lambda w: (0 if w.is_short() else 1, 0 if w.is_urgent() else 1, w.ready, w.seq),
-            )
+            best = min(self._waiters, key=key)
+            if best.is_urgent() and not best.is_short() and self.urgent_streak >= _URGENT_STREAK_MAX:
+                # NO STARVATION. With two stopped backlogs, one of them was
+                # always waiting at each release, so nobody's live preview
+                # was granted until the first backlog drained (review T2:
+                # first text 3.0-3.3 s instead of 0.1 s; about 45 min under
+                # chat for two one-hour backlogs). After _URGENT_STREAK_MAX
+                # urgent windows in a row, a waiting live window goes next.
+                live = [w for w in self._waiters if not w.is_urgent() and not w.future.done()]
+                if live:
+                    best = min(live, key=key)
             self._waiters.remove(best)
             if best.future.done():  # its task was cancelled while waiting
                 continue
+            self.urgent_streak = self.urgent_streak + 1 if best.is_urgent() else 0
             self.active += 1
             best.future.set_result(None)
 
@@ -1603,10 +1616,14 @@ class _SessionGate:
         self.last_unavailable = 0.0
         self.timeouts_in_a_row = 0
         self.opened_at = 0.0
+        self.urgent_streak = 0
 
 
 #: Session windows timed out in a row before the breaker opens.
 _BREAKER_TIMEOUTS = 2
+#: Urgent (stopped) session windows granted in a row before a waiting live
+#: window goes: a live preview gets at least one slot in three.
+_URGENT_STREAK_MAX = 2
 
 SESSION_GATE = _SessionGate()
 

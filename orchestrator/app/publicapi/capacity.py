@@ -355,6 +355,13 @@ def dictation_is_busy() -> bool:
         replicas = max(1, len(tuple(getattr(settings, "asr_base_urls", ()) or ())))
         waiting = int(getattr(pool, "waiting", 0) or 0)
         active = int(getattr(pool, "active", 0) or 0)
+        # Recording-session windows are dictation too: they have their own
+        # gate (asr.SESSION_GATE), which this probe ignored, so /v1 stopped
+        # yielding to anyone dictating through a session (2026-09-29 review).
+        gate = getattr(asr, "SESSION_GATE", None)
+        if gate is not None:
+            waiting += int(getattr(gate, "waiting", 0) or 0)
+            active += int(getattr(gate, "active", 0) or 0)
         if waiting > 0:
             return True
         if replicas == 1:

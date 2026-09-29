@@ -425,3 +425,63 @@ def test_a_stock_phrase_over_the_quiet_opening_does_not_sink_real_speech():
     # And sparse invented words with a stock phrase beside them still go.
     sparse = [{"start": 0.0, "end": 20.0, "text": "Thank you."}, {"start": 20.0, "end": 59.0, "text": "Stabilization is very good."}]
     assert not asr.speech_is_plausible("Thank you. Stabilization is very good.", 60.0, sparse, engine_heard_speech=False)
+
+
+# -- F. two stopped backlogs no longer freeze everybody's live preview -----
+
+
+def test_a_live_window_is_not_starved_by_two_stopped_backlogs():
+    """_SessionGate granted urgent (stopped) windows strictly first; with two
+    stopped backlogs one was always waiting at each release, so a live
+    talker's first window waited for the first backlog to drain."""
+
+    async def run() -> List[str]:
+        gate = asr._SessionGate()
+        order: List[str] = []
+        live_done = asyncio.Event()
+
+        async def session(name: str, urgent: bool, windows: int) -> None:
+            for _ in range(windows):
+                if name == "live" and live_done.is_set():
+                    return
+                await gate.acquire(urgent=urgent)
+                order.append(name)
+                await asyncio.sleep(0.01)
+                gate.release()
+                if name == "live":
+                    live_done.set()
+                    return
+                await asyncio.sleep(0)
+
+        await gate.acquire(urgent=True)  # a window already decoding
+        tasks = [
+            asyncio.create_task(session("stopped-a", True, 30)),
+            asyncio.create_task(session("stopped-b", True, 30)),
+        ]
+        await asyncio.sleep(0.01)
+        tasks.append(asyncio.create_task(session("live", False, 1)))
+        await asyncio.sleep(0.01)
+        gate.release()
+        await asyncio.gather(*tasks)
+        return order
+
+    order = asyncio.run(run())
+    assert "live" in order
+    # Before: every window of both backlogs (60) went first.
+    assert order.index("live") <= 2, order
+
+
+# -- /v1 yields to session dictation too ------------------------------------
+
+
+def test_public_audio_yields_to_a_session_window_as_to_a_legacy_dictation(monkeypatch):
+    """capacity.dictation_is_busy counted only the legacy POOL, so a public
+    clip started beside a decoding session window on a two-replica fleet."""
+    from app.publicapi import capacity
+
+    monkeypatch.setattr(settings, "asr_base_urls", ("http://asr-worker:1/v1", "http://asr-head:1/v1"))
+    monkeypatch.setattr(asr.POOL, "active", 0, raising=False)
+    monkeypatch.setattr(asr.SESSION_GATE, "active", 0)
+    assert capacity.dictation_is_busy() is False
+    monkeypatch.setattr(asr.SESSION_GATE, "active", 1)
+    assert capacity.dictation_is_busy() is True
