@@ -13,8 +13,9 @@ what those would have done, and to the build spec's protocol:
     its code: signed out 4401, voice off 4403, no live path / not yours /
     stopped 4404, too many 4429, bad protocol 4400, frame too large 4413;
   * one stream per recording (the newest wins, 4409), a stream ceiling, an
-    arrival ceiling, an idle close, and a re-check of the sign-in, the
-    feature and the recording while the stream runs;
+    arrival ceiling on samples and one on messages, an idle close, and a
+    re-check of the sign-in, the feature and the recording while the stream
+    runs;
   * partials replace, finals commit in order, flush ends with done and 1000,
     and a resumed stream continues the sample and utterance numbering;
   * an engine that is down, silent, full or dies mid-stream is 4503 / 4429,
@@ -209,6 +210,16 @@ def close_code(ws, timeout: float = 10.0) -> int:
     message = _next(ws, timeout)
     assert message["type"] == "websocket.close", message
     return message["code"]
+
+
+def flood(ws, message: Dict[str, Any], times: int) -> None:
+    """`times` copies of one client message, queued at once: what the server
+    finds waiting when a client writes faster than it is read."""
+    def queue() -> None:
+        for _ in range(times):
+            ws._receive_tx.send_nowait(message)
+
+    ws.portal.call(queue)
 
 
 def refused(ws, code: str, close: int) -> Dict[str, Any]:
@@ -413,6 +424,9 @@ def test_a_second_connection_for_a_recording_supersedes_the_first_4409(live, log
         json.dumps(start(next_u="3")),
         json.dumps(start(resume_from_sample=True)),
         json.dumps(start(clock_offset_ms="soon")),
+        json.dumps(start(frame_ms="40")),
+        json.dumps(start(frame_ms=True)),
+        json.dumps(start(frame_ms=float("nan"))),  # would switch the message ceiling off
         "[" * 5000,
     ],
 )
@@ -478,6 +492,97 @@ def test_audio_faster_than_the_clock_plus_the_resume_allowance_is_closed_4429(li
     settle()
     assert counter("voice_stream_rejections_total", reason="rate_limited") == 1
     assert counter("voice_stream_sessions_total", outcome="rejected") == 1
+
+
+@pytest.mark.parametrize(("frame_ms", "allowed"), [(40, 3_250), (None, 3_250), (80, 3_250), (1, 13_000)])
+def test_a_flood_of_tiny_frames_is_closed_4429_after_a_replays_worth(live, login_client, frame_ms, allowed):
+    """The arrival ceiling counts samples, so 2-byte frames went through at
+    160,000 a second for 6.5 s, each costing the one event loop what a 40 ms
+    frame does. Messages are bounded too: (wall seconds since start +
+    VOICE_LIVE_RESUME_MAX_S + 5) in frames of the start's frame_ms, twice
+    over -- 3,250 at the start for the browser's 40 ms. Declaring longer
+    frames buys no fewer, declaring shorter ones no more than 10 ms frames."""
+    alice = login_client("alice")
+    with socket(alice, session(alice)) as ws:
+        ready(ws, frame_ms=frame_ms)
+        began = time.monotonic()
+        flood(ws, {"type": "websocket.receive", "bytes": bytes(2)}, 20_000)
+        assert refused(ws, "rate_limited", 4429)["retryable"] is True
+        assert time.monotonic() - began < 5.0
+    settle()
+    forwarded = live.engine.streams[0].position  # one sample a frame
+    assert allowed <= forwarded < allowed * 1.1, forwarded
+    assert counter("voice_stream_rejections_total", reason="rate_limited") == 1
+
+
+def test_a_flood_of_pings_is_closed_4429_too(live, login_client):
+    """A ping carries no audio, so no sample ceiling ever stopped a flood of
+    them: every message after the start counts, whatever it is."""
+    alice = login_client("alice")
+    with socket(alice, session(alice)) as ws:
+        ready(ws)
+        flood(ws, {"type": "websocket.receive", "text": json.dumps({"type": "ping", "t": 1})}, 20_000)
+        pongs = 0
+        answer = event(ws)
+        while answer["type"] == "pong":
+            pongs += 1
+            answer = event(ws)
+        assert answer["code"] == "rate_limited"
+        assert close_code(ws) == 4429
+    assert 3_250 <= pongs < 3_575, pongs
+
+
+def test_a_real_time_stream_after_a_whole_rings_replay_is_not_refused(live, login_client):
+    """What a browser sends after a drop, and a little more: a start at the
+    last final's end, which need not fall on a frame boundary, a minute of
+    replay at once (1,500 frames, the ring's whole reach, then the short one a
+    mid-frame start leaves), then 40 ms frames as they are captured, a ping,
+    and flush. Neither ceiling trips."""
+    alice = login_client("alice")
+    resume = 32_000 + 123
+    with socket(alice, session(alice)) as ws:
+        ready(ws, resume_from_sample=resume, next_u=2)
+        flood(ws, {"type": "websocket.receive", "bytes": SILENCE}, 1_500)
+        ws.send_bytes(SILENCE[: 2 * (640 - 123)])
+        paced = time.monotonic()
+        for _ in range(25):  # a second of speech, in real time
+            ws.send_bytes(SPEECH)
+            assert event(ws)["type"] == "partial"
+            paced += 0.04
+            time.sleep(max(0.0, paced - time.monotonic()))
+        ws.send_json({"type": "ping", "t": 7})
+        assert event(ws) == {"type": "pong", "t": 7}
+        ws.send_json({"type": "flush"})
+        final = event(ws)
+        assert event(ws) == {"type": "done"}
+        assert close_code(ws) == 1000
+    live_from = resume + 1_500 * 640 + (640 - 123)
+    assert final == {"type": "final", "u": 2, "text": " ".join(f"kiwi{i}" for i in range(1, 26)),
+                     "start_sample": live_from, "end_sample": live_from + 25 * 640}
+    settle()
+    assert counter("voice_stream_rejections_total", reason="rate_limited") == 0
+    assert counter("voice_stream_sessions_total", outcome="completed") == 1
+
+
+@pytest.mark.parametrize("tail", [1, 639])
+def test_a_short_last_frame_then_flush_is_taken(live, login_client, tail):
+    """Stop: the worklet posts what it holds of the last 40 ms, 1 to 639
+    samples, and the browser sends that before flush. There is no minimum
+    frame size, because a resume that starts mid-frame sends a short one too."""
+    alice = login_client("alice")
+    with socket(alice, session(alice)) as ws:
+        ready(ws)
+        ws.send_bytes(SPEECH)
+        assert event(ws)["type"] == "partial"
+        ws.send_bytes(SPEECH[: 2 * tail])
+        words = {"u": 0, "text": "kiwi1 kiwi2", "start_sample": 0, "end_sample": 640 + tail}
+        assert event(ws) == {"type": "partial", **words}
+        ws.send_json({"type": "flush"})
+        assert event(ws) == {"type": "final", **words}
+        assert event(ws) == {"type": "done"}
+        assert close_code(ws) == 1000
+    settle()
+    assert counter("voice_stream_sessions_total", outcome="completed") == 1
 
 
 def test_partials_replace_finals_commit_and_flush_ends_with_done(live, login_client):

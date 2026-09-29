@@ -43,8 +43,9 @@ revocation, so every VOICE_LIVE_REVALIDATE_S the stream resolves its cookie
 again past the per-connection cache and re-reads the feature and the
 recording's status: signing out, a deactivation, a removal or voice being
 turned off ends the stream within that interval. Frames are bounded in size
-and in rate (never more audio than wall time plus the resume allowance), and a
-socket that sends no audio for VOICE_LIVE_IDLE_S is closed.
+and in rate (never more audio than wall time plus the resume allowance, and
+never more messages than that time holds in frames, twice over), and a socket
+that sends no audio for VOICE_LIVE_IDLE_S is closed.
 
 WHAT IS NEVER LOGGED: audio, transcript text, the cookie, the engine token.
 One line per stream close carries counts and durations.
@@ -102,6 +103,20 @@ STATS_CLAMP_MS = 60_000
 STATS_EVERY_S = 4.0
 #: The arrival ceiling's head start on top of VOICE_LIVE_RESUME_MAX_S.
 ARRIVAL_SLACK_S = 5.0
+#: The message ceiling beside it. Counting samples never bounded MESSAGES:
+#: 2-byte frames came through at 160,000 a second until their samples met
+#: the ceiling 6.5 s later, and pings, which carry none, without end. Each
+#: costs the one event loop every stream and chat in this process shares
+#: about what a 40 ms frame costs (measured 2026-09-29 under uvicorn: either
+#: flood took a whole core and slowed another stream's pong from 0.4 to 40 ms).
+#: So every message after the start, audio or text, counts against that same
+#: time in frames of the start's frame_ms (FRAME_MS unless it names a shorter
+#: one, and never shorter than MIN_FRAME_MS) times MESSAGES_FACTOR, which
+#: leaves room for the short frames a browser does send (a replay that
+#: resumes mid-frame ends on one, Stop sends one) and for its pings and
+#: client_stats. With the defaults: 3,250 at the start, 50 a second after.
+MIN_FRAME_MS = 10
+MESSAGES_FACTOR = 2
 #: How much arrival history the latency bookkeeping keeps: when each frame
 #: came in, so an event can be timed from the moment its audio arrived.
 ARRIVALS_KEEP_S = 60.0
@@ -789,6 +804,9 @@ class _Stream:
         self.last_audio = self.opened
         self.revalidate_at = self.opened + settings.voice_live_revalidate_s
         self.samples = 0
+        # The message ceiling's count, and its rate (the start may raise it).
+        self.messages = 0
+        self.message_rate = MESSAGES_FACTOR * 1000.0 / FRAME_MS
         self.utterances = 0
         self.client_code: Optional[int] = None
         self._uncounted = 0
@@ -944,6 +962,11 @@ class _Stream:
             isinstance(offset, float) and not math.isfinite(offset)
         ):
             raise _Stop(_protocol("clock_offset_ms must be a number."))
+        frame_ms = message.get("frame_ms", FRAME_MS)
+        if isinstance(frame_ms, bool) or not isinstance(frame_ms, (int, float)) or (
+            isinstance(frame_ms, float) and not math.isfinite(frame_ms)
+        ):
+            raise _Stop(_protocol("frame_ms must be a number."))
         language = message.get("language")
         if language is None or language == "":
             language = "auto"
@@ -953,6 +976,9 @@ class _Stream:
         if not isinstance(language, str) or language not in settings.voice_live_languages:
             raise _Stop(_UNSUPPORTED_LANGUAGE)
         self.first_sample, self.next_u, self.language = first_sample, next_u, language
+        # Shorter frames buy more messages a second, down to MIN_FRAME_MS's
+        # worth; a longer frame_ms buys no fewer than the browser's own.
+        self.message_rate = MESSAGES_FACTOR * 1000.0 / min(max(frame_ms, MIN_FRAME_MS), FRAME_MS)
         self._arrival_floor = first_sample
         self.started = time.monotonic()
 
@@ -968,6 +994,8 @@ class _Stream:
     async def _browser(self) -> None:
         while True:
             received = await self.ws.receive()
+            if received.get("type") == "websocket.receive":
+                self._paced()
             data = received.get("bytes")
             if data is not None and received.get("type") == "websocket.receive":
                 await self._audio(data)
@@ -976,6 +1004,14 @@ class _Stream:
             if text is None:
                 raise _Stop(_protocol("Unreadable message."))
             await self._control(text)
+
+    def _paced(self) -> None:
+        """The message ceiling (MESSAGES_FACTOR), before a message is handled:
+        what it costs this process is paid per message, whatever it holds."""
+        self.messages += 1
+        allowed_s = time.monotonic() - self.started + settings.voice_live_resume_max_s + ARRIVAL_SLACK_S
+        if self.messages > allowed_s * self.message_rate:
+            raise _Stop(_TOO_FAST)
 
     async def _audio(self, data: bytes) -> None:
         """One PCM frame: little-endian int16 mono at 16 kHz, 2 to
