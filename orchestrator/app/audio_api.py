@@ -152,6 +152,7 @@ def reset_for_tests() -> None:
 
     dictation.reset_for_tests()
     _POLLS.clear()
+    voice_live.reset_for_tests()
 
 
 async def require_voice(request: Request) -> None:
@@ -473,9 +474,13 @@ async def health(
     this: it learns the feature exists from /auth/me. Missing the capability
     is 404, like the rest of the admin surface, so the route does not confirm
     its own existence to someone probing for it.
+
+    `live` is live dictation's gateway (app/voice_live.py): whether it is
+    configured, the streams open, and its engines by number, never address.
     """
+    live = voice_live.health()
     if not settings.asr_enabled:
-        return {"enabled": False, "ready": False, "reason": "voice input is disabled"}
+        return {"enabled": False, "ready": False, "reason": "voice input is disabled", "live": live}
     # No engine is installed. `provider()` raises rather than returning a stub,
     # and an administrator asking whether dictation works deserves that answer
     # rather than an "enabled, not ready" that hides the reason.
@@ -483,7 +488,7 @@ async def health(
         engine = asr.provider()
     except asr.ASRUnavailable as exc:
         return {"enabled": True, "ready": False, "model": None,
-                "active": 0, "waiting": 0, "engines": [], "reason": str(exc)}
+                "active": 0, "waiting": 0, "engines": [], "reason": str(exc), "live": live}
     ready = await engine.health()
     fleet = engine.stats() if hasattr(engine, "stats") else []
     return {
@@ -497,6 +502,7 @@ async def health(
         # capacity.
         "engines": fleet,
         "reason": "" if ready else "no speech engine is answering",
+        "live": live,
     }
 
 
@@ -561,10 +567,12 @@ async def _record(
 import hashlib  # noqa: E402
 from datetime import datetime as _datetime  # noqa: E402
 
+from fastapi import WebSocket  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse, Response  # noqa: E402
 from starlette.requests import ClientDisconnect  # noqa: E402
 
 from . import dictation  # noqa: E402
+from . import voice_live  # noqa: E402
 
 
 def _flat(status: int, reason: str, detail: str, **extra: Any) -> JSONResponse:
@@ -901,6 +909,17 @@ async def session_audio(session_id: str, request: Request, user: UserRow = Depen
         return _recording_response(row)
     except dictation.SessionError as exc:
         return _refused(exc)
+
+
+@router.websocket("/sessions/{session_id}/live")
+async def live_session(websocket: WebSocket, session_id: str) -> None:
+    """The live preview of a recording being made (2026-09-29): 16 kHz PCM
+    in, partial and final text out, relayed to the streaming engine by
+    app/voice_live.py. A WebSocket gets none of this app's middleware and no
+    Request-typed dependency, so every check (Origin, sign-in, VOICE_INPUT,
+    ownership, limits) is made there, not here. Nothing it does touches the
+    recording session, whose transcript stays the record."""
+    await voice_live.serve(websocket, session_id)
 
 
 # ---------------------------------------------------------------------------
