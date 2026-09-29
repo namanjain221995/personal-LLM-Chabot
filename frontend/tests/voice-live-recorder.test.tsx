@@ -1527,6 +1527,9 @@ describe('the live words of a Hindi session, before the full pass', () => {
       });
     }
     expect(ctx.view.result.current.followUp).toMatchObject({ message: 'Inserted the live transcript.', actionLabel: null });
+    // Only once every part is in and the finish accepted: flipping a session
+    // that is still recording makes the last part's PUT a 409 (closed elsewhere).
+    await untilWithClock(() => server.status === 'finishing', 'the finish accepted');
     server.status = 'done';
     await fullPassOffered(ctx);
     // Offered, never put in by itself.
@@ -1575,6 +1578,9 @@ describe('the live words of a Hindi session, before the full pass', () => {
     }
     expect(ctx.onTranscript).not.toHaveBeenCalled();
     expect(ctx.view.result.current.state).toBe('finishing');
+    // Only once every part is in and the finish accepted: flipping a session
+    // that is still recording makes the last part's PUT a 409 (closed elsewhere).
+    await untilWithClock(() => server.status === 'finishing', 'the finish accepted');
     server.status = 'done';
     await untilWithClock(() => ctx.onTranscript.mock.calls.length > 0, 'the full pass in');
     expect(ctx.onTranscript).toHaveBeenCalledWith('The full pass.', null);
@@ -1618,6 +1624,9 @@ describe('the live words of a Hindi session, before the full pass', () => {
     await until(() => ctx.view.result.current.followUp !== null, 'the line');
     await act(async () => ctx.view.result.current.followUp!.dismiss());
     expect(ctx.view.result.current.followUp).toBeNull();
+    // Only once every part is in and the finish accepted: flipping a session
+    // that is still recording makes the last part's PUT a 409 (closed elsewhere).
+    await untilWithClock(() => server.status === 'finishing', 'the finish accepted');
     server.status = 'done';
     for (let t = 0; t < 10; t += 1) {
       await act(async () => {
@@ -1665,6 +1674,9 @@ describe('the live words of a Hindi session, before the full pass', () => {
     // The person corrects a word of what went in, while the full pass runs.
     const edited = `Draft: ${HINGLISH.replace('office', 'ऑफिस')}`;
     fireEvent.change(box, { target: { value: edited } });
+    // Only once every part is in and the finish accepted: flipping a session
+    // that is still recording makes the last part's PUT a 409 (closed elsewhere).
+    await untilWithClock(() => server.status === 'finishing', 'the finish accepted');
     server.status = 'done';
     await untilWithClock(() => screen.queryByText('Use the other one') !== null, 'the full pass offered');
     expect(box.value).toBe(edited);
