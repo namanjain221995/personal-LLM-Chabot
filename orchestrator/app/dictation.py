@@ -814,6 +814,37 @@ class _FfmpegStream:
 # ---------------------------------------------------------- the planner --
 
 
+def _cut_unacknowledged_tail(session_id: str) -> Optional[int]:
+    """Cut source.<ext> back to what the row acknowledges NOW, and return that
+    (None when the row is gone). Blocking.
+
+    Held under the part lock (`_session_lock`) and the file's flock, the same
+    pair `append_part` holds, so no part is between its write and its row
+    update in this process. While the session still records, nothing is cut:
+    another process's append (a rolling recreate) releases the flock before
+    its row update, and `append_part` cuts a crash tail itself before it
+    writes the next part."""
+    with _session_lock(session_id):
+        row = _row(session_id)
+        if row is None:
+            return None
+        acknowledged = int(row["bytes_stored"] or 0)
+        if row["status"] == STATUS_RECORDING:
+            return acknowledged
+        src = source_path(row)
+        try:
+            fd = os.open(src, os.O_RDWR)
+        except OSError:
+            return acknowledged
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if os.fstat(fd).st_size > acknowledged:
+                os.ftruncate(fd, acknowledged)
+        finally:
+            os.close(fd)
+        return acknowledged
+
+
 def _speech_s(window: vad.Window) -> float:
     return sum(b - a for a, b in window.regions)
 
@@ -1279,6 +1310,9 @@ _FREE_CHECK_BYTES = 64 * 1024 * 1024
 #: The largest read fed to a decoder at once: bounds the PCM one feed can
 #: produce before the next flush (16 kb/s Opus decodes 256 KiB to ~4 MB).
 _FEED_BYTES = 256 * 1024
+#: Reads that came back empty although the row acknowledges more (0.2 s
+#: apart, the row re-read each time) before the rest counts as unreadable.
+_EMPTY_READS_MAX = 25
 
 
 # ------------------------------------------------------------ the runner --
@@ -1711,13 +1745,15 @@ class _Live:
         left: the committed plan and the finished windows. The source is cut
         back to what the row acknowledged, and the PCM, which is derived, is
         decoded again from byte 0."""
-        src = source_path(self.row)
-        with contextlib.suppress(OSError):
-            if os.path.getsize(src) > self.bytes_stored:
-                # A crash between the append and the row update: the file is
-                # longer than anything acknowledged, the safe direction.
-                with open(src, "r+b") as fh:
-                    fh.truncate(self.bytes_stored)
+        # A crash between an append and its row update leaves the file longer
+        # than anything acknowledged. It is cut only against the row as it is
+        # NOW, under the part lock: `bytes_stored` from the lease claim is
+        # stale by any part stored since, and cutting to it erased parts the
+        # browser had been told were stored (2026-09-29).
+        acknowledged = await _io(_cut_unacknowledged_tail, self.id)
+        if acknowledged is not None:
+            with self.lock:
+                self.bytes_stored = max(self.bytes_stored, acknowledged)
         retranscribe = self.row.get("retranscribe")
         results: Dict[int, Dict[str, Any]] = {}
         for line in _read_lines(self._p("results.jsonl")):
@@ -1940,6 +1976,7 @@ class _Live:
             self.rev += 1
 
     async def _ingest(self) -> None:
+        empty_reads = 0
         try:
             await self._resolve_chain()
             while self.status != STATUS_CANCELLED:
@@ -1954,8 +1991,20 @@ class _Live:
                 if self.fed < total:
                     chunk = await _io(self._read_input, self.fed, min(_FEED_BYTES, total - self.fed))
                     if not chunk:
+                        # The row acknowledges bytes the file does not hold.
+                        # `append_part` writes the file BEFORE the row, so this
+                        # is lost audio, not audio on its way: re-read the row
+                        # and give up after _EMPTY_READS_MAX tries instead of
+                        # spinning here for ever with a live slot held.
+                        empty_reads += 1
+                        if empty_reads >= _EMPTY_READS_MAX:
+                            raise _Undecodable(
+                                f"the stored recording ends at byte {self.fed} but {total} were acknowledged"
+                            )
                         await asyncio.sleep(0.2)
+                        await self._refresh(force=True)
                         continue
+                    empty_reads = 0
                     if self._decoder is None:
                         self._decoder = await self._open_decoder(chunk)
                     try:
@@ -2350,6 +2399,7 @@ class _Live:
             error = {"reason": "undecodable", "detail": "The server couldn't read the rest of this recording."}
         elif error is None and self.fatal == "storage_full":
             error = {"reason": "storage_full", "detail": "The server ran out of space before the end of this recording was transcribed."}
+        await _io(_cut_unacknowledged_tail, self.id)
         src = source_path(self.row)
         sha = await _io(_sha256_file, src) if os.path.exists(src) else None
         self._write_transcript(
