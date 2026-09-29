@@ -687,11 +687,31 @@ never touches Docker's chains.
 | node | guarded tcp ports | accepted from | dropped |
 |---|---|---|---|
 | head | 8000-8005, 9100, 9835, 9838 | lo; docker0 and br-* from 172.16.0.0/12; enp1s0f1np1 from 10.100.184.0/24; enP2p1s0f1np1 from 10.100.185.0/24 | enP7s7, tailscale0, any other ingress (IPv4 and IPv6) |
-| worker | 9100, 9835, 9839, 30004, 30007 | lo; both rails; enP7s7 from the head 192.168.9.54 (not 9839); local Docker bridges | enP7s7 from anyone else, tailscale0, any other ingress |
+| worker | 9100, 9835, 9839, 30004, 30007, 30009 | lo; both rails; enP7s7 from the head 192.168.9.54 (not 9839); local Docker bridges | enP7s7 from anyone else, tailscale0, any other ingress |
 
 `apply` refuses, before calling nft, if the rules would drop a consumer in its
 built-in consumer table, if an interface it names is missing, or if a peer
 connected right now to a guarded port would lose its next connection.
+
+**30009 is the live-dictation engine** (`scripts/stt-stream.sh`,
+`compose/compose.stt-stream.yaml`). Its stream demands a bearer token, but its
+`/health` and `/metrics` do not, so it belongs behind the filter like the other
+worker engines. The repository's `scripts/host-guard.sh` lists it; the filter
+RUNNING on the worker is the copy installed as root, and it judges 30009 only
+once that copy is reinstalled. Until then `scripts/stt-stream.sh up` warns and
+prints these commands. As root on the worker (the owner's step; nothing
+restarts):
+
+```bash
+W=techsphere@10.100.184.2
+scp scripts/host-guard.sh "$W":.techsara-cluster/host-guard.sh
+ssh -t "$W" 'sudo bash ~/.techsara-cluster/host-guard.sh install-boot --role worker'
+ssh -t "$W" 'sudo bash ~/.techsara-cluster/host-guard.sh apply --role worker'
+ssh    "$W" 'bash ~/.techsara-cluster/host-guard.sh verify --role worker'
+```
+
+`install-boot` replaces the boot-time copy (below, "Surviving a reboot"), so
+the port stays guarded after the next reboot; `apply` loads the new table now.
 
 ### Head (OA-4)
 
@@ -941,6 +961,7 @@ last:
 | adj | who | what killing it frees |
 | --- | --- | --- |
 | 900 | OCR engine (`ocr`, worker; compose.ocr.yaml) | ~15.2 GiB GPU |
+| 900 | live dictation (`stt-stream`, worker; compose.stt-stream.yaml) — CPU only, the one service with a hard limit (`mem_limit: 8g`) | ~4 GiB host RSS |
 | 800 | speech (`whisper`, both nodes; compose.whisper.yaml) | 3.3 GiB (head) / 4.9 GiB (worker) GPU |
 | 700 | vllm-router, vllm-embed, vllm-reranker (head), `AUX_ENGINE_OOM_SCORE_ADJ=700` | 16.5 + 4.0 + 4.0 GiB GPU |
 | 600 | grafana, cadvisor, postgres-exporter, data-stores-exporter, blackbox-exporter | little (host RSS) |
@@ -979,12 +1000,16 @@ them. The launcher's readiness wait counts only restarts that happen during
 its own wait, so a restart after an OOM does not disable a role at the next
 deploy.
 
-No service has, or gains, a hard memory limit (`mem_limit`, `memswap_limit`,
-`deploy.resources.limits.memory`, `oom_kill_disable`). The engines' memory is
-not charged to their cgroup, so a limit would only bound their small host RSS
-and add a second way to be killed, at a size nobody has measured. The test
-`test_no_compose_file_gives_any_service_a_hard_memory_limit` makes adding one
-a deliberate decision.
+No service has a hard memory limit (`mem_limit`, `memswap_limit`,
+`deploy.resources.limits.memory`, `oom_kill_disable`) but one. The GPU
+engines' memory is not charged to their cgroup, so a limit would only bound
+their small host RSS and add a second way to be killed, at a size nobody has
+measured. The exception is the live-dictation engine, `mem_limit: 8g`: it
+decodes on the worker's CPU, so its memory IS charged to its cgroup, and it was
+measured (3.58 GB of RSS loaded, 4.08 GB with twelve streams open, 2026-09-29).
+The test `test_no_compose_file_gives_any_service_a_hard_memory_limit` makes
+every limit a deliberate decision: it names that one, with its measurement,
+and fails on any other.
 
 ### Right now, as root, without restarting anything (the bridge)
 

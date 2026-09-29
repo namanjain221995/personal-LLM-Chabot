@@ -11,7 +11,10 @@ and the next `ocr.sh up` / `whisper.sh up` would have left them all dialling a
 refused port. The engines stay on the management address and the host packet
 filter closes the LAN (scripts/host-guard.sh, operator actions OA-4/OA-6).
 What 229031c added and these tests keep: an empty or wildcard address stops
-the script instead of binding nothing or everything.
+the script instead of binding nothing or everything. The live-dictation engine
+(:30009, scripts/stt-stream.sh) follows the same rule on the worker, and also
+refuses a RoCE rail address: its only consumers, the head's gateway and
+Prometheus, dial the management address too.
 
 Each bind function is extracted from its script and run in bash with a fake
 ``ssh`` on PATH that records the call and answers with a chosen address.
@@ -120,6 +123,27 @@ class WorkerEngineBindTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0, result.stdout)
                     self.assertEqual(result.stdout, "", "nothing may be printed as a bind address")
                     self.assertIn("enP7s7", result.stderr)
+
+    def test_the_live_dictation_engine_binds_the_management_address_its_gateway_dials(self) -> None:
+        # The orchestrator's gateway dials ws://192.168.9.68:30009 and
+        # Prometheus scrapes :30009/metrics there. Worker only: there is no
+        # head variant to test (nothing new runs on the head).
+        result = self._bind_address(
+            "stt-stream.sh", "stt_bind_address", "worker", STT_MANAGEMENT_IFNAME="enP7s7", CLUSTER_WORKER_IP=RAIL_ADDRESS
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, MANAGEMENT_LAN_ADDRESS)
+        self.assertIn("enP7s7", self.ssh_log.read_text(encoding="utf-8"), "the address is read from the management interface")
+
+    def test_the_live_dictation_engine_never_binds_nothing_everything_or_the_fabric(self) -> None:
+        for answer in ("", "0.0.0.0", "::", "[::]", RAIL_ADDRESS, "10.100.185.2"):
+            with self.subTest(ssh_answer=answer):
+                result = self._bind_address(
+                    "stt-stream.sh", "stt_bind_address", "worker", STT_MANAGEMENT_IFNAME="enP7s7", FAKE_SSH_ANSWER=answer
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "", "nothing may be printed as a bind address")
+                self.assertIn("enP7s7", result.stderr)
 
     def test_the_head_engines_still_bind_the_docker_bridge_gateway(self) -> None:
         for script, function in (("ocr.sh", "ocr_bind_address"), ("whisper.sh", "whisper_bind_address")):
