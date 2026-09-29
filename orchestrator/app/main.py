@@ -213,6 +213,14 @@ async def lifespan(_app: FastAPI):
     artifact_pipeline.set_visual_reviewer(artifact_engine.visual_reviewer)
     artifact_pipeline.install_busy_probe(_chat_is_busy)
     await artifact_pipeline.start()
+    # Recording sessions (app/dictation.py): idle close, lease adoption after
+    # a restart, retention and the orphan sweep. Until 2026-09-29 only a
+    # /audio/sessions request started this, so after a restart none of it
+    # ran until somebody touched the microphone.
+    if settings.asr_enabled and settings.voice_sessions_enabled:
+        from . import dictation as _dictation
+
+        _dictation.RUNNER.ensure_maintenance()
     # The developer platform (CONTRACT-3). Two pieces of wiring, both here
     # because both need the pool open and the schema applied.
     _configure_api_key_pepper()
@@ -248,6 +256,14 @@ async def lifespan(_app: FastAPI):
         lag_probe_task = asyncio.get_running_loop().create_task(
             _latency_metrics.event_loop_lag_probe(), name="event-loop-lag-probe"
         )
+    # THE KNOWLEDGE PATH, warmed behind the app (2026-09-29): the first Fast
+    # turns after a deploy took 2.5-3.7 s against about 0.7 s warm, paying for
+    # the dense table, the page vocabulary and the reranker canary. Scheduled
+    # LAST and never awaited here, so start-up is not a second longer; it runs
+    # once the lifespan has handed over to serving. KNOWLEDGE_WARM_ON_START.
+    from .core import knowledge_warm as _knowledge_warm
+
+    _knowledge_warm.start()
     try:
         yield
     finally:
@@ -256,6 +272,7 @@ async def lifespan(_app: FastAPI):
             # asyncio.wait never re-raises the probe's CancelledError, so it
             # cannot swallow a cancellation aimed at this shutdown itself.
             await asyncio.wait({lag_probe_task}, timeout=1.0)
+        await _knowledge_warm.stop()
         # FIRST: durable /v1 runs suspend while the pool is still open (their
         # suspend writes leases and specs). The signal callback normally did
         # this at SIGTERM; repeating it is idempotent and covers a shutdown
@@ -290,6 +307,10 @@ async def lifespan(_app: FastAPI):
         await _stop_webhook_worker(webhook_worker)
         await video_pipeline.stop()
         await artifact_pipeline.stop()
+        # Before the pool closes, or its next pass fails every 15 s.
+        from . import dictation as _dictation_stop
+
+        _dictation_stop.RUNNER.stop_maintenance()
         await web_worker.stop()
         await continuity.stop()
         await engine_state.stop()
@@ -4441,6 +4462,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         "first_visible": None,
         "first_visible_kind": "",
         "first_visible_observed": False,
+        # chat_first_answer_seconds' `shape` (metrics.CHAT_ANSWER_SHAPES),
+        # set by the worker once the history and the lane are known.
+        "answer_shape": "plain",
     }
 
     def _observe_first_visible(route: str) -> None:
@@ -4629,6 +4653,15 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             from time import perf_counter as _pc
 
             _timing["first_token"] = _pc() - _timing["started"]
+            # The owner's per-class number (2026-09-29): the first ANSWER
+            # token by what the pre-pass decided and by the prompt's shape.
+            # Observed here, once — this branch runs only for the first token.
+            _latency_metrics.chat_first_answer(
+                _timing["first_token"],
+                effort=str(request.effort or ""),
+                decision=str(knowledge_state.get("decision") or "none"),
+                shape=str(_timing.get("answer_shape") or "plain"),
+            )
             # The answer is out of prefill and into decode: fact extraction
             # may have the router now without costing this person their
             # first token.
@@ -4773,6 +4806,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 if await _previous_send_unfinished(conv_key_outer, gen.intent_id):
                     lane = fast_lane.LaneDecision(False, lane.category, "unanswered_previous")
             fast_lane.record(lane)
+            _timing["answer_shape"] = _answer_shape(lane.entered, text, history)
 
             # CONTEXT READS START HERE (see _ContextReads). Before decide():
             # none of them depends on the plan, and at Think/Max the plan is
@@ -4908,6 +4942,157 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             if reads.concurrent and request.conversation_id and not lane.entered:
                 reads.start("recall", read_recall)
                 reads.start("summary", read_summary)
+            auto_web_search_allowed = request.mode == "assistant"
+
+            # Deep Research is EXPLICIT-only and needs the web: without a
+            # search provider there is nothing to research, so the request
+            # degrades to the ordinary engines rather than pretending. It is
+            # computed here, with the other web gates, because the pre-passes
+            # below all have to know about it — a research question that
+            # happens to quote a URL must not be diverted into the
+            # single-page reader, and one that says "index" must not be read
+            # as a crawl request. Computed before decide() since 2026-09-29:
+            # it reads only the request, and the Think/Max knowledge pre-pass
+            # below may be dispatched before decide() runs.
+            deep_research_on = bool(
+                request.deep_research
+                and settings.deep_research_enabled
+                and settings.search_enabled
+                and request.text
+                and not request.pdf_data
+                and not request.image_data
+                and auto_web_search_allowed
+            )
+
+            # THE PER-USER SEARCH WINDOW (engines/search.py, 10 a minute).
+            # Until 2026-09-29 every assistant text turn spent a slot here,
+            # before anything had decided to search: from the 11th Fast
+            # message in a minute the live lookup was silently switched off,
+            # and the "Search rate limit reached" line was emitted at 2-4 ms
+            # and counted as the turn's first visible text (16 such
+            # observations in the live process that morning). The window is
+            # now PEEKED here and SPENT only where a search or the Fast live
+            # lookup actually starts, and the line is said only when one is
+            # actually refused.
+            from .engines import search as _search_engine
+
+            user_key = str(viewer)
+            # May this request spend network at all? The pill OFF is a hard
+            # stop at every effort (until 2026-09-03 the Fast pre-pass still
+            # fetched two pages with the pill off, outside the per-user rate
+            # limit and unattributed in the search log). Salesforce mode
+            # closes it too.
+            search_policy = bool(
+                settings.search_enabled
+                and request.web_search != "off"
+                and auto_web_search_allowed
+            )
+            search_gate = bool(
+                search_policy
+                and request.text
+                and not request.pdf_data
+                and not request.image_data
+                and not request.video_uploads
+                # A small-talk lane turn never searches, so it must not spend
+                # a slot of the per-user search rate limit either.
+                and not lane.entered
+            )
+            search_room = _search_engine.rate_peek(user_key) if search_gate else True
+            search_allowed = search_policy and search_room
+            search_refusal_said = False
+
+            async def _say_search_refused() -> None:
+                nonlocal search_refusal_said
+                if search_refusal_said:
+                    return
+                search_refusal_said = True
+                await emit(
+                    "status",
+                    {"text": "Search rate limit reached — answering from model knowledge."},
+                )
+
+            # LIVING KNOWLEDGE, started early (2026-09-03). The classifier +
+            # local retrieval are independent of every pre-pass below
+            # (memory recall, stored pages, compaction), so they run
+            # CONCURRENTLY with them instead of after — measured ~150-250 ms
+            # off a Fast answer's time to first token. Only for the turn
+            # shape the plain chat branch can actually answer; when another
+            # engine wins the dispatch the task is cancelled unread.
+            knowledge_task: Optional[asyncio.Task] = None
+            knowledge_started_at = 0.0
+            # True when the pre-pass was given no network ONLY because the
+            # search window was full: a live lookup it would have made is
+            # then refused, and the person is told so after the await.
+            knowledge_network_closed_by_rate = False
+            # Set the moment the pre-pass enters its ONE slow branch (the
+            # live lookup). The status line below keys off this, not off
+            # "the task is still running": on a host where the embedding or
+            # router calls fail slowly (DNS timeouts on CI) an unfinished
+            # task means nothing is being fetched, and announcing a lookup
+            # that is not happening broke the assistant-mode event contract.
+            knowledge_lookup_started = asyncio.Event()
+
+            async def _note_lookup(kind: str, data: dict) -> None:
+                if knowledge_lookup_started.is_set():
+                    return
+                knowledge_lookup_started.set()
+                # The live lookup is a search: it takes its one slot of the
+                # per-user window here, when it starts, and only then.
+                _search_engine.rate_take(user_key)
+
+            # Stage 1 runs for every assistant text turn — including one the
+            # auto classifier wants to SEARCH (ADR-0001 D6): if the store
+            # answers with confidence, the search is skipped; if it cannot,
+            # a Think request escalates. Only a FORCED search skips it: the
+            # search engine merges stored passages itself. Network inside
+            # the pre-pass is only allowed when no search is going to run.
+            knowledge_gates = bool(
+                settings.living_knowledge_enabled
+                and request.mode == "assistant"
+                and request.text
+                and not request.pdf_data
+                and not request.pdf_uploads
+                and not request.video_uploads
+                and not request.image_data
+                and not request.agent
+                and not deep_research_on
+                and not lane.entered
+            )
+            # THINK AND MAX START THE PRE-PASS BESIDE decide() (2026-09-29).
+            # decide() is a router round trip at those efforts — live traces
+            # p50 555/655 ms, p95 1,057/1,324 ms (Think/Max, 14 days) — and
+            # the pre-pass waited behind it although only ONE of its gates
+            # reads the plan: "the agent is not answering". So when every
+            # other gate holds, the task starts first and is cancelled unread
+            # if the plan picks the agent. A forced search is excluded (it
+            # skips the pre-pass). `allow_network` cannot wait for the plan,
+            # and does not need to: at Think and Max prepare() returns before
+            # the live lookup (living_knowledge.prepare, `effort != "fast"`),
+            # so it only decides whether the result is labelled
+            # escalate_search, and the escalation below is gated on
+            # `not want_search` anyway. Fast keeps its order: its decide()
+            # makes no router call.
+            early_knowledge = bool(
+                knowledge_gates
+                and settings.chat_prepass_beside_decide
+                and request.web_search != "on"
+                and llm.normalize_effort(request.effort) in ("think", "max")
+            )
+            if early_knowledge:
+                knowledge_started_at = time.perf_counter()
+                knowledge_network_closed_by_rate = bool(search_policy and not search_room)
+                knowledge_task = asyncio.ensure_future(
+                    _prepare_knowledge(
+                        request,
+                        text,
+                        allow_network=search_allowed,
+                        emit=_note_lookup,
+                        user_id=viewer,
+                        conversation_id=conv_key_outer,
+                        history=history,
+                    )
+                )
+
             # Phase 1: decide whether to run web search (never for attachments).
             # AUTO-ORCHESTRATION (2026-07-28): with no Agent toggle in the UI,
             # one cheap non-thinking call decides whether this request deserves
@@ -4921,8 +5106,6 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # Live, "what problems do customers describe in their support
             # cases?" came back with web articles about IT ticketing instead
             # of this org's cases.
-            auto_web_search_allowed = request.mode == "assistant"
-
             auto_plan = None
             if (
                 request.text
@@ -4946,122 +5129,61 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 )
 
             want_agent = request.agent or bool(auto_plan and auto_plan.agent)
+            if knowledge_task is not None and want_agent:
+                # Started beside decide(), and the plan picked the agent,
+                # which answers without it: cancelled unread.
+                knowledge_task.cancel()
+                knowledge_task = None
 
             want_search = False
-            search_rate_limited = False
-            if (
-                settings.search_enabled
-                and request.web_search != "off"
-                and not request.pdf_data
-                and not request.image_data
-                and not request.video_uploads
-                and request.text
-                # Salesforce mode NEVER searches the web — at any effort
-                # level, and even if the client sends web_search="on" (owner
-                # request 2026-08-05; until then an explicit "on" was an
-                # escape hatch). The composer hides the web-search option in
-                # that mode, and this gate makes the promise hold for ANY
-                # client, not just the current UI. Turning the Salesforce
-                # toggle off is how you ask the web.
-                and auto_web_search_allowed
-                # A small-talk lane turn never searches, so it must not spend
-                # a slot of the per-user search rate limit either.
-                and not lane.entered
-            ):
-                from .engines.search import rate_ok, should_search
-
-                user_key = str(viewer)
-                if not rate_ok(user_key):
-                    search_rate_limited = True
-                    await emit(
-                        "status",
-                        {"text": "Search rate limit reached — answering from model knowledge."},
-                    )
-                elif request.web_search == "on":
-                    want_search = True
+            # Salesforce mode NEVER searches the web — at any effort level,
+            # and even if the client sends web_search="on" (owner request
+            # 2026-08-05; until then an explicit "on" was an escape hatch).
+            # The composer hides the web-search option in that mode, and
+            # `search_gate` makes the promise hold for ANY client, not just
+            # the current UI. Turning the Salesforce toggle off is how you ask
+            # the web.
+            if search_gate:
+                # Looked at again: decide() may have taken a second, in which
+                # another turn of the same person can have spent the last slot.
+                search_room = _search_engine.rate_peek(user_key)
+                search_allowed = search_policy and search_room
+                if request.web_search == "on":
+                    wanted = True
                 elif auto_plan is not None:
                     # The orchestration call already judged this request.
-                    want_search = auto_plan.search
+                    wanted = bool(auto_plan.search)
+                elif not search_room:
+                    # No plan (the Agent toggle) and no room: the classifier
+                    # is not asked, as before, and the refusal is said.
+                    wanted = True
                 else:  # "auto"
                     # The conversation's own turns only — never the pinned
                     # memory blocks (should_search strips them itself).
-                    want_search = await should_search(request.text, history)
+                    wanted = await _search_engine.should_search(request.text, history)
+                if wanted and search_room:
+                    _search_engine.rate_take(user_key)
+                    want_search = True
+                elif wanted:
+                    await _say_search_refused()
 
-            # Deep Research is EXPLICIT-only and needs the web: without a
-            # search provider there is nothing to research, so the request
-            # degrades to the ordinary engines rather than pretending. It is
-            # computed here, with the other web gates, because the pre-passes
-            # below all have to know about it — a research question that
-            # happens to quote a URL must not be diverted into the
-            # single-page reader, and one that says "index" must not be read
-            # as a crawl request.
-            deep_research_on = bool(
-                request.deep_research
-                and settings.deep_research_enabled
-                and settings.search_enabled
-                and request.text
-                and not request.pdf_data
-                and not request.image_data
-                and auto_web_search_allowed
-            )
             if request.deep_research and not deep_research_on:
                 await emit(
                     "status",
                     {"text": "Deep Research is unavailable here — answering normally."},
                 )
 
-            # LIVING KNOWLEDGE, started early (2026-09-03). The classifier +
-            # local retrieval are independent of every pre-pass below
-            # (memory recall, stored pages, compaction), so they run
-            # CONCURRENTLY with them instead of after — measured ~150-250 ms
-            # off a Fast answer's time to first token. Only for the turn
-            # shape the plain chat branch can actually answer; when another
-            # engine wins the dispatch the task is cancelled unread.
-            knowledge_task: Optional[asyncio.Task] = None
-            # Set the moment the pre-pass enters its ONE slow branch (the
-            # live lookup). The status line below keys off this, not off
-            # "the task is still running": on a host where the embedding or
-            # router calls fail slowly (DNS timeouts on CI) an unfinished
-            # task means nothing is being fetched, and announcing a lookup
-            # that is not happening broke the assistant-mode event contract.
-            knowledge_lookup_started = asyncio.Event()
-
-            async def _note_lookup(kind: str, data: dict) -> None:
-                knowledge_lookup_started.set()
-
-            # May this request spend network at all? The pill OFF is a hard
-            # stop at every effort (until 2026-09-03 the Fast pre-pass still
-            # fetched two pages with the pill off, outside the per-user rate
-            # limit and unattributed in the search log). Salesforce mode and
-            # the rate limit close it too.
-            search_allowed = bool(
-                settings.search_enabled
-                and request.web_search != "off"
-                and auto_web_search_allowed
-                and not search_rate_limited
-            )
-            # Stage 1 runs for every assistant text turn — including one the
-            # auto classifier wants to SEARCH (ADR-0001 D6): if the store
-            # answers with confidence, the search is skipped; if it cannot,
-            # a Think request escalates. Only a FORCED search skips it: the
-            # search engine merges stored passages itself. Network inside
-            # the pre-pass is only allowed when no search is going to run.
             prepared_early = None
             if (
-                settings.living_knowledge_enabled
-                and request.mode == "assistant"
-                and request.text
-                and not request.pdf_data
-                and not request.pdf_uploads
-                and not request.video_uploads
-                and not request.image_data
-                and not request.agent
+                not early_knowledge
+                and knowledge_gates
                 and not want_agent
                 and not (want_search and request.web_search == "on")
-                and not deep_research_on
-                and not lane.entered
             ):
                 knowledge_started_at = time.perf_counter()
+                knowledge_network_closed_by_rate = bool(
+                    search_policy and not search_room and not want_search
+                )
                 knowledge_task = asyncio.ensure_future(
                     _prepare_knowledge(
                         request,
@@ -5812,6 +5934,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .living_knowledge import Prepared
 
                 knowledge_outcome = "ok"
+                knowledge_blocked_from = time.perf_counter()
                 try:
                     prepared_early = await _await_knowledge(
                         knowledge_task,
@@ -5838,16 +5961,47 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # turn that goes to the network, and the single most expensive
                 # stage in front of the first token — was never recorded.
                 #
-                # It is observed HERE because this is the await: the task is
-                # dispatched much earlier and overlaps memory recall and
-                # compaction, so the time that matters is the time the answer
-                # path could not proceed, not the task's own duration.
+                # It is timed from the task's DISPATCH, so it includes the
+                # part that overlapped memory recall, the context reads and
+                # compaction. The part the answer path actually waited for is
+                # knowledge_blocked_seconds (2026-09-29), timed from the start
+                # of the await: on a turn whose pre-pass had already finished
+                # it is near zero while this one still reads the whole task.
+                _knowledge_decision = str(getattr(prepared_early, "decision", "") or "none")
+                # Read first, so blocked <= prepare holds exactly: it starts
+                # later (the await, not the dispatch) and ends no later.
+                _knowledge_blocked_s = max(0.0, time.perf_counter() - knowledge_blocked_from)
                 _latency_metrics.knowledge_prepare(
                     max(0.0, time.perf_counter() - knowledge_started_at),
                     effort=str(request.effort or ""),
-                    decision=str(getattr(prepared_early, "decision", "") or "none"),
+                    decision=_knowledge_decision,
                     outcome=knowledge_outcome,
                 )
+                _latency_metrics.knowledge_blocked(
+                    _knowledge_blocked_s,
+                    effort=str(request.effort or ""),
+                    decision=_knowledge_decision,
+                )
+                if (
+                    knowledge_network_closed_by_rate
+                    and not want_search
+                    and _knowledge_decision == "stale_offline"
+                    and (
+                        llm.normalize_effort(request.effort) == "fast"
+                        # Think/Max escalate only a CONFIRMED time-sensitive
+                        # verdict (living_knowledge.prepare: the router's
+                        # "default" never escalates), so only that one was
+                        # refused.
+                        or getattr(getattr(prepared_early, "verdict", None), "reason", "")
+                        != "default"
+                    )
+                ):
+                    # The pre-pass wanted the network for a time-sensitive
+                    # question the store could not answer fresh, and the only
+                    # thing that closed it was the full search window: the
+                    # lookup (Fast) or the escalation (Think/Max) is refused
+                    # here, so the person is told why the answer may be dated.
+                    await _say_search_refused()
                 if prepared_early.local_first and want_search and request.web_search != "on":
                     want_search = False
                     orchestration_state["search"] = False
@@ -5862,11 +6016,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     and not want_agent
                     and not deep_research_on
                 ):
-                    want_search = True
-                    orchestration_state["search"] = True
-                    orchestration_state["escalated"] = True
-                    _metrics.inc("knowledge_escalation_total", effort=request.effort or "", stage="search")
-                    await emit("status", {"text": "Stored knowledge is not enough — searching the web…"})
+                    # The escalation IS a search: it takes its slot of the
+                    # per-user window now, or is refused and says so.
+                    if _search_engine.rate_peek(user_key):
+                        _search_engine.rate_take(user_key)
+                        want_search = True
+                        orchestration_state["search"] = True
+                        orchestration_state["escalated"] = True
+                        _metrics.inc("knowledge_escalation_total", effort=request.effort or "", stage="search")
+                        await emit("status", {"text": "Stored knowledge is not enough — searching the web…"})
+                    else:
+                        await _say_search_refused()
 
             # ARTIFACT INTENT — decided by rules on the RESOLVED text, before
             # the chain, so no engine below can claim a turn that asked for a
@@ -7075,6 +7235,25 @@ class StopRequest(BaseModel):
     @classmethod
     def _conversation_id_is_not_synthetic(cls, value: Optional[str]) -> Optional[str]:
         return _reject_synthetic_conversation_id(value)
+
+
+def _answer_shape(lane_entered: bool, text: str, history) -> str:
+    """chat_first_answer_seconds' `shape` (metrics.CHAT_ANSWER_SHAPES): what
+    the engine will have to read before its first token. The small-talk lane
+    first (its prompt is ~630 characters whatever came before), then pasted
+    material, then any earlier turn of the conversation, else a first message.
+    """
+    if lane_entered:
+        return "lane"
+    from .core import pasted as _pasted
+
+    if _pasted.is_paste(text or ""):
+        return "paste"
+    if any(
+        isinstance(m, dict) and m.get("role") in ("user", "assistant") for m in history or ()
+    ):
+        return "followup"
+    return "plain"
 
 
 async def _await_knowledge(

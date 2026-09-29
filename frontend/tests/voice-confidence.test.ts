@@ -31,6 +31,7 @@ import { transcribe } from '@/lib/voice';
 const CLEAR =
   "That recording wasn't clear enough to transcribe. Try again, closer to the microphone.";
 const CHECK_IT = 'That was hard to make out — check the text before you send it.';
+const UNSAID = 'No words came back, and the server did not say why.';
 
 const blob = () => new Blob(['opus'], { type: 'audio/webm' });
 
@@ -95,20 +96,63 @@ describe('an empty draft is never called silence unless silence was measured', (
   // 'unclear' — the second opinion was declined, or the words were dropped
   // as invented. 'low' — a caution that still came back empty. null — a
   // server that said nothing about it. None of them measured silence.
-  it.each([['unclear'], ['low'], [null]])(
-    'confidence %s does not claim the room was quiet',
-    async (confidence: string | null) => {
-      const result = await send(reply({ confidence }));
-      expect('error' in result).toBe(true);
-      const message = (result as { error: { message: string } }).error.message;
-      expect(message).toBe(CLEAR);
-      expect(message).not.toContain('Nothing was said');
-    },
-  );
+  it('confidence unclear does not claim the room was quiet', async () => {
+    const result = await send(reply({ confidence: 'unclear' }));
+    expect('error' in result).toBe(true);
+    const message = (result as { error: { message: string } }).error.message;
+    expect(message).toBe(CLEAR);
+    expect(message).not.toContain('Nothing was said');
+  });
+
+  // 2026-09-29: 'low' is the server's word for "there IS a draft and it may be
+  // invented" (orchestrator/app/asr.py CONFIDENCE_LOW). An empty draft marked
+  // 'low' is not a judgement that the audio was unclear, so it is not blamed
+  // on the microphone; it was, until then.
+  it('confidence low on an empty draft does not claim the room was quiet, nor blame the microphone', async () => {
+    const result = await send(reply({ confidence: 'low' }));
+    expect('error' in result).toBe(true);
+    const message = (result as { error: { message: string } }).error.message;
+    expect(message).toBe(UNSAID);
+    expect(message).not.toContain('microphone');
+    expect(message).not.toContain('Nothing was said');
+  });
+
+  // 2026-09-29: "closer to the microphone" is kept ONLY where the server
+  // judged the audio unclear. A server that said nothing about it used to get
+  // the microphone sentence too, which blamed the one thing nobody had judged.
+  it('no confidence at all is not blamed on the microphone either', async () => {
+    const result = await send(reply({ confidence: null }));
+    const message = (result as { error: { message: string } }).error.message;
+    expect(message).toBe(UNSAID);
+    expect(message).not.toContain('microphone');
+    expect(message).not.toContain('Nothing was said');
+  });
 
   it('a value this client does not know is treated as no opinion', async () => {
     const result = await send(reply({ confidence: 'extremely-confident' }));
-    expect((result as { error: { message: string } }).error.message).toBe(CLEAR);
+    expect((result as { error: { message: string } }).error.message).toBe(UNSAID);
+  });
+
+  it('a long unclear clip names the first 30 seconds, not the microphone', async () => {
+    // The owner's recording, 2026-09-24: 181,427 ms, empty, in 2,175 ms. The
+    // engine judged only its first 30 s, and over 120 s no second listen is
+    // taken, so moving the microphone could not have helped.
+    const result = await transcribe(blob(), {
+      durationMs: 181_427,
+      mimeType: 'audio/webm',
+      fetchImpl: vi.fn(async () =>
+        Response.json(reply({ confidence: 'unclear', duration_ms: 181_427 }), { status: 200 }),
+      ) as unknown as typeof fetch,
+    });
+    const message = (result as { error: { message: string } }).error.message;
+    expect(message).toBe(
+      // 2026-09-29 (backend verifier item K): 'unclear' is also what the
+      // server says when it judged the heard words invented, or the decoder
+      // returned nothing with the gate open, so the sentence claims only what
+      // is true of all three.
+      'No words came back for that recording, and the server could not tell whether anything was said. A recording this long is judged by its first 30 seconds, so a quiet start can empty all of it: start speaking right away, or attach long recordings as a file.',
+    );
+    expect(message).not.toContain('microphone');
   });
 
   it('every empty draft is retryable, whatever the reason', async () => {

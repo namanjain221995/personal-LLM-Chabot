@@ -36,16 +36,22 @@
 import { useEffect, useState } from 'react';
 import { IconStop, IconX } from './icons';
 import { Loader } from './Loader';
-import { LEVEL_BARS } from '@/lib/voice';
-import type { VoiceState } from '@/lib/voice';
+import {
+  BACKLOG_NOTICE_MS,
+  LEVEL_BARS,
+  VOICE_MESSAGES,
+  formatElapsed,
+  idleWords,
+} from '@/lib/voice';
+import type { SessionProgress, VoiceState } from '@/lib/voice';
+import type { VoiceFollowUp } from './useVoiceRecorder';
 
-/** mm:ss — a dictation is never long enough to need hours. */
-export function formatElapsed(ms: number): string {
-  const total = Math.max(0, Math.floor(ms / 1000));
-  const minutes = Math.floor(total / 60);
-  const seconds = total % 60;
-  return `${minutes}:${String(seconds).padStart(2, '0')}`;
-}
+/**
+ * m:ss, and h:mm:ss from an hour. It lives in lib/voice.ts now, because the
+ * failure sentences quote durations too; re-exported here for the callers
+ * and tests that always imported it from the bar.
+ */
+export { formatElapsed };
 
 /**
  * Milliseconds since `active` last became true; 0 while it is false.
@@ -118,101 +124,277 @@ function Waveform({ levels }: { levels: number[] }) {
   );
 }
 
+
+/**
+ * The lines above the controls row while a SESSION records or finishes: what
+ * has been transcribed so far, where the recording is kept, and anything the
+ * person should know about the upload.
+ *
+ * Not a live region. The transcript grows every few seconds for as long as
+ * someone talks, and announcing each piece would drown the one sentence the
+ * status row announces. A screen reader can still read it on demand.
+ */
+function SessionPanel({
+  state,
+  progress,
+  hint,
+  warning,
+}: {
+  state: 'requesting' | 'recording' | 'finishing';
+  progress: SessionProgress | null;
+  hint: string | null;
+  warning: string | null;
+}) {
+  const lines: Array<{ key: string; text: string; tone: 'muted' | 'warn' }> = [];
+  if (hint) lines.push({ key: 'hint', text: hint, tone: 'muted' });
+  if (warning) lines.push({ key: 'warning', text: warning, tone: 'warn' });
+  if (progress) {
+    if (progress.offline) {
+      lines.push({
+        key: 'offline',
+        // Past the server's idle close the audio no longer simply "uploads
+        // when the connection is back": the server has closed the recording,
+        // and what it missed waits on this device (2026-09-29).
+        text: progress.offlineLong
+          ? VOICE_MESSAGES.offlineLong(idleWords(progress.idleCloseS ?? 600))
+          : state === 'finishing'
+            ? VOICE_MESSAGES.offlineFinishing(formatElapsed(progress.pendingMs))
+            : VOICE_MESSAGES.offlineRecording,
+        tone: 'warn',
+      });
+    } else if (progress.storageTrouble) {
+      lines.push({ key: 'storage', text: VOICE_MESSAGES.storageTrouble, tone: 'warn' });
+    }
+    if (!progress.progressive && state === 'recording') {
+      lines.push({ key: 'progressive', text: VOICE_MESSAGES.notProgressive, tone: 'muted' });
+    } else if (state === 'recording' && progress.backlogMs > BACKLOG_NOTICE_MS) {
+      lines.push({
+        key: 'behind',
+        text: VOICE_MESSAGES.behind(formatElapsed(progress.backlogMs), progress.waitingOn),
+        tone: 'muted',
+      });
+    }
+    // An engine that cannot be reached is said at once, whatever the backlog:
+    // it is not "behind", and the audio being saved is what matters now.
+    if (progress.waitingOn === 'engine_unavailable' && !lines.some((l) => l.key === 'behind')) {
+      lines.push({ key: 'engine', text: VOICE_MESSAGES.engineUnavailableLive, tone: 'warn' });
+    }
+  }
+  const words = progress ? `${progress.preview}` : '';
+  const tentative = progress?.tentative ?? '';
+  if (!lines.length && !words && !tentative && !progress) return null;
+  return (
+    <div className="flex flex-col gap-1 px-3 pt-1 text-xs" data-testid="voice-session-panel">
+      {(words || tentative) && (
+        // The newest words at the bottom edge, older ones scrolling off the
+        // top: three lines is enough to see the sentence being heard.
+        <p className="line-clamp-3 break-words text-sm leading-5 text-ink" dir="auto">
+          {words}
+          {tentative && (
+            <span className="text-muted">
+              {words ? ' ' : ''}
+              {tentative}
+            </span>
+          )}
+        </p>
+      )}
+      {lines.map((line) => (
+        <p key={line.key} className={line.tone === 'warn' ? 'text-warn' : 'text-muted'}>
+          {line.text}
+        </p>
+      ))}
+      {progress && progress.savedMs !== 0 && (
+        <p className="text-faint">
+          {/* Where the stored recordings are (feat/voice-recordings-page). A
+              new tab: leaving this page while recording would end the
+              recording. Drawn only once the server has acknowledged audio,
+              and it says how much, and how much is still only on this device. */}
+          <a
+            href="/recordings"
+            target="_blank"
+            rel="noopener"
+            className="underline-offset-2 hover:text-muted hover:underline"
+          >
+            {progress.savedMs === undefined
+              ? VOICE_MESSAGES.saved(progress.retentionDays)
+              : VOICE_MESSAGES.savedSoFar(
+                  formatElapsed(progress.savedMs),
+                  progress.pendingMs > 0 ? formatElapsed(progress.pendingMs) : null,
+                  progress.retentionDays,
+                )}
+          </a>
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function VoiceBar({
   state,
   levels,
   elapsedMs,
   maxMs,
+  progress = null,
+  hint = null,
+  warning = null,
   onCancel,
   onStop,
 }: {
-  state: Extract<VoiceState, 'requesting' | 'recording' | 'transcribing'>;
+  state: Extract<VoiceState, 'requesting' | 'recording' | 'finishing'>;
   levels: number[];
   elapsedMs: number;
-  maxMs: number;
+  /**
+   * The ceiling in force, or null for none. Only the legacy road has one
+   * (ten minutes); a session records for as long as the person talks, so it
+   * shows no countdown and nothing warns that it will stop.
+   */
+  maxMs: number | null;
+  /** Upload and transcript progress on the session road. */
+  progress?: SessionProgress | null;
+  /** One sentence about the road this recording took. */
+  hint?: string | null;
+  /** Something that happened while recording, e.g. the screen went off. */
+  warning?: string | null;
   onCancel: () => void;
   onStop: () => void;
 }) {
   const recording = state === 'recording';
-  const transcribing = state === 'transcribing';
-  const waitedMs = useWaitClock(transcribing);
-  const remaining = Math.max(0, maxMs - elapsedMs);
-  // Only in the last thirty seconds. A countdown that is always on turns a
-  // two-sentence dictation into a timed exam.
+  const finishing = state === 'finishing';
+  const waitedMs = useWaitClock(finishing);
+  const remaining = maxMs === null ? Infinity : Math.max(0, maxMs - elapsedMs);
+  // Only in the last thirty seconds, and only where there IS a limit. A
+  // countdown that is always on turns a two-sentence dictation into a timed
+  // exam.
   const closing = recording && remaining <= 30_000;
+  const finishingText =
+    progress && progress.backlogMs > 0
+      ? VOICE_MESSAGES.finishingTail(formatElapsed(progress.backlogMs))
+      : progress
+        ? VOICE_MESSAGES.finishing
+        : 'Transcribing…';
 
   return (
+    <div className="flex flex-col">
+      <SessionPanel state={state} progress={progress} hint={hint} warning={warning} />
+      <div
+        className="flex h-[52px] items-center gap-3 px-2"
+        // One live region for the whole bar: a screen reader is told the state
+        // changed, not read a timer forty-eight times a second.
+        role="status"
+        aria-live="polite"
+      >
+        <button
+          type="button"
+          onClick={onCancel}
+          aria-label={finishing ? 'Cancel transcription' : 'Cancel recording'}
+          title={finishing ? 'Cancel' : 'Cancel recording (Esc)'}
+          className="shrink-0 rounded-lg p-2 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        >
+          <IconX size={17} />
+        </button>
+
+        {finishing ? (
+          <span className="flex min-w-0 flex-1 items-center justify-center gap-2.5 text-sm text-muted">
+            <Loader size={16} />
+            <span className="truncate">{finishingText}</span>
+            {/* aria-hidden: the live region announces the state once (the
+                sr-only sentence below), not a number every second. */}
+            <span aria-hidden="true" className="text-xs tabular-nums">
+              {formatElapsed(waitedMs)}
+            </span>
+          </span>
+        ) : state === 'requesting' ? (
+          <span className="flex flex-1 items-center justify-center gap-2.5 text-sm text-muted">
+            <Loader size={16} />
+            Waiting for the microphone…
+          </span>
+        ) : (
+          <>
+            <Waveform levels={levels} />
+            <span
+              className={`shrink-0 text-xs tabular-nums ${
+                closing ? 'text-warn' : 'text-muted'
+              }`}
+              title={closing ? 'Recording will stop at the limit' : undefined}
+            >
+              {closing
+                ? `−${formatElapsed(remaining)}`
+                : formatElapsed(elapsedMs)}
+            </span>
+          </>
+        )}
+
+        {/* The primary action stays in the primary position — the same corner
+            the send button occupies, so the thumb does not have to move. */}
+        <button
+          type="button"
+          onClick={onStop}
+          disabled={!recording}
+          aria-label="Stop recording and transcribe"
+          title="Stop and transcribe (Enter)"
+          className="shrink-0 rounded-lg bg-accent-strong p-2 text-white transition-all duration-ts hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-35"
+        >
+          <IconStop size={17} />
+        </button>
+
+        {/* The state in words, for a screen reader. The waveform above is
+            aria-hidden and the timer is decoration; this sentence is what is
+            actually announced. */}
+        <span className="sr-only">
+          {finishing
+            ? 'Transcribing your recording'
+            : recording
+              ? `Recording, ${formatElapsed(elapsedMs)} elapsed`
+              : 'Waiting for microphone permission'}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One line beside the composer after a recording, with the thing the person
+ * can do about it: Retry a saved recording's missing parts, end a recording
+ * left running in another tab, or insert a recording a closed tab finished.
+ * A toast would be gone before they could press the button.
+ */
+export function VoiceFollowUpLine({ followUp }: { followUp: VoiceFollowUp }) {
+  return (
     <div
-      className="flex h-[52px] items-center gap-3 px-2"
-      // One live region for the whole bar: a screen reader is told the state
-      // changed, not read a timer forty-eight times a second.
-      role="status"
-      aria-live="polite"
+      role={followUp.tone === 'error' ? 'alert' : undefined}
+      className={`mb-2 flex items-start gap-2 rounded-ts border border-border px-3 py-2 text-xs ${
+        followUp.tone === 'error' ? 'text-ink' : 'text-muted'
+      }`}
     >
-      <button
-        type="button"
-        onClick={onCancel}
-        aria-label={transcribing ? 'Cancel transcription' : 'Cancel recording'}
-        title={transcribing ? 'Cancel' : 'Cancel recording (Esc)'}
-        className="shrink-0 rounded-lg p-2 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-      >
-        <IconX size={17} />
-      </button>
-
-      {transcribing ? (
-        <span className="flex flex-1 items-center justify-center gap-2.5 text-sm text-muted">
-          <Loader size={16} />
-          Transcribing…
-          {/* aria-hidden: the live region announces the state once (the
-              sr-only sentence below), not a number every second. */}
-          <span aria-hidden="true" className="text-xs tabular-nums">
-            {formatElapsed(waitedMs)}
-          </span>
-        </span>
-      ) : state === 'requesting' ? (
-        <span className="flex flex-1 items-center justify-center gap-2.5 text-sm text-muted">
-          <Loader size={16} />
-          Waiting for the microphone…
-        </span>
-      ) : (
-        <>
-          <Waveform levels={levels} />
-          <span
-            className={`shrink-0 text-xs tabular-nums ${
-              closing ? 'text-warn' : 'text-muted'
-            }`}
-            title={closing ? 'Recording will stop at the limit' : undefined}
-          >
-            {closing
-              ? `−${formatElapsed(remaining)}`
-              : formatElapsed(elapsedMs)}
-          </span>
-        </>
+      <p className="min-w-0 flex-1 break-words">{followUp.message}</p>
+      {followUp.actionLabel && (
+        <button
+          type="button"
+          onClick={followUp.run}
+          disabled={followUp.busy}
+          className="shrink-0 rounded-lg px-2 py-0.5 font-medium text-accent transition-colors duration-ts hover:bg-surface-2 disabled:cursor-wait disabled:opacity-60"
+        >
+          {followUp.busy ? <Loader size={12} /> : followUp.actionLabel}
+        </button>
       )}
-
-      {/* The primary action stays in the primary position — the same corner
-          the send button occupies, so the thumb does not have to move. */}
+      {followUp.secondaryLabel && followUp.runSecondary && (
+        <button
+          type="button"
+          onClick={followUp.runSecondary}
+          disabled={followUp.busy}
+          className="shrink-0 rounded-lg px-2 py-0.5 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink disabled:opacity-60"
+        >
+          {followUp.secondaryLabel}
+        </button>
+      )}
       <button
         type="button"
-        onClick={onStop}
-        disabled={!recording}
-        aria-label="Stop recording and transcribe"
-        title="Stop and transcribe (Enter)"
-        className="shrink-0 rounded-lg bg-accent-strong p-2 text-white transition-all duration-ts hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-35"
+        onClick={followUp.dismiss}
+        aria-label="Dismiss"
+        className="shrink-0 rounded-lg p-0.5 text-icon transition-colors duration-ts hover:bg-surface-2 hover:text-ink"
       >
-        <IconStop size={17} />
+        <IconX size={13} />
       </button>
-
-      {/* The state in words, for a screen reader. The waveform above is
-          aria-hidden and the timer is decoration; this sentence is what is
-          actually announced. */}
-      <span className="sr-only">
-        {transcribing
-          ? 'Transcribing your recording'
-          : recording
-            ? `Recording, ${formatElapsed(elapsedMs)} elapsed`
-            : 'Waiting for microphone permission'}
-      </span>
     </div>
   );
 }
