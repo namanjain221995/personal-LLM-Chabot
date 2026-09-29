@@ -51,7 +51,10 @@
  * lectures whisper had twice Nemotron's word error rate and wrote a fifth of
  * it in Urdu script). A quiet line says which went in and swaps the other in
  * on request; the full pass's Retry and "Upload the rest" are offered only
- * while its own text is the one in the draft.
+ * while its own text is the one in the draft. When the live words decide by
+ * themselves (the person chose Hindi, or they are a fifth Devanagari), they
+ * go in as soon as the live stream ends, and the full pass is offered once it
+ * is done (`deliverLiveFirst`, spec 13).
  *
  * The transitions live in lib/voice.ts and are unit-tested without a DOM.
  * What is here is the part that genuinely needs the browser.
@@ -103,6 +106,7 @@ import {
   type VoiceState,
 } from '@/lib/voice';
 import {
+  LIVE_FULL_PASS_FAILED,
   LIVE_INSERTED_FULL_PASS,
   LIVE_INSERTED_LIVE,
   LIVE_INSERT_LABEL,
@@ -114,6 +118,7 @@ import {
   LiveCapture,
   chooseFinalText,
   getVoiceLanguage,
+  liveChosenWithoutWhisper,
   liveMayStillBeChosen,
   setVoiceLanguage,
   withLiveWords,
@@ -129,6 +134,8 @@ import {
  * that never does.
  */
 const STOP_EVENT_GRACE_MS = 2000;
+
+const noop = () => undefined;
 
 /** A line beside the composer that the person can act on, or dismiss. */
 export interface VoiceFollowUp {
@@ -371,6 +378,15 @@ export function useVoiceRecorder({
   /** The recording's stop handler while its stop event is still owed; a second Stop defers to it. */
   const pendingStop = useRef<(() => void) | null>(null);
   const stopFallback = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * The session the server stopped taking parts from (storage or quota full,
+   * closed elsewhere...). Its words wait for the full pass even when the live
+   * ones would decide alone (`deliverLiveFirst`): the insert then carries the
+   * sentence that says why the recording stopped and what is kept here.
+   */
+  const interrupted = useRef<VoiceSession | null>(null);
+  /** The follow-up on screen, as `setFollowUp` last set it: a late full pass updates only its own line. */
+  const shownLine = useRef<VoiceFollowUp | null>(null);
 
   const storeFor = useCallback((who: string | null): Promise<OutboxStore> => {
     if (!who) return Promise.resolve((memoryStore.current ??= createMemoryOutbox()));
@@ -427,6 +443,7 @@ export function useVoiceRecorder({
     (next: VoiceFollowUp | null, backing?: Backing | null) => {
       stopHolding();
       if (backing) hold(backing);
+      shownLine.current = next;
       if (alive.current) setFollowUpState(next);
     },
     [hold, stopHolding],
@@ -1103,6 +1120,93 @@ export function useVoiceRecorder({
   );
 
   /**
+   * THE LIVE WORDS FIRST (build spec 13, 2026-09-30). A session whose live
+   * transcript goes in whatever whisper hears (`liveChosenWithoutWhisper`:
+   * the person chose Hindi, or a fifth of the letters are Devanagari, and the
+   * live transcript is complete with no English-model words) gets it the
+   * moment the live stream has ended, not once the full pass is done.
+   * Measured in the browser end to end: a 67 s Hindi dictation's live stream
+   * said `done` 0.2 s after Stop, and its insert waited 26.6 s for whisper,
+   * whose text it then did not use.
+   *
+   * The words go in at once. The recording stays `finishing` only until the
+   * server has accepted its finish (`told`: the last part is up and the
+   * finish request answered, which does not wait for whisper): until then the
+   * server still counts it as this person's one live recording, and a new one
+   * started meanwhile would be refused as "already recording in another tab".
+   * X in that moment still discards the recording, as it always has; the
+   * words already put in stay the person's.
+   *
+   * Then one quiet line says the live transcript went in, with nothing to
+   * press yet. The full pass carries on, and when it is done the line offers
+   * it ("Use the other one"), then and not before. It never writes into the
+   * draft by itself: the swap puts it in on request, and only over live words
+   * nobody has changed. When it fails, the line says so quietly and the words
+   * stay. The record is settled as for any live insert (`keepForShown`), once
+   * the full pass is over. A line the person dismissed, or one a new
+   * recording replaced, is not brought back.
+   *
+   * A recording the server stopped (`interrupted`) does not come here: its
+   * insert waits for the full pass, whose result says why it stopped.
+   */
+  const deliverLiveFirst = useCallback(
+    async (
+      s: VoiceSession,
+      capture: LiveCapture,
+      ending: Promise<SessionResult>,
+      told: Promise<void>,
+      backing: Backing,
+    ) => {
+      const liveText = capture.text();
+      capture.abort();
+      if (live.current === capture) live.current = null;
+      // The recording's own notices (a stretch with the screen off) are true of either transcript.
+      onTranscriptRef.current(liveText, notices.current.join(' ') || null);
+      const settle = (result: SessionResult | null) => {
+        if (!result || result.kind === 'withdrawn') return;
+        void settleRecord(
+          backing.outbox,
+          backing.sessionId,
+          keepForShown({ shown: 'live', durable: result.kind === 'text' ? result.text : '', offer: result.offer }),
+        );
+      };
+      await Promise.race([told, ending.then(noop, noop)]);
+      // Discarded meanwhile (X while finishing): the recording is gone, the words are the person's.
+      if (session.current !== s) return;
+      session.current = null;
+      if (!alive.current) {
+        void ending.then(settle, noop);
+        return;
+      }
+      setLiveView(null);
+      setLiveLanguage(null);
+      move('idle');
+      const inserted: VoiceFollowUp = {
+        message: LIVE_INSERTED_LIVE,
+        tone: 'info',
+        actionLabel: null,
+        busy: false,
+        run: noop,
+        dismiss: () => setFollowUp(null),
+      };
+      setFollowUp(inserted);
+      const result = await ending.catch(() => null);
+      settle(result);
+      if (!alive.current || shownLine.current !== inserted || result?.kind === 'withdrawn') return;
+      if (result?.kind === 'text') {
+        setFollowUp(
+          transcriptLine({ shown: 'live', live: liveText, durable: result.text, liveComplete: true, offer: result.offer, backing }),
+          result.offer ? backing : null,
+        );
+        return;
+      }
+      // No Retry here: it would put whisper's text over the live words (spec 12).
+      setFollowUp({ ...inserted, message: `${LIVE_INSERTED_LIVE} ${LIVE_FULL_PASS_FAILED}` });
+    },
+    [move, setFollowUp, transcriptLine],
+  );
+
+  /**
    * A legacy recording the server refused is KEPT, with "Try again" and
    * "Save it" (2026-09-29). It used to be thrown away with a "Please try
    * again" that could not be acted on: at 10:00 the 413 discarded ten minutes
@@ -1182,14 +1286,51 @@ export function useVoiceRecorder({
     [keepLegacy, move],
   );
 
-  /** SESSION ROAD: upload what is left, finish, wait for the words. */
+  /**
+   * SESSION ROAD: upload what is left, finish, wait for the words. `told`
+   * resolves once the server has accepted the finish (`deliverLiveFirst`).
+   */
   const finishSession = useCallback(
-    async (s: VoiceSession, durationMs: number, outbox: OutboxStore, capture: LiveCapture | null) => {
+    async (
+      s: VoiceSession,
+      durationMs: number,
+      outbox: OutboxStore,
+      capture: LiveCapture | null,
+      told: Promise<void>,
+    ) => {
       if (!move('finishing')) return;
-      const result = await s.end(endReason.current, durationMs, {
+      const ending = s.end(endReason.current, durationMs, {
         notices: notices.current,
         peakLevel: meterRan.current ? peakLevel.current : null,
       });
+      if (capture) {
+        // The live stream normally ends within half a second of Stop, the full
+        // pass seconds to minutes later. If the live words are over first and
+        // go in whatever whisper hears, they go in now (spec 13).
+        const liveFirst = await Promise.race([
+          capture.settled().then(() => true),
+          ending.then(
+            () => false,
+            () => false,
+          ),
+        ]);
+        if (
+          liveFirst &&
+          alive.current &&
+          session.current === s &&
+          interrupted.current !== s &&
+          liveChosenWithoutWhisper({
+            liveText: capture.text(),
+            liveComplete: capture.complete(),
+            englishModelFinals: capture.englishModelFinals(),
+            userLanguage: capture.language ?? getVoiceLanguage(),
+          })
+        ) {
+          await deliverLiveFirst(s, capture, ending, told, { outbox, sessionId: s.sessionId });
+          return;
+        }
+      }
+      const result = await ending;
       if (session.current !== s) return; // discarded, or superseded
       // The live stream's last final and its `done` come within
       // LIVE_FINISH_BUDGET_MS of Stop, normally long before the stored
@@ -1208,7 +1349,8 @@ export function useVoiceRecorder({
         liveMayStillBeChosen({
           liveText: capture.text(),
           englishModelFinals: capture.englishModelFinals(),
-          language: capture.language,
+          // The model the rest is heard by: an "auto" the server runs on English is English (spec 14.2).
+          language: capture.hearingLanguage,
         })
       ) {
         await capture.settled(LIVE_SETTLE_WAIT_MS);
@@ -1217,7 +1359,7 @@ export function useVoiceRecorder({
       session.current = null;
       deliver(result, { outbox, sessionId: s.sessionId }, capture);
     },
-    [deliver, move],
+    [deliver, deliverLiveFirst, move],
   );
 
   /** The server stopped taking parts while the recorder was still running. */
@@ -1642,6 +1784,10 @@ export function useVoiceRecorder({
 
       let s: VoiceSession | null = null;
       let outbox: OutboxStore | null = null;
+      // Resolved once the server has accepted this recording's finish; every
+      // progress the session reports after that says so (finishAccepted).
+      let toldServer: () => void = noop;
+      const told = new Promise<void>((resolve) => (toldServer = resolve));
       if (onSessionRoad) {
         const account = who ? await who : await identify();
         outbox = await storeFor(account);
@@ -1655,9 +1801,13 @@ export function useVoiceRecorder({
           { store: outbox, tombstones: tombstonesFor(account) },
           {
             onProgress: (p) => {
+              if (s?.finishAccepted) toldServer();
               if (alive.current && session.current === s) setProgress(p);
             },
-            onInterrupt,
+            onInterrupt: () => {
+              interrupted.current = s;
+              onInterrupt();
+            },
           },
         );
         await s.open();
@@ -1745,7 +1895,7 @@ export function useVoiceRecorder({
             move('error');
             return;
           }
-          void finishSession(s, durationMs, outbox!, liveOfThis);
+          void finishSession(s, durationMs, outbox!, liveOfThis, told);
           return;
         }
         const parts = chunks.current;

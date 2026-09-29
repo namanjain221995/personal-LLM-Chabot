@@ -9,12 +9,18 @@
  *     utterances already covered by `transcribed_ms` are not shown twice, and
  *     before the durable path has text the live words are all there is;
  *   - the ring keeps the last minute by absolute sample index;
- *   - the capture clock is not fooled by a main thread that stalls.
+ *   - the capture clock is not fooled by a main thread that stalls;
+ *   - which transcript goes into the draft, and when that is known before the
+ *     full pass (spec 13);
+ *   - a piece that starts with the punctuation closing the one before joins
+ *     it without a space, in every join (spec 14.3).
  */
 import { describe, expect, it } from 'vitest';
 import {
   describeOutcome,
   joinPreview,
+  mergeTranscript,
+  mergeTranscriptAt,
   parseLiveConfig,
   parseSessionConfig,
   parseSessionState,
@@ -31,6 +37,7 @@ import {
   getVoiceLanguage,
   isHindiSession,
   joinPieces,
+  liveChosenWithoutWhisper,
   liveMayStillBeChosen,
   liveSocketUrl,
   mergeLiveTranscript,
@@ -663,5 +670,128 @@ describe('the progress the bar draws', () => {
     // "Saved to your account" is drawn only once the server has audio.
     expect(shown.savedMs).toBe(0);
     expect(shown.offline).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The live words before the full pass (build spec 13, 2026-09-30)
+// ---------------------------------------------------------------------------
+
+describe('whether the live words go in before the full pass is done', () => {
+  const HINGLISH = 'मैं आज office जा रहा हूँ, meeting दस बजे है।';
+  const ENGLISH = 'I am going to the office today, the meeting is at ten.';
+  /** Mostly Latin: whisper's language would decide it, so it must wait for whisper. */
+  const LATIN_HINGLISH = 'Main aaj office ja raha hoon, meeting दस baje hai.';
+
+  it('is when they decide by themselves: Hindi chosen, or a fifth of the letters Devanagari', () => {
+    expect(liveChosenWithoutWhisper({ liveText: HINGLISH, liveComplete: true, userLanguage: 'auto' })).toBe(true);
+    expect(liveChosenWithoutWhisper({ liveText: 'aaj hum office jayenge', liveComplete: true, userLanguage: 'hi' })).toBe(
+      true,
+    );
+    // Devanagari decides whatever was chosen: only the multilingual model writes it.
+    expect(liveChosenWithoutWhisper({ liveText: HINGLISH, liveComplete: true, userLanguage: 'en' })).toBe(true);
+    expect(liveChosenWithoutWhisper({ liveText: HINGLISH, liveComplete: true, userLanguage: null })).toBe(true);
+    // Still waiting for whisper: English, and Auto whose letters are under a fifth Devanagari.
+    expect(liveChosenWithoutWhisper({ liveText: ENGLISH, liveComplete: true, userLanguage: 'auto' })).toBe(false);
+    expect(liveChosenWithoutWhisper({ liveText: ENGLISH, liveComplete: true, userLanguage: 'en' })).toBe(false);
+    expect(liveChosenWithoutWhisper({ liveText: LATIN_HINGLISH, liveComplete: true, userLanguage: 'auto' })).toBe(false);
+    expect(liveChosenWithoutWhisper({ liveText: LATIN_HINGLISH, liveComplete: true, userLanguage: null })).toBe(false);
+  });
+
+  it('is never for a live transcript that missed part of the recording, has no words, or holds English-model words', () => {
+    expect(liveChosenWithoutWhisper({ liveText: HINGLISH, liveComplete: true, userLanguage: 'hi' })).toBe(true);
+    expect(liveChosenWithoutWhisper({ liveText: HINGLISH, liveComplete: false, userLanguage: 'hi' })).toBe(false);
+    expect(liveChosenWithoutWhisper({ liveText: '   ', liveComplete: true, userLanguage: 'hi' })).toBe(false);
+    expect(
+      liveChosenWithoutWhisper({ liveText: HINGLISH, liveComplete: true, englishModelFinals: true, userLanguage: 'hi' }),
+    ).toBe(false);
+  });
+
+  it('never disagrees with what the full pass would decide, whatever language whisper then hears', () => {
+    const texts = [HINGLISH, ENGLISH, LATIN_HINGLISH, 'aaj hum office jayenge', 'नमस्ते', '', 'Bonjour à tous'];
+    const whispers = ['hi', 'ur', 'Hindi', 'Urdu', 'en', 'English', 'fr', '', null, undefined];
+    let early = 0;
+    for (const liveText of texts) {
+      for (const liveComplete of [true, false]) {
+        for (const englishModelFinals of [true, false]) {
+          for (const userLanguage of ['auto', 'en', 'hi', null] as const) {
+            const input = { liveText, liveComplete, englishModelFinals, userLanguage };
+            if (!liveChosenWithoutWhisper(input)) continue;
+            early += 1;
+            for (const whisperLanguage of whispers) {
+              expect(chooseFinalText({ ...input, whisperLanguage })).toBe('live');
+            }
+          }
+        }
+      }
+    }
+    // Not a vacuous check: HINGLISH and नमस्ते with any choice (8), and each
+    // of the four other texts with words when Hindi was chosen (4).
+    expect(early).toBe(12);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A piece that closes the one before it (build spec 14.3, 2026-09-30)
+// ---------------------------------------------------------------------------
+
+describe('joining a piece that starts with the punctuation closing the one before it', () => {
+  /** Every mark spec 14.3 names, with the full-width forms and the ideographic comma and full stop. */
+  const CLOSING = [',', '.', ';', ':', '!', '?', '।', '॥', ')', ']', '}', '…', '，', '．', '；', '：', '！', '？', '）', '］', '｝', '、', '。'];
+
+  it('puts no space before it, and keeps the space before a word or an opening mark', () => {
+    // The engine keeps the danda or comma that ends an utterance on the next one.
+    expect(joinPreview('है', '। जंगल')).toBe('है। जंगल');
+    expect(joinPreview('told', ', and')).toBe('told, and');
+    expect(joinPreview('told', 'and')).toBe('told and');
+    for (const mark of CLOSING) {
+      expect(joinPreview('words', `${mark} more`)).toBe(`words${mark} more`);
+      expect(spaceBetween('words', `${mark} more`)).toBe('');
+    }
+    for (const opening of ['(and', '[and', '"and', '“and', '-and', '#1']) {
+      expect(spaceBetween('told', opening)).toBe(' ');
+    }
+    // Whatever space a side already has is kept as it is.
+    expect(joinPreview('told ', ', and')).toBe('told , and');
+    expect(joinPreview('told', ' , and')).toBe('told , and');
+  });
+
+  it('in the live transcript, which is what goes into the draft', () => {
+    const t = new LiveTranscript();
+    t.final(0, 'जंगल में है', 0, 100);
+    t.final(1, '। फिर हम घर गए', 100, 200);
+    t.partialUpdate(2, ', और सो गए', 200, 300);
+    expect(t.text()).toBe('जंगल में है। फिर हम घर गए, और सो गए');
+  });
+
+  it('in the live words the bar merges with the stored recording’s', () => {
+    const heard = [u(0, 'I told them', 0, 2000), u(1, ', and they agreed', 2000, 4000), u(2, '. Then we left', 4000, 6000)];
+    const m = mergeLiveTranscript(progress({ audioMs: 6000 }), view(heard, u(3, '! Really', 6000, 7000)));
+    expect(m.live).toBe('I told them, and they agreed. Then we left');
+    expect(m.partial).toBe('! Really');
+    // What whisper already covers is dropped; the rest joins as before.
+    const after = mergeLiveTranscript(progress({ preview: 'Stored.', transcribedMs: 2500 }), view(heard));
+    expect(after.live).toBe(', and they agreed. Then we left');
+  });
+
+  it('in the draft the transcript is merged into', () => {
+    expect(mergeTranscript('Draft: है', '। जंगल')).toBe('Draft: है। जंगल');
+    expect(mergeTranscript('I told them', ', and then')).toBe('I told them, and then');
+    expect(mergeTranscript('I told', 'them')).toBe('I told them');
+    const placed = mergeTranscriptAt('Draft: है', '। जंगल');
+    expect(placed.text).toBe('Draft: है। जंगल');
+    expect(placed.text.slice(placed.span!.start, placed.span!.end)).toBe('। जंगल');
+  });
+
+  it('still in one pass, exactly as folding joinPreview does', () => {
+    const fold = (pieces: string[]) => pieces.reduce((out, piece) => joinPreview(out, piece), '');
+    const kinds = ['Hello there', '। मीटिंग', ', and', 'दस बजे है', '今日は', '。晴れ', '… so', '(aside)', 'OK'];
+    let seed = 11;
+    const next = () => (seed = (seed * 48271) % 2147483647);
+    for (let round = 0; round < 200; round += 1) {
+      const pieces = Array.from({ length: 1 + (next() % 12) }, () => kinds[next() % kinds.length]!);
+      expect(joinPieces(pieces)).toBe(fold(pieces));
+    }
+    expect(joinPieces(['दस बजे है', '। मीटिंग', ', and', '… so'])).toBe('दस बजे है। मीटिंग, and… so');
   });
 });

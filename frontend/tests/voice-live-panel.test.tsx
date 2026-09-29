@@ -120,6 +120,23 @@ describe('the transcript above the recording bar', () => {
     expect(screen.getByTestId('voice-transcript').textContent).toBe('今日は晴れですね');
   });
 
+  // Spec 14.3 (2026-09-30): the engine keeps the danda or comma that ends an
+  // utterance on the next one; joined with a space it read "है । फिर".
+  it('joins a piece that starts with the punctuation closing the one before straight onto it', () => {
+    bar(progress({ preview: 'जंगल में है', tentative: '। फिर हम', live: { committed: ', और घर गए', partial: '। अब' } }));
+    const text = screen.getByTestId('voice-transcript').querySelector('p')!;
+    expect(text.textContent).toBe('जंगल में है। फिर हम, और घर गए। अब');
+    expect([...text.querySelectorAll('span')].map((s) => s.textContent)).toEqual([
+      'जंगल में है',
+      '। फिर हम',
+      ', और घर गए',
+      '। अब',
+    ]);
+    cleanup();
+    bar(progress({ preview: 'I told them', live: { committed: 'and they agreed', partial: '… mostly' } }));
+    expect(screen.getByTestId('voice-transcript').textContent).toBe('I told them and they agreed… mostly');
+  });
+
   it('is not announced: outside the status region, and not a live region itself', () => {
     bar(progress({ preview: 'x', live: { committed: 'y', partial: 'z' } }));
     const box = screen.getByTestId('voice-transcript');
@@ -272,5 +289,36 @@ describe('the follow-up line after a recording', () => {
     view.unmount();
     render(<VoiceFollowUpLine followUp={{ message: 'y', tone: 'info', actionLabel: null, busy: false, run, dismiss: vi.fn() }} />);
     expect(screen.queryByTestId('voice-follow-up-actions')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// What the browser's comments say was measured (build spec 14.4, 2026-09-30)
+// ---------------------------------------------------------------------------
+
+describe('the accuracy figures the browser code quotes', () => {
+  // The first FLEURS-Hindi numbers (8.58% auto, 7.48% hi) were redone after
+  // the scoring was fixed (a \w word class had split Hindi words apart):
+  // 11.8% (auto) and 10.9% (hi) for the live model, 41.9% for whisper
+  // (benchmarks/voice-live/README.md).
+  it('are the redone FLEURS-Hindi ones, wherever they are quoted', async () => {
+    const { readdirSync, readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const root = process.cwd();
+    const sources: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(join(root, dir), { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) walk(path);
+        else if (/\.(tsx?|m?js|cjs)$/.test(entry.name)) sources.push(path);
+      }
+    };
+    for (const dir of ['app', 'components', 'lib', 'public/voice']) walk(dir);
+    expect(sources).toContain(join('components', 'VoiceBar.tsx'));
+    const stale = sources.filter((path) => /\b(?:8\.58|7\.48)\s*%/.test(readFileSync(join(root, path), 'utf8')));
+    expect(stale).toEqual([]);
+    // The comment's own words, its line breaks and leading asterisks taken out.
+    const comment = readFileSync(join(root, 'components', 'VoiceBar.tsx'), 'utf8').replace(/\s*\n\s*\*\s*/g, ' ');
+    expect(comment).toContain('FLEURS-hi 10.9% against 11.8% on auto; whisper, the full pass, 41.9%');
   });
 });

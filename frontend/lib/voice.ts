@@ -207,14 +207,17 @@ export function describeCaptureError(err: unknown): VoiceError {
  * The rules are small and all of them come from watching the alternative go
  * wrong: never lose what was already typed (that is somebody's sentence);
  * separate with exactly one space; do not add a space after an opening
- * bracket or before punctuation; and capitalise nothing — the model already
+ * bracket, nor before punctuation that closes the draft's last words (a
+ * transcript that starts with a danda or a comma:
+ * `startsWithClosingPunctuation`; until 2026-09-30 this comment promised it
+ * and the code did not do it); and capitalise nothing — the model already
  * punctuates, and second-guessing it mangles names.
  */
 export function mergeTranscript(draft: string, transcript: string): string {
   const spoken = transcript.trim();
   if (!spoken) return draft;
   if (!draft) return spoken;
-  const needsSpace = !/[\s([{"'‘“-]$/.test(draft);
+  const needsSpace = !/[\s([{"'‘“-]$/.test(draft) && !startsWithClosingPunctuation(spoken);
   return `${draft}${needsSpace ? ' ' : ''}${spoken}`;
 }
 
@@ -939,17 +942,39 @@ export function parseSessionConfig(body: unknown): SessionConfig {
 }
 
 /**
+ * Punctuation that closes the text before it: , . ; : ! ? । ॥ ) ] } … and
+ * their full-width forms (，．；：！？）］｝, and the ideographic 、。).
+ *
+ * A piece of transcript that STARTS with one of these belongs to the piece
+ * before it (build spec 14.3, 2026-09-30). The streaming engine cuts an
+ * utterance at the pause and keeps the danda or comma that ends it on the
+ * NEXT utterance, on purpose, so "जंगल में है" is followed by "। फिर हम": joined
+ * with a space, the draft read "है । फिर" and "told , and".
+ */
+const CLOSING_PUNCTUATION = /^[,.;:!?।॥)\]}…，．；：！？）］｝、。]/u;
+
+/** Whether `text` starts by closing what came before it (`CLOSING_PUNCTUATION`). */
+export function startsWithClosingPunctuation(text: string): boolean {
+  return CLOSING_PUNCTUATION.test(text);
+}
+
+/**
  * Join two pieces of transcript for the live PREVIEW only.
  *
  * The final text comes from the server whole, because joining segments with
  * spaces is wrong for scripts written without them. The preview has to join
- * something, so it adds a space only where neither side already has one and
- * neither side is Thai, Lao, Burmese, Khmer, Japanese or Chinese.
+ * something, so it adds a space only where neither side already has one,
+ * neither side is Thai, Lao, Burmese, Khmer, Japanese or Chinese, and the
+ * right side does not start by closing the left one (a danda, a comma:
+ * `CLOSING_PUNCTUATION`). Each of those depends only on the character on
+ * either side of the join, which is what lets lib/voiceLive.ts `joinPieces`
+ * join a whole transcript in one pass.
  */
 export function joinPreview(left: string, right: string): string {
   if (!left) return right;
   if (!right) return left;
   if (/\s$/.test(left) || /^\s/.test(right)) return left + right;
+  if (CLOSING_PUNCTUATION.test(right)) return left + right;
   const noSpace = /[฀-໿က-႟ក-៿぀-ヿ㐀-䶿一-鿿豈-﫿]/;
   if (noSpace.test(left.slice(-1)) && noSpace.test(right.slice(0, 1))) return left + right;
   return `${left} ${right}`;
@@ -2433,6 +2458,17 @@ export class VoiceSession {
   /** Whether the outbox survives a reload (IndexedDB), which decides what the person is promised. */
   get persistent(): boolean {
     return this.store.persistent;
+  }
+
+  /**
+   * Whether the server has accepted this recording's finish: it no longer
+   * counts the recording as this person's one live recording, so a new one
+   * may start. The recorder hook reads it when a Hindi session's live words
+   * go into the draft before the full pass (components/useVoiceRecorder.ts,
+   * build spec 13); every `onProgress` after the acceptance sees it true.
+   */
+  get finishAccepted(): boolean {
+    return this.finishSent;
   }
 
   /**

@@ -17,7 +17,8 @@
  *   - whether the live words are the whole recording (done, no gap, nothing
  *     skipped), and a language chosen mid-recording (a new stream from the
  *     last committed word, once the choice has stood for 500 ms), and whether
- *     the English-only model wrote any of them;
+ *     the English-only model wrote any of them, by the model each connection
+ *     runs on: `ready.language` when the server says it, else the start's;
  *   - backpressure at 256 KiB queued, released below 64 KiB, and a ring that
  *     overflowed meanwhile starts again after the backoff;
  *   - Stop: the rest of the audio, then `flush`, nothing after it, `done`
@@ -731,6 +732,99 @@ describe('which model wrote the live words', () => {
   });
 });
 
+// Build spec 14.2 (2026-09-30): release 2's gateway may put an "auto" stream
+// on the English-only model (for people whose recent dictations were all
+// English) and says which in `ready.language`; release 1 says nothing.
+describe('the model each connection runs on', () => {
+  it('is the one ready names, else the one the start asked for; finals on English are the English model’s', () => {
+    // Auto, which the server put on the English model.
+    const routed = setup({ language: 'auto' });
+    routed.push(0, 25);
+    FakeWebSocket.last.handshake({ language: 'en' });
+    expect(routed.stream.hearingLanguage).toBe('en');
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'May aaj of his jar a who.', start_sample: 0, end_sample: 8_000 });
+    expect(routed.stream.englishModelFinals).toBe(true);
+
+    // No language in ready (release 1): the start's, exactly as before.
+    resetLiveFakes();
+    const plain = setup({ language: 'en' });
+    plain.push(0, 25);
+    FakeWebSocket.last.handshake();
+    expect(plain.stream.hearingLanguage).toBe('en');
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'Hello.', start_sample: 0, end_sample: 8_000 });
+    expect(plain.stream.englishModelFinals).toBe(true);
+
+    resetLiveFakes();
+    const auto = setup({ language: 'auto' });
+    auto.push(0, 25);
+    FakeWebSocket.last.handshake();
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'Hello.', start_sample: 0, end_sample: 8_000 });
+    expect(auto.stream.hearingLanguage).toBe('auto');
+    expect(auto.stream.englishModelFinals).toBe(false);
+  });
+
+  it('believes the server over the start, either way, and reads its word loosely', () => {
+    const toHindi = setup({ language: 'en' });
+    toHindi.push(0, 25);
+    FakeWebSocket.last.handshake({ language: 'hi' });
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'नमस्ते', start_sample: 0, end_sample: 8_000 });
+    expect(toHindi.stream.hearingLanguage).toBe('hi');
+    expect(toHindi.stream.englishModelFinals).toBe(false);
+
+    resetLiveFakes();
+    const shouted = setup({ language: 'auto' });
+    shouted.push(0, 25);
+    FakeWebSocket.last.handshake({ language: ' EN ' });
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'Hello.', start_sample: 0, end_sample: 8_000 });
+    expect(shouted.stream.englishModelFinals).toBe(true);
+
+    // Not a language at all, or a blank one: the start's language stands.
+    for (const odd of [42, null, '', '   ', { code: 'en' }]) {
+      resetLiveFakes();
+      const each = setup({ language: 'auto' });
+      each.push(0, 25);
+      FakeWebSocket.last.handshake({ language: odd });
+      FakeWebSocket.last.say({ type: 'final', u: 0, text: 'Hello.', start_sample: 0, end_sample: 8_000 });
+      expect(each.stream.hearingLanguage).toBe('auto');
+      expect(each.stream.englishModelFinals).toBe(false);
+    }
+  });
+
+  it('is each connection’s own: English-model words stay counted when a later one runs on another model', () => {
+    const { push, stream, transcript } = setup({ language: 'auto' });
+    push(0, 50);
+    const first = FakeWebSocket.last;
+    first.handshake({ language: 'en' });
+    first.say({ type: 'final', u: 0, text: 'May aaj.', start_sample: 0, end_sample: 8_000 });
+    first.hangUp(1006);
+    vi.advanceTimersByTime(600);
+    const second = FakeWebSocket.last;
+    expect(second).not.toBe(first);
+    // The same choice, put on the multilingual model this time.
+    expect(second.handshake({ language: 'auto' })).toMatchObject({ language: 'auto', resume_from_sample: 8_000 });
+    expect(stream.hearingLanguage).toBe('auto');
+    second.say({ type: 'final', u: 1, text: 'मीटिंग दस बजे है', start_sample: 8_000, end_sample: 16_000 });
+    expect(transcript.text()).toBe('May aaj. मीटिंग दस बजे है');
+    expect(stream.englishModelFinals).toBe(true);
+  });
+
+  it('is the choice while a change of it is waiting, and before a connection has said anything', () => {
+    const { push, stream } = setup({ language: 'auto' });
+    expect(stream.hearingLanguage).toBe('auto'); // no connection yet
+    push(0, 25);
+    const first = FakeWebSocket.last;
+    first.handshake({ language: 'en' });
+    expect(stream.hearingLanguage).toBe('en');
+    stream.setLanguage('hi');
+    expect(stream.hearingLanguage).toBe('hi'); // the next start asks for it
+    vi.advanceTimersByTime(LIVE_LANGUAGE_DEBOUNCE_MS);
+    const second = FakeWebSocket.last;
+    expect(stream.hearingLanguage).toBe('hi'); // connecting
+    second.handshake();
+    expect(stream.hearingLanguage).toBe('hi');
+  });
+});
+
 describe('backpressure', () => {
   it('stops handing frames over past 256 KiB queued and resumes below 64 KiB', () => {
     const { push } = setup();
@@ -1173,6 +1267,19 @@ describe('the capture on the meter’s context', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(early).toBe(true);
     expect(capture.complete()).toBe(true);
+  });
+
+  it('hears the rest in the language the server runs the stream on (spec 14.2)', async () => {
+    const { capture, node } = await attached();
+    node!.frames(0, 25);
+    expect(capture.hearingLanguage).toBeNull(); // no stream yet
+    openOn(capture);
+    FakeWebSocket.last.handshake({ language: 'en' });
+    expect(capture.language).toBe('auto'); // what the person chose
+    expect(capture.hearingLanguage).toBe('en'); // what the server runs
+    FakeWebSocket.last.say({ type: 'error', code: 'voice_off', message: 'x', retryable: false });
+    FakeWebSocket.last.hangUp(4403);
+    expect(capture.hearingLanguage).toBeNull();
   });
 
   it('has no language once refused for good, and is not complete', async () => {

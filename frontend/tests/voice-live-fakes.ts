@@ -91,8 +91,12 @@ export class FakeWebSocket {
     this.onclose?.({ code });
   }
 
-  /** accept + read the start message + answer ready at the resume point it asked for. */
-  handshake(): Record<string, unknown> {
+  /**
+   * accept + read the start message + answer ready at the resume point it
+   * asked for. `extra` goes into the ready, e.g. `{ language: 'en' }`: the
+   * model release 2's gateway says it put the stream on (spec 14.2).
+   */
+  handshake(extra: Record<string, unknown> = {}): Record<string, unknown> {
     this.accept();
     const start = this.texts[0]!;
     this.say({
@@ -103,6 +107,7 @@ export class FakeWebSocket {
       max_frame_bytes: 16384,
       resume_from_sample: start.resume_from_sample,
       next_u: start.next_u,
+      ...extra,
     });
     return start;
   }

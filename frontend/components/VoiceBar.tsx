@@ -137,12 +137,13 @@ const LANGUAGE_CHOICES: ReadonlyArray<{ value: VoiceLanguage; label: string; lan
  * Which language the live transcript listens for (2026-09-30). The English
  * model makes a third fewer errors on English than the multilingual one
  * (LibriSpeech 4.13% against 6.23% WER), and pinning Hindi helps the
- * multilingual one on Hindi (FLEURS-hi 7.48% against 8.58% on auto), so a
- * person who knows gets to say. Changing it mid-recording starts the live
- * stream again in the new language from the last committed word, once the
- * choice has stood for half a second (LiveStream.setLanguage), so walking the
- * options with the arrow keys opens one connection; the stored recording is
- * not touched.
+ * multilingual one on Hindi (FLEURS-hi 10.9% against 11.8% on auto; whisper,
+ * the full pass, 41.9%: benchmarks/voice-live/README.md), so a person who
+ * knows gets to say. Changing it mid-recording starts the live stream again
+ * in the new language from the last committed word, once the choice has
+ * stood for half a second (LiveStream.setLanguage), so walking the options
+ * with the arrow keys opens one connection; the stored recording is not
+ * touched.
  *
  * Native radio buttons, so the arrow keys, the one Tab stop and what a screen
  * reader says are the browser's own. Outside the status row, like the
