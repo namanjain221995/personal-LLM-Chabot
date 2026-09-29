@@ -26,8 +26,10 @@ receiver. Read every severity below as "how urgent", not "who is told".
 | `monitoring/prometheus/tests/developer_api.yml` | promtool unit tests: every alert fires on its shape and stays quiet on the look-alikes measured here |
 | `monitoring/developer-api/metrics-contract.json` | every queried metric with its status: `live`, `event_driven`, `pending`, `proposed` |
 | `monitoring/developer-api/check_metrics.py` | proves the contract against a running Prometheus (read-only) |
-| `monitoring/developer-api/tests/` | offline tests: dashboard schema, contract coverage, panel markers, the textfile writer |
+| `monitoring/developer-api/tests/` | offline tests: dashboard schema, contract coverage, panel markers, the textfile writer, the live dictation rules and scrape job |
 | `monitoring/exporters/host-guard/host_guard_textfile.sh` | writes the host packet filter's state for node-exporter (not installed) |
+| `monitoring/prometheus/rules/voice-stream.yml` | live dictation (2026-09-29): 9 recording rules and 6 alerts in groups `voice-stream-recording` and `voice-stream` ([Live dictation](#live-dictation-real-time-speech-to-text)) |
+| `monitoring/prometheus/tests/voice_stream.yml` | promtool cases for every one of those rules, firing and not firing |
 
 ## How it reaches production
 
@@ -37,8 +39,8 @@ Nothing here restarts an engine, the orchestrator or a scrape target.
   bind-mounted `monitoring/prometheus/rules`. A new file is loaded on the next
   configuration reload: `curl -X POST http://127.0.0.1:9090/-/reload` (the
   lifecycle API is enabled). After that, check `/rules` for the five groups
-  with no `lastError`. `PrometheusRuleEvaluationFailing` in alerts.yml
-  watches evaluation errors.
+  (seven with `voice-stream.yml`) with no `lastError`.
+  `PrometheusRuleEvaluationFailing` in alerts.yml watches evaluation errors.
 * **Delivery. Not in place.** There is no Alertmanager and no Grafana contact
   point, so a firing alert is a line on `/alerts`. Before any alert here can be
   an early warning, the owner has to choose a receiver (an Alertmanager with a
@@ -46,8 +48,11 @@ Nothing here restarts an engine, the orchestrator or a scrape target.
   decision and a monitoring-container change, not part of this directory.
 * **Dashboard.** Grafana's file provider rescans every 30 s. The dashboard
   appears once the deploy checkout contains the file.
-* **Scrape jobs.** Unchanged. Every live metric here comes from a job that
-  already exists.
+* **Scrape jobs.** One new job since 2026-09-29: `stt-stream`, live
+  dictation's engine on the worker. A `prometheus.yml` change needs
+  `./scripts/monitoring.sh restart`, not `/-/reload`: the file is a single-file
+  bind mount, and a checkout replaces its inode (docs/MONITORING.md). Every
+  other metric here comes from a job that already existed.
 
 ## Metric status
 
@@ -65,7 +70,7 @@ lazily published admission gauges are event_driven.
 | --- | --- | --- |
 | live | in Prometheus now | `vllm:*` (running, waiting, KV, tokens, iterations, preemptions, TTFT, e2e) and `http_requests_total` from every engine; `node_memory_*`; `pg_stat_user_tables_n_tup_ins/upd`; `techsara_vllm_state`; `upload_sessions_open` |
 | event_driven | merged code; the series appears at the first event, so absent after an orchestrator start is normal | `llm_admission_lane_active`, `llm_admission_waiting` (published when a lane is used: present only intermittently since 2026-09-12); `llm_admission_rejections_total`; `asr_queue_depth`, `asr_active_requests`, `asr_requests_total`, `asr_batch_requests_total`, `asr_request_duration_seconds`, `asr_batch_request_duration_seconds` (none since 2026-09-11 18:41Z); `upload_session_total`, `upload_part_bytes_total`, `upload_finalize_seconds` |
-| pending | written, not merged or not deployed | `public_api_engine_in_flight`, `public_api_engine_waiting` (publicapi/capacity.py); `techsara_host_guard_*` (the writer below, once installed) |
+| pending | written, not merged or not deployed | `public_api_engine_in_flight`, `public_api_engine_waiting` (publicapi/capacity.py); `techsara_host_guard_*` (the writer below, once installed); `voice_stream_*` and `stt_stream_*` (live dictation's gateway and engine, not deployed on 2026-09-29) |
 | proposed | nothing emits it | `public_api_requests_total`, `public_api_request_duration_seconds`, `public_api_ttft_seconds`, `public_api_streams_in_flight`, `public_api_background_jobs`, `public_api_background_jobs_total`, `public_api_output_tokens_total`, `public_api_capacity_refusals_total`, `usage_events_written_total`, `public_api_usage_settle_total` |
 
 A panel on a pending or proposed metric is titled `[pending]` or `[proposed]`.
@@ -431,6 +436,186 @@ or `UNKNOWN` (the check could not run).
 `bash ~/.techsara-cluster/host-guard.sh verify --role worker` on the worker
 (OPERATIONS.md §13).
 
+## Live dictation (real-time speech to text)
+
+Live dictation streams the microphone over a WebSocket while someone speaks
+and shows the words as they come (2026-09-29). Two sources feed its
+monitoring. Neither is deployed yet, so every metric is `pending` in the
+contract and every panel says so:
+
+| source | scrape job | metrics |
+| --- | --- | --- |
+| the gateway in the orchestrator, `orchestrator/app/voice_live.py` | `orchestrator` (unchanged) | `voice_stream_*` |
+| the streaming engine on the worker, `compose/stt-stream` (project `sf-local-ai-stt`) | `stt-stream` (new: the worker's management address, port 30009) | `stt_stream_*` |
+
+The rules are in `monitoring/prometheus/rules/voice-stream.yml`, the promtool
+cases in `monitoring/prometheus/tests/voice_stream.yml`, and the panels are
+the dashboard's last row, **Real-time speech to text**.
+
+**The live path is a preview.** The durable path (V42 recording sessions: Opus
+parts, whisper-large-v3, the transcript inserted after Stop) stays
+authoritative and depends on nothing here. A live failure costs the words that
+appear while someone speaks, never the transcript, so every alert is a
+warning. Like every alert in this directory, none reaches a person until a
+receiver exists.
+
+**The thresholds are uncalibrated.** Nothing has run in production. They come
+from the design targets and the worker measurements. Each latency threshold
+sits on a bucket edge of the gateway's histogram ladder (0.05, 0.1, 0.15, 0.2,
+0.3, 0.4, 0.5, 0.75, 1, 1.5, 2, 3, 5, 10, 30 s), so "p95 over 1.5 s" means
+exactly "more than one in twenty above 1.5 s". Recalibrate them from the first
+weeks of real use.
+
+| alert | fires when | for |
+| --- | --- | --- |
+| VoiceStreamFirstPartialSlow | first-words p95 over 1.5 s, with at least 20 utterances per 5 minutes | 10m |
+| VoiceStreamFinalSlow | final p95 over 2 s, with at least 20 finals per 5 minutes | 10m |
+| VoiceStreamEngineFallingBehind | `cause="decode_rtf"`: a profile's real-time factor over 0.8 with at least half a real-time stream on it; `cause="capacity_refusals"`: at least 3 capacity refusals in every 5-minute window | 5m |
+| VoiceStreamErrorRatioHigh | over 10% of the streams that ran ended `engine_unavailable` or `error`, with at least 3 per 5 minutes | 10m |
+| VoiceStreamDisconnectsAbnormal | over 25% ended `disconnected` or `superseded`, with at least 5 per 5 minutes (`idle` is normal use) | 10m |
+| VoiceStreamEngineDown | the engine's scrape fails and the gateway failed to reach an engine in the last 15 minutes | 2m |
+
+Every one names `scripts/stt-stream.sh status` as its safe command: the engine
+container and its own `/health` on the worker. Starting, stopping or
+recreating the engine is an operator's decision. It never involves the main
+model.
+
+### Live dictation latency
+
+`VoiceStreamFirstPartialSlow` and `VoiceStreamFinalSlow` use the gateway's
+clock:
+
+* **First words**: an utterance's first sample arriving at the gateway, to its
+  first partial written to the browser. The design target is a few hundred
+  milliseconds.
+* **Final**: its last sample arriving, to the final written. The engine waits
+  0.6 s of silence (`STT_ENDPOINT_S`) before it commits, and finals measured
+  0.68-0.83 s at p50 on the worker. An overflow stream on a 560 ms profile can
+  wait one chunk more, about 1.3 s at worst by that arithmetic, which is why
+  the final line is at 2 s.
+
+The floor, 20 per 5 minutes, is about one person dictating steadily. Below it,
+a p95 is one or two utterances. The 10 minutes are for reconnects. A browser
+that reconnects replays up to 60 s of buffered audio, and the gateway times
+each utterance from when its samples arrived, so a replay reads as a burst of
+multi-second latencies. One burst holds the 5-minute window above the line for
+about five and a half minutes (a promtool case pins this). Only repeated
+reconnects hold it for ten, and then `VoiceStreamDisconnectsAbnormal` names the
+cause.
+
+**Triage, in order:**
+
+1. `VoiceStreamEngineFallingBehind` is firing too: the engine is short of CPU
+   (next section).
+2. `VoiceStreamDisconnectsAbnormal` is firing too: this is replayed audio. Fix
+   the drops.
+3. Neither: compare the event lag panel with the engine's real-time factor and
+   decode step panels. The factor reaches 1.0 exactly when a decode worker
+   falls behind (next section), so high lag with the factor well under 0.8
+   puts the delay outside the decoder: the orchestrator's event loop (one
+   CPU-bound handler stalls every stream at once), or the network to the
+   worker. The factor is a 5-minute average per profile; a decode step p95
+   near the chunk budget shows one slow decode worker that the average hides.
+   The browser capture-to-render panel adds the path from the browser to the
+   orchestrator: the tunnel and the frontend relay.
+
+### Live dictation engine
+
+**`VoiceStreamEngineDown` needs the gateway's failures as well as a down
+target.** The engine's target is static in `prometheus.yml`, so it reads down
+by design whenever live dictation is off: before the engine is first deployed,
+and after `scripts/stt-stream.sh down`. No series says "live dictation is
+configured". The gateway failing to reach an engine
+(`voice_stream_errors_total` with `engine_unavailable` or `engine_timeout`)
+in the last 15 minutes proves it is configured and in use. So the alert is
+silent while nobody dictates, and it clears 15 minutes after the last attempt
+even if the engine is still down. A gateway gauge of how many engines it is
+configured with would remove both limits.
+
+Prometheus reaches the engine the way the gateway does, as the head's LAN
+address. When the worker's host packet filter starts guarding port 30009, it
+must also list 30009 among the ports the head may reach, or the scrape and
+live dictation fail together.
+
+**The real-time factor** is `stt_stream_compute_seconds_total` divided by
+`stt_stream_audio_seconds_total`, per profile, over 5 minutes. The engine
+charges every stream in a `decode_streams` batch the batch's wall time: each
+call adds `elapsed x batch size` to the compute counter, and the audio counter
+adds the seconds of audio received (build spec section 11). The factor is
+then a decode step's wall time over the chunk it decodes, weighted by batch
+size:
+
+* **1.0 means falling behind.** A decode worker needs a whole chunk's length
+  to decode one chunk, so every stream on it slips behind real time.
+  `VoiceStreamEngineFallingBehind` warns above 0.8, a fifth of the budget
+  short of that.
+* **A saturated engine reads exactly 1.0; it does not climb with the
+  backlog.** Its streams are in every batch, the worker never idles, and their
+  audio keeps arriving at real time, so the backlog grows while the ratio
+  stays put. How far behind it is shows in the latency alerts, not here. A
+  promtool case pins this shape: compute equal to audio fires.
+* **Charged once per batch instead,** a full profile would top out at decode
+  workers divided by streams (0.25 with 2 workers and 8 streams) and the
+  alert could never fire. That is why the definition is part of the contract
+  (`metrics-contract.json`).
+
+The decode step panel is the per-call headroom: one `decode_streams` call
+against the chunk budget (160 ms on the fast profiles, 560 ms on the wide
+ones), measured at p95 99-102 ms with 12 streams on the worker, 0.62-0.64 of
+the budget.
+
+**Capacity refusals.** The gateway refuses with `capacity` both at its own
+`VOICE_LIVE_MAX_STREAMS` (64) and when every engine profile for the stream's
+language is full. By default that is 8 + 8 streams on 160 ms chunks and
+12 + 12 on 560 ms chunks; `en` can use all four profiles, `auto` and `hi` the
+two multilingual ones. The refusals panel shows the engine's own count beside
+the gateway's. A refused browser retries while it records (0.5, 1, 2, 4, 8 s,
+then every 15 s), so one person turned away for half a minute is a burst of
+about six refusals, all in the first 30 s. The alert counts refusals over 5
+minutes and must hold for 5 minutes, so it needs at least 3 in every 5-minute
+window across that time. The last of those windows opens when the first three
+were counted, so it takes three more after them: a burst that is over within
+about a minute leaves the window before the alert can fire, and refusals that
+keep coming hold it (a promtool case pins each). With a 10-minute window, one
+person turned away for 4 s fired it five minutes later.
+
+**More capacity trades against chat.** The engine runs on the worker's CPU,
+held to eight cores, because chat is tensor-parallel across both Sparks: 12
+streams cost chat nothing measurable, while 48 streams with every core busy
+cost it 11-16% of its decode speed. Raising the caps is the owner's decision.
+
+### Live dictation failures and drops
+
+`VoiceStreamErrorRatioHigh` and `VoiceStreamDisconnectsAbnormal` read
+`voice_stream_sessions_total{outcome}`, which the gateway settles exactly once
+per admitted stream. `voice_stream_errors_total` is not a per-stream count:
+every failed engine attempt and every rejected engine event adds one. So it
+cannot be a share, and it is shown by reason on its own panel. Refusals
+(`rejected`) are left out of both ratios, so a capacity storm cannot dilute
+them.
+
+| outcome | meaning | counted as |
+| --- | --- | --- |
+| `completed` | Stop, and the last words came back | normal |
+| `client_closed` | the browser closed the socket: cancel, discard, a closing tab | normal |
+| `disconnected` | the socket closed with no close frame: a network drop, or a relay destroyed at a frontend deploy | drop |
+| `idle` | no audio for `VOICE_LIVE_IDLE_S` (120 s) with the socket open. A phone whose screen turns off mid-recording stops sending audio and ends this way (the recorder says "Recording paused while the screen was off"), so it is normal use: shown on the outcomes panel, and in the drop ratio's denominator only | normal |
+| `superseded` | a newer connection took the recording over, usually a reconnect before the old socket was noticed dead | drop |
+| `engine_unavailable` | no engine answered, or it went away mid-stream | failure |
+| `error` | the gateway failed | failure |
+| `rejected` | refused after it was admitted: a protocol or limit violation, or a failed re-check of access | neither |
+
+Both alerts hold a 5-minute window for 10 minutes, because single events come
+in bursts by design: a frontend deploy drops every open stream at once, an
+engine restart fails every stream for a minute, and browsers retry both with
+backoff. A burst leaves the window before 10 minutes. A broken engine, or a
+network that keeps dropping streams, does not.
+
+The metrics name no person, so one person's bad network and a broken tunnel
+look the same here. The gateway logs one line per stream close (outcome,
+duration, whether it was a reconnect) and the frontend relay logs `ws_close`
+per socket; those tell them apart.
+
 ## Validation
 
 Run from the repository root:
@@ -439,8 +624,19 @@ Run from the repository root:
 IMG=$(grep -o 'prom/prometheus@sha256:[0-9a-f]*' compose/compose.monitoring.yaml | head -1)
 docker run --rm -v "$PWD/monitoring/prometheus:/p:ro" --entrypoint promtool "$IMG" check rules /p/rules/developer-api.yml
 docker run --rm -v "$PWD/monitoring/prometheus:/p:ro" --entrypoint promtool "$IMG" test rules /p/tests/developer_api.yml
+docker run --rm -v "$PWD/monitoring/prometheus:/p:ro" --entrypoint promtool "$IMG" check rules /p/rules/voice-stream.yml
+docker run --rm -v "$PWD/monitoring/prometheus:/p:ro" --entrypoint promtool "$IMG" test rules /p/tests/voice_stream.yml
 python3 -m unittest discover -s monitoring/developer-api/tests -v
 python3 monitoring/developer-api/check_metrics.py            # needs Prometheus on 127.0.0.1:9090, and PyYAML
 ```
 
-The tests are not wired into CI; neither are the existing promtool tests.
+Run the promtool containers on the worker, from a copy of
+`monitoring/prometheus`: nothing new may use the head's memory. The live
+dictation promtool cases were also checked by mutation (2026-09-29, and again
+after its review): 28 deliberate breaks of `voice-stream.yml` (a threshold, a
+floor, a window, a `for`, the engine-down gate and each reason it reads, each
+outcome of the two ratios and where `idle` is counted, the real-time factor's
+zero guard, a wrong job or reason), and every one made `test rules` fail.
+
+The offline Python tests run in CI (the launcher job's monitoring step); the
+promtool tests do not.
