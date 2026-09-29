@@ -610,7 +610,7 @@ def test_partials_replace_finals_commit_and_flush_ends_with_done(live, login_cli
     assert live.engine.urls == [ENGINE_URL + "/v1/stream"]
     assert live.engine.tokens == [ENGINE_TOKEN]
     assert live.engine.starts == [{"type": "start", "sample_rate": 16000, "encoding": "pcm_s16le", "first_sample": 0,
-                                   "first_u": 0, "mode": "dictation", "language": "auto"}]
+                                   "first_u": 0, "mode": "dictation", "language": "auto", "frame_ms": 40}]
     assert live.engine.streams[0].closed, "the engine's stream was closed with the browser's"
     assert counter("voice_stream_sessions_started_total") == 1
     assert counter("voice_stream_sessions_total", outcome="completed") == 1
@@ -644,6 +644,19 @@ def test_a_resumed_stream_continues_the_sample_and_utterance_numbering(live, log
         ws.send_bytes(SPEECH)
         assert event(ws) == {"type": "partial", "u": 3, "text": "kiwi1", "start_sample": 32000, "end_sample": 32640}
     assert live.engine.starts[0]["first_sample"] == 32000 and live.engine.starts[0]["first_u"] == 3
+
+
+@pytest.mark.parametrize(("sent", "passed"), [(10, 10), (20, 20), (5, 10), (100, 40)])
+def test_the_engine_is_told_the_browsers_frame_length_clamped_like_the_ceiling(live, login_client, sent, passed):
+    # The engine counts messages against its own ceiling, which assumes 40 ms
+    # frames when the start does not say: a browser sending 10 ms frames would
+    # pass the gateway's ceiling and then trip the engine's.
+    alice = login_client("alice")
+    with socket(alice, session(alice)) as ws:
+        ready(ws, frame_ms=sent)
+        ws.send_bytes(SPEECH)
+        assert event(ws)["type"] == "partial"
+    assert live.engine.starts[0]["frame_ms"] == passed
 
 
 def test_client_stats_are_bounded_clamped_and_rate_limited(live, login_client):

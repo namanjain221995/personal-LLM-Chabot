@@ -713,6 +713,7 @@ class _Engines:
             "type": "start", "sample_rate": SAMPLE_RATE, "encoding": "pcm_s16le",
             "first_sample": stream.first_sample, "first_u": stream.next_u,
             "mode": "dictation", "language": stream.language,
+            "frame_ms": stream.frame_ms,
         }
         budget = settings.voice_live_engine_connect_s
         try:
@@ -796,6 +797,10 @@ class _Stream:
         self.first_sample = 0
         self.next_u = 0
         self.language = "auto"
+        # The browser's frame length, clamped the way both message ceilings
+        # clamp it; passed on to the engine, whose own ceiling assumes 40 ms
+        # when the start does not say.
+        self.frame_ms = float(FRAME_MS)
         self.started = self.opened
         # State.
         self.streaming = False
@@ -978,7 +983,8 @@ class _Stream:
         self.first_sample, self.next_u, self.language = first_sample, next_u, language
         # Shorter frames buy more messages a second, down to MIN_FRAME_MS's
         # worth; a longer frame_ms buys no fewer than the browser's own.
-        self.message_rate = MESSAGES_FACTOR * 1000.0 / min(max(frame_ms, MIN_FRAME_MS), FRAME_MS)
+        self.frame_ms = float(min(max(frame_ms, MIN_FRAME_MS), FRAME_MS))
+        self.message_rate = MESSAGES_FACTOR * 1000.0 / self.frame_ms
         self._arrival_floor = first_sample
         self.started = time.monotonic()
 
