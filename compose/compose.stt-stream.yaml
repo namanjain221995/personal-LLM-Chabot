@@ -76,7 +76,7 @@ services:
       # Nemotron Speech Streaming model (LibriSpeech WER 4.13% at 160 ms);
       # "auto" (the model's own language ID, the default: never translate,
       # never force a language) and "hi" go to the multilingual Nemotron 3.5
-      # (LibriSpeech 6.23% auto, FLEURS Hindi 8.58% auto, 7.48% pinned), which
+      # (LibriSpeech 6.23% auto, FLEURS Hindi 11.8% auto, 10.9% pinned), which
       # also takes English once the English profile is full. The 160 ms
       # exports answer first; the 560 ms ones, cheaper per stream and a
       # little slower to show words, take the overflow. Gujarati is NOT

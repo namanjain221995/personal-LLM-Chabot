@@ -30,7 +30,7 @@ that allows its language and has room. The deployed list
 (compose/compose.stt-stream.yaml) sends "en" to the English-only Nemotron
 Speech Streaming model (LibriSpeech WER 4.13% at 160 ms) and "auto" and "hi" to
 the multilingual Nemotron 3.5 (LibriSpeech 6.23% with its own language ID,
-FLEURS Hindi 8.58%, 7.48% pinned), each first at 160 ms chunks and then, for
+FLEURS Hindi 11.8%, 10.9% pinned), each first at 160 ms chunks and then, for
 the overflow, at 560 ms. Gujarati is not offered: both models read it at 104%
 WER.
 
@@ -1232,8 +1232,7 @@ class DecodeWorker:
             stream.accept_waveform(SAMPLE_RATE, np.zeros(self.lead, dtype=np.float32))
         return stream
 
-    def _pump(self) -> None:
-        recognizer = self.recognizer
+    def _adopt_new(self) -> None:
         while self._adopt:
             slot = self._adopt.popleft()
             try:
@@ -1244,6 +1243,9 @@ class DecodeWorker:
                 continue
             self._slots.append(slot)
 
+    def _pump(self) -> None:
+        recognizer = self.recognizer
+
         # Audio is moved into the streams on EVERY pass, not once per pump: a
         # reconnect's replay can keep this loop decoding for seconds, and the
         # other streams on this worker must not wait that long for their
@@ -1253,6 +1255,7 @@ class DecodeWorker:
         # overload that never lets it run dry, would otherwise hold its last
         # final and `done` past the gateway's 5 s wait.
         while not self._stopping:
+            self._adopt_new()
             self._feed()
             ready = [s for s in self._slots if recognizer.is_ready(s.stream)]
             if not ready:
@@ -1670,15 +1673,22 @@ def parse_start(text: str) -> Tuple[Optional[Start], str]:
             return None, f"{key} must be a non-negative integer"
         numbers[key] = value
     frame_ms = message.get("frame_ms", FRAME_MS)
-    if isinstance(frame_ms, bool) or not isinstance(frame_ms, (int, float)) or (
-            isinstance(frame_ms, float) and not math.isfinite(frame_ms)):
+    if isinstance(frame_ms, bool) or not isinstance(frame_ms, (int, float)):
+        return None, "frame_ms must be a finite number"
+    try:
+        # An int too large for a float (JSON has no size limit) raises here,
+        # not in a handler that would close the socket without a close frame.
+        frame_ms = float(frame_ms)
+    except OverflowError:
+        return None, "frame_ms must be a finite number"
+    if not math.isfinite(frame_ms):
         return None, "frame_ms must be a finite number"
     language = message.get("language", "auto")
     if language is None or language == "":
         language = "auto"
     if not isinstance(language, str) or not _LANGUAGE.match(language):
         return None, "language must be 'auto' or a code like en, hi or en-US"
-    return Start(numbers["first_sample"], numbers["first_u"], language, mode, float(frame_ms)), ""
+    return Start(numbers["first_sample"], numbers["first_u"], language, mode, frame_ms), ""
 
 
 def message_rate(frame_ms: float) -> float:

@@ -132,6 +132,7 @@ def test_ready_describes_the_stream_in_both_spellings_of_the_resume_point():
     start_message(frame_ms=True),
     start_message(frame_ms=float("nan")),       # json.dumps writes NaN, which Python's json reads back
     start_message(frame_ms=float("inf")),
+    start_message(frame_ms=10 ** 400),          # an int no float can hold: OverflowError, not a crash
     "[" * 5000 + "]" * 5000,                    # RecursionError in json, not ValueError
 ])
 def test_a_bad_start_is_refused_with_4400(first):
