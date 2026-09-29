@@ -21,17 +21,26 @@
  *   - a second Stop inside the stop event's delay no longer strands the
  *     recording (the audit's stop() race);
  *   - at Stop the full pass goes in for English and the complete live
- *     transcript for Hindi or Hinglish (spec section 10), one quiet line says
- *     which, and its button swaps the other in over the untouched words;
+ *     transcript for Hindi or Hinglish (spec sections 10 and 12), one quiet
+ *     line says which, and its button swaps the other in over the untouched
+ *     words; the full pass's Retry and "Upload the rest" come only with the
+ *     full pass, and nothing a reload finds may write over the live words;
+ *   - a stream switched from English to Hindi keeps the full pass (spec 12);
+ *   - once the full pass is in, the insert waits for the live stream only
+ *     while it could still decide, and then for a second at most;
  *   - the bar's language control starts the live stream again in the chosen
- *     language, from the last committed word.
+ *     language, from the last committed word, once the choice has stood for
+ *     half a second.
  */
 import { act, cleanup, fireEvent, render, renderHook, screen, within } from '@testing-library/react';
+import { IDBFactory, IDBKeyRange } from 'fake-indexeddb';
 import { Blob as NodeBlob } from 'node:buffer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Composer } from '@/components/Composer';
 import { useVoiceRecorder } from '@/components/useVoiceRecorder';
 import { DEFAULT_PREFS } from '@/lib/prefs';
+import { OUTBOX_STALE_MS } from '@/lib/voice';
+import { LIVE_LANGUAGE_DEBOUNCE_MS, LIVE_SETTLE_WAIT_MS } from '@/lib/voiceLive';
 import { FakeSessionServer, SESSION_ID, sliceBytes, type FakeOptions } from './voice-session-fake';
 import {
   FakeLiveAudioContext,
@@ -176,14 +185,61 @@ afterEach(() => {
   Reflect.deleteProperty(navigator, 'mediaDevices');
 });
 
-async function startRecording() {
+/**
+ * A signed-in account whose outbox is IndexedDB (fake-indexeddb, fresh), so a
+ * record outlives the hook the way it outlives a reload. Without one the
+ * outbox is the tab's memory, which a reload empties.
+ */
+function signedIn(owner = 'u1') {
+  vi.stubGlobal('indexedDB', new IDBFactory());
+  vi.stubGlobal('IDBKeyRange', IDBKeyRange);
+  return vi.fn(async () => owner);
+}
+
+async function startRecording(resolveOwner?: () => Promise<string | null>) {
   const onTranscript = vi.fn();
-  const view = renderHook(() => useVoiceRecorder({ onTranscript, maxMs: 10 * 60 * 1000 }));
+  const view = renderHook(() =>
+    useVoiceRecorder({ onTranscript, maxMs: 10 * 60 * 1000, ...(resolveOwner ? { resolveOwner } : {}) }),
+  );
   await act(async () => {
     view.result.current.start();
   });
   await until(() => view.result.current.state === 'recording', 'recording started');
   return { view, onTranscript, rec: FakeRecorder.last! };
+}
+
+/** Every record in account u1's outbox, as a reload would find them. */
+async function outboxRecords(): Promise<Array<Record<string, unknown>>> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('techsara-voice-outbox:u1');
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      const all = db.transaction('records', 'readonly').objectStore('records').getAll();
+      all.onerror = () => reject(all.error);
+      all.onsuccess = () => {
+        db.close();
+        resolve(all.result as Array<Record<string, unknown>>);
+      };
+    };
+  });
+}
+
+/** Wait, on real turns, until the outbox satisfies `cond` (its writes are real async work). */
+async function untilOutbox(
+  cond: (records: Array<Record<string, unknown>>) => boolean,
+  what: string,
+): Promise<Array<Record<string, unknown>>> {
+  const deadline = performance.now() + 20_000;
+  let records: Array<Record<string, unknown>> = [];
+  while (performance.now() < deadline) {
+    records = await outboxRecords();
+    if (cond(records)) return records;
+    await act(async () => {
+      for (let t = 0; t < 10; t += 1) await turn();
+    });
+  }
+  throw new Error(`never happened: ${what} (outbox: ${JSON.stringify(records.map((r) => ({ ...r, init: undefined })))})`);
 }
 
 type Ctx = Awaited<ReturnType<typeof startRecording>>;
@@ -803,9 +859,12 @@ async function stopWithLiveDone(ctx: Ctx, ws: FakeWebSocket) {
 }
 
 /** Record one slice with these live words, and stop. */
-async function dictate(liveWords: string, options: { language?: string } = {}) {
+async function dictate(
+  liveWords: string,
+  options: { language?: string; resolveOwner?: () => Promise<string | null> } = {},
+) {
   if (options.language) window.localStorage.setItem('techsara-voice-language', options.language);
-  const ctx = await startRecording();
+  const ctx = await startRecording(options.resolveOwner);
   const ws = await goLive(25);
   await talk(ctx, 1);
   await act(async () => {
@@ -894,30 +953,119 @@ describe('which transcript goes in at Stop', () => {
     });
   });
 
-  it('keeps the full pass’s Retry on the same line, and the Retry follows the transcript in the draft', async () => {
-    useServer({
-      finalState: (_words, s) =>
-        s.retranscribes === 0
-          ? { outcome: 'transcribed_with_gaps', gaps: [{ start_ms: 5000, end_ms: 10_000, reason: 'engine_unavailable' }] }
-          : {},
-    });
+  // The review's high finding (2026-09-30): this line used to carry the full
+  // pass's Retry over the live words, and in Chromium Retry put whisper's Urdu
+  // script where the complete Hindi transcript had been, with no way back.
+  // Spec 12: the live words have no gap; the Retry comes with the full pass.
+  const GAPPY = (_words: string[], s: FakeSessionServer) =>
+    s.retranscribes === 0
+      ? {
+          outcome: 'transcribed_with_gaps',
+          gaps: [{ start_ms: 5000, end_ms: 10_000, reason: 'engine_unavailable' }],
+          language: 'Hindi',
+          language_code: 'hi',
+        }
+      : { language: 'Hindi', language_code: 'hi' };
+
+  it('offers no Retry over the live words it put in; the full pass brings its Retry with it, and takes it away again', async () => {
+    useServer({ finalState: GAPPY });
     const ctx = await dictate(HINGLISH);
     expect(ctx.onTranscript).toHaveBeenCalledWith(HINGLISH, null);
     const line = ctx.view.result.current.followUp!;
-    expect(line.message).toBe(
-      "Inserted the live transcript. The speech engine couldn't transcribe 1 part (0:05–0:10). The audio is saved. Press Retry to transcribe them.",
-    );
-    expect(line.actionLabel).toBe('Retry');
-    expect(line.secondaryLabel).toBe('Use the other one');
-    await act(async () => line.runSecondary!());
+    expect(line).toMatchObject({ message: 'Inserted the live transcript.', tone: 'info', actionLabel: 'Use the other one' });
+    expect(line.secondaryLabel ?? null).toBeNull();
+
+    // The full pass goes in with the Retry for its gap.
+    await act(async () => line.run());
     expect(ctx.onTranscript).toHaveBeenLastCalledWith('w0 w1', null, HINGLISH, true);
-    const swapped = ctx.view.result.current.followUp!;
-    expect(swapped.message.startsWith('Inserted the full-pass transcript. ')).toBe(true);
-    // Retry now replaces the full pass's words, which are the ones in the draft.
-    await act(async () => swapped.run());
-    await untilWithClock(() => ctx.onTranscript.mock.calls.length === 3, 'the Retry delivered');
-    expect(ctx.onTranscript.mock.calls[2]!.slice(0, 3)).toEqual(['w0 w1', null, 'w0 w1']);
+    const fullPass = ctx.view.result.current.followUp!;
+    expect(fullPass.message).toBe(
+      "Inserted the full-pass transcript. The speech engine couldn't transcribe 1 part (0:05–0:10). The audio is saved. Press Retry to transcribe them.",
+    );
+    expect(fullPass.actionLabel).toBe('Retry');
+    expect(fullPass.secondaryLabel).toBe('Use the other one');
+
+    // Back to the live words: the Retry goes with the full pass.
+    await act(async () => fullPass.runSecondary!());
+    expect(ctx.onTranscript).toHaveBeenLastCalledWith(HINGLISH, null, 'w0 w1', true);
+    const liveAgain = ctx.view.result.current.followUp!;
+    expect(liveAgain).toMatchObject({ message: 'Inserted the live transcript.', actionLabel: 'Use the other one' });
+    expect(liveAgain.secondaryLabel ?? null).toBeNull();
+
+    // Pressed with the full pass in, Retry replaces the full pass's words.
+    await act(async () => liveAgain.run());
+    await act(async () => ctx.view.result.current.followUp!.run());
+    await untilWithClock(() => ctx.onTranscript.mock.calls.length === 5, 'the Retry delivered');
+    expect(ctx.onTranscript.mock.calls[4]!.slice(0, 3)).toEqual(['w0 w1', null, 'w0 w1']);
     expect(server.retranscribes).toBe(1);
+  });
+
+  it('leaves nothing that a reload could offer over the live words', async () => {
+    useServer({ finalState: GAPPY });
+    const resolveOwner = signedIn();
+    const ctx = await dictate(HINGLISH, { resolveOwner });
+    expect(ctx.onTranscript).toHaveBeenCalledWith(HINGLISH, null);
+    // The record goes: before 2026-09-30 it kept the Retry, set to replace the live words.
+    await untilOutbox((records) => records.length === 0, 'the record settled');
+    ctx.view.unmount(); // reload
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(40_000);
+    });
+    const again = renderHook(() => useVoiceRecorder({ onTranscript: vi.fn(), resolveOwner }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(OUTBOX_STALE_MS + 2000); // the look at mount, and the second one
+    });
+    await until(() => resolveOwner.mock.calls.length >= 3, 'the reopened page looked for recordings');
+    for (let t = 0; t < 50; t += 1) await act(async () => turn());
+    expect(again.result.current.followUp).toBeNull();
+    expect(server.retranscribes).toBe(0);
+  });
+
+  it('offers no "Upload the rest" over the live words either, and keeps the audio held on this device', async () => {
+    const resolveOwner = signedIn();
+    useServer({
+      // The server runs out of space at the second part: the rest stays on this device.
+      inject: ({ method, seq }) =>
+        method === 'PUT' && seq === 1 ? { status: 507, body: { detail: 'full', reason: 'storage_full' } } : undefined,
+      finalState: () => ({ language: 'Hindi', language_code: 'hi' }),
+    });
+    const ctx = await startRecording(resolveOwner);
+    const ws = await goLive(25);
+    await act(async () => {
+      ws.say({ type: 'final', u: 0, text: HINGLISH, start_sample: 0, end_sample: 16_000 });
+    });
+    await talk(ctx, 1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+      ctx.rec.emit(); // refused: the recording stops here
+    });
+    await until(() => ctx.rec.state === 'inactive', 'the recorder stopped by the refusal');
+    await act(async () => {
+      FakeWorkletNode.last.flushed(16_000);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      ws.say({ type: 'done' });
+    });
+    await untilWithClock(() => ctx.onTranscript.mock.calls.length > 0, 'the words delivered');
+    expect(ctx.onTranscript.mock.calls[0]![0]).toBe(HINGLISH);
+    const line = ctx.view.result.current.followUp!;
+    expect(line).toMatchObject({ message: 'Inserted the live transcript.', actionLabel: 'Use the other one' });
+    expect(line.secondaryLabel ?? null).toBeNull();
+    // Held audio is never deleted unasked; its record just names no text in the draft for "Upload the rest" to replace.
+    const [held] = await untilOutbox(
+      (records) => records.length === 1 && records[0]!.held != null && records[0]!.deliveredText === null,
+      'the held record, tied to no text',
+    );
+    expect(held!.offer ?? null).toBeNull();
+
+    // With the full pass in, "Upload the rest" is offered over its words.
+    await act(async () => line.run());
+    expect(ctx.onTranscript).toHaveBeenLastCalledWith('w0', null, HINGLISH, true);
+    const fullPass = ctx.view.result.current.followUp!;
+    expect(fullPass.actionLabel).toBe('Upload the rest');
+    expect(fullPass.secondaryLabel).toBe('Use the other one');
+    await untilOutbox((records) => records[0]?.deliveredText === 'w0', 'the held record tied to the full pass');
   });
 
   it('draws no line when there were no live words, as before', async () => {
@@ -986,6 +1134,163 @@ describe('the swap in the composer', () => {
 });
 
 // ---------------------------------------------------------------------------
+// A switch from English to Hindi mid-recording (spec 12)
+// ---------------------------------------------------------------------------
+
+describe('a switch from English to Hindi mid-recording', () => {
+  // The review's finding 3: the English-only model's guesses at the Hindi
+  // before the switch went into the draft as a complete Hindi transcript.
+  it('puts the full pass in, not the English model’s guesses at the opening, and offers the live words', async () => {
+    window.localStorage.setItem('techsara-voice-language', 'en');
+    const WHISPER_HINDI = 'मैं आज ऑफिस जा रहा हूँ मीटिंग दस बजे है';
+    useServer({ finalState: () => ({ text: WHISPER_HINDI, language: 'Hindi', language_code: 'hi' }) });
+    render(
+      <Composer streaming={false} prefs={DEFAULT_PREFS} onPrefsChange={vi.fn()} onSend={vi.fn()} onStop={vi.fn()} />,
+    );
+    const box = screen.getByLabelText('Message') as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Start voice input'));
+    });
+    await until(() => FakeRecorder.last?.state === 'recording', 'recording started');
+    const rec = FakeRecorder.last!;
+    const ws = await goLive(25);
+    expect(ws.texts[0]!.language).toBe('en');
+    // What an English-only model makes of Hindi speech: English-looking words.
+    await act(async () => {
+      ws.say({ type: 'final', u: 0, text: 'May aaj of his jar a who.', start_sample: 0, end_sample: 8_000 });
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('radio', { name: 'हिन्दी' }));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_LANGUAGE_DEBOUNCE_MS);
+    });
+    const next = FakeWebSocket.last;
+    expect(next).not.toBe(ws);
+    await act(async () => {
+      expect(next.handshake()).toMatchObject({ language: 'hi', resume_from_sample: 8_000, next_u: 1 });
+      next.say({ type: 'final', u: 1, text: 'मीटिंग दस बजे है', start_sample: 8_000, end_sample: 16_000 });
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+      rec.emit();
+    });
+    await until(() => server.appendedSlices.length >= 1, 'slice 0 on the server');
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Stop recording and transcribe'));
+    });
+    await act(async () => {
+      FakeWorkletNode.last.flushed(16_000);
+      await vi.advanceTimersByTimeAsync(0);
+      next.say({ type: 'done' });
+    });
+    await untilWithClock(() => box.value !== '', 'words in the draft');
+    expect(box.value).toBe(WHISPER_HINDI);
+    expect(screen.getByText('Inserted the full-pass transcript.')).toBeTruthy();
+    // The live words, English model's opening and all, are one click away.
+    await act(async () => {
+      fireEvent.click(screen.getByText('Use the other one'));
+    });
+    expect(box.value).toBe('May aaj of his jar a who. मीटिंग दस बजे है');
+    expect(screen.getByText('Inserted the live transcript.')).toBeTruthy();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// How long the insert waits for the live stream once the full pass is in
+// ---------------------------------------------------------------------------
+
+describe('how long the insert waits for the live stream once the full pass is in', () => {
+  /**
+   * The fake clock in steps of 100 ms, with real turns between them, until
+   * `cond`. The waits under test are timers; everything else (hashing the last
+   * part, the requests) is real async work that must not move the clock.
+   */
+  async function inSteps(cond: () => boolean, what: string): Promise<void> {
+    const deadline = performance.now() + 20_000;
+    while (performance.now() < deadline) {
+      if (cond()) return;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(100);
+      });
+      for (let t = 0; t < 20; t += 1) await act(async () => turn());
+    }
+    if (!cond()) throw new Error(`never happened: ${what}`);
+  }
+
+  /** One slice with these live words, then Stop and the worklet's last frame; the live stream never says done. */
+  async function stopWithoutDone(words: string): Promise<{ ctx: Ctx; ws: FakeWebSocket }> {
+    const ctx = await startRecording();
+    const ws = await goLive(25);
+    await talk(ctx, 1);
+    await act(async () => {
+      ws.say({ type: 'final', u: 0, text: words, start_sample: 0, end_sample: 16_000 });
+    });
+    await act(async () => {
+      ctx.view.result.current.stop();
+    });
+    await act(async () => {
+      FakeWorkletNode.last.flushed(16_000);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    // The last part and the finish go out on real turns alone.
+    await until(() => server.finishBody !== null, 'the finish request');
+    // The finish long-poll, until the server has the full pass; then its answer lands.
+    await inSteps(() => server.status === 'done', 'the full pass done on the server');
+    for (let t = 0; t < 50; t += 1) await act(async () => turn());
+    return { ctx, ws };
+  }
+
+  /** Fake milliseconds from the full pass being done to its insert. */
+  async function waitAfterFullPass(ctx: Ctx): Promise<number> {
+    const doneAt = Date.now();
+    await inSteps(() => ctx.onTranscript.mock.calls.length > 0, 'the words delivered');
+    return Date.now() - doneAt;
+  }
+
+  // The review's finding 5: with the language on English, whose outcome the
+  // live words cannot change, the insert still waited out the stream's whole
+  // 3 s finish budget when it never said done (2 s after the full pass).
+  it('does not wait at all when the live words cannot go in: English chosen', async () => {
+    window.localStorage.setItem('techsara-voice-language', 'en');
+    const { ctx } = await stopWithoutDone('Hello there.');
+    expect(await waitAfterFullPass(ctx)).toBe(0);
+    expect(ctx.onTranscript).toHaveBeenCalledWith('w0 w1', null);
+    // The live words are still offered, said to be part of the recording: they never finished.
+    expect(ctx.view.result.current.followUp).toMatchObject({
+      message: 'Inserted the full-pass transcript.',
+      actionLabel: 'Use what was heard live (part of the recording)',
+    });
+  });
+
+  it('waits a second at most while they could still go in, then counts them incomplete', async () => {
+    const { ctx } = await stopWithoutDone(HINGLISH);
+    const waited = await waitAfterFullPass(ctx);
+    expect(waited).toBeGreaterThanOrEqual(LIVE_SETTLE_WAIT_MS);
+    expect(waited).toBeLessThanOrEqual(LIVE_SETTLE_WAIT_MS + 100);
+    expect(ctx.onTranscript).toHaveBeenCalledWith('w0 w1', null);
+    expect(ctx.view.result.current.followUp).toMatchObject({
+      message: 'Inserted the full-pass transcript.',
+      actionLabel: 'Use what was heard live (part of the recording)',
+    });
+  });
+
+  it('still takes the live words of a Hindi session whose done comes within that second', async () => {
+    const { ctx, ws } = await stopWithoutDone(HINGLISH);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_SETTLE_WAIT_MS / 2);
+    });
+    expect(ctx.onTranscript).not.toHaveBeenCalled();
+    await act(async () => {
+      ws.say({ type: 'done' });
+    });
+    await inSteps(() => ctx.onTranscript.mock.calls.length > 0, 'the words delivered');
+    expect(ctx.onTranscript).toHaveBeenCalledWith(HINGLISH, null);
+    expect(ctx.view.result.current.followUp).toMatchObject({ message: 'Inserted the live transcript.' });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The language control in the bar
 // ---------------------------------------------------------------------------
 
@@ -1022,7 +1327,12 @@ describe('the language control in the recording bar', () => {
     });
     expect(window.localStorage.getItem('techsara-voice-language')).toBe('hi');
     expect((screen.getByRole('radio', { name: 'हिन्दी' }) as HTMLInputElement).checked).toBe(true);
-    // A new stream in Hindi from the last committed word; the old one is closed.
+    // Once the choice has stood for half a second: a new stream in Hindi from
+    // the last committed word; the old one is closed.
+    expect(ws.closedWith).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_LANGUAGE_DEBOUNCE_MS);
+    });
     expect(ws.closedWith).toBe(1000);
     const next = FakeWebSocket.last;
     expect(next).not.toBe(ws);
@@ -1034,6 +1344,28 @@ describe('the language control in the recording bar', () => {
     });
     await redraw();
     expect(screen.getByTestId('voice-transcript').textContent).toBe('Hello everyone. आज हम');
+  });
+
+  // The review's finding 4: every change opened a socket at once, so walking
+  // the options (a held arrow key) opened one per step.
+  it('opens one connection for choices made in quick succession, in the last one chosen', async () => {
+    await recordInComposer();
+    const ws = await goLive(25);
+    for (const name of ['English', 'हिन्दी', 'Auto', 'English']) {
+      await act(async () => {
+        fireEvent.click(screen.getByRole('radio', { name }));
+        await vi.advanceTimersByTimeAsync(100);
+      });
+    }
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LIVE_LANGUAGE_DEBOUNCE_MS);
+    });
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(ws.closedWith).toBe(1000);
+    expect(FakeWebSocket.last.handshake().language).toBe('en');
+    expect(window.localStorage.getItem('techsara-voice-language')).toBe('en');
+    expect((screen.getByRole('radio', { name: 'English' }) as HTMLInputElement).checked).toBe(true);
   });
 
   it('is gone once the live stream is refused for good', async () => {

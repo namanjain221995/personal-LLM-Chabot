@@ -14,6 +14,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   describeOutcome,
+  joinPreview,
   parseLiveConfig,
   parseSessionConfig,
   parseSessionState,
@@ -29,6 +30,8 @@ import {
   devanagariShare,
   getVoiceLanguage,
   isHindiSession,
+  joinPieces,
+  liveMayStillBeChosen,
   liveSocketUrl,
   mergeLiveTranscript,
   setVoiceLanguage,
@@ -495,6 +498,8 @@ describe('which transcript goes into the draft', () => {
     ).toBe('durable');
   });
 
+  // Spec 12 (2026-09-30): the English-only model scores ~80% WER on the MUCS
+  // lectures, whisper 55.8%, so for someone who chose English whisper goes in.
   it('is the full pass when the person chose English and whisper heard Hindi: the English model cannot write it', () => {
     for (const whisperLanguage of ['hi', 'ur']) {
       expect(
@@ -505,6 +510,81 @@ describe('which transcript goes into the draft', () => {
     expect(chooseFinalText({ liveText: HINGLISH, liveComplete: true, userLanguage: 'en', whisperLanguage: 'hi' })).toBe(
       'live',
     );
+  });
+
+  // The review's finding 3: switched from English to Hindi mid-recording, the
+  // English model's guesses at the opening went in as a "complete Hindi
+  // transcript". Spec 12: the full pass goes in instead.
+  it('is the full pass for a Hindi session any of whose words the English-only model wrote', () => {
+    const switched = `May aaj of his jar a who. ${HINGLISH}`;
+    for (const userLanguage of ['hi', 'auto'] as const) {
+      expect(
+        chooseFinalText({ liveText: switched, liveComplete: true, englishModelFinals: true, userLanguage, whisperLanguage: 'hi' }),
+      ).toBe('durable');
+      expect(
+        chooseFinalText({ liveText: switched, liveComplete: true, englishModelFinals: false, userLanguage, whisperLanguage: 'hi' }),
+      ).toBe('live');
+    }
+    expect(chooseFinalText({ liveText: HINGLISH, liveComplete: true, userLanguage: 'hi', whisperLanguage: 'hi' })).toBe(
+      'live',
+    );
+  });
+});
+
+describe('whether the live stream’s last words are worth waiting for', () => {
+  const HINGLISH = 'मैं आज office जा रहा हूँ, meeting दस बजे है।';
+
+  it('is not once the English-only model wrote any of the words, whatever the language now', () => {
+    for (const language of ['auto', 'en', 'hi'] as const) {
+      expect(liveMayStillBeChosen({ liveText: HINGLISH, englishModelFinals: true, language })).toBe(false);
+    }
+  });
+
+  it('is not for words heard in English that are under a fifth Devanagari: whatever arrives, the full pass goes in', () => {
+    expect(liveMayStillBeChosen({ liveText: 'Hello there.', englishModelFinals: false, language: 'en' })).toBe(false);
+    expect(liveMayStillBeChosen({ liveText: '', englishModelFinals: false, language: 'en' })).toBe(false);
+  });
+
+  it('is while more Devanagari may come, or the words so far already make a Hindi session', () => {
+    expect(liveMayStillBeChosen({ liveText: 'Hello there.', englishModelFinals: false, language: 'auto' })).toBe(true);
+    expect(liveMayStillBeChosen({ liveText: '', englishModelFinals: false, language: 'hi' })).toBe(true);
+    // Hindi until a switch to English at the very end: complete, it goes in.
+    expect(liveMayStillBeChosen({ liveText: HINGLISH, englishModelFinals: false, language: 'en' })).toBe(true);
+  });
+
+  it('is not without a stream that can still finish', () => {
+    expect(liveMayStillBeChosen({ liveText: HINGLISH, englishModelFinals: false, language: null })).toBe(false);
+  });
+});
+
+describe('the live words as one text, at any length', () => {
+  /** What text() did until 2026-09-30: joinPreview folded over the growing text. */
+  const fold = (pieces: string[]) => pieces.reduce((out, piece) => joinPreview(out, piece), '');
+
+  it('joins exactly as folding joinPreview does, space or none by the script on each side', () => {
+    const scripts = ['Hello there.', 'मीटिंग दस बजे है', '今日は', '晴れです', 'สวัสดี', 'ครับ', '😀 ok', 'OK', 'ア'];
+    let seed = 7;
+    const next = () => (seed = (seed * 48271) % 2147483647);
+    for (let round = 0; round < 200; round += 1) {
+      const pieces = Array.from({ length: 1 + (next() % 12) }, () => scripts[next() % scripts.length]!);
+      expect(joinPieces(pieces)).toBe(fold(pieces));
+    }
+    expect(joinPieces(['a', '', 'b'])).toBe(fold(['a', '', 'b']));
+    expect(joinPieces([])).toBe('');
+  });
+
+  // The review's finding 6: 10,000 utterances (216,659 characters) took about
+  // a second of main thread at Stop, and twice as many four times as long.
+  it('takes linear time: 20,000 utterances are joined in well under a second', () => {
+    const t = new LiveTranscript();
+    for (let i = 0; i < 20_000; i += 1) t.final(i, `utterance number ${i} said.`, i * 1000, i * 1000 + 800);
+    t.partialUpdate(20_000, 'and one more', 20_000_000, 20_000_500);
+    const started = performance.now();
+    const text = t.text();
+    const took = performance.now() - started;
+    expect(text.startsWith('utterance number 0 said. utterance number 1 said.')).toBe(true);
+    expect(text.endsWith('utterance number 19999 said. and one more')).toBe(true);
+    expect(took).toBeLessThan(500);
   });
 });
 

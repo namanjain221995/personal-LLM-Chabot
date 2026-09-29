@@ -16,7 +16,8 @@
  *     reconnect, 2026-09-30), and an overwrite that happens anyway backs off;
  *   - whether the live words are the whole recording (done, no gap, nothing
  *     skipped), and a language chosen mid-recording (a new stream from the
- *     last committed word);
+ *     last committed word, once the choice has stood for 500 ms), and whether
+ *     the English-only model wrote any of them;
  *   - backpressure at 256 KiB queued, released below 64 KiB, and a ring that
  *     overflowed meanwhile starts again after the backoff;
  *   - Stop: the rest of the audio, then `flush`, nothing after it, `done`
@@ -30,6 +31,7 @@ import { parseLiveConfig } from '@/lib/voice';
 import {
   CaptureClock,
   LIVE_FINISH_BUDGET_MS,
+  LIVE_LANGUAGE_DEBOUNCE_MS,
   LIVE_RESUME_HEADROOM_SECONDS,
   LIVE_RING_SECONDS,
   LIVE_SUBPROTOCOL,
@@ -534,7 +536,9 @@ describe('whether the live transcript is the whole recording', () => {
 });
 
 describe('a language chosen mid-recording', () => {
-  it('starts again at once in the new language, from the last committed word, losing and repeating nothing', async () => {
+  // Until 2026-09-30 a choice replaced the connection at once; since the
+  // review's finding 4 it does so once the choice has stood for 500 ms.
+  it('starts again in the new language once the choice has stood for 500 ms, from the last committed word, losing and repeating nothing', async () => {
     const { push, stream, transcript } = setup({ language: 'auto' });
     push(0, 100); // 4 s
     const first = FakeWebSocket.last;
@@ -542,8 +546,13 @@ describe('a language chosen mid-recording', () => {
     first.say({ type: 'final', u: 0, text: 'Hello everyone.', start_sample: 0, end_sample: 32_000 });
     first.say({ type: 'partial', u: 1, text: 'aaj hum', start_sample: 33_000, end_sample: 60_000 });
     stream.setLanguage('hi');
+    expect(stream.currentLanguage).toBe('hi');
+    vi.advanceTimersByTime(LIVE_LANGUAGE_DEBOUNCE_MS - 1);
+    expect(first.closedWith).toBeNull();
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    vi.advanceTimersByTime(1);
     expect(first.closedWith).toBe(1000);
-    expect(FakeWebSocket.instances).toHaveLength(2); // at once: no backoff for a choice
+    expect(FakeWebSocket.instances).toHaveLength(2); // no backoff for a choice
     const second = FakeWebSocket.last;
     expect(second.handshake()).toMatchObject({ language: 'hi', resume_from_sample: 32_000, next_u: 1 });
     // The utterance under way is heard again, in Hindi; the committed one is not sent again.
@@ -570,6 +579,9 @@ describe('a language chosen mid-recording', () => {
     expect(FakeWebSocket.instances).toHaveLength(1);
     vi.advanceTimersByTime(500);
     expect(FakeWebSocket.last.handshake().language).toBe('en');
+    // The debounce that ends meanwhile finds the connection already in English.
+    vi.advanceTimersByTime(LIVE_LANGUAGE_DEBOUNCE_MS);
+    expect(FakeWebSocket.instances).toHaveLength(2);
   });
 
   it('changes nothing for the language already in use, or after Stop', () => {
@@ -577,11 +589,145 @@ describe('a language chosen mid-recording', () => {
     push(0);
     FakeWebSocket.last.handshake();
     stream.setLanguage('en');
+    vi.advanceTimersByTime(LIVE_LANGUAGE_DEBOUNCE_MS);
     expect(FakeWebSocket.instances).toHaveLength(1);
     void stream.finish();
     stream.setLanguage('hi');
+    vi.advanceTimersByTime(LIVE_LANGUAGE_DEBOUNCE_MS);
     expect(FakeWebSocket.instances).toHaveLength(1);
     expect(FakeWebSocket.last.closedWith).toBeNull();
+    expect(stream.currentLanguage).toBe('en');
+  });
+
+  // The review's finding 4: native radios walk auto -> en -> hi -> auto with a
+  // key held down; 30 changes in a second opened 30 sockets, each counted
+  // against the gateway's 30 connections a minute.
+  it('opens one connection for a burst of 30 changes in a second, in the language the burst ended on', () => {
+    const { push, stream } = setup({ language: 'auto' });
+    push(0, 25);
+    const first = FakeWebSocket.last;
+    first.handshake();
+    // Every press a real change: hi, auto, en, hi, ... ending on en (k = 29).
+    const cycle = ['hi', 'auto', 'en'] as const;
+    for (let k = 0; k < 30; k += 1) {
+      stream.setLanguage(cycle[k % 3]!);
+      vi.advanceTimersByTime(33);
+    }
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    vi.advanceTimersByTime(LIVE_LANGUAGE_DEBOUNCE_MS);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(first.closedWith).toBe(1000);
+    expect(FakeWebSocket.last.handshake().language).toBe('en');
+    vi.advanceTimersByTime(10_000);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+
+  it('opens none when the choice comes back to the language in use within the 500 ms', () => {
+    const { push, stream } = setup({ language: 'auto' });
+    push(0, 25);
+    const first = FakeWebSocket.last;
+    first.handshake();
+    stream.setLanguage('en');
+    vi.advanceTimersByTime(300);
+    stream.setLanguage('auto');
+    vi.advanceTimersByTime(5 * LIVE_LANGUAGE_DEBOUNCE_MS);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(first.closedWith).toBeNull();
+    expect(stream.currentLanguage).toBe('auto');
+  });
+
+  it('drops a change still inside the 500 ms at Stop: the last words are heard in the language the open connection asked for', async () => {
+    const { push, stream } = setup({ language: 'auto' });
+    push(0, 25);
+    const ws = FakeWebSocket.last;
+    ws.handshake();
+    stream.setLanguage('en');
+    vi.advanceTimersByTime(200);
+    let finished = false;
+    void stream.finish().then(() => (finished = true));
+    vi.advanceTimersByTime(LIVE_LANGUAGE_DEBOUNCE_MS);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(ws.texts.map((t) => t.type)).toEqual(['start', 'flush']);
+    // The final-text policy reads the language the words were heard in.
+    expect(stream.currentLanguage).toBe('auto');
+    ws.say({ type: 'done' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(finished).toBe(true);
+    expect(stream.complete).toBe(true);
+  });
+
+  it('drops it on cancel too', () => {
+    const { push, stream } = setup({ language: 'auto' });
+    push(0, 25);
+    FakeWebSocket.last.handshake();
+    stream.setLanguage('hi');
+    stream.abort();
+    vi.advanceTimersByTime(5 * LIVE_LANGUAGE_DEBOUNCE_MS);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(FakeWebSocket.last.closedWith).toBe(1000);
+  });
+});
+
+describe('which model wrote the live words', () => {
+  it('knows a final with words came from the English-only model when its connection asked for "en"', () => {
+    const { push, stream } = setup({ language: 'en' });
+    push(0, 25);
+    const ws = FakeWebSocket.last;
+    ws.handshake();
+    ws.say({ type: 'partial', u: 0, text: 'May aaj', start_sample: 0, end_sample: 4_000 });
+    expect(stream.englishModelFinals).toBe(false); // a partial commits nothing
+    ws.say({ type: 'final', u: 0, text: '  ', start_sample: 0, end_sample: 4_000 });
+    expect(stream.englishModelFinals).toBe(false); // nor does a final with no words
+    ws.say({ type: 'final', u: 1, text: 'May aaj of his jar a who.', start_sample: 4_000, end_sample: 8_000 });
+    expect(stream.englishModelFinals).toBe(true);
+  });
+
+  it('keeps knowing it after a switch from English to Hindi (the review’s finding 3)', () => {
+    const { push, stream, transcript } = setup({ language: 'en' });
+    push(0, 25);
+    const first = FakeWebSocket.last;
+    first.handshake();
+    first.say({ type: 'final', u: 0, text: 'May aaj of his jar a who.', start_sample: 0, end_sample: 8_000 });
+    stream.setLanguage('hi');
+    vi.advanceTimersByTime(LIVE_LANGUAGE_DEBOUNCE_MS);
+    const second = FakeWebSocket.last;
+    expect(second.handshake()).toMatchObject({ language: 'hi', resume_from_sample: 8_000, next_u: 1 });
+    second.say({ type: 'final', u: 1, text: 'मीटिंग दस बजे है', start_sample: 8_000, end_sample: 16_000 });
+    // The English model's attempt at the opening is still the start of the text.
+    expect(transcript.text()).toBe('May aaj of his jar a who. मीटिंग दस बजे है');
+    expect(stream.englishModelFinals).toBe(true);
+  });
+
+  it('goes by the connection that sent the final, not by the choice still inside its 500 ms', () => {
+    const toHindi = setup({ language: 'en' });
+    toHindi.push(0, 25);
+    FakeWebSocket.last.handshake();
+    toHindi.stream.setLanguage('hi');
+    // The English connection is still the one in use: its final is the English model's.
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'Hello.', start_sample: 0, end_sample: 8_000 });
+    expect(toHindi.stream.englishModelFinals).toBe(true);
+
+    resetLiveFakes();
+    const toEnglish = setup({ language: 'hi' });
+    toEnglish.push(0, 25);
+    FakeWebSocket.last.handshake();
+    toEnglish.stream.setLanguage('en');
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'नमस्ते', start_sample: 0, end_sample: 8_000 });
+    expect(toEnglish.stream.englishModelFinals).toBe(false);
+    vi.advanceTimersByTime(LIVE_LANGUAGE_DEBOUNCE_MS);
+    FakeWebSocket.last.handshake();
+    FakeWebSocket.last.say({ type: 'final', u: 1, text: 'Thank you.', start_sample: 8_000, end_sample: 16_000 });
+    expect(toEnglish.stream.englishModelFinals).toBe(true);
+  });
+
+  it('is never set by Auto or Hindi, nor by a late or repeated final', () => {
+    const { push, stream } = setup({ language: 'auto' });
+    push(0, 25);
+    const ws = FakeWebSocket.last;
+    ws.handshake();
+    ws.say({ type: 'final', u: 0, text: 'Hello there.', start_sample: 0, end_sample: 8_000 });
+    ws.say({ type: 'final', u: 0, text: 'Hello there.', start_sample: 0, end_sample: 8_000 });
+    expect(stream.englishModelFinals).toBe(false);
   });
 });
 
@@ -977,6 +1123,7 @@ describe('the capture on the meter’s context', () => {
     FakeWebSocket.last.say({ type: 'final', u: 0, text: 'Hi.', start_sample: 0, end_sample: 8_000 });
     capture.setLanguage('en');
     expect(capture.language).toBe('en');
+    vi.advanceTimersByTime(LIVE_LANGUAGE_DEBOUNCE_MS);
     const second = FakeWebSocket.last;
     expect(second.handshake()).toMatchObject({ language: 'en', resume_from_sample: 8_000, next_u: 1 });
     expect(capture.complete()).toBe(false); // not before its end
@@ -987,6 +1134,45 @@ describe('the capture on the meter’s context', () => {
     await done;
     expect(capture.complete()).toBe(true);
     expect(capture.text()).toBe('Hi.');
+    // "Hi." came from the multilingual model, before the switch.
+    expect(capture.englishModelFinals()).toBe(false);
+  });
+
+  it('says when the English-only model wrote any of its words', async () => {
+    const { capture, node } = await attached();
+    node!.frames(0, 25);
+    expect(capture.englishModelFinals()).toBe(false); // no stream yet
+    capture.open({ config: LIVE, sessionId: SID, recorderStartedAt: Date.now(), language: 'en', location: HERE });
+    FakeWebSocket.last.handshake();
+    FakeWebSocket.last.say({ type: 'final', u: 0, text: 'Hello.', start_sample: 0, end_sample: 8_000 });
+    expect(capture.englishModelFinals()).toBe(true);
+  });
+
+  // The review's finding 5: every insert waited out the whole finish budget
+  // behind a stream slow to say done.
+  it('stops waiting for a stream that never says done after the time it is given, and at once when it does', async () => {
+    const { capture, node } = await attached();
+    node!.frames(0, 25);
+    openOn(capture);
+    FakeWebSocket.last.handshake();
+    capture.finish();
+    node!.flushed(16_000);
+    await vi.advanceTimersByTimeAsync(0);
+    let waited = false;
+    void capture.settled(1000).then(() => (waited = true));
+    await vi.advanceTimersByTimeAsync(999);
+    expect(waited).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(waited).toBe(true);
+    // The stream itself still has the rest of its budget.
+    expect(capture.stream!.state).not.toBe('closed');
+    let early = false;
+    void capture.settled(1000).then(() => (early = true));
+    await vi.advanceTimersByTimeAsync(100);
+    FakeWebSocket.last.say({ type: 'done' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(early).toBe(true);
+    expect(capture.complete()).toBe(true);
   });
 
   it('has no language once refused for good, and is not complete', async () => {

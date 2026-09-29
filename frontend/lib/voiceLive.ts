@@ -27,7 +27,8 @@
  *     commits, late and repeated events are ignored);
  *   - mergeLiveTranscript: the durable preview and the live words as one text;
  *   - chooseFinalText: which of the two transcripts goes into the draft at
- *     Stop (the live one for Hindi and Hinglish, when it heard everything);
+ *     Stop (the live one for Hindi and Hinglish, when it heard everything and
+ *     the English-only model wrote none of it);
  *   - attachPcmTap: the worklet on the meter's own AudioContext;
  *   - LiveStream: the socket (subprotocol techsara.voice.v1, reconnect with
  *     resume, backpressure, ping, client_stats, a language change);
@@ -79,6 +80,20 @@ export const LIVE_HIGH_WATER_BYTES = 256 * 1024;
 export const LIVE_LOW_WATER_BYTES = 64 * 1024;
 /** After Stop, the live stream gets this long to deliver its last words. */
 export const LIVE_FINISH_BUDGET_MS = 3000;
+/**
+ * Once the full pass is in, how much longer its insert may wait for the live
+ * stream's last words, and only while they could still decide which
+ * transcript goes in (`liveMayStillBeChosen`). A stream not done by then
+ * counts as incomplete, and the full pass goes in. Waiting out the whole
+ * finish budget held every insert up to 3 s behind a stream slow to say
+ * `done` (review, 2026-09-30).
+ */
+export const LIVE_SETTLE_WAIT_MS = 1000;
+/**
+ * A language chosen mid-recording replaces the connection only once no other
+ * choice came for this long (`LiveStream.setLanguage`).
+ */
+export const LIVE_LANGUAGE_DEBOUNCE_MS = 500;
 /** How long the worklet may take to hand over its last partial frame. */
 export const LIVE_TAP_FLUSH_MS = 300;
 export const LIVE_STATS_INTERVAL_MS = 5000;
@@ -415,11 +430,31 @@ export class LiveTranscript {
 
   /** Everything heard, as one text: what "Insert live transcript" puts in the draft. */
   text(): string {
-    let out = '';
-    for (const utterance of this.list) out = joinPreview(out, utterance.text);
-    if (this.partial) out = joinPreview(out, this.partial.text);
-    return out.trim();
+    const pieces = this.list.map((utterance) => utterance.text);
+    if (this.partial) pieces.push(this.partial.text);
+    return joinPieces(pieces).trim();
   }
+}
+
+/**
+ * Pieces of transcript joined exactly as folding `joinPreview` over them
+ * would join them, in one pass. Its separator depends only on the character
+ * before it and the one after it, so each is decided from the two
+ * neighbouring pieces alone. The fold ran joinPreview's end-of-text test on
+ * everything joined so far at every step: at Stop, an hour of dictation
+ * (10,000 utterances, 216,659 characters) held the main thread for a second
+ * (review, 2026-09-30).
+ */
+export function joinPieces(pieces: readonly string[]): string {
+  const out: string[] = [];
+  let previous = '';
+  for (const piece of pieces) {
+    if (!piece) continue;
+    if (previous) out.push(spaceBetween(previous, piece));
+    out.push(piece);
+    previous = piece;
+  }
+  return out.join('');
 }
 
 // ---------------------------------------------------------------------------
@@ -532,9 +567,7 @@ export function mergeLiveTranscript(
     pieces.push(u.text);
     chars += u.text.length + 1;
   }
-  let text = '';
-  for (let i = pieces.length - 1; i >= 0; i -= 1) text = joinPreview(text, pieces[i]!);
-  text = tailOf(text, tailChars);
+  const text = tailOf(joinPieces(pieces.reverse()), tailChars);
   const partial = live.partial && shown(live.partial) ? live.partial.text : '';
   return { settled, held, live: text, partial };
 }
@@ -617,8 +650,9 @@ export function devanagariShare(text: string): number {
 }
 
 /**
- * THE FINAL-TEXT POLICY (build spec section 10, which keeps 9B). Which
- * transcript goes into the draft once the full pass is done.
+ * THE FINAL-TEXT POLICY (build spec section 10, amended by section 12 on
+ * 2026-09-30). Which transcript goes into the draft once the full pass is
+ * done.
  *
  * Measured 2026-09-29 on 34 minutes of Hindi-English lectures (MUCS), same
  * normaliser: whisper-large-v3, the full pass, 40.2% document WER with script
@@ -628,32 +662,48 @@ export function devanagariShare(text: string): number {
  * model) and the full pass is clearly ahead on FLEURS-en (6.81% against
  * 10.16%).
  *
- * So a Hindi or Hinglish session (the live words are at least 20% Devanagari
- * letters, the person chose Hindi, or whisper heard Hindi or Urdu while the
- * person had not chosen English: `isHindiSession`) gets the
- * LIVE transcript, but only a complete one: a live stream that missed part of
- * the recording never stands in for the whole of it. Everything else — English
- * above all, and any language this was not measured on — gets the full pass,
- * as before live dictation existed.
+ * So a Hindi or Hinglish session (`isHindiSession`) gets the LIVE transcript,
+ * but only a complete one that the English-only model had no part in. A live
+ * stream that missed part of the recording never stands in for the whole of
+ * it. A stream switched from English to Hindi mid-recording still holds what
+ * the English model made of the speech before the switch (the new stream
+ * resumes after the last final), so the full pass goes in, and the live text
+ * is one click away. Everything else — English above all, and any language
+ * this was not measured on — gets the full pass, as before live dictation
+ * existed.
  */
 export function chooseFinalText(input: {
   liveText: string;
   liveComplete: boolean;
+  /**
+   * The English-only model committed some of the live words (a connection
+   * that asked for "en": `LiveStream.englishModelFinals`). Absent is none.
+   */
+  englishModelFinals?: boolean;
   /** The language the live stream was asked for at the end (the bar's control). */
   userLanguage: VoiceLanguage | null;
   /** The full pass's language, as the session state's language_code (or its name). */
   whisperLanguage: string | null | undefined;
 }): TranscriptSource {
-  if (!input.liveText.trim() || !input.liveComplete) return 'durable';
+  if (!input.liveText.trim() || !input.liveComplete || input.englishModelFinals) return 'durable';
   return isHindiSession(input) ? 'live' : 'durable';
 }
 
 /**
- * Section 10's test for a Hindi or Hinglish session, with one refinement:
- * whisper hearing Hindi or Urdu does not count when the person chose English.
- * "en" puts the live stream on the English-only model (spec section 8A),
- * which cannot write Hindi at all, and the 19.4% above was measured on the
- * multilingual one; the full pass is then the only transcript that tried.
+ * Spec 12's test for a Hindi or Hinglish session: the person chose Hindi, or
+ * at least a fifth of the live words' letters are Devanagari, or whisper heard
+ * Hindi or Urdu while the language was left on Auto.
+ *
+ * THE ENGLISH EXCEPTION (spec 12, the spec owner's amendment of section 10,
+ * 2026-09-30 02:20). Whisper hearing Hindi or Urdu does not make a Hindi
+ * session when the person chose English. "en" puts the live stream on the
+ * English-only model (spec 8A), which scores about 80% WER on the MUCS
+ * Hindi-English lectures (spec 12), where whisper, the full pass, scored 55.8%
+ * document WER, 40.2% with script set aside (spec 10). For someone who chose
+ * English, whisper's text is the better of the two even when it hears Hindi or
+ * Urdu, and it goes in. Devanagari in the live words still counts: only the
+ * multilingual model writes it (before a switch to English), and
+ * `chooseFinalText` turns down every stream the English model added words to.
  */
 export function isHindiSession(input: {
   liveText: string;
@@ -666,6 +716,27 @@ export function isHindiSession(input: {
     (input.userLanguage !== 'en' && WHISPER_HINDI.has(whisper)) ||
     devanagariShare(input.liveText) >= HINDI_SHARE
   );
+}
+
+/**
+ * Whether the live stream's last words could still make `chooseFinalText`
+ * pick the live transcript. That is the one reason for the insert to wait for
+ * them once the full pass is in (components/useVoiceRecorder.ts, at most
+ * LIVE_SETTLE_WAIT_MS). They cannot once the English-only model has committed
+ * words, nor without a stream still able to finish (`language` null). Nor
+ * when the rest is heard in English with under a fifth of the letters so far
+ * Devanagari: that model writes no Devanagari, any word it adds is an
+ * English-model final, and the English choice keeps whisper's language out of
+ * the decision. Whatever still arrives then, the full pass goes in.
+ */
+export function liveMayStillBeChosen(input: {
+  liveText: string;
+  englishModelFinals: boolean;
+  /** The stream's language (`LiveCapture.language`): the one the words still to come are heard in. */
+  language: VoiceLanguage | null;
+}): boolean {
+  if (input.englishModelFinals || input.language === null) return false;
+  return input.language !== 'en' || devanagariShare(input.liveText) >= HINDI_SHARE;
 }
 
 /**
@@ -890,6 +961,12 @@ export class LiveStream {
   private attempt = 0;
   /** What the next `start` asks for; the bar's control changes it mid-recording. */
   private language: VoiceLanguage;
+  /** What this connection's `start` asked for; null until it is sent. */
+  private sentLanguage: VoiceLanguage | null = null;
+  /** A final with words came back on a connection that asked for "en" (`englishModelFinals`). */
+  private englishFinals = false;
+  /** A language change waiting out LIVE_LANGUAGE_DEBOUNCE_MS (`setLanguage`). */
+  private languageTimer: ReturnType<typeof setTimeout> | null = null;
   /** A connection started after audio no final covered: those words were never heard. */
   private skipped = false;
   private ended: LiveEnd | null = null;
@@ -956,24 +1033,77 @@ export class LiveStream {
   }
 
   /**
+   * Whether the English-only model wrote any of the committed words: a final
+   * with words came back on a connection whose `start` asked for "en". A
+   * language switch keeps them (the new stream resumes after the last final),
+   * so a stream switched from English to Hindi still holds the English model's
+   * attempt at whatever was said before the switch, and the final-text policy
+   * keeps the full pass (spec 12). A final the old connection sends during a
+   * switch's debounce is its model's, whatever the new choice.
+   */
+  get englishModelFinals(): boolean {
+    return this.englishFinals;
+  }
+
+  /**
    * The person picked another language mid-recording. The engine reads the
    * language once, at `start`, so a new stream in the new language takes over,
    * through the same resume a dropped connection uses: it starts where the last
    * final ended, so the committed words stay as they are and the utterance
    * being spoken is heard again, in the new language. Whatever the old
    * connection still sends is ignored (it is no longer this.ws), and `next_u`
-   * carries the numbering on, so no word is lost or shown twice. Waiting out a
-   * backoff, the next attempt simply says the new language; after Stop it no
-   * longer matters.
+   * carries the numbering on, so no word is lost or shown twice.
+   *
+   * DEBOUNCED (review, 2026-09-30). The choice counts at once: any `start`
+   * sent from now on says it. The connection in use is only replaced once no
+   * other choice has come for LIVE_LANGUAGE_DEBOUNCE_MS, and not at all when
+   * the choice is back to the language it asked for. The control is a set of
+   * native radios, so a held arrow key walks auto -> en -> hi -> auto, one
+   * change per key repeat: 24 presses 33 ms apart opened 24 sockets in under a
+   * second, each one counted against the gateway's 30 connections a minute and
+   * each one an engine stream on the worker, and a real network drop in that
+   * minute would then have been refused. Waiting out a backoff, the next
+   * attempt simply says the new language. After Stop the choice no longer
+   * matters (`finish`).
    */
   setLanguage(language: VoiceLanguage): void {
+    if (this.finishing || this.phase === 'closed' || this.phase === 'failed') return;
     if (language === this.language) return;
     this.language = language;
-    if (this.finishing) return;
-    if (this.phase === 'connecting' || this.phase === 'streaming') {
-      this.drop();
-      this.connect();
+    this.clearLanguageTimer();
+    this.languageTimer = setTimeout(() => {
+      this.languageTimer = null;
+      this.applyLanguage();
+    }, LIVE_LANGUAGE_DEBOUNCE_MS);
+  }
+
+  /** The debounce is over: replace the connection if it asked for another language. */
+  private applyLanguage(): void {
+    if (this.finishing || (this.phase !== 'connecting' && this.phase !== 'streaming')) return;
+    // Not open yet (its `start` will say the choice), or back where it was.
+    if (this.sentLanguage === null || this.sentLanguage === this.language) return;
+    this.drop();
+    this.connect();
+  }
+
+  private clearLanguageTimer(): void {
+    if (this.languageTimer !== null) {
+      clearTimeout(this.languageTimer);
+      this.languageTimer = null;
     }
+  }
+
+  /**
+   * Stop came inside a language change's debounce, so the change never reached
+   * the engine: the words still to come are heard in the language the open
+   * connection asked for. That is the language the stream reports from now on,
+   * because the final-text policy is about the model that heard the words. The
+   * choice itself is still this browser's preference for the next recording.
+   */
+  private dropPendingLanguage(): void {
+    if (this.languageTimer === null) return;
+    this.clearLanguageTimer();
+    if (this.ws !== null && this.sentLanguage !== null) this.language = this.sentLanguage;
   }
 
   /**
@@ -1014,6 +1144,7 @@ export class LiveStream {
    */
   finish(budgetMs = LIVE_FINISH_BUDGET_MS): Promise<void> {
     if (this.finished) return this.finished;
+    this.dropPendingLanguage();
     this.finished = new Promise<void>((resolve) => {
       this.resolveFinished = resolve;
     });
@@ -1102,6 +1233,7 @@ export class LiveStream {
     this.paused = false;
     this.flushSent = false;
     this.errorRetryable = null;
+    this.sentLanguage = null;
     this.phase = 'connecting';
     try {
       ws.binaryType = 'arraybuffer';
@@ -1117,6 +1249,7 @@ export class LiveStream {
       // overflowing while it connected has moved its oldest sample since.
       const resume = this.resumePoint();
       this.sent = resume;
+      this.sentLanguage = this.language;
       this.send(ws, JSON.stringify(this.startMessage(resume)));
       this.startTicking();
     };
@@ -1202,6 +1335,8 @@ export class LiveStream {
         : transcript.partialUpdate(u, words, start, end);
     if (!changed) return;
     if (kind === 'final') {
+      // Words committed by the English-only model (an empty final commits none).
+      if (this.sentLanguage === 'en' && words.trim()) this.englishFinals = true;
       this.pendingFinalEnds.push(end);
       if (this.pendingFinalEnds.length > STATS_MAX) this.pendingFinalEnds.shift();
     } else {
@@ -1390,6 +1525,7 @@ export class LiveStream {
 
   private settle(): void {
     this.clearReconnect();
+    this.clearLanguageTimer();
     if (this.finishTimer !== null) {
       clearTimeout(this.finishTimer);
       this.finishTimer = null;
@@ -1592,9 +1728,20 @@ export class LiveCapture {
     return this.finishing;
   }
 
-  /** Resolves once a finish has run its course (at most LIVE_FINISH_BUDGET_MS after the tap). */
-  settled(): Promise<void> {
-    return this.finishing?.done ?? Promise.resolve();
+  /**
+   * Resolves once a finish has run its course (at most LIVE_FINISH_BUDGET_MS
+   * after the tap), or once `withinMs` has passed, whichever comes first.
+   */
+  settled(withinMs?: number): Promise<void> {
+    const done = this.finishing?.done ?? Promise.resolve();
+    if (withinMs === undefined) return done;
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, Math.max(0, withinMs));
+      void done.then(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 
   abort(): void {
@@ -1625,7 +1772,15 @@ export class LiveCapture {
     return this.liveStream?.complete ?? false;
   }
 
-  /** The language the stream asks for now; null with no stream, or one refused for good. */
+  /** Whether the English-only model wrote any of `text()` (LiveStream.englishModelFinals). */
+  englishModelFinals(): boolean {
+    return this.liveStream?.englishModelFinals ?? false;
+  }
+
+  /**
+   * The language the stream asks for now (after Stop, the one its last words
+   * are heard in); null with no stream, or one refused for good.
+   */
   get language(): VoiceLanguage | null {
     const stream = this.liveStream;
     return stream && stream.active ? stream.currentLanguage : null;

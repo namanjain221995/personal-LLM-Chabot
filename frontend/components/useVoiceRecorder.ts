@@ -46,10 +46,12 @@
  *
  * WHICH TEXT GOES IN (2026-09-30). At Stop both transcripts are kept, and the
  * one put into the draft is the full pass's, except for a Hindi or Hinglish
- * session whose live transcript heard the whole recording (lib/voiceLive.ts
- * `chooseFinalText`: on Hinglish lectures whisper had twice Nemotron's word
- * error rate and wrote a fifth of it in Urdu script). A quiet line says which
- * went in and swaps the other in on request.
+ * session whose live transcript heard the whole recording, none of it through
+ * the English-only model (lib/voiceLive.ts `chooseFinalText`: on Hinglish
+ * lectures whisper had twice Nemotron's word error rate and wrote a fifth of
+ * it in Urdu script). A quiet line says which went in and swaps the other in
+ * on request; the full pass's Retry and "Upload the rest" are offered only
+ * while its own text is the one in the draft.
  *
  * The transitions live in lib/voice.ts and are unit-tested without a DOM.
  * What is here is the part that genuinely needs the browser.
@@ -105,12 +107,14 @@ import {
   LIVE_INSERTED_LIVE,
   LIVE_INSERT_LABEL,
   LIVE_INSERT_PARTIAL_LABEL,
+  LIVE_SETTLE_WAIT_MS,
   LIVE_SWAP_EDITED,
   LIVE_SWAP_LABEL,
   LIVE_SWAP_PARTIAL_LABEL,
   LiveCapture,
   chooseFinalText,
   getVoiceLanguage,
+  liveMayStillBeChosen,
   setVoiceLanguage,
   withLiveWords,
   type LiveView,
@@ -180,7 +184,8 @@ export interface VoiceRecorder {
   language: VoiceLanguage | null;
   /**
    * Choose that language: remembered for this browser, and the live stream
-   * starts again in it from the last committed word.
+   * starts again in it from the last committed word once the choice has stood
+   * for half a second.
    */
   setLanguage: (language: VoiceLanguage) => void;
 }
@@ -244,6 +249,31 @@ interface TwoTranscripts {
   liveComplete: boolean;
   offer: VoiceOffer | null;
   backing: Backing;
+}
+
+/** The full pass's Retry or "Upload the rest", over its own words in the draft; null for anything else. */
+function fullPassOffer(offer: VoiceOffer | null, durable: string): VoiceOffer | null {
+  return offer?.kind === 'retranscribe' || offer?.kind === 'upload_rest' ? { ...offer, replaces: durable } : null;
+}
+
+/**
+ * What stays in the outbox while `two.shown` is the transcript in the draft
+ * (build spec section 12). With the full pass in, what it left to do stays
+ * owed over its own words, as before live dictation. With the live words in,
+ * nothing is owed: they have no gap, and they are kept nowhere else, so no
+ * Retry or "Upload the rest" offered after a reload may write over them (the
+ * review's high finding, 2026-09-30: Retry put whisper's Urdu script where a
+ * complete Hindi transcript had been, for good, and the record offered the
+ * same Retry again after a reload). The record goes. One whose audio is held
+ * on this device stays, since held audio is never deleted unasked, but no
+ * longer names text in the draft, so its "Upload the rest" adds the full
+ * transcript instead of replacing anything. A record let go this way is not
+ * written again when the person swaps the full pass in later: that line's
+ * Retry lasts as long as the page.
+ */
+function keepForShown(two: Pick<TwoTranscripts, 'shown' | 'durable' | 'offer'>) {
+  if (two.shown === 'durable') return keepForOffer(two.offer, two.durable);
+  return two.offer?.kind === 'upload_rest' ? { deliveredText: null, offer: null } : null;
 }
 
 export function useVoiceRecorder({
@@ -919,29 +949,31 @@ export function useVoiceRecorder({
   );
 
   /**
-   * WHICH TRANSCRIPT WENT IN (build spec section 10, 2026-09-30). A recording
-   * with a live stream ends with two transcripts, and `chooseFinalText` put one
-   * of them in the draft. One quiet line says which, and its button swaps in
-   * the other, in the same place, for as long as the person has not changed
-   * the words that went in (the composer checks: `exact`). What the full pass
-   * left to do — a Retry for its gaps, "Upload the rest" — stays on the same
-   * line and follows whichever text is in the draft, so a Retry that succeeds
-   * replaces that one.
+   * WHICH TRANSCRIPT WENT IN (build spec sections 10 and 12, 2026-09-30). A
+   * recording with a live stream ends with two transcripts, and
+   * `chooseFinalText` put one of them in the draft. One quiet line says which,
+   * and its button swaps in the other, in the same place, for as long as the
+   * person has not changed the words that went in (the composer checks:
+   * `exact`). What the full pass left to do — a Retry for its gaps, "Upload
+   * the rest" — is offered on the same line only while the full pass is the
+   * text in the draft, and a Retry that succeeds replaces it there. With the
+   * live words in, the line offers the swap alone: they have no gap, and a
+   * Retry would write whisper's text over the only copy of them.
    */
   const transcriptLineRef = useRef<(two: TwoTranscripts) => VoiceFollowUp>(() => {
     throw new Error('transcriptLine is not ready');
   });
   const transcriptLine = useCallback(
     (two: TwoTranscripts): VoiceFollowUp => {
-      const current = two.shown === 'live' ? two.live : two.durable;
-      const other = two.shown === 'live' ? two.durable : two.live;
-      const said = two.shown === 'live' ? LIVE_INSERTED_LIVE : LIVE_INSERTED_FULL_PASS;
-      const swapLabel = two.shown === 'durable' && !two.liveComplete ? LIVE_SWAP_PARTIAL_LABEL : LIVE_SWAP_LABEL;
-      const offer: VoiceOffer | null =
-        two.offer?.kind === 'retranscribe' || two.offer?.kind === 'upload_rest'
-          ? { ...two.offer, replaces: current }
-          : null;
-      const holding = offer ? two.backing : null;
+      const liveIn = two.shown === 'live';
+      const current = liveIn ? two.live : two.durable;
+      const other = liveIn ? two.durable : two.live;
+      const said = liveIn ? LIVE_INSERTED_LIVE : LIVE_INSERTED_FULL_PASS;
+      const swapLabel = !liveIn && !two.liveComplete ? LIVE_SWAP_PARTIAL_LABEL : LIVE_SWAP_LABEL;
+      const owed = fullPassOffer(two.offer, two.durable);
+      const offer = liveIn ? null : owed;
+      // Kept alive while the line shows, whichever text is in: the swap may bring the offer back.
+      const holding = owed ? two.backing : null;
       const swap = () => {
         if (onTranscriptRef.current(other, null, current, true) === false) {
           // Changed since it went in: nothing is swapped, and it is not offered again.
@@ -960,8 +992,9 @@ export function useVoiceRecorder({
           }
           return;
         }
-        if (offer) void settleRecord(two.backing.outbox, two.backing.sessionId, keepForOffer(offer, other));
-        setFollowUp(transcriptLineRef.current({ ...two, shown: two.shown === 'live' ? 'durable' : 'live' }), holding);
+        const next: TwoTranscripts = { ...two, shown: liveIn ? 'durable' : 'live' };
+        void settleRecord(two.backing.outbox, two.backing.sessionId, keepForShown(next));
+        setFollowUp(transcriptLineRef.current(next), holding);
       };
       if (offer) {
         const line = offerLine(offer, 'info', two.backing);
@@ -986,9 +1019,11 @@ export function useVoiceRecorder({
       if (!alive.current) return;
       // The recording is over, and so is its live stream. What it heard is
       // kept for the choice below and for the fallback: the words, whether
-      // they are the whole recording, and the language it was last asked for.
+      // they are the whole recording, whether the English-only model wrote
+      // any of them, and the language it was last asked for.
       const liveText = capture ? capture.text() : '';
       const liveComplete = capture ? capture.complete() : false;
+      const englishModelFinals = capture ? capture.englishModelFinals() : false;
       const userLanguage = capture?.language ?? getVoiceLanguage();
       if (capture) {
         capture.abort();
@@ -1005,12 +1040,17 @@ export function useVoiceRecorder({
         const shown = chooseFinalText({
           liveText,
           liveComplete,
+          englishModelFinals,
           userLanguage,
           whisperLanguage: result.languageCode ?? result.language,
         });
         const inserted = shown === 'live' ? liveText : result.text;
         onTranscriptRef.current(inserted, result.notices.join(' ') || null);
-        void settleRecord(backing.outbox, backing.sessionId, keepFor(result, inserted));
+        void settleRecord(
+          backing.outbox,
+          backing.sessionId,
+          keepForShown({ shown, durable: result.text, offer: result.offer }),
+        );
         if (liveText) {
           setFollowUp(
             transcriptLine({ shown, live: liveText, durable: result.text, liveComplete, offer: result.offer, backing }),
@@ -1151,11 +1191,28 @@ export function useVoiceRecorder({
         peakLevel: meterRan.current ? peakLevel.current : null,
       });
       if (session.current !== s) return; // discarded, or superseded
-      // Before choosing between the two transcripts, or offering the live
-      // words instead, let them finish arriving: the stream's last final and
-      // its `done` come within LIVE_FINISH_BUDGET_MS of Stop, normally long
-      // before the stored recording's own finish, which never waited for them.
-      if (capture) await capture.settled();
+      // The live stream's last final and its `done` come within
+      // LIVE_FINISH_BUDGET_MS of Stop, normally long before the stored
+      // recording's own finish, which never waits for them. When the stored
+      // transcript could not be had, the live words are all the person may
+      // get: every one of them is let arrive. With the stored transcript in,
+      // they are waited for only while they could still decide which of the
+      // two goes in (never while the rest is heard in English:
+      // `liveMayStillBeChosen`), and then for LIVE_SETTLE_WAIT_MS at most; a
+      // stream not done by then counts as incomplete (review, 2026-09-30: a
+      // live stream slow to say `done` held every insert up to 3 s).
+      if (capture && result.kind === 'error') await capture.settled();
+      else if (
+        capture &&
+        result.kind === 'text' &&
+        liveMayStillBeChosen({
+          liveText: capture.text(),
+          englishModelFinals: capture.englishModelFinals(),
+          language: capture.language,
+        })
+      ) {
+        await capture.settled(LIVE_SETTLE_WAIT_MS);
+      }
       if (session.current !== s) return;
       session.current = null;
       deliver(result, { outbox, sessionId: s.sessionId }, capture);
@@ -1944,8 +2001,10 @@ export function useVoiceRecorder({
    * The bar's language control. The choice is remembered for this browser
    * (the next recording starts in it), and a recording under way hears the
    * rest in it: the live stream starts again from the last committed word
-   * (LiveStream.setLanguage). The stored recording and its full pass are not
-   * touched; whisper always detects the language itself.
+   * once no other choice has come for LIVE_LANGUAGE_DEBOUNCE_MS
+   * (LiveStream.setLanguage), so arrowing across the options opens one
+   * connection, not one per key. The stored recording and its full pass are
+   * not touched; whisper always detects the language itself.
    */
   const setLanguage = useCallback((language: VoiceLanguage) => {
     setVoiceLanguage(language);
