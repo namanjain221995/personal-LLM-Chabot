@@ -170,8 +170,11 @@ FAKE_WORKER = textwrap.dedent(
     #!/usr/bin/env python3
     # wcpp-worker's protocol, with canned answers: silence scores 0.71 (the measured digital-silence
     # number), anything else is "hello world" in English; n_samples == 12345 makes it die and
-    # n_samples == 23456 makes it hang.
-    import json, struct, sys, time
+    # n_samples == 23456 makes it hang. FAKE_WCPP_NO_START makes it exit before its ready line,
+    # like a decoder killed while it loads the model.
+    import json, os, struct, sys, time
+    if os.environ.get("FAKE_WCPP_NO_START"):
+        sys.exit(1)
     print(json.dumps({"ready": True, "load_ms": 1.0, "system_info": "fake"}), flush=True)
     for line in sys.stdin.buffer:
         head = json.loads(line)
@@ -334,6 +337,30 @@ def test_a_dead_decoder_is_a_503_and_the_next_clip_restarts_it(server):
     assert r.status_code == 503
     assert _post(client, _wav(1.0)).json()["text"] == "hello world"
     assert client.get("/health").json()["worker_failures"] == 0
+
+
+def test_a_decoder_that_cannot_restart_is_a_503_counted_toward_the_restart(server, monkeypatch):
+    """Found end to end on the worker (2026-09-30): a decoder killed while it was starting made
+    _start_worker raise, which answered 500 and was never counted. So a replica whose decoder could
+    no longer start (its model gone from the bind mount, a load that dies) answered 500 to every
+    clip while the process stayed up and Docker never restarted it."""
+    module, client = server
+    exits = []
+    monkeypatch.setattr(module, "_exit_soon", lambda *args, **kwargs: exits.append(args))
+    # Every decoder started from here on dies before its ready line.
+    monkeypatch.setenv("FAKE_WCPP_NO_START", "1")
+    assert _post(client, _wav(0, samples=12345)).status_code == 503  # the running decoder dies
+    for failures in (2, 3):
+        r = _post(client, _wav(1.0))  # its restart fails
+        assert r.status_code == 503, r.text
+        assert "did not restart" in r.json()["detail"]
+        assert client.get("/health").json()["worker_failures"] == failures
+    # Three in a row: the process is told to end, so Docker restarts it and re-runs the start-up
+    # checks, and until then /health says why it is not ready.
+    assert len(exits) == 1
+    health = client.get("/health").json()
+    assert health["ready"] is False and "3 times in a row" in health["error"]
+    assert _post(client, _wav(1.0)).status_code == 503
 
 
 def test_a_hung_decoder_is_killed_at_its_bound_and_the_next_clip_gets_a_fresh_one(server):

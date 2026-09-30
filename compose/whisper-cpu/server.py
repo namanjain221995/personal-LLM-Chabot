@@ -206,7 +206,16 @@ def _ask_worker(audio: np.ndarray, language: Optional[str], *, timestamps: bool,
     with _worker_io:
         proc = _state.get("worker")
         if proc is None or proc.poll() is not None:
-            _start_worker()
+            try:
+                _start_worker()
+            except RuntimeError as exc:
+                # A decoder that cannot be RESTARTED is the same failure as one that dies in a
+                # decode: a 503, counted, so three in a row end the process and Docker restarts
+                # it, and the restart re-runs the start-up checks (the model file, its SHA-256)
+                # and puts any failure on /health. Before this it was a 500 that was never
+                # counted: a replica whose decoder could no longer start answered 500 to every
+                # clip while the process stayed up (found on the worker, 2026-09-30).
+                raise WorkerDied(f"decoder did not restart: {exc}") from None
             proc = _state["worker"]
         header = {
             "n_samples": int(audio.size),
