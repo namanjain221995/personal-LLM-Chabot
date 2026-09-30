@@ -384,6 +384,10 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
         "plan": set(DECIDE_PLANS),
         "outcome": set(STEP_OUTCOMES),
     },
+    # My files (app/myfiles.py, 2026-09-30): which read, and how it ended.
+    # Never a file name, a user or a query — those are the person's content.
+    "myfiles_list_seconds": {"view": set(MYFILES_VIEWS)},
+    "myfiles_list_total": {"view": set(MYFILES_VIEWS), "result": set(MYFILES_RESULTS)},
     # Engine first token to the SSE write that carries it — the part of the
     # 105 -> 88 tok/s relay loss that is time, not throughput.
     "relay_overhead_seconds": dict(_ROUTE_EFFORT),
@@ -398,10 +402,6 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
         "category": set(FAST_LANE_CATEGORIES),
         "veto": set(FAST_LANE_VETOES),
     },
-    # My files (app/myfiles.py, 2026-09-30): which read, and how it ended.
-    # Never a file name, a user or a query — those are the person's content.
-    "myfiles_list_seconds": {"view": set(MYFILES_VIEWS)},
-    "myfiles_list_total": {"view": set(MYFILES_VIEWS), "result": set(MYFILES_RESULTS)},
 }
 _ALLOWED_BY_METRIC.update(_LABELS_BY_METRIC)
 

@@ -259,16 +259,23 @@ sum(rate(myfiles_list_total{result="error"}[15m]))
 
 - **Orchestrator:** `tests/test_myfiles_api.py` (61 tests) and
   `tests/test_uploads_video_download.py` (6).
-  - 39 of the first 45 failed on the base commit `fd6e9beb`; the other 6 pin
-    behaviour that must not change.
+  - Run against the code of `main` 30cee881 (the branch rebased onto it, the
+    two test files copied in), 61 of the 67 fail: the routes answer 404 and a
+    swept video 410. The other 6 pass on both sides because they pin
+    behaviour that must not change (the admin views, another person's 404,
+    the 410 when both stores are empty, document and dataset downloads, the
+    writers' `notes` markers).
   - The 20 single-kind tests (4 of them failed before the `UNION` fix) and the
-    metrics test were added after the end-to-end run.
+    metrics test were added after the first end-to-end run.
 - **Frontend:**
   - `tests/my-files-lib.test.ts`, `tests/my-files-page.test.tsx` and
     `tests/my-files-proxy.test.ts`;
   - `tests/account-menu.test.tsx`, which pins the menu entry above Recordings.
+  - On the code of `main` 30cee881 all four files fail (three modules do not
+    exist; the menu has no "My files").
 - **End to end, in headless Chromium** against a throwaway stack on the
-  worker:
+  worker, run twice: on the first build (2026-09-30 morning) and again on the
+  commit rebased onto `main` 30cee881 (evening), with the same results:
   - Setup: loopback ports 30190-30192, a private database, and the CI stub
     engine. Member 1 attached a PDF, a CSV, a ZIP, an MP3, an MP4 and a picture
     through the composer, and dictated 10 s through Chrome's fake microphone.
@@ -286,6 +293,13 @@ sum(rate(myfiles_list_total{result="error"}[15m]))
   - After the workspace copies were removed: the PDF showed Text only with a
     working text preview, the CSV showed Summary only, and the MP4 still
     downloaded with an identical sha256.
+  - The light theme (`html.light`) draws the page from the same tokens, on a
+    desktop and a phone.
+  - The chat around it still renders: one streamed answer with a table, a
+    fenced code block and a mermaid diagram drew all three, and "give it in
+    docs" opened the artifact panel on the Word file it made. (The stub
+    engine was a throwaway copy that answers that markdown to a marked
+    prompt; nothing of it is committed.)
 - **Two defects were found only end to end, and are now fixed and pinned:**
   1. `?kind=recording` was a 500. A `UNION` takes its column names from its
      first branch, and that filter leaves the recordings branch alone.
