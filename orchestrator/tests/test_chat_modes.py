@@ -95,10 +95,19 @@ def test_effort_is_expressed_as_thinking_not_a_system_line():
 
 
 def test_thinking_body_is_the_chat_template_switch():
+    # With thinking on, the level rides along (2026-09-30: the 27B's template
+    # reads reasoning_effort, xhigh|medium|low); an unnamed level is Think's.
     assert llm.thinking_body(True) == {
-        "chat_template_kwargs": {"enable_thinking": True}
+        "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "medium"}
     }
+    assert llm.thinking_body(True, "max") == {
+        "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "xhigh"}
+    }
+    # Thinking off sends the switch alone: the template never reads the level.
     assert llm.thinking_body(False) == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+    assert llm.thinking_body(False, "max") == {
         "chat_template_kwargs": {"enable_thinking": False}
     }
 
@@ -196,9 +205,9 @@ def test_a_legacy_model_value_does_not_veto_the_chosen_effort(monkeypatch):
     kwargs = rec["chat_kwargs"]
     assert kwargs["model"] == settings.llm_model
     assert kwargs["messages"] == [{"role": "user", "content": "hi"}]
-    assert kwargs["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}, (
-        "effort=high (alias -> think) must reason, whatever `model` says"
-    )
+    assert kwargs["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "medium"}
+    }, "effort=high (alias -> think) must reason, at Think's level, whatever `model` says"
     # ...and Fast is still Fast on the same legacy value: it is the EFFORT
     # that switches the reasoning pass, at every choice.
     _, rec_fast = _collect_events(

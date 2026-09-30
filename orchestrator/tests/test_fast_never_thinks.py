@@ -154,7 +154,7 @@ async def _drain(gen):
 def test_reasoning_extra_body_is_off_while_a_fast_turn_is_marked():
     caps = settings.main_capabilities
     assert llm.reasoning_extra_body(caps, True) == {
-        "chat_template_kwargs": {"enable_thinking": True}
+        "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "medium"}
     }
     llm.mark_fast_turn(True)
     assert llm.fast_turn() is True

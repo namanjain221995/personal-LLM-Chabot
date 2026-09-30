@@ -36,9 +36,10 @@ And `guard_public_id()` holds the other side: a public id is TechSara
 vocabulary (`techsara-…`), never an internal name, URL or host.
 
 READ AT CALL TIME, NEVER CAPTURED AT IMPORT. The main model has been swapped
-under a running deployment more than once (27B → 35B-A3B, 2026-08-29), and a
-module-level constant would keep naming the old checkpoint in the usage
-ledger and in `/v1/models` until someone noticed. The ceilings come from
+under a running deployment more than once (27B → 35B-A3B, 2026-08-29; back to
+a 27B, nvidia/Qwen3.8-27B-NVFP4, 2026-09-30), and a module-level constant
+would keep naming the old checkpoint in the usage ledger and in `/v1/models`
+until someone noticed. The ceilings come from
 `settings` and from each engine's SERVED window (narrow-only, see
 `note_served_window`), so the documented ceiling and the served one cannot
 disagree in the direction that produces an engine 400.
@@ -66,6 +67,14 @@ log = logging.getLogger(__name__)
 #: one: adding an id is a contract change, a documentation change and a scope
 #: review, so it happens here in a reviewed diff. The ORDER is the order of
 #: `/v1/models`, and the first is the flagship the OpenAPI examples use.
+#: The flagship chat id names the PRODUCT, not a checkpoint: since 2026-09-30
+#: it is answered by nvidia/Qwen3.8-27B-NVFP4 (`settings.llm_model`, read at
+#: call time by `_build_main`), and it was deliberately NOT renamed. An id is
+#: a contract: keys' allowlists (`api_projects.allowed_models`), the
+#: `public_models` disable rows — narrow-only, so a new id would arrive
+#: UN-disabled on a deployment that had withdrawn this one — the usage
+#: ledger's history and every client that names it would all have to follow.
+#: A rename is an owner decision with its own migration, not part of a swap.
 TECHSARA_35B = "techsara-35b"
 TECHSARA_8B_VISION = "techsara-8b-vision"
 TECHSARA_OCR = "techsara-ocr"
@@ -501,8 +510,9 @@ def guard_internal_target(target: str, engine: str = ENGINE_MAIN) -> str:
     hostname of any engine); the checkpoint name of any OTHER public engine;
     and the checkpoint of an internal-only service (the agent, vision) unless
     it is this engine's own — VISION_MODEL defaults to the main checkpoint
-    because Qwen3.6-35B-A3B is a vision-language model, and the agent defaults
-    to the router's.
+    because the main model (nvidia/Qwen3.8-27B-NVFP4 since 2026-09-30, the
+    Qwen3.6-35B-A3B before it) is a vision-language model, and the agent
+    defaults to the router's.
 
     Called on every construction of a `PublicModel`, not only on the entries
     that exist today, because the next entry will be added by someone reading

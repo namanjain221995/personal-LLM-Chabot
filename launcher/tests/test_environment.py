@@ -32,6 +32,7 @@ from techsara_cli.environment import (
     effective_user_environment,
     has_salesforce_credentials,
     main_context_notices,
+    main_served_names,
     prepare_controller_secrets,
     prepare_local_secrets,
     profile_context_length,
@@ -1109,6 +1110,48 @@ class MainContextWindowTests(EnvironmentCase):
         # The cluster line is the only extra narration beyond the window ones.
         self.assertEqual(len(self._notices(values, generated)), 1, "no TP=1 estimate in dual mode")
 
+    def test_the_27b_main_model_at_one_million_tokens_needs_an_18_gib_budget(self) -> None:
+        """Production since 2026-09-30: nvidia/Qwen3.8-27B-NVFP4 at MAIN_MODEL_MAX_LEN=1000000.
+
+        NESTED_CONFIG carries that checkpoint's text_config geometry (rev
+        482ca0f3, identical to the RadixArk repack this fixture was written
+        from): 16 of 64 layers page a KV cache, 4 KV heads x 256, so 16,384
+        bytes/token on each node at TP=2. The 8 GiB budget the 35B ran on
+        holds 461,373 of those tokens, so `up` must refuse it with the fix in
+        the message rather than let vLLM refuse the window mid-start; 18 GiB
+        is the smallest whole budget that holds one full window.
+        """
+        self.assertEqual(self.profile.main_model.id, "nvidia/Qwen3.8-27B-NVFP4")
+        self._write_main_config()
+        window = {**self.DUAL, "MAIN_MODEL_MAX_LEN": "1000000"}
+        with self.assertRaisesRegex(
+            TechSaraError,
+            r"CLUSTER_KV_CACHE_MEMORY_GIB=8 holds 461,373 tokens at TP=2 .*"
+            r"set CLUSTER_KV_CACHE_MEMORY_GIB=18 on both nodes",
+        ):
+            self._generate({**window, "CLUSTER_KV_CACHE_MEMORY_GIB": "8"})
+        with self.assertRaisesRegex(TechSaraError, "set CLUSTER_KV_CACHE_MEMORY_GIB=18"):
+            self._generate({**window, "CLUSTER_KV_CACHE_MEMORY_GIB": "17"})
+        generated = self._generate({**window, "CLUSTER_KV_CACHE_MEMORY_GIB": "18"})
+        self.assertEqual(generated["MAIN_MODEL"], "nvidia/Qwen3.8-27B-NVFP4")
+        self.assertEqual(generated["VISION_MODEL"], "nvidia/Qwen3.8-27B-NVFP4")
+        self.assertEqual(generated["MODEL_MAX_CONTEXT"], "1000000")
+        self.assertEqual(generated["MAIN_MODEL_KV_BYTES_PER_TOKEN"], "32768")
+        engine = shlex.split(generated["CLUSTER_ENGINE_ARGS"])
+        self.assertEqual(engine[engine.index("--max-model-len") + 1], "1000000")
+        self.assertEqual(engine[engine.index("--kv-cache-memory-bytes") + 1], str(18 * 1024 ** 3))
+        rope = json.loads(engine[engine.index("--hf-overrides") + 1])["text_config"]["rope_parameters"]
+        # 1,000,000 / 262,144 = 3.8147, rounded UP to two decimals.
+        self.assertEqual(rope["factor"], 3.82)
+        self.assertEqual(rope["rope_type"], "yarn")
+        self.assertEqual(rope["original_max_position_embeddings"], 262144)
+        # The multimodal rope layout survives the override: dropping it would
+        # rebuild the rotary embedding wrong for every image.
+        self.assertEqual(rope["mrope_section"], [11, 11, 10])
+        self.assertIs(rope["mrope_interleaved"], True)
+        # MTP stays off unless .env asks for it (the GDN spec-decode fault).
+        self.assertNotIn("--speculative-config", engine)
+
     def test_a_window_the_kv_pool_cannot_hold_is_refused_with_the_arithmetic(self) -> None:
         self._write_main_config()
         with self.assertRaises(TechSaraError) as caught:
@@ -1138,6 +1181,50 @@ class MainContextWindowTests(EnvironmentCase):
         # 32 paged layers, 8 KV heads, head_dim 128, fp8.
         self.assertEqual(generated["MAIN_MODEL_KV_BYTES_PER_TOKEN"], str(2 * 32 * 8 * 128))
         self.assertIn('"factor":2.0', generated["MAIN_MODEL_ROPE_OVERRIDE"])
+
+
+class MainServedNamesTests(EnvironmentCase):
+    """MAIN_MODEL_SERVED_ALIASES -> MAIN_MODEL_SERVED_NAMES (2026-09-30).
+
+    The swap to nvidia/Qwen3.8-27B-NVFP4 renamed the served model, and callers
+    outside this repository name it on the raw port (the litellm-dgx proxy's
+    config.yaml maps to Qwen/Qwen3.6-35B-A3B-NVFP4). An opt-in alias keeps
+    them answering; unset, the list is MAIN_MODEL alone.
+    """
+
+    OLD = "Qwen/Qwen3.6-35B-A3B-NVFP4"
+    NEW = "nvidia/Qwen3.8-27B-NVFP4"
+
+    def test_unset_is_main_model_alone(self) -> None:
+        self.assertEqual(main_served_names({}, self.NEW), self.NEW)
+        self.assertEqual(main_served_names({"MAIN_MODEL_SERVED_ALIASES": "  "}, self.NEW), self.NEW)
+
+    def test_aliases_follow_main_model_once_each(self) -> None:
+        self.assertEqual(
+            main_served_names({"MAIN_MODEL_SERVED_ALIASES": f"{self.OLD},{self.NEW}  {self.OLD} bare-name"}, self.NEW),
+            f"{self.NEW} {self.OLD} bare-name",
+        )
+
+    def test_anything_that_is_not_a_name_is_refused(self) -> None:
+        for bad in ("$(id)", "a/b/c", "--host", "x;y", "`id`", "a b/c\\d"):
+            with self.subTest(alias=bad), self.assertRaisesRegex(TechSaraError, "is not a model name"):
+                main_served_names({"MAIN_MODEL_SERVED_ALIASES": bad}, self.NEW)
+
+    def test_the_generated_key_carries_the_list_and_main_model_stays_the_primary(self) -> None:
+        profile = select_profile(nvidia(128, dgx=True), REPO_ROOT)
+        cache = self.root / "cache"
+        plain = build_generated_environment(
+            self.layout, profile, self.installs(profile, cache), cache_root=cache, user_environment={},
+        )
+        self.assertEqual(plain["MAIN_MODEL"], self.NEW)
+        self.assertEqual(plain["MAIN_MODEL_SERVED_NAMES"], self.NEW)
+        aliased = build_generated_environment(
+            self.layout, profile, self.installs(profile, cache), cache_root=cache,
+            user_environment={"MAIN_MODEL_SERVED_ALIASES": self.OLD},
+        )
+        self.assertEqual(aliased["MAIN_MODEL"], self.NEW)
+        self.assertEqual(aliased["VISION_MODEL"], self.NEW)
+        self.assertEqual(aliased["MAIN_MODEL_SERVED_NAMES"], f"{self.NEW} {self.OLD}")
 
 
 class SidecarMemoryKnobTests(EnvironmentCase):

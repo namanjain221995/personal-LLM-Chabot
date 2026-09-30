@@ -305,7 +305,8 @@ whether a port answers. It comes from the **engine controller**
 watches the worker rank through the sentinel on Spark 2, and publishes one of
 exactly nine states. The contract is
 [`availability/CONTRACT.md`](availability/CONTRACT.md) (v2, **strict
-one-model mode**: only `nvidia/Qwen3.6-35B-A3B-NVFP4` ever answers a person;
+one-model mode**: only the main model — `nvidia/Qwen3.8-27B-NVFP4` since
+2026-09-30 — ever answers a person;
 there is no fallback model, and while the primary is not READY the
 orchestrator holds every accepted request in a durable queue and resumes the
 same generation when READY returns). This table is the operator's view of it.

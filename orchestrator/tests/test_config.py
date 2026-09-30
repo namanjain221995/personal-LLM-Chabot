@@ -15,7 +15,8 @@ _SIDECAR_ENV = (
 def test_main_model_default_matches_spec(monkeypatch):
     monkeypatch.delenv("MAIN_MODEL", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
-    assert Settings().llm_model == "Qwen/Qwen3.6-35B-A3B-NVFP4"
+    # The main model since 2026-09-30 (owner decision, no rollback).
+    assert Settings().llm_model == "nvidia/Qwen3.8-27B-NVFP4"
 
 
 def test_main_model_env_is_honored(monkeypatch):
@@ -35,7 +36,7 @@ def test_reranker_model_env_is_honored(monkeypatch):
 
 
 def test_vllm_sidecar_defaults_match_design(monkeypatch):
-    for name in _SIDECAR_ENV:
+    for name in _SIDECAR_ENV + ("MAIN_MODEL", "LLM_MODEL"):
         monkeypatch.delenv(name, raising=False)
     s = Settings()
     # Classification + agent sub-steps run on the small model again.
@@ -43,9 +44,25 @@ def test_vllm_sidecar_defaults_match_design(monkeypatch):
     assert s.agent_base_url == s.router_base_url
     assert s.router_model == "Qwen/Qwen3-VL-8B-Instruct-FP8"
     assert s.vision_base_url == "http://vllm:30000/v1"
-    assert s.vision_model == "Qwen/Qwen3.6-35B-A3B-NVFP4"
+    assert s.vision_model == "nvidia/Qwen3.8-27B-NVFP4"
     assert s.embed_base_url == "http://vllm-embed:30003/v1"
     assert s.embed_model == "Qwen/Qwen3-Embedding-0.6B"
+
+
+def test_vision_follows_the_main_model_unless_named(monkeypatch):
+    """The main model reads images, so VISION_MODEL defaults to MAIN_MODEL —
+    a literal default kept naming the replaced 35B after the 2026-09-30 swap."""
+    monkeypatch.delenv("VISION_MODEL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.setenv("MAIN_MODEL", "nvidia/Qwen3.8-27B-NVFP4")
+    assert Settings().vision_model == "nvidia/Qwen3.8-27B-NVFP4"
+    monkeypatch.setenv("MAIN_MODEL", "some/other-main")
+    assert Settings().vision_model == "some/other-main"
+    # An explicit VISION_MODEL still wins, and an empty one is not a name.
+    monkeypatch.setenv("VISION_MODEL", "some/vision-engine")
+    assert Settings().vision_model == "some/vision-engine"
+    monkeypatch.setenv("VISION_MODEL", "")
+    assert Settings().vision_model == "some/other-main"
 
 
 def test_vllm_sidecar_env_overrides_and_trailing_slash(monkeypatch):

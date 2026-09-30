@@ -7,8 +7,9 @@
  * sentence from `describe(plan)` — "Planning steps and searching the web" —
  * and then never change. In Max that line can sit there for minutes: measured
  * on this deployment, a 23,520-character paste took 213 s before the first
- * step event arrived, because Max runs several full passes of a 35B model
- * before it has anything to show. A frozen sentence for three and a half
+ * step event arrived, because Max runs several full passes of the main model
+ * (then a 35B MoE; since 2026-09-30 a dense 27B, slower still) before it has
+ * anything to show. A frozen sentence for three and a half
  * minutes reads as a hung app.
  *
  * What it does NOT do is invent progress. The backend sends no events during

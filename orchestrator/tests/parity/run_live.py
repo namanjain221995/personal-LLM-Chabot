@@ -38,8 +38,9 @@ sys.path.insert(0, HERE)
 
 os.environ.setdefault("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
 os.environ.setdefault("OPENAI_API_KEY", "x")
-os.environ.setdefault("MAIN_MODEL", "Qwen/Qwen3.6-35B-A3B-NVFP4")
-os.environ.setdefault("LLM_MODEL", "Qwen/Qwen3.6-35B-A3B-NVFP4")
+# The served main model since 2026-09-30.
+os.environ.setdefault("MAIN_MODEL", "nvidia/Qwen3.8-27B-NVFP4")
+os.environ.setdefault("LLM_MODEL", "nvidia/Qwen3.8-27B-NVFP4")
 
 
 def gpu_idle(timeout_s: float = 900.0) -> None:

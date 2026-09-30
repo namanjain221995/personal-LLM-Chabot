@@ -215,13 +215,12 @@
       "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
     },
     "dgx-qwen38-27b-nvfp4": {
-      "id": "RadixArk/Qwen3.8-27B-NVFP4",
-      "served_id": "Qwen/Qwen3.8-27B-NVFP4",
-      "provider": "RadixArk",
-      "revision": "554ebba9b5f1b79dc11246341960360e6ef05ef4",
+      "id": "nvidia/Qwen3.8-27B-NVFP4",
+      "provider": "NVIDIA",
+      "revision": "482ca0f3832238542f8f5295dde86b5f22711d80",
       "backend": "vllm-cuda",
-      "quantization": "NVFP4 / ModelOpt",
-      "approximate_download_bytes": 21945295265,
+      "quantization": "NVFP4 + FP8 mixed precision / ModelOpt",
+      "approximate_download_bytes": 21945291730,
       "approximate_loaded_weight_bytes": 23068672000,
       "context_limit": 262144,
       "tested_context": 262144,
@@ -242,7 +241,7 @@
       "startup_arguments": ["--quantization", "modelopt", "--attention-backend", "flashinfer"],
       "tokenizer_arguments": {},
       "health_probe": {"path": "/v1/models", "method": "GET"},
-      "required_files": ["config.json", "tokenizer.json", "*.safetensors"],
+      "required_files": ["config.json", "tokenizer.json", "chat_template.jinja", "preprocessor_config.json", "*.safetensors"],
       "license_metadata": {"spdx": "Apache-2.0", "source": "model-card"}
     },
     "dgx-qwen3-vl-8b-fp8": {

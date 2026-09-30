@@ -239,10 +239,16 @@ def _dynamic_id(profile_id: str, hardware: HardwareInfo) -> str:
     return profile_id
 
 
-# Measured FP8 KV layouts for the DGX main models; anything else receives the
-# more conservative allowance below.  Qwen3.8-27B is dense (64 layers x 4 KV
-# heads x 256 head dim, FP8 KV), so its per-token cost is larger than the 35B
-# MoE despite the smaller parameter count.
+# Single-node sizing allowances for the DGX main models; anything else receives
+# the more conservative allowance below. Both entries are 4x the real FP8 cost
+# at TP=1, on purpose: only the full-attention layers page a KV cache (the
+# gated-delta-net layers keep a fixed per-sequence state), so the real figures
+# are 10,240 B/token for the 35B MoE (10 of 40 layers x 2 KV heads x 256) and
+# 32,768 B/token for nvidia/Qwen3.8-27B-NVFP4, the main model since 2026-09-30
+# (16 of 64 layers x 4 KV heads x 256). The allowance only picks the profile's
+# default window; the two-node KV budget is checked against the real geometry
+# read from config.json (modelshape.py), and the dgx-spark profile still picks
+# 262,144 with the 27B (69.6 GiB of the 92.5 GiB fixture capacity).
 _DGX_KV_BYTES_PER_TOKEN = {
     "dgx-qwen36-35b-nvfp4": 40 * 1024,
     "dgx-qwen38-27b-nvfp4": 128 * 1024,
