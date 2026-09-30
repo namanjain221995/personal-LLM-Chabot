@@ -358,65 +358,6 @@ def running_project_checkouts(
     return seen
 
 
-def served_model_names(argv: Sequence[object]) -> tuple[str, ...]:
-    """The ``--served-model-name`` values of a ``vllm serve`` argv, or ().
-
-    vLLM takes one OR MORE names after the flag (the engine answers to every
-    one of them), so every token up to the next option counts; the
-    ``--served-model-name=NAME`` spelling is read too.
-    """
-    tokens = [str(item) for item in argv]
-    for index, token in enumerate(tokens):
-        if token.startswith("--served-model-name="):
-            value = token.split("=", 1)[1].strip()
-            return (value,) if value else ()
-        if token == "--served-model-name":
-            names: list[str] = []
-            for following in tokens[index + 1:]:
-                if following.startswith("--"):
-                    break
-                if following.strip():
-                    names.append(following.strip())
-            return tuple(names)
-    return ()
-
-
-def running_head_served_names(
-    *,
-    project: str = "sf-local-ai",
-    service: str = "vllm",
-    runner: Callable[..., object] = run_command,
-) -> tuple[str, ...]:
-    """The names the RUNNING main-model head answers to, read from its argv.
-
-    () when there is no running head or it cannot be inspected: a missing
-    answer is never evidence that the model changed.
-    """
-    listed = runner(
-        [
-            "docker", "ps", "--filter", f"label=com.docker.compose.project={project}",
-            "--filter", f"label=com.docker.compose.service={service}", "--format", "{{.ID}}",
-        ],
-        timeout=10.0,
-    )
-    if getattr(listed, "returncode", 1) != 0:
-        return ()
-    containers = str(getattr(listed, "stdout", "") or "").split()
-    if not containers:
-        return ()
-    inspected = runner(
-        ["docker", "inspect", containers[0], "--format", "{{json .Config.Cmd}}"],
-        timeout=15.0,
-    )
-    if getattr(inspected, "returncode", 1) != 0:
-        return ()
-    try:
-        argv = json.loads(str(getattr(inspected, "stdout", "") or "").strip() or "null")
-    except json.JSONDecodeError:
-        return ()
-    return served_model_names(argv) if isinstance(argv, list) else ()
-
-
 def foreign_checkout_owner(
     root: "Path | str",
     *,

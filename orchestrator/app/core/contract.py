@@ -177,8 +177,7 @@ PROPOSER_INPUT_CHARS = 1500
 
 #: The proposer's wall clock, and the ladder around it, copied from
 #: artifacts/requirements.build so the two behave identically.
-# x5 for the dense Qwen3.8-27B (2026-09-30; was 8 s on the 35B-A3B).
-PROPOSER_TIMEOUT_S = 40.0
+PROPOSER_TIMEOUT_S = 8.0
 
 #: An upper bound on a requirements list, so a pathological message cannot
 #: turn into a hundred-item contract.

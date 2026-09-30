@@ -1,15 +1,11 @@
 """Continuity in one-model mode (CONTRACT v2 §8.3–8.4) — what happens to a
 person's request while the main model cannot take it.
 
-WHY THIS EXISTS. Only the main model may answer a person: the engine behind
-OPENAI_BASE_URL, serving `settings.llm_model` (nvidia/Qwen3.8-27B-NVFP4 since
-2026-09-30, the Qwen3.6-35B-A3B before it). Nothing here names a checkpoint —
-the hold keys on the main ENGINE (the breaker and the controller's verdict),
-so a model swap needs no change in this file. There is no smaller model to
-stand in for it and there never will be: an answer from another model is a
-different answer, and the person asked this one. A reload of the TP=2 pair
-measured 3 m 32 s warm and 5 m 20 s cold on the 35B (2026-09-11); the old
-shape for that window was a spinner, then the
+WHY THIS EXISTS. Only `nvidia/Qwen3.6-35B-A3B-NVFP4` may answer a person.
+There is no smaller model to stand in for it and there never will be: an
+answer from another model is a different answer, and the person asked this
+one. A reload of the TP=2 pair measured 3 m 32 s warm and 5 m 20 s cold
+(2026-09-11); the old shape for that window was a spinner, then the
 MODEL_UNAVAILABLE sentence, then a Retry the person had to press. The new
 shape is the one a queue has: the request is KEPT, the person is TOLD, and
 the same generation goes on by itself when the model is back.

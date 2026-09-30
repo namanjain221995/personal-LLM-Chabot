@@ -33,7 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ORCH)
 
 BASE = "http://127.0.0.1:8000"
-MODEL = os.environ.get("MAIN_MODEL", "nvidia/Qwen3.8-27B-NVFP4")
+MODEL = "Qwen/Qwen3.6-35B-A3B-NVFP4"
 
 
 def gpu_idle(timeout_s: float = 900.0) -> None:

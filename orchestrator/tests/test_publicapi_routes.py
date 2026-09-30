@@ -372,40 +372,6 @@ def test_a_parameter_the_platform_cannot_honour_is_a_400_naming_the_field(api, e
     assert response.json()["error"]["param"] == "top_p"
 
 
-@pytest.mark.parametrize(
-    "path, body, param",
-    [
-        ("/v1/responses", _body(reasoning_effort="high"), "reasoning_effort"),
-        ("/v1/responses", _body(reasoning={"effort": "high"}), "reasoning"),
-        (
-            "/v1/chat/completions",
-            {"model": registry.TECHSARA_35B, "messages": [{"role": "user", "content": "hi"}],
-             "reasoning_effort": "high"},
-            "reasoning_effort",
-        ),
-        (
-            "/v1/chat/completions",
-            {"model": registry.TECHSARA_35B, "messages": [{"role": "user", "content": "hi"}],
-             "reasoning_effort": "xhigh"},
-            "reasoning_effort",
-        ),
-    ],
-)
-def test_a_reasoning_effort_is_refused_by_name_and_never_reaches_the_engine(api, engine, path, body, param):
-    """2026-09-30: the main model's chat template raises on any reasoning
-    effort outside xhigh|medium|low, and vLLM would let a forwarded field
-    override the level this server sets. /v1 runs thinking-off
-    (streaming.PUBLIC_EFFORT) and publishes no level, so the field — in either
-    dialect, legal value or not — is a 400 naming it, never an engine 500."""
-    fake = engine(["ok"])
-    response = api.post(path, json=body, headers=_auth())
-
-    assert response.status_code == 400, response.text
-    assert response.json()["error"]["code"] == "invalid_request_error"
-    assert response.json()["error"]["param"] == param
-    assert fake.calls == 0
-
-
 def test_a_body_over_the_cap_is_refused_before_it_is_parsed(api, engine, monkeypatch):
     engine(["ok"])
     monkeypatch.setattr("app.publicapi.models.max_body_bytes", lambda: 512)

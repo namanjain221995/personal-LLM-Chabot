@@ -188,12 +188,6 @@ DIAGRAM_ROLES = ("service", "store", "model", "external")
 #   origin/dev 232 tokens; document-vocabulary-r2 240; diagram-roles 415;
 #   integ/diagram-group 356; THIS FILE 365.
 #
-# The counts are the 27B's too. nvidia/Qwen3.8-27B-NVFP4, the main model since
-# 2026-09-30, ships a tokenizer.json with the same BPE vocabulary, merges,
-# normalizer, pre-tokenizer and post-processor (compared field by field
-# 2026-09-30); it adds seven special audio/TTS tokens (<|audio_start|> ...
-# <tts_pad>) that no prompt here contains, so ordinary text encodes the same.
-#
 # So +133 tokens per prompt over origin/dev, at every effort, in all eight
 # modules. Against the twelve context_assembly_golden fixtures — 41,496 tokens
 # on origin/dev, mean 3,458 per prompt, 43,092 here, exactly +133 on each of

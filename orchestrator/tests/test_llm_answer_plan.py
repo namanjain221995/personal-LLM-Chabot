@@ -30,21 +30,15 @@ from app.core import answer_sampling
 from tests.test_llm_public_stream_kwargs import MODEL, MSGS, world  # noqa: F401 — fixture
 
 _NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
-#: A thinking call names its level since 2026-09-30 (the 27B's chat template
-#: reads reasoning_effort, xhigh|medium|low): Think is medium, Max xhigh, and a
-#: plan that turns thinking on at "fast" effort gets the least, low.
-_THINK = {"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "medium"}}
-_THINK_MAX = {"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "xhigh"}}
-_THINK_LOW = {"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "low"}}
+_THINK = {"chat_template_kwargs": {"enable_thinking": True}}
 _BASE = {"model": MODEL, "stream": True, "stream_options": {"include_usage": True}}
 
-#: Captured from llm.py BEFORE the answer_plan keyword (worktree base 1756614),
-#: with the one change made on purpose since: the thinking level (2026-09-30).
+#: Captured from llm.py BEFORE the answer_plan keyword (worktree base 1756614).
 SNAPSHOT = {
     "fast_smart_8000_t06": {**_BASE, "extra_body": _NO_THINK, "max_tokens": 8000, "temperature": 0.6},
     "low_smart_8000_t06": {**_BASE, "extra_body": _NO_THINK, "max_tokens": 8000, "temperature": 0.6},
     "think_smart_16000_t03": {**_BASE, "extra_body": _THINK, "max_tokens": 65536, "temperature": 0.3},
-    "max_smart_16000_t03": {**_BASE, "extra_body": _THINK_MAX, "max_tokens": 65536, "temperature": 0.3},
+    "max_smart_16000_t03": {**_BASE, "extra_body": _THINK, "max_tokens": 65536, "temperature": 0.3},
     "fast_fastmodel_6000_t06": {**_BASE, "extra_body": _NO_THINK, "max_tokens": 6000, "temperature": 0.6},
     "think_continue": {
         **_BASE,
@@ -104,7 +98,7 @@ def test_a_routed_thinking_plan_places_keys_and_skips_the_floor(world):
         "temperature": 1.0,
         "top_p": 0.95,
         "presence_penalty": 1.5,
-        "extra_body": {**_THINK_LOW, "top_k": 20, "min_p": 0.0},
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": True}, "top_k": 20, "min_p": 0.0},
     }
     assert sent["max_tokens"] < settings.max_output_tokens
     assert "seed" not in sent
@@ -119,7 +113,7 @@ def test_a_thinking_plan_is_honoured_at_a_legacy_model_value(world):
     plan = SimpleNamespace(sampling=answer_sampling.routed_thinking_sampling(), enable_thinking=True)
     sent = _sent(world, model_choice="fast", effort="fast", temperature=0.6, max_tokens=1024 + 8000,
                  answer_plan=plan)
-    assert sent["extra_body"]["chat_template_kwargs"] == _THINK_LOW["chat_template_kwargs"]
+    assert sent["extra_body"]["chat_template_kwargs"] == {"enable_thinking": True}
     # Byte-identical to the same plan at "smart": the choice changes nothing.
     assert sent == _sent(world, model_choice="smart", effort="fast", temperature=0.6,
                          max_tokens=1024 + 8000, answer_plan=plan)
@@ -186,7 +180,7 @@ def test_a_legacy_model_choice_does_not_veto_a_plan_that_asks_to_think(world):
     the test below proves it still does."""
     plan = SimpleNamespace(sampling={}, enable_thinking=True)
     sent = _sent(world, model_choice="fast", effort="fast", temperature=0.6, max_tokens=500, answer_plan=plan)
-    assert sent["extra_body"] == _THINK_LOW
+    assert sent["extra_body"] == _THINK
 
 
 def test_a_strict_backend_gets_no_vllm_extensions(world, monkeypatch):

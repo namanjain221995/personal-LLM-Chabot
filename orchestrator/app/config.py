@@ -163,21 +163,18 @@ class Settings:
     """Orchestrator settings, resolved from the environment at construction."""
 
     def __init__(self) -> None:
-        # --- The main model via vLLM (OpenAI-compatible endpoint) ---
+        # --- gpt-oss-120b via vLLM (OpenAI-compatible endpoint) ---
         self.openai_base_url: str = os.environ.get("OPENAI_BASE_URL", "http://vllm:30000/v1")
         # Local inference server: the key is a placeholder, not a real secret.
         self.openai_api_key: str = os.environ.get("OPENAI_API_KEY", "local")
-        # The launcher's generated.env sets MAIN_MODEL (the manifest's served
-        # id); LLM_MODEL is a secondary fallback for local overrides, and the
-        # literal is only what a bare process with neither gets: the main
-        # model since 2026-09-30, nvidia/Qwen3.8-27B-NVFP4. It is multimodal
-        # AND reasoning-capable, so it serves chat, SQL, RAG, reports, vision,
-        # PDF and agent planning/synthesis — everything except the cheap
-        # classification calls.
+        # docker-compose sets MAIN_MODEL; LLM_MODEL is a secondary fallback for
+        # local overrides. The main model is multimodal AND reasoning-capable,
+        # so it serves chat, SQL, RAG, reports, vision, PDF and agent
+        # planning/synthesis — everything except the cheap classification calls.
         self.llm_model: str = (
             os.environ.get("MAIN_MODEL")
             or os.environ.get("LLM_MODEL")
-            or "nvidia/Qwen3.8-27B-NVFP4"
+            or "Qwen/Qwen3.6-35B-A3B-NVFP4"
         )
 
         # --- Sidecar vLLM services (router / vision / embeddings), all
@@ -200,10 +197,7 @@ class Settings:
         self.vision_base_url: str = os.environ.get(
             "VISION_BASE_URL", "http://vllm:30000/v1"
         ).rstrip("/")
-        # The main model reads images itself, so vision follows it unless the
-        # environment names another engine: a literal here kept naming the 35B
-        # after the swap, while MAIN_MODEL had moved on.
-        self.vision_model: str = os.environ.get("VISION_MODEL") or self.llm_model
+        self.vision_model: str = os.environ.get("VISION_MODEL", "Qwen/Qwen3.6-35B-A3B-NVFP4")
         self.embed_base_url: str = os.environ.get(
             "EMBED_BASE_URL", "http://vllm-embed:30003/v1"
         ).rstrip("/")

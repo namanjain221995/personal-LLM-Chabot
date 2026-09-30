@@ -26,7 +26,7 @@ flowchart LR
             UP["/uploads router (uploads.py)"]
         end
         subgraph MODELS["inference network (internal-only)"]
-            VMAIN["vllm :30000<br/>nvidia/Qwen3.8-27B-NVFP4<br/>1M ctx (YaRN 3.82), thinking + tools"]
+            VMAIN["vllm :30000<br/>Qwen/Qwen3.6-35B-A3B-NVFP4<br/>1M ctx (YaRN 3.82), thinking + tools"]
             VROUTER["vllm-router :30002<br/>Qwen3-VL-8B-Instruct-FP8"]
             VEMBED["vllm-embed :30003<br/>Qwen3-Embedding-0.6B"]
             VOCR["vllm-ocr :30004<br/>baidu/Unlimited-OCR"]
@@ -118,8 +118,7 @@ typed SOQL with ONE forced tool call (`submit_plan`, planner.py:218-231).
 ## 3. vLLM serving — actual vs mission-recommended flags
 
 Main service (compose/compose.dgx-spark.yaml:33-76), served model
-`nvidia/Qwen3.8-27B-NVFP4` since 2026-09-30 (`Qwen/Qwen3.6-35B-A3B-NVFP4`
-before it; the rows below were written against the 35B), port 30000:
+`Qwen/Qwen3.6-35B-A3B-NVFP4` (`nvidia/Qwen3.6-35B-A3B-NVFP4`), port 30000:
 
 | Mission recommendation | Current state | Verdict |
 |---|---|---|

@@ -112,7 +112,7 @@ def test_stream_missing_reasoning_field_keeps_token_sse(monkeypatch):
 
     assert asyncio.run(collect()) == [("token", "still here")]
     assert recorder["extra_body"] == {
-        "chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "medium"}
+        "chat_template_kwargs": {"enable_thinking": True}
     }
 
 

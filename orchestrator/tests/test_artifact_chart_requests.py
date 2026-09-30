@@ -84,7 +84,7 @@ def live_chart(req, tables, *, base_url, model, timeout=60.0):
 @pytest.mark.skipif(not LIVE, reason="live engine evaluation is opt-in (AS3_LIVE=1)")
 def test_live_requests_work_with_values_checked(tables):
     base_url = os.environ.get("AS3_LLM_BASE_URL", "http://127.0.0.1:8000/v1")
-    model = os.environ.get("AS3_LLM_MODEL", "nvidia/Qwen3.8-27B-NVFP4")
+    model = os.environ.get("AS3_LLM_MODEL", "Qwen/Qwen3.6-35B-A3B-NVFP4")
     limit = int(os.environ.get("AS3_LIVE_LIMIT", "60"))
     results = []
     # Every non-English/typo request first, then English, up to the call budget.

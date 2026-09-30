@@ -34,7 +34,7 @@ services:
     image: vllm/vllm-openai@sha256:24f2f8975d011ea7f7066a547886a08a1fd3c4bf0880463487fae4f01ce723c6
     command: >
       ${MAIN_MODEL_CONTAINER_PATH:?MAIN_MODEL_CONTAINER_PATH must be generated}
-      --served-model-name ${MAIN_MODEL_SERVED_NAMES:-${MAIN_MODEL:?MAIN_MODEL must be generated}}
+      --served-model-name ${MAIN_MODEL:?MAIN_MODEL must be generated}
       --host 0.0.0.0
       --port 30000
       --max-model-len ${MODEL_MAX_CONTEXT:-8192}

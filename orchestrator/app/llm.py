@@ -3,17 +3,13 @@ endpoints (owner override of SPEC §4).
 
 Since 2026-07-28 ONE set of weights serves every chat path:
 
-- the main model, `settings.llm_model` (MAIN_MODEL; nvidia/Qwen3.8-27B-NVFP4
-  since 2026-09-30, Qwen3.6-35B-A3B before it — NVFP4, multimodal,
-  reasoning) → OPENAI_BASE_URL, and VISION_BASE_URL points at the same
-  endpoint;
+- Qwen3.6-35B-A3B (NVFP4, multimodal, reasoning) → OPENAI_BASE_URL, and
+  ROUTER_BASE_URL / VISION_BASE_URL now point at the same endpoint;
 - Qwen3-Embedding-0.6B → EMBED_BASE_URL (embeddings).
 
 "Smart" vs "Fast" is therefore NOT two models — it is one model with the
 reasoning pass on or off (`enable_thinking`), which is where the latency
-actually lives, and with it on, how hard it thinks (`reasoning_effort`:
-Think medium, Max xhigh). See `wants_thinking` and HOW HARD A THINKING CALL
-THINKS.
+actually lives. See `wants_thinking`.
 
 Context windows are enforced server-side by each vLLM instance
 (--max-model-len); §8's DEFAULT/REPORT context split is applied by the
@@ -218,121 +214,6 @@ def _thinking_allowed(enabled: object) -> bool:
     forgets the rule cannot exist.
     """
     return bool(enabled) and not fast_turn()
-
-
-# ---------------------------------------------------------------------------
-# HOW HARD A THINKING CALL THINKS (2026-09-30, nvidia/Qwen3.8-27B-NVFP4).
-#
-# The 27B's chat template (rev 482ca0f3, chat_template.jinja) reads
-# `reasoning_effort` whenever thinking is on and accepts EXACTLY three values:
-# xhigh (its default when the key is absent), medium and low. Anything else —
-# `high`, `max`, `minimal`, a null — reaches `raise_exception` inside the
-# template, which is an HTTP 400 for the whole request. vLLM hands
-# chat_template_kwargs to the template (keeping only names the template
-# declares), and its own top-level `reasoning_effort` field, which accepts
-# none|minimal|low|medium|high|xhigh|max, OVERRIDES that key whenever it is
-# not null (build_chat_params in the running image, read 2026-09-30).
-#
-# The owner's levels (2026-09-30): Fast = thinking off, Think = medium, Max =
-# xhigh, the highest; best-of-N candidates are Max calls. A thinking call that
-# names no effort (the SQL writer, a compaction summary, a planner step)
-# thinks at medium: left to the template it would think at xhigh, the most
-# expensive setting, on a model that decodes ~4x slower than the 35B-A3B it
-# replaced (24-27 tok/s at TP=2 in August, with MTP on, vs 101-107), and
-# helper calls were the same depth at Think and Max before the swap.
-#
-# `_guard_reasoning_effort` is the last line: `_primary_send` runs it on every
-# request to the main model, so no caller — a future one included — can put
-# a value on the wire the template raises on.
-# ---------------------------------------------------------------------------
-
-#: The values the main model's chat template accepts as `reasoning_effort`.
-TEMPLATE_REASONING_EFFORTS: Tuple[str, ...] = ("xhigh", "medium", "low")
-
-#: Our levels -> the template's. "fast" appears only for a call that turns
-#: thinking on anyway outside a Fast turn (an answer plan deciding it): the
-#: least thinking the template offers.
-_TEMPLATE_EFFORT_FOR_LEVEL = {"fast": "low", "think": "medium", "max": "xhigh"}
-
-#: A value already on the wire in vLLM's or OpenAI's vocabulary -> the
-#: template value closest to it. None: no reasoning at all, so the request
-#: goes out thinking-off rather than guessing a level.
-_WIRE_EFFORT_TO_TEMPLATE = {
-    "high": "xhigh",
-    "max": "xhigh",
-    "extra_high": "xhigh",
-    "minimal": "low",
-    "none": None,
-    "off": None,
-}
-
-
-def template_reasoning_effort(effort: Optional[str] = None) -> str:
-    """The template's `reasoning_effort` for a thinking-ON main-model call.
-
-    `effort` is OUR level — fast / think / max, or a legacy alias
-    `normalize_effort` accepts — plus the template's own `xhigh`. Nothing
-    (None, "") and anything unknown are Think: medium.
-    """
-    value = str(effort or "").strip().lower()
-    if value == "xhigh":
-        return value
-    return _TEMPLATE_EFFORT_FOR_LEVEL[normalize_effort(value)]
-
-
-def _guard_reasoning_effort(request: dict) -> dict:
-    """`request` with every reasoning effort made one the template accepts.
-
-    - a top-level `reasoning_effort` (OpenAI's parameter) is taken off: vLLM
-      would let it override the template key, in a vocabulary the template
-      refuses. What it asked for is kept as the template value it maps to,
-      unless chat_template_kwargs already names one;
-    - chat_template_kwargs.reasoning_effort outside xhigh|medium|low becomes
-      the closest template value, none/off turns thinking off, and anything
-      unreadable (a null, a typo) is dropped with a warning — the template's
-      own default then applies instead of a 400.
-
-    The request is returned untouched (the same object) when it is already
-    safe, and COPIED otherwise: `_open_stream` shares nested dicts between
-    its attempts, so nothing here edits the caller's dicts in place.
-    """
-    top_present = "reasoning_effort" in request
-    extra = request.get("extra_body")
-    kwargs = extra.get("chat_template_kwargs") if isinstance(extra, Mapping) else None
-    inner_present = isinstance(kwargs, Mapping) and "reasoning_effort" in kwargs
-    if not top_present and not (
-        inner_present and kwargs.get("reasoning_effort") not in TEMPLATE_REASONING_EFFORTS
-    ):
-        return request
-    safe = dict(request)
-    body = dict(extra) if isinstance(extra, Mapping) else {}
-    template = dict(kwargs) if isinstance(kwargs, Mapping) else {}
-    wanted = template.pop("reasoning_effort", None) if inner_present else None
-    if top_present:
-        forwarded = safe.pop("reasoning_effort", None)
-        if wanted is None:
-            wanted = forwarded
-    if wanted is not None:
-        value = str(wanted).strip().lower()
-        if value in TEMPLATE_REASONING_EFFORTS:
-            template["reasoning_effort"] = value
-        elif value in _WIRE_EFFORT_TO_TEMPLATE:
-            mapped = _WIRE_EFFORT_TO_TEMPLATE[value]
-            if mapped is None:
-                template["enable_thinking"] = False
-            else:
-                template["reasoning_effort"] = mapped
-        else:
-            log.warning(
-                "reasoning_effort %r is not one the main model's chat template accepts "
-                "(%s); dropped so the template's default applies instead of a 400",
-                str(wanted)[:40], "|".join(TEMPLATE_REASONING_EFFORTS),
-            )
-    if template or isinstance(kwargs, Mapping):
-        body["chat_template_kwargs"] = template
-    if body or isinstance(extra, Mapping):
-        safe["extra_body"] = body
-    return safe
 
 
 def _capture_usage(chunk) -> None:
@@ -723,11 +604,6 @@ async def _primary_send(
     no lane and gets the plain wrapper.
     """
 
-    # Whatever built it, nothing reaches the engine with a reasoning effort
-    # the main model's chat template would raise on (HOW HARD A THINKING
-    # CALL THINKS, above).
-    request = _guard_reasoning_effort(request)
-
     def create():
         # DISPATCHED (no-timeout /v1, 2026-09-13): past the breaker and the
         # admission lane, the request is being written to the engine now. A
@@ -948,13 +824,12 @@ def normalize_effort(effort: str) -> str:
 def normalize_system(messages: Sequence[dict]) -> List[dict]:
     """Fold every system block into ONE system message at index 0.
 
-    The Qwen chat templates (Qwen3.6 then, Qwen3.8-27B now) reject the request
-    outright ("System message must be at the beginning") if they see a second
-    system turn or one that is not first. That is exactly the shape this app
-    produces: the engines start with a system prompt, then compaction prepends
-    the rolling summary and appends the semantic-recall block just before the
-    latest question, and search adds its sources the same way. Every one of
-    those turns is a 400 on this model.
+    Qwen3.6's chat template rejects the request outright ("System message must
+    be at the beginning") if it sees a second system turn or one that is not
+    first. That is exactly the shape this app produces: the engines start with
+    a system prompt, then compaction prepends the rolling summary and appends
+    the semantic-recall block just before the latest question, and search adds
+    its sources the same way. Every one of those turns is a 400 on this model.
 
     Order is preserved when joining, so the engine prompt still leads and the
     retrieved material still reads as later context. Blocks keep their own
@@ -1240,7 +1115,7 @@ async def chat_completion_with_reasoning(
     request = dict(
         model=model_id, messages=sized, temperature=temperature, max_tokens=budget
     )
-    extra_body = reasoning_extra_body(settings.main_capabilities, thinking_on, effort)
+    extra_body = reasoning_extra_body(settings.main_capabilities, thinking_on)
     if extra_body is not None:
         request["extra_body"] = extra_body
     import asyncio as _asyncio
@@ -1426,24 +1301,18 @@ def thinking_budget(effort: str) -> Optional[int]:
     }.get(normalize_effort(effort))
 
 
-def thinking_body(enabled: bool, effort: Optional[str] = None) -> dict:
+def thinking_body(enabled: bool) -> dict:
     """`extra_body` toggling the chat template's thinking block.
 
-    The Qwen templates honour `enable_thinking`; passing it through
+    Qwen3.6's template honours `enable_thinking`; passing it through
     chat_template_kwargs is how a single deployment serves both a reasoning
-    and a quick-answer mode. With thinking on, the 27B's template also reads
-    `reasoning_effort` (xhigh|medium|low), so the level goes with it —
-    `template_reasoning_effort` maps `effort` (fast/think/max) onto it. With
-    thinking off nothing else is sent: the template never reads the key then.
+    and a quick-answer mode.
     """
-    kwargs: dict = {"enable_thinking": bool(enabled)}
-    if enabled:
-        kwargs["reasoning_effort"] = template_reasoning_effort(effort)
-    return {"chat_template_kwargs": kwargs}
+    return {"chat_template_kwargs": {"enable_thinking": bool(enabled)}}
 
 
 def reasoning_extra_body(
-    capabilities: ModelCapabilities, enabled: bool, effort: Optional[str] = None
+    capabilities: ModelCapabilities, enabled: bool
 ) -> Optional[dict]:
     """Return the Qwen/vLLM thinking switch only when the backend allows it.
 
@@ -1453,14 +1322,13 @@ def reasoning_extra_body(
 
     On a Fast turn (`mark_fast_turn`) the switch is false whatever the caller
     asked for: this is the last gate every main-model request passes through
-    on its way to `enable_thinking`. `effort` sets how hard a thinking call
-    thinks (see `template_reasoning_effort`); None is Think's medium.
+    on its way to `enable_thinking`.
     """
     if not capabilities.supports_reasoning:
         return None
     if not capabilities.allows_extra_body("chat_template_kwargs"):
         return None
-    return thinking_body(_thinking_allowed(enabled), effort)
+    return thinking_body(_thinking_allowed(enabled))
 
 
 def _delta_value(delta: object, name: str):
@@ -1538,11 +1406,10 @@ def apply_reasoning_effort(
     """Messages for a request at the given effort.
 
     Historically this prepended gpt-oss's "Reasoning: <effort>" system line.
-    That model is long gone and the Qwen models ignore such a line, so effort
-    is now expressed where it has a real effect — `enable_thinking` and the
-    template's `reasoning_effort` (see `wants_thinking`, `thinking_body`).
-    Kept as the single place that shapes messages by effort, and still a
-    no-op passthrough.
+    That model is long gone and Qwen3.6 ignores such a line, so effort is now
+    expressed where it has a real effect — `enable_thinking` (see
+    `wants_thinking`). Kept as the single place that shapes messages by
+    effort, and still a no-op passthrough.
     """
     return list(messages)
 
@@ -1752,7 +1619,7 @@ async def stream_chat_events(
         request["timeout"] = transport_timeout
     # THE picker's real mechanism on the DGX runtime: Smart thinks, Fast does
     # not. Other runtimes omit this vLLM-specific extension entirely.
-    extra_body = reasoning_extra_body(capabilities, thinking_on, effort)
+    extra_body = reasoning_extra_body(capabilities, thinking_on)
     if extra_body is not None:
         if budget_tokens and settings.server_thinking_budget:
             # OFF by default: tested 2026-08-19 against this vLLM/Qwen3.6
@@ -2050,7 +1917,7 @@ async def chat_with_tools(
         tools=list(tools),
         tool_choice=tool_choice,
     )
-    extra_body = reasoning_extra_body(settings.main_capabilities, thinking, effort)
+    extra_body = reasoning_extra_body(settings.main_capabilities, thinking)
     if extra_body is not None:
         request["extra_body"] = extra_body
     reset_finish_reason()
@@ -2118,7 +1985,7 @@ async def json_completion(
         temperature=temperature,
         max_tokens=budget,
     )
-    extra_body = reasoning_extra_body(settings.main_capabilities, thinking, effort)
+    extra_body = reasoning_extra_body(settings.main_capabilities, thinking)
     if extra_body is not None:
         base["extra_body"] = extra_body
 

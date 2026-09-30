@@ -46,7 +46,7 @@ services:
     ports: !reset []
     command: >
       ${MAIN_MODEL_CONTAINER_PATH:?MAIN_MODEL_CONTAINER_PATH must be generated}
-      --served-model-name ${MAIN_MODEL_SERVED_NAMES:-${MAIN_MODEL:?MAIN_MODEL must be generated}}
+      --served-model-name ${MAIN_MODEL:?MAIN_MODEL must be generated}
       --host ${CLUSTER_API_BIND_ADDRESS:?CLUSTER_API_BIND_ADDRESS must be generated}
       --port ${VLLM_PORT:?VLLM_PORT must be generated}
       --reasoning-parser qwen3
