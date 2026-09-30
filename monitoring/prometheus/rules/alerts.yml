@@ -220,9 +220,8 @@ groups:
   # CONTROLLER (monitoring/engine-controller, job engine-controller) proved
   # with its canary, or on counters that cannot move without both ranks.
   #
-  # STRICT ONE-MODEL MODE (v2). Nothing but the main model (MAIN_MODEL;
-  # nvidia/Qwen3.8-27B-NVFP4 since 2026-09-30) answers a person. While it is
-  # not READY the orchestrator accepts and
+  # STRICT ONE-MODEL MODE (v2). Nothing but nvidia/Qwen3.6-35B-A3B-NVFP4
+  # answers a person. While it is not READY the orchestrator accepts and
   # durably QUEUES every request (llm_queued_generations) and resumes the
   # same generation when READY returns; there is no fallback model, so no
   # rule here mentions one, and "DOWN" means nobody is being answered.

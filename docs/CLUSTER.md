@@ -5,43 +5,14 @@ model across **both** DGX Sparks. Everything below was measured on the two
 machines it describes; numbers are from `.runtime/logs/cluster-bench-*.txt`,
 `scripts/cluster-test.sh` and `perftest`, not estimates.
 
-> **MAIN MODEL SINCE 2026-09-30: `nvidia/Qwen3.8-27B-NVFP4`** (revision
-> `482ca0f3832238542f8f5295dde86b5f22711d80`, served under that id; owner
-> decision, no switch back planned). It is the dense 27B this cluster was built
-> on — NVIDIA's own checkpoint of the same weights and geometry as the
-> `RadixArk/Qwen3.8-27B-NVFP4` repack measured below (identical text config;
-> mixed NVFP4 MLP / FP8 attention, which vLLM loads as `modelopt_mixed` whatever
-> `--quantization modelopt` says). Where this page says "current 35B-A3B", read
-> "35B-A3B, 2026-08-29 to 2026-09-30". What the swap changes here:
->
-> * **KV:** 16 of 64 layers page a cache, 4 KV heads × 256 → 16,384 B/token per
->   node at TP=2 (the 35B paid 5,120). One 1,000,000-token request is ~15.3 GiB
->   of KV per node, so `MAIN_MODEL_MAX_LEN=1000000` needs
->   `CLUSTER_KV_CACHE_MEMORY_GIB=18` (1,038,090 tokens at the launcher's 0.88
->   hybrid fraction); `up` refuses 8 with that number in the message.
-> * **Memory per rank:** ~10.6 GiB of weights + 18 GiB KV + graphs/activations,
->   against 24.8 GiB measured for the 35B at 8 GiB — plan ~+9 GiB per node, and
->   prove the 1M prefill headroom with `validate_long_context.py`, not a 4-token
->   prefill.
-> * **Decode:** 24–27 tok/s single stream at TP=2 on the August build — WITH MTP
->   on (69 % acceptance, table below), ~4× below the 35B-A3B. MTP stays off now,
->   so expect less; re-measure on the current build (`scripts/cluster-bench.sh`).
-> * **Speculative decoding stays off** (`CLUSTER_SPECULATIVE_CONFIG=`): the
->   checkpoint carries one MTP layer, and MTP gave the dense 27B +49 % on the
->   August build, but the GDN spec-decode fault class is not proven closed on
->   this build; re-enable only after `cluster-soak.py --minutes 120` passes with it.
-> * **Thinking levels:** the template accepts `reasoning_effort` xhigh | medium |
->   low only (raises on anything else); the orchestrator sends Fast = thinking
->   off, Think = medium, Max = xhigh (`llm.template_reasoning_effort`).
-
 ## What it is (and is not)
 
 Each DGX Spark has one NVIDIA GB10 with 128 GB of *unified* memory. Linux on
 Node 1 never sees Node 2's GPU, and the two memories are never one address
 space. What dual mode does is **tensor-parallel sharding**: vLLM's multi-node
 `mp` executor runs one worker process per node, each holding half of every
-weight matrix (10.6 GiB per node for the 27B, the main model again since
-2026-09-30; 11.35 GiB for the 35B-A3B before it, instead of 20.8 GiB) and half of every
+weight matrix (11.35 GiB per node for the current 35B-A3B; the 27B was 10.6 GiB
+instead of 20.8 GiB) and half of every
 attention/KV head. Every forward pass is computed by both GB10s, and the halves
 are combined with NCCL all-reduces over the two direct 200G RoCE links.
 

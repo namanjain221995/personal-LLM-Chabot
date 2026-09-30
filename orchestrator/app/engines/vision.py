@@ -958,7 +958,7 @@ async def run_vision_engine(
     # complete answer. Passing the request's effort through is the entire
     # fix; `stream_chat_events` already maps it to `enable_thinking`.
     #
-    # model_choice stays "smart" on purpose: the main model (nvidia/Qwen3.8-27B-NVFP4 since 2026-09-30; Qwen3.6-35B-A3B from 2026-08-29, a 27B before) is the vision model on
+    # model_choice stays "smart" on purpose: the main model (Qwen3.6-35B-A3B since 2026-08-29; the 27B before) is the vision model on
     # this deployment (VISION_BASE_URL == OPENAI_BASE_URL). The dedicated 8B
     # VL model is NOT a fallback — measured 2026-08-28 it was slower to first
     # token AND refused the extraction outright.

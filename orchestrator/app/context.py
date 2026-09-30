@@ -87,15 +87,12 @@ _NON_ASCII_BYTES_PER_TOKEN = 2.0
 
 # What one image costs the main model's prefill. Measured 2026-09-09 against
 # Qwen3.6-35B-A3B on this box: 640px ≈ 297 tokens, 896px ≈ 525, 1280×720 ≈ 957
-# — one token per ~32×32 pixels (patch 16, merge 2). They hold for
-# nvidia/Qwen3.8-27B-NVFP4, the main model since 2026-09-30: its vision tower
-# has the same patching (patch 16, spatial merge 2, temporal patch 2) and a
-# byte-identical preprocessor_config.json, and the count follows only those.
-# The processor caps an image at 16,384 tokens (its default longest_edge of
-# 16,777,216 pixels; the serving command sets no smaller max_pixels), which is
-# what an image whose size cannot be read is charged: that is the direction
-# that keeps a large image prefill out of the NORMAL lane (F046). Until
-# 2026-09-13 an image part counted zero.
+# — one token per ~32×32 pixels (patch 16, merge 2). The processor caps an
+# image at 16,384 tokens (its default longest_edge of 16,777,216 pixels; the
+# serving command sets no smaller max_pixels), which is what an image whose
+# size cannot be read is charged: that is the direction that keeps a large
+# image prefill out of the NORMAL lane (F046). Until 2026-09-13 an image part
+# counted zero.
 _IMAGE_PIXELS_PER_TOKEN_EDGE = 32
 _IMAGE_MAX_TOKENS = 16384
 _IMAGE_OVERHEAD_TOKENS = 4  # vision start/end markers around the patch tokens

@@ -442,8 +442,7 @@ def _tables_from_parent(material: C.Material, parent: Any) -> None:
 # --- AS3 integration BEGIN: requested styling on a NEW file ---
 #: A style phrase the parser could not read goes to ONE small JSON call
 #: (style.extract_patch_llm: thinking off, 300 tokens) under this deadline.
-# x5 for the dense Qwen3.8-27B (2026-09-30; measured 5/8/8 s on the 35B-A3B).
-_STYLE_LLM_TIMEOUT_S = {"fast": 25.0, "think": 40.0, "max": 40.0}
+_STYLE_LLM_TIMEOUT_S = {"fast": 5.0, "think": 8.0, "max": 8.0}
 
 
 async def compose_for_pipeline(ctx: "pipeline.ComposeContext"):

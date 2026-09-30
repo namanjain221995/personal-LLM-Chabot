@@ -215,11 +215,7 @@ def test_effort_reaches_the_chat_template_thinking_switch(monkeypatch, effort, t
     assert answer == "## All Data"
     extra_body = rec["chat_kwargs"]["extra_body"]
     assert extra_body["chat_template_kwargs"]["enable_thinking"] is thinking
-    assert extra_body == llm.thinking_body(thinking, effort)
-    # ...and the level with it (2026-09-30): Think medium, Max xhigh, Fast none.
-    assert extra_body["chat_template_kwargs"].get("reasoning_effort") == {
-        "fast": None, "think": "medium", "max": "xhigh",
-    }[effort]
+    assert extra_body == llm.thinking_body(thinking)
     assert llm.wants_thinking("smart", effort) is thinking
 
 

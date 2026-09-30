@@ -98,9 +98,6 @@ class ClusterScriptTests(unittest.TestCase):
         self.assertIsNotNone(plain_keys)
         self.assertIn("VLLM_HEALTHCHECK_MIN_AGE_S", plain_keys.group(1).split("|"))
         self.assertIn("VLLM_HEALTHCHECK_KILL_AFTER", plain_keys.group(1).split("|"))
-        # The head's --served-model-name list (MAIN_MODEL plus aliases) reaches
-        # the worker's command line too (2026-09-30).
-        self.assertIn("MAIN_MODEL_SERVED_NAMES", plain_keys.group(1).split("|"))
         self.assertIn('echo "SENTINEL_CODE_SHA=$sentinel_sha"', text)
         # The env-only branch calls the image stage; the image stage is one
         # function, so the two paths cannot drift apart.

@@ -36,9 +36,9 @@ export type Engine =
   | 'artifact';
 
 /**
- * Historically two models. There is now ONE main model (nvidia/Qwen3.8-27B-NVFP4
- * since 2026-09-30) and the picker chooses EFFORT instead, so this is always
- * "smart" in new requests — kept so stored prefs and older payloads keep working.
+ * Historically two models. There is now ONE (Qwen3.6-35B-A3B) and the picker
+ * chooses EFFORT instead, so this is always "smart" in new requests — kept so
+ * stored prefs and older payloads keep working.
  */
 export type ModelChoice = 'smart' | 'fast';
 

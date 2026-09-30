@@ -289,45 +289,6 @@ def resolve_prefix_caching(values: Mapping[str, str]) -> bool:
     )
 
 
-#: Extra names the main engine answers to, besides MAIN_MODEL (.env, opt-in).
-MAIN_ALIASES_KEY = "MAIN_MODEL_SERVED_ALIASES"
-#: What the overlays pass to --served-model-name: MAIN_MODEL first, then the
-#: aliases. vLLM names responses and metrics after the FIRST.
-MAIN_SERVED_NAMES_KEY = "MAIN_MODEL_SERVED_NAMES"
-#: A model name, bare or `org/name`: nothing a shell or Compose would split,
-#: quote or interpolate, because the value lands on a folded command line.
-_SERVED_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,127})?$")
-
-
-def main_served_names(values: Mapping[str, str], primary: str) -> str:
-    """The main engine's --served-model-name values: MAIN_MODEL, then aliases.
-
-    WHY ALIASES EXIST (2026-09-30, the swap to nvidia/Qwen3.8-27B-NVFP4). The
-    main engine has callers outside this repository that name the model on
-    the raw port: the interview-analysis tenant on the worker posts to
-    CLUSTER_HEAD_IP:8000/v1, and the litellm-dgx proxy on the head maps its
-    own name to `Qwen/Qwen3.6-35B-A3B-NVFP4` (its config.yaml). A swap that
-    only renames the served model turns every one of their calls into a 404.
-    MAIN_MODEL_SERVED_ALIASES=Qwen/Qwen3.6-35B-A3B-NVFP4 keeps them working
-    while their owners move over: vLLM answers to every name it is given, and
-    the response's `model` field says which model really answered. Unset (the
-    default) renders exactly MAIN_MODEL, so nothing changes for anyone else.
-    """
-    names = [primary] if primary else []
-    raw = str(values.get(MAIN_ALIASES_KEY, "") or "")
-    for token in re.split(r"[\s,]+", raw.strip()):
-        if not token:
-            continue
-        if not _SERVED_NAME.fullmatch(token):
-            raise TechSaraError(
-                f"{MAIN_ALIASES_KEY} holds {token!r}, which is not a model name "
-                "(letters, digits, '.', '_' and '-', with at most one '/')"
-            )
-        if token not in names:
-            names.append(token)
-    return " ".join(names)
-
-
 #: Sidecar KV budgets are a fraction of TOTAL device memory, so on a 122 GiB
 #: GB10 a seemingly small fraction is a large reservation: 0.14 for OCR is
 #: 17.0 GiB, of which 12.1 GiB became KV cache -- 211,552 tokens for a model
@@ -886,8 +847,6 @@ def build_generated_environment(
     # here so the dual-mode engine string and the single-node overlays cannot
     # disagree about them.
     prefix_caching = resolve_prefix_caching(user_values)
-    main_model_id = profile.main_model.api_model_id if profile.main_model else "disabled"
-    served_names = main_served_names(user_values, main_model_id)
     speculative_argument = speculative_config_argument(user_values)
     gdn_prefill_argument = gdn_prefill_backend_argument(user_values)
     main_model_image(user_values)
@@ -993,7 +952,6 @@ def build_generated_environment(
         "TECHSARA_CLUSTER_REASON": cluster.reason,
         "OPENAI_BASE_URL": main_url,
         "MAIN_MODEL": main.api_model_id if main else "disabled",
-        MAIN_SERVED_NAMES_KEY: served_names,
         "ROUTER_BASE_URL": router_url,
         "ROUTER_MODEL": router.api_model_id if router else "disabled",
         "AGENT_BASE_URL": router_url,

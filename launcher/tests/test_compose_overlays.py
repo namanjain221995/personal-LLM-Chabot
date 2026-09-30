@@ -263,7 +263,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
     WORKER_ENV = {
         "CLUSTER_VLLM_IMAGE": "vllm/vllm-openai@sha256:" + "2" * 64,
         "MAIN_MODEL_CONTAINER_PATH": "/models/repos/main",
-        "MAIN_MODEL": "nvidia/Qwen3.8-27B-NVFP4",
+        "MAIN_MODEL": "Qwen/Qwen3.6-35B-A3B-NVFP4",
         "CLUSTER_ENGINE_ARGS": "--max-model-len 262144 --tensor-parallel-size 2 --nnodes 2 --master-addr 192.168.100.1 --master-port 29501",
         "CLUSTER_WORKER_IP": "192.168.100.2",
         "CLUSTER_HEAD_IP": "192.168.100.1",
@@ -377,8 +377,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
     def test_the_dgx_overlay_keeps_its_measured_model_family_and_flags(self) -> None:
         profile, rendered = self._render(FIXTURES["dgx-spark"])
         self.assertEqual(profile.hardware_profile_id, "dgx-spark")
-        self.assertEqual(profile.main_model.id, "nvidia/Qwen3.8-27B-NVFP4")
-        self.assertEqual(profile.main_model.revision, "482ca0f3832238542f8f5295dde86b5f22711d80")
+        self.assertEqual(profile.main_model.id, "nvidia/Qwen3.6-35B-A3B-NVFP4")
         command = " ".join(rendered["services"]["vllm"]["command"])
         for flag in (
             "--kv-cache-dtype fp8",
@@ -391,8 +390,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             "--gpu-memory-utilization 0.35",
         ):
             self.assertIn(flag, command)
-        self.assertIn("--served-model-name nvidia/Qwen3.8-27B-NVFP4", command)
-        self.assertIn("/models/repos/nvidia--Qwen3.8-27B-NVFP4--482ca0f38322", command)
+        self.assertIn("--served-model-name Qwen/Qwen3.6-35B-A3B-NVFP4", command)
         self.assertIn("vllm-router", rendered["services"])
         self.assertIn("vllm-ocr", rendered["services"])
 
@@ -1083,9 +1081,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             environment = rendered["services"][service].get("environment", {})
             self.assertTrue(environment, f"{service} received no environment")
         orchestrator = rendered["services"]["orchestrator"]["environment"]
-        self.assertEqual(orchestrator["MAIN_MODEL"], "nvidia/Qwen3.8-27B-NVFP4")
-        # The main model reads images, so vision rides the same engine and name.
-        self.assertEqual(orchestrator["VISION_MODEL"], "nvidia/Qwen3.8-27B-NVFP4")
+        self.assertEqual(orchestrator["MAIN_MODEL"], "Qwen/Qwen3.6-35B-A3B-NVFP4")
         self.assertEqual(orchestrator["OPENAI_BASE_URL"], "http://vllm:30000/v1")
         self.assertTrue(orchestrator["RERANKER_MODEL"].startswith("/models/"))
         self.assertEqual(
@@ -1156,7 +1152,7 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             "--quantization modelopt",
             "--attention-backend flashinfer",
             f"--max-model-len {profile.context_length}",
-            "--served-model-name nvidia/Qwen3.8-27B-NVFP4",
+            "--served-model-name Qwen/Qwen3.6-35B-A3B-NVFP4",
         ):
             self.assertIn(flag, command)
         self.assertNotIn("--headless", argv)
@@ -1200,73 +1196,6 @@ class ComposeOverlayValidationTests(unittest.TestCase):
             "http://vllm:18000/v1",
         )
         self.assertTrue(published["services"]["vllm-router"].get("ports"))
-
-    def test_served_name_aliases_reach_both_ranks_and_change_nothing_when_unset(self) -> None:
-        """MAIN_MODEL_SERVED_ALIASES (2026-09-30): raw-port callers that still
-        name the replaced model keep working, on the head and on the worker;
-        unset, both command lines and both definition hashes are exactly what
-        an older generated.env / worker.env renders."""
-        detectors = ClusterDetectors(
-            ifname_for_ip=lambda ip: {"192.168.100.1": "enP2p1s0f1np1"}.get(ip),
-            hcas_for_ifnames=lambda names: ["rocep1s0f1" for name in names if name == "enP2p1s0f1np1"],
-            docker_bridge_gateway=lambda: "172.17.0.1",
-        )
-        dual = {
-            "CLUSTER_MODE": "dual",
-            "CLUSTER_HEAD_IP": "192.168.100.1",
-            "CLUSTER_WORKER_IP": "192.168.100.2",
-        }
-        old = "Qwen/Qwen3.6-35B-A3B-NVFP4"
-        new = "nvidia/Qwen3.8-27B-NVFP4"
-
-        def names(argv: list) -> list:
-            start = argv.index("--served-model-name") + 1
-            end = next(i for i in range(start, len(argv)) if str(argv[i]).startswith("--"))
-            return argv[start:end]
-
-        with (
-            patch.object(environment, "CLUSTER_DETECTORS", detectors),
-            patch.object(environment, "CLUSTER_DISCOVERY", fake_discovery()),
-        ):
-            _profile, plain = self._render(FIXTURES["dgx-spark"], dual)
-            _profile, aliased = self._render(
-                FIXTURES["dgx-spark"], {**dual, "MAIN_MODEL_SERVED_ALIASES": f"{old}, {new} {old}"},
-            )
-            _profile, stale = self._render(
-                FIXTURES["dgx-spark"], dual, drop_generated=("MAIN_MODEL_SERVED_NAMES",),
-            )
-            _profile, single = self._render(
-                FIXTURES["dgx-spark"], {"MAIN_MODEL_SERVED_ALIASES": old},
-            )
-            # A value that would reach the folded command line as something
-            # other than a name is refused, never quoted into it.
-            for bad in ("$(id)", "a/b/c", "'x'", "--host"):
-                with self.subTest(alias=bad), self.assertRaisesRegex(
-                    TechSaraError, "MAIN_MODEL_SERVED_ALIASES holds .* which is not a model name"
-                ):
-                    self._render(FIXTURES["dgx-spark"], {**dual, "MAIN_MODEL_SERVED_ALIASES": bad})
-        self.assertEqual(names(plain["services"]["vllm"]["command"]), [new])
-        # MAIN_MODEL first (vLLM names responses and metrics after it), each
-        # alias once, whatever separators the operator used.
-        self.assertEqual(names(aliased["services"]["vllm"]["command"]), [new, old])
-        self.assertEqual(names(single["services"]["vllm"]["command"]), [new, old])
-        # A generated.env from before this key renders the same head argv.
-        self.assertEqual(stale["services"]["vllm"]["command"], plain["services"]["vllm"]["command"])
-        # The orchestrator keeps calling the model by MAIN_MODEL alone.
-        self.assertEqual(aliased["services"]["orchestrator"]["environment"]["MAIN_MODEL"], new)
-
-        worker = self._render_worker(self.WORKER_ENV)["services"]["vllm-worker"]["command"]
-        self.assertEqual(names(worker), [self.WORKER_ENV["MAIN_MODEL"]])
-        both = {**self.WORKER_ENV, "MAIN_MODEL_SERVED_NAMES": f"{new} {old}"}
-        self.assertEqual(names(self._render_worker(both)["services"]["vllm-worker"]["command"]), [new, old])
-        # The key carrying MAIN_MODEL alone does not move the worker's hash, so
-        # shipping it on a routine --env-only sync recreates nothing.
-        self.assertEqual(
-            self._worker_service_hash(self.WORKER_ENV, "vllm-worker"),
-            self._worker_service_hash(
-                {**self.WORKER_ENV, "MAIN_MODEL_SERVED_NAMES": self.WORKER_ENV["MAIN_MODEL"]}, "vllm-worker",
-            ),
-        )
 
 
 if __name__ == "__main__":

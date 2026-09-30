@@ -31,10 +31,7 @@ CONTROLLER_ENV="$RUNTIME_DIR/controller.env"
 # prefix CLUSTER_ (the healthcheck's last-resort tier and its age guard,
 # contract §6; VLLM_HEALTHCHECK_MIN_AGE_S is the launcher's resolution of
 # ENGINE_COLD_START_BUDGET_S, so both nodes guard a cold start the same way).
-# MAIN_MODEL_SERVED_NAMES is MAIN_MODEL plus any MAIN_MODEL_SERVED_ALIASES, so
-# both ranks carry the head's --served-model-name list; with no aliases it is
-# MAIN_MODEL itself and the worker's definition hash does not move.
-WORKER_PLAIN_KEYS='MAIN_MODEL|MAIN_MODEL_SERVED_NAMES|MAIN_MODEL_CONTAINER_PATH|MODEL_MAX_CONTEXT|VLLM_PORT|TECHSARA_CLUSTER_MODE|VLLM_HEALTHCHECK_KILL_AFTER|VLLM_HEALTHCHECK_MIN_AGE_S'
+WORKER_PLAIN_KEYS='MAIN_MODEL|MAIN_MODEL_CONTAINER_PATH|MODEL_MAX_CONTEXT|VLLM_PORT|TECHSARA_CLUSTER_MODE|VLLM_HEALTHCHECK_KILL_AFTER|VLLM_HEALTHCHECK_MIN_AGE_S'
 
 # The image the sentinel runs on is whatever the head's engine-controller
 # service resolves to (digest-pinned in compose.dgx-spark.yaml), read back
