@@ -33,7 +33,7 @@ import { createPortal } from 'react-dom';
 import type { FetchLike } from '@/lib/auth';
 import { menuKeyAction } from '@/lib/conversationMenu';
 import { SettingsDialog, type SettingsSection } from './SettingsDialog';
-import { IconChevronDown, IconLogout, IconMic } from './icons';
+import { IconChevronDown, IconLogout, IconMic, IconPaperclip } from './icons';
 
 /* ------------------------------------------------------- account identity */
 
@@ -340,6 +340,7 @@ export function AccountMenu({ fetchFn = fetch, navigate }: AccountMenuProps) {
       icon: <IconGear />,
       run: () => openSettings('profile'),
     },
+    { id: 'files', label: 'My files', icon: <IconPaperclip size={14} />, href: '/files' },
     { id: 'recordings', label: 'Recordings', icon: <IconMic size={14} />, href: '/recordings' },
     {
       id: 'help',

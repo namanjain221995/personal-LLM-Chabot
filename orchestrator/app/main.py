@@ -1641,6 +1641,10 @@ app.include_router(auth_router)
 app.include_router(history_router)
 
 app.include_router(uploads_router)
+# My files (2026-09-30): the caller's own uploads across every chat, read-only.
+from .myfiles import router as myfiles_router  # noqa: E402
+
+app.include_router(myfiles_router)
 # Speech to text for the composer. Its own router because it is the only
 # route that takes audio, and the only one gated on Feature.VOICE_INPUT.
 app.include_router(audio_router)

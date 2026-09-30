@@ -122,6 +122,32 @@ describe('menu items follow capabilities', () => {
   });
 });
 
+describe('My files', () => {
+  it('links to /files, directly above Recordings', async () => {
+    await openMenu(meFetch(MEMBER));
+    const menu = screen.getByRole('menu', { name: 'Account' });
+    const files = within(menu).getByRole('menuitem', { name: 'My files' });
+    expect(files.tagName).toBe('A');
+    expect(files.getAttribute('href')).toBe('/files');
+    const labels = within(menu)
+      .getAllByRole('menuitem')
+      .map((item) => item.textContent);
+    expect(labels.indexOf('Recordings') - labels.indexOf('My files')).toBe(1);
+  });
+
+  it('is reached from the keyboard like every other item', async () => {
+    await openMenu(meFetch(MEMBER));
+    const menu = screen.getByRole('menu', { name: 'Account' });
+    const files = within(menu).getByRole('menuitem', { name: 'My files' });
+    await waitFor(() => expect(document.activeElement).toBe(within(menu).getAllByRole('menuitem')[0]));
+    for (let i = 0; i < 5 && document.activeElement !== files; i += 1) {
+      fireEvent.keyDown(menu, { key: 'ArrowDown' });
+    }
+    expect(document.activeElement).toBe(files);
+    expect(files.getAttribute('tabindex')).toBe('0');
+  });
+});
+
 describe('log out', () => {
   it('POSTs /api/auth/logout then hard-redirects to /login', async () => {
     const fn = meFetch(MEMBER);

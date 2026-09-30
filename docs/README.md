@@ -29,6 +29,7 @@ source.
 | Base Compose and runtime overlays | [`01-codebase/infra-docker-compose.md`](01-codebase/infra-docker-compose.md) |
 | Test entrypoints and current verification boundary | [`01-codebase/test-map.md`](01-codebase/test-map.md) |
 | Current application data stores | [`01-codebase/data-model.md`](01-codebase/data-model.md) |
+| **My files** (2026-09-30): the page listing everything a person uploaded, what of each file is really stored, its routes, security, cost and metrics | [`MY-FILES.md`](MY-FILES.md) |
 | Salesforce clarification, query-plan safety, context budgeting | [`06-agent-design/SALESFORCE-INTELLIGENCE-MODE.md`](06-agent-design/SALESFORCE-INTELLIGENCE-MODE.md) |
 | The knowledge "brain": forensic audit, RAG/memory/search audit, ADR-0001 (one evidence pipeline, scopes, reranker, index policy), eval and benchmarks | [`07-brain/`](07-brain/) |
 
