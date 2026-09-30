@@ -191,9 +191,10 @@ class ComposeFileBindTests(unittest.TestCase):
         # management address does not survive a reboot on the worker).
         self.assertIn("network_mode: host", text)
         self.assertNotRegex(text, r"(?m)^\s*ports:")
-        # It is the CPU copy: no GPU reservation, pinned to the X925 cores.
+        # It is the CPU copy: no GPU reservation, pinned to the X925 cores (the worker's, and the
+        # default; the head's copy is given its own set, test_whisper_cpu_head.py).
         self.assertNotIn("capabilities: [gpu]", text)
-        self.assertIn('cpuset: "5-9,15-19"', text)
+        self.assertIn('cpuset: "${WHISPER_CPU_CPUSET:-5-9,15-19}"', text)
 
     def test_the_env_example_warns_that_the_main_model_port_8000_is_unauthenticated_too(self) -> None:
         text = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")

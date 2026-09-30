@@ -208,7 +208,7 @@ purge shared pages by domain, origin or introducer); on the host,
 |---|---|---|
 | `ASR_TIMEOUT_S` | `600` | How long the orchestrator waits for one engine to answer one clip. |
 | `ASR_MAX_AUDIO_SECONDS` | `600` | The longest recording accepted; the composer stops recording at it. |
-| `ASR_CPU_BASE_URLS` | empty | The CPU overflow replica(s) on the worker (`scripts/whisper-cpu.sh` writes it). Empty: no CPU replica. |
+| `ASR_CPU_BASE_URLS` | empty | The CPU overflow replicas, tried in this order: the worker's, then the head's when it runs (`scripts/whisper-cpu.sh` merges it; `WHISPER_CPU_NODE=head` for the head's copy). Empty: no CPU replica. |
 | `ASR_CPU_FIXED_S` | `8.5` | The CPU replica's per-clip overhead in its decode estimate (pre-pass + one encoder window). |
 | `ASR_CPU_S_PER_AUDIO_S` | `0.45` | The CPU replica's seconds of decoding per second of audio in that estimate (the slowest measured: Hindi-English long form). |
 | `ASR_CPU_DEADLINE_MARGIN` | `1.5` | A clip goes to the CPU replica only when estimate x this fits its deadline. |

@@ -528,3 +528,46 @@ def test_the_pools_question_to_the_router_is_the_routers_rule_and_counts_nothing
     assert slow.cpu_takes_next() is False  # a clip of unknown length would miss the engine timeout
     assert asr.RoutedProvider([a]).cpu_takes_next() is False  # no CPU replica
     assert dict(metrics._counters.get("asr_cpu_overflow_total", {})) == before
+
+
+# -- two CPU copies: the worker's, then the head's ------------------------------------------------
+
+def test_with_two_cpu_copies_the_first_listed_takes_the_overflow_and_the_second_the_next():
+    # ASR_CPU_BASE_URLS lists the worker's copy first and the head's last
+    # (scripts/whisper-cpu.sh, docs/voice/CPU-REPLICA-HEAD.md): the head's cores also run the
+    # orchestrator and rank 0's engine loop, so its copy only takes a clip the worker's cannot.
+    a, b = Engine("http://a/v1"), Engine("http://b/v1")
+    worker = Engine("http://192.168.9.68:30008/v1", tier="cpu", fixed_s=8.5, s_per_audio_s=0.45)
+    head = Engine("http://172.17.0.1:30008/v1", tier="cpu", fixed_s=8.5, s_per_audio_s=0.45)
+    router = asr.RoutedProvider([a, b], [worker, head])
+
+    async def drive():
+        first = await hold(router, a, wav_bytes(20.0))
+        second = await hold(router, b, wav_bytes(20.0))
+        third = await hold(router, worker, wav_bytes(10.0))
+        assert router._active == {0: 1, 1: 1, 2: 1, 3: 0}
+        fourth = await router.transcribe(wav_bytes(10.0), filename="d.wav", content_type="audio/wav")
+        for engine in (a, b, worker):
+            engine.release.set()
+        await first; await second; await third
+        return fourth
+
+    assert asyncio.run(drive()).text == "http://172.17.0.1:30008/v1"
+    assert (worker.calls, head.calls) == (1, 1)
+    assert router._active == {0: 0, 1: 0, 2: 0, 3: 0}
+
+
+def test_with_two_cpu_copies_the_pool_lends_each_its_one_slot_and_adds_no_permit(monkeypatch):
+    """The permits stay the GPU replicas' (4); each free CPU copy is lent one slot to the clip the
+    router sends it, so seven clips at once place two per GPU and one per copy, and one is busy."""
+    monkeypatch.setattr(settings, "asr_max_concurrent", 2)
+    monkeypatch.setattr(settings, "asr_base_urls", ("http://a/v1", "http://b/v1"))
+    monkeypatch.setattr(settings, "asr_cpu_base_urls", ("http://192.168.9.68:30008/v1", "http://172.17.0.1:30008/v1"))
+    assert asr.POOL._size() == 4
+    a, b = Engine("http://a/v1"), Engine("http://b/v1")
+    worker = Engine("http://192.168.9.68:30008/v1", tier="cpu", fixed_s=8.5, s_per_audio_s=0.45)
+    head = Engine("http://172.17.0.1:30008/v1", tier="cpu", fixed_s=8.5, s_per_audio_s=0.45)
+    router = asr.RoutedProvider([a, b], [worker, head])
+    placed, lent, busy = _legacy_burst(monkeypatch, router, (a, b, worker, head), clips=7)
+    assert placed == {0: 2, 1: 2, 2: 1, 3: 1} and lent == 2
+    assert busy == 1

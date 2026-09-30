@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Speech-to-text overflow: openai/whisper-large-v3 on the WORKER's CPU cores.
+# Speech-to-text overflow: openai/whisper-large-v3 on the WORKER's CPU cores (and the head's).
 #
 #   scripts/whisper-cpu.sh up       convert the pinned weights (once), build the image, start the
-#                                   replica on the worker, wait until it is ready, and record its
-#                                   address as ASR_CPU_BASE_URLS in .env
+#                                   replica on the worker, wait until it is ready, and add its
+#                                   address to ASR_CPU_BASE_URLS in .env
 #   scripts/whisper-cpu.sh down     stop and remove it (the converted weights stay) and take it
-#                                   back out of .env
+#                                   back out of .env; the other node's replica stays listed
 #   scripts/whisper-cpu.sh status   container state + the replica's own /health
 #   scripts/whisper-cpu.sh logs     follow the replica's log
 #   scripts/whisper-cpu.sh verify   transcribe a real clip end to end, print it and the time taken
 #   scripts/whisper-cpu.sh url      print the endpoint the orchestrator should use
+#
+#   Every command acts on the worker's copy. WHISPER_CPU_NODE=head acts on the head's instead.
 #
 # WHAT IT IS. A third copy of the SAME model the two GPU replicas run (scripts/whisper.sh), on ten
 # Cortex-X925 cores of the worker and no GPU. The orchestrator prefers the GPU replicas and sends a
@@ -17,8 +19,19 @@
 # its deadline at this copy's measured speed (ASR_CPU_* in orchestrator/app/config.py). Measured
 # before it was built: docs/voice/CPU-REPLICA.md.
 #
-# WORKER ONLY, AND DUAL MODE ONLY. The head's memory is off limits for anything new (owner,
-# 2026-09-16), so there is no head variant and no single-node fallback: this script refuses.
+# THE WORKER BY DEFAULT, THE HEAD ONLY WHEN ASKED, AND DUAL MODE ONLY. The head's memory is off
+# limits for anything new (owner, 2026-09-16). The owner's exception of 2026-09-30 allows this one
+# copy there too, on the condition that chat decode drops by no more than 5 % while it is busy
+# (docs/voice/CPU-REPLICA-HEAD.md, scripts/whisper-cpu-chat-gate.py). So the head's copy:
+#   - starts only with WHISPER_CPU_NODE=head, and not below 20 GiB of MemAvailable there;
+#   - compiles and converts NOTHING on the head: it runs the image the worker built and the q8_0
+#     file the worker converted, both copied over ssh and checked against the worker's image ID and
+#     the q8_0 pin (a compile is minutes of four jobs, a conversion loads 3 GB of fp16 weights);
+#   - binds the Docker bridge gateway (172.17.0.1), like the head's GPU replica on 30007;
+#   - runs on its own cores (WHISPER_CPU_HEAD_CPUSET/_CPUS/_THREADS, from the environment or .env,
+#     where a cap decided at the chat gate is kept so the next `up` cannot undo it);
+#   - is listed LAST in ASR_CPU_BASE_URLS, so the worker's copy takes overflow first.
+# There is no single-node fallback: in single mode this script refuses.
 #
 # NOTHING HERE TOUCHES THE LLM OR THE GPU REPLICAS. Its own Compose project
 # (sf-local-ai-whisper-cpu) on its own port (30008); `down` leaves vLLM, both GPU speech replicas,
@@ -53,13 +66,64 @@ WHISPER_CPU_READY_TIMEOUT_S="${WHISPER_CPU_READY_TIMEOUT_S:-300}"
 WHISPER_MANAGEMENT_IFNAME="${WHISPER_MANAGEMENT_IFNAME:-enP7s7}"
 REMOTE_DIR="${WORKER_REMOTE_DIR:-\$HOME/.techsara-cluster}"
 
+#: Which copy a command acts on: "worker" (the default) or "head" (the owner's 2026-09-30 exception).
+WHISPER_CPU_NODE="${WHISPER_CPU_NODE:-worker}"
+case "$WHISPER_CPU_NODE" in
+  worker|head) ;;
+  *) die "WHISPER_CPU_NODE must be 'worker' or 'head', not '$WHISPER_CPU_NODE'" ;;
+esac
+#: The head's own model cache (the head runs the script, so this is a local path there).
+WHISPER_CPU_HEAD_MODEL_CACHE="${WHISPER_CPU_HEAD_MODEL_CACHE:-${TECHSARA_MODEL_CACHE:-$HOME/Documents/project/Model}}"
+#: Nothing starts on the head below this much MemAvailable: the floor the owner's exception was
+#: measured against (the replica itself peaks at 2.0 GiB and is capped at 4 GiB).
+WHISPER_CPU_HEAD_MIN_AVAILABLE_GIB="${WHISPER_CPU_HEAD_MIN_AVAILABLE_GIB:-20}"
+
 hf_dir_name() { printf '%s--%s' "${WHISPER_MODEL//\//--}" "${WHISPER_MODEL_REVISION:0:12}"; }
 ggml_dir_name() { printf '%s-ggml' "$(hf_dir_name)"; }
 
-require_worker() {
+require_cluster() {
   [ "${CLUSTER_MODE:-single}" = "dual" ] \
-    || die "the CPU speech replica runs on the worker only, and CLUSTER_MODE is '${CLUSTER_MODE:-single}'. The head's memory is off limits for new services."
+    || die "the CPU speech replica runs only in the two-node cluster, and CLUSTER_MODE is '${CLUSTER_MODE:-single}'. The head's memory is off limits for new services."
+  # The head's copy needs the worker too: its image and model file come from there.
   [ -n "${CLUSTER_WORKER_SSH:-}" ] || die "CLUSTER_WORKER_SSH is not set"
+}
+
+# head_setting KEY DEFAULT: the head copy's placement from the environment, else .env, else DEFAULT.
+head_setting() {
+  local value="${!1:-}"
+  [ -n "$value" ] || value="$(env_get "$ENV_FILE" "$1" 2>/dev/null || true)"
+  printf '%s' "${value:-$2}"
+}
+
+# The head copy's cores. Default: eight Cortex-X925 cores without 5-6, where the chat model's
+# rank-0 engine loop and worker thread ran during decode on 2026-09-30 (3 s per-thread sample),
+# with eight cores' worth of time. That is the configuration measured on the head that day: the
+# same transcripts as the worker's copy, 1.3-1.6 % slower (docs/voice/CPU-REPLICA-HEAD.md).
+head_placement() {
+  local cpuset cpus threads
+  cpuset="$(head_setting WHISPER_CPU_HEAD_CPUSET 7-9,15-19)"
+  cpus="$(head_setting WHISPER_CPU_HEAD_CPUS 8)"
+  threads="$(head_setting WHISPER_CPU_HEAD_THREADS 8)"
+  [[ "$cpuset" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] \
+    || die "WHISPER_CPU_HEAD_CPUSET '$cpuset' is not a cpuset (for example 7-9,15-19)"
+  [[ "$cpus" =~ ^[1-9][0-9]?$ ]] && [ "$cpus" -le 20 ] \
+    || die "WHISPER_CPU_HEAD_CPUS '$cpus' must be a whole number of cores from 1 to 20"
+  [[ "$threads" =~ ^[1-9][0-9]?$ ]] && [ "$threads" -le 20 ] \
+    || die "WHISPER_CPU_HEAD_THREADS '$threads' must be from 1 to 20"
+  printf 'WHISPER_CPU_CPUSET=%s WHISPER_CPU_CPUS=%s WHISPER_CPU_THREADS=%s' "$cpuset" "$cpus" "$threads"
+}
+
+# The owner's condition, as a floor: nothing starts on the head below 20 GiB of MemAvailable.
+head_memory_floor() {
+  local kb floor_kb
+  [[ "$WHISPER_CPU_HEAD_MIN_AVAILABLE_GIB" =~ ^[0-9]+$ ]] \
+    || die "WHISPER_CPU_HEAD_MIN_AVAILABLE_GIB '$WHISPER_CPU_HEAD_MIN_AVAILABLE_GIB' must be a whole number of GiB"
+  kb="$(awk '/^MemAvailable:/ {print $2}' "${WHISPER_CPU_MEMINFO:-/proc/meminfo}" 2>/dev/null || true)"
+  [[ "$kb" =~ ^[0-9]+$ ]] || die "could not read MemAvailable on the head"
+  floor_kb=$((WHISPER_CPU_HEAD_MIN_AVAILABLE_GIB * 1024 * 1024))
+  [ "$kb" -ge "$floor_kb" ] \
+    || die "the head has $((kb / 1048576)) GiB available, under the ${WHISPER_CPU_HEAD_MIN_AVAILABLE_GIB} GiB floor for its CPU speech replica; not starting it"
+  check_pass "head memory: $((kb / 1048576)) GiB available (floor ${WHISPER_CPU_HEAD_MIN_AVAILABLE_GIB} GiB)"
 }
 
 run_worker() { # run_worker - script on stdin
@@ -67,10 +131,24 @@ run_worker() { # run_worker - script on stdin
   ssh -o BatchMode=yes -o ConnectTimeout=8 ${CLUSTER_WORKER_SSH_OPTS:-} "$CLUSTER_WORKER_SSH" "bash -s"
 }
 
-# The worker's MANAGEMENT address (enP7s7), read over ssh: never 0.0.0.0, never a RoCE address.
+# The address a copy binds, for the node given (default: WHISPER_CPU_NODE, else the worker).
+# The worker's: its MANAGEMENT address (enP7s7), read over ssh: never 0.0.0.0, never a RoCE address.
 # Same rule, same reasons, as scripts/whisper.sh whisper_bind_address.
+# The head's: a Docker bridge gateway, 172.17.0.1 unless WHISPER_CPU_HEAD_BIND says another one
+# inside 172.16.0.0/12. The head's host guard does not judge 30008 (nor 30007, where the head's
+# GPU replica listens on the same gateway), so the bind is the boundary: a LAN, rail or wildcard
+# address would put an unauthenticated engine on the network, and loopback hides it from the
+# orchestrator's container.
 bind_address() {
-  local address
+  local address node="${1:-${WHISPER_CPU_NODE:-worker}}"
+  if [ "$node" = head ]; then
+    address="${WHISPER_CPU_HEAD_BIND:-172.17.0.1}"
+    if [[ "$address" =~ ^172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+      printf '%s' "$address"
+      return 0
+    fi
+    die "the head's CPU speech replica binds a Docker bridge gateway (172.16.0.0/12), not '$address'"
+  fi
   address="$(ssh_worker "ip -4 -br addr show ${WHISPER_MANAGEMENT_IFNAME} 2>/dev/null | awk '{print \$3}' | cut -d/ -f1" </dev/null)" || address=""
   case "$address" in
     "") die "could not read the worker's ${WHISPER_MANAGEMENT_IFNAME} address over ssh ($CLUSTER_WORKER_SSH)" ;;
@@ -161,6 +239,55 @@ EOS
   check_pass "q8_0 model converted and verified ($ggml)"
 }
 
+# ------------------------------------------------------------------ head --
+
+# The head's copy runs exactly what the worker's runs: the image the worker built, loaded here
+# under the same ID, and the q8_0 file the worker converted, checked here against the same pin.
+fetch_image_from_worker() {
+  local want have
+  want="$(ssh_worker "docker image inspect -f '{{.Id}}' '$WHISPER_CPU_IMAGE' 2>/dev/null" </dev/null || true)"
+  [[ "$want" == sha256:* ]] \
+    || die "the worker has no $WHISPER_CPU_IMAGE to copy; run scripts/whisper-cpu.sh up (the worker's copy) first"
+  have="$(docker image inspect -f '{{.Id}}' "$WHISPER_CPU_IMAGE" 2>/dev/null || true)"
+  if [ "$have" != "$want" ]; then
+    log_info "copying $WHISPER_CPU_IMAGE from the worker; nothing is compiled on the head"
+    ssh_worker "docker save '$WHISPER_CPU_IMAGE'" </dev/null | docker load >/dev/null \
+      || die "could not copy $WHISPER_CPU_IMAGE from the worker"
+    have="$(docker image inspect -f '{{.Id}}' "$WHISPER_CPU_IMAGE" 2>/dev/null || true)"
+    [ "$have" = "$want" ] || die "the image on the head is '${have:-none}', not the worker's $want"
+  fi
+  check_pass "image $WHISPER_CPU_IMAGE is the worker's build (${want:7:12})"
+}
+
+ensure_model_head() {
+  local dir file partial
+  dir="$WHISPER_CPU_HEAD_MODEL_CACHE/repos/$(ggml_dir_name)"
+  file="$dir/ggml-large-v3-q8_0.bin"
+  if [ -f "$file" ] && echo "$GGML_Q8_0_SHA256  $file" | sha256sum -c --status -; then
+    check_pass "q8_0 model present on the head and matches its pin ($(ggml_dir_name))"
+    return 0
+  fi
+  log_info "copying the q8_0 model from the worker (converted and checked there, never on the head)"
+  mkdir -p "$dir"
+  partial="$(mktemp "$dir/.ggml-large-v3-q8_0.bin.XXXXXX")"
+  # An interrupted copy must not leave 1.7 GB behind in the model cache.
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$partial'" EXIT
+  if ! ssh_worker "cat '$WHISPER_MODEL_CACHE/repos/$(ggml_dir_name)/ggml-large-v3-q8_0.bin'" </dev/null >"$partial"; then
+    rm -f "$partial"
+    die "the worker has no q8_0 model to copy; run scripts/whisper-cpu.sh up (the worker's copy) first"
+  fi
+  if ! echo "$GGML_Q8_0_SHA256  $partial" | sha256sum -c --status -; then
+    rm -f "$partial"
+    die "the q8_0 file copied from the worker does not match its pin"
+  fi
+  # uid 10008 reads it through a read-only mount.
+  chmod 0644 "$partial"
+  mv -f "$partial" "$file"
+  trap - EXIT
+  check_pass "q8_0 model copied from the worker and verified ($(ggml_dir_name))"
+}
+
 # ------------------------------------------------------------------ endpoint --
 
 # ASR_CPU_BASE_URLS in .env is the ONLY link between "the replica started" and "the orchestrator
@@ -175,11 +302,65 @@ _set_env() { # _set_env KEY VALUE, idempotent, in .env
   fi
 }
 
+# ASR_CPU_BASE_URLS lists every CPU copy, and the router offers an overflow clip to them IN THIS
+# ORDER (RoutedProvider: the first free one takes it). So MERGE, never replace: `up` or `down` on
+# one node leaves the other node's copy listed (scripts/whisper.sh record_endpoints; replacing is
+# how a rebuild of one GPU engine silently halved the fleet on 2026-09-08). The head's copy (a
+# Docker bridge gateway address; the worker's is its management address) always goes LAST: the
+# head's cores also run the orchestrator, Postgres and the chat model's rank-0 engine loop.
+cpu_endpoints_recorded() {
+  grep -E '^ASR_CPU_BASE_URLS=' "$ROOT/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr ',' ' ' || true
+}
+
+# is_head_endpoint URL: the head copy's URL, a Docker bridge gateway (the worker's is 192.168.x).
+is_head_endpoint() {
+  [[ "$1" =~ ^http://172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}: ]]
+}
+
+# record_cpu_endpoint URL
+record_cpu_endpoint() {
+  local url
+  local -a first=() last=() all=()
+  for url in $(cpu_endpoints_recorded) "$1"; do
+    case " ${first[*]-} ${last[*]-} " in *" $url "*) continue ;; esac
+    if is_head_endpoint "$url"; then last+=("$url"); else first+=("$url"); fi
+  done
+  all=("${first[@]}" "${last[@]}")
+  _set_env ASR_CPU_BASE_URLS "$(IFS=,; printf '%s' "${all[*]}")"
+}
+
+# forget_cpu_endpoint URL
+forget_cpu_endpoint() {
+  local url
+  local -a kept=()
+  for url in $(cpu_endpoints_recorded); do
+    [ "$url" = "$1" ] || kept+=("$url")
+  done
+  _set_env ASR_CPU_BASE_URLS "$(IFS=,; printf '%s' "${kept[*]-}")"
+}
+
 compose_worker() { # compose_worker <bind> ARGS...
   local bind="$1"; shift
   ssh_worker "cd $REMOTE_DIR && WHISPER_BIND=$bind WHISPER_CPU_PORT=$WHISPER_CPU_PORT \
     WHISPER_CPU_MODEL_DIR='$WHISPER_MODEL_CACHE/repos/$(ggml_dir_name)' \
     docker compose --project-name $WHISPER_CPU_PROJECT -f compose.whisper-cpu.yaml $*" </dev/null
+}
+
+# The head's copy is run by this checkout's compose file, on the head's own Docker. Its placement
+# is validated before `up`; for ps, logs and down a broken setting must not stand in the way.
+# compose_head BIND ARGS...
+compose_head() {
+  local bind="$1" placement; shift
+  placement="$(head_placement 2>/dev/null || true)"
+  # shellcheck disable=SC2086
+  env WHISPER_BIND="$bind" WHISPER_CPU_PORT="$WHISPER_CPU_PORT" \
+    WHISPER_CPU_MODEL_DIR="$WHISPER_CPU_HEAD_MODEL_CACHE/repos/$(ggml_dir_name)" $placement \
+    docker compose --project-name "$WHISPER_CPU_PROJECT" -f "$ROOT/compose/compose.whisper-cpu.yaml" "$@"
+}
+
+# compose_node BIND ARGS...: the copy WHISPER_CPU_NODE names.
+compose_node() {
+  if [ "$WHISPER_CPU_NODE" = head ]; then compose_head "$@"; else compose_worker "$@"; fi
 }
 
 wait_ready() { # wait_ready <bind>
@@ -250,43 +431,57 @@ require_host_guard() {
 cmd="${1:-status}"; shift || true
 case "$cmd" in
   up)
-    require_worker
-    require_host_guard
+    require_cluster
+    [ "$WHISPER_CPU_NODE" = head ] || require_host_guard
     bind="$(bind_address)"
-    sync_files
-    build_images
-    ensure_model
-    compose_worker "$bind" up -d
+    if [ "$WHISPER_CPU_NODE" = head ]; then
+      head_placement >/dev/null
+      head_memory_floor
+      fetch_image_from_worker
+      ensure_model_head
+      # --no-build: the image is the worker's, loaded above; a missing one must fail, not compile.
+      compose_head "$bind" up -d --no-build
+    else
+      sync_files
+      build_images
+      ensure_model
+      compose_worker "$bind" up -d
+    fi
     wait_ready "$bind"
-    _set_env ASR_CPU_BASE_URLS "$(endpoint "$bind")"
-    check_pass "recorded ASR_CPU_BASE_URLS=$(endpoint "$bind") in .env"
+    record_cpu_endpoint "$(endpoint "$bind")"
+    check_pass "recorded ASR_CPU_BASE_URLS=$(env_get "$ENV_FILE" ASR_CPU_BASE_URLS || true) in .env"
     log_info "the orchestrator uses it after its next restart (./techsara up); the GPU replicas are unchanged"
+    if [ "$WHISPER_CPU_NODE" = head ]; then
+      log_info "the head's copy is allowed while chat decode stays within 5 % of it idle: docs/voice/CPU-REPLICA-HEAD.md"
+    fi
     ;;
   down|stop)
-    require_worker
+    require_cluster
     bind="$(bind_address)"
-    compose_worker "$bind" "$([ "$cmd" = down ] && echo down || echo stop)"
-    _set_env ASR_CPU_BASE_URLS ""
-    check_pass "recorded ASR_CPU_BASE_URLS= (empty) in .env"
+    compose_node "$bind" "$([ "$cmd" = down ] && echo down || echo stop)"
+    forget_cpu_endpoint "$(endpoint "$bind")"
+    check_pass "recorded ASR_CPU_BASE_URLS=$(env_get "$ENV_FILE" ASR_CPU_BASE_URLS || true) in .env"
     log_info "restart the orchestrator to stop routing to it:  ./techsara up"
     ;;
   status)
-    require_worker
+    require_cluster
     bind="$(bind_address)"
-    compose_worker "$bind" ps || true
+    compose_node "$bind" ps || true
     curl -fsS -m 5 "http://$bind:$WHISPER_CPU_PORT/health" || echo "  replica not answering"
     echo
     ;;
   logs)
-    require_worker
-    compose_worker "$(bind_address)" logs -f
+    require_cluster
+    bind="$(bind_address)"
+    compose_node "$bind" logs -f
     ;;
   url)
-    require_worker
-    endpoint "$(bind_address)"; echo
+    require_cluster
+    bind="$(bind_address)"
+    endpoint "$bind"; echo
     ;;
   verify)
-    require_worker
+    require_cluster
     bind="$(bind_address)"
     clip="${TMPDIR:-/tmp}/whisper-verify.flac"
     [ -f "$clip" ] || curl -fsSL -o "$clip" https://github.com/openai/whisper/raw/main/tests/jfk.flac \

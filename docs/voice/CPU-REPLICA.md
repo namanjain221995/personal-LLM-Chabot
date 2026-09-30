@@ -38,8 +38,10 @@ worker's fast cores, GPU replicas preferred, the same accuracy measured before i
         ▼
 ```
 
-- **Worker only.** The head's memory is off limits for new services (owner, 2026-09-16), and
-  `scripts/whisper-cpu.sh` refuses anything but dual mode.
+- **The worker, and the head only by exception.** The head's memory is off limits for new services
+  (owner, 2026-09-16), and `scripts/whisper-cpu.sh` refuses anything but dual mode. On 2026-09-30
+  the owner allowed a second copy on the head, if chat decode drops by no more than 5 % while it
+  is busy: [CPU-REPLICA-HEAD.md](CPU-REPLICA-HEAD.md) (`WHISPER_CPU_NODE=head`, not deployed).
 - **The ten Cortex-X925 cores** (cpus 5-9 and 15-19, 3.9 GHz), with a quota of eight cores' worth
   of time. cpus 0-4 and 10-14 are the slower A725 cluster. **Nothing keeps the chat model's
   worker rank off the X925 cores:** its container has no cpuset (`docker inspect` shows
@@ -456,12 +458,13 @@ scripts/whisper-cpu.sh up       # check the host guard, build, convert + verify 
 scripts/whisper-cpu.sh status   # container state and the replica's /health
 scripts/whisper-cpu.sh verify   # transcribe the JFK clip and print the time taken
 scripts/whisper-cpu.sh logs
-scripts/whisper-cpu.sh down     # stop it and empty ASR_CPU_BASE_URLS; nothing else is touched
+scripts/whisper-cpu.sh down     # stop it and take it out of ASR_CPU_BASE_URLS; nothing else is touched
 ```
 
-`up` writes `ASR_CPU_BASE_URLS` into `.env`. The orchestrator reads it on its next recreate
-(`./techsara up`, a routine up; the main model is not restarted). Until then nothing routes to the
-replica. `down` empties the key.
+`up` adds the replica to `ASR_CPU_BASE_URLS` in `.env`. The orchestrator reads it on its next
+recreate (`./techsara up`, a routine up; the main model is not restarted). Until then nothing routes
+to the replica. `down` removes that replica's entry and leaves the other node's copy listed
+(`WHISPER_CPU_NODE=head` acts on the head's copy, which is always listed last).
 
 **Before the first `up`** (owner, root). The replica has no authentication, as the GPU replica has
 none, and the worker's packet filter judges only the ports it lists: until it lists 30008, the

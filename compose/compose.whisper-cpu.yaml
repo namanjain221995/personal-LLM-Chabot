@@ -1,5 +1,6 @@
-# Whisper Large-v3 on the worker's CPU cores: the overflow replica. Its own Compose project
-# (sf-local-ai-whisper-cpu), on the WORKER only (spark-476e), started by scripts/whisper-cpu.sh.
+# Whisper Large-v3 on a Spark's CPU cores: the overflow replica. Its own Compose project
+# (sf-local-ai-whisper-cpu), on the WORKER (spark-476e) and, by the owner's exception of
+# 2026-09-30, on the HEAD (spark-0e68) as well, started by scripts/whisper-cpu.sh.
 #
 # WHAT IT IS FOR. The two GPU replicas (compose.whisper.yaml, one per Spark) serve speech. The
 # orchestrator sends this copy a clip only when every GPU replica is already decoding one, and only
@@ -8,16 +9,21 @@
 # same decode settings, the same HTTP contract as compose/whisper/server.py; see
 # docs/voice/CPU-REPLICA.md for the measurements behind all of it.
 #
-# NEVER ON THE HEAD. The head's memory is off limits for new services (owner, 2026-09-16) and its
-# CPU runs the orchestrator; scripts/whisper-cpu.sh refuses anything but the worker.
+# THE HEAD ONLY BY EXCEPTION. The head's memory is off limits for new services (owner,
+# 2026-09-16). On 2026-09-30 the owner allowed this one copy there, on the condition that chat
+# decode drops by no more than 5 % while it is busy, measured first
+# (docs/voice/CPU-REPLICA-HEAD.md). scripts/whisper-cpu.sh starts it there only when asked
+# (WHISPER_CPU_NODE=head) and refuses when the head has less than 20 GiB available.
 #
 # NO GPU, ON PURPOSE. A GPU speech replica on either Spark slows the chat model on both (it is
-# tensor-parallel across them). This one uses ten of the worker's cores and none of its GPU.
+# tensor-parallel across them). This one uses eight of a Spark's cores and none of its GPU.
 #
-# BINDING: the worker's MANAGEMENT address, bound by the process itself with host networking,
-# exactly like compose.whisper.yaml (a published port does not survive a reboot there, and the RoCE
-# addresses belong to the main model's fabric). WHISPER_BIND is required. The host packet filter
-# must accept 30008 from the head only (scripts/host-guard.sh), as it does 30007.
+# BINDING, bound by the process itself with host networking, exactly like compose.whisper.yaml.
+# On the worker, the MANAGEMENT address (a published port does not survive a reboot there, and the
+# RoCE addresses belong to the main model's fabric). The host packet filter must accept 30008 from
+# the head only (scripts/host-guard.sh), as it does 30007. On the head, the Docker bridge gateway
+# 172.17.0.1, where the head's GPU replica listens on 30007: the orchestrator reaches it from its
+# compose bridge, and the office LAN does not. WHISPER_BIND is required on both.
 
 services:
   whisper-cpu:
@@ -30,7 +36,7 @@ services:
       WHISPER_BIND: "${WHISPER_BIND:?WHISPER_BIND must be set; scripts/whisper-cpu.sh derives it on the worker}"
       WHISPER_PORT: "${WHISPER_CPU_PORT:-30008}"
       WHISPER_MAX_AUDIO_SECONDS: "${WHISPER_MAX_AUDIO_SECONDS:-600}"
-      WHISPER_CPU_THREADS: "8"
+      WHISPER_CPU_THREADS: "${WHISPER_CPU_THREADS:-8}"
       WHISPER_CPU_MODEL_FILE: /models/ggml-large-v3-q8_0.bin
       # OpenMP threads sleep when there is nothing to decode instead of spinning on the cores the
       # chat model's worker rank may be scheduled on.
@@ -39,10 +45,12 @@ services:
     # THE TEN CORTEX-X925 CORES, AND EIGHT CORES' WORTH OF TIME ON THEM. cpus 0-4 and 10-14 are the
     # slower A725 cluster. Nothing pins the chat model's worker rank to them (its container has no
     # cpuset), so its threads may run on these ten too; the measured chat cost includes that.
-    # The quota leaves two X925 cores' worth of time free
-    # inside the set as well.
-    cpuset: "5-9,15-19"
-    cpus: 8
+    # The quota leaves two X925 cores' worth of time free inside the set as well. These are the
+    # WORKER's values and the defaults. The head's copy is given its own
+    # (WHISPER_CPU_CPUSET/_CPUS/_THREADS, set by scripts/whisper-cpu.sh): eight X925 cores without
+    # 5-6, where the chat model's rank-0 engine loop ran on 2026-09-30.
+    cpuset: "${WHISPER_CPU_CPUSET:-5-9,15-19}"
+    cpus: ${WHISPER_CPU_CPUS:-8}
     # A MEMORY CEILING, AND NO SWAP: the one service with a hard limit, decided on purpose
     # (launcher/tests/test_oom_score_adj.py DECIDED_MEMORY_LIMITS). No GPU code runs here, so all
     # of its memory is host RSS the cgroup charges. Measured peak 2.0 GiB (the q8_0 model, the
