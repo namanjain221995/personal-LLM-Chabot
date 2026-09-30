@@ -751,6 +751,12 @@ describe('joining a piece that starts with the punctuation closing the one befor
     for (const opening of ['(and', '[and', '"and', '“and', '-and', '#1']) {
       expect(spaceBetween('told', opening)).toBe(' ');
     }
+    // A '.' or ',' with a letter or digit right after it starts a word of its own.
+    expect(joinPreview('the rate is', '.5 percent')).toBe('the rate is .5 percent');
+    expect(joinPreview('the rate is', ',5 percent')).toBe('the rate is ,5 percent');
+    expect(joinPreview('built on', '.NET')).toBe('built on .NET');
+    expect(joinPreview('and then', '... more')).toBe('and then... more');
+    expect(joinPreview('है', '।जंगल')).toBe('है।जंगल');
     // Whatever space a side already has is kept as it is.
     expect(joinPreview('told ', ', and')).toBe('told , and');
     expect(joinPreview('told', ' , and')).toBe('told , and');

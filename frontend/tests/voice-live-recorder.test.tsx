@@ -46,7 +46,7 @@ import { IDBFactory, IDBKeyRange } from 'fake-indexeddb';
 import { Blob as NodeBlob } from 'node:buffer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Composer } from '@/components/Composer';
-import { useVoiceRecorder } from '@/components/useVoiceRecorder';
+import { STOP_REPEAT_GUARD_MS, useVoiceRecorder } from '@/components/useVoiceRecorder';
 import { DEFAULT_PREFS } from '@/lib/prefs';
 import { OUTBOX_STALE_MS } from '@/lib/voice';
 import { LIVE_LANGUAGE_DEBOUNCE_MS, LIVE_SETTLE_WAIT_MS } from '@/lib/voiceLive';
@@ -1513,7 +1513,7 @@ describe('the live words of a Hindi session, before the full pass', () => {
     expect(ctx.onTranscript).toHaveBeenCalledWith(words, null);
     // The full pass is not done; under load the finish request may not even have gone out yet.
     expect(server.status).not.toBe('done');
-    await until(() => ctx.view.result.current.state === 'idle', 'idle once the server has the finish');
+    await untilWithClock(() => ctx.view.result.current.state === 'idle', 'idle once the server has the finish');
     expect(ctx.view.result.current.error).toBeNull();
     expect(ctx.view.result.current.followUp).toMatchObject({
       message: 'Inserted the live transcript.',
@@ -1538,6 +1538,28 @@ describe('the live words of a Hindi session, before the full pass', () => {
     expect(ctx.onTranscript).toHaveBeenLastCalledWith(WHISPER_URDU, null, words, true);
   });
 
+  it('stays finishing for STOP_REPEAT_GUARD_MS after Stop, so a double-click or a second Enter cannot send the words', async () => {
+    useHeldFullPass();
+    const ctx = await startRecording();
+    const ws = await goLive(25);
+    const doneAt = await stopAfter(ctx, ws, HINGLISH);
+    await until(() => ctx.onTranscript.mock.calls.length > 0, 'the live words in');
+    // The words are in at once; the bar (and so Stop, not Send, under the cursor) stays.
+    for (let t = 0; t < 30; t += 1) await act(async () => turn());
+    expect(ctx.view.result.current.state).toBe('finishing');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(Math.max(0, STOP_REPEAT_GUARD_MS - 1 - (Date.now() - doneAt)));
+    });
+    for (let t = 0; t < 10; t += 1) await act(async () => turn());
+    expect(ctx.view.result.current.state).toBe('finishing');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2);
+    });
+    await until(() => ctx.view.result.current.state === 'idle', 'idle once the guard has passed');
+    expect(ctx.view.result.current.followUp).toMatchObject({ message: 'Inserted the live transcript.', actionLabel: null });
+    expect(ctx.onTranscript).toHaveBeenCalledTimes(1);
+  });
+
   it('stays finishing, with the words already in, until the server has the recording’s finish', async () => {
     useHeldFullPass();
     let letFinishThrough: () => void = () => undefined;
@@ -1560,7 +1582,7 @@ describe('the live words of a Hindi session, before the full pass', () => {
     expect(ctx.view.result.current.state).toBe('finishing');
     expect(ctx.view.result.current.followUp).toBeNull();
     letFinishThrough();
-    await until(() => ctx.view.result.current.state === 'idle', 'idle once the finish is in');
+    await untilWithClock(() => ctx.view.result.current.state === 'idle', 'idle once the finish is in');
     expect(server.status).toBe('finishing');
     expect(ctx.view.result.current.followUp).toMatchObject({ message: 'Inserted the live transcript.', actionLabel: null });
     expect(ctx.onTranscript).toHaveBeenCalledTimes(1);
@@ -1621,7 +1643,7 @@ describe('the live words of a Hindi session, before the full pass', () => {
     const ctx = await startRecording(resolveOwner);
     const ws = await goLive(25);
     await stopAfter(ctx, ws, HINGLISH);
-    await until(() => ctx.view.result.current.followUp !== null, 'the line');
+    await untilWithClock(() => ctx.view.result.current.followUp !== null, 'the line');
     await act(async () => ctx.view.result.current.followUp!.dismiss());
     expect(ctx.view.result.current.followUp).toBeNull();
     // Only once every part is in and the finish accepted: flipping a session
@@ -1669,7 +1691,7 @@ describe('the live words of a Hindi session, before the full pass', () => {
     });
     await until(() => box.value === `Draft: ${HINGLISH}`, 'the live words in the draft');
     expect(server.status).not.toBe('done');
-    await until(() => screen.queryByText('Inserted the live transcript.') !== null, 'the line');
+    await untilWithClock(() => screen.queryByText('Inserted the live transcript.') !== null, 'the line');
     expect(screen.queryByText('Use the other one')).toBeNull();
     // The person corrects a word of what went in, while the full pass runs.
     const edited = `Draft: ${HINGLISH.replace('office', 'ऑफिस')}`;

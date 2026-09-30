@@ -38,7 +38,10 @@ It is a draft and is never sent on its own:
   or at least 20 % of the live transcript's letters are Devanagari. If the
   live stream heard the whole recording, its transcript goes in as soon as the
   stream settles, without waiting for whisper: 0.43 s after Stop for a 67.2 s
-  Hindi dictation ([Latency](#latency)). A quiet line says *Inserted the live
+  Hindi dictation ([Latency](#latency)). The bar stays for 0.6 s after Stop
+  (`STOP_REPEAT_GUARD_MS`): Send sits where Stop was, and a double-click's
+  second click, or a second Enter, would otherwise send the words before the
+  person has read them. Then a quiet line says *Inserted the live
   transcript.*, with nothing to press yet. The full pass (whisper over the
   stored recording) carries on, and only when it is done does the line offer
   **Use the other one**. If the full pass fails, the line adds *The full-pass

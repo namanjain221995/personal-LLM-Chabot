@@ -950,8 +950,11 @@ export function parseSessionConfig(body: unknown): SessionConfig {
  * utterance at the pause and keeps the danda or comma that ends it on the
  * NEXT utterance, on purpose, so "जंगल में है" is followed by "। फिर हम": joined
  * with a space, the draft read "है । फिर" and "told , and".
+ *
+ * A '.' or ',' counts only when no letter or digit follows it: ".5 percent"
+ * and ".NET" are words of their own and keep their space (T4c QA).
  */
-const CLOSING_PUNCTUATION = /^[,.;:!?।॥)\]}…，．；：！？）］｝、。]/u;
+const CLOSING_PUNCTUATION = /^(?:[;:!?।॥)\]}…，．；：！？）］｝、。]|[.,](?![\p{L}\p{N}]))/u;
 
 /** Whether `text` starts by closing what came before it (`CLOSING_PUNCTUATION`). */
 export function startsWithClosingPunctuation(text: string): boolean {

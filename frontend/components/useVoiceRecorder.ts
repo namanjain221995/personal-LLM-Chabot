@@ -135,6 +135,16 @@ import {
  */
 const STOP_EVENT_GRACE_MS = 2000;
 
+/**
+ * How long after Stop the recorder stays 'finishing' when a Hindi session's
+ * live words go straight in (spec 13). The bar leaves when it goes idle, and
+ * Send sits where Stop was: a double-click's second click, or a second Enter,
+ * sent the words before the person had read them (T4c QA, real Chromium,
+ * second click 174 ms after the first). 600 ms covers the usual OS
+ * double-click interval; the words are already in the draft meanwhile.
+ */
+export const STOP_REPEAT_GUARD_MS = 600;
+
 const noop = () => undefined;
 
 /** A line beside the composer that the person can act on, or dismiss. */
@@ -353,6 +363,8 @@ export function useVoiceRecorder({
   // transition that has already happened.
   const current = useRef<VoiceState>('idle');
   const alive = useRef(true);
+  /** When the person pressed Stop (Date.now()), for STOP_REPEAT_GUARD_MS. */
+  const stoppedAt = useRef(0);
   /** Bumped by every start and cancel, so a stale async step knows it is stale. */
   const generation = useRef(0);
   /** The account the last lookup found; null when it could not be told. */
@@ -1171,6 +1183,9 @@ export function useVoiceRecorder({
         );
       };
       await Promise.race([told, ending.then(noop, noop)]);
+      // Stay 'finishing' until a repeated Stop can no longer land on Send.
+      const guard = STOP_REPEAT_GUARD_MS - (Date.now() - stoppedAt.current);
+      if (guard > 0) await new Promise<void>((resolve) => setTimeout(resolve, guard));
       // Discarded meanwhile (X while finishing): the recording is gone, the words are the person's.
       if (session.current !== s) return;
       session.current = null;
@@ -2054,6 +2069,7 @@ export function useVoiceRecorder({
   const stop = useCallback(() => {
     if (current.current !== 'recording') return;
     outcome.current = 'stop';
+    stoppedAt.current = Date.now();
     const rec = recorder.current;
     if (!rec || rec.state === 'inactive') {
       // THE SECOND STOP (2026-09-29). rec.stop() makes the recorder inactive
