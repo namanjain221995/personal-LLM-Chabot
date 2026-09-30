@@ -127,6 +127,14 @@ the row.
 The super admin's download is audited only when audio is actually served
 (200/206).
 
+One narrow race is left on purpose. If the head copy is released in the
+milliseconds between the existence check and the file being opened, that one
+request fails (a 500, or a response cut short), and the next one streams from
+the store. It can happen at most once per recording, when its grace ends. A
+fix would mean serving from a file opened before the check, with Range
+handled by hand, or making every playback hold the lock a release takes,
+which would make a retranscription wait behind a long download.
+
 The Recordings page (`frontend/components/recordings/RecordingItem.tsx`)
 reacts to a failed player with one `Range: bytes=0-0` request
 (`lib/recordings.ts` `diagnosePlayback`). That request tells apart a format
