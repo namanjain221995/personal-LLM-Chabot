@@ -92,7 +92,7 @@ def _key(project_row, workspace_id, *, public_id="pub0000000000001", **kwargs) -
 # --------------------------------------------------------------- migration --
 
 
-def test_the_migration_list_ends_at_v42_and_the_test_database_is_fully_migrated():
+def test_the_migration_list_ends_at_v43_and_the_test_database_is_fully_migrated():
     versions = [version for version, _ddl in db._MIGRATIONS]
 
     # V35 (2026-09-13): api_responses.max_output_tokens and finish_reason.
@@ -107,13 +107,15 @@ def test_the_migration_list_ends_at_v42_and_the_test_database_is_fully_migrated(
     #                   shown, so a restart does not undo the follow-up fix.
     # V42 (2026-09-29): voice_sessions — chunked, stored dictation with no
     #                   length limit (app/dictation.py).
-    assert versions == list(range(1, 43))
-    assert db.LATEST_SCHEMA_VERSION == 42
-    assert db.schema_version() == 42
+    # V43 (2026-09-30): voice_sessions.archive_state and friends — where a
+    #                   finished recording's audio lives (app/voice_archive.py).
+    assert versions == list(range(1, 44))
+    assert db.LATEST_SCHEMA_VERSION == 43
+    assert db.schema_version() == 43
     # Applying an applied migration is a no-op, which is what makes the
     # startup path safe to run on every boot.
     db.init_schema()
-    assert db.schema_version() == 42
+    assert db.schema_version() == 43
 
 
 def test_the_v34_migration_applies_to_a_database_that_has_never_seen_it():

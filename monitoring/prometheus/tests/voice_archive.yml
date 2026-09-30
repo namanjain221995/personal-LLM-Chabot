@@ -1,0 +1,198 @@
+# promtool unit tests for monitoring/prometheus/rules/voice-archive.yml.
+#
+#   IMG=$(grep -o 'prom/prometheus@sha256:[0-9a-f]*' compose/compose.monitoring.yaml | head -1)
+#   docker run --rm -v "$PWD/monitoring/prometheus:/p:ro" --entrypoint promtool "$IMG" \
+#     test rules /p/tests/voice_archive.yml
+#
+# Label set is the orchestrator job's (prometheus.yml):
+#   instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"
+
+rule_files:
+  - ../rules/voice-archive.yml
+
+evaluation_interval: 15s
+
+group_eval_order:
+  - voice-archive-recording
+  - voice-archive
+
+tests:
+  # ============================================== recording rule
+  - interval: 1m
+    name: "errors are summed by reason over an hour"
+    input_series:
+      - series: 'voice_archive_errors_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",reason="unreachable"}'
+        values: '0+1x120'
+    promql_expr_test:
+      - expr: reason:voice_archive_errors:increase1h
+        eval_time: 90m
+        exp_samples:
+          - labels: 'reason:voice_archive_errors:increase1h{reason="unreachable"}'
+            value: 60
+
+  # ============================================== VoiceArchiveStoreDown
+  - interval: 1m
+    name: "the store down for 15 minutes while the mover runs fires"
+    input_series:
+      - series: 'voice_archive_store_up{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '1x5 0x40'
+      - series: 'voice_archive_enabled{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '1x45'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: VoiceArchiveStoreDown
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: VoiceArchiveStoreDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: host.docker.internal:8080
+            exp_annotations:
+              summary: "The voice archive store on the worker has not answered for 15 minutes"
+              description: "Moved recordings cannot be played or retranscribed until it is back; nothing is lost and new recordings keep working. `scripts/voice-store.sh status` shows the container and /health."
+              runbook: docs/voice-archive.md#when-the-store-is-down
+
+  - interval: 1m
+    name: "a store that is down while the mover is off is not an alert"
+    input_series:
+      - series: 'voice_archive_store_up{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x40'
+      - series: 'voice_archive_enabled{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: VoiceArchiveStoreDown
+        exp_alerts: []
+
+  # ============================================== VoiceArchiveBacklogOverdue
+  - interval: 1m
+    name: "a recording six hours past its grace for 30 minutes fires"
+    input_series:
+      - series: 'voice_archive_overdue_oldest_seconds{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x5 22000x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: VoiceArchiveBacklogOverdue
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: VoiceArchiveBacklogOverdue
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: host.docker.internal:8080
+            exp_annotations:
+              summary: "A finished recording has waited 6h 6m 40s past its grace to move"
+              description: "The head keeps it, so nothing is lost, but the head's disk is carrying it. `docker exec sf-local-ai-orchestrator-1 python -m app.voice_archive status` shows the counts; archive_error on the row names the reason."
+              runbook: docs/voice-archive.md#when-recordings-stop-moving
+
+  # ============================================== VoiceArchiveCopiesMissing
+  - interval: 1m
+    name: "an archived recording missing from the store fires after 5 minutes"
+    input_series:
+      - series: 'voice_archive_remote_missing{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x3 2x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: VoiceArchiveCopiesMissing
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: VoiceArchiveCopiesMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: host.docker.internal:8080
+            exp_annotations:
+              summary: "2 archived recording(s) are missing from the voice archive store"
+              description: "Rows with archive_error = 'remote_missing'. Check the worker's disk and ~/techsara-data/voice before anything else writes there."
+              runbook: docs/voice-archive.md#when-the-store-lost-a-recording
+
+  # ============================================== VoiceArchivePurgeStuck
+  - interval: 1m
+    name: "a deleted recording still on the store after an hour fires"
+    input_series:
+      - series: 'voice_archive_purge_pending{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '1x90'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: VoiceArchivePurgeStuck
+        exp_alerts: []
+      - eval_time: 75m
+        alertname: VoiceArchivePurgeStuck
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: host.docker.internal:8080
+            exp_annotations:
+              summary: "1 deleted recording(s) still have a copy on the voice archive store"
+              description: "The person's delete took effect at once; the worker's copy goes on the next pass that reaches the store."
+              runbook: docs/voice-archive.md#when-the-store-is-down
+
+  # ============================================== VoiceArchiveStoreLowSpace
+  - interval: 1m
+    name: "free space within 10% of the floor for 30 minutes fires"
+    input_series:
+      - series: 'voice_archive_store_free_bytes{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '300x5 270x60'
+      - series: 'voice_archive_store_min_free_bytes{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '250x65'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: VoiceArchiveStoreLowSpace
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: VoiceArchiveStoreLowSpace
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: host.docker.internal:8080
+            exp_annotations:
+              summary: "The voice archive's disk on the worker is near its free-space floor"
+              description: "`ssh worker df -h /` and `du -sh ~/techsara-data/voice` show where the space went."
+              runbook: docs/voice-archive.md#when-the-worker-disk-fills
+
+  # ============================================== VoiceArchiveScrubMismatch
+  - interval: 1m
+    name: "a damaged stored recording fires after 5 minutes"
+    input_series:
+      - series: 'voice_archive_store_scrub_mismatches{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0x2 1x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: VoiceArchiveScrubMismatch
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: VoiceArchiveScrubMismatch
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: host.docker.internal:8080
+            exp_annotations:
+              summary: "The voice archive scrub found 1 damaged recording(s)"
+              description: "The store logs which ones (`scripts/voice-store.sh logs`). With one copy it cannot repair them."
+              runbook: docs/voice-archive.md#when-the-store-lost-a-recording
+
+  # ============================================== VoiceArchivePassStalled
+  - interval: 1m
+    name: "no pass for 15 minutes while the mover is on fires; a running mover does not"
+    input_series:
+      # Passes every minute until minute 10 (the value is the pass time in
+      # seconds since the epoch of the test clock), then none.
+      - series: 'voice_archive_last_pass_timestamp_seconds{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '0+60x10 600x50'
+      - series: 'voice_archive_enabled{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: VoiceArchivePassStalled
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: VoiceArchivePassStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: host.docker.internal:8080
+            exp_annotations:
+              summary: "The voice archive's mover has not completed a pass for 35m 0s"
+              description: "The orchestrator log names the failure (\"voice archive pass failed\")."
+              runbook: docs/voice-archive.md#when-recordings-stop-moving

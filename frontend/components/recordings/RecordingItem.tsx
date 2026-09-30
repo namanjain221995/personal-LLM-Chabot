@@ -11,6 +11,13 @@
  * the owner's phone just by being opened. Nothing is fetched until Play, and
  * the proxy forwards Range, so seeking fetches only what it needs.
  *
+ * A PLAYER THAT FAILS SAYS WHY. <audio> reports only that it failed, and a
+ * finished recording may now be kept on the voice archive server
+ * (2026-09-30), which can be unreachable for a while with nothing lost. One
+ * one-byte request (lib/recordings diagnosePlayback) tells a format this
+ * browser cannot play from an archive that is not answering, from audio that
+ * is gone.
+ *
  * THE TRANSCRIPT IS FETCHED WHEN ASKED FOR, AND COPIED BY A SECOND PRESS. The
  * list carries a 120-character preview; the full text is one plain read of
  * the session state. Copy is its own button on the loaded text rather than a
@@ -25,8 +32,10 @@ import { CopyButton } from '@/components/CopyButton';
 import { IconDownload, IconFileText, IconTrash } from '@/components/icons';
 import { formatBytes, formatDay, formatWhen } from '@/lib/format';
 import {
+  PLAYBACK_MESSAGES,
   STATUS_LABEL,
   deleteRecording,
+  diagnosePlayback,
   loadTranscript,
   noTextNote,
   recordingAudioUrl,
@@ -105,9 +114,27 @@ export function RecordingItem({ rec, fetchFn, onDeleted, now }: RecordingItemPro
   const [confirming, setConfirming] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
-  const [playError, setPlayError] = useState(false);
+  const [playError, setPlayError] = useState<string | null>(null);
+  const playbackProbe = useRef<AbortController | null>(null);
 
-  useEffect(() => () => transcriptAbort.current?.abort(), []);
+  useEffect(
+    () => () => {
+      transcriptAbort.current?.abort();
+      playbackProbe.current?.abort();
+    },
+    [],
+  );
+
+  async function explainPlayError() {
+    playbackProbe.current?.abort();
+    const controller = new AbortController();
+    playbackProbe.current = controller;
+    // Something at once; the named cause once the server has answered.
+    setPlayError(PLAYBACK_MESSAGES.unknown);
+    const problem = await diagnosePlayback(fetchFn, rec.id, controller.signal);
+    if (controller.signal.aborted) return;
+    setPlayError(PLAYBACK_MESSAGES[problem]);
+  }
 
   // Stable, because ConfirmDialog re-runs its focus effect whenever this
   // changes: an unstable one pulled focus back to Cancel on every re-render
@@ -209,15 +236,17 @@ export function RecordingItem({ rec, fetchFn, onDeleted, now }: RecordingItemPro
           preload="none"
           src={recordingAudioUrl(rec.id)}
           aria-label={`Play the recording from ${when}`}
-          onError={() => setPlayError(true)}
-          onPlay={() => setPlayError(false)}
+          onError={() => void explainPlayError()}
+          onPlay={() => {
+            playbackProbe.current?.abort();
+            setPlayError(null);
+          }}
           className="mt-3 block h-10 w-full"
         />
       )}
       {playError && (
         <p role="alert" className="mt-2 text-xs text-danger">
-          This recording couldn&apos;t be played here. This browser may not play its format, or its
-          audio is no longer on the server. Try downloading it.
+          {playError}
         </p>
       )}
 

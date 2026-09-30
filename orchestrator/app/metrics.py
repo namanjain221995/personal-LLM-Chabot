@@ -393,6 +393,22 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
         "category": set(FAST_LANE_CATEGORIES),
         "veto": set(FAST_LANE_VETOES),
     },
+    # The voice archive (app/voice_archive.py, 2026-09-30). Literal here so
+    # this module imports nothing; tests/test_voice_archive.py pins these to
+    # voice_archive.ERROR_REASONS / PROXY_RESULTS / RESTORE_RESULTS /
+    # RECONCILE_RESULTS. No id, user or path is ever a label.
+    "voice_archive_errors_total": {"reason": {
+        "unreachable", "timeout", "tls", "auth", "storage_full", "busy", "conflict",
+        "remote_sha_mismatch", "missing", "http_4xx", "http_5xx",
+        "local_missing", "local_size_mismatch", "local_sha_mismatch", "remote_missing",
+    }},
+    "voice_archive_proxy_total": {"result": {"ok", "partial", "not_satisfiable", "unavailable", "missing"}},
+    "voice_archive_restored_total": {"result": {
+        "restored", "held", "unavailable", "missing", "mismatch", "no_space", "deleted",
+    }},
+    "voice_archive_reconcile_total": {"result": {
+        "orphan_deleted", "deleted_row_purged", "repaired", "remote_missing", "foreign",
+    }},
 }
 _ALLOWED_BY_METRIC.update(_LABELS_BY_METRIC)
 

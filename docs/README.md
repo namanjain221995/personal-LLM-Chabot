@@ -23,6 +23,7 @@ source.
 | Two-node DGX Spark cluster (`CLUSTER_MODE=dual`): topology, generated config, scripts, benchmarks, limitations | [`CLUSTER.md`](CLUSTER.md) |
 | **The main model's availability** (2026-09-12): what to do when an alert fires, the engine controller and worker sentinel, the orchestrator's breaker, request continuity and admission lanes, the 2026-09-11 incident, the ADR, the SLOs, the engine candidate | [`availability/`](availability/README.md) — start with [`RUNBOOK.md`](availability/RUNBOOK.md) |
 | Move the OCR engine to the worker (`scripts/ocr.sh`), the hand-over, and how to go back | [`ocr-on-the-worker.md`](ocr-on-the-worker.md) |
+| Stored recordings' audio on the worker's disk (the voice archive, `scripts/voice-store.sh`): design, measurements, deploy, runbook, rollback | [`voice-archive.md`](voice-archive.md) |
 | The 2026-09 engine crashes (MTP spec-decode on the Qwen GDN layer): root cause, remediation, measurements, rollback | [`ISSUE/`](ISSUE/) |
 | Current files and entrypoints | [`00-INVENTORY.md`](00-INVENTORY.md) |
 | Launcher plus application request flows | [`01-codebase/CRITICAL-PATHS.md`](01-codebase/CRITICAL-PATHS.md) |

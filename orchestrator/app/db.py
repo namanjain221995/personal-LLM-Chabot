@@ -2992,6 +2992,62 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_sessions_one_continuation
 """
 
 
+_MIGRATION_V43 = """
+-- V43 (2026-09-30): THE VOICE ARCHIVE -- where a finished recording's audio
+-- lives (app/voice_archive.py). Additive and idempotent: columns with
+-- constant defaults (metadata only, PostgreSQL 11+), one CHECK, three
+-- partial indexes, no backfill. Every existing row is 'local', which is true.
+--
+-- WHY. /data/voice is on the head's root NVMe with the OS, /var/lib/docker
+-- and production Postgres, one copy (owner, 2026-09-30: "improve the storage
+-- of that audio" -> "Move to worker's big disk"). source.<ext> is 99.3% of a
+-- recording's bytes, so only that file moves, to the store on the worker
+-- (compose/voice-store), and only once the recording is finished. The small
+-- files (transcript, parts, plan, results) stay here, so the list, previews
+-- and transcripts never wait for the worker.
+--
+-- archive_state:
+--   local     only the head has the audio (every recording until it moves);
+--   copied    the store holds a copy verified by reading it back, AND the
+--             head file still exists (just copied, held, or brought back);
+--   archived  the store holds the only copy; head_released_at says when the
+--             head file went. A restore takes it back to 'copied'.
+-- head_hold_until keeps a copied recording on the head (a retranscription or
+-- a continuation brought it back). archive_attempts/archive_next_at/
+-- archive_error are the mover's backoff; archive_error is a reason code,
+-- never a message. remote_purged_at: the store's copy of a DELETED recording
+-- is gone too (audio_deleted_at alone says only that the head's is).
+--
+-- LOCKING, as V36: lock_timeout 3 s for this transaction, and init_schema
+-- retries lock_not_available instead of hanging behind a parked session.
+SET LOCAL lock_timeout = '3s';
+ALTER TABLE voice_sessions
+    ADD COLUMN IF NOT EXISTS archive_state    text        NOT NULL DEFAULT 'local',
+    ADD COLUMN IF NOT EXISTS archived_at      timestamptz,
+    ADD COLUMN IF NOT EXISTS head_released_at timestamptz,
+    ADD COLUMN IF NOT EXISTS head_hold_until  timestamptz,
+    ADD COLUMN IF NOT EXISTS archive_attempts integer     NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS archive_next_at  timestamptz,
+    ADD COLUMN IF NOT EXISTS archive_error    text,
+    ADD COLUMN IF NOT EXISTS remote_purged_at timestamptz;
+ALTER TABLE voice_sessions DROP CONSTRAINT IF EXISTS voice_sessions_archive_state;
+ALTER TABLE voice_sessions ADD CONSTRAINT voice_sessions_archive_state
+    CHECK (archive_state IN ('local', 'copied', 'archived'));
+
+-- The mover's claim: finished recordings whose audio is still only here.
+CREATE INDEX IF NOT EXISTS idx_voice_sessions_archive_due
+    ON voice_sessions (finished_at)
+    WHERE archive_state = 'local' AND audio_deleted_at IS NULL AND status IN ('done', 'failed');
+-- Copies whose head file has not been released yet.
+CREATE INDEX IF NOT EXISTS idx_voice_sessions_archive_copied
+    ON voice_sessions (head_hold_until) WHERE archive_state = 'copied';
+-- Deleted recordings whose copy on the store is still to be deleted.
+CREATE INDEX IF NOT EXISTS idx_voice_sessions_archive_purge
+    ON voice_sessions (audio_deleted_at)
+    WHERE audio_deleted_at IS NOT NULL AND archive_state <> 'local' AND remote_purged_at IS NULL;
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -3035,6 +3091,7 @@ _MIGRATIONS: tuple = (
     (40, _MIGRATION_V40),
     (41, _MIGRATION_V41),
     (42, _MIGRATION_V42),
+    (43, _MIGRATION_V43),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and

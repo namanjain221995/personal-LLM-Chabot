@@ -307,7 +307,11 @@ def test_the_recording_is_stored_byte_for_byte_private_and_downloadable_by_its_o
     with db.connection() as con:
         row = con.execute("SELECT source_sha256, bytes_stored FROM voice_sessions WHERE id = %s", (sid,)).fetchone()
     assert row["source_sha256"] == sha(data) and row["bytes_stored"] == len(data)
-    assert done["stored"] == {"kept": True, "retention_days": 0, "delete_after": None, "bytes": len(data)}
+    assert done["stored"] == {
+        "kept": True, "retention_days": 0, "delete_after": None, "bytes": len(data),
+        # V43: on this server, not yet moved to the voice archive.
+        "archived": False,
+    }
 
     got = alice.get(f"/audio/sessions/{sid}/audio")
     assert got.status_code == 200 and got.content == data

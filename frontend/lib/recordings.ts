@@ -289,6 +289,76 @@ export async function loadTranscript(
   return { kind: 'none', message: noTextNote(state.status, state.outcome) };
 }
 
+/* ------------------------------------------------------- playback errors */
+
+/**
+ * Why a player could not play a recording. An <audio> element says only
+ * THAT it failed, never why, and since 2026-09-30 a finished recording's audio
+ * may live on the voice archive server (orchestrator/app/voice_archive.py),
+ * which can be down for a while with nothing lost. So the page asks the
+ * server once, for one byte, and names the real cause:
+ *   format               the server served audio, so this browser cannot play it
+ *   archive_unavailable  503: the archive server is not answering
+ *   audio_missing        410: the archive server has no copy
+ *   deleted              410/404: the audio is gone
+ *   unknown              the probe itself failed
+ */
+export type PlaybackProblem = 'format' | 'archive_unavailable' | 'audio_missing' | 'deleted' | 'unknown';
+
+export const PLAYBACK_MESSAGES: Record<PlaybackProblem, string> = {
+  format:
+    "This browser can't play this recording's format. Download it and open it in another player.",
+  archive_unavailable:
+    "This recording is kept on the archive server, which isn't answering right now. Nothing is lost; try again in a few minutes.",
+  audio_missing:
+    "This recording's audio could not be found on the archive server. Its transcript is still here.",
+  deleted: "This recording's audio is no longer on the server.",
+  unknown:
+    "This recording couldn't be played here. This browser may not play its format, or its audio is no longer on the server. Try downloading it.",
+};
+
+/** One byte of the recording, to learn why a player failed. Never throws. */
+export async function diagnosePlayback(
+  fetchImpl: typeof fetch,
+  id: string,
+  signal?: AbortSignal,
+): Promise<PlaybackProblem> {
+  let response: Response;
+  try {
+    response = await fetchImpl(recordingAudioUrl(id), {
+      method: 'GET',
+      headers: { range: 'bytes=0-0' },
+      cache: 'no-store',
+      signal,
+    });
+  } catch {
+    return 'unknown';
+  }
+  if (response.status === 200 || response.status === 206) {
+    // The server can serve it: whatever failed was the browser's decoder.
+    // Stop reading in case a 200 carries the whole file.
+    try {
+      await response.body?.cancel();
+    } catch {
+      // nothing to release
+    }
+    return 'format';
+  }
+  let reason: string | null = null;
+  try {
+    const body = (await response.json()) as unknown;
+    if (typeof body === 'object' && body !== null && typeof (body as { reason?: unknown }).reason === 'string') {
+      reason = (body as { reason: string }).reason;
+    }
+  } catch {
+    reason = null;
+  }
+  if (response.status === 503 && reason === 'archive_unavailable') return 'archive_unavailable';
+  if (response.status === 410 && reason === 'audio_missing') return 'audio_missing';
+  if (response.status === 410 || response.status === 404) return 'deleted';
+  return 'unknown';
+}
+
 export type DeleteResult = { kind: 'deleted' } | { kind: 'not_deleted'; message: string };
 
 /**

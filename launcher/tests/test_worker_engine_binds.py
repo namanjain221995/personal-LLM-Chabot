@@ -121,6 +121,65 @@ class WorkerEngineBindTests(unittest.TestCase):
                     self.assertEqual(result.stdout, "", "nothing may be printed as a bind address")
                     self.assertIn("enP7s7", result.stderr)
 
+    def test_the_voice_archive_store_binds_the_management_address_the_orchestrator_dials(self) -> None:
+        # The head orchestrator dials https://192.168.9.68:30011 (VOICE_ARCHIVE_URL,
+        # written by the same script) and the certificate's IP SAN is this
+        # address. Worker only: nothing new runs on the head.
+        result = self._bind_address(
+            "voice-store.sh", "voice_store_bind_address", "worker",
+            VOICE_STORE_MANAGEMENT_IFNAME="enP7s7", CLUSTER_WORKER_IP=RAIL_ADDRESS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, MANAGEMENT_LAN_ADDRESS)
+        self.assertIn("enP7s7", self.ssh_log.read_text(encoding="utf-8"), "the address is read from the management interface")
+
+    def test_the_voice_archive_store_never_binds_nothing_everything_or_the_fabric(self) -> None:
+        for answer in ("", "0.0.0.0", "::", "[::]", RAIL_ADDRESS, "10.100.185.2"):
+            with self.subTest(ssh_answer=answer):
+                result = self._bind_address(
+                    "voice-store.sh", "voice_store_bind_address", "worker",
+                    VOICE_STORE_MANAGEMENT_IFNAME="enP7s7", FAKE_SSH_ANSWER=answer,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "", "nothing may be printed as a bind address")
+                self.assertIn("enP7s7", result.stderr)
+
+    def test_a_candidate_voice_store_never_rewrites_the_production_stores_compose_file(self) -> None:
+        # lib/cluster-common.sh sets WORKER_REMOTE_DIR itself, so a candidate
+        # that took its directory from it ran `docker compose` out of, and
+        # copied its compose file over, the production store's
+        # ~/.techsara-cluster/compose.voice-store.yaml (candidate run,
+        # 2026-09-30). The whole script runs here, every ssh call recorded.
+        def compose_dirs(*args: str, **env: str) -> list[str]:
+            if self.ssh_log.exists():
+                self.ssh_log.unlink()
+            result = subprocess.run(
+                ["bash", str(SCRIPTS / "voice-store.sh"), "down", *args],
+                env={
+                    "PATH": self.path,
+                    "HOME": str(self.root),
+                    "CLUSTER_MODE": "dual",
+                    "CLUSTER_WORKER_SSH": f"techsphere@{MANAGEMENT_LAN_ADDRESS}",
+                    **env,
+                },
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            log = self.ssh_log.read_text(encoding="utf-8")
+            return re.findall(r"-- cd (\S+) && .*docker compose", log)
+
+        self.assertEqual(compose_dirs(), ["$HOME/.techsara-cluster"])
+        self.assertEqual(
+            compose_dirs("--candidate", VOICE_STORE_PORT="30195"),
+            ["$HOME/.techsara-cluster/candidates/voice-store-candidate"],
+        )
+        self.assertEqual(
+            compose_dirs("--candidate", VOICE_STORE_PORT="30195", VOICE_STORE_PROJECT="trackb-voice-store"),
+            ["$HOME/.techsara-cluster/candidates/trackb-voice-store"],
+        )
+
     def test_the_head_engines_still_bind_the_docker_bridge_gateway(self) -> None:
         for script, function in (("ocr.sh", "ocr_bind_address"), ("whisper.sh", "whisper_bind_address")):
             with self.subTest(script=script):

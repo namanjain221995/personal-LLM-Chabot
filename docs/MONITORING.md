@@ -604,6 +604,7 @@ protocol at all:
 | `lancedb_web` | vector index over pages the search/crawler stored |
 | `parquet_landing` | the sync worker's landing zone |
 | `reports`, `workspaces`, `brain` | generated documents, clones, knowledge packs |
+| `video`, `voice` | video analyses; stored dictation (V42), which falls to transcripts plus the last day's recordings once the voice archive moves finished audio to the worker |
 
 `data-stores-exporter` walks the volume **read-only** and publishes
 `techsara_store_size_bytes`, `techsara_store_files`,
@@ -913,6 +914,33 @@ braces. Histograms use the registry's fixed buckets.
 Alerting suggestions: `rerank_canary_ok == 0` for 10 min; rate of
 `knowledge_degraded_total` > 5% of `chat_route_total`; `chat_ttft_seconds`
 p95 for route=chat, effort=fast above 3 s.
+
+## The voice archive (orchestrator `/metrics`, 2026-09-30)
+
+Stored recordings' audio moves to a store on the worker
+([`voice-archive.md`](voice-archive.md)). **There is no scrape job for the
+store**: the orchestrator's mover relays the store's `/health` as
+`voice_archive_store_*`, so Prometheus needs neither the worker's port nor its
+pinned certificate. The series exist only in a process that has run a pass
+(`VOICE_ARCHIVE_ENABLED` and the store configured); with the archive off the
+rules in `rules/voice-archive.yml` are inert.
+
+| metric | labels | what it answers |
+|---|---|---|
+| `voice_archive_backlog_sessions`, `voice_archive_backlog_bytes`, `voice_archive_overdue_sessions`, `voice_archive_overdue_oldest_seconds` | — | finished recordings still only on the head, and how late the oldest is |
+| `voice_archive_copied_sessions`, `voice_archive_archived_sessions`, `voice_archive_archived_bytes` | — | where the audio is |
+| `voice_archive_purge_pending`, `voice_archive_remote_missing` | — | deleted recordings still on the store (a privacy lag); archived recordings the store lost |
+| `voice_archive_store_up`, `voice_archive_store_free_bytes`, `voice_archive_store_min_free_bytes`, `voice_archive_store_objects`, `voice_archive_store_bytes`, `voice_archive_store_scrub_mismatches` | — | the store's own `/health` |
+| `voice_archive_errors_total` | reason (15 closed values) | why a copy or a store call failed |
+| `voice_archive_proxy_total` | result = ok / partial / not_satisfiable / unavailable / missing | playback of archived recordings |
+| `voice_archive_restored_total` | result = restored / held / unavailable / missing / mismatch / no_space / deleted | recordings brought back for a retranscription or a continuation |
+| `voice_archive_reconcile_total` | result = orphan_deleted / deleted_row_purged / repaired / remote_missing / foreign | the daily reconcile |
+| `voice_archive_copied_total`, `voice_archive_released_total`, `voice_archive_purged_total`, `voice_archive_last_pass_timestamp_seconds`, `voice_archive_enabled` | — | the mover's progress |
+
+Rules (no mail): `VoiceArchiveStoreDown`, `VoiceArchiveBacklogOverdue`,
+`VoiceArchiveCopiesMissing`, `VoiceArchivePurgeStuck`,
+`VoiceArchiveStoreLowSpace`, `VoiceArchiveScrubMismatch`,
+`VoiceArchivePassStalled`; promtool tests in `tests/voice_archive.yml`.
 
 ---
 

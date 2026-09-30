@@ -561,10 +561,10 @@ async def _record(
 import hashlib  # noqa: E402
 from datetime import datetime as _datetime  # noqa: E402
 
-from fastapi.responses import FileResponse, JSONResponse, Response  # noqa: E402
+from fastapi.responses import JSONResponse, Response  # noqa: E402
 from starlette.requests import ClientDisconnect  # noqa: E402
 
-from . import dictation  # noqa: E402
+from . import dictation, voice_archive  # noqa: E402
 
 
 def _flat(status: int, reason: str, detail: str, **extra: Any) -> JSONResponse:
@@ -877,28 +877,23 @@ async def retranscribe_session(session_id: str, request: Request, user: UserRow 
     return JSONResponse(status_code=202 if started else 200, content=dictation.state(row))
 
 
-def _recording_response(row: dict) -> FileResponse:
-    path = dictation.audio_file(row)
-    stamp = row["created_at"].strftime("%Y%m%d-%H%M") if row.get("created_at") else "recording"
-    return FileResponse(
-        path,
-        media_type=row["mime_type"],
-        filename=f"recording-{stamp}.{row['ext']}",
-        headers={
-            "Cache-Control": "no-store",
-            "X-Recording-Complete": "false" if row["status"] == dictation.STATUS_RECORDING else "true",
-        },
-    )
+async def _recording_response(row: dict, request: Request) -> Response:
+    """The head's file, or, once the recording moved to the voice archive
+    (app/voice_archive.py), the archive's copy streamed through with Range
+    forwarded: 503 archive_unavailable (Retry-After) while the archive does
+    not answer, 410 audio_missing when it has no copy. SessionError 410
+    audio_deleted for a recording that is gone, as before."""
+    return await voice_archive.recording_response(row, request)
 
 
 @router.get("/sessions/{session_id}/audio")
 async def session_audio(session_id: str, request: Request, user: UserRow = Depends(require_user)) -> Any:
     """The stored recording, exactly as the browser encoded it. Its owner
     only, with no feature gate (item 7); a super admin uses the audited admin
-    route."""
+    route. Ownership is checked before anything reaches the archive."""
     try:
         row = await db.run_in_thread(dictation._owned_row, session_id, int(user["id"]))
-        return _recording_response(row)
+        return await _recording_response(row, request)
     except dictation.SessionError as exc:
         return _refused(exc)
 
@@ -977,13 +972,15 @@ async def admin_member_recording_audio(
 ) -> Any:
     row = await _admin_session(principal, user_id, session_id)
     try:
-        response = _recording_response(row)
+        response = await _recording_response(row, request)
     except dictation.SessionError as exc:
         return _refused(exc)
-    await _admin_audit(
-        principal, request, "admin_downloaded_voice_recording", user_id,
-        resource_type="voice_session", resource_id=session_id,
-    )
+    if response.status_code in (200, 206):
+        # Audited when audio is served, not when the archive refused.
+        await _admin_audit(
+            principal, request, "admin_downloaded_voice_recording", user_id,
+            resource_type="voice_session", resource_id=session_id,
+        )
     return response
 
 

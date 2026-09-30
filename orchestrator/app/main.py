@@ -221,6 +221,14 @@ async def lifespan(_app: FastAPI):
         from . import dictation as _dictation
 
         _dictation.RUNNER.ensure_maintenance()
+    # The voice archive (app/voice_archive.py, 2026-09-30): finished
+    # recordings' audio moves to the store on the worker's disk. Its own
+    # thread and loop; off unless VOICE_ARCHIVE_ENABLED and the store's URL
+    # and token are set. Independent of ASR: recordings already stored keep
+    # moving (and stay playable) whether or not dictation is on.
+    from . import voice_archive as _voice_archive
+
+    _voice_archive.start()
     # The developer platform (CONTRACT-3). Two pieces of wiring, both here
     # because both need the pool open and the schema applied.
     _configure_api_key_pepper()
@@ -311,6 +319,10 @@ async def lifespan(_app: FastAPI):
         from . import dictation as _dictation_stop
 
         _dictation_stop.RUNNER.stop_maintenance()
+        # Before the pool closes, like the voice maintenance above; and the
+        # request loop's pooled client to the archive store with it.
+        _voice_archive.stop()
+        await _voice_archive.close_client()
         await web_worker.stop()
         await continuity.stop()
         await engine_state.stop()

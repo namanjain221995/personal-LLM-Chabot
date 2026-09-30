@@ -242,3 +242,23 @@ their own status line. A client that hangs up does not cancel the work: the
 speech server cannot stop a decode it has started, so the dictation slot
 (`ASR_MAX_CONCURRENT` per engine) stays taken until the engine answers — that
 slot is the only bound on how much decoding members can queue.
+
+### Stored recordings: the voice archive (2026-09-30)
+
+A finished recording's audio can move from the head's disk to a store on the
+worker's disk; transcripts and the list stay on the head. Off unless
+`VOICE_ARCHIVE_ENABLED=true`. Design, measurements, deploy steps and runbook:
+[`voice-archive.md`](voice-archive.md).
+
+| Variable | Default | What it does |
+|---|---|---|
+| `VOICE_ARCHIVE_ENABLED` | `false` | Starts the mover (one thread in the orchestrator). |
+| `VOICE_ARCHIVE_URL` | empty | The store, `https://<worker management address>:30011`; written by `scripts/voice-store.sh up`. With URL and token set, archived recordings stay playable even with the mover off. |
+| `VOICE_ARCHIVE_TOKEN` | empty | The store's bearer token. `.runtime/secrets.env` only, never `.env` or `environment:`. |
+| `VOICE_ARCHIVE_TLS_CERT_B64` | empty | The store's self-signed certificate, pinned (no CA bundle). Required for an `https://` URL. |
+| `VOICE_ARCHIVE_AFTER_S` | `86400` | How long a finished recording stays on the head before it moves. |
+| `VOICE_ARCHIVE_INTERVAL_S` | `60` | Seconds between passes. |
+| `VOICE_ARCHIVE_BATCH` | `20` | Recordings copied per pass. |
+| `VOICE_ARCHIVE_RATE_BYTES_PER_S` | `20971520` | Copy and read-back pace: 20 MiB/s is 17% of the 1 GbE management LAN (average ping +0.05–0.2 ms at it). |
+| `VOICE_ARCHIVE_HOLD_S` | `21600` | A recording brought back for a retranscription or a continuation stays on the head at least this long. |
+| `VOICE_ARCHIVE_RESTORE_WAIT_S` | `86400` | How long a continuation waits for a store that is down before it decodes alone. |
