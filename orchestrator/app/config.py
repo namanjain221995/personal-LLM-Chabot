@@ -484,6 +484,38 @@ class Settings:
         # after an outage.
         self.voice_session_create_per_min: int = max(1, _int("VOICE_SESSION_CREATE_PER_MIN", 10))
         self.voice_part_per_min: int = max(1, _int("VOICE_PART_PER_MIN", 120))
+        # -- The voice archive (2026-09-30, app/voice_archive.py) -----------
+        # FINISHED recordings' source files move to a store on the worker's
+        # disk (compose/voice-store, scripts/voice-store.sh); recording,
+        # transcripts and the list stay here. The store's address and pinned
+        # certificate come from scripts/voice-store.sh (.env); its token from
+        # .runtime/secrets.env through env_file, never `environment:`.
+        # URL and token alone let this process READ the archive (playback,
+        # restore, deletes); VOICE_ARCHIVE_ENABLED also starts the mover.
+        self.voice_archive_enabled: bool = _bool("VOICE_ARCHIVE_ENABLED", False)
+        self.voice_archive_url: str = os.environ.get("VOICE_ARCHIVE_URL", "").strip()
+        self.voice_archive_token: str = os.environ.get("VOICE_ARCHIVE_TOKEN", "").strip()
+        # The store's self-signed certificate (PEM, base64), pinned: an
+        # https:// URL is refused without it.
+        self.voice_archive_tls_cert_b64: str = os.environ.get("VOICE_ARCHIVE_TLS_CERT_B64", "").strip()
+        # How long a finished recording stays on the head before it moves
+        # (0 = at the next pass). A day keeps a just-finished dictation's
+        # "Try again" and playback local.
+        self.voice_archive_after_s: float = max(0.0, _float("VOICE_ARCHIVE_AFTER_S", 86400.0))
+        self.voice_archive_interval_s: float = max(5.0, _float("VOICE_ARCHIVE_INTERVAL_S", 60.0))
+        self.voice_archive_batch: int = max(1, _int("VOICE_ARCHIVE_BATCH", 20))
+        # Copy and read-back pace. 20 MiB/s is 17% of the 1 GbE management
+        # LAN the whisper hop and the tunnel share: ping went 0.275 -> 0.413 ms
+        # average at it, 0.968 ms uncapped (measured 2026-09-30).
+        self.voice_archive_rate_bytes_per_s: int = max(
+            1024 * 1024, _int("VOICE_ARCHIVE_RATE_BYTES_PER_S", 20 * 1024 * 1024)
+        )
+        # A recording brought back for a retranscription (or a continuation)
+        # stays on the head at least this long before it may move again.
+        self.voice_archive_hold_s: float = max(60.0, _float("VOICE_ARCHIVE_HOLD_S", 6 * 3600.0))
+        # A continuation whose earlier recording is archived waits this long
+        # for the archive to answer before it decodes alone.
+        self.voice_archive_restore_wait_s: float = max(0.0, _float("VOICE_ARCHIVE_RESTORE_WAIT_S", 86400.0))
 
         # -- Video understanding (2026-09-09) ----------------------------------
         #

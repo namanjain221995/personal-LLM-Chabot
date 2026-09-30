@@ -1,0 +1,112 @@
+# The voice archive store: finished recordings' audio on the WORKER's disk.
+# Its own Compose project (sf-local-ai-voice-store), on the worker only.
+#
+# WHY (owner, 2026-09-30: "improve the storage of that audio" -> "Move to
+# worker's big disk"). Stored dictation lives on the head's root NVMe beside
+# the OS, /var/lib/docker and production Postgres, one copy. The worker's
+# disk is 3.7 TB and 17% used. The orchestrator's mover
+# (orchestrator/app/voice_archive.py) copies a FINISHED recording's
+# source.<ext> here, reads it back and hashes it, and only then releases the
+# head's copy. docs/voice-archive.md has the design, the measurements and the
+# runbook.
+#
+# scripts/voice-store.sh copies this file to $HOME/.techsara-cluster/ on the
+# worker and compose/voice-store/ (the image sources) to
+# $HOME/.techsara-cluster/voice-store/, the layout compose.whisper.yaml uses,
+# and runs it there with everything below set. Nothing new runs on the head
+# (owner rule of 2026-09-16): the head's side is one thread in the
+# orchestrator.
+#
+# WHY A SEPARATE PROJECT. The isolation promise compose.whisper.yaml makes:
+# `docker compose up` here cannot restart the main model, and nothing here
+# comes near sf-local-ai-worker, the main model's tensor-parallel rank 1.
+#
+# BINDING. The management address only (VOICE_STORE_BIND, required, no
+# default), never 0.0.0.0 and never a 10.100.x RoCE address, which belongs to
+# the fabric the main model's shards talk over; the process binds it itself
+# under host networking, for the reboot reason compose.whisper.yaml explains.
+# The port (30011) is closed to everything but the head by the host packet
+# filter (scripts/host-guard.sh); scripts/voice-store.sh refuses to start the
+# production store until the worker's LIVE ruleset lists it. Every route under
+# /v1 also demands a bearer token (VOICE_STORE_TOKENS, from store.env, written
+# 0600 over ssh stdin by the script, never on a command line), and by default
+# the store speaks TLS with a key generated ON the worker; the orchestrator
+# pins its certificate.
+#
+# RESOURCES. The Cortex-A725 efficiency cores (0-4, 10-14) and one CPU's worth
+# of them: the Cortex-X925 cores stay free for other work, and a copy is
+# paced at 20 MiB/s by the orchestrator anyway. No GPU, no model. It uses
+# about 40 MB of memory (measured with the probe, 2026-09-30); there is no
+# hard memory limit, because launcher/tests/test_oom_score_adj.py allows one
+# only as a measured, deliberate exception.
+name: sf-local-ai-voice-store
+
+services:
+  voice-store:
+    build:
+      context: ./${VOICE_STORE_FILES:-voice-store}
+      dockerfile: Dockerfile
+    image: ${VOICE_STORE_IMAGE:-sf-local-ai-voice-store:1}
+    env_file:
+      # VOICE_STORE_TOKENS only (comma-separated during a rotation). Required:
+      # the store refuses to start without a token.
+      - path: ./${VOICE_STORE_FILES:-voice-store}/store.env
+        required: true
+    environment:
+      VOICE_STORE_BIND: "${VOICE_STORE_BIND:?VOICE_STORE_BIND must be set; scripts/voice-store.sh derives it from the worker's management interface}"
+      VOICE_STORE_PORT: "${VOICE_STORE_PORT:-30011}"
+      VOICE_STORE_ROOT: /store
+      # 250 GiB: the worker's Docker, model caches, OCR and speech engines and
+      # another tenant's Postgres share this disk. An upload that would leave
+      # less free is refused (507) before its body is read.
+      VOICE_STORE_MIN_FREE_BYTES: "${VOICE_STORE_MIN_FREE_BYTES:-268435456000}"
+      # Empty = plain HTTP (scripts/voice-store.sh --plain-http).
+      VOICE_STORE_TLS_CERT: "${VOICE_STORE_TLS_CERT-/tls/cert.pem}"
+      VOICE_STORE_TLS_KEY: "${VOICE_STORE_TLS_KEY-/tls/key.pem}"
+    volumes:
+      # The recordings: a directory under the worker user's home (0700),
+      # NOT under ~/.techsara-cluster, which scripts rewrite.
+      - type: bind
+        source: "${VOICE_STORE_DATA_DIR:?VOICE_STORE_DATA_DIR must be set by scripts/voice-store.sh}"
+        target: /store
+      # The TLS key and certificate, generated on the worker by the script.
+      - type: bind
+        source: ./${VOICE_STORE_FILES:-voice-store}/tls
+        target: /tls
+        read_only: true
+    network_mode: host
+    # The worker user's own uid/gid, which owns the data directory.
+    user: "${VOICE_STORE_UID:-1000}:${VOICE_STORE_GID:-1000}"
+    cpuset: "0-4,10-14"
+    cpus: 1
+    # BEHIND THE OTHER SIDE STACKS IN THE OOM KILLER'S ORDER (OPERATIONS.md
+    # section 14): it frees about 40 MB, so killing it first gains nothing;
+    # a killed store only delays archiving, and a copy is never half-kept.
+    oom_score_adj: 500
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # tini as PID 1 forwards SIGTERM to uvicorn.
+    init: true
+    # Core dumps off the way that works with apport (compose.ocr.yaml).
+    ulimits:
+      core:
+        soft: 1
+        hard: 1
+    pids_limit: 64
+    restart: unless-stopped
+    healthcheck:
+      # The address and scheme the server ACTUALLY uses, from the same
+      # variables; `ready` is checked, not just the status.
+      test: ["CMD-SHELL", "python3 -c \"import os,ssl,json,sys,urllib.request as u; h=os.environ['VOICE_STORE_BIND']; p=os.environ.get('VOICE_STORE_PORT','30011'); c=os.environ.get('VOICE_STORE_TLS_CERT',''); x=ssl.create_default_context(cafile=c) if c else None; b=json.load(u.urlopen(('https' if c else 'http')+'://'+h+':'+p+'/health', timeout=5, context=x)); sys.exit(0 if b.get('ready') else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

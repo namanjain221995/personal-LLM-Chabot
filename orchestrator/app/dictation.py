@@ -315,7 +315,10 @@ _COLUMNS = (
     "audio_ms, transcribed_ms, speech_ms, windows_total, windows_done, windows_failed, "
     "outcome, ended_by, language, language_code, source_sha256, retranscribe, created_at, "
     "last_part_at, finish_requested_at, finished_at, audio_deleted_at, lease_owner, "
-    "lease_expires_at, error, continues_session_id, audio_since"
+    "lease_expires_at, error, continues_session_id, audio_since, "
+    # V43: where the audio lives (app/voice_archive.py).
+    "archive_state, archived_at, head_released_at, head_hold_until, archive_attempts, "
+    "archive_next_at, archive_error, remote_purged_at"
 )
 
 
@@ -1334,6 +1337,9 @@ _DECODER_RESTARTS = 2
 #: Reads that came back empty although the row acknowledges more (0.2 s
 #: apart, the row re-read each time) before the rest counts as unreadable.
 _EMPTY_READS_MAX = 25
+#: How often a continuation asks again for an archived recording it
+#: continues while the voice archive does not answer (`_Live._bring_back`).
+_ARCHIVE_RETRY_S = 30.0
 
 
 # ------------------------------------------------------------ the runner --
@@ -2012,6 +2018,16 @@ class _Live:
             ):
                 log.info("voice session %s: the recording it continues is gone; decoding it alone", self.id)
                 return
+            if (prev.get("archive_state") or "local") != "local":
+                # Its audio is on the archive (app/voice_archive.py): bring it
+                # back if it moved, and hold it. 'copied' goes through here
+                # too: a release whose UPDATE began before this session's row
+                # was committed can still unlink the file after this read,
+                # and ensure_local re-reads the row under the release's own
+                # lock. While this session is live nothing releases it again.
+                prev = await self._bring_back(prev)
+                if prev is None:
+                    return
             path = source_path(prev)
             size = int(prev["bytes_stored"] or 0)
             saved = _saved_transcript(prev)
@@ -2027,6 +2043,28 @@ class _Live:
         self._prefix_bytes = sum(size for _p, size, _pcm in chain)
         self._prefix_pcm = sum(pcm for _p, _size, pcm in chain)
         self._skip_left = self._prefix_pcm
+
+    async def _bring_back(self, prev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """A recording this one continues whose audio is on the archive, back
+        on the head and held there. While the archive does not answer, wait
+        (waiting_on 'archive') up to
+        VOICE_ARCHIVE_RESTORE_WAIT_S, then decode alone as before."""
+        from . import voice_archive
+
+        deadline = time.monotonic() + float(settings.voice_archive_restore_wait_s)
+        while self.status != STATUS_CANCELLED:
+            try:
+                row = await voice_archive.ensure_local(prev)
+                self._set_waiting("none")
+                return row
+            except SessionError as exc:
+                if exc.reason != "archive_unavailable" or time.monotonic() >= deadline:
+                    log.info("voice session %s: the recording it continues is not available (%s)", self.id, exc.reason)
+                    self._set_waiting("none")
+                    return None
+            self._set_waiting("archive")
+            await asyncio.sleep(_ARCHIVE_RETRY_S)
+        return None
 
     async def _end_recording(self, ended_by: str) -> None:
         """Decoding stopped for good: stop the decoder and close the
@@ -2737,6 +2775,8 @@ def _stored(row: Dict[str, Any]) -> Dict[str, Any]:
         "retention_days": days,
         "delete_after": delete_after,
         "bytes": int(row.get("bytes_stored") or 0),
+        # V43: the audio is kept on the archive server, not on this one.
+        "archived": row.get("archive_state") == "archived",
     }
 
 
@@ -3136,6 +3176,12 @@ def _cancel_sync(row: Dict[str, Any]) -> None:
             (_now(), _now(), row["id"]),
         )
     shutil.rmtree(session_dir(row["user_id"], row["id"]), ignore_errors=True)
+    if (row.get("archive_state") or "local") != "local":
+        # The archive's copy goes too, asked for now and not waited on; the
+        # archive's purge step retries whatever this misses.
+        from . import voice_archive
+
+        voice_archive.forget_remote(row["user_id"], row["id"])
 
 
 def discard(user_id: int, session_id: str) -> None:
@@ -3185,7 +3231,8 @@ def retranscribe(user_id: int, session_id: str, scope: str) -> Tuple[Dict[str, A
     row = _owned_row(session_id, user_id)
     if row["status"] in LIVE_STATUSES:
         raise SessionError(409, "session_busy", "This recording is still being transcribed.")
-    if row.get("audio_deleted_at") is not None or not os.path.exists(source_path(row)):
+    moved = (row.get("archive_state") or "local") != "local"
+    if row.get("audio_deleted_at") is not None or (not moved and not os.path.exists(source_path(row))):
         raise SessionError(410, "audio_deleted", "This recording's audio has been deleted.")
     if (
         scope == "gaps" and row["status"] == STATUS_DONE and not int(row.get("windows_failed") or 0)
@@ -3204,6 +3251,19 @@ def retranscribe(user_id: int, session_id: str, scope: str) -> Tuple[Dict[str, A
         refusal = _storage_refusal()
         if refusal is not None:
             raise refusal
+        from . import voice_archive
+
+        if moved or voice_archive.configured():
+            # The audio on the head, and HELD there (app/voice_archive.py):
+            # brought back when it moved to the archive (503
+            # archive_unavailable, nothing changed, when the archive does
+            # not answer), and in every case kept from moving again before
+            # the UPDATE below.
+            row = voice_archive.ensure_local_sync(row)
+            if not os.path.exists(source_path(row)):
+                raise SessionError(410, "audio_deleted", "This recording's audio has been deleted.")
+        # Counted only once the audio is here: "Try again" pressed while the
+        # archive was down changed nothing, and must not use up the hour.
         if not _rate_ok("retranscribe", user_id, settings.voice_retranscribe_per_hour, window_s=3600.0):
             raise SessionError(429, "rate_limited", "This was tried again too often in the last hour.")
         if row.get("outcome") == "undecodable":
@@ -3216,7 +3276,8 @@ def retranscribe(user_id: int, session_id: str, scope: str) -> Tuple[Dict[str, A
             updated = con.execute(
                 f"""UPDATE voice_sessions SET status = 'finishing', retranscribe = %s, outcome = NULL,
                         error = NULL, finished_at = NULL, finish_requested_at = %s, rev = rev + 1
-                    WHERE id = %s AND status IN ('done', 'failed') RETURNING {_COLUMNS}""",
+                    WHERE id = %s AND status IN ('done', 'failed') AND archive_state IN ('local', 'copied')
+                    RETURNING {_COLUMNS}""",
                 (scope, _now(), session_id),
             ).fetchone()
     if updated is None:
@@ -3256,6 +3317,7 @@ def list_sessions(user_id: int, *, limit: int, before: Optional[datetime], previ
             "kept": stored["kept"],
             "delete_after": stored["delete_after"],
             "continues_session_id": row.get("continues_session_id"),
+            "archived": stored["archived"],
         }
         if preview:
             text = _saved_transcript(row).get("text") if row["status"] == STATUS_DONE and stored["kept"] else None

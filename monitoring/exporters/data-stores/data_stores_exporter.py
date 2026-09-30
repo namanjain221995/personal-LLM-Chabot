@@ -57,6 +57,12 @@ STORES = [
     ("lancedb_web", ROOT / "lancedb-web", "lancedb"),
     ("lancedb_video", ROOT / "lancedb-video", "lancedb"),
     ("video", ROOT / "video", "video"),
+    # Stored dictation (orchestrator/app/dictation.py, V42): per-session
+    # folders on the HEAD's root disk. Once the voice archive moves finished
+    # recordings to the worker (app/voice_archive.py) this should fall to the
+    # transcripts plus the recordings of the last day; the worker's own
+    # numbers arrive as voice_archive_store_* on the orchestrator's /metrics.
+    ("voice", ROOT / "voice", "voice"),
     ("parquet_landing", ROOT / "parquet", "parquet"),
     ("workspaces", ROOT / "workspaces", "workspace"),
     ("brain", ROOT / "brain", "knowledge"),

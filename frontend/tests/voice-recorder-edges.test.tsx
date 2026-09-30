@@ -542,6 +542,11 @@ describe('the recording bar', () => {
     expect(screen.getByText(VOICE_MESSAGES.engineUnavailableLive)).toBeTruthy();
   });
 
+  it('names the archive server when the transcript waits for an earlier part kept there', () => {
+    bar(progress({ waitingOn: 'archive', backlogMs: 120_000 }));
+    expect(screen.getByText(/^Transcript 2:00 behind — .*archive server.*nothing is lost$/)).toBeTruthy();
+  });
+
   it('does not say "Saved to your account" while the server holds nothing, and says how much once it does', () => {
     // Before 2026-09-29 the line was drawn whenever there was progress: after
     // a minute offline with 0 bytes on the server, right under "Connection

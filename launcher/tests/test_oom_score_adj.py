@@ -80,6 +80,10 @@ LAUNCHER_CHAIN = (
 EXPECTED_SIDE_STACK = {
     "compose.ocr.yaml": {"ocr": 900},
     "compose.whisper.yaml": {"whisper": 800},
+    # The voice archive store (worker, scripts/voice-store.sh): about 40 MB,
+    # so killing it first would free nothing; behind the engines, with the
+    # telemetry.
+    "compose.voice-store.yaml": {"voice-store": 500},
     "compose.monitoring.yaml": {
         "grafana": 600, "cadvisor": 600, "postgres-exporter": 600,
         "data-stores-exporter": 600, "blackbox-exporter": 600,
