@@ -2042,7 +2042,10 @@ def _guard_routine_deploy_model_change(profile: SelectedProfile) -> None:
     if not wanted:
         return
     served = running_head_served_names()
-    if not served or wanted in served:
+    # vLLM's FIRST --served-model-name is the model actually answering; an
+    # alias naming the wanted model does not make a different engine the
+    # wanted one (swap review 2026-09-30).
+    if not served or served[0] == wanted:
         return
     raise TechSaraError(
         f"the main model changes from {served[0]} to {wanted}, and this is a routine deploy "

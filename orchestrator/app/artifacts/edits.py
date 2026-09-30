@@ -94,8 +94,11 @@ MATCH_FLOOR = 0.62
 MATCH_TIE = 0.04
 #: Planner model call bounds.
 PLANNER_MAX_TOKENS = 800
-PLANNER_TIMEOUT_FAST_S = 6.0
-PLANNER_TIMEOUT_S = 12.0
+# Sized for the dense Qwen3.8-27B (2026-09-30): it decodes ~4-6x slower than
+# the 35B-A3B these were measured on (6 s / 12 s), so the planner would time out
+# and fall back to a full Regenerate.
+PLANNER_TIMEOUT_FAST_S = 30.0
+PLANNER_TIMEOUT_S = 60.0
 
 
 class _Strict(BaseModel):

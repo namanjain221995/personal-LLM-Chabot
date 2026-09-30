@@ -115,10 +115,15 @@ class RoutineDeployGuardTests(unittest.TestCase):
         self.assertIn("./techsara up (without the flag)", message)
         self.assertIn("scripts/deploy.sh --full", message)
 
-    def test_the_same_model_or_one_of_its_names_is_not_a_change(self) -> None:
+    def test_the_same_model_first_is_not_a_change_even_with_aliases(self) -> None:
         self._guard(("nvidia/Qwen3.8-27B-NVFP4",))
         self._guard(("nvidia/Qwen3.8-27B-NVFP4", "Qwen/Qwen3.6-35B-A3B-NVFP4"))
-        self._guard(("Qwen/Qwen3.6-35B-A3B-NVFP4", "nvidia/Qwen3.8-27B-NVFP4"))
+
+    def test_a_head_that_only_aliases_the_wanted_name_is_a_change(self) -> None:
+        # vLLM's first --served-model-name is the model that answers: a 35B
+        # head carrying the 27B's name as an alias is still the 35B.
+        with self.assertRaises(TechSaraError):
+            self._guard(("Qwen/Qwen3.6-35B-A3B-NVFP4", "nvidia/Qwen3.8-27B-NVFP4"))
 
     def test_no_running_head_is_not_a_change(self) -> None:
         self._guard(())
