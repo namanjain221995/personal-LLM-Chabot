@@ -1,0 +1,299 @@
+# Live dictation (real-time speech to text), 2026-09-29. Two sources:
+#   job orchestrator  the WebSocket gateway, orchestrator/app/voice_live.py:
+#                     voice_stream_* (one uvicorn process, one registry)
+#   job stt-stream    the streaming engine on the WORKER, compose/stt-stream
+#                     (project sf-local-ai-stt): stt_stream_*, closed labels,
+#                     `profile` = one entry of STT_PROFILES
+# Loaded by the same `rule_files: /etc/prometheus/rules/*.yml` glob as the
+# other rule files; no group, alert or recorded name here repeats one of
+# theirs. Unit tests: monitoring/prometheus/tests/voice_stream.yml (promtool).
+# Runbook: monitoring/developer-api/README.md, "Live dictation".
+#
+# EVERY METRIC HERE IS PENDING (monitoring/developer-api/metrics-contract.json):
+# on 2026-09-29 the gateway and the engine are written on branches and neither
+# is deployed. A rule on a missing series is inert, never firing: nothing here
+# uses `or vector(...)` or `absent()` (developer-api.yml's construction rules).
+#
+# THE LIVE PATH IS A PREVIEW. The durable path (V42 recording sessions: Opus
+# parts, whisper-large-v3, the final transcript after Stop) stays authoritative
+# and depends on nothing here. A live failure costs the words that appear while
+# someone speaks, never the transcript, so every alert is a warning.
+#
+# NOTHING HERE REACHES A PERSON. There is no Alertmanager (developer-api.yml
+# header): these show on Prometheus's /alerts page and in Grafana only.
+#
+# THRESHOLDS ARE UNCALIBRATED: nothing has run in production yet. They come from
+# the design targets and the worker measurements in the build spec, and each
+# latency threshold sits ON a bucket edge of the gateway's ladder (0.05, 0.1,
+# 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1, 1.5, 2, 3, 5, 10, 30 s), so "p95 > 1.5"
+# means "more than one in twenty took longer than 1.5 s", not a guess
+# interpolated inside a bucket:
+#   first words  should appear a few hundred ms after they are spoken.
+#   final        commits 0.5-1 s after a pause: the engine waits
+#                STT_ENDPOINT_S (0.6 s) of silence, and finals measured
+#                0.68-0.83 s (p50) after speech end on the worker. An overflow
+#                stream on a 560 ms profile can wait up to one chunk more
+#                (about 1.3 s worst case, by that arithmetic).
+#   engine       decodes one chunk per tick; at the measured 12-stream
+#                capacity the tick p95 was 99-102 ms of the 160 ms budget.
+#
+# A RECONNECT REPLAYS AUDIO. After a drop the browser resends up to 60 s of
+# buffered PCM and the gateway times every utterance from when its samples
+# ARRIVED, so replayed speech, decoded in a burst, reads as seconds of latency.
+# One reconnect is one burst. The latency alerts need a 5-minute window to stay
+# above the line for 10 more minutes, which one burst cannot do; a network that
+# keeps dropping streams does, and VoiceStreamDisconnectsAbnormal names it.
+
+groups:
+  # --------------------------------------------------------------- recording
+  # Evaluated before the alert group in the promtool tests (group_eval_order);
+  # in production the two groups run independently at the global 15 s, so an
+  # alert reads a value at most one evaluation old.
+  - name: voice-stream-recording
+    rules:
+      # Arrival of an utterance's first sample at the gateway to its first
+      # partial written to the browser.
+      - record: cluster:voice_stream_first_partial_seconds:p95_5m
+        expr: >-
+          histogram_quantile(0.95,
+            sum by (le) (rate(voice_stream_first_partial_seconds_bucket{job="orchestrator"}[5m])))
+
+      # Arrival of an utterance's last sample to its final written.
+      - record: cluster:voice_stream_final_seconds:p95_5m
+        expr: >-
+          histogram_quantile(0.95,
+            sum by (le) (rate(voice_stream_final_seconds_bucket{job="orchestrator"}[5m])))
+
+      # Arrival of the newest sample an event covers to that event written,
+      # per event (partial, final). High lag with the engine's real-time
+      # factor (defined below) well under 0.8 puts the delay outside the
+      # decoder: the orchestrator's event loop, or the network to the worker.
+      - record: event:voice_stream_event_lag_seconds:p95_5m
+        expr: >-
+          histogram_quantile(0.95,
+            sum by (event, le) (rate(voice_stream_event_lag_seconds_bucket{job="orchestrator"}[5m])))
+
+      # Audio seconds received per second: how many people are speaking into
+      # a live stream right now, averaged over 5 minutes. A replay after a
+      # reconnect counts its audio again.
+      - record: cluster:voice_stream_audio_received_seconds:rate5m
+        expr: sum(rate(voice_stream_audio_received_seconds_total{job="orchestrator"}[5m]))
+
+      - record: cluster:voice_stream_sessions_active:sum
+        expr: sum(voice_stream_sessions_active{job="orchestrator"})
+
+      - record: profile:stt_stream_active_streams:sum
+        expr: sum by (profile) (stt_stream_active_streams{job="stt-stream"})
+
+      # The engine's own audio rate per profile: the RTF denominator, and the
+      # floor that keeps a near-idle profile out of VoiceStreamEngineFallingBehind.
+      - record: profile:stt_stream_audio_seconds:rate5m
+        expr: sum by (profile) (rate(stt_stream_audio_seconds_total{job="stt-stream"}[5m]))
+
+      # REAL-TIME FACTOR: decode seconds charged per second of audio received.
+      # The engine charges EVERY stream in a decode_streams batch the batch's
+      # wall time (stt_stream_compute_seconds_total += elapsed x streams in
+      # the batch; build spec section 11), so the factor is a decode step's
+      # wall time over the chunk it decodes, weighted by batch size. 1.0 is a
+      # decode worker that needs a whole chunk's length to decode one chunk:
+      # every stream on it falls behind real time. A saturated worker reads
+      # exactly 1.0: its streams are in every batch, it never idles, and their
+      # audio keeps arriving at real time, so the backlog grows while the
+      # ratio stays put. Charged once per batch instead, a full profile would
+      # top out at workers / streams (0.25 for 2 workers and 8 streams) and
+      # never reach the alert line.
+      # The `> 0` on the denominator leaves an idle profile with no sample
+      # instead of NaN, and instead of +Inf when a tail is decoded after its
+      # audio stopped: +Inf compares greater than any threshold.
+      - record: profile:stt_stream_real_time_factor:ratio_rate5m
+        expr: >-
+          sum by (profile) (rate(stt_stream_compute_seconds_total{job="stt-stream"}[5m]))
+            / (sum by (profile) (rate(stt_stream_audio_seconds_total{job="stt-stream"}[5m])) > 0)
+
+      - record: cluster:stt_stream_real_time_factor:ratio_rate5m
+        expr: >-
+          sum(rate(stt_stream_compute_seconds_total{job="stt-stream"}[5m]))
+            / (sum(rate(stt_stream_audio_seconds_total{job="stt-stream"}[5m])) > 0)
+
+  # ------------------------------------------------------------------ alerts
+  - name: voice-stream
+    rules:
+      - alert: VoiceStreamFirstPartialSlow
+        # At least 20 first partials in 5 minutes, about one person dictating
+        # steadily; below that the p95 is one or two utterances.
+        expr: >-
+          cluster:voice_stream_first_partial_seconds:p95_5m > 1.5
+            and on() sum(increase(voice_stream_first_partial_seconds_count{job="orchestrator"}[5m])) >= 20
+        for: 10m
+        labels: { severity: warning, service: stt-stream }
+        annotations:
+          summary: "Live dictation: the first words of an utterance take {{ $value | printf \"%.1f\" }} s to appear (p95, 5 minutes)"
+          description: >-
+            More than one utterance in twenty waited over 1.5 s between its
+            first audio reaching the orchestrator and its first words reaching
+            the browser, for 10 minutes with at least 20 utterances per 5
+            minutes. The design target is a few hundred milliseconds. With
+            VoiceStreamEngineFallingBehind the engine is short of CPU; with
+            VoiceStreamDisconnectsAbnormal this is audio replayed after
+            reconnects; with neither, compare the event-lag panel with the
+            engine RTF to see which side is slow.
+          runbook: monitoring/developer-api/README.md#live-dictation-latency
+          safe_command: "scripts/stt-stream.sh status"
+
+      - alert: VoiceStreamFinalSlow
+        expr: >-
+          cluster:voice_stream_final_seconds:p95_5m > 2
+            and on() sum(increase(voice_stream_final_seconds_count{job="orchestrator"}[5m])) >= 20
+        for: 10m
+        labels: { severity: warning, service: stt-stream }
+        annotations:
+          summary: "Live dictation: utterances commit {{ $value | printf \"%.1f\" }} s after their last word (p95, 5 minutes)"
+          description: >-
+            More than one final in twenty came over 2 s after the utterance's
+            last audio reached the orchestrator, for 10 minutes with at least
+            20 finals per 5 minutes. The design is 0.5-1 s: the engine waits
+            0.6 s of silence (STT_ENDPOINT_S), and finals measured 0.68-0.83 s
+            at p50 on the worker. Same triage as the first-words alert.
+          runbook: monitoring/developer-api/README.md#live-dictation-latency
+          safe_command: "scripts/stt-stream.sh status"
+
+      - alert: VoiceStreamEngineFallingBehind
+        # Two causes, told apart by the `cause` label.
+        #
+        # decode_rtf: the real-time factor (defined on its recording rule
+        # above: every stream in a decode batch is charged the batch's wall
+        # time) over 0.8 on a profile carrying at least half a real-time
+        # stream. 1.0 is a decode worker that needs a whole chunk's length per
+        # chunk, and a saturated one reads exactly 1.0, so 0.8 leaves a fifth
+        # of the budget. The 12-stream measurement on the worker had a decode
+        # tick p95 of 99-102 ms, 0.62-0.64 of the 160 ms chunk.
+        #
+        # capacity_refusals: the gateway's own count of streams it refused
+        # with `capacity`, which covers both an engine with every profile for
+        # the language full (the engine answers `capacity` and the gateway
+        # relays it) and the gateway's VOICE_LIVE_MAX_STREAMS. It does not
+        # depend on the new scrape path to the worker. A refused browser
+        # retries while it records (0.5, 1, 2, 4, 8 s, then every 15 s), so
+        # one person turned away for half a minute is a burst of about six,
+        # all in the first 30 s. The window is no longer than `for`, so the
+        # last window the alert must hold in opens when the first three were
+        # counted: it takes three more after them. A burst that is over within
+        # about a minute leaves the window first; refusals that keep coming
+        # warn. A 10-minute window held 5 minutes fired on one person turned
+        # away for 4 s (review, 2026-09-29).
+        expr: >-
+          label_replace(
+            (profile:stt_stream_real_time_factor:ratio_rate5m > 0.8)
+              and on(profile) (profile:stt_stream_audio_seconds:rate5m >= 0.5),
+            "cause", "decode_rtf", "", "")
+          or
+          label_replace(
+            sum(increase(voice_stream_rejections_total{job="orchestrator", reason="capacity"}[5m])) >= 3,
+            "cause", "capacity_refusals", "", "")
+        for: 5m
+        labels: { severity: warning, service: stt-stream }
+        annotations:
+          summary: '{{ if eq $labels.cause "decode_rtf" }}Live dictation engine: profile {{ $labels.profile }} spends {{ $value | printf "%.2f" }} s decoding per second of audio{{ else }}Live dictation refused {{ $value | printf "%.0f" }} stream(s) at capacity in 5 minutes{{ end }}'
+          description: >-
+            decode_rtf: for 5 minutes a profile has been charged more than
+            0.8 s of decoding per second of its audio, every stream in a
+            decode batch being charged the batch's time. At 1.0 its decode
+            workers need a whole chunk's length per chunk and every stream
+            on them falls behind; a saturated engine reads exactly 1.0, and
+            how far behind it is shows in the latency alerts, not here.
+            capacity_refusals: for 5 minutes, every 5-minute window held at
+            least 3 streams refused because every engine profile for their
+            language was full, or the gateway reached VOICE_LIVE_MAX_STREAMS;
+            the refusals panel shows the engine's own count beside the
+            gateway's. The engine is held to eight of the worker's cores so
+            that chat does not pay for it: 12 streams cost chat nothing
+            measurable, while 48 streams with every core busy cost it 11-16%
+            of its decode speed. More capacity trades against chat and is the
+            owner's decision.
+          runbook: monitoring/developer-api/README.md#live-dictation-engine
+          safe_command: "scripts/stt-stream.sh status"
+
+      - alert: VoiceStreamErrorRatioHigh
+        # Streams that ENDED on a server-side failure, as a share of the
+        # streams that ran: voice_stream_sessions_total{outcome} is settled
+        # exactly once per admitted stream. voice_stream_errors_total is not a
+        # per-stream count (every failed engine attempt and every malformed
+        # engine event adds one), so it cannot be a share. Refusals are left
+        # out of both sides: a capacity storm must not dilute a failure rate.
+        expr: >-
+          100 * sum(increase(voice_stream_sessions_total{job="orchestrator", outcome=~"engine_unavailable|error"}[5m]))
+            / sum(increase(voice_stream_sessions_total{job="orchestrator", outcome!="rejected"}[5m])) > 10
+          and on() sum(increase(voice_stream_sessions_total{job="orchestrator", outcome=~"engine_unavailable|error"}[5m])) >= 3
+        for: 10m
+        labels: { severity: warning, service: stt-stream }
+        annotations:
+          summary: "Live dictation: {{ $value | printf \"%.0f\" }}% of live streams failed on the server side (5 minutes)"
+          description: >-
+            Streams ending engine_unavailable (no engine answered, or it went
+            away mid-stream) or error (the gateway failed), over 10% of the
+            streams that ran with at least 3 per 5 minutes, for 10 minutes.
+            Browsers retry these with backoff while recording, so one broken
+            engine is a steady stream of failures; an engine restart of a
+            minute is not. People still get the transcript after Stop; they
+            lose the live words. The errors-by-reason panel says which side
+            failed.
+          runbook: monitoring/developer-api/README.md#live-dictation-failures-and-drops
+          safe_command: "scripts/stt-stream.sh status"
+
+      - alert: VoiceStreamDisconnectsAbnormal
+        # disconnected: the socket closed with no close frame (a network drop,
+        # a relay destroyed at a frontend deploy). superseded: a newer
+        # connection took the recording over, usually a reconnect that
+        # arrived before the old socket was noticed dead.
+        # NOT idle (no audio for VOICE_LIVE_IDLE_S, 120 s, with the socket
+        # open): a phone whose screen turns off mid-recording stops sending
+        # audio and closes exactly that way in normal use (the recorder then
+        # says "Recording paused while the screen was off"), and the build
+        # spec keeps that close as `idle` (section 11). Idle stays on the
+        # outcomes panel, and in the denominator: those streams ran.
+        expr: >-
+          100 * sum(increase(voice_stream_sessions_total{job="orchestrator", outcome=~"disconnected|superseded"}[5m]))
+            / sum(increase(voice_stream_sessions_total{job="orchestrator", outcome!="rejected"}[5m])) > 25
+          and on() sum(increase(voice_stream_sessions_total{job="orchestrator", outcome=~"disconnected|superseded"}[5m])) >= 5
+        for: 10m
+        labels: { severity: warning, service: stt-stream }
+        annotations:
+          summary: "Live dictation: {{ $value | printf \"%.0f\" }}% of live streams dropped (disconnected or superseded, 5 minutes)"
+          description: >-
+            Over a quarter of the streams that ran ended without either side
+            closing them, or were taken over by a reconnect, with at least 5
+            per 5 minutes, for 10 minutes. A deploy drops every open stream
+            once and does not hold that long. Idle closes (no audio for 120 s,
+            as when a phone's screen turns off while recording) are normal
+            use and not counted. The metrics name no person, so one person's
+            bad network and a broken tunnel look alike here; the gateway's
+            per-stream close log line (outcome, reconnect) and the frontend
+            relay's ws_close lines tell them apart.
+          runbook: monitoring/developer-api/README.md#live-dictation-failures-and-drops
+          safe_command: "scripts/stt-stream.sh status"
+
+      - alert: VoiceStreamEngineDown
+        # The target is static (prometheus.yml, job stt-stream), so it reads
+        # down BY DESIGN whenever live dictation is off: before the engine is
+        # deployed, and after `scripts/stt-stream.sh down`. No series says
+        # "live dictation is configured"; the gateway failing to reach an
+        # engine in the last 15 minutes proves it is configured AND in use.
+        # So this is silent while nobody dictates, and a wrong URL in
+        # VOICE_LIVE_ENGINE_URLS with a healthy engine shows up in
+        # VoiceStreamErrorRatioHigh, not here.
+        expr: >-
+          (up{job="stt-stream"} == 0)
+            and on() (sum(increase(voice_stream_errors_total{job="orchestrator", reason=~"engine_unavailable|engine_timeout"}[15m])) > 0)
+        for: 2m
+        labels: { severity: warning, service: stt-stream }
+        annotations:
+          summary: "Live dictation engine on {{ $labels.node }} is not answering, and the orchestrator failed to reach it"
+          description: >-
+            Prometheus cannot scrape the engine's /metrics, and the gateway
+            counted engine_unavailable or engine_timeout in the last 15
+            minutes: live dictation is configured, in use, and gives nobody
+            live words. Recordings still transcribe after Stop, since whisper
+            does not depend on this engine. Starting or recreating it is an
+            operator's decision; it never involves the main model.
+          runbook: monitoring/developer-api/README.md#live-dictation-engine
+          safe_command: "scripts/stt-stream.sh status"

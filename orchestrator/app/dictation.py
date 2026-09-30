@@ -524,6 +524,13 @@ def _rate_ok(kind: str, user_id: int, limit: int, *, window_s: float = 60.0) -> 
         return True
 
 
+def live_connect_ok(user_id: int) -> bool:
+    """One live-dictation connection (app/voice_live.py) against the person's
+    VOICE_LIVE_CONNECTS_PER_MIN: the "live" kind of the same per-process
+    window as the session's other limits, so it resets with them."""
+    return _rate_ok("live", user_id, settings.voice_live_connects_per_min)
+
+
 # ------------------------------------------------------------- formats --
 
 
@@ -2828,6 +2835,31 @@ def config() -> Dict[str, Any]:
         "bits_per_second": bits or None,
         "idle_close_s": int(settings.voice_session_idle_s),
         "long_poll_max_s": LONG_POLL_MAX_S,
+        "live": _live_config(),
+    }
+
+
+def _live_config() -> Optional[Dict[str, Any]]:
+    """Where and how the browser streams the live preview (app/voice_live.py),
+    or None when this deployment has no live engine: the recorder then shows
+    this session's own preview, exactly as before. Only a session's create
+    response carries it; the legacy one-request path never goes live.
+
+    The path is the BROWSER's, through the frontend's WebSocket relay, with
+    `{id}` standing for the session id. It is sent under both `path` (the
+    protocol spec's name) and `path_template` (what it is), so a client
+    written to either reads it."""
+    from . import voice_live  # here, not at the top: voice_live imports this module
+
+    if not voice_live.configured():
+        return None
+    path = "/api/audio/sessions/{id}/live"
+    return {
+        "path": path,
+        "path_template": path,
+        "sample_rate": voice_live.SAMPLE_RATE,
+        "frame_ms": voice_live.FRAME_MS,
+        "resume_max_s": int(settings.voice_live_resume_max_s),
     }
 
 

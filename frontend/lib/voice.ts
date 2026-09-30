@@ -207,14 +207,17 @@ export function describeCaptureError(err: unknown): VoiceError {
  * The rules are small and all of them come from watching the alternative go
  * wrong: never lose what was already typed (that is somebody's sentence);
  * separate with exactly one space; do not add a space after an opening
- * bracket or before punctuation; and capitalise nothing — the model already
+ * bracket, nor before punctuation that closes the draft's last words (a
+ * transcript that starts with a danda or a comma:
+ * `startsWithClosingPunctuation`; until 2026-09-30 this comment promised it
+ * and the code did not do it); and capitalise nothing — the model already
  * punctuates, and second-guessing it mangles names.
  */
 export function mergeTranscript(draft: string, transcript: string): string {
   const spoken = transcript.trim();
   if (!spoken) return draft;
   if (!draft) return spoken;
-  const needsSpace = !/[\s([{"'‘“-]$/.test(draft);
+  const needsSpace = !/[\s([{"'‘“-]$/.test(draft) && !startsWithClosingPunctuation(spoken);
   return `${draft}${needsSpace ? ' ' : ''}${spoken}`;
 }
 
@@ -739,6 +742,22 @@ export type SessionOutcome =
 export type WaitingOn = 'none' | 'chat' | 'engine' | 'engine_unavailable';
 export type EndedBy = 'person' | 'recorder_error' | 'lost_parts' | 'page_hidden';
 
+/**
+ * The live-transcript socket a session offers (2026-09-29), or none: the
+ * server sends `"live": null` when the live path is off, and the legacy road
+ * never has one. lib/voiceLive.ts is the client.
+ */
+export interface LiveConfig {
+  /** The socket's path on this origin, with `{id}` where the session id goes. */
+  path: string;
+  /** Always 16000: the only rate the browser tap produces. */
+  sampleRate: number;
+  /** Always 40: one 640-sample frame per message. */
+  frameMs: number;
+  /** How much buffered audio a reconnect may replay, in seconds. */
+  resumeMaxS: number;
+}
+
 export interface SessionConfig {
   /** The timeslice the recorder MUST use. */
   partMs: number;
@@ -747,6 +766,8 @@ export interface SessionConfig {
   bitsPerSecond: number | null;
   idleCloseS: number;
   longPollMaxS: number;
+  /** The live-transcript socket, or null when the server has none. */
+  live: LiveConfig | null;
 }
 
 export const DEFAULT_SESSION_CONFIG: SessionConfig = {
@@ -755,7 +776,29 @@ export const DEFAULT_SESSION_CONFIG: SessionConfig = {
   bitsPerSecond: null,
   idleCloseS: 600,
   longPollMaxS: 25,
+  live: null,
 };
+
+/**
+ * The `live` block of a session's config, or null for anything this client
+ * cannot honour. The browser tap produces exactly 16 kHz in 40 ms frames, so a
+ * server asking for another rate or frame size gets no live stream rather
+ * than audio it would misread; the path must name the session with `{id}`
+ * (lib/voiceLive.ts `liveSocketUrl` checks what it becomes). The orchestrator
+ * also sends the path as `path_template`; either name is read.
+ */
+export function parseLiveConfig(raw: unknown): LiveConfig | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const path = typeof r.path === 'string' ? r.path : r.path_template;
+  if (typeof path !== 'string' || !path.startsWith('/') || !path.includes('{id}')) return null;
+  if ((r.sample_rate ?? 16000) !== 16000 || (r.frame_ms ?? 40) !== 40) return null;
+  const resume =
+    typeof r.resume_max_s === 'number' && Number.isFinite(r.resume_max_s) && r.resume_max_s >= 0
+      ? r.resume_max_s
+      : 60;
+  return { path, sampleRate: 16000, frameMs: 40, resumeMaxS: resume };
+}
 
 export interface SessionSegment {
   i: number;
@@ -894,7 +937,28 @@ export function parseSessionConfig(body: unknown): SessionConfig {
       typeof c.bits_per_second === 'number' && c.bits_per_second > 0 ? c.bits_per_second : null,
     idleCloseS: positive(c.idle_close_s, DEFAULT_SESSION_CONFIG.idleCloseS),
     longPollMaxS: positive(c.long_poll_max_s, DEFAULT_SESSION_CONFIG.longPollMaxS),
+    live: parseLiveConfig(c.live),
   };
+}
+
+/**
+ * Punctuation that closes the text before it: , . ; : ! ? । ॥ ) ] } … and
+ * their full-width forms (，．；：！？）］｝, and the ideographic 、。).
+ *
+ * A piece of transcript that STARTS with one of these belongs to the piece
+ * before it (build spec 14.3, 2026-09-30). The streaming engine cuts an
+ * utterance at the pause and keeps the danda or comma that ends it on the
+ * NEXT utterance, on purpose, so "जंगल में है" is followed by "। फिर हम": joined
+ * with a space, the draft read "है । फिर" and "told , and".
+ *
+ * A '.' or ',' counts only when no letter or digit follows it: ".5 percent"
+ * and ".NET" are words of their own and keep their space (T4c QA).
+ */
+const CLOSING_PUNCTUATION = /^(?:[;:!?।॥)\]}…，．；：！？）］｝、。]|[.,](?![\p{L}\p{N}]))/u;
+
+/** Whether `text` starts by closing what came before it (`CLOSING_PUNCTUATION`). */
+export function startsWithClosingPunctuation(text: string): boolean {
+  return CLOSING_PUNCTUATION.test(text);
 }
 
 /**
@@ -902,13 +966,18 @@ export function parseSessionConfig(body: unknown): SessionConfig {
  *
  * The final text comes from the server whole, because joining segments with
  * spaces is wrong for scripts written without them. The preview has to join
- * something, so it adds a space only where neither side already has one and
- * neither side is Thai, Lao, Burmese, Khmer, Japanese or Chinese.
+ * something, so it adds a space only where neither side already has one,
+ * neither side is Thai, Lao, Burmese, Khmer, Japanese or Chinese, and the
+ * right side does not start by closing the left one (a danda, a comma:
+ * `CLOSING_PUNCTUATION`). Each of those depends only on the character on
+ * either side of the join, which is what lets lib/voiceLive.ts `joinPieces`
+ * join a whole transcript in one pass.
  */
 export function joinPreview(left: string, right: string): string {
   if (!left) return right;
   if (!right) return left;
   if (/\s$/.test(left) || /^\s/.test(right)) return left + right;
+  if (CLOSING_PUNCTUATION.test(right)) return left + right;
   const noSpace = /[฀-໿က-႟ក-៿぀-ヿ㐀-䶿一-鿿豈-﫿]/;
   if (noSpace.test(left.slice(-1)) && noSpace.test(right.slice(0, 1))) return left + right;
   return `${left} ${right}`;
@@ -1413,9 +1482,31 @@ export type VoiceOffer =
     };
 
 export type SessionResult =
-  | { kind: 'text'; text: string; notices: string[]; offer: VoiceOffer | null; sessionId: string }
+  | {
+      kind: 'text';
+      text: string;
+      notices: string[];
+      offer: VoiceOffer | null;
+      sessionId: string;
+      /**
+       * The language the full pass heard, when the server said: `language`
+       * as its name ("Hindi"), `languageCode` as its code ("hi"). Which
+       * transcript goes into the draft depends on it (lib/voiceLive.ts
+       * `chooseFinalText`: whisper writes a fifth of Hinglish in Urdu script).
+       */
+      language?: string;
+      languageCode?: string;
+    }
   | { kind: 'error'; error: VoiceError; offer: VoiceOffer | null }
   | { kind: 'withdrawn' };
+
+/** The full pass's language as a text result carries it: only what the server said. */
+function languageOf(state: SessionState): { language?: string; languageCode?: string } {
+  return {
+    ...(state.language ? { language: state.language } : {}),
+    ...(state.languageCode ? { languageCode: state.languageCode } : {}),
+  };
+}
 
 /** Whether a result leaves anything for the person to act on later. */
 function offerKeepsRecord(offer: VoiceOffer | null): boolean {
@@ -1488,7 +1579,7 @@ export function describeOutcome(
         )
       : null;
   if (offer && offer.kind === 'retranscribe') offer.replaces = text;
-  return { kind: 'text', text, notices, offer, sessionId: state.sessionId };
+  return { kind: 'text', text, notices, offer, sessionId: state.sessionId, ...languageOf(state) };
 }
 
 // ---------------------------------------------------------------------------
@@ -2076,6 +2167,20 @@ export interface SessionProgress {
   /** Held-back text that may still change; replaced on every answer. */
   tentative: string;
   audioMs: number;
+  /**
+   * The server's `transcribed_ms`: audio before this point is in `preview`
+   * and `tentative` (or is silence). The live transcript shows only what it
+   * heard after it (lib/voiceLive.ts `mergeLiveTranscript`). Absent on
+   * progress built by hand, where `audioMs - backlogMs` is the same number.
+   */
+  transcribedMs?: number;
+  /**
+   * The live transcript's words after what `preview` and `tentative` cover:
+   * committed utterances, then the one still being heard. Set by the
+   * recorder hook (lib/voiceLive.ts `withLiveWords`), never by VoiceSession;
+   * absent when the recording has no live stream.
+   */
+  live?: { committed: string; partial: string } | null;
   backlogMs: number;
   waitingOn: WaitingOn;
   /** Slices recorded but not yet acknowledged by the server. */
@@ -2330,6 +2435,7 @@ export class VoiceSession {
       preview: '',
       tentative: '',
       audioMs: 0,
+      transcribedMs: 0,
       backlogMs: 0,
       waitingOn: 'none',
       pendingParts: 0,
@@ -2355,6 +2461,17 @@ export class VoiceSession {
   /** Whether the outbox survives a reload (IndexedDB), which decides what the person is promised. */
   get persistent(): boolean {
     return this.store.persistent;
+  }
+
+  /**
+   * Whether the server has accepted this recording's finish: it no longer
+   * counts the recording as this person's one live recording, so a new one
+   * may start. The recorder hook reads it when a Hindi session's live words
+   * go into the draft before the full pass (components/useVoiceRecorder.ts,
+   * build spec 13); every `onProgress` after the acceptance sees it true.
+   */
+  get finishAccepted(): boolean {
+    return this.finishSent;
   }
 
   /**
@@ -2817,6 +2934,7 @@ export class VoiceSession {
       preview,
       tentative: state.tentative,
       audioMs: state.audioMs,
+      transcribedMs: state.transcribedMs,
       backlogMs: state.backlogMs,
       waitingOn: state.waitingOn,
       progressive: state.progressive,
@@ -3488,12 +3606,16 @@ export class VoiceSession {
       return results.find((r) => r.kind === 'error' && r.offer !== null) ?? last;
     }
     const offers = results.map((r) => (r.kind === 'withdrawn' ? null : r.offer));
+    // The language of the session that holds most of the words speaks for the whole.
+    const most = texts.reduce((a, b) => (b.text.length > a.text.length ? b : a));
     return {
       kind: 'text',
       text: texts.reduce((acc, r) => mergeTranscript(acc, r.text), ''),
       notices: [...new Set(texts.flatMap((r) => r.notices))],
       offer: offers.find((o) => o?.kind === 'retranscribe') ?? null,
       sessionId: this.sessionId,
+      ...(most.language ? { language: most.language } : {}),
+      ...(most.languageCode ? { languageCode: most.languageCode } : {}),
     };
   }
 }

@@ -33,7 +33,7 @@
  * was never affected.
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { IconStop, IconX } from './icons';
 import { Loader } from './Loader';
 import {
@@ -44,6 +44,7 @@ import {
   idleWords,
 } from '@/lib/voice';
 import type { SessionProgress, VoiceState } from '@/lib/voice';
+import { spaceBetween, type VoiceLanguage } from '@/lib/voiceLive';
 import type { VoiceFollowUp } from './useVoiceRecorder';
 
 /**
@@ -125,6 +126,69 @@ function Waveform({ levels }: { levels: number[] }) {
 }
 
 
+/** The live transcript's languages, each named in itself. */
+const LANGUAGE_CHOICES: ReadonlyArray<{ value: VoiceLanguage; label: string; lang?: string }> = [
+  { value: 'auto', label: 'Auto' },
+  { value: 'en', label: 'English', lang: 'en' },
+  { value: 'hi', label: 'हिन्दी', lang: 'hi' },
+];
+
+/**
+ * Which language the live transcript listens for (2026-09-30). The English
+ * model makes a third fewer errors on English than the multilingual one
+ * (LibriSpeech 4.13% against 6.23% WER), and pinning Hindi helps the
+ * multilingual one on Hindi (FLEURS-hi 10.9% against 11.8% on auto; whisper,
+ * the full pass, 41.9%: benchmarks/voice-live/README.md), so a person who
+ * knows gets to say. Changing it mid-recording starts the live stream again
+ * in the new language from the last committed word, once the choice has
+ * stood for half a second (LiveStream.setLanguage), so walking the options
+ * with the arrow keys opens one connection; the stored recording is not
+ * touched.
+ *
+ * Native radio buttons, so the arrow keys, the one Tab stop and what a screen
+ * reader says are the browser's own. Outside the status row, like the
+ * transcript: the row is the one live region, and a control inside it would
+ * be announced with every state change. Tokens only: `bg-surface-2` and
+ * `text-ink` for the choice, with no opacity modifier on a var() token (it
+ * compiles to nothing, the trap described at the top of this file).
+ */
+function LanguageChoice({
+  value,
+  onChange,
+}: {
+  value: VoiceLanguage;
+  onChange: (language: VoiceLanguage) => void;
+}) {
+  const name = useId();
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Language of the live transcript"
+      data-testid="voice-language"
+      className="ml-auto flex shrink-0 items-center rounded-lg border border-border p-0.5"
+    >
+      {LANGUAGE_CHOICES.map((choice) => (
+        <label key={choice.value} className="cursor-pointer">
+          <input
+            type="radio"
+            name={name}
+            value={choice.value}
+            checked={value === choice.value}
+            onChange={() => onChange(choice.value)}
+            className="peer sr-only"
+          />
+          <span
+            lang={choice.lang}
+            className="block rounded-md px-2 py-0.5 text-muted transition-colors duration-ts hover:text-ink peer-checked:bg-surface-2 peer-checked:text-ink peer-focus-visible:ring-2 peer-focus-visible:ring-accent"
+          >
+            {choice.label}
+          </span>
+        </label>
+      ))}
+    </div>
+  );
+}
+
 /**
  * The lines above the controls row while a SESSION records or finishes: what
  * has been transcribed so far, where the recording is kept, and anything the
@@ -139,11 +203,15 @@ function SessionPanel({
   progress,
   hint,
   warning,
+  language,
+  onLanguage,
 }: {
   state: 'requesting' | 'recording' | 'finishing';
   progress: SessionProgress | null;
   hint: string | null;
   warning: string | null;
+  language: VoiceLanguage | null;
+  onLanguage: ((language: VoiceLanguage) => void) | null;
 }) {
   const lines: Array<{ key: string; text: string; tone: 'muted' | 'warn' }> = [];
   if (hint) lines.push({ key: 'hint', text: hint, tone: 'muted' });
@@ -180,50 +248,86 @@ function SessionPanel({
       lines.push({ key: 'engine', text: VOICE_MESSAGES.engineUnavailableLive, tone: 'warn' });
     }
   }
-  const words = progress ? `${progress.preview}` : '';
-  const tentative = progress?.tentative ?? '';
-  if (!lines.length && !words && !tentative && !progress) return null;
+  // In the order they were spoken: the server's final segments, the text it
+  // still holds back, then the live transcript's committed utterances and
+  // the one being heard now (lib/voiceLive.ts drops what the first two
+  // already cover). Committed words in ink; words that may still change in
+  // muted.
+  const pieces: Array<{ key: string; text: string; settled: boolean }> = [
+    { key: 'preview', text: progress?.preview ?? '', settled: true },
+    { key: 'tentative', text: progress?.tentative ?? '', settled: false },
+    { key: 'live', text: progress?.live?.committed ?? '', settled: true },
+    { key: 'partial', text: progress?.live?.partial ?? '', settled: false },
+  ].filter((piece) => piece.text);
+  const saved = progress !== null && progress.savedMs !== 0;
+  const choosing = state === 'recording' && language !== null && onLanguage !== null;
+  if (!lines.length && !pieces.length && !progress && !choosing) return null;
   return (
     <div className="flex flex-col gap-1 px-3 pt-1 text-xs" data-testid="voice-session-panel">
-      {(words || tentative) && (
-        // The newest words at the bottom edge, older ones scrolling off the
-        // top: three lines is enough to see the sentence being heard.
-        <p className="line-clamp-3 break-words text-sm leading-5 text-ink" dir="auto">
-          {words}
-          {tentative && (
-            <span className="text-muted">
-              {words ? ' ' : ''}
-              {tentative}
-            </span>
-          )}
-        </p>
+      {pieces.length > 0 && (
+        // THE TAIL, NOT THE HEAD (2026-09-29). This was `line-clamp-3`, which
+        // keeps the FIRST three lines: past three lines (the preview holds up
+        // to 600 characters) the words being spoken now were the ones cut,
+        // while this comment said the opposite. Measured in Chromium: the
+        // newest words sat at y=356 in a box that ended at y=74. The box is
+        // now anchored to its bottom edge (a column justified to its end, four
+        // lines at most, the overflow hidden), so older lines leave by the top
+        // and the newest words are always the ones in view: seven lines of
+        // text in the 80 px box, measured the same way, put the last line at
+        // 614-632 inside a box spanning 553-633 and the first three above it.
+        <div className="flex max-h-20 flex-col justify-end overflow-hidden" data-testid="voice-transcript">
+          <p className="break-words text-sm leading-5 text-ink" dir="auto">
+            {pieces.map((piece, index) => {
+              const before = index > 0 ? spaceBetween(pieces[index - 1]!.text, piece.text) : '';
+              return piece.settled ? (
+                <span key={piece.key}>
+                  {before}
+                  {piece.text}
+                </span>
+              ) : (
+                <span key={piece.key} className="text-muted">
+                  {before}
+                  {piece.text}
+                </span>
+              );
+            })}
+          </p>
+        </div>
       )}
       {lines.map((line) => (
         <p key={line.key} className={line.tone === 'warn' ? 'text-warn' : 'text-muted'}>
           {line.text}
         </p>
       ))}
-      {progress && progress.savedMs !== 0 && (
-        <p className="text-faint">
-          {/* Where the stored recordings are (feat/voice-recordings-page). A
-              new tab: leaving this page while recording would end the
-              recording. Drawn only once the server has acknowledged audio,
-              and it says how much, and how much is still only on this device. */}
-          <a
-            href="/recordings"
-            target="_blank"
-            rel="noopener"
-            className="underline-offset-2 hover:text-muted hover:underline"
-          >
-            {progress.savedMs === undefined
-              ? VOICE_MESSAGES.saved(progress.retentionDays)
-              : VOICE_MESSAGES.savedSoFar(
-                  formatElapsed(progress.savedMs),
-                  progress.pendingMs > 0 ? formatElapsed(progress.pendingMs) : null,
-                  progress.retentionDays,
-                )}
-          </a>
-        </p>
+      {(saved || choosing) && (
+        // One row: where the recording is kept on the left, the live
+        // transcript's language at the right, above the Stop button. On a
+        // narrow phone the language wraps under the saved line.
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          {saved && progress && (
+            <p className="min-w-0 text-faint">
+              {/* Where the stored recordings are (feat/voice-recordings-page). A
+                  new tab: leaving this page while recording would end the
+                  recording. Drawn only once the server has acknowledged audio,
+                  and it says how much, and how much is still only on this device. */}
+              <a
+                href="/recordings"
+                target="_blank"
+                rel="noopener"
+                className="underline-offset-2 hover:text-muted hover:underline"
+              >
+                {progress.savedMs === undefined
+                  ? VOICE_MESSAGES.saved(progress.retentionDays)
+                  : VOICE_MESSAGES.savedSoFar(
+                      formatElapsed(progress.savedMs),
+                      progress.pendingMs > 0 ? formatElapsed(progress.pendingMs) : null,
+                      progress.retentionDays,
+                    )}
+              </a>
+            </p>
+          )}
+          {choosing && <LanguageChoice value={language} onChange={onLanguage} />}
+        </div>
       )}
     </div>
   );
@@ -237,6 +341,8 @@ export function VoiceBar({
   progress = null,
   hint = null,
   warning = null,
+  language = null,
+  onLanguage = null,
   onCancel,
   onStop,
 }: {
@@ -255,6 +361,12 @@ export function VoiceBar({
   hint?: string | null;
   /** Something that happened while recording, e.g. the screen went off. */
   warning?: string | null;
+  /**
+   * The live transcript's language, while the recording has one; the
+   * control is drawn only then, and only while recording.
+   */
+  language?: VoiceLanguage | null;
+  onLanguage?: ((language: VoiceLanguage) => void) | null;
   onCancel: () => void;
   onStop: () => void;
 }) {
@@ -275,7 +387,14 @@ export function VoiceBar({
 
   return (
     <div className="flex flex-col">
-      <SessionPanel state={state} progress={progress} hint={hint} warning={warning} />
+      <SessionPanel
+        state={state}
+        progress={progress}
+        hint={hint}
+        warning={warning}
+        language={language}
+        onLanguage={onLanguage}
+      />
       <div
         className="flex h-[52px] items-center gap-3 px-2"
         // One live region for the whole bar: a screen reader is told the state
@@ -357,8 +476,41 @@ export function VoiceBar({
  * can do about it: Retry a saved recording's missing parts, end a recording
  * left running in another tab, or insert a recording a closed tab finished.
  * A toast would be gone before they could press the button.
+ *
+ * THE ACTIONS WRAP UNDER THE MESSAGE WHEN THEY DO NOT FIT (2026-09-30). They
+ * used to sit beside it at their full width whatever the width of the line,
+ * and the message took what was left. On a 390 px phone (311 px of composer)
+ * "Retry" beside "Insert what was heard live (part of the recording)" left
+ * the message 0 px wide: one letter per line, a line 2,300 px tall, and the
+ * second button running off the edge (measured in Chromium). The message now
+ * keeps at least 12rem, the actions go to the next row together when they
+ * cannot stand beside it, and a label longer than the row wraps inside its
+ * button; the row's -ml-2 lines the buttons' words up with the message's
+ * (their hover fill reaches into the line's padding). Wide enough, nothing
+ * moves: message, actions, dismiss, in one row.
  */
 export function VoiceFollowUpLine({ followUp }: { followUp: VoiceFollowUp }) {
+  const primary = followUp.actionLabel ? (
+    <button
+      type="button"
+      onClick={followUp.run}
+      disabled={followUp.busy}
+      className="max-w-full rounded-lg px-2 py-0.5 text-left font-medium text-accent transition-colors duration-ts hover:bg-surface-2 disabled:cursor-wait disabled:opacity-60"
+    >
+      {followUp.busy ? <Loader size={12} /> : followUp.actionLabel}
+    </button>
+  ) : null;
+  const secondary =
+    followUp.secondaryLabel && followUp.runSecondary ? (
+      <button
+        type="button"
+        onClick={followUp.runSecondary}
+        disabled={followUp.busy}
+        className="max-w-full rounded-lg px-2 py-0.5 text-left text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink disabled:opacity-60"
+      >
+        {followUp.secondaryLabel}
+      </button>
+    ) : null;
   return (
     <div
       role={followUp.tone === 'error' ? 'alert' : undefined}
@@ -366,27 +518,15 @@ export function VoiceFollowUpLine({ followUp }: { followUp: VoiceFollowUp }) {
         followUp.tone === 'error' ? 'text-ink' : 'text-muted'
       }`}
     >
-      <p className="min-w-0 flex-1 break-words">{followUp.message}</p>
-      {followUp.actionLabel && (
-        <button
-          type="button"
-          onClick={followUp.run}
-          disabled={followUp.busy}
-          className="shrink-0 rounded-lg px-2 py-0.5 font-medium text-accent transition-colors duration-ts hover:bg-surface-2 disabled:cursor-wait disabled:opacity-60"
-        >
-          {followUp.busy ? <Loader size={12} /> : followUp.actionLabel}
-        </button>
-      )}
-      {followUp.secondaryLabel && followUp.runSecondary && (
-        <button
-          type="button"
-          onClick={followUp.runSecondary}
-          disabled={followUp.busy}
-          className="shrink-0 rounded-lg px-2 py-0.5 text-muted transition-colors duration-ts hover:bg-surface-2 hover:text-ink disabled:opacity-60"
-        >
-          {followUp.secondaryLabel}
-        </button>
-      )}
+      <div className="flex min-w-0 flex-1 flex-wrap items-start gap-x-2 gap-y-1">
+        <p className="min-w-[min(12rem,100%)] flex-1 break-words">{followUp.message}</p>
+        {(primary || secondary) && (
+          <div className="-ml-2 flex max-w-full flex-wrap items-start gap-1" data-testid="voice-follow-up-actions">
+            {primary}
+            {secondary}
+          </div>
+        )}
+      </div>
       <button
         type="button"
         onClick={followUp.dismiss}

@@ -1,0 +1,169 @@
+# Live dictation transcripts: the streaming speech-to-text engine.
+# Its own Compose project (sf-local-ai-stt), on the WORKER only.
+#
+# scripts/stt-stream.sh copies this file to $HOME/.techsara-cluster/ on the
+# worker and compose/stt-stream/ (the image sources) to
+# $HOME/.techsara-cluster/stt-stream/, the layout compose.whisper.yaml uses,
+# and runs it there. The head never runs it: nothing new is loaded on the
+# head (owner rule of 2026-09-16). The orchestrator's WebSocket gateway is its
+# only client.
+#
+# WHY A SEPARATE PROJECT. The isolation promise compose.whisper.yaml makes:
+# `docker compose up` here cannot restart the main model, and nothing here
+# comes near sf-local-ai-worker, the main model's tensor-parallel rank 1.
+#
+# CPU, PINNED AND CAPPED. Chat decode runs at the speed of the slower rank,
+# so this engine stays off the GPU entirely. On the CPU it is not free either:
+# measured 2026-09-29, 12 streams on ~5 cores left chat decode unchanged, but
+# all 20 cores saturated cost chat 11-16%. So the container gets the ten
+# Cortex-X925 cores as its cpuset, at most 8 cores' worth of time within
+# them; every profile refuses streams above its capacity, and the engine
+# refuses any stream its decode budget (STT_MAX_COST) cannot pay for.
+#
+# BINDING. The management address only (STT_BIND, required, no default),
+# never 0.0.0.0 and never a 10.100.x RoCE address; the process binds it
+# itself under host networking, for the reboot reason compose.whisper.yaml
+# explains. The port is closed to everything but the head by the host packet
+# filter (scripts/host-guard.sh, 30009) and, unlike whisper, the engine also
+# demands a bearer token: STT_TOKEN arrives through stt-stream/stt.env, written
+# 0600 by scripts/stt-stream.sh, so it is never on a command line.
+name: sf-local-ai-stt
+
+services:
+  stt-stream:
+    build:
+      context: ./stt-stream
+      dockerfile: Dockerfile
+    image: sf-local-ai-stt-stream:cpu
+    env_file:
+      # STT_TOKEN only. Required: without it the engine refuses to start.
+      - path: ./stt-stream/stt.env
+        required: true
+    environment:
+      STT_BIND: "${STT_BIND:?STT_BIND must be set; scripts/stt-stream.sh derives it from the worker's management interface}"
+      STT_PORT: "${STT_PORT:-30009}"
+      # Decode threads PER PROFILE, all sharing that profile's one
+      # recognizer, and the ONNX Runtime threads each decode runs on. Four
+      # profiles x 2 workers keep the decode threads within the 8 cores this
+      # container may use (build spec 8E); the measured budget for the 160 ms
+      # model is ~5 cores for 12 real-time streams.
+      STT_WORKERS: "${STT_WORKERS:-2}"
+      STT_THREADS: "${STT_THREADS:-2}"
+      # Trailing silence after the last word that closes an utterance; the
+      # live final lands 0.68-0.83 s (p50) after the speaker stops.
+      STT_ENDPOINT_S: "${STT_ENDPOINT_S:-0.6}"
+      STT_MAX_UTTERANCE_S: "${STT_MAX_UTTERANCE_S:-30}"
+      # A fresh recognizer stream after every final whose silence reaches
+      # this (0 = never): measured, renewing after 2.0 s took FLEURS Hindi
+      # from 15.78% to 12.4-12.9% WER for at most 0.5 points of English,
+      # where renewing at every 0.6 s endpoint cost English 2.2 (server.py,
+      # Settings.renew_silence_s).
+      STT_RENEW_SILENCE_S: "${STT_RENEW_SILENCE_S:-2.0}"
+      # THE DECODE BUDGET, across all four profiles: a 160 ms stream costs 2
+      # units and a 560 ms stream 1 ("cost" below; measured: 0.41 core per
+      # 160 ms stream, half that at 560 ms). 32 units are the ~16 real-time
+      # 160 ms streams the 8 cores decode (6.6 cores), leaving ~1.4 cores of
+      # headroom. With these profiles the engine admits 20 'auto' streams
+      # (multi-fast 8 + multi-wide 12, 28 units: the profile caps refuse
+      # first), 16 'en' streams (en-fast 8 + multi-fast 8: the budget refuses
+      # first) and at most 24 in any mix, never 32 (docs/voice/REALTIME.md,
+      # "How many streams fit"). Refusals are a retryable 4429. Measured at
+      # the cap, 16 x 160 ms on the production container (2026-09-30):
+      # WER 3.83 %, first partial p50 673 / p90 1,603 ms, 0 errors.
+      STT_MAX_COST: "${STT_MAX_COST:-32}"
+      STT_IDLE_S: "${STT_IDLE_S:-60}"
+      # Silence in front of every new stream (build spec 8C): Nemotron 3.5
+      # drops the first word without it (27/30 kept with 160 ms, 4/30 with 0).
+      STT_LEAD_PAD_MS: "${STT_LEAD_PAD_MS:-160}"
+      # ADMISSION ORDER (build spec 8E): a stream goes to the first profile
+      # that allows its language and has room. "en" goes to the English-only
+      # Nemotron Speech Streaming model (LibriSpeech WER 4.13% at 160 ms);
+      # "auto" (the model's own language ID, the default: never translate,
+      # never force a language) and "hi" go to the multilingual Nemotron 3.5
+      # (LibriSpeech 6.23% auto, FLEURS Hindi 11.8% auto, 10.9% pinned), which
+      # also takes English once the English profile is full. The 160 ms
+      # exports answer first; the 560 ms ones, cheaper per stream and a
+      # little slower to show words, take the overflow. Gujarati is NOT
+      # offered: both models read it at 104% WER. Changing a profile is an
+      # edit to this file, reviewed, not an environment knob.
+      STT_PROFILES: >-
+        [{"id": "en-fast", "dir": "/models/en-160", "chunk_ms": 160, "max_streams": 8, "cost": 2,
+          "model": "nemotron-speech-streaming-en-0.6b-160ms-int8", "languages": ["en"]},
+         {"id": "multi-fast", "dir": "/models/multi-160", "chunk_ms": 160, "max_streams": 8, "cost": 2,
+          "model": "nemotron-3.5-asr-streaming-0.6b-160ms-int8", "languages": ["auto", "hi", "en"]},
+         {"id": "en-wide", "dir": "/models/en-560", "chunk_ms": 560, "max_streams": 12, "cost": 1,
+          "model": "nemotron-speech-streaming-en-0.6b-560ms-int8", "languages": ["en"]},
+         {"id": "multi-wide", "dir": "/models/multi-560", "chunk_ms": 560, "max_streams": 12, "cost": 1,
+          "model": "nemotron-3.5-asr-streaming-0.6b-560ms-int8", "languages": ["auto", "hi", "en"]}]
+    volumes:
+      # The pinned revisions in the cluster's model cache, read-only, one
+      # directory per model and nothing else of the cache. scripts/stt-stream.sh
+      # fetches them there by Hugging Face commit and checks every file's
+      # sha256; nothing is ever downloaded at start.
+      - type: bind
+        source: "${STT_MODEL_CACHE:?STT_MODEL_CACHE must be set by scripts/stt-stream.sh}/repos/${STT_EN_160_DIR:?STT_EN_160_DIR must be set by scripts/stt-stream.sh}"
+        target: /models/en-160
+        read_only: true
+      - type: bind
+        source: "${STT_MODEL_CACHE:?STT_MODEL_CACHE must be set by scripts/stt-stream.sh}/repos/${STT_MULTI_160_DIR:?STT_MULTI_160_DIR must be set by scripts/stt-stream.sh}"
+        target: /models/multi-160
+        read_only: true
+      - type: bind
+        source: "${STT_MODEL_CACHE:?STT_MODEL_CACHE must be set by scripts/stt-stream.sh}/repos/${STT_EN_560_DIR:?STT_EN_560_DIR must be set by scripts/stt-stream.sh}"
+        target: /models/en-560
+        read_only: true
+      - type: bind
+        source: "${STT_MODEL_CACHE:?STT_MODEL_CACHE must be set by scripts/stt-stream.sh}/repos/${STT_MULTI_560_DIR:?STT_MULTI_560_DIR must be set by scripts/stt-stream.sh}"
+        target: /models/multi-560
+        read_only: true
+    network_mode: host
+    cpuset: "5-9,15-19"
+    cpus: 8
+    # A HARD MEMORY LIMIT, the one deliberate exception in the repository
+    # (launcher/tests/test_oom_score_adj.py, NoServiceGainsAHardMemoryLimitTests).
+    # Four recognizers, ONE per profile shared by its decode threads (build
+    # spec 8B), measured on the worker 2026-09-29: 3.58 GB of RSS loaded,
+    # 4.08 GB with twelve streams open. Unlike the GPU engines this memory IS
+    # charged to the container's cgroup, so the limit bounds the whole engine;
+    # 8g is twice the measured peak, and a leak ends in a restart of this
+    # preview rather than in the kernel choosing among the node's processes.
+    mem_limit: 8g
+    # FIRST IN LINE FOR THE KERNEL'S OOM KILLER, beside the OCR engine
+    # (OPERATIONS.md section 14): an optional preview whose loss costs nothing
+    # (whisper stays authoritative) and whose restart is clean. Set at CREATE
+    # time so it never depends on the root timer that holds the older
+    # sidecars at their values.
+    oom_score_adj: 900
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # tini as PID 1 forwards SIGTERM to uvicorn, which closes every stream
+    # with 1012 (the gateway reconnects elsewhere or later).
+    init: true
+    # CORE DUMPS OFF the way that works with apport (compose.ocr.yaml):
+    # RLIMIT_CORE of 1 aborts a pipe dump before apport reads gigabytes of
+    # model memory into a report and holds the restart for minutes.
+    ulimits:
+      core:
+        soft: 1
+        hard: 1
+    pids_limit: 256
+    restart: unless-stopped
+    healthcheck:
+      # The address the server ACTUALLY binds, read from the same two
+      # variables; `ready` is checked, not just the status, because /health
+      # answers while the recognizers are still loading.
+      test: ["CMD-SHELL", "python3 -c \"import os,urllib.request,json,sys; h=os.environ.get('STT_BIND','127.0.0.1'); p=os.environ.get('STT_PORT','30009'); b=json.load(urllib.request.urlopen(f'http://{h}:{p}/health', timeout=5)); sys.exit(0 if b.get('ready') else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      # Four recognizers load and warm up from local disk; a first start
+      # after a reboot reads 2.6 GB of weights from a cold page cache.
+      start_period: 300s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
