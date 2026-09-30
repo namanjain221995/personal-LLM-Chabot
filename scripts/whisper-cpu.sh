@@ -192,12 +192,63 @@ wait_ready() { # wait_ready <bind>
   die "the replica did not report ready within ${WHISPER_CPU_READY_TIMEOUT_S}s; last /health: ${body:-no answer}"
 }
 
+# ------------------------------------------------------------------ guard --
+
+# THE PORT HAS NO AUTHENTICATION, so `up` never starts the replica on a worker whose packet filter
+# lets the office LAN or the tailnet reach it, now or after the next reboot. The worker's guard
+# judges only the ports it lists (scripts/host-guard.sh: `tcp dport != @guarded_ports accept`), so
+# an unlisted port is open to every network the worker is on. Two readings, and neither needs root:
+#   - the table loaded NOW: $GUARD_APPLIED_RULESET, written by `host-guard.sh apply`;
+#   - the table the NEXT BOOT loads: `plan` of the boot copy $GUARD_BOOT_COPY, written by
+#     `host-guard.sh install-boot`. A guard applied from the new script but not installed for boot
+#     reopens the port at the next reboot, and `restart: unless-stopped` brings the replica back.
+# Each must judge the port (set guarded_ports) and let the head's orchestrator through
+# (set head_lan_ports).
+GUARD_APPLIED_RULESET="/run/techsara-host-guard/ruleset.nft"
+GUARD_BOOT_COPY="/usr/local/sbin/techsara-host-guard"
+GUARD_OWNER_STEPS="copy this checkout's scripts/host-guard.sh to the worker's ~/.techsara-cluster/host-guard.sh, then on the worker: sudo bash ~/.techsara-cluster/host-guard.sh install-boot --role worker && sudo bash ~/.techsara-cluster/host-guard.sh apply --role worker && sudo bash ~/.techsara-cluster/host-guard.sh verify --role worker"
+
+ruleset_guards_port() { # ruleset_guards_port PORT < ruleset (host-guard.sh's rendered form)
+  awk -v port="$1" '
+    /^[[:space:]]*set [A-Za-z_]+ \{/ { set = $2; next }
+    set != "" && /elements = \{/ {
+      line = $0
+      sub(/.*elements = \{/, "", line)
+      sub(/\}.*/, "", line)
+      n = split(line, items, ",")
+      for (i = 1; i <= n; i++) {
+        item = items[i]
+        gsub(/[[:space:]]/, "", item)
+        if (item == port) { found[set] = 1 }
+        else if (item ~ /^[0-9]+-[0-9]+$/) {
+          split(item, range, "-")
+          if (port + 0 >= range[1] + 0 && port + 0 <= range[2] + 0) { found[set] = 1 }
+        }
+      }
+    }
+    /^[[:space:]]*\}[[:space:]]*$/ { set = "" }
+    END { exit !(("guarded_ports" in found) && ("head_lan_ports" in found)) }
+  '
+}
+
+require_host_guard() {
+  local applied boot
+  applied="$(ssh_worker "cat $GUARD_APPLIED_RULESET 2>/dev/null" </dev/null)" || applied=""
+  printf '%s\n' "$applied" | ruleset_guards_port "$WHISPER_CPU_PORT" \
+    || die "the worker's packet filter does not close port $WHISPER_CPU_PORT to the office LAN and the tailnet ($GUARD_APPLIED_RULESET must list it in guarded_ports and head_lan_ports). The replica has no authentication, so it was not started. Owner, as root: $GUARD_OWNER_STEPS"
+  boot="$(ssh_worker "$GUARD_BOOT_COPY plan --role worker 2>/dev/null" </dev/null)" || boot=""
+  printf '%s\n' "$boot" | ruleset_guards_port "$WHISPER_CPU_PORT" \
+    || die "the worker's packet filter closes port $WHISPER_CPU_PORT now, but its boot copy ($GUARD_BOOT_COPY) does not, so the next reboot would reopen it while Docker restarts the replica. It was not started. Owner, as root: $GUARD_OWNER_STEPS"
+  check_pass "the worker's packet filter closes $WHISPER_CPU_PORT to the office LAN and the tailnet, now and after a reboot"
+}
+
 # ------------------------------------------------------------------ commands --
 
 cmd="${1:-status}"; shift || true
 case "$cmd" in
   up)
     require_worker
+    require_host_guard
     bind="$(bind_address)"
     sync_files
     build_images
@@ -207,7 +258,6 @@ case "$cmd" in
     _set_env ASR_CPU_BASE_URLS "$(endpoint "$bind")"
     check_pass "recorded ASR_CPU_BASE_URLS=$(endpoint "$bind") in .env"
     log_info "the orchestrator uses it after its next restart (./techsara up); the GPU replicas are unchanged"
-    log_info "the host packet filter must accept $WHISPER_CPU_PORT from the head only: see docs/voice/CPU-REPLICA.md"
     ;;
   down|stop)
     require_worker
