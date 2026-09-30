@@ -140,12 +140,35 @@ same ten cores. Every speed below includes that contention.
 
 | backend | build / type | WER LibriSpeech / FLEURS-en / FLEURS-hi | seconds per 30 s window (encoder) | decode ms/token | RTF | peak RSS |
 |---|---|---|---:|---:|---:|---:|
-| **whisper.cpp v1.9.4 q8_0** | armv8.6-a + dotprod + i8mm + fp16 + KleidiAI | **3.89 / 7.03 / 44.73 %** | **1.9** | 15-28 | **0.21-0.60** | **2.0 GiB** |
-| whisper.cpp f16 | same build | pending | 4.9 | 39-45 | — | 3.5 GiB |
-| whisper.cpp q5_0 | same build | pending | 6.4 (v8.6 build) | 42 | — | 1.4 GiB |
-| faster-whisper 1.2.1 / CTranslate2 4.8.2 int8 (= int8_float32 on CPU) | PyPI aarch64 wheel (NEON, Ruy, OpenBLAS) | pending | 3.3-4.4 | 105-285 | 0.77 (4 clips) | 3.0 GiB |
-| CTranslate2 float32 | same | — | 6.6 | 251 | — | — |
-| transformers 5.16.1 fp32 (the GPU replica's own code path) | torch 2.14 CPU, oneDNN | pending | 3.0-3.5 | 256 | — | 6.5 GiB |
+| **whisper.cpp v1.9.4 q8_0** | armv8.6-a + dotprod + i8mm + fp16 + KleidiAI | **3.89 / 7.03 / 44.73 %** | **1.9** | 15-28 | **0.45-0.60** short sets, 0.21-0.46 long form | **2.0 GiB** |
+| whisper.cpp f16 | same build | 4.21 / 6.92 / 43.53 % | 4.9 | 39-45 | 1.25-1.73 | 3.3 GiB |
+| whisper.cpp q5_0 | same build | 4.13 / — / 44.13 % | 6.4 | 42 | 1.26-1.71 | 1.5 GiB |
+| faster-whisper 1.2.1 / CTranslate2 4.8.2 int8 (= int8_float32 on CPU) | PyPI aarch64 wheel (NEON, Ruy, OpenBLAS) | 2.59 / — / — (a different decode, below) | 3.3-4.4 | 105-285 | 2.33 | 3.0 GiB |
+| CTranslate2 float32 | same | not run | 6.6 | 251 | — | — |
+| transformers 5.16.1 fp32 (the GPU replica's own code path) | torch 2.14 CPU, oneDNN | not run | 3.0-3.5 | 256 | — | 6.5 GiB |
+
+The RTF column is for the same short sets, one clip after another, pinned to the ten X925 cores
+with 8 threads. The worker was shared throughout, as described above. Paired against the GPU
+replica in the same way as the chosen build:
+
+| backend | LibriSpeech CPU − GPU (95 % CI) | FLEURS-en | FLEURS-hi |
+|---|---|---|---|
+| whisper.cpp f16 | 0.00 pp (−1.13, +1.40), text identical 47/60 | +0.11 (−0.36, +0.58) | +1.60 (−0.85, +5.30) |
+| **whisper.cpp q8_0** | −0.32 (−1.51, +1.10), 46/60 | +0.22 (−0.22, +0.65) | +2.81 (−0.22, +6.62) |
+| whisper.cpp q5_0 | −0.08 (−1.27, +1.35), 45/60 | — | +2.21 (−0.39, +5.92) |
+| faster-whisper int8 | **−1.62 (−3.04, −0.52)**, 47/60 | — | — |
+
+- **f16 reproduces the GPU replica's LibriSpeech score exactly** (4.21 %). That shows the
+  conversion and the decode settings are faithful. q8_0 costs nothing measurable against f16 and
+  decodes 2.5-3 times faster. f16 and q5_0 are slower than real time on short clips, because
+  KleidiAI's kernels cover q8_0 and q4_0 but not q5_0 or f16.
+- **faster-whisper is not the same decode.** Its lower LibriSpeech score is mostly quotation
+  marks. The transformers pipeline and whisper.cpp both write dialogue as `'…'`. The normaliser
+  keeps apostrophes, so those marks count as errors. faster-whisper decodes in timestamp mode and
+  leaves them out. Its no-speech probabilities are up to 0.15 away from the GPU replica's.
+
+  It is also slower than real time here (RTF 2.33). So it would be a different product, and a
+  slower one.
 
 whisper.cpp build flags matter more than the quantisation. Encoder seconds for one 30 s window,
 q8_0, 8 threads:
@@ -158,8 +181,9 @@ q8_0, 8 threads:
 | **... + Arm KleidiAI** (the image's build) | **1.9 s** |
 
 **Why whisper.cpp q8_0.** It is the only engine whose decoder is fast on these cores: 15-28 ms per
-token, against 105-285 for CTranslate2's aarch64 wheel and 256 for transformers. Its accuracy is the
-GPU replica's within noise, and it holds 2.0 GiB.
+token, against 105-285 for CTranslate2's aarch64 wheel and 256 for transformers. It is also the
+fastest whisper.cpp variant here, 2.5-3 times faster than f16 or q5_0. Its accuracy is the GPU
+replica's within noise, and it holds 2.0 GiB.
 
 ### Speed of the chosen replica
 

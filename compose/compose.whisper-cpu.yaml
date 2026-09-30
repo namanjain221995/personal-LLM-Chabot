@@ -25,7 +25,7 @@ services:
       context: ./whisper-cpu
       dockerfile: Dockerfile
       target: service
-    image: sf-local-ai-whisper-cpu:wcpp-927cfce3-q8_0
+    image: sf-local-ai-whisper-cpu:wcpp-927cfce3-cap443-q8_0
     environment:
       WHISPER_BIND: "${WHISPER_BIND:?WHISPER_BIND must be set; scripts/whisper-cpu.sh derives it on the worker}"
       WHISPER_PORT: "${WHISPER_CPU_PORT:-30008}"

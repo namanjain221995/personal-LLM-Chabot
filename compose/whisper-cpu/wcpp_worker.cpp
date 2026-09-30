@@ -28,7 +28,10 @@
 //   * sequential long form: whisper.cpp slides its 30 s window by the model's own timestamps, as
 //     the transformers pipeline does when `chunk_length_s` is not passed;
 //   * NO per-window silence skipping (no_speech_thold 2.0 can never be met), because the
-//     transformers pipeline does not skip windows either.
+//     transformers pipeline does not skip windows either;
+//   * up to 443 new tokens per window (the model's 448-token context minus the prompt), as the
+//     transformers pipeline allows. Upstream whisper.cpp stops at 220 and then decodes the rest of
+//     the window again, which repeated text in dense Hindi. The Dockerfile patches that one line.
 //
 // THE SILENCE GATE AND THE LANGUAGE ARE MEASURED THE WAY THE GPU REPLICA MEASURES THEM, and not
 // the way whisper.cpp does. server.py's `_no_speech_probability` runs the model on the first 30 s

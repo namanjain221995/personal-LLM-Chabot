@@ -149,6 +149,20 @@ def test_the_gpu_replicas_decode_settings_are_the_ones_the_cpu_replica_mirrors()
     )
 
 
+def test_the_image_lifts_whisper_cpps_220_token_window_cap():
+    """Upstream whisper.cpp stops a window at n_text_ctx/2 - 4 = 220 new tokens and then decodes the
+    rest of the window again: 5 of 200 FLEURS Hindi clips (17-24 s) came back with a phrase
+    repeated. The GPU replica's pipeline allows the model's whole context. The Dockerfile patches
+    the one line and fails the build when the patch does not apply; this keeps both steps."""
+    dockerfile = (CPU_SERVER.parent / "Dockerfile").read_text(encoding="utf-8")
+    assert "sed -i 's|n_max = whisper_n_text_ctx(ctx)/2 - 4;|n_max = whisper_n_text_ctx(ctx) - (int) prompt.size() - 1;|'" in dockerfile
+    assert "test \"$(grep -c 'n_max = whisper_n_text_ctx(ctx)/2 - 4;' \"$f\")\" = 1" in dockerfile
+    assert "test \"$(grep -c 'n_max = whisper_n_text_ctx(ctx) - (int) prompt.size() - 1;' \"$f\")\" = 1" in dockerfile
+    # The patch sits in the stage that compiles wcpp-worker, before the compile.
+    build_stage = dockerfile.split("FROM python:3.12-slim AS convert", 1)[0]
+    assert build_stage.index("sed -i 's|n_max") < build_stage.index("cmake --build")
+
+
 # -- the live half -------------------------------------------------------------------------------
 
 FAKE_WORKER = textwrap.dedent(

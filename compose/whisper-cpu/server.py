@@ -28,7 +28,8 @@ noise, and q8_0 was the fastest variant on these cores. `MODEL_SHA256` pins the 
 
 THE DECODE SETTINGS ARE THE GPU REPLICAS', ONE BY ONE, and they are set in wcpp_worker.cpp next to
 the reason for each: greedy, no temperature fallback, no conditioning on previous text, transcribe
-never translate, timestamps only for segments or clips of 30 s and more, sequential long form.
+never translate, timestamps only for segments or clips of 30 s and more, sequential long form, and
+up to 443 new tokens per window (the image patches whisper.cpp's 220-token cap; see its Dockerfile).
 
 WHY A SEPARATE DECODER PROCESS. whisper.cpp is a C++ library. The decoder runs in `wcpp-worker`,
 one long-lived child process that holds the model; this file keeps the HTTP half identical to the

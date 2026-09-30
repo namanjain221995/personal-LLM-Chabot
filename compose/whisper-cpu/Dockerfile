@@ -22,8 +22,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# ONE CHANGE TO WHISPER.CPP: THE PER-WINDOW TOKEN CAP. Upstream stops a 30 s window after
+# n_text_ctx/2 - 4 = 220 new tokens, because it keeps half the context for past text. We never pass
+# past text (no_context), and the GPU replica's transformers pipeline allows the model's whole
+# 448-token context minus the prompt. Dense Hindi reaches 220 tokens: 5 of 200 FLEURS-hi clips
+# (17-24 s) hit it. whisper.cpp then cut the window mid-character and decoded the tail again as a
+# second window, so text was repeated (+2 to +19 word errors against the GPU's answer). That was
+# more than the whole measured Hindi gap to the GPU (docs/voice/CPU-REPLICA.md). With the cap at
+# n_text_ctx - prompt - 1 (443), those clips decode in one window, as on the GPU, and four of the
+# five score exactly the GPU's errors. The build fails if the line is not found exactly once, so a
+# whisper.cpp bump cannot drop the change unnoticed.
 RUN git clone https://github.com/ggml-org/whisper.cpp /src/whisper.cpp \
-    && git -C /src/whisper.cpp checkout --detach "${WHISPER_CPP_COMMIT}"
+    && git -C /src/whisper.cpp checkout --detach "${WHISPER_CPP_COMMIT}" \
+    && f=/src/whisper.cpp/src/whisper.cpp \
+    && test "$(grep -c 'n_max = whisper_n_text_ctx(ctx)/2 - 4;' "$f")" = 1 \
+    && sed -i 's|n_max = whisper_n_text_ctx(ctx)/2 - 4;|n_max = whisper_n_text_ctx(ctx) - (int) prompt.size() - 1;|' "$f" \
+    && test "$(grep -c 'n_max = whisper_n_text_ctx(ctx) - (int) prompt.size() - 1;' "$f")" = 1
 
 COPY CMakeLists.txt wcpp_worker.cpp /src/worker/
 
