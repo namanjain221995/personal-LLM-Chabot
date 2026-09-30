@@ -115,6 +115,39 @@ def test_the_same_model_gate_and_limits():
         assert ast.dump(ast.Module(strip(_function(cpu, name)), [])) == ast.dump(ast.Module(strip(_function(gpu, name)), [])), name
 
 
+def test_the_gpu_replicas_decode_settings_are_the_ones_the_cpu_replica_mirrors():
+    """A TRIPWIRE, deliberately. wcpp_worker.cpp reproduces the transformers pipeline's defaults one
+    by one (greedy, no fallback, no previous-text conditioning, transcribe, timestamps only for
+    segments or >= 30 s, sequential long form). If compose/whisper/server.py starts passing
+    anything else to the pipeline (a language hint, beam search, a prompt, chunk_length_s), the two
+    replicas no longer transcribe alike: make the same change in wcpp_worker.cpp, re-measure both
+    on the paired sets (docs/voice/CPU-REPLICA.md), then update the sets below."""
+    run = _function(_tree(GPU_SERVER), "_run")
+    generate = set()
+    pipeline_kwargs = set()
+    for node in ast.walk(run):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id == "generate_kwargs" and isinstance(node.value, ast.Dict):
+                    generate |= {k.value for k in node.value.keys}
+                if isinstance(target, ast.Name) and target.id == "kwargs" and isinstance(node.value, ast.Dict):
+                    pipeline_kwargs |= {k.value for k in node.value.keys}
+                if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                    if target.value.id == "generate_kwargs":
+                        generate.add(target.slice.value)
+                    elif target.value.id == "kwargs":
+                        pipeline_kwargs.add(target.slice.value)
+    assert generate == {"task", "language"}, "the GPU replica's generate_kwargs changed: mirror it in wcpp_worker.cpp"
+    assert pipeline_kwargs == {"return_language", "generate_kwargs", "return_timestamps"}, (
+        "the GPU replica's pipeline arguments changed: mirror them in wcpp_worker.cpp"
+    )
+    load = GPU_SERVER.read_text(encoding="utf-8")
+    assert "chunk_length_s=" not in load.split("def _load", 1)[1].split("def _decode", 1)[0], (
+        "the GPU replica switched to chunked long form; wcpp_worker.cpp decodes sequentially"
+    )
+
+
 # -- the live half -------------------------------------------------------------------------------
 
 FAKE_WORKER = textwrap.dedent(
