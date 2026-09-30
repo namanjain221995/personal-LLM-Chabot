@@ -572,6 +572,17 @@ describe('the server’s capacity, in words', () => {
     );
   });
 
+  it('a continuation waiting for its earlier part from the voice archive says so, and that nothing is lost', () => {
+    // The server's `waiting_on: "archive"` (orchestrator/app/dictation.py
+    // _Live._bring_back): the recording this one continues moved to the
+    // archive server, which is not answering; the session waits for it.
+    const state = parseSessionState({ session_id: 'a'.repeat(32), status: 'recording', waiting_on: 'archive' });
+    expect(state?.waitingOn).toBe('archive');
+    expect(VOICE_MESSAGES.behind('2:00', 'archive')).toBe(
+      'Transcript 2:00 behind — the earlier part of this recording is on the archive server, which isn’t answering right now; nothing is lost',
+    );
+  });
+
   it('a full quota mid-recording keeps the rest on this device and points at the Recordings page', async () => {
     const server = new EdgeServer();
     const h = harness(server);

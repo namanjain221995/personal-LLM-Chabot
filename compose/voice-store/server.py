@@ -99,6 +99,12 @@ MIB = 1024 ** 2
 #: Written to disk in batches of this, off the event loop.
 WRITE_BATCH = 1 * MIB
 
+#: uvicorn closes a kept-alive connection idle this long. The orchestrator's
+#: pooled client gives an idle connection up well before this
+#: (voice_archive._KEEPALIVE_EXPIRY_S; a test compares the two), so it never
+#: reuses one the store is closing at that moment.
+KEEP_ALIVE_TIMEOUT_S = 5
+
 #: The label values /metrics may carry; anything else is "other".
 OPS = ("put", "get", "head", "delete", "inventory")
 CODES = ("200", "201", "204", "206", "400", "401", "404", "408", "409", "411", "413", "416", "422", "500", "503", "507")
@@ -942,7 +948,7 @@ def main() -> None:
         log_level="warning",
         server_header=False,
         proxy_headers=False,
-        timeout_keep_alive=5,
+        timeout_keep_alive=KEEP_ALIVE_TIMEOUT_S,
         limit_concurrency=32,
     )
 

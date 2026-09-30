@@ -687,7 +687,7 @@ never touches Docker's chains.
 | node | guarded tcp ports | accepted from | dropped |
 |---|---|---|---|
 | head | 8000-8005, 9100, 9835, 9838 | lo; docker0 and br-* from 172.16.0.0/12; enp1s0f1np1 from 10.100.184.0/24; enP2p1s0f1np1 from 10.100.185.0/24 | enP7s7, tailscale0, any other ingress (IPv4 and IPv6) |
-| worker | 9100, 9835, 9839, 30004, 30007 | lo; both rails; enP7s7 from the head 192.168.9.54 (not 9839); local Docker bridges | enP7s7 from anyone else, tailscale0, any other ingress |
+| worker | 9100, 9835, 9839, 30004, 30007, 30011 (the voice archive store, [`voice-archive.md`](../voice-archive.md)) | lo; both rails; enP7s7 from the head 192.168.9.54 (not 9839); local Docker bridges | enP7s7 from anyone else, tailscale0, any other ingress |
 
 `apply` refuses, before calling nft, if the rules would drop a consumer in its
 built-in consumer table, if an interface it names is missing, or if a peer

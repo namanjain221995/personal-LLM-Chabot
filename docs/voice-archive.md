@@ -159,7 +159,10 @@ Callers:
   ones, because a release whose UPDATE began before the continuation's row was
   committed can still unlink the file after the decoder read the row. If the
   store is down the session waits (`waiting_on: "archive"`, retried every
-  30 s, up to `VOICE_ARCHIVE_RESTORE_WAIT_S`) instead of failing.
+  30 s, up to `VOICE_ARCHIVE_RESTORE_WAIT_S`) instead of failing. The
+  recording bar says why: "Transcript 2:00 behind — the earlier part of this
+  recording is on the archive server, which isn't answering right now;
+  nothing is lost" (`frontend/lib/voice.ts`, `VOICE_MESSAGES.behind`).
 
 ## Deletes and retention
 
@@ -237,7 +240,15 @@ a wildcard, and never a `10.100.x` rail address.
   then the bearer token and whole recordings cross the office LAN in the
   clear. TLS cost nothing measurable (below).
 - **The client never uses a proxy** (`trust_env=False`) and never follows
-  redirects.
+  redirects. It drops an idle pooled connection after 2 s
+  (`_KEEPALIVE_EXPIRY_S`), well before the store closes one after 5 s
+  (`KEEP_ALIVE_TIMEOUT_S`); a test compares the two. With httpx's default
+  of 5 s the two were equal, and a request that reused a connection the
+  store was closing at that moment failed with nothing wrong (503
+  `archive_unavailable` to someone seeking in a moved recording). Measured
+  against the candidate store over the LAN, with idle gaps within 1.5 ms of
+  5 s: 32 of 240 requests failed (`RemoteProtocolError`) at the 5 s expiry,
+  0 of 240 at 2 s.
 - **Packet filter:** port 30011 is judged by the host guard and admitted from
   the head's management address only. `voice-store.sh up` refuses to start
   the production store until the worker's LIVE ruleset
@@ -277,21 +288,55 @@ With 64 KiB steps, a 2 h recording (230 MB) was copied and read back in
 against 0.275 idle. A second run of the whole candidate, taken while three
 full test-suite shards loaded the head, measured 0.455 ms (max 2.02) for the
 same copy and 0.396 ms (max 2.19) for the 356 MB pass. Uncapped, ping
-averaged 0.968 ms. The cap allows at most 1.81 TB a day.
+averaged 0.968 ms. The cap allows at most 1.81 TB a day. The third run
+(below) measured 0.359 ms (max 2.08) for the 2 h copy and 0.299 ms (max 1.88)
+for the 356 MB pass.
 
 **The candidate orchestrator against the real worker, over pinned TLS.**
-There were two runs. The second used the final code, with the store brought
-up and removed by `scripts/voice-store.sh up|verify|down --candidate`.
+There were three runs, each with the store brought up and removed by
+`scripts/voice-store.sh up|verify|down --candidate`. The third ran the final
+code rebased onto main `30cee881`, while `nvidia/Qwen3.8-27B-NVFP4` served
+chat.
 
-| Check | Result |
+| Check | Result (runs 1 / 2 / 3) |
 |---|---|
-| 30 s speech, 5 min, 1 h and 2 h recordings | archived in one pass (34.5 / 34.7 s), sha256 equal on both sides |
+| 30 s speech, 5 min, 1 h and 2 h recordings | archived in one pass (34.5 / 34.7 / 34.6 s), sha256 equal on both sides |
 | Head folders after the move | 2.4–38 KB each (metadata only) |
-| A 64 KiB Range 200 MB into the 2 h recording, through the proxy | 19.7 / 33.7 ms, the right bytes |
-| Full 5 min download through the proxy | 0.10 / 0.11 s |
-| Retranscribing an archived recording | accepted in 57 / 181 ms (restore included), transcribed, left `copied` |
+| A 64 KiB Range 200 MB into the 2 h recording, through the proxy | 19.7 / 33.7 / 81.7 ms, the right bytes |
+| Full 5 min download through the proxy | 0.10 / 0.11 / 0.13 s |
+| Retranscribing an archived recording | accepted in 57 / 181 / 123 ms (restore included), transcribed, left `copied` |
 | Deleting one | gone on both sides |
 | `voice-store.sh verify --candidate` | 8 of 8 checks pass |
+| `recall-all` (the rollback), run 3 only, three times | three 2 h recordings (691 MB) back on the head in 6.6–7.0 s, sha256 checked, rows `local`, the store's copies deleted |
+| `python -m app.voice_archive status`, `pass`, `reconcile`, run 3 only | all answer, exit 0 |
+
+**Chat on the main model while recordings move (run 3, re-measured on
+`nvidia/Qwen3.8-27B-NVFP4` after the 2026-09-30 swap).** A single Fast
+stream (thinking off, 200 tokens, the same prompt every time) ran without a
+break for 13 minutes. Meanwhile 60 s windows alternated between nothing and
+the mover's exact traffic: a 2 h recording hashed on the head, PUT and read
+back at the 20 MiB/s cap over pinned TLS, deleted, on repeat. There were 29
+samples inside each kind of window.
+
+| Per sample | Archive traffic on | Off |
+|---|---|---|
+| Median decode rate, all samples | 18.81 tok/s | 17.96 tok/s |
+| Samples in the engine's normal mode (median time per token under 60 ms) | 22 of 29 | 16 of 29 |
+| ... median time per token | 49.3 ms | 49.2 ms |
+| ... median longest gap between two tokens | 116 ms | 119 ms |
+| ... median time to first token | 0.18 s | 0.19 s |
+| Samples in a slow mode (77–85 ms per token, 12–13 tok/s) | 7 of 29 | 13 of 29 |
+
+So the traffic had no measurable effect: the time per token in the normal
+mode differs by 0.1 ms. The slow mode came and went with other work on the
+engine, not with the archive: it was more common with the archive off. In
+those samples the worker GPU drew about 1.3 W more (36.9 W against 35.6 W)
+and the head GPU about 4.6 W less (26.1 W against 30.7 W), so rank 1 was
+slowed by other GPU work on the worker and rank 0 waited for it. Other
+tracks' speech evaluations were running on the worker at the time. Two
+earlier measurements that ran the passes back to back, without that
+interleaving, had put the slow-mode samples inside the passes by chance, and
+an idle sample right after a pass showed the same slow mode.
 
 The container ran as uid 1000 with a read-only root filesystem, cpuset
 `0-4,10-14` with 1 CPU, `oom_score_adj` 500, `cap_drop ALL` and
@@ -554,7 +599,9 @@ answers 410 for anything archived.
    - an off-box backup.
 2. **The worker is TP rank 1.** The store is pinned to the A725 cores with
    1 CPU, uses about 40 MB, writes at most 20 MiB/s and never touches RoCE.
-   Nothing about it can restart vLLM.
+   Nothing about it can restart vLLM, and chat measured the same with the
+   archive's traffic on and off (49.3 against 49.2 ms per token on the 27B,
+   "Measured" above).
 3. **The LAN is shared** with the whisper hop and the tunnel's egress. At the
    cap, average ping rises by 0.05–0.2 ms (0.32–0.46 ms against 0.275 idle).
 4. **The guard comes first.** Without it, 30011 would be reachable from the

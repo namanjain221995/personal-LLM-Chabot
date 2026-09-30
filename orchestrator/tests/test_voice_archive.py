@@ -218,6 +218,39 @@ def test_the_store_accepts_exactly_the_extensions_dictation_stores():
     assert store_extensions == set(dictation._EXTENSIONS.values())
 
 
+def test_the_pooled_client_gives_up_an_idle_connection_before_the_store_closes_it(monkeypatch):
+    """A kept-alive connection that the store closes just as the client reuses
+    it fails a request with nothing wrong: a person seeking in a moved
+    recording is told the archive "isn't answering" (503). httpx keeps an idle
+    connection 5 s by default and uvicorn closes one after timeout_keep_alive,
+    which the store set to 5 s too: equal, the worst case. The client must let
+    an idle connection go well before the store does."""
+    tree = ast.parse((REPO / "compose" / "voice-store" / "server.py").read_text(encoding="utf-8"))
+    run_call = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "run"
+        and getattr(node.func.value, "id", None) == "uvicorn"
+    )
+    keep_alive = {k.arg: k.value for k in run_call.keywords}["timeout_keep_alive"]
+    assert isinstance(keep_alive, ast.Name) and keep_alive.id == "KEEP_ALIVE_TIMEOUT_S", (
+        "the store's keep-alive is the constant this test compares with"
+    )
+
+    monkeypatch.setattr(settings, "voice_archive_url", f"http://{STORE_HOST}:30011")
+    monkeypatch.setattr(settings, "voice_archive_token", TOKEN)
+    monkeypatch.setattr(settings, "voice_archive_tls_cert_b64", "")
+
+    async def pooled_expiry() -> Optional[float]:
+        client = await voice_archive._client()
+        try:
+            return client._transport._pool._keepalive_expiry
+        finally:
+            await voice_archive.close_client()
+
+    expiry = asyncio.run(pooled_expiry())
+    assert expiry is not None and expiry <= STORE.KEEP_ALIVE_TIMEOUT_S / 2, (expiry, STORE.KEEP_ALIVE_TIMEOUT_S)
+
+
 def test_every_archive_metric_label_is_a_closed_set_the_module_agrees_with():
     closed = metrics._LABELS_BY_METRIC
     assert closed["voice_archive_errors_total"]["reason"] == set(voice_archive.ERROR_REASONS)

@@ -128,6 +128,12 @@ MISSING_DETAIL = "This recording's audio could not be found on the archive serve
 #: hop away, and a dead one must answer 503 to a person promptly.
 _CONNECT_TIMEOUT_S = 2.0
 _READ_TIMEOUT_S = 30.0
+#: An idle pooled connection is dropped after this, well before the store
+#: closes it (compose/voice-store/server.py KEEP_ALIVE_TIMEOUT_S, 5 s). With
+#: httpx's default of 5 s the two were equal, and a request reusing a
+#: connection the store was closing at that moment failed with nothing
+#: wrong: 503 archive_unavailable to someone seeking in a moved recording.
+_KEEPALIVE_EXPIRY_S = 2.0
 _DELETE_TIMEOUT_S = 2.0
 _HEALTH_TIMEOUT_S = 5.0
 #: Download and hashing chunks; the proxy streams 64 KiB pieces.
@@ -260,7 +266,9 @@ async def _client() -> httpx.AsyncClient:
                 lambda: factory(
                     verify=verify,
                     timeout=httpx.Timeout(_READ_TIMEOUT_S, connect=_CONNECT_TIMEOUT_S),
-                    limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+                    limits=httpx.Limits(
+                        max_connections=8, max_keepalive_connections=4, keepalive_expiry=_KEEPALIVE_EXPIRY_S,
+                    ),
                     follow_redirects=False,
                     # The store is a LAN address: an HTTP(S)_PROXY in the
                     # environment must never carry recordings elsewhere.
