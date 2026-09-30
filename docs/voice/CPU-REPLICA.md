@@ -48,6 +48,23 @@ worker's fast cores, GPU replicas preferred, the same accuracy measured before i
   overflow capacity, so the kernel kills it before the replica that serves speech normally. OCR goes
   first because it frees about 15 GiB of the unified memory a UVM-driven OOM is short of; this copy
   frees about 2.3 GiB of host memory.
+- **A 4 GiB memory ceiling with no swap** (`mem_limit`, `memswap_limit`). This is the only hard
+  memory limit in the project, recorded as a decided exception in
+  `launcher/tests/test_oom_score_adj.py`. The rule against limits exists because GB10 engine
+  memory is not charged to the cgroup. None of that applies here: no GPU code runs, so all of this
+  service's memory is host RSS. The measured peak is 2.0 GiB (2.002 GiB in the container with a
+  4 GiB limit).
+
+  Without the limit, a leak would reach the global OOM killer. That killer takes the OCR engine
+  (900) before this replica (850). With the limit, only this copy is killed, and the router falls
+  back to the GPU replicas. The model is never swapped out either, because a swapped model would
+  decode slower than the router's estimate.
+- **A hung decode is killed.** A decode that runs past `60 s + 2.5 × seconds of audio` is killed.
+  That bound is five to seven times the slowest clip measured. The request gets a 503, the next
+  clip starts a fresh decoder (about 9 s to load), and three deaths in a row end the process so
+  that Docker restarts it. This is the GPU replica's CUDA-death rule. Without the kill, a native
+  hang would hold the one-clip lock for good while `/health` kept saying ready. Verified in the
+  built image with a 1 s bound: 503, 503, 503, then exit 3.
 
 ## The same model, the same decode, the same contract
 
@@ -220,6 +237,38 @@ replicas are busy. A quiet-GPU re-measurement before enabling is on the checklis
 6. **Pool sizes.** The legacy dictation pool gains exactly the CPU replica's one slot. The
    recording-session gate (`VOICE_SESSION_ASR_CONCURRENCY`) and the video pool
    (`VIDEO_ASR_CONCURRENCY`) are unchanged, and `/v1` still routes over `ASR_BASE_URLS` only.
+
+### When "every GPU replica is busy" actually happens
+
+"Busy" means that the replica has a clip in flight that this orchestrator started. That includes
+dictation, recording-session windows, video windows and `/v1` public clips (`counted_in_dictation_routing`
+counts those too). Other tenants that call the raw port directly are not counted.
+
+**Recording sessions alone never make both GPU replicas busy.** `VOICE_SESSION_ASR_CONCURRENCY`
+defaults to 1: one session window decodes at a time across the whole fleet, and the others wait in
+the session gate. This is the owner's trade, which caps the chat cost of dictation at the one-node
+figure. So while only people dictating are using speech, one GPU replica is always free, and the
+CPU replica is never reached. It is reached when:
+
+- a **video analysis** holds both GPU replicas (`VIDEO_ASR_CONCURRENCY=2`, 90 s windows), and a
+  dictation window, a legacy clip or a public clip arrives;
+- **public `/v1` audio or the legacy dictation path** fills the second GPU replica while a session
+  window holds the first;
+- **a GPU replica is standing down or fails a call** (a node rebooting, a CUDA death).
+
+**What that buys.** A 30 s window behind a 90 s video window waits up to about 15 s on a GPU
+replica and then decodes in 2-3 s. On the CPU it takes about 13-15 s. So for a long window the
+latency is roughly a tie. The gains are elsewhere:
+- a short window (5-10 s) is back in about 5-9 s instead of waiting;
+- a second or third queued clip does not wait behind the first;
+- the GPU replicas do no extra work, so the chat cost stays where the video already put it;
+- dictation keeps working when a GPU replica is down.
+
+**Owner decision (not built): a CPU lane for recording sessions.** The session gate could admit a
+second window only onto the CPU replica. That window would be pinned to the CPU tier, so the free
+GPU is not used and the chat cost stays at the one-node figure. Recording bursts from several
+people would then use the CPU even when no video is running. This changes the gate's
+one-at-a-time rule, which is a product trade, so it is not in this branch.
 
 **Metrics**:
 - `asr_route_total{tier="gpu"|"cpu"}`: clips sent to each tier.

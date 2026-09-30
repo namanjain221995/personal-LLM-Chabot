@@ -77,8 +77,8 @@ int main(int argc, char ** argv) {
         emit({{"ready", false}, {"error", "usage: wcpp-worker --model <ggml file> [--threads N]"}});
         return 1;
     }
-    // stdout carries the protocol; whisper.cpp logs to stderr, which server.py forwards to the
-    // container log at startup and otherwise discards.
+    // stdout carries the protocol. stderr is the container log (server.py passes it through), and
+    // WCPP_QUIET keeps whisper.cpp's routine log lines out of it: what lands there is a failure.
     if (std::getenv("WCPP_QUIET")) { whisper_log_set(silence_logs, nullptr); }
 
     const auto t_load = std::chrono::steady_clock::now();

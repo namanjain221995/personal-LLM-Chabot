@@ -19,6 +19,7 @@ import shutil
 import stat
 import sys
 import textwrap
+import time
 import wave
 from pathlib import Path
 
@@ -154,8 +155,9 @@ FAKE_WORKER = textwrap.dedent(
     """\
     #!/usr/bin/env python3
     # wcpp-worker's protocol, with canned answers: silence scores 0.71 (the measured digital-silence
-    # number), anything else is "hello world" in English; n_samples == 12345 makes it die.
-    import json, struct, sys
+    # number), anything else is "hello world" in English; n_samples == 12345 makes it die and
+    # n_samples == 23456 makes it hang.
+    import json, struct, sys, time
     print(json.dumps({"ready": True, "load_ms": 1.0, "system_info": "fake"}), flush=True)
     for line in sys.stdin.buffer:
         head = json.loads(line)
@@ -163,6 +165,8 @@ FAKE_WORKER = textwrap.dedent(
         raw = sys.stdin.buffer.read(n * 4)
         if n == 12345:
             sys.exit(9)
+        if n == 23456:
+            time.sleep(120)
         samples = struct.unpack("<%df" % n, raw)
         silent = max(abs(x) for x in samples) == 0.0
         nsp = 0.71 if silent else 0.01
@@ -315,6 +319,29 @@ def test_a_dead_decoder_is_a_503_and_the_next_clip_restarts_it(server):
     r = _post(client, dying)
     assert r.status_code == 503
     assert _post(client, _wav(1.0)).json()["text"] == "hello world"
+    assert client.get("/health").json()["worker_failures"] == 0
+
+
+def test_a_hung_decoder_is_killed_at_its_bound_and_the_next_clip_gets_a_fresh_one(server):
+    module, client = server
+    module.HANG_FIXED_S = 1.0
+    module.HANG_S_PER_AUDIO_S = 0.0
+    started = time.monotonic()
+    r = _post(client, _wav(0, samples=23456))  # the fake worker sleeps on exactly this many samples
+    assert r.status_code == 503 and "longer than 1s" in r.json()["detail"]
+    assert time.monotonic() - started < 30, "the watchdog did not end the hung decode"
+    health = client.get("/health").json()
+    assert health["busy"] is False and health["worker_failures"] == 1
+    assert _post(client, _wav(1.0)).json()["text"] == "hello world"
+    assert client.get("/health").json()["worker_failures"] == 0
+
+
+def test_the_watchdog_leaves_a_decode_inside_its_bound_alone(server):
+    module, client = server
+    module.HANG_FIXED_S = 30.0
+    module.HANG_S_PER_AUDIO_S = 0.0
+    for _ in range(3):
+        assert _post(client, _wav(1.0)).json()["text"] == "hello world"
     assert client.get("/health").json()["worker_failures"] == 0
 
 

@@ -546,6 +546,16 @@ class TheRunbookRecommendsWhatTheTestsPinTests(unittest.TestCase):
 #: at the limit, whatever the host has free) or switch the killer off for it.
 HARD_MEMORY_KEYS = ("mem_limit", "memswap_limit", "oom_kill_disable")
 
+#: The limits decided on purpose, each with its measured basis. Everything else stays unlimited.
+#: compose.whisper-cpu.yaml (2026-09-30): the CPU speech replica runs no GPU code, so ALL of its
+#: memory is host RSS that the cgroup does charge. Measured peak 2.0 GiB (2.002 GiB in the built
+#: image under this very limit); 4g is twice that. Without a limit a leak there would reach the
+#: global OOM killer, which takes the OCR engine (900) BEFORE this replica (850). With it, the
+#: overflow replica alone is killed and the router falls back to the GPU replicas.
+DECIDED_MEMORY_LIMITS = {
+    "compose.whisper-cpu.yaml": {"mem_limit: 4g", "memswap_limit: 4g"},
+}
+
 
 class NoServiceGainsAHardMemoryLimitTests(unittest.TestCase):
     def test_no_compose_file_gives_any_service_a_hard_memory_limit(self) -> None:
@@ -567,6 +577,8 @@ class NoServiceGainsAHardMemoryLimitTests(unittest.TestCase):
                 if key is None:
                     continue
                 if key.group(1) in HARD_MEMORY_KEYS:
+                    if line.strip() in DECIDED_MEMORY_LIMITS.get(path.name, set()):
+                        continue
                     offenders.append(f"{path.name}:{number}: {line.strip()}")
                 elif key.group(1) == "memory":
                     # deploy.resources.limits.memory is the v3 spelling of mem_limit;

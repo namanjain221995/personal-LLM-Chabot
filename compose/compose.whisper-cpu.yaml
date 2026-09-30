@@ -42,6 +42,16 @@ services:
     # inside the set as well.
     cpuset: "5-9,15-19"
     cpus: 8
+    # A MEMORY CEILING, AND NO SWAP: the one service with a hard limit, decided on purpose
+    # (launcher/tests/test_oom_score_adj.py DECIDED_MEMORY_LIMITS). No GPU code runs here, so all
+    # of its memory is host RSS the cgroup charges. Measured peak 2.0 GiB (the q8_0 model, the
+    # decoder state and a 600 s clip); the ceiling is twice that. Without it, a leak would reach
+    # the global OOM killer, which takes the OCR engine (900) BEFORE this replica (850), and would
+    # press on the unified memory the chat model's rank 1 uses. With it, only this overflow copy
+    # is killed and the router falls back to the GPU replicas. No swap, because a swapped-out model
+    # decodes slower than the router's estimate.
+    mem_limit: 4g
+    memswap_limit: 4g
     # ONE READ-ONLY FILE IN, NOTHING WRITTEN. The model is the q8_0 file scripts/whisper-cpu.sh
     # converted from the pinned Hugging Face revision (server.py checks its SHA-256 at start).
     read_only: true

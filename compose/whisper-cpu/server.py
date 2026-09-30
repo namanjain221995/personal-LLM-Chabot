@@ -104,6 +104,15 @@ _cpu_lock = asyncio.Lock()
 #: replica's CUDA_DEATH_THRESHOLD, for a native decoder that keeps dying).
 WORKER_DEATH_THRESHOLD = int(os.environ.get("WHISPER_CPU_WORKER_DEATH_THRESHOLD", "3"))
 
+#: A DECODE THAT RUNS PAST HANG_FIXED_S + seconds x HANG_S_PER_AUDIO_S IS HUNG, NOT SLOW. The
+#: slowest clips measured fitted under 8.5 s + 0.45 s per second of audio (docs/voice/CPU-REPLICA.md),
+#: so this bound is five to seven times that. The decoder process is killed, the request is a 503
+#: like any other decoder death, and the next clip starts a fresh one. Without it a native hang
+#: would hold `_cpu_lock` for good while /health went on saying ready, and every later clip the
+#: orchestrator sent here would wait out its whole timeout behind it.
+HANG_FIXED_S = float(os.environ.get("WHISPER_CPU_HANG_FIXED_S", "60"))
+HANG_S_PER_AUDIO_S = float(os.environ.get("WHISPER_CPU_HANG_S_PER_AUDIO_S", "2.5"))
+
 _state: dict = {
     "ready": False,
     "worker": None,
@@ -134,7 +143,9 @@ def _start_worker() -> None:
         [WORKER_BIN, "--model", MODEL_FILE, "--threads", str(THREADS)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        # Inherited: the container log. WCPP_QUIET silences whisper.cpp's routine log lines, so
+        # what reaches it from here is a native failure (a ggml abort names its cause there).
+        stderr=None,
         env={**os.environ, "WCPP_QUIET": "1", "OMP_NUM_THREADS": str(THREADS)},
     )
     assert proc.stdout is not None
@@ -203,6 +214,16 @@ def _ask_worker(audio: np.ndarray, language: Optional[str], *, timestamps: bool,
             "gate": bool(gate),
             "threshold": NO_SPEECH_THRESHOLD,
         }
+        budget = HANG_FIXED_S + HANG_S_PER_AUDIO_S * (audio.size / SAMPLE_RATE)
+        hung = threading.Event()
+
+        def _kill_hung() -> None:
+            hung.set()
+            proc.kill()
+
+        watchdog = threading.Timer(budget, _kill_hung)
+        watchdog.daemon = True
+        watchdog.start()
         try:
             proc.stdin.write((json.dumps(header) + "\n").encode())
             proc.stdin.write(np.ascontiguousarray(audio, dtype="<f4").tobytes())
@@ -211,10 +232,16 @@ def _ask_worker(audio: np.ndarray, language: Optional[str], *, timestamps: bool,
         except (BrokenPipeError, OSError) as exc:
             proc.kill()
             _state["worker"] = None
+            if hung.is_set():
+                raise WorkerDied(f"decoder took longer than {budget:.0f}s and was killed") from None
             raise WorkerDied(f"decoder pipe failed: {exc}") from None
+        finally:
+            watchdog.cancel()
         if not line:
             proc.kill()
             _state["worker"] = None
+            if hung.is_set():
+                raise WorkerDied(f"decoder took longer than {budget:.0f}s and was killed")
             raise WorkerDied(f"decoder exited (status {proc.poll()})")
         try:
             return json.loads(line)
