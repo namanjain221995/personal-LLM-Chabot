@@ -345,11 +345,13 @@ class Settings:
         # How long the CPU replica takes for a clip when it is free, as
         # ASR_CPU_FIXED_S + seconds x ASR_CPU_S_PER_AUDIO_S. Measured
         # 2026-09-30 on the worker with the replica's own decoder, 8 threads
-        # on the X925 cores, while other tenants shared them, 257 clips from
+        # on the X925 cores, while other tenants shared them, 413 clips from
         # 2 s to 5 min (docs/voice/CPU-REPLICA.md). 0.45 s/s is the slowest
-        # long-form rate measured (Hindi-English lectures, 0.41-0.46; English
-        # long form ran 0.19-0.25), and 8.5 s puts every measured clip under
-        # the line at that rate: the fixed part is the no-speech / language
+        # long-form rate measured (Hindi-English lectures, 0.41-0.46 before
+        # the 443-token window patch, 0.28 after; English long form ran
+        # 0.17-0.25). 406 of the 413 clips are under the line and 412 under
+        # the line x ASR_CPU_DEADLINE_MARGIN; the exception was a 9 s clip
+        # slowed 3x by other load. The fixed part is the no-speech / language
         # pre-pass plus one 30 s encoder window, ~1.9 s each.
         self.asr_cpu_fixed_s: float = max(0.0, _float("ASR_CPU_FIXED_S", 8.5))
         self.asr_cpu_s_per_audio_s: float = max(0.01, _float("ASR_CPU_S_PER_AUDIO_S", 0.45))

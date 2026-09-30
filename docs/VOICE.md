@@ -215,11 +215,15 @@ orchestrator sends it a clip only when every GPU replica is already decoding
 one, and only if the clip can finish inside its deadline at the CPU's measured
 speed (`ASR_CPU_*`). Measured on the GPU baselines' own clips, utterance by
 utterance, it matches the GPU replicas within noise: LibriSpeech 3.89 % against
-4.21 %, FLEURS English 7.03 % against 6.81 %, FLEURS Hindi 44.73 % against
-41.93 %, MUCS Hindi-English 65.84 % against 65.40 %. Every 95 % interval
-contains zero. It holds 2.0 GiB and takes 0.2-0.6 s per second of audio. No
-chat slowdown was measurable within ±12 %. Everything, including how it was
-measured, is in [voice/CPU-REPLICA.md](voice/CPU-REPLICA.md).
+4.21 %, FLEURS English 7.03 % against 6.81 %, FLEURS Hindi 39.11 % against
+39.42 % (200 utterances), MUCS Hindi-English 69.99 % against 65.40 % (one
+looping clip; 64.74 against 66.01 % without it). Every 95 % interval contains
+zero. Its image lifts whisper.cpp's 220-token window limit to the pipeline's
+443, without which dense Hindi repeated its tail. It holds 2.0 GiB and takes
+0.2-1.0 s per second of audio. While it decodes, the 27B main model loses
+about 5 % of its decode speed (a GPU replica costs it about 19 %).
+Everything, including how it was measured, is in
+[voice/CPU-REPLICA.md](voice/CPU-REPLICA.md).
 
 ### Honest comparison with what this replaced
 
