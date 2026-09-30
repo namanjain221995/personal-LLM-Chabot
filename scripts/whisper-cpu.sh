@@ -233,10 +233,13 @@ ruleset_guards_port() { # ruleset_guards_port PORT < ruleset (host-guard.sh's re
 
 require_host_guard() {
   local applied boot
-  applied="$(ssh_worker "cat $GUARD_APPLIED_RULESET 2>/dev/null" </dev/null)" || applied=""
+  # A missing file or boot copy reads as empty (no guard); only ssh itself failing is a read error.
+  applied="$(ssh_worker "cat $GUARD_APPLIED_RULESET 2>/dev/null || true" </dev/null)" \
+    || die "could not read the worker's packet filter over ssh ($CLUSTER_WORKER_SSH); nothing was started"
   printf '%s\n' "$applied" | ruleset_guards_port "$WHISPER_CPU_PORT" \
     || die "the worker's packet filter does not close port $WHISPER_CPU_PORT to the office LAN and the tailnet ($GUARD_APPLIED_RULESET must list it in guarded_ports and head_lan_ports). The replica has no authentication, so it was not started. Owner, as root: $GUARD_OWNER_STEPS"
-  boot="$(ssh_worker "$GUARD_BOOT_COPY plan --role worker 2>/dev/null" </dev/null)" || boot=""
+  boot="$(ssh_worker "$GUARD_BOOT_COPY plan --role worker 2>/dev/null || true" </dev/null)" \
+    || die "could not read the worker's boot-time packet filter over ssh ($CLUSTER_WORKER_SSH); nothing was started"
   printf '%s\n' "$boot" | ruleset_guards_port "$WHISPER_CPU_PORT" \
     || die "the worker's packet filter closes port $WHISPER_CPU_PORT now, but its boot copy ($GUARD_BOOT_COPY) does not, so the next reboot would reopen it while Docker restarts the replica. It was not started. Owner, as root: $GUARD_OWNER_STEPS"
   check_pass "the worker's packet filter closes $WHISPER_CPU_PORT to the office LAN and the tailnet, now and after a reboot"

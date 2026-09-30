@@ -91,6 +91,8 @@ class TheReplicaIsNeverStartedOnAnUnguardedPortTests(unittest.TestCase):
         fake_ssh.write_text(
             "#!/usr/bin/env bash\n"
             f'printf "%s\\n" "$*" >> "{self.ssh_log}"\n'
+            # FAKE_SSH_DOWN: ssh itself fails, as it does when the worker is unreachable (255).
+            '[ -n "${FAKE_SSH_DOWN:-}" ] && exit 255\n'
             'case "$*" in\n'
             f'  *ruleset.nft*) cat "{self.applied}" 2>/dev/null ;;\n'
             f'  *"plan --role worker"*) cat "{self.boot}" 2>/dev/null ;;\n'
@@ -133,7 +135,7 @@ class TheReplicaIsNeverStartedOnAnUnguardedPortTests(unittest.TestCase):
         )
         return result.returncode == 0
 
-    def require_host_guard(self) -> subprocess.CompletedProcess[str]:
+    def require_host_guard(self, **env: str) -> subprocess.CompletedProcess[str]:
         program = "\n".join(
             [
                 "set -euo pipefail",
@@ -159,6 +161,7 @@ class TheReplicaIsNeverStartedOnAnUnguardedPortTests(unittest.TestCase):
                 "HOME": str(self.root),
                 "LC_ALL": "C",
                 "CLUSTER_WORKER_SSH": "techsphere@192.168.9.68",
+                **env,
             },
         )
 
@@ -210,6 +213,13 @@ class TheReplicaIsNeverStartedOnAnUnguardedPortTests(unittest.TestCase):
         result = self.require_host_guard()
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertIn("does not close port 30008", result.stderr)
+
+    def test_an_unreachable_worker_is_a_read_error_not_a_guard_verdict(self) -> None:
+        # Telling the owner to run sudo on the worker would be the wrong errand for a network fault.
+        result = self.require_host_guard(FAKE_SSH_DOWN="1")
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("could not read the worker's packet filter over ssh", result.stderr)
+        self.assertNotIn("does not close port", result.stderr)
 
     def test_a_worker_guarded_now_and_after_a_reboot_passes(self) -> None:
         ruleset = self.rendered_worker_guard()
