@@ -163,14 +163,12 @@ GUARD_WORKER_RAIL_B_IP="${GUARD_WORKER_RAIL_B_IP:-10.100.185.2}"
 # anyway so a future 0.0.0.0 publish on a host-network engine is still closed),
 # node_exporter 9100 (live *:9100), GPU exporter 9835, engine controller 9838.
 GUARD_HEAD_PORTS="${GUARD_HEAD_PORTS:-8000-8005, 9100, 9835, 9838}"
-# Worker: node_exporter 9100, GPU exporter 9835, sentinel 9839, OCR 30004, speech 30007,
-# live dictation 30009 (scripts/stt-stream.sh: its stream needs a bearer token, but its
-# /health and /metrics do not).
-GUARD_WORKER_PORTS="${GUARD_WORKER_PORTS:-9100, 9835, 9839, 30004, 30007, 30009}"
-# The worker ports the head reaches over the office LAN (the orchestrator's OCR,
-# ASR and live-dictation clients, Prometheus, the controller's GPU probe). The
-# sentinel is not one: the controller polls it over rail A.
-GUARD_WORKER_LAN_PORTS="${GUARD_WORKER_LAN_PORTS:-9100, 9835, 30004, 30007, 30009}"
+# Worker: node_exporter 9100, GPU exporter 9835, sentinel 9839, OCR 30004, speech 30007.
+GUARD_WORKER_PORTS="${GUARD_WORKER_PORTS:-9100, 9835, 9839, 30004, 30007}"
+# The worker ports the head reaches over the office LAN (the orchestrator's OCR
+# and ASR clients, Prometheus, the controller's GPU probe). The sentinel is not
+# one: the controller polls it over rail A.
+GUARD_WORKER_LAN_PORTS="${GUARD_WORKER_LAN_PORTS:-9100, 9835, 30004, 30007}"
 
 CLUSTER_WORKER_SSH="${CLUSTER_WORKER_SSH:-$(id -un 2>/dev/null || echo techsphere)@${GUARD_WORKER_RAIL_IP}}"
 

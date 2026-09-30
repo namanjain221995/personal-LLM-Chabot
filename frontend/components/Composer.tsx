@@ -53,7 +53,6 @@ import {
   shiftSpan,
   type DraftSpan,
 } from '@/lib/voice';
-import { swapInDraft } from '@/lib/voiceLive';
 import { ModelPicker } from './ModelPicker';
 import { QuotedContext } from './QuotedContext';
 import { useToast } from './Providers';
@@ -506,7 +505,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     }, [text]);
     const voice = useVoiceRecorder({
       maxMs: VOICE_MAX_MS,
-      onTranscript: (transcript, notice, replaces, exact) => {
+      onTranscript: (transcript, notice, replaces) => {
         // Read from the last committed draft, not a state updater: whether
         // the text could be placed has to be known now, to ask if it cannot.
         const prev = committedText.current;
@@ -514,12 +513,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         let span: DraftSpan | null;
         if (replaces) {
           // A saved recording transcribed again (Retry, Upload the rest): its
-          // first transcript is already in the draft. `exact`: the other of
-          // its two transcripts (live, full pass), swapped in only over words
-          // nobody has changed since they went in.
-          const placed = exact
-            ? swapInDraft(prev, voiceSpan.current, replaces, transcript)
-            : placeRetranscript(prev, voiceSpan.current, replaces, transcript);
+          // first transcript is already in the draft.
+          const placed = placeRetranscript(prev, voiceSpan.current, replaces, transcript);
           if (!placed) return false;
           next = placed.text;
           span = placed.span;
@@ -1338,8 +1333,6 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 progress={voice.progress}
                 hint={voice.hint}
                 warning={voice.warning}
-                language={voice.language}
-                onLanguage={voice.setLanguage}
                 onCancel={voice.cancel}
                 onStop={voice.stop}
               />

@@ -51,11 +51,6 @@ _WAIT_BUCKETS = (1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1200.0,
 #: those, not across it).
 _TTFT_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 30.0)
 
-#: Seconds, for live dictation (app/voice_live.py, 2026-09-29): words should
-#: appear a few hundred milliseconds after they are spoken and commit 0.5-1 s
-#: after a pause, and the default set has only 0.25 and 0.5 in that range.
-_STREAM_BUCKETS = (0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0)
-
 #: Per-metric bucket sets. A global change would break histogram_quantile
 #: continuity for every retrieval histogram on the default set; an entry here
 #: moves only the metric named.
@@ -80,11 +75,6 @@ _BUCKETS_BY_METRIC = {
     "orchestrator_event_loop_lag_seconds": (
         0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
     ),
-    # Live dictation latencies (2026-09-29).
-    "voice_stream_first_partial_seconds": _STREAM_BUCKETS,
-    "voice_stream_final_seconds": _STREAM_BUCKETS,
-    "voice_stream_event_lag_seconds": _STREAM_BUCKETS,
-    "voice_stream_client_e2e_seconds": _STREAM_BUCKETS,
 }
 
 
@@ -353,29 +343,6 @@ SPECULATIVE_EMBED_WASTE_REASONS = frozenset(
     {"refetch_empty", "load_failed", "cancelled"}
 )
 
-#: Live dictation (app/voice_live.py, 2026-09-29). How an ADMITTED stream
-#: ended: the person pressed Stop and the last words came back (completed),
-#: the browser closed it (client_closed) or vanished (disconnected), another
-#: connection took the recording over (superseded), it sent no audio for
-#: VOICE_LIVE_IDLE_S (idle), it was refused after the handshake (rejected: a
-#: protocol or limit broken, access withdrawn while streaming, every engine
-#: full), the engine could not be reached or went away (engine_unavailable),
-#: or this process failed (error).
-VOICE_STREAM_OUTCOMES = frozenset({
-    "completed", "client_closed", "disconnected", "superseded", "idle",
-    "rejected", "engine_unavailable", "error",
-})
-#: Why a stream was refused, at the handshake or later.
-VOICE_STREAM_REJECTION_REASONS = frozenset({
-    "origin", "signed_out", "voice_off", "unavailable", "not_found",
-    "rate_limited", "capacity", "protocol", "frame_too_large",
-})
-#: What went wrong on this side of the stream.
-VOICE_STREAM_ERROR_REASONS = frozenset({
-    "engine_unavailable", "engine_timeout", "engine_protocol", "internal",
-})
-VOICE_STREAM_EVENTS = frozenset({"partial", "final"})
-
 _ROUTE_EFFORT = {"route": set(CHAT_ROUTES), "effort": set(CHAT_EFFORTS)}
 
 #: metric -> {label name: closed value set}. Only these label NAMES survive.
@@ -426,19 +393,6 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
         "category": set(FAST_LANE_CATEGORIES),
         "veto": set(FAST_LANE_VETOES),
     },
-    # Live dictation (2026-09-29). An empty set closes a metric to NO
-    # labels at all: a session or user id passed by mistake is dropped.
-    "voice_stream_sessions_active": {},
-    "voice_stream_sessions_started_total": {},
-    "voice_stream_sessions_total": {"outcome": set(VOICE_STREAM_OUTCOMES)},
-    "voice_stream_audio_received_seconds_total": {},
-    "voice_stream_utterances_total": {},
-    "voice_stream_rejections_total": {"reason": set(VOICE_STREAM_REJECTION_REASONS)},
-    "voice_stream_errors_total": {"reason": set(VOICE_STREAM_ERROR_REASONS)},
-    "voice_stream_first_partial_seconds": {},
-    "voice_stream_final_seconds": {},
-    "voice_stream_event_lag_seconds": {"event": set(VOICE_STREAM_EVENTS)},
-    "voice_stream_client_e2e_seconds": {"event": set(VOICE_STREAM_EVENTS)},
 }
 _ALLOWED_BY_METRIC.update(_LABELS_BY_METRIC)
 
@@ -529,29 +483,6 @@ def observe_many(observations) -> None:
                 for i in range(bisect_left(buckets, seconds), len(buckets)):
                     counts[i] += 1
                 series[key] = (counts, total + float(seconds), n + 1)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def inc_by(name: str, amount: float, help_text: str = "", **labels: str) -> None:
-    """Add `amount` to a counter: seconds of audio, not one event.
-
-    The labels go through the same cleaning as `inc`, per metric, which is
-    what uploads.py's private reach into `_counters` skipped. A negative or
-    non-finite amount is ignored: a counter that goes down reads as a restart
-    to rate(), and NaN would poison the series for good. An amount of 0 makes
-    the series exist at zero, which is how a counter is registered before its
-    first event (increase() cannot see an event whose series is born at 1;
-    monitoring/developer-api/README.md)."""
-    try:
-        value = float(amount)
-        if not (value >= 0.0) or value == float("inf"):
-            return
-        _declare(name, "counter", help_text or name)
-        key = _clean(labels, name)
-        with _lock:
-            _counters.setdefault(name, {})
-            _counters[name][key] = _counters[name].get(key, 0.0) + value
     except Exception:  # noqa: BLE001
         pass
 
