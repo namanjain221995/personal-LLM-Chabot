@@ -2996,7 +2996,8 @@ _MIGRATION_V43 = """
 -- V43 (2026-09-30): THE VOICE ARCHIVE -- where a finished recording's audio
 -- lives (app/voice_archive.py). Additive and idempotent: columns with
 -- constant defaults (metadata only, PostgreSQL 11+), one CHECK, three
--- partial indexes, no backfill. Every existing row is 'local', which is true.
+-- partial indexes, one one-row table, no backfill. Every existing row is
+-- 'local', which is true.
 --
 -- WHY. /data/voice is on the head's root NVMe with the OS, /var/lib/docker
 -- and production Postgres, one copy (owner, 2026-09-30: "improve the storage
@@ -3041,10 +3042,29 @@ CREATE INDEX IF NOT EXISTS idx_voice_sessions_archive_due
 -- Copies whose head file has not been released yet.
 CREATE INDEX IF NOT EXISTS idx_voice_sessions_archive_copied
     ON voice_sessions (head_hold_until) WHERE archive_state = 'copied';
--- Deleted recordings whose copy on the store is still to be deleted.
+-- Deleted recordings whose store copy is not known to be gone. Keyed on the
+-- DELETE, not on archive_state: a verified copy can sit behind a 'local' row
+-- (deleted or retranscribed while it was copied, or a mover killed between
+-- its upload and its UPDATE), and the store's DELETE is idempotent.
 CREATE INDEX IF NOT EXISTS idx_voice_sessions_archive_purge
     ON voice_sessions (audio_deleted_at)
-    WHERE audio_deleted_at IS NOT NULL AND archive_state <> 'local' AND remote_purged_at IS NULL;
+    WHERE audio_deleted_at IS NOT NULL AND remote_purged_at IS NULL;
+
+-- WHICH DEPLOYMENT THIS IS, to the store (fix round 2026-09-30). Every object
+-- the store keeps is tagged with the owner below (X-Archive-Owner), and the
+-- store deletes or sets aside an object for its owner only. The owner lives
+-- in THIS DATABASE, made once by app/voice_archive.py (32 random hex
+-- characters), so any other orchestrator -- an e2e stack, a candidate, a
+-- developer's -- is another owner even when it is given this deployment's
+-- store URL, token and certificate: the reconcile of a database that lacks
+-- this deployment's rows can no longer touch this deployment's recordings.
+-- One row, never changed: a new owner would make every stored recording
+-- another deployment's (nothing lost, but none of them deletable).
+CREATE TABLE IF NOT EXISTS voice_archive_owner (
+    id         smallint    PRIMARY KEY CONSTRAINT voice_archive_owner_singleton CHECK (id = 1),
+    owner      text        NOT NULL CONSTRAINT voice_archive_owner_hex CHECK (owner ~ '^[0-9a-f]{32}$'),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
 """
 
 

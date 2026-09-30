@@ -400,14 +400,17 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
     "voice_archive_errors_total": {"reason": {
         "unreachable", "timeout", "tls", "auth", "storage_full", "busy", "conflict",
         "remote_sha_mismatch", "missing", "http_4xx", "http_5xx",
-        "local_missing", "local_size_mismatch", "local_sha_mismatch", "remote_missing",
+        "local_missing", "local_size_mismatch", "local_sha_mismatch", "local_unreadable", "remote_missing",
     }},
-    "voice_archive_proxy_total": {"result": {"ok", "partial", "not_satisfiable", "unavailable", "missing"}},
+    "voice_archive_proxy_total": {"result": {
+        "ok", "partial", "not_satisfiable", "bad_request", "busy", "unavailable", "missing",
+    }},
     "voice_archive_restored_total": {"result": {
         "restored", "held", "unavailable", "missing", "mismatch", "no_space", "deleted",
     }},
     "voice_archive_reconcile_total": {"result": {
-        "orphan_deleted", "deleted_row_purged", "repaired", "remote_missing", "foreign",
+        "orphan_quarantined", "orphan_waiting", "other_owner", "unowned",
+        "deleted_row_purged", "repaired", "remote_missing", "foreign",
     }},
 }
 _ALLOWED_BY_METRIC.update(_LABELS_BY_METRIC)

@@ -299,17 +299,26 @@ export async function loadTranscript(
  * server once, for one byte, and names the real cause:
  *   format               the server served audio, so this browser cannot play it
  *   archive_unavailable  503: the archive server is not answering
+ *   archive_busy         503: every connection to it is carrying a recording
  *   audio_missing        410: the archive server has no copy
  *   deleted              410/404: the audio is gone
  *   unknown              the probe itself failed
  */
-export type PlaybackProblem = 'format' | 'archive_unavailable' | 'audio_missing' | 'deleted' | 'unknown';
+export type PlaybackProblem =
+  | 'format'
+  | 'archive_unavailable'
+  | 'archive_busy'
+  | 'audio_missing'
+  | 'deleted'
+  | 'unknown';
 
 export const PLAYBACK_MESSAGES: Record<PlaybackProblem, string> = {
   format:
     "This browser can't play this recording's format. Download it and open it in another player.",
   archive_unavailable:
     "This recording is kept on the archive server, which isn't answering right now. Nothing is lost; try again in a few minutes.",
+  archive_busy:
+    'Many recordings are playing from the archive server right now. Nothing is lost; try again in a moment.',
   audio_missing:
     "This recording's audio could not be found on the archive server. Its transcript is still here.",
   deleted: "This recording's audio is no longer on the server.",
@@ -354,6 +363,7 @@ export async function diagnosePlayback(
     reason = null;
   }
   if (response.status === 503 && reason === 'archive_unavailable') return 'archive_unavailable';
+  if (response.status === 503 && reason === 'archive_busy') return 'archive_busy';
   if (response.status === 410 && reason === 'audio_missing') return 'audio_missing';
   if (response.status === 410 || response.status === 404) return 'deleted';
   return 'unknown';

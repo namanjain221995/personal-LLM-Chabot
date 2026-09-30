@@ -230,6 +230,7 @@ describe('diagnosePlayback', () => {
       [new Response(new Uint8Array([1]), { status: 206 }), 'format'],
       [new Response(new Uint8Array([1, 2, 3]), { status: 200 }), 'format'],
       [reply({ detail: 'x', reason: 'archive_unavailable', retry_after_s: 30 }, 503), 'archive_unavailable'],
+      [reply({ detail: 'x', reason: 'archive_busy', retry_after_s: 5 }, 503), 'archive_busy'],
       [reply({ detail: 'x', reason: 'audio_missing' }, 410), 'audio_missing'],
       [reply({ detail: 'x', reason: 'audio_deleted' }, 410), 'deleted'],
       [reply({ detail: 'x', reason: 'not_found' }, 404), 'deleted'],
@@ -246,9 +247,10 @@ describe('diagnosePlayback', () => {
   });
 
   it('has a sentence for every reason, and the archive one says nothing is lost', () => {
-    for (const reason of ['format', 'archive_unavailable', 'audio_missing', 'deleted', 'unknown'] as const) {
+    for (const reason of ['format', 'archive_unavailable', 'archive_busy', 'audio_missing', 'deleted', 'unknown'] as const) {
       expect(PLAYBACK_MESSAGES[reason].length).toBeGreaterThan(20);
     }
     expect(PLAYBACK_MESSAGES.archive_unavailable).toContain('Nothing is lost');
+    expect(PLAYBACK_MESSAGES.archive_busy).toContain('Nothing is lost');
   });
 });

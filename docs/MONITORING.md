@@ -931,10 +931,10 @@ rules in `rules/voice-archive.yml` are inert.
 | `voice_archive_copied_sessions`, `voice_archive_archived_sessions`, `voice_archive_archived_bytes` | — | where the audio is |
 | `voice_archive_purge_pending`, `voice_archive_remote_missing` | — | deleted recordings still on the store (a privacy lag); archived recordings the store lost |
 | `voice_archive_store_up`, `voice_archive_store_free_bytes`, `voice_archive_store_min_free_bytes`, `voice_archive_store_objects`, `voice_archive_store_bytes`, `voice_archive_store_scrub_mismatches` | — | the store's own `/health` |
-| `voice_archive_errors_total` | reason (15 closed values) | why a copy or a store call failed |
-| `voice_archive_proxy_total` | result = ok / partial / not_satisfiable / unavailable / missing | playback of archived recordings |
+| `voice_archive_errors_total` | reason (16 closed values) | why a copy or a store call failed |
+| `voice_archive_proxy_total` | result = ok / partial / not_satisfiable / bad_request / busy / unavailable / missing | playback of archived recordings |
 | `voice_archive_restored_total` | result = restored / held / unavailable / missing / mismatch / no_space / deleted | recordings brought back for a retranscription or a continuation |
-| `voice_archive_reconcile_total` | result = orphan_deleted / deleted_row_purged / repaired / remote_missing / foreign | the daily reconcile |
+| `voice_archive_reconcile_total` | result = orphan_quarantined / orphan_waiting / other_owner / unowned / deleted_row_purged / repaired / remote_missing / foreign | the daily reconcile; it never deletes a recording because a row is missing (docs/voice-archive.md, "Who owns a recording") |
 | `voice_archive_copied_total`, `voice_archive_released_total`, `voice_archive_purged_total`, `voice_archive_last_pass_timestamp_seconds`, `voice_archive_enabled` | — | the mover's progress |
 
 Rules (no mail): `VoiceArchiveStoreDown`, `VoiceArchiveBacklogOverdue`,

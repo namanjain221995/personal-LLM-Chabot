@@ -3251,8 +3251,6 @@ def retranscribe(user_id: int, session_id: str, scope: str) -> Tuple[Dict[str, A
         refusal = _storage_refusal()
         if refusal is not None:
             raise refusal
-        if not _rate_ok("retranscribe", user_id, settings.voice_retranscribe_per_hour, window_s=3600.0):
-            raise SessionError(429, "rate_limited", "This was tried again too often in the last hour.")
         from . import voice_archive
 
         if moved or voice_archive.configured():
@@ -3264,6 +3262,10 @@ def retranscribe(user_id: int, session_id: str, scope: str) -> Tuple[Dict[str, A
             row = voice_archive.ensure_local_sync(row)
             if not os.path.exists(source_path(row)):
                 raise SessionError(410, "audio_deleted", "This recording's audio has been deleted.")
+        # Counted only once the audio is here: "Try again" pressed while the
+        # archive was down changed nothing, and must not use up the hour.
+        if not _rate_ok("retranscribe", user_id, settings.voice_retranscribe_per_hour, window_s=3600.0):
+            raise SessionError(429, "rate_limited", "This was tried again too often in the last hour.")
         if row.get("outcome") == "undecodable":
             # Nothing was decoded, so nothing was planned: plan again from the audio.
             for name in ("plan.jsonl", "results.jsonl"):

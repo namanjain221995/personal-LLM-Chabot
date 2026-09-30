@@ -18,6 +18,11 @@ import server  # noqa: E402,F401
 TOKEN = "voice-store-test-token-" + "a" * 40
 OTHER_TOKEN = "voice-store-test-token-" + "b" * 40
 AUTH = {"authorization": f"Bearer {TOKEN}"}
+#: The deployment a call speaks for (X-Archive-Owner), and another one: an
+#: e2e stack or a candidate given the same URL, token and certificate.
+OWNER = "a" * 32
+OTHER_OWNER = "b" * 32
+OWNED = {**AUTH, "x-archive-owner": OWNER}
 UID = "7"
 SID = "0123456789abcdef0123456789abcdef"
 
@@ -27,7 +32,7 @@ def sha(data: bytes) -> str:
 
 
 def put_headers(data: bytes, **extra: str) -> Dict[str, str]:
-    return {**AUTH, "x-content-sha256": sha(data), "x-recording-type": "audio/webm", **extra}
+    return {**OWNED, "x-content-sha256": sha(data), "x-recording-type": "audio/webm", **extra}
 
 
 def object_url(uid: str = UID, sid: str = SID, name: str = "source.webm") -> str:

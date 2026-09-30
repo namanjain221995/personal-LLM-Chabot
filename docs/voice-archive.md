@@ -62,7 +62,8 @@ The other V43 columns:
   `audio_deleted_at` alone only says the head's copy is gone.
 
 The migration is additive and idempotent. It adds columns with constant
-defaults (a metadata-only change), one CHECK and three partial indexes, and
+defaults (a metadata-only change), one CHECK, three partial indexes and the
+one-row table `voice_archive_owner` (section "Who owns a recording"), and
 needs no backfill. Like V36, it sets `lock_timeout` to 3 s.
 
 ## One pass of the mover
@@ -72,8 +73,11 @@ is on:
 
 1. **Health.** Call the store's `/health`. If the store is down, the pass does
    nothing more.
-2. **Purge.** For deleted recordings whose copy is still on the store, send
-   `DELETE`.
+2. **Purge.** For every deleted recording whose store copy is not known to be
+   gone (`audio_deleted_at` set, `remote_purged_at` not), whatever its
+   `archive_state`, send `DELETE`. A verified copy can sit behind a `local`
+   row: deleted, or retranscribed, while it was copied, or a mover killed
+   between its upload and its UPDATE. The store's `DELETE` is idempotent.
 3. **Release.** Release `copied` recordings whose hold has passed.
 4. **Copy.** Claim up to `VOICE_ARCHIVE_BATCH` (20) due recordings, oldest
    first, with `FOR UPDATE SKIP LOCKED`, so two processes during a rolling
@@ -93,7 +97,8 @@ When a copy fails, that recording backs off: `min(3600, 60 x 2^(n-1))` s,
 plus or minus 20%, with the reason stored in `archive_error`. A failure of
 the STORE itself (unreachable, timeout, tls, auth, storage_full, busy, 5xx)
 stops the rest of the pass, so a refused token (401) is tried once per pass,
-not twenty times.
+not twenty times. A head file that cannot be read (EIO, EACCES) backs off
+that recording only (`local_unreadable`); the rest of the pass goes on.
 
 **Release** is the one step that deletes the only local copy, so three things
 guard it:
@@ -119,13 +124,22 @@ the row.
 | Situation | Answer |
 |---|---|
 | The head file exists (every `local` or `copied` recording) | `FileResponse`, as before |
-| `archived` | The store's copy streamed through (one pooled client, 64 KiB chunks). `Range` and `If-Range` are forwarded; 200/206/416 with `Content-Range`, `Content-Length` and `Accept-Ranges` are passed back. `Content-Disposition`, `Cache-Control: no-store` and `X-Recording-Complete` are unchanged. |
+| `archived` | The store's copy streamed through (one pooled client per event loop, up to 32 connections, 64 KiB chunks). `Range` and `If-Range` are forwarded; 200/206/416 with `Content-Range`, `Content-Length` and `Accept-Ranges` are passed back, and a multi-range answer keeps its `multipart/byteranges` type. A Range the store refuses (400, malformed) gets the same 400 the head gives. `Content-Disposition`, `Cache-Control: no-store` and `X-Recording-Complete` are unchanged. |
 | The store is down, answers 5xx or times out | **503 `archive_unavailable`**, `Retry-After: 30`, "This recording is kept on the archive server, which isn't answering right now. Nothing is lost; try again in a few minutes." |
+| All 32 connections are carrying recordings (waited 5 s) | **503 `archive_busy`**, `Retry-After: 5`, "Many recordings are playing from the archive server right now. Nothing is lost; try again in a moment." |
 | The store has no copy of an `archived` recording | **410 `audio_missing`**, counted, and the row flagged `remote_missing` |
 | The recording was deleted | 410 `audio_deleted`, as before |
 
 The super admin's download is audited only when audio is actually served
 (200/206).
+
+**Why 32 connections.** Every proxied playback or download holds one pooled
+connection for its whole stream, and a paused player keeps its connection
+until the browser lets it go (about 20 s in Chromium). With the first
+build's 8, the ninth listener waited out the pool (30 s) and was told the
+archive "isn't answering" while it was fine (review 2026-09-30, real
+Chromium). The store serves 64 at once (`LIMIT_CONCURRENCY` in
+`server.py`): a full pool from each of the two event loops that talk to it.
 
 One narrow race is left on purpose. If the head copy is released in the
 milliseconds between the existence check and the file being opened, that one
@@ -133,7 +147,9 @@ request fails (a 500, or a response cut short), and the next one streams from
 the store. It can happen at most once per recording, when its grace ends. A
 fix would mean serving from a file opened before the check, with Range
 handled by hand, or making every playback hold the lock a release takes,
-which would make a retranscription wait behind a long download.
+which would make a retranscription wait behind a long download. The other
+half of that window is closed: a request that read the row while it still
+said `local` re-reads it before answering 410, and streams from the store.
 
 The Recordings page (`frontend/components/recordings/RecordingItem.tsx`)
 reacts to a failed player with one `Range: bytes=0-0` request
@@ -159,9 +175,13 @@ Callers:
 
 - **Retranscribe** (`dictation.retranscribe`) calls it BEFORE its conditional
   UPDATE, and that UPDATE now also requires `archive_state IN ('local','copied')`.
-  If the store is down, it answers 503 and the row is unchanged. After the
-  retranscription the next pass releases the file again **without a second
-  upload**: the bytes never change after finish, so the sha256 is the same.
+  If the store is down, it answers 503 and the row is unchanged, and the
+  refusal does not count against the hourly retries
+  (`VOICE_RETRANSCRIBE_PER_HOUR`): they are counted once the audio is here.
+  If the head's disk fills during the download, it answers 507
+  `storage_full` and leaves nothing behind. After the retranscription the
+  next pass releases the file again **without a second upload**: the bytes
+  never change after finish, so the sha256 is the same.
 - **A continuation** (`_Live._resolve_chain`) calls it for every earlier
   recording it decodes whose audio is not `local`. That includes `copied`
   ones, because a release whose UPDATE began before the continuation's row was
@@ -177,10 +197,94 @@ Callers:
 `discard`, the admin delete and cancel keep their order: first the row is set
 to cancelled with `audio_deleted_at`, then the head folder goes. After that,
 the store is asked to delete its copy at once (2 s timeout, not waited on by
-the request). The purge step retries whatever that misses, and the reason is
-visible as `voice_archive_purge_pending`. Retention (`VOICE_RETENTION_DAYS`,
-still 0 = keep) deletes the rows, and the same purge removes the worker
+the request). The purge step retries whatever that misses, keyed on the
+delete and not on `archive_state` (a copy verified just as the person
+deleted the recording sits behind a `local` row), and the reason is visible
+as `voice_archive_purge_pending`. Retention (`VOICE_RETENTION_DAYS`, still
+0 = keep) marks the rows deleted, and the same purge removes the worker
 copies.
+
+## Who owns a recording
+
+Added in the fix round of 2026-09-30, for the review's HIGH finding. The
+store's token says who may talk to the store. It cannot say which
+deployment a recording belongs to. The first build's daily reconcile deleted
+every stored object that its OWN database had no row for, after a day. So an
+e2e stack, a candidate or a developer's orchestrator, running on its own
+database but given production's `VOICE_ARCHIVE_URL`, token and certificate,
+deleted production's only copies ten minutes after it started. That was
+measured: `{'orphan_deleted': 1}`, then 410 `audio_missing` on production's
+playback. `scripts/e2e-stack.sh` also copied `VOICE_ARCHIVE_ENABLED` from
+production, as it copies every `*_ENABLED` flag.
+
+Now:
+
+- **Every object names its owner.** Every `PUT`, `DELETE` and quarantine call
+  carries `X-Archive-Owner`: 32 hex characters kept in the deployment's
+  DATABASE, in the one-row table `voice_archive_owner` (V43), and made on
+  first use. Another database is another owner, whatever settings it was
+  given. The store records the owner in `manifest.json` and returns it in
+  the inventory.
+- **The store enforces it.** A `DELETE`, quarantine or restore from another
+  owner is `409 owner_mismatch`, and nothing changes. The same bytes `PUT`
+  by another owner are 409 too, and are never adopted. `verify` checks this
+  on the live store: another owner's `DELETE` must answer 409.
+- **Only a positive tombstone deletes.** The orchestrator deletes a store
+  copy only when one of its own rows says the recording was deleted
+  (`audio_deleted_at`), or when `recall-all` has brought the recording back
+  with its bytes checked. A missing row is never a reason. A copy whose row
+  vanished while it was being copied is kept.
+- **Orphans are set aside, never deleted by the reconcile.** One of this
+  deployment's objects that no row knows is counted (`orphan_waiting`) and,
+  once it was stored more than **14 days** ago, set aside on the store
+  (`orphan_quarantined`). It moves under `.quarantine/`, which takes it out
+  of reads, the inventory, the scan and the scrub, and it is kept whole.
+  Another deployment's objects (`other_owner`) and objects with no recorded
+  owner (`unowned`) are never set aside or deleted.
+- **Only an operator purges, and not soon.** The store refuses to purge
+  anything set aside less than `VOICE_STORE_QUARANTINE_MIN_AGE_S` (30 days)
+  ago, whoever asks, and only its owner may purge it.
+
+A true orphan has three possible causes: a users row an operator deleted by
+hand (the V42 cascade), a database restored from a backup older than the
+recording, or a COPY of this database running as a second deployment. With
+that last one, the copy shares the owner. The two-week grace lets a
+short-lived copy come and go without touching anything. After that, a
+production recording the copy set aside is still whole, and production
+flags it `remote_missing` (`VoiceArchiveCopiesMissing`) until an operator
+restores it.
+
+The operator's commands, inside the orchestrator container:
+
+```bash
+docker exec sf-local-ai-orchestrator-1 python -m app.voice_archive quarantine-list          # this deployment's; --all for every owner
+docker exec sf-local-ai-orchestrator-1 python -m app.voice_archive quarantine-restore <uid>/<sid>
+docker exec sf-local-ai-orchestrator-1 python -m app.voice_archive quarantine-purge          # set aside 30+ days ago; --older-than-days N
+```
+
+Never change or delete the `voice_archive_owner` row. A new owner would make
+every stored recording belong to "another deployment". Nothing would be
+lost, but none of them could be deleted: deletes would stay pending and
+`VoiceArchivePurgeStuck` would fire. `scripts/e2e-stack.sh` no longer
+inherits `VOICE_ARCHIVE_ENABLED` from production. A stack that should run
+the mover says so in its `E2E_EXTRA_ENV_FILE`.
+
+**A copy of production's database is the one case the owner cannot tell
+apart.** A restored backup or a clone carries production's owner row, and
+its rows say which recordings were deleted. A copy given this store's URL
+and token can therefore delete production's copy of any recording that is
+deleted IN THE COPY. The URL and token alone are enough for this, because
+every deployment with them asks the store to delete a copy when a recording
+is deleted, with or without `VOICE_ARCHIVE_ENABLED`. So, before a copy of
+production's database is pointed at this store (a disaster-recovery drill,
+say), make it a deployment of its own, in the copy:
+
+```sql
+DELETE FROM voice_archive_owner;  -- in the COPY only: a new owner is made on first use
+```
+
+Production's recordings then stay readable from the copy, but the copy can
+no longer delete or set aside any of them.
 
 **The privacy lag, stated plainly:** if the store is down when someone
 deletes a recording, the delete takes effect for them at once, but the
@@ -207,10 +311,14 @@ FastAPI and no pydantic.
 
 | Route | What it does |
 |---|---|
-| `PUT /v1/recordings/<uid>/<sid>/source.<ext>` | Requires `Content-Length` (chunked: 411) and `X-Content-SHA256`. The ids are validated (uid digits, sid 32 hex) and the extension must be one of `dictation._EXTENSIONS`, checked by a test. The body streams into `.incoming-<uuid>` (O_EXCL, 0600) and is hashed as it arrives. A length or sha mismatch is 422 and leaves nothing behind. Then the file is fsynced, **linked** into place (a link never overwrites) and the folder fsynced, and `manifest.json` is written the same way. The same bytes again: 200. Different bytes: 409, and the stored file is never replaced. At most 2 PUTs run at once (503 busy). |
+| `PUT /v1/recordings/<uid>/<sid>/source.<ext>` | Requires `Content-Length` (chunked: 411), `X-Content-SHA256` and `X-Archive-Owner` (400 `owner_required`). The ids are validated (uid digits, sid 32 hex) and the extension must be one of `dictation._EXTENSIONS`, checked by a test. The body streams into `.incoming-<uuid>` (O_EXCL, 0600) and is hashed as it arrives. A length or sha mismatch is 422 and leaves nothing behind. Then the file is fsynced, **linked** into place (a link never overwrites) and the folder fsynced, and `manifest.json` (with the owner) is written the same way. The same bytes again from the same owner: 200. Different bytes, or another owner: 409, and the stored file is never replaced. At most 2 PUTs run at once (503 busy). |
 | `GET`/`HEAD` same path | A `FileResponse` with Range, 206/416 and If-Range; the ETag is the sha256 |
-| `DELETE /v1/recordings/<uid>/<sid>` | Always 204 |
-| `GET /v1/inventory?after=&limit=` | What is stored, for the reconcile |
+| `DELETE /v1/recordings/<uid>/<sid>` | Requires `X-Archive-Owner`. 204 (also when there is nothing); 409 `owner_mismatch` for another owner's recording, which stays |
+| `POST /v1/recordings/<uid>/<sid>/quarantine` | Its owner only: moves the recording under `.quarantine/` (out of reads, the inventory and the scrub), whole |
+| `GET /v1/inventory?after=&limit=` | What is stored, each with its owner, for the reconcile |
+| `GET /v1/quarantine?after=&limit=` | What is set aside, each with its owner and `quarantined_at` |
+| `POST /v1/quarantine/<uid>/<sid>/restore` | Its owner only: puts it back (409 if a recording is stored under that name again) |
+| `DELETE /v1/quarantine/<uid>/<sid>` | Its owner only, and 409 `too_recent` until `VOICE_STORE_QUARANTINE_MIN_AGE_S` (30 days) after it was set aside |
 | `GET /health`, `GET /metrics` | No token (the host guard closes the port). `ready`, `free_bytes`, `min_free_bytes`, `reserved_bytes`, counts, scrub state |
 
 Everything under `/v1` needs `Authorization: Bearer <token>`. The comparison
@@ -397,6 +505,7 @@ The store (`compose/compose.voice-store.yaml`):
 | `VOICE_STORE_MAX_OBJECT_BYTES` | 64 GiB | 413 above it |
 | `VOICE_STORE_MAX_CONCURRENT_PUTS` | `2` | |
 | `VOICE_STORE_SCRUB_INTERVAL_S` / `_BYTES_PER_S` | 7 d / 50 MB/s | |
+| `VOICE_STORE_QUARANTINE_MIN_AGE_S` | 30 d | A recording set aside cannot be purged sooner, whoever asks |
 | `VOICE_STORE_TLS_CERT` / `_KEY` | `/tls/*.pem` | Empty = plain HTTP |
 
 ## Metrics and alerts
@@ -416,10 +525,10 @@ and no TLS configuration in Prometheus.
 | `voice_archive_remote_missing` | Archived recordings the store lost |
 | `voice_archive_store_up`, `_free_bytes`, `_min_free_bytes`, `_objects`, `_bytes`, `_scrub_mismatches` | From the store's `/health` |
 | `voice_archive_copied_total`, `_released_total`, `_purged_total` | Counters |
-| `voice_archive_errors_total{reason}` | reason is one of 15 closed values |
-| `voice_archive_proxy_total{result}` | ok, partial, not_satisfiable, unavailable, missing |
+| `voice_archive_errors_total{reason}` | reason is one of 16 closed values |
+| `voice_archive_proxy_total{result}` | ok, partial, not_satisfiable, bad_request, busy, unavailable, missing |
 | `voice_archive_restored_total{result}` | restored, held, unavailable, missing, mismatch, no_space, deleted |
-| `voice_archive_reconcile_total{result}` | orphan_deleted, deleted_row_purged, repaired, remote_missing, foreign |
+| `voice_archive_reconcile_total{result}` | orphan_quarantined, orphan_waiting, other_owner, unowned, deleted_row_purged, repaired, remote_missing, foreign |
 
 No label ever carries an id, a user or a path; `metrics.py` closes every set.
 
@@ -465,7 +574,8 @@ mount under `$HOME`.
 scripts/voice-store.sh up        # refuses (exit 2) until the guard lists 30011; then builds on the worker,
                                  # mints the token + TLS cert once, writes VOICE_ARCHIVE_URL and
                                  # VOICE_ARCHIVE_TLS_CERT_B64 to .env and VOICE_ARCHIVE_TOKEN to .runtime/secrets.env
-scripts/voice-store.sh verify    # health, PUT 201, PUT again 200, GET sha, Range 206, no token 401, DELETE 204, 404
+scripts/voice-store.sh verify    # health, PUT 201, PUT again 200, GET sha, Range 206, no token 401,
+                                 # another owner's DELETE 409, the owner's DELETE 204, 404
 ./techsara up                    # the orchestrator gets URL, cert and token (playback/restore ready; mover still off)
 # set VOICE_ARCHIVE_ENABLED=true in .env, then
 ./techsara up
@@ -577,6 +687,27 @@ still on the head. Before anything else writes to the worker's disk:
 
 The daily reconcile clears the flag if the object reappears.
 
+If the flagged recordings are ones the reconcile set aside (a copy of this
+database running elsewhere, or a restored backup), they are not lost: look
+at `quarantine-list --all`, then `quarantine-restore <uid>/<sid>` each one
+(section "Who owns a recording").
+
+### When the reconcile sets recordings aside, or sees another owner
+
+`voice_archive_reconcile_total{result="orphan_quarantined"}` or
+`{result="other_owner"}` rising, and a warning in the orchestrator's log.
+
+- `orphan_quarantined`: this deployment's recordings that no row of its
+  database knows, stored more than two weeks ago. They are kept whole under
+  `.quarantine/`. Find out why the rows are gone before a
+  `quarantine-purge`, which cannot take anything set aside less than 30 days
+  ago.
+- `other_owner`: another orchestrator, on its own database, writes to this
+  store (an e2e stack or a candidate given its settings). Nothing of this
+  deployment's can be touched by it, and nothing of its is touched here.
+  Take the settings out of that stack. Its recordings can be removed by
+  hand on the worker. Leftovers of a `verify` run that died are user `0`.
+
 ## Rollback
 
 **Order matters.** Code that predates V43 cannot see the store, and it
@@ -588,7 +719,9 @@ answers 410 for anything archived.
 2. `docker exec sf-local-ai-orchestrator-1 python -m app.voice_archive recall-all`
    brings every recording back with sha256 checks and marks it `local`. It
    deletes the store's copies unless you pass `--keep-remote`, and it exits
-   non-zero if any recording failed.
+   non-zero if any recording failed. It refuses (exit 2) while
+   `VOICE_ARCHIVE_ENABLED` is still on, because the next pass would move
+   everything out again; `--force` overrides that.
 3. Only then roll back the code. V43's columns are additive and can stay.
 4. `scripts/voice-store.sh down` stops the store. The data stays on the
    worker's disk until it is removed by hand.

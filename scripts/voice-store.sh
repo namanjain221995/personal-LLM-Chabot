@@ -11,8 +11,8 @@
 #   scripts/voice-store.sh down [--candidate]  stop and remove the container (the recordings stay on disk)
 #   scripts/voice-store.sh status              container state + the store's own /health
 #   scripts/voice-store.sh logs                follow the store's log
-#   scripts/voice-store.sh verify              a synthetic PUT / GET / Range / DELETE round trip with a
-#                                              sha256 check, from the head, and the host guard check
+#   scripts/voice-store.sh verify              a synthetic PUT / GET / Range / DELETE round trip (sha256
+#                                              checked, another owner's DELETE refused), and the guard
 #   scripts/voice-store.sh url                 the address the orchestrator should use
 #   scripts/voice-store.sh rotate-token        accept a new token beside the old one; then recreate the
 #                                              orchestrator; then `rotate-token --finish` drops the old one
@@ -210,6 +210,31 @@ current_worker_tokens() {
   ssh_worker "sed -n 's/^VOICE_STORE_TOKENS=//p' $FILES_DIR/store.env 2>/dev/null" </dev/null
 }
 
+# set_secret <file> <key>: set KEY=<value> in a secrets file, the value read
+# from STDIN. Never an argument: /proc/<pid>/cmdline is readable by every
+# user of the head (no hidepid), which is why the token goes to the worker
+# over ssh stdin too. Every KEY= line gets the value (or one is added), and
+# the file is replaced atomically, still 0600.
+set_secret() {
+  python3 -c '
+import os, sys, tempfile
+path, key = sys.argv[1], sys.argv[2]
+value = sys.stdin.read().strip()
+if not value or "\n" in value:
+    sys.exit("set_secret: the value is empty or more than one line")
+with open(path, encoding="utf-8") as fh:
+    lines = fh.read().splitlines()
+out = [key + "=" + value if line.startswith(key + "=") else line for line in lines]
+if out == lines:
+    out.append(key + "=" + value)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".secrets.")
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(out) + "\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+' "$1" "$2"
+}
+
 # ------------------------------------------------------------------- the TLS --
 
 # A P-256 key and a self-signed certificate for the bind address, made ON the
@@ -334,20 +359,24 @@ expect() {
 }
 
 # The round trip `verify` runs: 64 KiB under user 0 (reserved, no account
-# has it) and a fresh session id, removed at the end whatever happens.
+# has it) and a fresh session id, removed at the end whatever happens. It
+# speaks as a throwaway owner of its own (X-Archive-Owner): every object on
+# the store belongs to one deployment, and only that one may delete it.
 round_trip() { # round_trip <bind> <header-file>
-  local bind="$1" header="$2" sid sum url code got
+  local bind="$1" header="$2" sid sum url code got owner other
   sid="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+  owner="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+  other="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
   head -c 65536 /dev/urandom >"$WORK/probe.bin"
   sum="$(sha256sum "$WORK/probe.bin" | cut -d' ' -f1)"
   url="$(store_url "$bind")/v1/recordings/0/$sid/source.webm"
   # shellcheck disable=SC2064
-  trap "store_curl '$bind' '$header' -o /dev/null -X DELETE '$(store_url "$bind")/v1/recordings/0/$sid' >/dev/null 2>&1 || true; rm -rf '$WORK'" EXIT
+  trap "store_curl '$bind' '$header' -o /dev/null -X DELETE -H 'X-Archive-Owner: $owner' '$(store_url "$bind")/v1/recordings/0/$sid' >/dev/null 2>&1 || true; rm -rf '$WORK'" EXIT
   code="$(store_curl "$bind" "$header" -o /dev/null -w '%{http_code}' -X PUT --data-binary @"$WORK/probe.bin" \
-    -H "X-Content-SHA256: $sum" -H 'Content-Type: application/octet-stream' "$url")"
+    -H "X-Content-SHA256: $sum" -H "X-Archive-Owner: $owner" -H 'Content-Type: application/octet-stream' "$url")"
   expect "201" "$code" "PUT stored 64 KiB (201)" "PUT answered $code, not 201"
   code="$(store_curl "$bind" "$header" -o /dev/null -w '%{http_code}' -X PUT --data-binary @"$WORK/probe.bin" \
-    -H "X-Content-SHA256: $sum" -H 'Content-Type: application/octet-stream' "$url")"
+    -H "X-Content-SHA256: $sum" -H "X-Archive-Owner: $owner" -H 'Content-Type: application/octet-stream' "$url")"
   expect "200" "$code" "the same PUT again is 200 (already stored)" "a repeated PUT answered $code, not 200"
   got="$(store_curl "$bind" "$header" "$url" | sha256sum | cut -d' ' -f1)"
   expect "$sum" "$got" "GET returns the same sha256" "GET returned different bytes"
@@ -359,8 +388,12 @@ round_trip() { # round_trip <bind> <header-file>
   fi
   code="$(store_curl "$bind" - -o /dev/null -w '%{http_code}' "$url")"
   expect "401" "$code" "without the token: 401" "without the token the store answered $code"
-  code="$(store_curl "$bind" "$header" -o /dev/null -w '%{http_code}' -X DELETE "$(store_url "$bind")/v1/recordings/0/$sid")"
-  expect "204" "$code" "DELETE 204" "DELETE answered $code"
+  code="$(store_curl "$bind" "$header" -o /dev/null -w '%{http_code}' -X DELETE -H "X-Archive-Owner: $other" \
+    "$(store_url "$bind")/v1/recordings/0/$sid")"
+  expect "409" "$code" "DELETE by another deployment: 409, nothing deleted" "a DELETE by another deployment answered $code, not 409"
+  code="$(store_curl "$bind" "$header" -o /dev/null -w '%{http_code}' -X DELETE -H "X-Archive-Owner: $owner" \
+    "$(store_url "$bind")/v1/recordings/0/$sid")"
+  expect "204" "$code" "DELETE by its owner: 204" "DELETE answered $code"
   code="$(store_curl "$bind" "$header" -o /dev/null -w '%{http_code}' "$url")"
   expect "404" "$code" "gone after the DELETE (404)" "after the DELETE the store answered $code"
 }
@@ -464,7 +497,7 @@ case "$action" in
       new="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
       write_worker_tokens "$new,$old"
       store_compose "$bind" up -d
-      sed -i "s|^VOICE_ARCHIVE_TOKEN=.*|VOICE_ARCHIVE_TOKEN=${new}|" "$SECRETS_ENV"
+      printf '%s' "$new" | set_secret "$SECRETS_ENV" VOICE_ARCHIVE_TOKEN
       check_pass "the store accepts the new token and the old one; .runtime/secrets.env holds the new one"
       log_info "next: ./techsara up (the orchestrator picks up the new token), then scripts/voice-store.sh rotate-token --finish"
     fi

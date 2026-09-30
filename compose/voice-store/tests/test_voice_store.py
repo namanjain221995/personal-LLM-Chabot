@@ -18,7 +18,8 @@ import time
 import pytest
 
 from store_helpers import (
-    AUTH, OTHER_TOKEN, SID, TOKEN, UID, files_under, leftovers, object_url, put, put_headers, server, sha,
+    AUTH, OTHER_OWNER, OTHER_TOKEN, OWNED, OWNER, SID, TOKEN, UID, files_under, leftovers, object_url, put,
+    put_headers, server, sha,
 )
 
 DATA = bytes(range(256)) * 300  # 76,800 bytes: about 5 s of a browser recording
@@ -32,6 +33,8 @@ def test_every_route_under_v1_needs_the_token_and_health_does_not(store):
     for method, url in (
         ("PUT", object_url()), ("GET", object_url()), ("HEAD", object_url()),
         ("DELETE", f"/v1/recordings/{UID}/{SID}"), ("GET", "/v1/inventory"),
+        ("POST", f"/v1/recordings/{UID}/{SID}/quarantine"), ("GET", "/v1/quarantine"),
+        ("POST", f"/v1/quarantine/{UID}/{SID}/restore"), ("DELETE", f"/v1/quarantine/{UID}/{SID}"),
     ):
         for headers in ({}, {"authorization": "Bearer wrong-token-" + "c" * 40}, {"authorization": TOKEN}):
             response = client.request(method, url, headers={**headers, "x-content-sha256": sha(DATA)},
@@ -57,6 +60,7 @@ def test_settings_refuse_to_start_without_a_long_token_and_the_bind_refuses_a_wi
     settings = server.Settings.from_env({"VOICE_STORE_TOKENS": f" {TOKEN} , {OTHER_TOKEN} "})
     assert settings.tokens == (TOKEN, OTHER_TOKEN)
     assert settings.min_free_bytes == 250 * 1024 ** 3, "the worker's floor is 250 GiB by default"
+    assert settings.quarantine_min_age_s == 30 * 86400, "a recording set aside is kept 30 days at least"
     for bind in ("", "0.0.0.0", "::", "[::]"):
         with pytest.raises(SystemExit):
             server._bind_address({"VOICE_STORE_BIND": bind})
@@ -165,8 +169,8 @@ def test_a_wrong_sha_or_length_is_422_and_leaves_nothing(store):
 
 def test_a_malformed_sha_header_or_an_empty_body_is_a_bad_request(store):
     client, _store, root = store
-    assert put(client, DATA, headers={**AUTH, "x-content-sha256": "ABC"}).status_code == 400
-    assert put(client, b"", headers={**AUTH, "x-content-sha256": sha(b"")}).status_code == 400
+    assert put(client, DATA, headers={**OWNED, "x-content-sha256": "ABC"}).json()["reason"] == "bad_request"
+    assert put(client, b"", headers={**OWNED, "x-content-sha256": sha(b"")}).status_code == 400
     assert files_under(root) == []
 
 
@@ -233,6 +237,7 @@ def test_an_object_whose_manifest_was_lost_is_rehashed_not_replaced(store):
     assert put(client, DATA).status_code == 200
     manifest = json.loads((root / UID / SID / "manifest.json").read_text())
     assert manifest["sha256"] == sha(DATA) and manifest["rebuilt"] is True
+    assert manifest["owner"] == OWNER, "the deployment whose PUT found it"
 
 
 def test_the_file_is_fsynced_before_it_is_linked_and_the_folder_after(store, monkeypatch):
@@ -257,6 +262,105 @@ def test_the_file_is_fsynced_before_it_is_linked_and_the_folder_after(store, mon
     monkeypatch.setattr(os, "replace", replace)
     assert put(client, DATA).status_code == 201
     assert events == ["fsync", "link", "dirsync", "fsync", "replace", "dirsync"], events
+
+
+# ------------------------------------------- owners, and setting aside --
+
+
+def test_every_upload_names_its_deployment_and_the_manifest_and_the_inventory_keep_it(store):
+    client, _store, root = store
+    anonymous = {k: v for k, v in put_headers(DATA).items() if k != "x-archive-owner"}
+    refused = put(client, DATA, headers=anonymous)
+    assert refused.status_code == 400 and refused.json()["reason"] == "owner_required"
+    assert put(client, DATA, headers={**put_headers(DATA), "x-archive-owner": "not-a-deployment"}).status_code == 400
+    assert files_under(root) == [], "refused before a byte of the body"
+    assert put(client, DATA).status_code == 201
+    assert json.loads((root / UID / SID / "manifest.json").read_text())["owner"] == OWNER
+    page = client.get("/v1/inventory", headers=AUTH).json()
+    assert [(o["session_id"], o["owner"]) for o in page["objects"]] == [(SID, OWNER)]
+
+
+def test_another_deployment_can_neither_delete_nor_set_aside_nor_claim_a_recording(store):
+    """An e2e stack or a candidate given production's URL, token and
+    certificate is ANOTHER owner: whatever its own database lacks, nothing of
+    production's changes (the voice-archive review's HIGH, 2026-09-30)."""
+    client, _store, root = store
+    assert put(client, DATA).status_code == 201
+    other = {**AUTH, "x-archive-owner": OTHER_OWNER}
+    deleted = client.delete(f"/v1/recordings/{UID}/{SID}", headers=other)
+    assert deleted.status_code == 409 and deleted.json()["reason"] == "owner_mismatch"
+    aside = client.post(f"/v1/recordings/{UID}/{SID}/quarantine", headers=other)
+    assert aside.status_code == 409 and aside.json()["reason"] == "owner_mismatch"
+    claimed = put(client, DATA, headers={**put_headers(DATA), "x-archive-owner": OTHER_OWNER})
+    assert claimed.status_code == 409 and claimed.json()["reason"] == "owner_mismatch"
+    unnamed = client.delete(f"/v1/recordings/{UID}/{SID}", headers=AUTH)
+    assert unnamed.status_code == 400 and unnamed.json()["reason"] == "owner_required"
+    assert client.get(object_url(), headers=AUTH).content == DATA
+    assert json.loads((root / UID / SID / "manifest.json").read_text())["owner"] == OWNER
+    assert client.delete(f"/v1/recordings/{UID}/{SID}", headers=OWNED).status_code == 204
+    assert client.get(object_url(), headers=AUTH).status_code == 404
+
+
+def test_a_recording_stored_before_owners_were_recorded_is_adopted_by_the_same_bytes(store):
+    client, _store, root = store
+    assert put(client, DATA).status_code == 201
+    path = root / UID / SID / "manifest.json"
+    manifest = json.loads(path.read_text())
+    del manifest["owner"]
+    path.write_text(json.dumps(manifest))
+    again = put(client, DATA, headers={**put_headers(DATA), "x-archive-owner": OTHER_OWNER})
+    assert again.status_code == 200 and again.json()["stored"] == "already"
+    assert json.loads(path.read_text())["owner"] == OTHER_OWNER
+    assert put(client, DATA).json()["reason"] == "owner_mismatch", "adopted once, then owned"
+
+
+def test_a_recording_set_aside_leaves_reads_and_the_inventory_and_comes_back_whole(store):
+    client, store_, root = store
+    store_.scan()
+    assert put(client, DATA).status_code == 201
+    aside = client.post(f"/v1/recordings/{UID}/{SID}/quarantine", headers=OWNED)
+    assert aside.status_code == 200 and aside.json()["quarantined"] is True
+    assert client.get(object_url(), headers=AUTH).status_code == 404
+    assert client.get("/v1/inventory", headers=AUTH).json()["objects"] == []
+    assert client.get("/health").json()["objects"] == 0
+    listed = client.get("/v1/quarantine", headers=AUTH).json()["objects"]
+    assert [(o["user_id"], o["session_id"], o["owner"], o["sha256"]) for o in listed] == [
+        (int(UID), SID, OWNER, sha(DATA)),
+    ]
+    assert listed[0]["quarantined_at"]
+    assert not (root / UID).exists(), "nothing of it is left where reads look"
+    assert store_.scrub_once()["checked"] == 0 and store_.sweep_once() == 0
+    assert client.post(f"/v1/recordings/{UID}/{SID}/quarantine", headers=OWNED).status_code == 404
+    other = {**AUTH, "x-archive-owner": OTHER_OWNER}
+    assert client.post(f"/v1/quarantine/{UID}/{SID}/restore", headers=other).json()["reason"] == "owner_mismatch"
+    restored = client.post(f"/v1/quarantine/{UID}/{SID}/restore", headers=OWNED)
+    assert restored.status_code == 200, restored.text
+    assert client.get(object_url(), headers=AUTH).content == DATA
+    assert client.get("/v1/quarantine", headers=AUTH).json()["objects"] == []
+    assert not (root / UID / SID / "quarantine.json").exists()
+    assert client.get("/health").json()["objects"] == 1
+    assert client.post(f"/v1/quarantine/{UID}/{SID}/restore", headers=OWNED).status_code == 404
+    assert leftovers(root) == []
+
+
+def test_a_recording_set_aside_is_purged_only_by_its_owner_and_never_before_the_minimum_age(make_store):
+    client, _store, root = make_store(quarantine_min_age_s=3600.0)
+    assert put(client, DATA).status_code == 201
+    assert client.post(f"/v1/recordings/{UID}/{SID}/quarantine", headers=OWNED).status_code == 200
+    early = client.delete(f"/v1/quarantine/{UID}/{SID}", headers=OWNED)
+    assert early.status_code == 409 and early.json()["reason"] == "too_recent"
+    marker = root / ".quarantine" / UID / SID / "quarantine.json"
+    marker.unlink()
+    assert client.delete(f"/v1/quarantine/{UID}/{SID}", headers=OWNED).json()["reason"] == "too_recent", (
+        "without a record of when, it is never old enough"
+    )
+    marker.write_text(json.dumps({"quarantined_at": "2026-01-01T00:00:00+00:00"}))
+    other = {**AUTH, "x-archive-owner": OTHER_OWNER}
+    assert client.delete(f"/v1/quarantine/{UID}/{SID}", headers=other).json()["reason"] == "owner_mismatch"
+    assert (root / ".quarantine" / UID / SID / "source.webm").read_bytes() == DATA
+    assert client.delete(f"/v1/quarantine/{UID}/{SID}", headers=OWNED).status_code == 204
+    assert files_under(root) == []
+    assert client.delete(f"/v1/quarantine/{UID}/{SID}", headers=OWNED).status_code == 204, "idempotent"
 
 
 # --------------------------------------------------- uploads that die --
@@ -284,7 +388,7 @@ def _asgi_put(app, receive_messages, *, length: int, digest: str):
         "root_path": "", "server": ("test", 80), "client": ("test", 1),
         "headers": [
             (b"authorization", f"Bearer {TOKEN}".encode()), (b"content-length", str(length).encode()),
-            (b"x-content-sha256", digest.encode()),
+            (b"x-content-sha256", digest.encode()), (b"x-archive-owner", OWNER.encode()),
         ],
     }
 
@@ -374,10 +478,10 @@ def test_head_reports_the_size_and_sha_without_a_body(store):
 def test_delete_is_always_204_and_removes_the_folder(store):
     client, store_, root = store
     assert put(client, DATA).status_code == 201
-    assert client.delete(f"/v1/recordings/{UID}/{SID}", headers=AUTH).status_code == 204
+    assert client.delete(f"/v1/recordings/{UID}/{SID}", headers=OWNED).status_code == 204
     assert not (root / UID).exists(), "an emptied user folder goes too"
     assert client.get(object_url(), headers=AUTH).status_code == 404
-    assert client.delete(f"/v1/recordings/{UID}/{SID}", headers=AUTH).status_code == 204, "idempotent"
+    assert client.delete(f"/v1/recordings/{UID}/{SID}", headers=OWNED).status_code == 204, "idempotent"
 
 
 def test_the_inventory_pages_in_numeric_user_order(store):

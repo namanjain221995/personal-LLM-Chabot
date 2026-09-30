@@ -180,6 +180,45 @@ class WorkerEngineBindTests(unittest.TestCase):
             ["$HOME/.techsara-cluster/candidates/trackb-voice-store"],
         )
 
+    def test_a_rotated_voice_archive_token_never_appears_on_a_command_line(self) -> None:
+        # /proc/<pid>/cmdline is readable by every user of the head (no
+        # hidepid), and rotate-token put the new token there: `sed -i
+        # "s|...|VOICE_ARCHIVE_TOKEN=${new}|"` (review 2026-09-30). It goes
+        # through stdin now, like the worker's copy. The function runs here
+        # with a python3 on PATH that records its own arguments.
+        script = SCRIPTS / "voice-store.sh"
+        self.assertNotRegex(script.read_text(encoding="utf-8"), r"sed -i[^\n]*\$\{?new")
+        real_python = shutil.which("python3")
+        self.assertIsNotNone(real_python)
+        argv_log = self.root / "argv.log"
+        shim = self.root / "bin" / "python3"
+        shim.write_text(
+            f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{argv_log}"\nexec "{real_python}" "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        secrets_env = self.root / "secrets.env"
+        secrets_env.write_text("# kept\nOTHER=1\nVOICE_ARCHIVE_TOKEN=old-token-" + "c" * 40 + "\n", encoding="utf-8")
+        secrets_env.chmod(0o600)
+        token = "new-token-" + "d" * 40  # low entropy: secret scanners flag random-looking literals
+        program = "\n".join([
+            "set -euo pipefail",
+            _function_source(script, "set_secret"),
+            'printf "%s" "$TOKEN_UNDER_TEST" | set_secret "$1" VOICE_ARCHIVE_TOKEN',
+        ])
+        result = subprocess.run(
+            ["bash", "-c", program, "set-secret-test", str(secrets_env)],
+            env={"PATH": self.path, "HOME": str(self.root), "TOKEN_UNDER_TEST": token},
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(secrets_env.read_text(encoding="utf-8"), f"# kept\nOTHER=1\nVOICE_ARCHIVE_TOKEN={token}\n")
+        self.assertEqual(secrets_env.stat().st_mode & 0o777, 0o600)
+        arguments = argv_log.read_text(encoding="utf-8")
+        self.assertIn("VOICE_ARCHIVE_TOKEN", arguments, "python3 did the replacement")
+        self.assertNotIn(token, arguments)
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith(".secrets.")], [])
+
     def test_the_head_engines_still_bind_the_docker_bridge_gateway(self) -> None:
         for script, function in (("ocr.sh", "ocr_bind_address"), ("whisper.sh", "whisper_bind_address")):
             with self.subTest(script=script):

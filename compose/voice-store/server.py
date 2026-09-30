@@ -11,24 +11,45 @@ recording, decoding, transcripts, previews and the list stay on the head and
 never wait for the worker (app/voice_archive.py is the other half).
 
 WHAT IT IS. A small authenticated HTTP object store for one kind of object,
-    PUT    /v1/recordings/<user>/<session>/source.<ext>   store, verified
+    PUT    /v1/recordings/<user>/<session>/source.<ext>   store, verified (owner required)
     GET    /v1/recordings/<user>/<session>/source.<ext>   read (Range, If-Range)
     HEAD   same path                                      size, sha256
-    DELETE /v1/recordings/<user>/<session>                always 204
-    GET    /v1/inventory?after=<user>/<session>&limit=N   what is stored
+    DELETE /v1/recordings/<user>/<session>                204; 409 for another owner's
+    POST   /v1/recordings/<user>/<session>/quarantine     set aside (its owner only)
+    GET    /v1/inventory?after=<user>/<session>&limit=N   what is stored, with owners
+    GET    /v1/quarantine?after=<user>/<session>&limit=N  what is set aside
+    POST   /v1/quarantine/<user>/<session>/restore        put back (its owner only)
+    DELETE /v1/quarantine/<user>/<session>                purge (its owner only, not before
+                                                          VOICE_STORE_QUARANTINE_MIN_AGE_S)
     GET    /health, /metrics                              no token (guarded port)
 Everything under /v1 needs `Authorization: Bearer <token>`, compared in
 constant time against VOICE_STORE_TOKENS (a comma-separated list, so a token
 can be rotated without a window where nothing is accepted).
+
+WHO OWNS AN OBJECT (fix round, 2026-09-30). The token says who may talk to
+the store; it cannot say WHICH deployment a recording belongs to, and any
+orchestrator given this store's URL, token and certificate (an e2e stack, a
+candidate, a developer's) used to be able to delete production's only copy:
+its reconcile deleted every object its own database had no row for. So every
+PUT, DELETE and quarantine call names its deployment in X-Archive-Owner (32
+hex characters the orchestrator keeps in its own DATABASE, table
+voice_archive_owner: another database is another owner), the manifest keeps
+the owner, and nothing is deleted, set aside or restored for anyone else
+(409 owner_mismatch, nothing changed). An orchestrator deletes only what its
+own row says was deleted; an object no row knows is SET ASIDE under
+.quarantine/ (out of reads, the inventory and the scrub), and removed only
+by an operator's purge, never within VOICE_STORE_QUARANTINE_MIN_AGE_S (30
+days) of being set aside.
 
 WHAT A 201 PROMISES. The body was streamed into a private `.incoming-<uuid>`
 file (O_EXCL, 0600) and hashed as it arrived; its length equals the declared
 Content-Length and its sha256 equals the declared X-Content-SHA256 (else 422
 and the temporary file is gone); it was fsynced; it was LINKED into place
 (os.link fails rather than replace, so an object is never overwritten) and
-the directory fsynced; and manifest.json (ids, type, bytes, sha256, times)
-was written the same way. The same object sent again is 200; different bytes
-under the same name are 409 and the stored file is left alone.
+the directory fsynced; and manifest.json (ids, type, bytes, sha256, times,
+owner) was written the same way. The same object sent again by its owner is
+200; different bytes under the same name, or the same bytes from another
+owner, are 409 and the stored file is left alone.
 
 WHAT IT REFUSES BEFORE READING A BYTE of the body: a missing token (401), a
 malformed id or name (400), a chunked upload (411: the free-space check needs
@@ -89,10 +110,18 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_NAME = re.compile(r"^source\.([a-z0-9]{2,5})$")
 MIME = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,40}/[a-z0-9][a-z0-9.+-]{0,60}$")
 TIMESTAMP = re.compile(r"^[0-9T:.+\- ]{10,40}$")
+#: The deployment an object belongs to (X-Archive-Owner): the orchestrator's
+#: voice_archive_owner row, one per database.
+OWNER = re.compile(r"^[0-9a-f]{32}$")
 
 INCOMING_PREFIX = ".incoming-"
 MANIFEST_PREFIX = ".manifest-"
 MANIFEST = "manifest.json"
+#: Objects set aside live under <root>/.quarantine/<user>/<session>/, a name
+#: no user id matches, so reads, the inventory, the scan, the sweep and the
+#: scrub never see them. QUARANTINE_FILE records when.
+QUARANTINE_DIR = ".quarantine"
+QUARANTINE_FILE = "quarantine.json"
 GIB = 1024 ** 3
 MIB = 1024 ** 2
 
@@ -105,13 +134,28 @@ WRITE_BATCH = 1 * MIB
 #: reuses one the store is closing at that moment.
 KEEP_ALIVE_TIMEOUT_S = 5
 
+#: Connections (and requests) uvicorn serves at once before it answers 503.
+#: The orchestrator keeps up to voice_archive._MAX_CONNECTIONS (32) per event
+#: loop, and two loops talk to the store (requests, and the mover with its
+#: restores): room for both, so a store that is fine never refuses a player.
+LIMIT_CONCURRENCY = 64
+
 #: The label values /metrics may carry; anything else is "other".
-OPS = ("put", "get", "head", "delete", "inventory")
+OPS = ("put", "get", "head", "delete", "inventory", "quarantine", "quarantine_list", "unquarantine", "purge")
 CODES = ("200", "201", "204", "206", "400", "401", "404", "408", "409", "411", "413", "416", "422", "500", "503", "507")
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str):
+        return None
+    with contextlib.suppress(ValueError):
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
 
 
 # --------------------------------------------------------------- settings --
@@ -134,6 +178,9 @@ class Settings:
     scrub_first_after_s: float = 3600.0
     scrub_bytes_per_s: int = 50 * 1000 * 1000
     inventory_max: int = 1000
+    #: A recording set aside is purged no sooner than this after it was set
+    #: aside, whoever asks: time for someone to notice it was wanted.
+    quarantine_min_age_s: float = 30 * 86400.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Settings":
@@ -168,6 +215,7 @@ class Settings:
             scrub_interval_s=number("VOICE_STORE_SCRUB_INTERVAL_S", 7 * 86400.0, 60.0),
             scrub_first_after_s=number("VOICE_STORE_SCRUB_FIRST_AFTER_S", 3600.0, 0.0),
             scrub_bytes_per_s=int(number("VOICE_STORE_SCRUB_BYTES_PER_S", 50 * 1000 * 1000, 1024)),
+            quarantine_min_age_s=number("VOICE_STORE_QUARANTINE_MIN_AGE_S", 30 * 86400.0, 0.0),
         )
 
 
@@ -343,12 +391,26 @@ class Store:
         if not self.authorized(request):
             raise Refusal(401, "unauthorized", "A valid bearer token is required.", **{"www-authenticate": "Bearer"})
 
+    @staticmethod
+    def presented_owner(request: Request) -> str:
+        """The deployment a PUT, DELETE or quarantine call speaks for."""
+        owner = (request.headers.get("x-archive-owner") or "").strip().lower()
+        if not OWNER.match(owner):
+            raise Refusal(400, "owner_required", "X-Archive-Owner must name the deployment (32 hex characters).")
+        return owner
+
+    @staticmethod
+    def owner_of(found: Optional["Stored"]) -> Optional[str]:
+        """The deployment that stored `found`, or None when its manifest does not say."""
+        owner = (found.manifest or {}).get("owner") if found is not None else None
+        return owner if isinstance(owner, str) and OWNER.match(owner) else None
+
     # -- reading what is there ------------------------------------------------
 
     @staticmethod
-    def read_manifest(directory: str) -> Optional[Dict[str, Any]]:
+    def read_manifest(directory: str, name: str = MANIFEST) -> Optional[Dict[str, Any]]:
         try:
-            with open(os.path.join(directory, MANIFEST), encoding="utf-8") as fh:
+            with open(os.path.join(directory, name), encoding="utf-8") as fh:
                 data = json.load(fh)
         except (OSError, ValueError):
             return None
@@ -374,9 +436,11 @@ class Store:
             sha = None
         return Stored(name=name, bytes=size, sha256=sha, manifest=manifest)
 
-    def _stored_with_sha(self, directory: str) -> Optional[Stored]:
+    def _stored_with_sha(self, directory: str, owner: Optional[str] = None) -> Optional[Stored]:
         """`stored`, with a missing manifest rebuilt from the file itself (a
-        crash between the link and the manifest). Blocking."""
+        crash between the link and the manifest). The rebuilt manifest keeps
+        the owner it had, else takes `owner`, the deployment whose PUT found
+        it. Blocking."""
         found = self.stored(directory)
         if found is None or found.sha256 is not None:
             return found
@@ -387,6 +451,9 @@ class Store:
             "ext": found.name.split(".", 1)[1], "mime": "application/octet-stream",
             "bytes": size, "sha256": sha, "stored_at": _now_iso(), "rebuilt": True,
         }
+        keep = self.owner_of(found) or owner
+        if keep:
+            manifest["owner"] = keep
         _write_json_atomic(directory, MANIFEST, manifest)
         return Stored(name=found.name, bytes=size, sha256=sha, manifest=manifest)
 
@@ -419,6 +486,7 @@ class Store:
         self.require_token(request)
         user, session = self.key(request.path_params["user"], request.path_params["session"])
         name = self.source_name(request.path_params["name"])
+        owner = self.presented_owner(request)
         if "chunked" in (request.headers.get("transfer-encoding") or "").lower():
             raise Refusal(411, "length_required", "Send the recording with a Content-Length, not chunked.")
         raw_length = request.headers.get("content-length")
@@ -445,31 +513,41 @@ class Store:
                 meta[field] = value
 
         directory = self.session_dir(user, session)
-        existing = await asyncio.to_thread(self._stored_with_sha, directory)
+        existing = await asyncio.to_thread(self._stored_with_sha, directory, owner)
         if existing is not None:
-            return self._answer_existing(existing, name, length, want)
+            return await self._answer_existing(directory, existing, name, length, want, owner)
 
         temp = os.path.join(directory, f"{INCOMING_PREFIX}{uuid.uuid4().hex}")
         key = (user, session)
         self._admit(key, length, temp)
         try:
-            return await self._receive(request, user, session, name, length, want, mime, meta, temp)
+            return await self._receive(request, user, session, name, length, want, mime, meta, temp, owner)
         finally:
             self._release(key, length)
 
-    @staticmethod
-    def _answer_existing(existing: Stored, name: str, length: int, want: str) -> Response:
+    async def _answer_existing(
+        self, directory: str, existing: Stored, name: str, length: int, want: str, owner: str,
+    ) -> Response:
         same = existing.name == name and existing.sha256 == want and existing.bytes == length
-        if same:
-            return JSONResponse(
-                {"stored": "already", "sha256": existing.sha256, "bytes": existing.bytes},
-                status_code=200, headers={"cache-control": "no-store"},
+        if not same:
+            raise Refusal(409, "conflict", "A different recording is already stored under this name; it was not replaced.")
+        recorded = self.owner_of(existing)
+        if recorded is None:
+            # Stored before its owner was recorded: the same bytes, from the
+            # deployment that sends them now.
+            await asyncio.to_thread(
+                _write_json_atomic, directory, MANIFEST, {**(existing.manifest or {}), "owner": owner},
             )
-        raise Refusal(409, "conflict", "A different recording is already stored under this name; it was not replaced.")
+        elif recorded != owner:
+            raise Refusal(409, "owner_mismatch", "This recording is stored for another deployment; it was not replaced.")
+        return JSONResponse(
+            {"stored": "already", "sha256": existing.sha256, "bytes": existing.bytes},
+            status_code=200, headers={"cache-control": "no-store"},
+        )
 
     async def _receive(
         self, request: Request, user: str, session: str, name: str, length: int, want: str,
-        mime: str, meta: Dict[str, str], temp: str,
+        mime: str, meta: Dict[str, str], temp: str, owner: str,
     ) -> Response:
         directory = self.session_dir(user, session)
 
@@ -523,15 +601,15 @@ class Store:
             try:
                 await asyncio.to_thread(os.link, temp, final)
             except FileExistsError:
-                existing = await asyncio.to_thread(self._stored_with_sha, directory)
+                existing = await asyncio.to_thread(self._stored_with_sha, directory, owner)
                 if existing is None:
                     raise Refusal(409, "conflict", "The recording changed while it was being stored.") from None
-                return self._answer_existing(existing, name, length, want)
+                return await self._answer_existing(directory, existing, name, length, want, owner)
             except FileNotFoundError:
                 raise Refusal(409, "deleted", "The recording was deleted while it was being stored.") from None
             manifest = {
                 "user_id": int(user), "session_id": session, "name": name, "ext": name.split(".", 1)[1],
-                "mime": mime, "bytes": length, "sha256": got, "stored_at": _now_iso(), **meta,
+                "mime": mime, "bytes": length, "sha256": got, "stored_at": _now_iso(), "owner": owner, **meta,
             }
 
             def settle() -> None:
@@ -583,16 +661,18 @@ class Store:
     async def delete(self, request: Request) -> Response:
         self.require_token(request)
         user, session = self.key(request.path_params["user"], request.path_params["session"])
+        owner = self.presented_owner(request)
         directory = self.session_dir(user, session)
 
         def remove() -> Optional[Stored]:
             found = self.stored(directory)
+            recorded = self.owner_of(found)
+            if recorded is not None and recorded != owner:
+                # Another deployment's recording: whatever its caller's
+                # database says, it is not this caller's to delete.
+                raise Refusal(409, "owner_mismatch", "This recording belongs to another deployment; it was not deleted.")
             shutil.rmtree(directory, ignore_errors=True)
-            parent = os.path.join(self.root, user)
-            with contextlib.suppress(OSError):
-                os.rmdir(parent)  # only when empty
-            with contextlib.suppress(OSError):
-                _fsync_dir(parent if os.path.isdir(parent) else self.root)
+            self._drop_empty(os.path.join(self.root, user))
             return found
 
         found = await asyncio.to_thread(remove)
@@ -601,15 +681,27 @@ class Store:
             log.info("deleted %s/%s", user, session)
         return Response(status_code=204, headers={"cache-control": "no-store"})
 
-    def inventory_page(self, after: str, limit: int) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-        """Objects in (user as a number, session) order after `after`. Blocking."""
+    def _drop_empty(self, parent: str) -> None:
+        """rmdir `parent` when it is empty, and fsync what holds it. Blocking."""
+        with contextlib.suppress(OSError):
+            os.rmdir(parent)  # only when empty
+        with contextlib.suppress(OSError):
+            _fsync_dir(parent if os.path.isdir(parent) else os.path.dirname(parent))
+
+    def inventory_page(
+        self, after: str, limit: int, *, quarantined: bool = False,
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Objects in (user as a number, session) order after `after`, each
+        with its owner (None when its manifest does not say); with
+        `quarantined`, the objects set aside instead, each with when. Blocking."""
+        base = os.path.join(self.root, QUARANTINE_DIR) if quarantined else self.root
         cursor: Optional[Tuple[int, str]] = None
         if after:
             user, _, session = after.partition("/")
             self.key(user, session)
             cursor = (int(user), session)
         try:
-            users = sorted((int(e.name), e.name) for e in os.scandir(self.root) if e.is_dir() and USER_ID.match(e.name))
+            users = sorted((int(e.name), e.name) for e in os.scandir(base) if e.is_dir() and USER_ID.match(e.name))
         except OSError:
             users = []
         out: List[Dict[str, Any]] = []
@@ -619,30 +711,34 @@ class Store:
                 continue
             try:
                 sessions = sorted(
-                    e.name for e in os.scandir(os.path.join(self.root, user)) if e.is_dir() and SESSION_ID.match(e.name)
+                    e.name for e in os.scandir(os.path.join(base, user)) if e.is_dir() and SESSION_ID.match(e.name)
                 )
             except OSError:
                 continue
             for session in sessions:
                 if cursor is not None and (number, session) <= cursor:
                     continue
-                found = self.stored(self.session_dir(user, session))
+                directory = os.path.join(base, user, session)
+                found = self.stored(directory)
                 if found is None:
                     continue
                 if len(out) >= limit:
                     more = True
                     break
                 manifest = found.manifest or {}
-                out.append({
+                item = {
                     "user_id": number, "session_id": session, "name": found.name, "bytes": found.bytes,
-                    "sha256": found.sha256, "stored_at": manifest.get("stored_at"),
-                })
+                    "sha256": found.sha256, "stored_at": manifest.get("stored_at"), "owner": self.owner_of(found),
+                }
+                if quarantined:
+                    item["quarantined_at"] = (self.read_manifest(directory, QUARANTINE_FILE) or {}).get("quarantined_at")
+                out.append(item)
             if more:
                 break
         next_after = f"{out[-1]['user_id']}/{out[-1]['session_id']}" if more and out else None
         return out, next_after
 
-    async def inventory(self, request: Request) -> Response:
+    async def _listing(self, request: Request, *, quarantined: bool) -> Response:
         self.require_token(request)
         after = (request.query_params.get("after") or "").strip()
         try:
@@ -650,8 +746,122 @@ class Store:
         except ValueError:
             raise Refusal(400, "bad_request", "limit must be an integer.") from None
         limit = max(1, min(self.settings.inventory_max, limit))
-        objects, next_after = await asyncio.to_thread(self.inventory_page, after, limit)
+        objects, next_after = await asyncio.to_thread(self.inventory_page, after, limit, quarantined=quarantined)
         return JSONResponse({"objects": objects, "next_after": next_after}, headers={"cache-control": "no-store"})
+
+    async def inventory(self, request: Request) -> Response:
+        return await self._listing(request, quarantined=False)
+
+    async def quarantine_list(self, request: Request) -> Response:
+        return await self._listing(request, quarantined=True)
+
+    # -- setting aside ---------------------------------------------------------
+
+    def quarantine_dir(self, user: str, session: str) -> str:
+        return os.path.join(self.root, QUARANTINE_DIR, user, session)
+
+    def _owned(self, directory: str, owner: str, missing: str) -> Stored:
+        """The object in `directory`, which `owner` stored. Blocking."""
+        found = self.stored(directory)
+        if found is None:
+            raise Refusal(404, "not_found", missing)
+        if self.owner_of(found) != owner:
+            raise Refusal(409, "owner_mismatch", "Only the deployment that stored this recording can do that.")
+        return found
+
+    async def quarantine(self, request: Request) -> Response:
+        """Set a recording aside: out of reads and the inventory, kept whole
+        until its owner restores it or an operator purges it."""
+        self.require_token(request)
+        user, session = self.key(request.path_params["user"], request.path_params["session"])
+        owner = self.presented_owner(request)
+        directory = self.session_dir(user, session)
+        target = self.quarantine_dir(user, session)
+
+        def move() -> Tuple[Stored, str]:
+            found = self._owned(directory, owner, "No such recording in the store.")
+            with self._lock:
+                if (user, session) in self._in_flight:
+                    raise Refusal(409, "in_progress", "This recording is being stored right now.")
+            if os.path.lexists(target):
+                raise Refusal(409, "already_quarantined", "A recording under this name is already set aside.")
+            stamp = _now_iso()
+            # Written before the move, so an object set aside always says when.
+            _write_json_atomic(directory, QUARANTINE_FILE, {"quarantined_at": stamp})
+            _private_dir(os.path.join(self.root, QUARANTINE_DIR))
+            _private_dir(os.path.dirname(target))
+            os.rename(directory, target)
+            _fsync_dir(os.path.dirname(target))
+            self._drop_empty(os.path.join(self.root, user))
+            return found, stamp
+
+        found, stamp = await asyncio.to_thread(move)
+        self._adjust(-1, -found.bytes)
+        log.warning("set aside %s/%s at its owner's request", user, session)
+        return JSONResponse({"quarantined": True, "quarantined_at": stamp}, headers={"cache-control": "no-store"})
+
+    async def unquarantine(self, request: Request) -> Response:
+        """Put a recording that was set aside back where reads find it."""
+        self.require_token(request)
+        user, session = self.key(request.path_params["user"], request.path_params["session"])
+        owner = self.presented_owner(request)
+        source = self.quarantine_dir(user, session)
+        directory = self.session_dir(user, session)
+
+        def move_back() -> Stored:
+            found = self._owned(source, owner, "No such recording is set aside.")
+            for attempt in (1, 2):
+                if os.path.lexists(directory):
+                    raise Refusal(409, "exists", "A recording is stored under this name again; nothing was moved.")
+                _private_dir(os.path.join(self.root, user))
+                try:
+                    os.rename(source, directory)
+                    break
+                except FileNotFoundError:
+                    # A delete emptied and removed the user folder between the
+                    # mkdir and the rename; make it again, once.
+                    if attempt == 2:
+                        raise
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(os.path.join(directory, QUARANTINE_FILE))
+            _fsync_dir(directory)
+            _fsync_dir(os.path.join(self.root, user))
+            self._drop_empty(os.path.dirname(source))
+            return found
+
+        found = await asyncio.to_thread(move_back)
+        self._adjust(1, found.bytes)
+        log.warning("restored %s/%s from the quarantine", user, session)
+        return JSONResponse({"restored": True}, headers={"cache-control": "no-store"})
+
+    async def purge(self, request: Request) -> Response:
+        """Delete a recording that was set aside: its owner only, and never
+        sooner than quarantine_min_age_s after it was set aside."""
+        self.require_token(request)
+        user, session = self.key(request.path_params["user"], request.path_params["session"])
+        owner = self.presented_owner(request)
+        source = self.quarantine_dir(user, session)
+
+        def remove() -> Optional[Stored]:
+            if self.stored(source) is None:
+                return None
+            found = self._owned(source, owner, "No such recording is set aside.")
+            since = _parse_iso((self.read_manifest(source, QUARANTINE_FILE) or {}).get("quarantined_at"))
+            age = (datetime.now(timezone.utc) - since).total_seconds() if since else None
+            if age is None or age < self.settings.quarantine_min_age_s:
+                raise Refusal(
+                    409, "too_recent",
+                    f"A recording set aside is kept at least {self.settings.quarantine_min_age_s / 86400:g} days "
+                    "before it can be purged.",
+                )
+            shutil.rmtree(source, ignore_errors=True)
+            self._drop_empty(os.path.dirname(source))
+            return found
+
+        found = await asyncio.to_thread(remove)
+        if found is not None:
+            log.warning("purged %s/%s from the quarantine", user, session)
+        return Response(status_code=204, headers={"cache-control": "no-store"})
 
     def health_body(self) -> Dict[str, Any]:
         try:
@@ -901,8 +1111,16 @@ def create_app(settings: Settings, *, background: bool = True) -> Starlette:
         Route("/metrics", metrics, methods=["GET"]),
         Route(object_path, handler("put", store.put), methods=["PUT"]),
         Route(object_path, handler("get", store.get), methods=["GET", "HEAD"]),
+        # POST only: a PUT or GET of ".../quarantine" is the object route's,
+        # and refused there as a name that is not source.<ext>.
+        Route("/v1/recordings/{user}/{session}/quarantine", handler("quarantine", store.quarantine), methods=["POST"]),
         Route("/v1/recordings/{user}/{session}", handler("delete", store.delete), methods=["DELETE"]),
         Route("/v1/inventory", handler("inventory", store.inventory), methods=["GET"]),
+        Route("/v1/quarantine", handler("quarantine_list", store.quarantine_list), methods=["GET"]),
+        Route(
+            "/v1/quarantine/{user}/{session}/restore", handler("unquarantine", store.unquarantine), methods=["POST"],
+        ),
+        Route("/v1/quarantine/{user}/{session}", handler("purge", store.purge), methods=["DELETE"]),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.store = store
@@ -949,7 +1167,7 @@ def main() -> None:
         server_header=False,
         proxy_headers=False,
         timeout_keep_alive=KEEP_ALIVE_TIMEOUT_S,
-        limit_concurrency=32,
+        limit_concurrency=LIMIT_CONCURRENCY,
     )
 
 

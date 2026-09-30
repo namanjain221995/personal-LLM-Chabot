@@ -56,18 +56,34 @@ come back.
 
 READS. `recording_response` serves the head file when it exists (every local
 or copied recording), and otherwise streams the store's copy, forwarding
-Range and If-Range and passing 200/206/416 and their headers back. Store down:
-503 archive_unavailable with Retry-After. Store has no copy: 410
-audio_missing, counted, and flagged on the row for the reconcile.
+Range and If-Range and passing 200/206/416 and their headers back (and the
+store's answer to a malformed Range, as the head gives it). Store down: 503
+archive_unavailable with Retry-After. Every pooled connection in use: 503
+archive_busy. Store has no copy: 410 audio_missing, counted, and flagged on
+the row for the reconcile.
 
 DELETES keep dictation's order (row cancelled, then the folder), then ask the
-store to delete its copy at once without waiting; the purge step retries what
-that misses, and the reconcile removes anything left.
+store to delete its copy at once without waiting; the purge step retries
+every deleted row whose copy is not known to be gone, whatever its
+archive_state, and the reconcile catches anything left.
+
+OWNERSHIP. Every object on the store belongs to the deployment that stored
+it: X-Archive-Owner, this DATABASE's voice_archive_owner row (V43). The
+store deletes, sets aside or restores an object for its owner only, and
+this module deletes an object only when one of its rows POSITIVELY says the
+recording was deleted (or was recalled to the head with its bytes checked),
+never because a row is missing: an orchestrator with its own database and
+this deployment's store settings (an e2e stack, a candidate) once deleted
+production's only copies exactly that way. An object of ours that no row
+knows is set aside on the store after two weeks (the reconcile), and only an
+operator purges it (`quarantine-list`, `quarantine-restore`,
+`quarantine-purge`).
 
 ROLLBACK. VOICE_ARCHIVE_ENABLED=false, then `python -m app.voice_archive
 recall-all` (inside the orchestrator container) BEFORE any code rollback: it
-brings every recording back with sha256 checks and marks it local again. Code
-that predates V43 cannot see the store and answers 410 for anything archived.
+brings every recording back with sha256 checks and marks it local again, and
+refuses while VOICE_ARCHIVE_ENABLED is on. Code that predates V43 cannot see
+the store and answers 410 for anything archived.
 """
 from __future__ import annotations
 
@@ -77,11 +93,13 @@ import base64
 import binascii
 import concurrent.futures
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
 import logging
 import os
+import secrets
 import ssl
 import sys
 import threading
@@ -110,17 +128,27 @@ ARCHIVED = "archived"
 ERROR_REASONS = (
     "unreachable", "timeout", "tls", "auth", "storage_full", "busy", "conflict",
     "remote_sha_mismatch", "missing", "http_4xx", "http_5xx",
-    "local_missing", "local_size_mismatch", "local_sha_mismatch", "remote_missing",
+    "local_missing", "local_size_mismatch", "local_sha_mismatch", "local_unreadable", "remote_missing",
 )
 #: A failure of the STORE (not of one recording): the rest of the pass waits.
 STOP_REASONS = frozenset({"unreachable", "timeout", "tls", "auth", "storage_full", "busy", "http_5xx"})
-PROXY_RESULTS = ("ok", "partial", "not_satisfiable", "unavailable", "missing")
+PROXY_RESULTS = ("ok", "partial", "not_satisfiable", "bad_request", "busy", "unavailable", "missing")
 RESTORE_RESULTS = ("restored", "held", "unavailable", "missing", "mismatch", "no_space", "deleted")
-RECONCILE_RESULTS = ("orphan_deleted", "deleted_row_purged", "repaired", "remote_missing", "foreign")
+#: What the daily reconcile found. There is no "deleted" for an object this
+#: database has no row for: such an object is set aside (orphan_quarantined)
+#: once it is older than _ORPHAN_GRACE_S, and only an operator purges it.
+RECONCILE_RESULTS = (
+    "orphan_quarantined", "orphan_waiting", "other_owner", "unowned",
+    "deleted_row_purged", "repaired", "remote_missing", "foreign",
+)
 
 UNAVAILABLE_DETAIL = (
     "This recording is kept on the archive server, which isn't answering right now. "
     "Nothing is lost; try again in a few minutes."
+)
+BUSY_DETAIL = (
+    "Many recordings are playing from the archive server right now. "
+    "Nothing is lost; try again in a moment."
 )
 MISSING_DETAIL = "This recording's audio could not be found on the archive server."
 
@@ -134,6 +162,16 @@ _READ_TIMEOUT_S = 30.0
 #: connection the store was closing at that moment failed with nothing
 #: wrong: 503 archive_unavailable to someone seeking in a moved recording.
 _KEEPALIVE_EXPIRY_S = 2.0
+#: Connections to the store per event loop. Every proxied playback or
+#: download holds one for its whole stream (a paused player too, until the
+#: browser lets it go), so with 8 the ninth listener waited out the pool and
+#: was told the archive "isn't answering" (review 2026-09-30, measured with
+#: real Chromium). The store serves compose/voice-store/server.py
+#: LIMIT_CONCURRENCY (64) at once: room for this loop's pool and the mover's.
+_MAX_CONNECTIONS = 32
+#: How long a request waits for a free connection before it is told the
+#: archive is busy (503 archive_busy), not that the archive is down.
+_POOL_TIMEOUT_S = 5.0
 _DELETE_TIMEOUT_S = 2.0
 _HEALTH_TIMEOUT_S = 5.0
 #: Download and hashing chunks; the proxy streams 64 KiB pieces.
@@ -149,10 +187,15 @@ _BACKOFF_CAP_S = 3600.0
 _CLAIM_LEASE_S = 600
 _RECONCILE_EVERY_S = 86400.0
 _HEAD_SWEEP_EVERY_S = 3600.0
-#: An object with no row at all is deleted only after this long: a row is
-#: created long before its first byte, so this covers only a users row an
-#: operator deleted by hand (the V42 cascade) and a verify run that died.
-_ORPHAN_GRACE_S = 86400.0
+#: An object of THIS deployment that no row of this database knows is set
+#: aside (quarantined) once it was stored this long ago, and never deleted:
+#: a row exists long before its first byte, so a true orphan is a users row
+#: an operator deleted by hand (the V42 cascade), or this database restored
+#: from a backup older than the recording, or a copy of it running elsewhere.
+#: Two weeks lets a short-lived copy come and go without touching anything,
+#: and the store keeps what is set aside another 30 days at least
+#: (VOICE_STORE_QUARANTINE_MIN_AGE_S) until an operator purges it.
+_ORPHAN_GRACE_S = 14 * 86400.0
 _TEMP_MAX_AGE_S = 3600.0
 _LOCK_NAME = ".archive.lock"
 _RESTORE_PREFIX = ".restore-"
@@ -185,6 +228,14 @@ def _unavailable() -> dictation.SessionError:
     return dictation.SessionError(503, "archive_unavailable", UNAVAILABLE_DETAIL, retry_after_s=30)
 
 
+def _busy() -> dictation.SessionError:
+    return dictation.SessionError(503, "archive_busy", BUSY_DETAIL, retry_after_s=5)
+
+
+def _no_room() -> dictation.SessionError:
+    return dictation.SessionError(507, "storage_full", "The server has no room to bring this recording back right now.")
+
+
 def _missing() -> dictation.SessionError:
     return dictation.SessionError(410, "audio_missing", MISSING_DETAIL)
 
@@ -195,6 +246,57 @@ def _deleted() -> dictation.SessionError:
 
 def _error(reason: str) -> None:
     metrics.inc("voice_archive_errors_total", "voice archive failures, by reason", reason=reason)
+
+
+# ------------------------------------------------------------ the owner --
+#
+# The store's token says who may talk to it; it cannot say whose recording an
+# object is, and every orchestrator given this deployment's store URL, token
+# and certificate (an e2e stack, a candidate, a developer's) used to delete
+# production's only copies: its reconcile deleted whatever its OWN database
+# had no row for (review 2026-09-30, the HIGH). So every object carries the
+# owner of the deployment that stored it (X-Archive-Owner), and that owner is
+# kept in this deployment's DATABASE (voice_archive_owner, V43): another
+# database is another owner. The store deletes, sets aside or restores an
+# object for its owner only, and this module deletes only what one of its own
+# rows positively says was deleted.
+
+#: database DSN -> its owner. Keyed by the DSN because the owner belongs to
+#: the database, not the process (a test points one process at two).
+_OWNERS: Dict[str, str] = {}
+_OWNERS_LOCK = threading.Lock()
+
+
+def _load_owner() -> str:
+    """This database's owner, made on first use (32 random hex characters)."""
+    with db.connection() as con:
+        con.execute(
+            "INSERT INTO voice_archive_owner (id, owner) VALUES (1, %s) ON CONFLICT (id) DO NOTHING",
+            (secrets.token_hex(16),),
+        )
+        return str(con.execute("SELECT owner FROM voice_archive_owner WHERE id = 1").fetchone()["owner"])
+
+
+def deployment_owner_sync() -> str:
+    """This deployment's owner on the store. Blocking; cached per database."""
+    key = db.dsn()
+    with _OWNERS_LOCK:
+        owner = _OWNERS.get(key)
+    if owner is None:
+        loaded = _load_owner()
+        with _OWNERS_LOCK:
+            owner = _OWNERS.setdefault(key, loaded)
+    return owner
+
+
+async def deployment_owner() -> str:
+    owner = _OWNERS.get(db.dsn())
+    return owner if owner is not None else await db.run_in_thread(deployment_owner_sync)
+
+
+async def _owned_headers() -> Dict[str, str]:
+    """The token and this deployment's owner: every call that changes an object."""
+    return {**_auth(), "X-Archive-Owner": await deployment_owner()}
 
 
 # ------------------------------------------------------------ the client --
@@ -265,9 +367,10 @@ async def _client() -> httpx.AsyncClient:
             client = await asyncio.to_thread(
                 lambda: factory(
                     verify=verify,
-                    timeout=httpx.Timeout(_READ_TIMEOUT_S, connect=_CONNECT_TIMEOUT_S),
+                    timeout=_timeout(),
                     limits=httpx.Limits(
-                        max_connections=8, max_keepalive_connections=4, keepalive_expiry=_KEEPALIVE_EXPIRY_S,
+                        max_connections=_MAX_CONNECTIONS, max_keepalive_connections=4,
+                        keepalive_expiry=_KEEPALIVE_EXPIRY_S,
                     ),
                     follow_redirects=False,
                     # The store is a LAN address: an HTTP(S)_PROXY in the
@@ -311,6 +414,8 @@ def _transport_reason(exc: BaseException) -> str:
     text = str(exc)
     if "CERTIFICATE_VERIFY_FAILED" in text or "certificate" in text.lower() or isinstance(exc, ssl.SSLError):
         return "tls"
+    if isinstance(exc, httpx.PoolTimeout):
+        return "busy"  # every connection of this process's pool is in use
     if isinstance(exc, httpx.ConnectTimeout):
         return "unreachable"
     if isinstance(exc, httpx.TimeoutException):
@@ -337,7 +442,7 @@ def _status_reason(status: int) -> str:
 
 
 def _timeout(read: float = _READ_TIMEOUT_S) -> httpx.Timeout:
-    return httpx.Timeout(read, connect=_CONNECT_TIMEOUT_S)
+    return httpx.Timeout(read, connect=_CONNECT_TIMEOUT_S, pool=_POOL_TIMEOUT_S)
 
 
 async def _pace(started: float, done: int, rate: int) -> None:
@@ -419,7 +524,7 @@ async def put_object(row: Dict[str, Any], path: str, size: int, sha: str) -> str
     """PUT the head file; "new" or "already" (the same bytes were there)."""
     client = await _client()
     headers = {
-        **_auth(),
+        **await _owned_headers(),
         # With a Content-Length httpx sends the body as it is read, never chunked.
         "Content-Length": str(size),
         "X-Content-SHA256": sha,
@@ -474,22 +579,50 @@ async def read_back(row: Dict[str, Any], size: int, sha: str) -> None:
 
 
 async def delete_object(user_id: int, session_id: str, *, timeout: float = _READ_TIMEOUT_S) -> None:
+    """Delete this deployment's copy. Callers hold a POSITIVE reason, never
+    the absence of a row: a row that says deleted (a tombstone), or a row
+    recalled to the head with its bytes checked. The store refuses (409,
+    StoreError "conflict") an object another deployment stored."""
+    await _change("DELETE", f"/v1/recordings/{int(user_id)}/{session_id}", timeout=timeout)
+
+
+async def quarantine_object(user_id: int, session_id: str) -> None:
+    """Set this deployment's object aside on the store: out of reads and the
+    inventory, kept whole until restored or purged by an operator."""
+    await _change("POST", f"/v1/recordings/{int(user_id)}/{session_id}/quarantine")
+
+
+async def restore_quarantined(user_id: int, session_id: str) -> None:
+    await _change("POST", f"/v1/quarantine/{int(user_id)}/{session_id}/restore")
+
+
+async def purge_quarantined(user_id: int, session_id: str) -> None:
+    """Delete an object that was set aside. The store refuses (409) one set
+    aside less than VOICE_STORE_QUARANTINE_MIN_AGE_S ago, and another's."""
+    await _change("DELETE", f"/v1/quarantine/{int(user_id)}/{session_id}")
+
+
+async def _change(method: str, path: str, *, timeout: float = _READ_TIMEOUT_S) -> None:
     client = await _client()
+    headers = await _owned_headers()
     try:
-        response = await client.delete(
-            _url(f"/v1/recordings/{int(user_id)}/{session_id}"), headers=_auth(), timeout=_timeout(timeout),
-        )
+        response = await client.request(method, _url(path), headers=headers, timeout=_timeout(timeout))
     except httpx.HTTPError as exc:
         raise StoreError(_transport_reason(exc), str(exc)[:200]) from None
     if response.status_code not in (200, 204):
-        raise StoreError(_status_reason(response.status_code), status=response.status_code)
+        raise StoreError(_status_reason(response.status_code), _refusal_reason(response), status=response.status_code)
 
 
-async def inventory_page(after: str, limit: int = 500) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+async def inventory_page(
+    after: str, limit: int = 500, *, quarantined: bool = False,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """A page of what the store holds, each object with its owner; with
+    `quarantined`, of what it has set aside, each with when."""
     client = await _client()
     try:
         response = await client.get(
-            _url("/v1/inventory"), params={"after": after, "limit": limit}, headers=_auth(), timeout=_timeout(),
+            _url("/v1/quarantine" if quarantined else "/v1/inventory"),
+            params={"after": after, "limit": limit}, headers=_auth(), timeout=_timeout(),
         )
     except httpx.HTTPError as exc:
         raise StoreError(_transport_reason(exc), str(exc)[:200]) from None
@@ -637,10 +770,15 @@ def _releasable(limit: int) -> List[Dict[str, Any]]:
 
 
 def _purge_due(limit: int) -> List[Dict[str, Any]]:
+    """Deleted recordings whose store copy is not known to be gone. Keyed on
+    the DELETE, not on archive_state: a verified copy can sit behind a
+    'local' row (deleted while it was copied and the store's DELETE missed;
+    retranscribed while it was copied, then deleted; a mover killed between
+    its upload and its UPDATE), and the store's DELETE is idempotent."""
     with db.connection() as con:
         rows = con.execute(
             """SELECT id, user_id FROM voice_sessions
-               WHERE audio_deleted_at IS NOT NULL AND archive_state <> 'local' AND remote_purged_at IS NULL
+               WHERE audio_deleted_at IS NOT NULL AND remote_purged_at IS NULL
                ORDER BY audio_deleted_at LIMIT %s""",
             (int(limit),),
         ).fetchall()
@@ -751,8 +889,7 @@ def _gauges() -> Dict[str, Any]:
                 count(*) FILTER (WHERE archive_state = 'archived' AND audio_deleted_at IS NULL) AS archived_sessions,
                 COALESCE(sum(bytes_stored) FILTER (
                     WHERE archive_state = 'archived' AND audio_deleted_at IS NULL), 0) AS archived_bytes,
-                count(*) FILTER (WHERE audio_deleted_at IS NOT NULL AND archive_state <> 'local'
-                                   AND remote_purged_at IS NULL) AS purge_pending,
+                count(*) FILTER (WHERE audio_deleted_at IS NOT NULL AND remote_purged_at IS NULL) AS purge_pending,
                 count(*) FILTER (WHERE archive_error = 'remote_missing' AND archive_state = 'archived'
                                    AND audio_deleted_at IS NULL) AS remote_missing
                FROM (SELECT *, (archive_state = 'local' AND status IN ('done', 'failed') AND audio_deleted_at IS NULL
@@ -865,7 +1002,10 @@ async def copy_one(row: Dict[str, Any], *, room: Optional[int] = None) -> str:
         await db.run_in_thread(_fail, session_id, "local_missing")
         _error("local_missing")
         return "local_missing"
-    sha, actual = await asyncio.to_thread(_hash_file, path)
+    try:
+        sha, actual = await asyncio.to_thread(_hash_file, path)
+    except OSError as exc:
+        return await _unreadable(session_id, exc)
     if actual != size:
         await db.run_in_thread(_fail, session_id, "local_size_mismatch")
         _error("local_size_mismatch")
@@ -885,21 +1025,42 @@ async def copy_one(row: Dict[str, Any], *, room: Optional[int] = None) -> str:
         await db.run_in_thread(_fail, session_id, exc.reason)
         _error(exc.reason)
         raise
+    except OSError as exc:
+        # The head file failed while the PUT read it: this recording's
+        # trouble, not the store's (httpx raises its own errors for the network).
+        return await _unreadable(session_id, exc)
     metrics.inc("voice_archive_copied_total", "recordings copied to the store and read back")
     copied = await db.run_in_thread(_mark_copied, session_id, sha)
     if copied is None:
         current = await db.run_in_thread(dictation._row, session_id)
-        if current is None or current["status"] == dictation.STATUS_CANCELLED or current.get("audio_deleted_at") is not None:
-            # Deleted while it was copied: the copy goes too.
+        if current is None:
+            # No row at all (a users row deleted by hand): that is not a
+            # tombstone, so nothing is deleted; the reconcile sets it aside.
+            log.warning("voice archive: %s lost its row while it was copied; its copy is kept", session_id)
+            return "deleted_meanwhile"
+        if current["status"] == dictation.STATUS_CANCELLED or current.get("audio_deleted_at") is not None:
+            # Deleted while it was copied: the copy goes too, now or on the
+            # purge step (_purge_due), which retries what this misses.
             with contextlib.suppress(StoreError):
                 await delete_object(row["user_id"], session_id)
-                if current is not None:
-                    await db.run_in_thread(_mark_purged, session_id)
+                await db.run_in_thread(_mark_purged, session_id)
             return "deleted_meanwhile"
         # A retranscription started: the stored bytes are the same bytes, so
         # the copy stays and the next pass finds it already there.
         return "busy_meanwhile"
     return "archived" if await release(copied) else "copied"
+
+
+async def _unreadable(session_id: str, exc: OSError) -> str:
+    """A head file that cannot be read (EIO from a bad sector, EACCES): this
+    recording backs off and the rest of the pass goes on. Before, it raised
+    out of the pass, and as the oldest claim it came first in every pass
+    after, so nothing else ever moved (review 2026-09-30)."""
+    await db.run_in_thread(_fail, session_id, "local_unreadable")
+    _error("local_unreadable")
+    log.error("voice archive: %s could not be read on the head (%s); it waits, the rest move",
+              session_id, exc.strerror or type(exc).__name__)
+    return "local_unreadable"
 
 
 async def _purge_pass(stats: Dict[str, int]) -> None:
@@ -983,11 +1144,18 @@ async def _restore_file(row: Dict[str, Any], directory: str) -> None:
     free = dictation.free_bytes(directory)
     if free is not None and free - size < settings.voice_min_free_bytes:
         metrics.inc("voice_archive_restored_total", "recordings brought back to the head", result="no_space")
-        raise dictation.SessionError(507, "storage_full", "The server has no room to bring this recording back right now.")
+        raise _no_room()
     temp = os.path.join(directory, f"{_RESTORE_PREFIX}{uuid.uuid4().hex}")
     try:
         try:
             await download_to(row, temp, size, sha)
+        except OSError as exc:
+            if exc.errno not in (errno.ENOSPC, errno.EDQUOT):
+                raise
+            # The disk filled while it downloaded (the floor was checked just
+            # before): nothing is left behind, and the person is told so.
+            metrics.inc("voice_archive_restored_total", "recordings brought back to the head", result="no_space")
+            raise _no_room() from None
         except StoreError as exc:
             _error(exc.reason)
             if exc.reason == "missing":
@@ -1088,8 +1256,26 @@ async def recording_response(row: Dict[str, Any], request: Request) -> Response:
     if await asyncio.to_thread(os.path.exists, path):
         return FileResponse(path, media_type=row["mime_type"], filename=filename, headers=headers)
     if (row.get("archive_state") or LOCAL) == LOCAL:
-        raise _deleted()
+        # The row may have been read just before the mover copied and
+        # released this recording (milliseconds apart): read it again before
+        # calling the audio deleted.
+        fresh = await db.run_in_thread(dictation._row, row["id"])
+        if (
+            fresh is None or int(fresh["user_id"]) != int(row["user_id"])
+            or fresh.get("audio_deleted_at") is not None or (fresh.get("archive_state") or LOCAL) == LOCAL
+        ):
+            raise _deleted()
+        row = fresh
+        if await asyncio.to_thread(os.path.exists, path):
+            return FileResponse(path, media_type=row["mime_type"], filename=filename, headers=headers)
     return await _proxy(row, request, filename, headers)
+
+
+def _busy_response() -> JSONResponse:
+    error = _busy()
+    return JSONResponse(
+        status_code=error.status, content=error.body(), headers={"Retry-After": "5", "Cache-Control": "no-store"}
+    )
 
 
 async def _proxy(row: Dict[str, Any], request: Request, filename: str, headers: Dict[str, str]) -> Response:
@@ -1106,6 +1292,12 @@ async def _proxy(row: Dict[str, Any], request: Request, filename: str, headers: 
         response = await client.send(
             client.build_request("GET", _object_url(row), headers=upstream, timeout=_timeout()), stream=True,
         )
+    except httpx.PoolTimeout:
+        # Every connection this process may open to the store is carrying a
+        # recording: the store is fine, this is a queue.
+        _error("busy")
+        counted("busy")
+        return _busy_response()
     except (httpx.HTTPError, StoreError) as exc:
         _error(exc.reason if isinstance(exc, StoreError) else _transport_reason(exc))
         counted("unavailable")
@@ -1117,6 +1309,10 @@ async def _proxy(row: Dict[str, Any], request: Request, filename: str, headers: 
             if response.headers.get(name):
                 out[name] = response.headers[name]
         out["content-disposition"] = f'attachment; filename="{filename}"'
+        # A multi-range answer is multipart/byteranges with the store's
+        # boundary, exactly as the head's own FileResponse labels it.
+        upstream_type = response.headers.get("content-type") or ""
+        media_type = upstream_type if upstream_type.startswith("multipart/byteranges") else row["mime_type"]
 
         async def body() -> AsyncIterator[bytes]:
             try:
@@ -1129,8 +1325,26 @@ async def _proxy(row: Dict[str, Any], request: Request, filename: str, headers: 
         # The background close also runs when the listener left before the
         # first byte, so the pooled connection is never held by a dead stream.
         return StreamingResponse(
-            body(), status_code=status, headers=out, media_type=row["mime_type"],
+            body(), status_code=status, headers=out, media_type=media_type,
             background=BackgroundTask(response.aclose),
+        )
+    if 400 <= status < 500 and status not in (401, 403, 404, 407, 416):
+        # The listener's own request was refused (a malformed Range, say):
+        # the same answer the head gives, not "the archive isn't answering".
+        try:
+            detail = b""
+            async for chunk in response.aiter_raw(4096):
+                detail += chunk
+                if len(detail) >= 4096:
+                    break
+        except httpx.HTTPError:
+            detail = b""
+        finally:
+            await response.aclose()
+        counted("bad_request")
+        return Response(
+            content=detail[:4096], status_code=status, headers={"Cache-Control": "no-store"},
+            media_type=response.headers.get("content-type") or "text/plain",
         )
     await response.aclose()
     if status == 416:
@@ -1233,12 +1447,28 @@ def _parse_time(value: Any) -> Optional[datetime]:
 
 
 async def reconcile_once() -> Dict[str, int]:
-    """The store's inventory against the rows. Deletes what nobody owns any
-    more, flags archived recordings the store lost, and repairs rows that
+    """The store's inventory against this deployment's rows.
+
+    It NEVER deletes an object because this database has no row for it: after
+    release the store holds the only copy, and another orchestrator with its
+    own database (an e2e stack, a candidate) used to delete production's
+    recordings exactly that way (review 2026-09-30). So:
+      * another deployment's object (its owner is not ours) is counted,
+        never touched, never taken for one of ours;
+      * one of OUR objects with no row is set aside on the store once it was
+        stored _ORPHAN_GRACE_S ago (orphan_quarantined; kept whole, restorable,
+        purged only by an operator), and counted until then (orphan_waiting);
+      * an object with no recorded owner (stored before owners were) serves
+        rows that know it, and is never set aside;
+      * a row that SAYS its recording was deleted (a tombstone) deletes our
+        copy (deleted_row_purged).
+    It also flags archived recordings the store lost, and repairs rows that
     say local or copied when only the store has the audio."""
     stats = {name: 0 for name in RECONCILE_RESULTS}
+    me = await deployment_owner()
     started = await db.run_in_thread(_db_now)
     seen: set = set()
+    claimed_elsewhere = 0
     after = ""
     while True:
         objects, next_after = await inventory_page(after, 500)
@@ -1248,14 +1478,34 @@ async def reconcile_once() -> Dict[str, int]:
             if not dictation._SESSION_ID.match(session_id):
                 continue
             user_id = int(item.get("user_id") or 0)
-            seen.add(session_id)
+            owner = item.get("owner") if isinstance(item.get("owner"), str) else None
             row = rows.get(session_id)
+            if owner is not None and owner != me:
+                stats["other_owner"] += 1
+                claimed_elsewhere += row is not None
+                continue
+            if owner is None:
+                stats["unowned"] += 1
+            seen.add(session_id)
             if row is None:
+                if owner is None:
+                    continue  # nobody's we can prove: left exactly as it is
                 stored_at = _parse_time(item.get("stored_at"))
-                if stored_at is None or (started - stored_at).total_seconds() > _ORPHAN_GRACE_S:
-                    with contextlib.suppress(StoreError):
-                        await delete_object(user_id, session_id)
-                        stats["orphan_deleted"] += 1
+                if stored_at is None or (started - stored_at).total_seconds() <= _ORPHAN_GRACE_S:
+                    stats["orphan_waiting"] += 1
+                    continue
+                try:
+                    await quarantine_object(user_id, session_id)
+                except StoreError as exc:
+                    _error(exc.reason)
+                    stats["orphan_waiting"] += 1
+                    continue
+                stats["orphan_quarantined"] += 1
+                log.warning(
+                    "voice archive: set aside %d/%s on the store: stored %s and no row here knows it "
+                    "(python -m app.voice_archive quarantine-restore %d/%s puts it back)",
+                    user_id, session_id, item.get("stored_at"), user_id, session_id,
+                )
                 continue
             if int(row["user_id"]) != user_id:
                 stats["foreign"] += 1
@@ -1290,6 +1540,17 @@ async def reconcile_once() -> Dict[str, int]:
         _error("remote_missing")
         log.error("voice archive: archived recording %s is not on the store", row["id"])
         await db.run_in_thread(_flag, row["id"], "remote_missing")
+    if stats["other_owner"]:
+        log.warning(
+            "voice archive: the store holds %d recording(s) of another deployment (an orchestrator on another "
+            "database uses this store); none were touched", stats["other_owner"],
+        )
+    if claimed_elsewhere:
+        log.error(
+            "voice archive: %d recording(s) this database has rows for are stored under another owner "
+            "(was the voice_archive_owner row changed?); they are left alone and cannot be deleted from here",
+            claimed_elsewhere,
+        )
     for name, count in stats.items():
         for _ in range(count):
             metrics.inc("voice_archive_reconcile_total", "voice archive reconcile outcomes", result=name)
@@ -1434,18 +1695,77 @@ def stop() -> None:
 # ------------------------------------------------------------------- CLI --
 
 
+async def quarantined_objects(*, mine_only: bool = True) -> List[Dict[str, Any]]:
+    """What the store has set aside (this deployment's, unless `mine_only` is off)."""
+    me = await deployment_owner()
+    out: List[Dict[str, Any]] = []
+    after = ""
+    while True:
+        objects, next_after = await inventory_page(after, 500, quarantined=True)
+        out += [o for o in objects if not mine_only or o.get("owner") == me]
+        if not next_after:
+            return out
+        after = next_after
+
+
+async def quarantine_purge(*, older_than_days: float) -> Dict[str, int]:
+    """The operator's purge: this deployment's objects set aside more than
+    `older_than_days` ago (the store refuses any within its own minimum)."""
+    stats = {"purged": 0, "kept": 0, "failed": 0}
+    now = datetime.now(timezone.utc)
+    for item in await quarantined_objects():
+        since = _parse_time(item.get("quarantined_at"))
+        if since is None or (now - since).total_seconds() < older_than_days * 86400.0:
+            stats["kept"] += 1
+            continue
+        try:
+            await purge_quarantined(int(item["user_id"]), str(item["session_id"]))
+        except StoreError as exc:
+            stats["failed"] += 1
+            log.error("voice archive: %s/%s was not purged: %s %s", item["user_id"], item["session_id"], exc.reason, exc.detail)
+            continue
+        stats["purged"] += 1
+    return stats
+
+
+def _object_id(value: str) -> Tuple[int, str]:
+    user, _, session = (value or "").partition("/")
+    if not user.isdigit() or not dictation._SESSION_ID.match(session):
+        raise argparse.ArgumentTypeError("give <user id>/<session id>, as quarantine-list prints them")
+    return int(user), session
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.voice_archive", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     recall = sub.add_parser("recall-all", help="bring every recording back to the head and mark it local (rollback)")
     recall.add_argument("--keep-remote", action="store_true", help="leave the store's copies in place")
+    recall.add_argument(
+        "--force", action="store_true", help="run although VOICE_ARCHIVE_ENABLED is on (the mover moves them again)",
+    )
     sub.add_parser("status", help="counts by state, and the store's /health")
-    sub.add_parser("reconcile", help="run the reconcile once")
+    sub.add_parser("reconcile", help="run the reconcile once (it never deletes a recording no row knows)")
     sub.add_parser("pass", help="run one pass of the mover once")
+    qlist = sub.add_parser("quarantine-list", help="this deployment's recordings the reconcile set aside on the store")
+    qlist.add_argument("--all", action="store_true", help="every deployment's, with its owner")
+    qrestore = sub.add_parser("quarantine-restore", help="put a recording that was set aside back on the store")
+    qrestore.add_argument("object", type=_object_id, help="<user id>/<session id>")
+    qpurge = sub.add_parser("quarantine-purge", help="DELETE this deployment's recordings set aside long ago")
+    qpurge.add_argument("--older-than-days", type=float, default=30.0, help="set aside at least this long ago (30)")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     if not configured():
         print("VOICE_ARCHIVE_URL and VOICE_ARCHIVE_TOKEN must be set", file=sys.stderr)
+        return 2
+    if args.command == "recall-all" and settings.voice_archive_enabled and not args.force:
+        # Rollback step 1 skipped: the next pass would move everything back
+        # out, and the code rollback would then leave it answering 410.
+        print(
+            "VOICE_ARCHIVE_ENABLED is on, so the mover would move every recalled recording out again. "
+            "Set VOICE_ARCHIVE_ENABLED=false and recreate the orchestrator first (docs/voice-archive.md, "
+            "Rollback), or pass --force.",
+            file=sys.stderr,
+        )
         return 2
 
     async def run() -> Any:
@@ -1456,6 +1776,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return await reconcile_once()
             if args.command == "pass":
                 return await archive_once()
+            if args.command == "quarantine-list":
+                return {"owner": await deployment_owner(), "objects": await quarantined_objects(mine_only=not args.all)}
+            if args.command == "quarantine-restore":
+                try:
+                    await restore_quarantined(*args.object)
+                except StoreError as exc:
+                    return {"failed": 1, "reason": exc.reason, "detail": exc.detail}
+                return {"restored": 1}
+            if args.command == "quarantine-purge":
+                return await quarantine_purge(older_than_days=args.older_than_days)
             counts = await db.run_in_thread(_gauges)
             try:
                 health: Any = await store_health()

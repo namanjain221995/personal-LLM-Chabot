@@ -26,7 +26,9 @@ import ast
 import asyncio
 import base64
 import concurrent.futures
+import errno
 import importlib.util
+import json
 import os
 import shutil
 import socket
@@ -36,10 +38,13 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
+import psycopg
 import pytest
+from starlette.requests import Request
 
 from app import db, dictation, metrics, voice_archive
 from app.config import settings
@@ -305,9 +310,9 @@ def test_only_finished_kept_idle_recordings_with_audio_are_candidates(archive, v
         sid, _ = finished(voice, alice, seed=len(others) + 2)
         sql(statement, sid)
         others[label] = sid
-    claimed = run(db.run_in_thread(voice_archive._claim, 20, 0.0))
+    claimed = run(db.run_in_thread(voice_archive._claim, 20, DUE_NOW))
     assert [r["id"] for r in claimed] == [eligible]
-    assert run(db.run_in_thread(voice_archive._claim, 20, 0.0)) == [], "a claim is a lease another pass skips"
+    assert run(db.run_in_thread(voice_archive._claim, 20, DUE_NOW)) == [], "a claim is a lease another pass skips"
     for sid in others.values():
         assert row_of(sid)["archive_state"] == "local"
 
@@ -322,7 +327,7 @@ def test_a_row_another_mover_holds_is_skipped_not_waited_for(archive, voice, log
     try:
         other.execute("SELECT id FROM voice_sessions WHERE id = %s FOR UPDATE", (first,))
         started = time.monotonic()
-        claimed = run(db.run_in_thread(voice_archive._claim, 20, 0.0))
+        claimed = run(db.run_in_thread(voice_archive._claim, 20, DUE_NOW))
         assert time.monotonic() - started < 5
         assert [r["id"] for r in claimed] == [second]
     finally:
@@ -835,6 +840,82 @@ def test_a_delete_the_store_missed_is_purged_when_it_is_back(archive, voice, log
     assert 'voice_archive_purge_pending 0' in metrics.render()
 
 
+def _gauge(name: str) -> Optional[float]:
+    for line in metrics.render().splitlines():
+        if line.startswith(name + " "):
+            return float(line.split()[1])
+    return None
+
+
+def test_a_recording_deleted_during_its_copy_is_purged_by_the_next_pass_when_the_stores_delete_missed(
+    archive, voice, login_client, monkeypatch,
+):
+    """The copy was verified, then the person deleted the recording, and the
+    store's DELETE failed once: the row stays 'local'. The purge step (and
+    voice_archive_purge_pending) looked only at rows that were not 'local', so
+    the person's deleted voice stayed on the worker until the daily reconcile
+    (review 2026-09-30)."""
+    alice = login_client("alice")
+    sid, _data = finished(voice, alice)
+    uid = uid_of("alice")
+    real_read_back = voice_archive.read_back
+
+    async def discard_then_read_back(row, size, digest):
+        await db.run_in_thread(dictation.discard, uid, sid)
+        return await real_read_back(row, size, digest)
+
+    monkeypatch.setattr(voice_archive, "read_back", discard_then_read_back)
+    blips = {"n": 0}
+
+    def one_failed_delete(request: httpx.Request) -> Optional[httpx.Response]:
+        if request.method == "DELETE" and blips["n"] == 0:
+            blips["n"] += 1
+            return httpx.Response(503, json={"reason": "busy"})
+        return None
+
+    archive.fail = one_failed_delete
+    assert run(voice_archive.archive_once()) == {"deleted_meanwhile": 1}
+    assert blips["n"] == 1 and archive.objects() == [(uid, sid)], "the store's DELETE missed"
+    archive.fail = None
+    assert row_of(sid)["archive_state"] == "local" and row_of(sid)["remote_purged_at"] is None
+    assert _gauge("voice_archive_purge_pending") == 1.0, "and the gauge says so"
+    assert run(voice_archive.archive_once()) == {"purged": 1}
+    assert archive.objects() == [] and row_of(sid)["remote_purged_at"] is not None
+    assert _gauge("voice_archive_purge_pending") == 0.0
+
+
+def test_a_recording_retranscribed_during_its_copy_then_deleted_leaves_no_copy_on_the_store(
+    archive, voice, login_client, monkeypatch,
+):
+    """No store failure at all: 'busy_meanwhile' keeps the verified copy on
+    the store while the row stays 'local'; the person then deletes it."""
+    alice = login_client("alice")
+    sid, _data = finished(voice, alice)
+    uid = uid_of("alice")
+    real_read_back = voice_archive.read_back
+
+    async def retranscribe_then_read_back(row, size, digest):
+        r = await asyncio.to_thread(lambda: alice.post(f"/audio/sessions/{sid}/retranscribe", json={"scope": "all"}))
+        assert r.status_code == 202, r.text
+        return await real_read_back(row, size, digest)
+
+    monkeypatch.setattr(voice_archive, "read_back", retranscribe_then_read_back)
+    assert run(voice_archive.archive_once()) == {"busy_meanwhile": 1}
+    monkeypatch.setattr(voice_archive, "read_back", real_read_back)
+    wait_done(alice, sid)
+    assert archive.objects() == [(uid, sid)] and row_of(sid)["archive_state"] == "local"
+    assert alice.delete(f"/audio/sessions/{sid}").status_code == 204
+    assert run(voice_archive.archive_once()) == {"purged": 1}
+    assert archive.objects() == [], "the deleted recording's verified copy is gone from the worker"
+
+
+def test_the_purge_is_keyed_on_the_delete_in_the_index_too():
+    ddl = " ".join(db._MIGRATION_V43.split())
+    predicate = ddl.split("CREATE INDEX IF NOT EXISTS idx_voice_sessions_archive_purge", 1)[1].split(";", 1)[0]
+    assert "WHERE audio_deleted_at IS NOT NULL AND remote_purged_at IS NULL" in predicate
+    assert "archive_state" not in predicate
+
+
 def test_retention_deletes_the_stores_copy_as_well(archive, voice, login_client, monkeypatch):
     alice = login_client("alice")
     sid, _data = finished(voice, alice)
@@ -849,7 +930,43 @@ def test_retention_deletes_the_stores_copy_as_well(archive, voice, login_client,
 # ------------------------------------------------------------ reconcile --
 
 
-def test_the_reconcile_deletes_what_nobody_owns_flags_what_was_lost_and_repairs_rows(archive, voice, login_client):
+def _iso_days_ago(days: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def _plant(control: "StoreControl", uid: int, *, owner: Optional[str], days: float) -> str:
+    """An object on the store that no row of this database knows."""
+    sid = uuid.uuid4().hex
+    folder = control.root / str(uid) / sid
+    folder.mkdir(parents=True)
+    (folder / "source.wav").write_bytes(b"RIFF")
+    manifest = {"name": "source.wav", "sha256": "0" * 64, "bytes": 4, "stored_at": _iso_days_ago(days)}
+    if owner is not None:
+        manifest["owner"] = owner
+    (folder / "manifest.json").write_text(json.dumps(manifest))
+    return sid
+
+
+def _changes(control: "StoreControl", since: int) -> List[Tuple[str, str]]:
+    """Every call after `since` that could change or remove an object."""
+    return [(m, p) for m, p in control.requests[since:] if m in ("PUT", "POST", "DELETE")]
+
+
+def test_every_object_names_the_deployment_whose_database_stored_it(archive, voice, login_client):
+    alice = login_client("alice")
+    sid, _data = finished(voice, alice)
+    run(voice_archive.archive_once())
+    me = run(voice_archive.deployment_owner())
+    assert len(me) == 32 and int(me, 16) >= 0
+    with db.connection() as con:
+        assert con.execute("SELECT owner FROM voice_archive_owner").fetchall() == [{"owner": me}]
+    manifest = json.loads((archive.root / str(uid_of("alice")) / sid / "manifest.json").read_text())
+    assert manifest["owner"] == me
+
+
+def test_the_reconcile_sets_aside_only_its_own_old_orphans_and_deletes_only_what_a_row_says_was_deleted(
+    archive, voice, login_client, capsys,
+):
     alice = login_client("alice")
     uid = uid_of("alice")
     kept, _ = finished(voice, alice, seed=21)
@@ -857,27 +974,142 @@ def test_the_reconcile_deletes_what_nobody_owns_flags_what_was_lost_and_repairs_
     cancelled, _ = finished(voice, alice, seed=23)
     repaired, _ = finished(voice, alice, seed=24)
     run(voice_archive.archive_once())
-    # An object with no row, stored two days ago; one stored just now.
-    for sid, age in ((uuid.uuid4().hex, 2 * 86400), (uuid.uuid4().hex, 60)):
-        folder = archive.root / str(uid) / sid
-        folder.mkdir(parents=True)
-        (folder / "source.wav").write_bytes(b"RIFF")
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() - age))
-        (folder / "manifest.json").write_text(
-            f'{{"name": "source.wav", "sha256": "{"0" * 64}", "bytes": 4, "stored_at": "{stamp}"}}'
-        )
+    me = run(voice_archive.deployment_owner())
+    # No row of this database knows these: two of ours, 20 days and 2 days
+    # old; another deployment's; and one stored before owners were recorded.
+    old_orphan = _plant(archive, uid, owner=me, days=20)
+    young_orphan = _plant(archive, uid, owner=me, days=2)
+    theirs = _plant(archive, uid, owner="b" * 32, days=400)
+    nobodys = _plant(archive, uid, owner=None, days=400)
     shutil.rmtree(archive.root / str(uid) / lost)
     sql("UPDATE voice_sessions SET status = 'cancelled', audio_deleted_at = now(), archive_state = 'local' WHERE id = %s", cancelled)
     sql("UPDATE voice_sessions SET archive_state = 'local', head_released_at = NULL WHERE id = %s", repaired)
     sql("UPDATE voice_sessions SET archived_at = now() - interval '1 hour'")
+    before = len(archive.requests)
     stats = run(voice_archive.reconcile_once())
-    assert stats == {"orphan_deleted": 1, "deleted_row_purged": 1, "repaired": 1, "remote_missing": 1, "foreign": 0}
+    assert stats == {
+        "orphan_quarantined": 1, "orphan_waiting": 1, "other_owner": 1, "unowned": 1,
+        "deleted_row_purged": 1, "repaired": 1, "remote_missing": 1, "foreign": 0,
+    }
+    assert sorted(_changes(archive, before)) == [
+        ("DELETE", f"/v1/recordings/{uid}/{cancelled}"),
+        ("POST", f"/v1/recordings/{uid}/{old_orphan}/quarantine"),
+    ], "the tombstone's copy is deleted; the old orphan is set aside; nothing else is touched"
     assert row_of(lost)["archive_error"] == "remote_missing"
     assert row_of(repaired)["archive_state"] == "archived"
     assert row_of(kept)["archive_state"] == "archived" and row_of(kept)["archive_error"] is None
-    remaining = {sid for _u, sid in archive.objects()}
-    assert kept in remaining and repaired in remaining and cancelled not in remaining
-    assert len(remaining) == 3, "the fresh orphan waits out its grace"
+    assert {sid for _u, sid in archive.objects()} == {kept, repaired, young_orphan, theirs, nobodys}
+    aside = archive.root / ".quarantine" / str(uid) / old_orphan
+    assert (aside / "source.wav").read_bytes() == b"RIFF", "set aside whole, not deleted"
+    assert [(o["session_id"], o["owner"]) for o in run(voice_archive.quarantined_objects())] == [(old_orphan, me)]
+
+    # The operator's commands. The purge keeps what was set aside recently.
+    assert voice_archive.main(["quarantine-purge"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"purged": 0, "kept": 1, "failed": 0}
+    assert voice_archive.main(["quarantine-restore", f"{uid}/{old_orphan}"]) == 0
+    capsys.readouterr()
+    assert (archive.root / str(uid) / old_orphan / "source.wav").read_bytes() == b"RIFF"
+    run(voice_archive.quarantine_object(uid, old_orphan))
+    (aside / "quarantine.json").write_text(json.dumps({"quarantined_at": _iso_days_ago(40)}))
+    assert voice_archive.main(["quarantine-purge"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"purged": 1, "kept": 0, "failed": 0}
+    assert not aside.exists()
+    assert {sid for _u, sid in archive.objects()} == {kept, repaired, young_orphan, theirs, nobodys}
+
+
+def _empty_database(suffix: str) -> str:
+    """A second, empty database on the test server (another deployment's)."""
+    base, _, name = db.dsn().rpartition("/")
+    second = f"{name.split('?', 1)[0]}_{suffix}_test"
+    with psycopg.connect(f"{base}/postgres", autocommit=True, connect_timeout=5) as admin:
+        admin.execute(f'DROP DATABASE IF EXISTS "{second}" WITH (FORCE)')
+        admin.execute(f"""CREATE DATABASE "{second}" TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C' ENCODING 'UTF8'""")
+    return f"{base}/{second}"
+
+
+def _drop_database(dsn: str) -> None:
+    base, _, name = dsn.rpartition("/")
+    with psycopg.connect(f"{base}/postgres", autocommit=True, connect_timeout=5) as admin:
+        admin.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+def test_a_second_orchestrator_on_its_own_database_with_the_same_store_settings_deletes_nothing(
+    archive, voice, login_client, monkeypatch,
+):
+    """THE REVIEW'S HIGH (2026-09-30). An e2e stack, a candidate or a
+    developer's orchestrator given production's VOICE_ARCHIVE_URL, token and
+    certificate has its OWN, empty database. Its daily reconcile used to
+    delete every stored object its database had no row for, and after the
+    head copy's release the store holds production's ONLY copy: measured
+    {'orphan_deleted': 1}, then 410 audio_missing on production's playback.
+    Now the second deployment is another owner: its reconcile, its mover and
+    its purge touch nothing of production's, however old."""
+    alice = login_client("alice")
+    sid, data = finished(voice, alice)
+    assert run(voice_archive.archive_once()) == {"archived": 1}
+    uid = uid_of("alice")
+    production = run(voice_archive.deployment_owner())
+    manifest = archive.root / str(uid) / sid / "manifest.json"
+    body = json.loads(manifest.read_text())
+    body["stored_at"] = _iso_days_ago(400)  # past every grace there is
+    manifest.write_text(json.dumps(body))
+
+    first = db.dsn()
+    second = _empty_database("second_deployment")
+    try:
+        monkeypatch.setattr(settings, "app_database_url", second)
+        db.init_schema()
+        other = run(voice_archive.deployment_owner())
+        before = len(archive.requests)
+        stats = run(voice_archive.reconcile_once())
+        passed = run(voice_archive.archive_once())
+        changes = _changes(archive, before)
+    finally:
+        monkeypatch.setattr(settings, "app_database_url", first)
+        db.close_pool()
+        _drop_database(second)
+        voice_archive._OWNERS.pop(second, None)
+    assert other != production, "another database is another owner"
+    assert changes == [], f"the second deployment changed the store: {changes}"
+    assert stats["other_owner"] == 1 and stats["orphan_quarantined"] == 0, stats
+    assert passed == {}, passed
+    assert archive.objects() == [(uid, sid)]
+    back = alice.get(f"/audio/sessions/{sid}/audio")
+    assert back.status_code == 200 and back.content == data, "production still plays its recording"
+    # The store would refuse it anyway: another owner cannot delete it.
+    with pytest.raises(voice_archive.StoreError) as refused:
+        run(_as_owner(other, voice_archive.delete_object(uid, sid)))
+    assert refused.value.reason == "conflict" and refused.value.status == 409
+    assert archive.objects() == [(uid, sid)]
+
+
+async def _as_owner(owner: str, coro):
+    """Run `coro` speaking for `owner` on the store."""
+    key = db.dsn()
+    real = voice_archive._OWNERS.get(key)
+    voice_archive._OWNERS[key] = owner
+    try:
+        return await coro
+    finally:
+        if real is None:
+            voice_archive._OWNERS.pop(key, None)
+        else:
+            voice_archive._OWNERS[key] = real
+
+
+def test_a_copy_whose_row_vanished_is_kept_because_only_a_tombstone_deletes(archive, voice, login_client, monkeypatch):
+    alice = login_client("alice")
+    sid, _data = finished(voice, alice)
+    real_read_back = voice_archive.read_back
+
+    async def row_deleted_by_hand(row, size, digest):
+        await db.run_in_thread(sql, "DELETE FROM voice_sessions WHERE id = %s", sid)
+        return await real_read_back(row, size, digest)
+
+    monkeypatch.setattr(voice_archive, "read_back", row_deleted_by_hand)
+    assert run(voice_archive.archive_once()) == {"deleted_meanwhile": 1}
+    assert archive.objects() == [(uid_of("alice"), sid)], "no row is not a tombstone"
+    assert not [p for m, p in archive.requests if m == "DELETE"]
 
 
 # --------------------------------------------------------------- rollback --
@@ -897,6 +1129,217 @@ def test_recall_all_brings_every_recording_back_and_marks_it_local(archive, voic
         with open(dictation.source_path(row), "rb") as fh:
             assert fh.read() == data
     assert archive.objects() == []
+
+
+# ------------------------------------------------- reads, the fix round --
+
+
+@pytest.mark.parametrize("rng", ["bytes=abc", "bytes=5-2", "items=0-1"])
+def test_a_malformed_range_on_a_moved_recording_gets_the_heads_answer_not_an_outage(archive, voice, login_client, rng):
+    alice = login_client("alice")
+    sid, _data = finished(voice, alice)
+    local = alice.get(f"/audio/sessions/{sid}/audio", headers={"range": rng})
+    run(voice_archive.archive_once())
+    moved = alice.get(f"/audio/sessions/{sid}/audio", headers={"range": rng})
+    assert moved.status_code == local.status_code == 400, (local.status_code, moved.status_code, moved.text[:160])
+    assert 'voice_archive_errors_total{reason="http_4xx"}' not in metrics.render()
+    assert 'voice_archive_proxy_total{result="bad_request"}' in metrics.render()
+
+
+def test_a_multi_range_on_a_moved_recording_keeps_its_multipart_type(archive, voice, login_client):
+    alice = login_client("alice")
+    sid, _data = finished(voice, alice)
+    local = alice.get(f"/audio/sessions/{sid}/audio", headers={"range": "bytes=0-0,10-19"})
+    run(voice_archive.archive_once())
+    moved = alice.get(f"/audio/sessions/{sid}/audio", headers={"range": "bytes=0-0,10-19"})
+    assert local.headers["content-type"].startswith("multipart/byteranges")
+    assert moved.status_code == 206 and moved.headers["content-type"].startswith("multipart/byteranges")
+
+
+def test_a_read_that_saw_the_row_before_the_move_is_served_from_the_store_not_told_it_was_deleted(
+    archive, voice, login_client, monkeypatch,
+):
+    alice = login_client("alice")
+    sid, data = finished(voice, alice)
+    before_the_move = row_of(sid)
+    run(voice_archive.archive_once())
+    real = dictation._owned_row
+
+    def stale(session_id, user_id):
+        return dict(before_the_move) if session_id == sid else real(session_id, user_id)
+
+    monkeypatch.setattr(dictation, "_owned_row", stale)
+    got = alice.get(f"/audio/sessions/{sid}/audio")
+    assert got.status_code == 200 and got.content == data, got.text[:160]
+
+
+def test_retranscribe_refusals_while_the_store_is_down_do_not_use_up_the_hourly_retries(
+    archive, voice, login_client, monkeypatch,
+):
+    monkeypatch.setattr(settings, "voice_retranscribe_per_hour", 5)  # the production default
+    alice = login_client("alice")
+    sid, _data = finished(voice, alice)
+    run(voice_archive.archive_once())
+    archive.down = True
+    for attempt in range(5):
+        r = alice.post(f"/audio/sessions/{sid}/retranscribe", json={"scope": "all"})
+        assert r.status_code == 503 and r.json()["reason"] == "archive_unavailable", (attempt, r.text[:200])
+    archive.down = False
+    r = alice.post(f"/audio/sessions/{sid}/retranscribe", json={"scope": "all"})
+    assert r.status_code == 202, r.text[:200]
+
+
+def test_one_unreadable_head_file_does_not_stop_every_other_recording_moving(archive, voice, login_client, monkeypatch):
+    alice = login_client("alice")
+    first, _ = finished(voice, alice, seconds=4.0, seed=201)  # the oldest: claimed first
+    others = [finished(voice, alice, seconds=4.0, seed=202 + i)[0] for i in range(3)]
+    real_hash = voice_archive._hash_file
+
+    def unreadable(path):
+        if first in path:
+            raise OSError(errno.EIO, "Input/output error", path)
+        return real_hash(path)
+
+    monkeypatch.setattr(voice_archive, "_hash_file", unreadable)
+    assert run(voice_archive.archive_once()) == {"local_unreadable": 1, "archived": 3}
+    assert {row_of(s)["archive_state"] for s in others} == {"archived"}
+    row = row_of(first)
+    assert row["archive_state"] == "local" and row["archive_error"] == "local_unreadable" and row["archive_attempts"] == 1
+    assert 'voice_archive_errors_total{reason="local_unreadable"}' in metrics.render()
+
+
+def test_a_head_file_that_fails_while_the_put_reads_it_backs_off_that_recording_only(
+    archive, voice, login_client, monkeypatch,
+):
+    alice = login_client("alice")
+    sid, _data = finished(voice, alice)
+
+    async def failing_body(path, rate):
+        raise OSError(errno.EIO, "Input/output error", path)
+        yield b""  # pragma: no cover - an async generator
+
+    monkeypatch.setattr(voice_archive, "_paced_file", failing_body)
+    # Answered without the store: the transport reads the body, as a real one does.
+    archive.fail = lambda request: httpx.Response(201) if request.method == "PUT" else None
+    assert run(voice_archive.archive_once()) == {"local_unreadable": 1}
+    assert row_of(sid)["archive_error"] == "local_unreadable" and row_of(sid)["archive_state"] == "local"
+
+
+def test_the_heads_disk_filling_during_a_restore_is_507_and_leaves_nothing_behind(archive, voice, login_client, monkeypatch):
+    alice = login_client("alice")
+    sid, _data = finished(voice, alice)
+    run(voice_archive.archive_once())
+    calls = {"n": 0}
+
+    def fills_up(fd, data):
+        calls["n"] += 1
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(voice_archive, "_write_all", fills_up)
+    r = alice.post(f"/audio/sessions/{sid}/retranscribe", json={"scope": "all"})
+    assert calls["n"] >= 1
+    assert r.status_code == 507 and r.json()["reason"] == "storage_full", (r.status_code, r.text[:200])
+    row = row_of(sid)
+    assert row["archive_state"] == "archived" and row["status"] == "done"
+    assert not [n for n in head_files(voice, "alice", sid) if n.startswith((".restore-", "source."))]
+
+
+def test_recall_all_refuses_while_the_mover_would_move_everything_back_out(archive, voice, login_client, monkeypatch, capsys):
+    alice = login_client("alice")
+    sid, _data = finished(voice, alice)
+    run(voice_archive.archive_once())
+    monkeypatch.setattr(settings, "voice_archive_enabled", True)
+    assert voice_archive.main(["recall-all"]) == 2
+    assert "VOICE_ARCHIVE_ENABLED" in capsys.readouterr().err
+    assert row_of(sid)["archive_state"] == "archived", "nothing was recalled"
+    monkeypatch.setattr(settings, "voice_archive_enabled", False)
+    assert voice_archive.main(["recall-all"]) == 0
+    assert row_of(sid)["archive_state"] == "local"
+
+
+# ------------------------------------------------- the pool, real HTTP --
+
+
+def _store_server(root: Path) -> Tuple[Any, threading.Thread, int]:
+    """The store's app on a real port. Its own concurrency limit is set well
+    above any client pool here, so what is measured is the CLIENT's pool."""
+    import uvicorn
+
+    app = STORE.create_app(STORE.Settings(root=str(root), tokens=(TOKEN,), min_free_bytes=0), background=False)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(
+        app, host="127.0.0.1", port=port, log_level="error", lifespan="off", http="h11", loop="asyncio",
+        limit_concurrency=256,
+    ))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 15
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert server.started
+    return server, thread, port
+
+
+def test_playback_is_not_capped_at_eight_listeners_and_a_full_pool_says_busy_not_down(tmp_path, monkeypatch):
+    """Every proxied playback holds one pooled connection for its whole
+    stream. With 8 per loop the ninth listener waited out the pool and was
+    told the archive "isn't answering" (review 2026-09-30, real Chromium).
+    Real HTTP here: the store's own server, the module's own client."""
+    root = tmp_path / "store-root"
+    sid = uuid.uuid4().hex
+    folder = root / "7" / sid
+    folder.mkdir(parents=True)
+    data = os.urandom(256 * 1024)
+    (folder / "source.webm").write_bytes(data)
+    (folder / "manifest.json").write_text(json.dumps({"name": "source.webm", "sha256": sha(data), "bytes": len(data)}))
+    server, thread, port = _store_server(root)
+    monkeypatch.setattr(settings, "voice_archive_url", f"http://127.0.0.1:{port}")
+    monkeypatch.setattr(settings, "voice_archive_token", TOKEN)
+    monkeypatch.setattr(settings, "voice_archive_tls_cert_b64", "")
+    row = {"id": sid, "user_id": 7, "ext": "webm", "mime_type": "audio/webm", "status": "done", "archive_state": "archived"}
+
+    def request(rng: str) -> Request:
+        return Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": [(b"range", rng.encode())]})
+
+    async def scenario() -> Dict[str, Any]:
+        held: List[Any] = []
+        seen: Dict[str, Any] = {}
+        try:
+            async with asyncio.timeout(20):
+                for _ in range(16):  # sixteen players, each holding its stream
+                    held.append(await voice_archive._proxy(row, request("bytes=0-"), "r.webm", {}))
+                started = time.monotonic()
+                probe = await voice_archive._proxy(row, request("bytes=0-0"), "r.webm", {})
+                seen["seventeenth"] = (probe.status_code, time.monotonic() - started)
+                await probe.background()
+                while len(held) < voice_archive._MAX_CONNECTIONS:
+                    held.append(await voice_archive._proxy(row, request("bytes=0-"), "r.webm", {}))
+                started = time.monotonic()
+                full = await voice_archive._proxy(row, request("bytes=0-0"), "r.webm", {})
+                seen["full"] = (full.status_code, json.loads(full.body), full.headers.get("retry-after"), time.monotonic() - started)
+            seen["codes"] = sorted({r.status_code for r in held})
+            return seen
+        finally:
+            for response in held:
+                await response.background()
+            await voice_archive.close_client()
+
+    try:
+        seen = asyncio.run(scenario())
+    finally:
+        server.should_exit = True
+        thread.join(10)
+    assert seen["codes"] == [206]
+    status, elapsed = seen["seventeenth"]
+    assert status == 206 and elapsed < 2, seen
+    status, body, retry_after, waited = seen["full"]
+    assert status == 503 and body["reason"] == "archive_busy" and retry_after == "5", seen
+    assert waited < voice_archive._POOL_TIMEOUT_S + 3, "told promptly, not after the read timeout"
+    # And the store takes a full pool from each of the two loops that talk to
+    # it (requests; the mover with its restores) before it answers 503 itself.
+    assert STORE.LIMIT_CONCURRENCY >= 2 * voice_archive._MAX_CONNECTIONS
 
 
 # -------------------------------------------------------------- the pin --
