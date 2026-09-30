@@ -1,10 +1,10 @@
 # Live dictation
 
 The words while they are spoken. While someone dictates into the chat
-composer, a partial transcript follows their voice about a quarter of a second
-behind, and each utterance settles just under a second after they pause. It
-comes from a streaming speech model on the worker Spark's CPU, running beside
-the stored recording, which stays the record.
+composer, a partial transcript follows their voice about 0.3 s behind, and each
+utterance settles just under a second after they pause ([Latency](#latency)).
+It comes from a streaming speech model on the worker Spark's CPU, running
+beside the stored recording, which stays the record.
 
 Added 2026-09-30. Every number here was measured on this cluster, on the date
 given. The durable path this sits beside (V42 recording sessions,
@@ -30,29 +30,52 @@ The bar also has a small language control: **Auto**, **English** and
 in the new language from the last committed word. The recording itself is not
 touched.
 
-Press stop. The bar says *Transcribing…* while the full pass (whisper over the
-stored recording) finishes. Then one transcript goes into the message box. It
-is a draft and is never sent on its own:
+Press stop. One transcript goes into the message box, and which one, and
+when, depends on the language ([why](#which-transcript-goes-into-the-draft)).
+It is a draft and is never sent on its own:
 
-- **English, and any language not measured here:** the full-pass whisper
-  transcript, as before live dictation existed.
-- **Hindi or Hinglish:** the live transcript, but only if it heard the whole
-  recording. A session counts as Hindi or Hinglish when the live words are at
-  least 20 % Devanagari letters, when the person chose हिन्दी, or when whisper
-  heard Hindi or Urdu while the person had not chosen English. On this speech
-  whisper makes about twice the errors ([Accuracy](#accuracy)).
+- **Hindi or Hinglish, known from the live words:** the person chose हिन्दी,
+  or at least 20 % of the live transcript's letters are Devanagari. If the
+  live stream heard the whole recording, its transcript goes in as soon as the
+  stream settles, without waiting for whisper: 0.43 s after Stop for a 67.2 s
+  Hindi dictation ([Latency](#latency)). A quiet line says *Inserted the live
+  transcript.*, with nothing to press yet. The full pass (whisper over the
+  stored recording) carries on, and only when it is done does the line offer
+  **Use the other one**. If the full pass fails, the line adds *The full-pass
+  transcript could not be made, so there is no other one to swap in.* The live
+  words stay, and there is no Retry.
+- **English, and everything else:** the bar says *Transcribing…* until the
+  full pass is done, and then the full-pass whisper transcript goes in, as
+  before live dictation existed: 1.65 s after Stop for a 28.8 s English
+  dictation. The quiet line says *Inserted the full-pass transcript.*, with
+  **Use the other one** beside it. The exception: when whisper heard Hindi or
+  Urdu and the person had not chosen English, the complete live transcript
+  goes in instead, at that moment, because on Hindi and Hinglish whisper makes
+  about twice the errors ([Accuracy](#accuracy)).
 
-A quiet line says which transcript went in: *Inserted the live transcript.* or
-*Inserted the full-pass transcript.* Beside it, **Use the other one** swaps the
-text in place, as long as the person has not edited those words.
+Words from the English-only model never stand in for Hindi. If any part of the
+live transcript came from a connection that ran on English, the full pass goes
+in and the live text stays one click away. That happens after a switch from
+English to हिन्दी mid-recording. It would also happen to an `auto` dictation
+that the server ran on English. Release 1's gateway never routes `auto`; the
+meeting server change (release 2, V43) does
+([routing](#two-streaming-models-chosen-by-language)), and the browser already
+follows the language a server's `ready` reports.
+
+**Use the other one** swaps the text in place, as long as the person has not
+edited those words. Where pieces of text meet, in the panel and in the draft,
+a piece that starts with closing punctuation joins the one before it without a
+space. The engine can hand the danda or comma that ends one utterance to the
+next one ([the protocols](#the-protocols)), so "है" followed by "। जंगल" reads
+"है। जंगल", not "है । जंगल".
 
 When live dictation fails, nothing else does. The panel falls back to the
 session's own preview, which is whisper text arriving every five seconds or
 so, as before. The transcript after Stop is not affected. If the full pass
-fails or finds no words but the live stream heard some, the follow-up line
-offers **Insert live transcript**. If the live stream missed part of the
-recording, the offer reads *Insert what was heard live (part of the
-recording)* instead.
+fails or finds no words, and the live words did not already go in, the
+follow-up line offers **Insert live transcript** whenever the live stream heard
+some. If the live stream missed part of the recording, the offer reads *Insert
+what was heard live (part of the recording)* instead.
 
 Live dictation is shown only when two things are true: the deployment has a
 live engine configured (`VOICE_LIVE_ENGINE_URLS`), and the person has
@@ -158,7 +181,7 @@ From the gateway, every message is JSON text:
 
 | message | meaning |
 |---|---|
-| `{"type":"ready","v":1,"sample_rate":16000,"frame_ms":40,"max_frame_bytes":16384,"resume_from_sample":N,"next_u":K}` | Sent once the engine has accepted the stream. With the meeting server change it also says the `language` actually used ([routing](#two-streaming-models-chosen-by-language)). |
+| `{"type":"ready","v":1,"sample_rate":16000,"frame_ms":40,"max_frame_bytes":16384,"resume_from_sample":N,"next_u":K}` | Sent once the engine has accepted the stream. With the meeting server change (release 2) it also says the `language` actually used ([routing](#two-streaming-models-chosen-by-language)). The browser takes that as the language the connection ran on; release 1 sends none, and the language the `start` asked for stands. |
 | `{"type":"partial","u":k,"text":…,"start_sample":a,"end_sample":b}` | The WHOLE current hypothesis of utterance *k*. It replaces the previous partial and is never appended to it. |
 | `{"type":"final", …same fields…}` | Utterance *k* is committed and its partial cleared. Finals arrive in order of *u*. An utterance with no words produces no final. |
 | `{"type":"speech","active":true,"sample":n}` | An utterance's first words appeared (`true`), or it was committed (`false`). The engine derives it from the transcript. The UI may ignore it. |
@@ -178,7 +201,8 @@ danda can arrive as the first token of the next one: `", and I was told"`,
 Hindi finals on the worker. The mark is kept, because a Hindi transcript
 without its dandas is wrong. A consumer that joins utterances must join one
 that starts with closing punctuation *without* a space, and every other one
-with a single space.
+with a single space. The browser does, everywhere it joins text
+([joining](#which-transcript-goes-into-the-draft)).
 
 ### Close codes
 
@@ -352,13 +376,18 @@ is a reviewed edit, not an environment knob.
 at 104 % WER. `VOICE_LIVE_LANGUAGES` must never list `gu`. A Gujarati speaker
 still gets whisper's transcript after Stop, as before.
 
-**Routing `auto` per person** comes with the meeting server change (V43).
-When the browser asks for `auto`, the gateway routes the stream to `en` if the
-person's last five finished dictations were all English. Otherwise `auto`
-stays. The rule never applies to a meeting's `tab` source, because the other
-people's language is not the person's. It never routes to a language the
-deployment does not offer, and a history it cannot read leaves `auto`. `ready`
-reports the language used. Choosing English or हिन्दी in the bar overrides it.
+**Routing `auto` per person** comes with the meeting server change (V43,
+release 2). Release 1's gateway does not route, and its `ready` carries no
+`language`. With the change, when the browser asks for `auto`, the gateway
+routes the stream to `en` if the person's last five finished dictations were
+all English. Otherwise `auto` stays. The rule never applies to a meeting's
+`tab` source, because the other people's language is not the person's. It
+never routes to a language the deployment does not offer, and a history it
+cannot read leaves `auto`. `ready` reports the language used, and the browser
+already honours it: the words of a stream the server ran on `en` are the
+English-only model's, so they keep the full pass in the draft
+([Which transcript goes into the draft](#which-transcript-goes-into-the-draft)).
+Choosing English or हिन्दी in the bar overrides the routing.
 
 **There is no separate voice-activity detector.** An utterance begins when its
 first words are recognised. It ends on the recognizer's own endpoint rule:
@@ -438,9 +467,69 @@ language:
   skipped audio. A live stream that missed part of the recording never stands
   in for all of it.
 
-At Stop the page waits for the live stream's `done`, at most 3.3 s after Stop.
-That wait never delays the finish request, and the full pass normally takes
-longer anyway.
+A session counts as Hindi or Hinglish when the person chose हिन्दी, when at
+least 20 % of the live transcript's letters are Devanagari, or when whisper
+heard Hindi or Urdu and the person had not chosen English (`chooseFinalText`
+in `frontend/lib/voiceLive.ts`).
+
+**Never the English-only model's words.** On the MUCS lectures that model
+scored 69.9 % with script set aside and 80.0 % script-sensitive, against
+whisper's 40.2 % and 55.8 %. So if any connection of the recording ran on `en`
+and committed words, the full pass goes in, and the live text stays one click
+away. That covers a switch from English to हिन्दी mid-recording: the new
+stream resumes after the last final, so what came before it is the English
+model's. It also covers an `auto` stream the server ran on English. The
+browser takes each connection's language from `ready.language` when the server
+sends one, and from its own `start` otherwise. Release 1's gateway does not
+route and sends no `language`, so there the choice in the bar is the whole
+story. The meeting server change (release 2) routes `auto` to `en` for people
+whose last five dictations were English
+([routing](#two-streaming-models-chosen-by-language)), and the browser already
+honours what its `ready` says.
+
+**When it goes in.** The finish request never waits for the live stream. The
+live stream settles at most 3.3 s after Stop (0.3 s for the worklet's last
+frame, then 3 s for the stream's `done`); in the Hindi
+[browser tests](#latency) its `done` came 0.2 s after the browser's `flush`.
+The full pass takes seconds to minutes. So:
+
+- **When the live words decide alone,** the live transcript goes in as soon as
+  the stream settles. That is when the person chose हिन्दी or its letters are
+  at least 20 % Devanagari, and the live transcript is complete, has words,
+  and has none from the English-only model. Whisper's language could only add
+  a reason to choose the live words, so the full pass cannot change the
+  answer. In Run 3, the browser test of the build that ships, a 67.2 s Hindi
+  dictation's live transcript was in the draft 0.43 s after Stop. The
+  pre-review Run 2 waited for the full pass, which took 44 s of whisper's time
+  and ended 26.56 s after Stop, and then inserted the live transcript anyway.
+  The recording bar closes once the server has accepted the finish, which does
+  not wait for whisper. The line offers **Use the other one** only when the
+  full pass is done, and the full pass never writes into the draft by itself.
+  If it fails, a quiet note says there is no other transcript to swap in. It
+  offers no Retry, which would write whisper's text over the live words.
+- **Otherwise the full pass is waited for,** English and Auto without
+  Devanagari above all. Once it is in, the insert waits at most 1 s longer for
+  the live stream's last words, and only while they could still change the
+  choice. For a stream heard in English (asked for `en`, or an `auto` the
+  server ran on English) with under a fifth of its letters Devanagari, they
+  cannot, and nothing waits. In Run 3 a 28.8 s English dictation's full pass
+  was in the draft 1.65 s after Stop; the pre-review Run 2 waited for the live
+  stream and took 4.69 s. A live stream not done within that second counts as
+  incomplete.
+- **A recording the server stopped** (storage or quota full, or closed
+  elsewhere) always waits for the full pass, whose result says why it stopped.
+
+**Use the other one** puts the other transcript where the first one went, and
+only over the exact words that went in. Once the person has edited them,
+nothing is swapped, and the line says so.
+
+**Joining.** A piece of text that starts with closing punctuation (`,` `.`
+`;` `:` `!` `?` `।` `॥` `)` `]` `}` `…`, and their full-width and ideographic
+forms) joins the text before it without a space. The browser applies this in
+the panel, in the live transcript it inserts, and where a transcript meets
+words already typed (`joinPreview` and `mergeTranscript` in
+`frontend/lib/voice.ts`). So "है" followed by "। जंगल" reads "है। जंगल", and
+"told" followed by ", and" reads "told, and".
 
 ### No second pass
 
@@ -642,6 +731,25 @@ although `/health` reports a `capacity` of 32 (the budget divided by the
 cheapest profile's cost). So for the default language it is the profile caps,
 not the budget, that refuse first; for English it is the budget.
 
+**At the cap, in production** (2026-09-30, about 04:00 IST). The production
+engine, `sf-local-ai-stt-stt-stream-1` on the worker (cores 5-9 and 15-19,
+8 CPUs, 8 GiB, the four shipped profiles, `STT_MAX_COST` 32), was loaded with
+`stream_bench.py --target engine --set librispeech --language en --sessions 16
+--utterances 8`, the client on cores 0-4. All 16 streams were admitted,
+`en-fast` 8 and `multi-fast` 8 for all 32 units, as the table above predicts
+for English, and 128 utterances streamed in 99.5 s:
+
+| 16 streams at 160 ms, English | p50 | p90 | p99 |
+|---|---:|---:|---:|
+| first partial, from the frame that holds the speech onset | 673 ms | 1,603 ms | 2,974 ms |
+| final, from the last voiced frame (the endpoint's silence wait included) | 876 ms | 1,352 ms | 2,808 ms |
+| partial lag, behind the audio each partial covers | 372 ms | 896 ms | 2,536 ms |
+
+The WER was 3.83 %, with 0 stream errors. The main model's single-stream
+decode, probed from the head (`chat_probe.py`), ran at a median of about
+103 tok/s during the load and about 108 tok/s after it: about −4 %. Slow
+outliers appeared with and without the load, from other production traffic.
+
 Each profile loads one recognizer, and all of that profile's decode threads
 share it. Four threads decoding different streams through one recognizer gave
 16 of 16 transcripts identical to a sequential run. The engine's memory was
@@ -656,8 +764,9 @@ transcript after Stop is complete as always. Nothing queues, because a preview
 that falls behind the voice is worse than none.
 
 Raising capacity trades against chat, and the decision is the owner's. Twelve
-streams cost chat nothing measurable. Forty-eight streams with every core busy
-cost it 11-16 % of its decode speed.
+streams cost chat nothing measurable. Sixteen English streams at the
+production cap cost it about 4 % (above). Forty-eight streams with every core
+busy cost it 11-16 % of its decode speed.
 
 Network: 256 kbit/s a stream, so 64 streams are about 16 Mbit/s on the 1 GbE
 management LAN.
@@ -874,27 +983,43 @@ The promtool commands are in
 
 ### Latency
 
-**In the browser, end to end.** These were measured 2026-09-30 around 01:00
-IST, on a candidate stack on the worker:
+**In the browser, end to end: Run 3, the build that ships.** Measured
+2026-09-30 at about 05:03 IST on integration `a95aa829`, which carries the
+engine at `670bc253` and the browser at `f625622d`. It ran on a candidate
+stack on the worker:
 
-- the integration branch with the engine and browser tracks;
 - an engine with two 160 ms profiles on cores 15-19;
 - the CPU orchestrator image and the standalone frontend with the relay;
 - headless Chromium on the head, whose fake microphone played real speech, over
   an SSH tunnel.
 
-Capture to render, as the page measured it:
+Capture to render, as the page measured it, and what went into the draft:
 
-| | partial p50 / p90 | final p50 / p90 | n (partials, finals) |
-|---|---:|---:|---:|
-| English (LibriSpeech, 4 utterances, 28.8 s, `auto`) | 245 / 324 ms | 884 / 884 ms | 59, 6 |
-| Hindi (FLEURS, 4 utterances, 67.2 s, `hi`) | 279 / 326 ms | 884 / 918 ms | 226, 11 |
+| Run 3 | partial p50 / p90 | final p50 / p90 | n (partials, finals) | in the draft after Stop |
+|---|---:|---:|---:|---|
+| English (LibriSpeech, 4 utterances, 28.8 s, `auto`) | 269 / 348 ms | 486 / 488 ms | 60, 6 | 1.65 s: the full pass, WER 4.44 % |
+| Hindi (FLEURS, 4 utterances, 67.2 s, `hi`) | 300 / 341 ms | 469 / 500 ms | 236, 10 | 0.43 s: the live transcript, WER 13.33 % |
 
-The English run sent 748 PCM frames up and got 81 events down, with no console
-errors. After Stop, the full-pass text reached the composer in 1.66 s for the
-English clip and 5.5 s for the Hindi one. This path runs over the loopback
-interface and an SSH tunnel. In production the Cloudflare tunnel and the LAN
-hop to the worker are added, and they have not been measured yet.
+The English run sent 747 PCM frames up and the Hindi run 1,710, with no
+console errors. The harness (`browser_e2e.py`) reads the message box every
+0.2 s, so an insert time can be up to that much late.
+
+**Pre-review builds.** Two earlier runs on the same stack and audio used
+builds from before the review fixes. Their numbers do not describe what ships:
+
+| pre-review run, 2026-09-30 | English partial / final p50 | Hindi partial / final p50 | in the draft after Stop |
+|---|---:|---:|---|
+| Run 1, about 01:00 IST: `c96a5f45` (engine `204a5ca5`, browser `17041034`) | 245 / 884 ms | 279 / 884 ms | whisper's text in both: English 1.66 s, Hindi 5.5 s |
+| Run 2, about 02:53 IST: engine `6435d990`, browser `15e9c174` | 376 / 527 ms | 321 / 495 ms | English 4.69 s (whisper's text), Hindi 26.56 s (the live transcript, after waiting for whisper) |
+
+A final's latency counts from its `end_sample`. The engines of Runs 2 and 3
+put an endpoint final's `end_sample` inside the closing silence, about 0.3 s
+later than Run 1's engine did, so Run 1's finals are not comparable with the
+later ones.
+
+This path runs over the loopback interface and an SSH tunnel. In production
+the Cloudflare tunnel and the LAN hop to the worker are added, and they have
+not been measured yet.
 
 **In the engine, in audio time** (`benchmarks/voice-live/screen.py`, 160 ms
 chunks, endpoint 0.6 s, 2026-09-29):
@@ -937,9 +1062,15 @@ These numbers need three caveats:
   Wider chunks do not help the 3.5 model on Hinglish.
 - **Gujarati.** Both streaming models read FLEURS Gujarati at 104 %.
 
-End to end in the browser (the runs above), the Hindi live transcript scored
-10.37 % WER against 34.07 % for the full pass, which dropped a whole clause.
-The English composer text, which is the full pass, scored 4.44 %.
+End to end in the browser (the runs above), scored by the harness
+(`browser_e2e.py`), whose normaliser does not fold nukta or chandrabindu:
+
+- **Hindi:** the live transcript that Run 3 put in the draft scored 13.33 %.
+  Whisper's text for the same recording, which the pre-review Run 1 put in,
+  scored 35.56 %: it dropped a whole clause. With the normaliser above, the
+  same two texts score 11.11 % and 34.07 %.
+- **English:** the draft text, which is the full pass, scored 4.44 % in all
+  three runs.
 
 ---
 
@@ -950,7 +1081,10 @@ The English composer text, which is the full pass, scored 4.44 %.
 - **The live transcript of a dictation is not stored on the server.** Only a
   meeting's is (`live.jsonl`). For a Hindi dictation, the inserted text lives
   in the draft, and the server keeps the recording and whisper's transcript. A
-  reload loses the choice between the two. The recording can always be
+  reload loses the choice between the two. A reload while the full pass is
+  still running after the live words went in makes the next page offer
+  whisper's text as a recording interrupted when the page closed, with
+  *Insert it*; it is never inserted unasked. The recording can always be
   transcribed again.
 - **Safari and iOS are not verified on a device.** The code path is the same
   one: a worklet on one AudioContext, resumed when the browser starts it
