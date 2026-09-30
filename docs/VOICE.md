@@ -37,12 +37,21 @@ appear in that panel as they are spoken instead
 
 Press stop; the bar says *Transcribing…* while the last of the recording is
 transcribed. Then the words appear **in the message box**, joined to the end
-of whatever was already typed. On a candidate stack on 2026-09-30, that took
-1.66 s after Stop for a 28.8 s English dictation and 5.5 s for a 67.2 s Hindi
-one. The words are not sent. They are a draft, editable exactly like typed
-text, and pressing Send is a separate, deliberate act. For Hindi and Hinglish,
-the text that goes in may be the live transcript rather than whisper's
-([why](voice/REALTIME.md#which-transcript-goes-into-the-draft)).
+of whatever was already typed. In the browser test of the build that ships
+(2026-09-30, Run 3 in [`voice/REALTIME.md`](voice/REALTIME.md#latency)), a
+28.8 s English dictation's transcript was there 1.65 s after Stop. The words
+are not sent. They are a draft, editable exactly like typed text, and pressing
+Send is a separate, deliberate act.
+
+For Hindi and Hinglish, the text that goes in may be the live transcript
+rather than whisper's
+([why](voice/REALTIME.md#which-transcript-goes-into-the-draft)). When the
+person chose हिन्दी, or at least a fifth of the live words' letters are
+Devanagari, and the live stream heard the whole recording, none of it through
+the English-only model, it goes in as soon as the live stream ends, without
+waiting for whisper: 0.43 s after Stop for a 67.2 s Hindi dictation in the
+same test. Whisper's transcript is offered beside it (**Use the other one**)
+once it is done.
 
 Press cancel instead and the recording is discarded: deleted from the server,
 not transcribed. A recording longer than a minute asks first. Either way the
@@ -312,7 +321,9 @@ Recording sessions go further in three ways:
 It does not make the cost disappear. That is why the words-while-speaking
 preview does not use whisper at all: it runs on the worker's CPU, where twelve
 streams left chat decode unchanged
-([`voice/REALTIME.md`](voice/REALTIME.md#the-cpu-not-a-gpu)).
+([`voice/REALTIME.md`](voice/REALTIME.md#the-cpu-not-a-gpu)), and sixteen
+160 ms streams at the production engine's cap cost it about 4 % on 2026-09-30
+([capacity](voice/REALTIME.md#capacity)).
 
 ### Honest comparison with what this replaced
 
@@ -372,12 +383,15 @@ dictation keeps whisper's transcript.
 - It wrote 73 of the 364 MUCS segments in Urdu script, and 5 as English
   translations.
 - On FLEURS Hindi it wrote 9 of 40 sentences in Urdu script.
-- End to end in a browser on 2026-09-30, four FLEURS Hindi sentences came back
-  at 34.07 % from whisper, which dropped a whole clause, against 10.37 % from
-  the live stream.
+- End to end in a browser on 2026-09-30, on four FLEURS Hindi sentences, the
+  live transcript that went into the draft scored 13.33 %. Whisper's text for
+  the same recording, which a pre-review build had put in, scored 35.56 %: it
+  dropped a whole clause. Both are the browser harness's scores
+  ([`voice/REALTIME.md`](voice/REALTIME.md#accuracy)).
 
 So for a Hindi or Hinglish session, the text inserted into the draft is the
-live transcript when the live stream heard the whole recording
+live transcript when the live stream heard the whole recording and the
+English-only streaming model wrote none of it
 ([`voice/REALTIME.md`](voice/REALTIME.md#which-transcript-goes-into-the-draft)).
 The stored transcript is still whisper's.
 
