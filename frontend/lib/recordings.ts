@@ -140,6 +140,16 @@ export const STATUS_LABEL: Record<RecordingStatus, string> = {
 };
 
 /**
+ * What a delete confirmation adds for a recording still being made or
+ * transcribed: DELETE /audio/sessions/{id} stops it first and erases what was
+ * saved so far. My files uses it (it dropped the warning once, QA
+ * 2026-09-30); the Recordings page's deleteConfirmBody carries the same
+ * words, and tests/my-files-page.test.tsx fails if the two ever differ.
+ */
+export const IN_PROGRESS_DELETE_NOTE =
+  'It is still in progress: deleting it stops it and removes what was saved so far.';
+
+/**
  * True when retention has already removed this recording's audio and
  * transcript. The list keeps such a row as a tombstone. The server says so
  * with `kept: false`; before it did, `delete_after` was the only sign, and it

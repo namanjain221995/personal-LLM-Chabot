@@ -343,6 +343,11 @@ SPECULATIVE_EMBED_WASTE_REASONS = frozenset(
     {"refetch_empty", "load_failed", "cancelled"}
 )
 
+#: app/myfiles.py: the two reads (GET /files/mine and /files/mine/summary)
+#: and how each ended. A malformed query is `bad_request`, not a failure.
+MYFILES_VIEWS = frozenset({"list", "summary"})
+MYFILES_RESULTS = frozenset({"ok", "bad_request", "error"})
+
 _ROUTE_EFFORT = {"route": set(CHAT_ROUTES), "effort": set(CHAT_EFFORTS)}
 
 #: metric -> {label name: closed value set}. Only these label NAMES survive.
@@ -379,6 +384,10 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
         "plan": set(DECIDE_PLANS),
         "outcome": set(STEP_OUTCOMES),
     },
+    # My files (app/myfiles.py, 2026-09-30): which read, and how it ended.
+    # Never a file name, a user or a query — those are the person's content.
+    "myfiles_list_seconds": {"view": set(MYFILES_VIEWS)},
+    "myfiles_list_total": {"view": set(MYFILES_VIEWS), "result": set(MYFILES_RESULTS)},
     # Engine first token to the SSE write that carries it — the part of the
     # 105 -> 88 tok/s relay loss that is time, not throughput.
     "relay_overhead_seconds": dict(_ROUTE_EFFORT),

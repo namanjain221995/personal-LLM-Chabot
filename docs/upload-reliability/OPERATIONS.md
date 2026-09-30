@@ -62,6 +62,13 @@ unlinks the workspace copy and the inode survives on the `/data/video` link
 (`video/store.adopt_source`, proved in
 `orchestrator/tests/test_workspace_sweep.py`).
 
+Since 2026-09-30, `GET /uploads/{conversation}/{upload}/file` also serves a
+video or audio row (`notes == 'video'`) from that link once the workspace copy
+has been swept. It used to answer 410 "expired" for bytes still on disk. The
+admin download route still reads `_original` only. What each kind keeps, and
+for how long, is listed per person on the My files page
+([`../MY-FILES.md`](../MY-FILES.md)).
+
 ---
 
 ## 2. The SSE timeout chain

@@ -888,6 +888,19 @@ dashboard aggregates by label rather than by a hardcoded node list.
 
 ---
 
+## My files (orchestrator `/metrics`, 2026-09-30)
+
+| metric | labels | what it answers |
+|---|---|---|
+| `myfiles_list_seconds` | view = list / summary | time to answer one `/files/mine` or `/files/mine/summary` request |
+| `myfiles_list_total` | view, result = ok / bad_request / error | how often the page is used, and whether it fails |
+
+When the `view="list"` p95 passes 50 ms, add the `uploads.user_id` index
+described in [`MY-FILES.md`](MY-FILES.md#cost). Labels never carry a file
+name, a search or a user.
+
+---
+
 ## Knowledge pipeline metrics (orchestrator `/metrics`, ADR-0001 D12)
 
 All emitted by the orchestrator's own registry (`app/metrics.py`); labels in
