@@ -59,12 +59,8 @@ COPY --from=build --chown=nextjs:nodejs /app/.next/static ./.next/static
 # timeout off, a 60 s body-idle guard in its place, keep-alive above
 # cloudflared's 90 s, and a SIGTERM drain that cuts /v1 relays at +2 s and chat
 # streams at +15 s so one long relay no longer holds a deploy for 5 minutes.
-# Not part of Next's standalone output, so it is copied on its own — and so is
-# the live-dictation WebSocket relay it installs (2026-09-29), which it
-# requires from beside itself. Without that file the site still serves (the
-# preload logs `ws_relay_unavailable`), but live transcripts never connect.
+# Not part of Next's standalone output, so it is copied on its own.
 COPY --from=build --chown=nextjs:nodejs /app/server-preload.cjs ./server-preload.cjs
-COPY --from=build --chown=nextjs:nodejs /app/server-ws-relay.cjs ./server-ws-relay.cjs
 USER nextjs
 EXPOSE 3000
 # EXEC FORM, AND IT HAS TO STAY THAT WAY.

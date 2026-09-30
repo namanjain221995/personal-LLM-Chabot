@@ -636,7 +636,6 @@ cheap, honest signals.
 | `dgx-gpu`, `vllm-main`, `engine-controller` | **5 s** | the panels that must feel live; the engine state within one canary interval |
 | `node` | 10 s | host metrics move slowly |
 | `cadvisor`, `vllm-aux`, `blackbox` | 15 s | |
-| `stt-stream` | 15 s | live dictation's engine on the worker; its rules use 5-minute windows, like the orchestrator's |
 | `prometheus` (self) | 30 s | |
 
 One GPU scrape costs **63 ms** of `nvidia-smi` (41 ms + 21 ms), about **1.3 %
@@ -916,23 +915,6 @@ p95 for route=chat, effort=fast above 3 s.
 
 ---
 
-## Live dictation (real-time speech to text)
-
-Two sources (2026-09-29): the WebSocket gateway inside the orchestrator
-(`voice_stream_*`, job `orchestrator`) and the streaming engine on the worker
-(`stt_stream_*`, job `stt-stream`, the worker's management address, port
-30009). The rules are `monitoring/prometheus/rules/voice-stream.yml` (tests:
-`monitoring/prometheus/tests/voice_stream.yml`); the panels are the
-**Real-time speech to text** row of the Developer API dashboard; thresholds,
-triage and why each alert is shaped the way it is are in
-`monitoring/developer-api/README.md`, "Live dictation". The `stt-stream`
-target is static, so it reads down whenever live dictation is off; the
-engine-down alert also needs the gateway to have failed to reach an engine,
-so that down target alone never alerts. Adding the job needs
-`./scripts/monitoring.sh restart` (above), not `/-/reload`.
-
----
-
 ## Files
 
 ```
@@ -940,9 +922,7 @@ monitoring/
   prometheus/prometheus.yml            scrape config + topology labels
   prometheus/rules/recording.yml       cluster aggregates
   prometheus/rules/alerts.yml          alert rules
-  prometheus/rules/voice-stream.yml    live dictation: recording rules and alerts
-  prometheus/tests/*.yml               promtool unit tests (availability, developer API,
-                                       database timing, live dictation)
+  prometheus/tests/*.yml               promtool unit tests for the availability rules
   grafana/provisioning/datasources/    Prometheus datasource (uid dgx-prometheus)
   grafana/provisioning/dashboards/     dashboard provider
   grafana/dashboards/*.json            the five dashboards

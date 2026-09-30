@@ -98,18 +98,5 @@ EXPOSE 8080
 # GET /chat/requests/{intent_id} and GET /chat/attach/{conversation_id}
 # (docs/upload-reliability/API.md). A chunked part PUT cut the same way
 # leaves no accepted part and the client re-sends that one part.
-#
-# The --ws flags serve live dictation's socket (app/voice_live.py,
-# 2026-09-29). websockets-sansio because uvicorn's "auto" picks the LEGACY
-# websockets implementation on 0.46.0 (the CUDA image's) and sans-io on newer
-# releases (the CPU image's): naming it keeps the one the gateway was run
-# against end to end, whichever uvicorn an image resolves, and the one the
-# live engine runs. 1 MiB per message: a 40 ms PCM frame is 1,280 bytes and the
-# gateway refuses anything over VOICE_LIVE_MAX_FRAME_BYTES (16 KiB) anyway,
-# where uvicorn's default let one client hand this process 16 MiB frames.
-# No permessage-deflate: PCM does not compress, so it would be CPU for
-# nothing. Ping interval and timeout stay at uvicorn's 20 s.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", \
-     "--timeout-graceful-shutdown", "90", \
-     "--ws", "websockets-sansio", "--ws-max-size", "1048576", \
-     "--ws-per-message-deflate", "false"]
+     "--timeout-graceful-shutdown", "90"]

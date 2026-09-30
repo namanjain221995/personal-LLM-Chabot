@@ -149,7 +149,7 @@ scrape_configs:
         regex: ".*_created$"
         action: drop
 
-  # WHISPER HAS NO SCRAPE JOB, AND THAT IS NOT AN OVERSIGHT.
+  # SPEECH TO TEXT HAS NO SCRAPE JOB, AND THAT IS NOT AN OVERSIGHT.
   #
   # There was a `vllm-asr` job here pointed at 192.168.9.68:30006, from when
   # dictation ran on Qwen3-ASR under vLLM and inherited vLLM's /metrics for
@@ -161,7 +161,7 @@ scrape_configs:
   # job was removed rather than repointed.
   #
   # What replaces it, and it is enough:
-  #   * the ORCHESTRATOR's own /metrics (job orchestrator below)
+  #   * the ORCHESTRATOR's own /metrics (job techsara-orchestrator below)
   #     carries asr_requests_total, asr_request_duration_seconds,
   #     asr_errors_total, asr_queue_depth, asr_active_requests and
   #     asr_detected_language_total — every request goes through it, so its
@@ -170,39 +170,7 @@ scrape_configs:
   #   * dgx-gpu-exporter already shows what the speech engine is doing to both
   #     GPUs, which is the number that actually matters (see docs/VOICE.md,
   #     "What it costs the chat model").
-  # If whisper ever grows a /metrics endpoint, add its job back here.
-
-  # --- Live dictation: the streaming speech-to-text engine ----------------
-  # A different engine from whisper: compose/stt-stream (project
-  # sf-local-ai-stt), CPU-only on the WORKER, host networking, bound to the
-  # worker's management address only, and it DOES serve /metrics
-  # (stt_stream_*, closed labels). Scraped like the worker's two exporters
-  # above: the management address, never a RoCE rail, with node/role and the
-  # `service` its panels key on. The orchestrator's gateway (voice_stream_*)
-  # comes with job orchestrator below.
-  #
-  # Prometheus reaches this port as the head's own LAN address, exactly as
-  # the gateway does, so once the worker's host packet filter guards 30009 it
-  # must also list it among the ports the head may reach
-  # (GUARD_WORKER_PORTS and GUARD_WORKER_LAN_PORTS in scripts/host-guard.sh;
-  # reinstalling the guard on the worker needs root).
-  #
-  # STATIC ON PURPOSE: unlike OCR (file_sd above), this engine never moves,
-  # because nothing new may run on the head. So the target is DOWN BY DESIGN
-  # while live dictation is off: before the engine is first deployed and after
-  # `scripts/stt-stream.sh down`. VoiceStreamEngineDown (rules/voice-stream.yml)
-  # fires only when the gateway also failed to reach an engine, so that down
-  # target never alerts; if live dictation is retired for good, delete this
-  # job rather than leave a target that is red by construction.
-  - job_name: stt-stream
-    scrape_interval: 15s
-    static_configs:
-      - targets: ["192.168.9.68:30009"]
-        labels: { service: stt-stream, node: spark-2, role: worker }
-    metric_relabel_configs:
-      - source_labels: [__name__]
-        regex: ".*_created$"
-        action: drop
+  # If the engine ever grows a /metrics endpoint, add the job back here.
 
   # --- The living knowledge layer ----------------------------------------
   # The orchestrator's own /metrics (app/metrics.py, stdlib-only). Public like

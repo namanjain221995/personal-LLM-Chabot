@@ -732,7 +732,7 @@ drill_8() {
   rec "  PROCEDURE (worker console, announced window):"
   rec "    1. on the head: watch  curl -s $CONTROLLER_URL/state | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[\"state\"], d[\"signals\"][\"worker\"][\"reachable\"])'  every 5 s"
   rec "    2. on the worker: sudo ip link set enP7s7 down; sleep 20; sudo ip link set enP7s7 up   (management LAN only; the RoCE rails stay up)"
-  rec "    3. EXPECT: inference continues (NCCL is on RoCE); Prometheus up{node=\"spark-2\",job!=\"stt-stream\"} drops to 0 then returns (stt-stream, live dictation's engine, is down by design while live dictation is off);"
+  rec "    3. EXPECT: inference continues (NCCL is on RoCE); Prometheus up{node=\"spark-2\"} drops to 0 then returns;"
   rec "       the controller stays READY/BUSY (the sentinel is on the RoCE address, so worker.reachable stays true);"
   rec "       NEVER RECOVERING. If the sentinel were reached over the management LAN this drill would show DEGRADED - that is the point of §6.4's binding rule."
   rec "    4. record: the /state samples and  scripts/monitoring.sh verify  before and after"

@@ -79,9 +79,6 @@ LAUNCHER_CHAIN = (
 #: last, and the main engine never.
 EXPECTED_SIDE_STACK = {
     "compose.ocr.yaml": {"ocr": 900},
-    # The live-dictation engine (worker CPU): a preview whose loss costs
-    # nothing, since whisper stays the record.
-    "compose.stt-stream.yaml": {"stt-stream": 900},
     "compose.whisper.yaml": {"whisper": 800},
     "compose.monitoring.yaml": {
         "grafana": 600, "cadvisor": 600, "postgres-exporter": 600,
@@ -542,19 +539,6 @@ class TheRunbookRecommendsWhatTheTestsPinTests(unittest.TestCase):
 #: at the limit, whatever the host has free) or switch the killer off for it.
 HARD_MEMORY_KEYS = ("mem_limit", "memswap_limit", "oom_kill_disable")
 
-#: THE DELIBERATE EXCEPTIONS, each with the measurement that justifies it:
-#: (compose file, service, the exact line) -> why.
-DELIBERATE_HARD_LIMITS = {
-    ("compose.stt-stream.yaml", "stt-stream", "mem_limit: 8g"): (
-        "The live-dictation engine decodes on the worker's CPU, so unlike the GPU "
-        "engines its memory IS charged to its cgroup and a limit bounds the whole "
-        "engine. Measured on the worker 2026-09-29: 3.58 GB of RSS with its four "
-        "recognizers loaded, 4.08 GB with twelve streams open; 8g is twice that "
-        "peak. It is an optional preview (whisper stays the record), and its own "
-        "restart is cheaper than the kernel choosing among the node's processes."
-    ),
-}
-
 
 class NoServiceGainsAHardMemoryLimitTests(unittest.TestCase):
     def test_no_compose_file_gives_any_service_a_hard_memory_limit(self) -> None:
@@ -564,12 +548,9 @@ class NoServiceGainsAHardMemoryLimitTests(unittest.TestCase):
         the container at a number nobody measured, which is the outage this
         work exists to prevent. Ordering (oom_score_adj) is the mechanism; a
         limit may be added only with measured headroom, and this test is where
-        that decision has to be made on purpose: DELIBERATE_HARD_LIMITS names
-        each one with its measurement, and nothing else passes."""
+        that decision has to be made on purpose."""
         files = [REPO_ROOT / "compose.yaml", *sorted(COMPOSE.glob("*.yaml"))]
         offenders: list[str] = []
-        excepted: list[tuple[str, str]] = []
-        allowed = {(name, line): service for name, service, line in DELIBERATE_HARD_LIMITS}
         for path in files:
             lines = path.read_text(encoding="utf-8").splitlines()
             for number, line in enumerate(lines, 1):
@@ -579,9 +560,6 @@ class NoServiceGainsAHardMemoryLimitTests(unittest.TestCase):
                 if key is None:
                     continue
                 if key.group(1) in HARD_MEMORY_KEYS:
-                    if (path.name, line.strip()) in allowed:
-                        excepted.append((path.name, line.strip()))
-                        continue
                     offenders.append(f"{path.name}:{number}: {line.strip()}")
                 elif key.group(1) == "memory":
                     # deploy.resources.limits.memory is the v3 spelling of mem_limit;
@@ -596,14 +574,6 @@ class NoServiceGainsAHardMemoryLimitTests(unittest.TestCase):
                         offenders.append(f"{path.name}:{number}: limits.{line.strip()}")
         self.assertEqual(offenders, [])
         self.assertGreater(len(files), 10, "the glob found the compose overlays")
-        # Each exception is used exactly once, by the service it names: an
-        # exception that matches nothing is deleted, not kept to excuse the
-        # next limit someone adds.
-        self.assertEqual(sorted(excepted), sorted(allowed))
-        for (name, line), service in allowed.items():
-            with self.subTest(file=name, service=service):
-                block = _service_blocks(COMPOSE / name)[service]
-                self.assertIn(f"\n    {line}\n", "\n" + block)
 
 
 @unittest.skipUnless(overlays.COMPOSE_AVAILABLE, "Docker Compose v2.24+ is required")
