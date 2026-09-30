@@ -163,12 +163,13 @@ GUARD_WORKER_RAIL_B_IP="${GUARD_WORKER_RAIL_B_IP:-10.100.185.2}"
 # anyway so a future 0.0.0.0 publish on a host-network engine is still closed),
 # node_exporter 9100 (live *:9100), GPU exporter 9835, engine controller 9838.
 GUARD_HEAD_PORTS="${GUARD_HEAD_PORTS:-8000-8005, 9100, 9835, 9838}"
-# Worker: node_exporter 9100, GPU exporter 9835, sentinel 9839, OCR 30004, speech 30007.
-GUARD_WORKER_PORTS="${GUARD_WORKER_PORTS:-9100, 9835, 9839, 30004, 30007}"
+# Worker: node_exporter 9100, GPU exporter 9835, sentinel 9839, OCR 30004, speech 30007,
+# the CPU speech replica 30008 (scripts/whisper-cpu.sh).
+GUARD_WORKER_PORTS="${GUARD_WORKER_PORTS:-9100, 9835, 9839, 30004, 30007, 30008}"
 # The worker ports the head reaches over the office LAN (the orchestrator's OCR
 # and ASR clients, Prometheus, the controller's GPU probe). The sentinel is not
 # one: the controller polls it over rail A.
-GUARD_WORKER_LAN_PORTS="${GUARD_WORKER_LAN_PORTS:-9100, 9835, 30004, 30007}"
+GUARD_WORKER_LAN_PORTS="${GUARD_WORKER_LAN_PORTS:-9100, 9835, 30004, 30007, 30008}"
 
 CLUSTER_WORKER_SSH="${CLUSTER_WORKER_SSH:-$(id -un 2>/dev/null || echo techsphere)@${GUARD_WORKER_RAIL_IP}}"
 
@@ -398,11 +399,13 @@ EOF
     cat <<EOF
 accept 30004 ${GUARD_LAN_IFNAME} ${GUARD_HEAD_LAN_IP} head orchestrator OCR client and Prometheus file_sd scrape
 accept 30007 ${GUARD_LAN_IFNAME} ${GUARD_HEAD_LAN_IP} head orchestrator ASR client
+accept 30008 ${GUARD_LAN_IFNAME} ${GUARD_HEAD_LAN_IP} head orchestrator ASR client, CPU replica
 accept 9100 ${GUARD_LAN_IFNAME} ${GUARD_HEAD_LAN_IP} head Prometheus job node
 accept 9835 ${GUARD_LAN_IFNAME} ${GUARD_HEAD_LAN_IP} head Prometheus dgx-gpu and controller WORKER_GPU_EXPORTER_URL
 accept 9839 ${GUARD_RAIL_A_IFNAME} ${GUARD_HEAD_RAIL_IP} head engine controller to the sentinel
 accept 30004 lo ${GUARD_WORKER_LAN_IP} OCR container healthcheck
 accept 30007 lo ${GUARD_WORKER_LAN_IP} whisper container healthcheck
+accept 30008 lo ${GUARD_WORKER_LAN_IP} CPU whisper container healthcheck
 accept 9835 lo ${GUARD_WORKER_LAN_IP} GPU exporter healthcheck
 accept 9839 lo ${GUARD_WORKER_RAIL_IP} sentinel healthcheck
 accept 22 ${GUARD_LAN_IFNAME} 192.168.9.20 ssh from the office (never judged)
@@ -411,10 +414,12 @@ accept 22 ${GUARD_RAIL_B_IFNAME} ${GUARD_HEAD_RAIL_B_IP} cluster-sync.sh --via-l
 accept 33183 ${GUARD_RAIL_A_IFNAME} ${GUARD_HEAD_RAIL_IP} vLLM rank / Gloo ephemeral listener (never judged)
 drop 30004 ${GUARD_LAN_IFNAME} 192.168.9.20 office LAN host to OCR
 drop 30007 ${GUARD_LAN_IFNAME} 192.168.9.20 office LAN host to speech
+drop 30008 ${GUARD_LAN_IFNAME} 192.168.9.20 office LAN host to the CPU speech replica
 drop 9100 ${GUARD_LAN_IFNAME} 192.168.9.20 office LAN host to node_exporter
 drop 9839 ${GUARD_LAN_IFNAME} ${GUARD_HEAD_LAN_IP} the sentinel has no LAN consumer
 drop 30004 ${GUARD_TAILNET_IFNAME} 100.64.0.9 tailnet host to OCR
 drop 30007 ${GUARD_TAILNET_IFNAME} fd7a:115c:a1e0::9 tailnet host to speech over IPv6
+drop 30008 ${GUARD_TAILNET_IFNAME} 100.64.0.9 tailnet host to the CPU speech replica
 EOF
   fi
 }
@@ -898,6 +903,12 @@ cmd_verify() {
   else
     probe_local "OCR engine" "http://${GUARD_WORKER_LAN_IP}:30004/v1/models"
     probe_local "speech engine" "http://${GUARD_WORKER_LAN_IP}:30007/health"
+    # Optional (scripts/whisper-cpu.sh): probed only when something listens there.
+    if ss -ltn 2>/dev/null | grep -q ":30008 "; then
+      probe_local "CPU speech replica" "http://${GUARD_WORKER_LAN_IP}:30008/health"
+    else
+      report INFO "CPU speech replica (:30008) is not running on this node; nothing to probe"
+    fi
     probe_local "GPU exporter" "http://${GUARD_WORKER_LAN_IP}:9835/healthz"
     report INFO "from an office laptop (not the head), curl -m 5 http://${GUARD_WORKER_LAN_IP}:30004/v1/models must time out; from the head, scripts/ocr.sh verify must still read the test image"
   fi

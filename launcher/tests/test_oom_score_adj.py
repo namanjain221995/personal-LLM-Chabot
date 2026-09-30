@@ -80,6 +80,9 @@ LAUNCHER_CHAIN = (
 EXPECTED_SIDE_STACK = {
     "compose.ocr.yaml": {"ocr": 900},
     "compose.whisper.yaml": {"whisper": 800},
+    # The CPU speech replica (2026-09-30): overflow capacity, so it goes before the GPU replica
+    # that serves speech normally, and after OCR, which frees ~15 GiB of unified memory.
+    "compose.whisper-cpu.yaml": {"whisper-cpu": 850},
     "compose.monitoring.yaml": {
         "grafana": 600, "cadvisor": 600, "postgres-exporter": 600,
         "data-stores-exporter": 600, "blackbox-exporter": 600,
@@ -148,11 +151,15 @@ class OomScoreAdjStaticTests(unittest.TestCase):
                 self.assertEqual({s: v for s, v in actual.items() if v}, {s: [str(n)] for s, n in expected.items()})
         ocr = EXPECTED_SIDE_STACK["compose.ocr.yaml"]["ocr"]
         whisper = EXPECTED_SIDE_STACK["compose.whisper.yaml"]["whisper"]
+        whisper_cpu = EXPECTED_SIDE_STACK["compose.whisper-cpu.yaml"]["whisper-cpu"]
         telemetry = [n for f in ("compose.monitoring.yaml", "compose.monitoring-worker.yaml") for n in EXPECTED_SIDE_STACK[f].values()]
         # A UVM-driven OOM ends only when a GPU holder dies, so every
         # expendable GPU holder (OCR, speech, the auxiliary engines once their
         # switch is set) ranks ahead of telemetry, which frees next to nothing.
         self.assertTrue(1000 >= ocr > whisper > RECOMMENDED_AUX_ENGINE_ADJ > max(telemetry) >= min(telemetry) > 0)
+        # The CPU speech replica holds no GPU memory; it is overflow capacity, so it goes before the
+        # replica that serves speech normally and after the engine that frees the most memory.
+        self.assertTrue(ocr > whisper_cpu > whisper)
 
     def test_the_public_tunnel_is_left_alone(self) -> None:
         """cloudflared is the site's front door; scripts/tunnel.sh recreates it

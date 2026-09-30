@@ -207,6 +207,20 @@ and one ready to start, so the GPU never idles between clips and nobody queues
 behind more than one other person; past that a caller is told to try again
 rather than silently extending the window in which everyone's answers are slow.
 
+### A third copy on the worker's CPU (overflow only, 2026-09-30)
+
+`scripts/whisper-cpu.sh up` starts the same model (the same pinned weights,
+as whisper.cpp q8_0) on ten Cortex-X925 cores of the worker and no GPU. The
+orchestrator sends it a clip only when every GPU replica is already decoding
+one, and only if the clip can finish inside its deadline at the CPU's measured
+speed (`ASR_CPU_*`). Measured on the GPU baselines' own clips, utterance by
+utterance, it matches the GPU replicas within noise: LibriSpeech 3.89 % against
+4.21 %, FLEURS English 7.03 % against 6.81 %, FLEURS Hindi 44.73 % against
+41.93 %, MUCS Hindi-English 65.84 % against 65.40 %. Every 95 % interval
+contains zero. It holds 2.0 GiB and takes 0.2-0.6 s per second of audio. No
+chat slowdown was measurable within ±12 %. Everything, including how it was
+measured, is in [voice/CPU-REPLICA.md](voice/CPU-REPLICA.md).
+
 ### Honest comparison with what this replaced
 
 The engine before this was `Qwen/Qwen3-ASR-1.7B` on vLLM, and swapping it in
@@ -302,6 +316,8 @@ scripts/whisper.sh verify          # transcribe a real clip and print what came 
 scripts/whisper.sh url             # the endpoint(s) the orchestrator should use
 scripts/whisper.sh logs
 scripts/whisper.sh down            # stops dictation; touches nothing else
+scripts/whisper-cpu.sh up          # the CPU overflow replica on the worker (voice/CPU-REPLICA.md)
+scripts/whisper-cpu.sh down        # ...and back to GPU replicas only
 ```
 
 `up` writes `ASR_ENABLED=true` and `ASR_BASE_URLS` into `.env`, then the

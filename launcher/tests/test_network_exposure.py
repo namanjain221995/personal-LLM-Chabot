@@ -183,6 +183,18 @@ class ComposeFileBindTests(unittest.TestCase):
         self.assertIn('WHISPER_BIND: "${WHISPER_BIND:?', text)
         self.assertNotIn("192.168.9.68}", text)
 
+    def test_the_cpu_speech_replica_refuses_to_start_without_an_explicit_bind_or_a_gpu(self) -> None:
+        text = (REPO_ROOT / "compose" / "compose.whisper-cpu.yaml").read_text(encoding="utf-8")
+        self.assertIn('WHISPER_BIND: "${WHISPER_BIND:?', text)
+        self.assertNotIn("192.168.9.68}", text)
+        # Host networking with the bind inside the process, never a port publish (a published
+        # management address does not survive a reboot on the worker).
+        self.assertIn("network_mode: host", text)
+        self.assertNotRegex(text, r"(?m)^\s*ports:")
+        # It is the CPU copy: no GPU reservation, pinned to the X925 cores.
+        self.assertNotIn("capabilities: [gpu]", text)
+        self.assertIn('cpuset: "5-9,15-19"', text)
+
     def test_the_env_example_warns_that_the_main_model_port_8000_is_unauthenticated_too(self) -> None:
         text = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
         paragraph = text[: text.index("#TECHSARA_MODEL_BIND_ADDRESS=127.0.0.1")]
