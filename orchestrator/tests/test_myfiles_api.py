@@ -363,6 +363,23 @@ def test_text_only_documents_list_once_and_archive_members_fold(login_client):
     assert listed["report.pdf"]["source"] == "upload"
 
 
+def test_a_refused_upload_does_not_hide_the_text_of_the_same_name(login_client):
+    """Only an upload that is LISTED may fold a text row under it. A rejected
+    or failed upload is not listed ('ready' only), so folding under it made
+    the text the chat kept vanish from the page (QA, 2026-09-30)."""
+    alice = login_client("alice")
+    conv = conversation("alice", "alice-chat")
+    upload_row(conv, "sales.xlsx", status="rejected", notes="too many rows")
+    upload_row(conv, "export.zip", status="failed", notes="BadZipFile")
+    document_row(conv, "sales.xlsx")
+    document_row(conv, "export.zip/readme.txt")
+    items = every(alice)[0]
+    assert sorted(names(items)) == ["export.zip/readme.txt", "sales.xlsx"]
+    assert {i["source"] for i in items} == {"text"}
+    assert all(i["availability"] == "text_only" for i in items)
+    assert alice.get("/files/mine/summary").json()["kinds"]["document"]["count"] == 2
+
+
 def test_an_archive_sent_as_a_document_keeps_its_contents_text(login_client):
     """The composer sends a .zip on the DOCUMENT rail (found in the browser
     E2E, 2026-09-30): the archive keeps `_original`, and the chat stores what
@@ -480,6 +497,26 @@ def test_availability_follows_what_is_really_stored(login_client):
     assert listed["kept.mp4"]["id"] == f"upload:{video_present}"
 
 
+def test_a_partial_copy_in_the_video_store_is_not_stored(login_client):
+    """video/store.adopt_source copies to source.<ext>.part and renames it
+    when the two stores sit on different filesystems. A crash mid-copy leaves
+    the .part behind: a third of a video is not the file, so once the
+    workspace copy is swept the row is Removed, not Stored (QA, 2026-09-30)."""
+    from app.video import store
+
+    alice = login_client("alice")
+    conv = conversation("alice", "alice-chat")
+    upload_id = post_upload(alice, conv, "clip.mp4", MP4, "video", "video/mp4")
+    root = Path(store.analysis_dir(db.get_video_by_upload(conv, upload_id)["content_hash"]))
+    source = next(p for p in root.iterdir() if p.name.startswith("source."))
+    source.unlink()
+    (root / (source.name + ".part")).write_bytes(MP4[: len(MP4) // 3])
+    shutil.rmtree(workspace_copy(conv, upload_id))
+    item = mine(alice)["items"][0]
+    assert item["availability"] == "expired"
+    assert item["can"]["download"] is False
+
+
 # --------------------------------------------------------------------- paging --
 
 
@@ -579,6 +616,78 @@ def test_invalid_parameters_are_a_flat_400(login_client, params):
     assert resp.status_code == 400, resp.text
     body = resp.json()
     assert set(body) == {"detail", "reason"} and body["reason"] == "bad_request"
+
+
+@pytest.mark.parametrize(
+    "long_name",
+    [
+        # A name the client gave an inline document (ChatRequest.pdf_filename
+        # has no length bound). JSON's default \\uXXXX escapes made its cursor
+        # ~20,000 characters: over the route's 16,384, and over Node's 16 KB
+        # header limit, which answered 431 before the proxy ran.
+        "a-" + "文" * 2500 + ".pdf",
+        # An archive member keeps its whole path: 4,916 characters, over the
+        # 4,096 a name key could carry.
+        "legacy.zip/" + "/".join(f"directory-level-{n:02d}" for n in range(250)) + "/a.txt",
+    ],
+    ids=["cjk", "archive-path"],
+)
+def test_a_very_long_name_does_not_stall_name_paging(login_client, long_name):
+    """Under "Name, A to Z" the cursor carries the last row's sort key. With
+    the whole lowered name as that key, a page boundary on a long name handed
+    out a cursor the next request refused, and every file after it could only
+    be reached by another sort (QA, 2026-09-30)."""
+    alice = login_client("alice")
+    conv = conversation("alice", "alice-long")
+    document_row(conv, long_name)
+    document_row(conv, "zzz-short.pdf")
+    first = mine(alice, sort="name", limit=1)
+    assert names(first["items"]) == [long_name]
+    assert first["next_cursor"] and len(first["next_cursor"]) <= 4096, len(first["next_cursor"] or "")
+    second = mine(alice, sort="name", limit=1, cursor=first["next_cursor"])
+    assert names(second["items"]) == ["zzz-short.pdf"]
+    assert second["next_cursor"] is None
+
+
+def test_names_that_share_a_long_prefix_still_page_exactly(login_client):
+    """The name key is the first 512 characters of the lowered name, in the
+    ORDER BY and in the keyset comparison alike; names that agree that far
+    tie on it and (source, item id) orders them, so no row is skipped or
+    shown twice."""
+    alice = login_client("alice")
+    conv = conversation("alice", "alice-prefix")
+    stem = "quarterly-report-" * 40  # 680 characters
+    for n in range(5):
+        document_row(conv, f"{stem}{n}.pdf")
+    upload_row(conv, f"{stem}upload.pdf", notes="document")
+    document_row(conv, "b.pdf")
+    everything = {i["id"] for i in every(alice, limit=100)[0]}
+    paged, pages = every(alice, sort="name", limit=1)
+    assert pages == 7
+    ids = [i["id"] for i in paged]
+    assert len(ids) == len(set(ids)) == 7 and set(ids) == everything
+    assert paged[0]["name"] == "b.pdf"
+
+
+@pytest.mark.parametrize("path", ["/files/mine", "/files/mine/summary"])
+def test_a_nul_character_is_a_flat_400_not_a_500(login_client, path):
+    """PostgreSQL text cannot hold NUL (0x00): bound as a parameter it raised
+    psycopg.DataError, a 500 counted as result="error" (QA, 2026-09-30)."""
+    alice = login_client("alice")
+    upload_row(conversation("alice", "alice-chat"), "a.pdf", notes="document")
+    resp = alice.get(path, params={"q": "a\x00b"})
+    assert resp.status_code == 400, resp.text
+    assert resp.json() == {"detail": "q must not contain a NUL character.", "reason": "bad_request"}
+
+
+def test_a_nul_character_in_a_forged_name_cursor_is_a_400(login_client):
+    alice = login_client("alice")
+    upload_row(conversation("alice", "alice-chat"), "a.pdf", notes="document")
+    raw = json.dumps({"v": 1, "sort": "name", "k": ["a\x00b", "upload", "a" * 32]})
+    cursor = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+    resp = alice.get("/files/mine", params={"sort": "name", "cursor": cursor})
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["reason"] == "bad_request"
 
 
 def test_a_cursor_from_another_sort_is_refused(login_client):

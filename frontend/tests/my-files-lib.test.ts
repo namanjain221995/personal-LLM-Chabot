@@ -16,6 +16,7 @@ import {
   KIND_FILTER_LABEL,
   KIND_LABEL,
   appendFiles,
+  availabilityNote,
   chatUrl,
   dayStartIso,
   downloadUrl,
@@ -364,7 +365,13 @@ describe('words', () => {
   it('builds the retention sentences from the deployment', () => {
     const parsedRetention = parseMyFilesPage({ items: [], next_cursor: null, retention: RETENTION })!.retention!;
     const text = retentionSentences(parsedRetention).join(' ');
-    expect(text).toContain('kept for 24 hours');
+    // "up to": the sweep also enforces WORKSPACE_QUOTA_GB, so a large upload
+    // can evict a file sooner (QA 2026-09-30).
+    expect(text).toContain('kept for up to 24 hours;');
+    // Deleting a chat is not erasure: the bytes wait for the server's clean-up.
+    expect(text).toContain(
+      'Deleting a chat takes its files off this list at once; the server erases their stored copies later.',
+    );
     expect(text).toContain('Voice recordings stay until you delete them.');
     expect(text).toContain('Pictures stay only in the browser you sent them from.');
     const monthly = parseMyFilesPage({
@@ -373,8 +380,26 @@ describe('words', () => {
       retention: { ...RETENTION, upload_hours: 1, recording_days: 30 },
     })!.retention!;
     const other = retentionSentences(monthly).join(' ');
-    expect(other).toContain('kept for 1 hour;');
+    expect(other).toContain('kept for up to 1 hour;');
     expect(other).toContain('Voice recordings are deleted automatically 30 days after they finish.');
+  });
+});
+
+describe('the note under a row that is not simply stored', () => {
+  it('says a swept file was removed without promising when (the quota can evict sooner)', () => {
+    const retention = parseMyFilesPage({ items: [], next_cursor: null, retention: RETENTION })!.retention!;
+    const none = { download: false, preview: null, delete: false };
+    expect(availabilityNote(parsed({ availability: 'text_only', can: { ...none, preview: 'text' } }), retention)).toBe(
+      'The file was removed (chat files are kept for up to 24 hours). The text the chat read is kept.',
+    );
+    expect(
+      availabilityNote(parsed({ kind: 'dataset', name: 'sales.csv', availability: 'summary_only', can: { ...none, preview: 'summary' } }), retention),
+    ).toBe('The file was removed (chat files are kept for up to 24 hours). The summary the chat made of it is kept.');
+    // Without the server's retention block, no number is invented.
+    expect(availabilityNote(parsed({ availability: 'expired', can: none }), null)).toBe(
+      'The file was removed, and nothing of it was kept.',
+    );
+    expect(availabilityNote(parsed(), retention)).toBeNull();
   });
 });
 

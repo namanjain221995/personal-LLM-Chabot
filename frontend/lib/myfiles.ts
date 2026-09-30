@@ -184,12 +184,19 @@ function hours(n: number): string {
  * How long each kind is kept, from the deployment's own settings (the
  * server sends them with every page), so the page stays true when a TTL
  * changes.
+ *
+ * Nothing here promises more than the server does (QA 2026-09-30): "up to",
+ * because the sweep also enforces WORKSPACE_QUOTA_GB and a large upload can
+ * evict a file sooner; and deleting a chat drops its rows at once but leaves
+ * the bytes to the next sweep or the video reaper, so no erasure time is
+ * given.
  */
 export function retentionSentences(r: Retention): string[] {
   const out = [
-    `Files you attach to a chat are kept for ${hours(r.uploadHours)}; after that the chat keeps what it read (a document's text, a spreadsheet's summary).`,
+    `Files you attach to a chat are kept for up to ${hours(r.uploadHours)}; after that the chat keeps what it read (a document's text, a spreadsheet's summary).`,
   ];
   if (r.videoKeptWithChat) out.push('Videos and audio files stay while their chat exists.');
+  out.push('Deleting a chat takes its files off this list at once; the server erases their stored copies later.');
   out.push(
     r.recordingDays > 0
       ? `Voice recordings are deleted automatically ${r.recordingDays} day${r.recordingDays === 1 ? '' : 's'} after they finish.`
@@ -206,22 +213,23 @@ const ARCHIVE_NAME = /\.(zip|tar|tgz|tar\.gz)$/i;
  * file, and what of it is left. null for a stored file.
  */
 export function availabilityNote(file: MyFile, retention: Retention | null): string | null {
-  const after = retention ? `after ${hours(retention.uploadHours)}` : 'when it expired';
+  // Not "removed after N hours": the quota can evict a file sooner.
+  const why = retention ? ` (chat files are kept for up to ${hours(retention.uploadHours)})` : '';
   switch (file.availability) {
     case 'text_only':
       return file.source === 'text'
         ? 'Only the text the chat read was kept; the file itself was not stored.'
-        : `The file was removed ${after}. The text the chat read is kept.`;
+        : `The file was removed${why}. The text the chat read is kept.`;
     case 'summary_only':
       return ARCHIVE_NAME.test(file.name)
         ? 'An archive is unpacked when it arrives, so the archive itself is not kept. The summary the chat made is.'
-        : `The file was removed ${after}. The summary the chat made of it is kept.`;
+        : `The file was removed${why}. The summary the chat made of it is kept.`;
     case 'processing':
       return 'Still being recorded or transcribed.';
     case 'expired':
       return file.kind === 'video' || file.kind === 'audio'
         ? 'This file is no longer stored.'
-        : `The file was removed ${after}, and nothing of it was kept.`;
+        : `The file was removed${why}, and nothing of it was kept.`;
     default:
       return null;
   }

@@ -15,7 +15,9 @@ import type { ComponentProps, ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { MyFilesPage } from '@/components/myfiles/MyFilesPage';
+import { deleteConfirmBody } from '@/components/recordings/RecordingItem';
 import { formatWhen } from '@/lib/format';
+import { IN_PROGRESS_DELETE_NOTE, type Recording } from '@/lib/recordings';
 
 const nav = vi.hoisted(() => {
   const listeners = new Set<() => void>();
@@ -430,11 +432,35 @@ describe('each row', () => {
     expect(player.getAttribute('preload')).toBe('none');
   });
 
-  it('chat files have no delete; they say how to remove them', async () => {
+  it('chat files have no delete; they say what deleting the chat does', async () => {
     await renderPage(new FakeFiles([upload(1, { name: 'Q3 report.pdf' })]));
     const row = rowFor('Q3 report.pdf');
     expect(within(row).queryByRole('button', { name: /Delete/ })).toBeNull();
-    expect(within(row).getByText('To remove it, delete its chat.')).toBeTruthy();
+    // Not "to remove it": the stored copy outlives the chat until the server's
+    // clean-up (QA 2026-09-30), which the retention paragraph says once.
+    expect(within(row).getByText('Deleting its chat removes it from this list.')).toBeTruthy();
+    expect(screen.getByText(/the server erases their stored copies later/)).toBeTruthy();
+  });
+
+  it('says a recording is in Recordings "with its transcript" only once there is one', async () => {
+    await renderPage(
+      new FakeFiles([
+        recording(1),
+        recording(2, { media: { status: 'failed', duration_ms: 61_000 } }),
+        recording(3, {
+          availability: 'processing',
+          media: { status: 'finishing', duration_ms: null },
+          can: { download: false, preview: null, delete: true },
+        }),
+      ]),
+    );
+    const links = items().map((li) => within(li).getByRole('link', { name: /Recordings/ }));
+    expect(links.map((a) => a.textContent)).toEqual([
+      'Also in Recordings, with its transcript',
+      'Also in Recordings',
+      'Also in Recordings',
+    ]);
+    expect(links.every((a) => a.getAttribute('href') === '/recordings')).toBe(true);
   });
 
   it('previews a text-only document from the text the chat read', async () => {
@@ -490,7 +516,7 @@ describe('each row', () => {
     const fake = new FakeFiles([upload(1)]);
     fake.retention = { ...RETENTION, upload_hours: 36 };
     await renderPage(fake);
-    expect(screen.getByText(/Files you attach to a chat are kept for 36 hours/)).toBeTruthy();
+    expect(screen.getByText(/Files you attach to a chat are kept for up to 36 hours/)).toBeTruthy();
     expect(screen.getByText(/Pictures stay only in the browser you sent them from/)).toBeTruthy();
   });
 });
@@ -511,5 +537,52 @@ describe('deleting a recording', () => {
     const third = items()[1]!;
     await waitFor(() => expect(document.activeElement).toBe(within(third).getByRole('heading')));
     expect(screen.getByRole('status').textContent).toBe(`Deleted the voice recording from ${when}.`);
+  });
+
+  it('warns that deleting a recording still in progress stops it, as the Recordings page does', async () => {
+    // The DELETE stops a live recording and erases what was saved so far
+    // (QA 2026-09-30: the row went to 'cancelled' with its audio deleted).
+    const live = recording(1, {
+      availability: 'processing',
+      media: { status: 'recording', duration_ms: null },
+      can: { download: false, preview: null, delete: true },
+    });
+    await renderPage(new FakeFiles([live, recording(2)]));
+    const warning = 'It is still in progress: deleting it stops it and removes what was saved so far.';
+
+    fireEvent.click(within(items()[0]!).getByRole('button', { name: /^Delete the voice recording from/ }));
+    let dialog = screen.getByRole('alertdialog', { name: 'Delete this recording?' });
+    expect(within(dialog).getByText(/will be deleted from the server/).textContent).toContain(
+      `will be deleted from the server. ${warning} This can't be undone.`,
+    );
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+
+    // A finished recording's confirmation does not claim it is still running.
+    fireEvent.click(within(items()[1]!).getByRole('button', { name: /^Delete the voice recording from/ }));
+    dialog = screen.getByRole('alertdialog', { name: 'Delete this recording?' });
+    expect(dialog.textContent).not.toContain('still in progress');
+  });
+
+  it('says it in the very words the Recordings page uses', () => {
+    // My files reads the shared constant; the Recordings page still spells
+    // the sentence out, so this is what keeps the two pages from drifting.
+    expect(IN_PROGRESS_DELETE_NOTE).toBe(
+      'It is still in progress: deleting it stops it and removes what was saved so far.',
+    );
+    for (const status of ['recording', 'finishing'] as const) {
+      const live: Recording = {
+        id: hex(7),
+        createdAt: at(1),
+        status,
+        outcome: null,
+        audioMs: 0,
+        bytes: 4096,
+        mimeType: 'audio/webm',
+        deleteAfter: null,
+        kept: true,
+        preview: null,
+      };
+      expect(deleteConfirmBody(live)).toContain(` ${IN_PROGRESS_DELETE_NOTE} `);
+    }
   });
 });

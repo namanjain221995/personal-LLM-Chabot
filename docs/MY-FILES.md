@@ -21,7 +21,7 @@ changes.
 | Row | Comes from | Kind shown |
 |---|---|---|
 | an upload | an `uploads` row with `status='ready'`, in a chat the person owns | Document (`notes='document'`), Video (`notes='video'`), Audio (a `'video'` row whose name ends in one of `video.api.AUDIO_EXTENSIONS`), Spreadsheet or data (anything else) |
-| a text-only document | a `documents` row with no upload behind it: a PDF sent inside the chat request (every PDF before 2026-09-02), or one handed to the artifact studio. Only its extracted text was ever kept. | Document |
+| a text-only document | a `documents` row with no ready upload behind it: a PDF sent inside the chat request (every PDF before 2026-09-02), or one handed to the artifact studio. Only its extracted text was ever kept. | Document |
 | a recording | a `voice_sessions` row that is not cancelled and whose audio is not deleted | Voice recording |
 
 Archive members (`x.zip/a.txt`) and archive manifests (`x.zip (archive
@@ -50,22 +50,41 @@ The server decides `availability` the same way the download route does:
 Rules behind the table:
 - A video or audio file stays `available` after the 24 h workspace sweep while
   any chat links its analysis. Its bytes are hard-linked into
-  `VIDEO_DATA_DIR/<sha256>/source.<ext>`.
+  `VIDEO_DATA_DIR/<sha256>/source.<ext>`. A leftover `source.<ext>.part` (a
+  cross-device copy that a crash cut short) never counts, for this list, the
+  download route or the pipeline (`video.store.source_path`).
+- A text-only document folds only under an upload that is itself listed
+  (`status='ready'`). A rejected or failed upload of the same name no longer
+  hides the text the chat kept.
 - A recording's state comes from its database row alone. No stat is made, so
   where the voice store lives costs this list nothing.
 - Deleting is offered **for recordings only**, through the same
-  `DELETE /audio/sessions/{id}` the Recordings page uses. A chat's files go
-  when the chat is deleted, and each row says so.
+  `DELETE /audio/sessions/{id}` the Recordings page uses. On a recording still
+  in progress, the confirmation says that deleting it stops it and removes
+  what was saved so far, in the Recordings page's own words
+  (`lib/recordings.IN_PROGRESS_DELETE_NOTE`).
+- A chat's files leave this list when the chat is deleted, and each row says
+  so ("Deleting its chat removes it from this list."). No row promises an
+  erasure time: the bytes wait for the next sweep or the video reaper (see
+  *Operating it*).
 
 ### Retention sentence
 
 The sentence at the top of the page is built from the deployment's settings,
 which come with every response. It stays true when a TTL changes:
 
-> Files you attach to a chat are kept for 24 hours; after that the chat keeps
-> what it read (a document's text, a spreadsheet's summary). Videos and audio
-> files stay while their chat exists. Voice recordings stay until you delete
-> them. Pictures stay only in the browser you sent them from.
+> Files you attach to a chat are kept for up to 24 hours; after that the chat
+> keeps what it read (a document's text, a spreadsheet's summary). Videos and
+> audio files stay while their chat exists. Deleting a chat takes its files off
+> this list at once; the server erases their stored copies later. Voice
+> recordings stay until you delete them. Pictures stay only in the browser you
+> sent them from.
+
+"Up to", because the sweep also enforces `WORKSPACE_QUOTA_GB` and a large
+upload can evict a file sooner. For the same reason a swept row's note says
+"The file was removed (chat files are kept for up to 24 hours)", not "removed
+after 24 hours". A recording links to Recordings "with its transcript" only
+once its transcription is `done`.
 
 | Setting | Production value | Effect |
 |---|---|---|
@@ -96,6 +115,18 @@ them, the rule `/audio/sessions` follows.
 | `sort` | `newest` (default), `oldest`, `largest`, `name` |
 | `limit` | 1-100, default 50 |
 | `cursor` | the previous page's `next_cursor`; one minted under another sort is refused |
+
+A NUL character in any parameter, or in a cursor's name key, is a 400:
+PostgreSQL text cannot hold one, and it used to surface as a 500.
+
+The name sort's key is `left(lower(name), 512)`, in the `ORDER BY` and in the
+keyset comparison alike, and the cursor's JSON keeps it as UTF-8
+(`ensure_ascii=False`). Names that agree on their first 512 characters tie on
+the key and `(source, item_id)` orders them, so paging stays exact. Before
+this bound the key was the whole name: a 4,916-character archive member path,
+or 2,500 CJK characters escaped to a 20,063-character cursor, made the next
+page a 400 (or Node's 431), and "Name, A to Z" stopped there for good. A
+cursor is now at most about 2.8 KB.
 
 Anything else in the query string is ignored. There is no `user_id` parameter.
 
@@ -244,9 +275,18 @@ sum(rate(myfiles_list_total{result="error"}[15m]))
   migration, no new service, no environment variable and no new port.
 - **Rollback:** revert the commit. The page and its two routes disappear.
   Nothing was written to the database.
-- **Deleting:** a person deletes a recording from the page. A chat's files go
-  with the chat, but the bytes linger until the next sweep (up to 24 h) or
-  reaper run (72 h and more for video). Per-file deletion is phase 2.
+- **Deleting:** a person deletes a recording from the page. A chat's rows go
+  with the chat at once, but its bytes linger:
+  - an upload's workspace copy until the first sweep after it is
+    `WORKSPACE_TTL_HOURS` old. The sweep (`core/repo.enforce_quota_and_ttl`)
+    runs only when someone uploads a file or a repository is cloned, so on a
+    quiet box that can be well past 24 h;
+  - a video's analysis-store copy until the reaper finds it unlinked for
+    `VIDEO_ORPHAN_TTL_HOURS` (72 h), checked every
+    `VIDEO_MAINTENANCE_INTERVAL_S`.
+
+  This is why the page gives no erasure time. Per-file deletion, and erasing
+  a deleted chat's bytes at once, are phase 2.
 - **Empty or odd page:**
   - Read `myfiles_list_total{result="error"}` and the orchestrator log. The
     traceback names the statement; file names are not in it.
@@ -257,10 +297,11 @@ sum(rate(myfiles_list_total{result="error"}[15m]))
 
 ## Verified
 
-- **Orchestrator:** `tests/test_myfiles_api.py` (61 tests) and
-  `tests/test_uploads_video_download.py` (6).
+- **Orchestrator:** `tests/test_myfiles_api.py` (69 tests) and
+  `tests/test_uploads_video_download.py` (8), after the verification fix round
+  below (61 and 6 before it).
   - Run against the code of `main` 30cee881 (the branch rebased onto it, the
-    two test files copied in), 61 of the 67 fail: the routes answer 404 and a
+    two test files copied in), 61 of the first 67 fail: the routes answer 404 and a
     swept video 410. The other 6 pass on both sides because they pin
     behaviour that must not change (the admin views, another person's 404,
     the 410 when both stores are empty, document and dataset downloads, the
@@ -304,6 +345,45 @@ sum(rate(myfiles_list_total{result="error"}[15m]))
   1. `?kind=recording` was a 500. A `UNION` takes its column names from its
      first branch, and that filter leaves the recordings branch alone.
   2. A ZIP's text preview asked for the wrong `documents` row.
+- **Independent verification (2026-09-30 evening) found one medium and six
+  lows; all are fixed or documented, each with a test that failed first:**
+  - (medium) Delete on a recording still in progress did not say it stops
+    the recording: `deleting a recording › warns that deleting a recording
+    still in progress stops it` in `my-files-page.test.tsx`.
+  - Name paging stalled on a long name:
+    `test_a_very_long_name_does_not_stall_name_paging[cjk|archive-path]`,
+    with `test_names_that_share_a_long_prefix_still_page_exactly` guarding
+    the bounded key.
+  - NUL in `q` or a name cursor was a 500:
+    `test_a_nul_character_is_a_flat_400_not_a_500` (both routes) and
+    `test_a_nul_character_in_a_forged_name_cursor_is_a_400`.
+  - A `.part` in the video store was served as the whole file:
+    `test_a_partial_copy_in_the_video_store_is_not_stored`,
+    `test_a_partial_copy_in_the_analysis_store_is_never_served` and
+    `test_adopt_source_replaces_a_leftover_partial_copy`.
+  - A rejected upload hid a text row of the same name:
+    `test_a_refused_upload_does_not_hide_the_text_of_the_same_name`.
+  - Wording that promised more than the server does: the retention and
+    row-note tests in `my-files-lib.test.ts` and `my-files-page.test.tsx`.
+  - The same video twice in one chat, and ASCII-only case folding, are
+    listed under *Known limits*.
+
+---
+
+## Known limits (v1)
+
+- **The same video attached twice in one chat.** `video_attachments` is
+  `UNIQUE (conversation_id, analysis_id)` and `ON CONFLICT DO UPDATE` keeps
+  only the newest `upload_id`. After the sweep the OLDER upload finds no link:
+  it lists as Removed and its download is 410, although the bytes are still
+  stored under the newer upload, which downloads. The list and the route
+  agree, so nothing broken is offered. The proper fix keys the link per
+  `(conversation_id, upload_id)` and needs a migration.
+- **Search folds case for ASCII only.** The database runs `LC_CTYPE=C`, where
+  `ILIKE` folds A-Z only: `étude` does not find `ÉTUDE.pdf`, and lowercase
+  Cyrillic does not find uppercase. Every other `ILIKE` search in the app
+  behaves the same. Arabic, Hebrew, CJK and emoji substring search works,
+  chat titles in RTL included.
 
 ---
 

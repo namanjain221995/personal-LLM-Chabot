@@ -43,7 +43,7 @@ import {
   type Retention,
 } from '@/lib/myfiles';
 import { fetchDocumentText, fetchUploadProfile } from '@/lib/previewData';
-import { deleteRecording } from '@/lib/recordings';
+import { IN_PROGRESS_DELETE_NOTE, deleteRecording } from '@/lib/recordings';
 import { formatElapsed } from '@/lib/voice';
 
 /**
@@ -166,6 +166,8 @@ export function MyFileRow({ file, retention, fetchFn, onDeleted, onExpired }: My
   const when = formatWhen(file.createdAt);
   const what = describe(file);
   const duration = file.media?.durationMs ? formatElapsed(file.media.durationMs) : null;
+  // A recording still being made or transcribed: its DELETE stops it first.
+  const inProgress = file.availability === 'processing';
 
   function openPreview() {
     if (!plan || plan.kind === 'audio') return;
@@ -300,7 +302,8 @@ export function MyFileRow({ file, retention, fetchFn, onDeleted, onExpired }: My
                 href="/recordings"
                 className={`rounded font-medium text-accent underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${TOUCH_LINK}`}
               >
-                Also in Recordings, with its transcript
+                {/* A failed or unfinished recording has no transcript to promise. */}
+                {file.media?.status === 'done' ? 'Also in Recordings, with its transcript' : 'Also in Recordings'}
               </a>
             )}
           </p>
@@ -351,8 +354,10 @@ export function MyFileRow({ file, retention, fetchFn, onDeleted, onExpired }: My
                 <span className="sr-only"> {what}</span>
               </button>
             ) : (
+              // Not "to remove it": the stored copy outlives the chat until the
+              // server's clean-up, which the retention paragraph says once.
               file.conversation && (
-                <p className="ml-auto text-xs text-faint">To remove it, delete its chat.</p>
+                <p className="ml-auto text-xs text-faint">Deleting its chat removes it from this list.</p>
               )
             )}
           </div>
@@ -374,7 +379,9 @@ export function MyFileRow({ file, retention, fetchFn, onDeleted, onExpired }: My
       <ConfirmDialog
         open={confirming}
         title="Delete this recording?"
-        body={`The recording from ${when} and its transcript will be deleted from the server. This can't be undone.`}
+        body={`The recording from ${when} and its transcript will be deleted from the server.${
+          inProgress ? ` ${IN_PROGRESS_DELETE_NOTE}` : ''
+        } This can't be undone.`}
         confirmLabel="Delete recording"
         onConfirm={() => void confirmDelete()}
         onCancel={cancelDelete}

@@ -15,7 +15,7 @@ WHAT IS LISTED — three sources in one keyset-paged statement:
                ('document', 'video', or a dataset's own notes; pinned by
                tests/test_myfiles_api.py) and an audio file is a 'video' row
                whose name ends in an audio extension (video/api.py B12).
-    text       a `documents` row with no upload behind it: a document that
+    text       a `documents` row with no ready upload behind it: a document that
                was sent inside the chat request (before 2026-09-02 every PDF
                travelled that way) or handed to the artifact studio. Only its
                extracted text was ever kept. Archive members
@@ -105,11 +105,17 @@ LIMIT_MAX = 100
 #: them under V rather than ahead of every file.
 RECORDING_NAME = "Voice recording"
 
-#: The largest cursor this route will decode. A name key is at most one
-#: filename (a text row's name can carry a path), and base64 of the JSON
-#: around it stays far below this.
+#: The largest cursor this route will decode. The name sort's key is the
+#: first _NAME_KEY_CHARS characters of the lowered name, not the whole name:
+#: a text row's name is whatever the client sent (ChatRequest.pdf_filename
+#: has no bound) or an archive member's whole path, and a cursor carrying
+#: 4,916 characters of one was refused by the next request (QA, 2026-09-30),
+#: stalling "Name, A to Z" for good. 512 characters of JSON kept as UTF-8
+#: (ensure_ascii=False; the default \uXXXX escapes made a CJK name six times
+#: longer) keep a cursor under ~2.8 KB, far below this bound and Node's 16 KB
+#: header limit, which answered 431 before the proxy ran.
 _CURSOR_MAX_CHARS = 16_384
-_NAME_KEY_MAX_CHARS = 4_096
+_NAME_KEY_CHARS = 512
 #: Upload ids are uuid4().hex and text rows are a bigint; anything in this
 #: alphabet is safe as a bound parameter, and anything outside it is not an
 #: id this route ever minted.
@@ -162,6 +168,10 @@ def _text(params: Mapping[str, Any], name: str) -> Optional[str]:
     if value is None:
         return None
     value = str(value).strip()
+    if "\x00" in value:
+        # PostgreSQL text cannot hold NUL: bound as a parameter it raised
+        # psycopg.DataError, a 500 (QA, 2026-09-30).
+        raise BadRequest(f"{name} must not contain a NUL character.")
     return value or None
 
 
@@ -218,7 +228,9 @@ def parse_filters(params: Mapping[str, Any]) -> Filters:
 def encode_cursor(sort: str, key: Any, source: str, item_id: str) -> str:
     if isinstance(key, datetime):
         key = key.astimezone(timezone.utc).isoformat()
-    raw = json.dumps({"v": 1, "sort": sort, "k": [key, source, item_id]}, separators=(",", ":"))
+    raw = json.dumps(
+        {"v": 1, "sort": sort, "k": [key, source, item_id]}, separators=(",", ":"), ensure_ascii=False
+    )
     return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
 
 
@@ -254,7 +266,7 @@ def decode_cursor(text: str, sort: str) -> Tuple[Any, str, str]:
     elif sort == "largest":
         if isinstance(key, bool) or not isinstance(key, int) or not -1 <= key <= _BIGINT_MAX:
             raise invalid
-    elif not isinstance(key, str) or len(key) > _NAME_KEY_MAX_CHARS:
+    elif not isinstance(key, str) or len(key) > _NAME_KEY_CHARS or "\x00" in key:
         raise invalid
     return key, source, item_id
 
@@ -300,7 +312,9 @@ _UPLOADS_SEARCH = """
 
 # A document's text is folded under its upload when the upload names it
 # exactly, when it is a member of an uploaded archive ("x.zip/a.txt"), or when
-# it is an archive's manifest ("x.zip (archive contents)").
+# it is an archive's manifest ("x.zip (archive contents)"). Only under an
+# upload that is itself listed ('ready'): folding it under a rejected or
+# failed upload of the same name hid the text entirely (QA, 2026-09-30).
 _TEXT_BRANCH = """
     SELECT 'text'::text AS source, d.id::text AS item_id, d.conversation_id, d.filename AS name,
            NULL::bigint AS bytes, d.created_at, 'document'::text AS kind
@@ -309,7 +323,7 @@ _TEXT_BRANCH = """
      WHERE c.user_id = %(uid)s AND d.conversation_id !~ '^u[0-9]+-'
        AND NOT EXISTS (
              SELECT 1 FROM uploads u2
-              WHERE u2.conversation_id = d.conversation_id
+              WHERE u2.conversation_id = d.conversation_id AND u2.status = 'ready'
                 AND u2.filename IN (d.filename, split_part(d.filename, '/', 1),
                                     regexp_replace(d.filename, ' \\(archive contents\\)$', '')))"""
 
@@ -326,12 +340,15 @@ _RECORDINGS_BRANCH = """
 _RECORDINGS_SEARCH = """
        AND %(recording_name)s::text ILIKE %(pat)s ESCAPE '\\'"""
 
-#: sort -> (key expression over the union's columns, direction, keyset operator)
+#: sort -> (key expression over the union's columns, direction, keyset operator).
+#: The ORDER BY and the keyset comparison use the SAME expression, so the
+#: bounded name key stays exact: names that agree on their first
+#: _NAME_KEY_CHARS characters tie on it, and (source, item_id) orders them.
 _SORT_SPEC = {
     "newest": ("created_at", "DESC", "<"),
     "oldest": ("created_at", "ASC", ">"),
     "largest": ("COALESCE(bytes, -1)", "DESC", "<"),
-    "name": ("lower(name)", "ASC", ">"),
+    "name": (f"left(lower(name), {_NAME_KEY_CHARS})", "ASC", ">"),
 }
 
 _DECORATE = """

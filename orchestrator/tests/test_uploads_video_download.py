@@ -156,3 +156,53 @@ def test_a_non_video_row_never_reads_the_analysis_store(alice):
     assert store.source_path(content_hash)
     _sweep(conv, document)
     assert alice.get(f"/uploads/{conv}/{document}/file").status_code == 410
+
+
+def _partial_only(conv: str, upload_id: str) -> str:
+    """The analysis store as a crash in the middle of adopt_source's copy
+    leaves it (VIDEO_DATA_DIR on another filesystem than the workspace): only
+    source.<ext>.part, holding a third of the bytes. Returns the hash."""
+    from pathlib import Path
+
+    from app.video import store
+
+    content_hash = db.get_video_by_upload(conv, upload_id)["content_hash"]
+    root = Path(store.analysis_dir(content_hash))
+    source = next(p for p in root.iterdir() if p.name.startswith("source."))
+    source.unlink()
+    (root / (source.name + ".part")).write_bytes(MP4[: len(MP4) // 3])
+    return content_hash
+
+
+def test_a_partial_copy_in_the_analysis_store_is_never_served(alice):
+    """store.source_path matched any 'source.*' name, the .part included, so
+    the route answered 200 with a third of the video as the whole file (QA,
+    2026-09-30). A partial copy is not the file: 410, as with no copy."""
+    from app.video import store
+
+    conv = _chat(alice, "conv-part")
+    upload_id = _upload(alice, conv, "clip.mp4", MP4, "video", "video/mp4")
+    content_hash = _partial_only(conv, upload_id)
+    _sweep(conv, upload_id)
+    assert store.source_path(content_hash) is None
+    assert alice.get(f"/uploads/{conv}/{upload_id}/file").status_code == 410
+
+
+def test_adopt_source_replaces_a_leftover_partial_copy(tmp_path):
+    """The same .part also made adopt_source's "already stored" check hand
+    the pipeline a third of the video; the next adopt now finishes the copy."""
+    from pathlib import Path
+
+    from app.video import store
+
+    content_hash = "c" * 64
+    root = Path(store.analysis_dir(content_hash))
+    root.mkdir(parents=True)
+    (root / "source.mp4.part").write_bytes(MP4[:100])
+    upload = tmp_path / "upload.mp4"
+    upload.write_bytes(MP4)
+    dest = store.adopt_source(content_hash, str(upload), "upload.mp4")
+    assert Path(dest) == root / "source.mp4"
+    assert Path(dest).read_bytes() == MP4
+    assert store.source_path(content_hash) == dest
+    assert not (root / "source.mp4.part").exists()
