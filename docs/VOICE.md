@@ -222,6 +222,11 @@ zero. Its image lifts whisper.cpp's 220-token window limit to the pipeline's
 443, without which dense Hindi repeated its tail. It holds 2.0 GiB and takes
 0.2-1.0 s per second of audio. While it decodes, the 27B main model loses
 about 5 % of its decode speed (a GPU replica costs it about 19 %).
+It was proven end to end through the orchestrator's own router against a
+throwaway copy on the worker (13 scenarios, 2026-09-30). Its port, 30008, has no
+authentication, so `up` refuses to start it until the worker's packet filter
+closes that port to everything but the head, both in the table loaded now and in
+the copy that loads it at boot.
 Everything, including how it was measured, is in
 [voice/CPU-REPLICA.md](voice/CPU-REPLICA.md).
 

@@ -66,6 +66,10 @@ worker's fast cores, GPU replicas preferred, the same accuracy measured before i
   that Docker restarts it. This is the GPU replica's CUDA-death rule. Without the kill, a native
   hang would hold the one-clip lock for good while `/health` kept saying ready. Verified in the
   built image with a 1 s bound: 503, 503, 503, then exit 3.
+- **A decoder that cannot be restarted counts as a death too.** Before 2026-09-30 it was a 500
+  that was never counted, so a replica whose decoder could no longer start (its model gone from
+  the bind mount, a load that dies) answered 500 to every clip and Docker never restarted it.
+  Found and fixed in the end-to-end run below.
 
 ## The same model, the same decode, the same contract
 
@@ -412,7 +416,7 @@ one-at-a-time rule, which is a product trade, so it is not in this branch.
 ## Running it
 
 ```bash
-scripts/whisper-cpu.sh up       # convert + verify the weights (once), build, start, wait, record ASR_CPU_BASE_URLS
+scripts/whisper-cpu.sh up       # check the host guard, build, convert + verify the weights (once), start, wait, record ASR_CPU_BASE_URLS
 scripts/whisper-cpu.sh status   # container state and the replica's /health
 scripts/whisper-cpu.sh verify   # transcribe the JFK clip and print the time taken
 scripts/whisper-cpu.sh logs
@@ -423,16 +427,79 @@ scripts/whisper-cpu.sh down     # stop it and empty ASR_CPU_BASE_URLS; nothing e
 (`./techsara up`, a routine up; the main model is not restarted). Until then nothing routes to the
 replica. `down` empties the key.
 
-**Before the first `up`** (owner, root):
-- Copy this checkout's `scripts/host-guard.sh` to the worker.
-- Run `sudo bash ~/.techsara-cluster/host-guard.sh apply --role worker`, then `verify`. The guard
-  must accept 30008 from the head only, like 30007. The replica has no authentication, as the GPU
-  replica has none.
+**Before the first `up`** (owner, root). The replica has no authentication, as the GPU replica has
+none, and the worker's packet filter judges only the ports it lists: until it lists 30008, the
+office LAN and the tailnet can reach it. The filter loaded on the worker since 2026-09-27 does not
+list it. It has to be changed twice over: in the table loaded now, and in the boot copy
+(`/usr/local/sbin/techsara-host-guard`) that loads it again at every reboot, or the next reboot
+reopens the port while Docker brings the replica back.
+
+```bash
+# on the head, from the deploy checkout (after the merge); CLUSTER_WORKER_SSH, as the scripts use:
+scp scripts/host-guard.sh techsphere@10.100.184.2:.techsara-cluster/host-guard.sh
+# on the worker:
+sudo bash ~/.techsara-cluster/host-guard.sh install-boot --role worker   # the boot copy (does not load)
+sudo bash ~/.techsara-cluster/host-guard.sh apply --role worker          # the table, now
+sudo bash ~/.techsara-cluster/host-guard.sh verify --role worker         # must pass, boot copy not drifted
+```
+
+**`up` enforces this.** Before it builds or starts anything it reads, without root, the table
+loaded now (`/run/techsara-host-guard/ruleset.nft`) and the boot copy's own `plan --role worker`,
+and it stops unless both list the port in `guarded_ports` and in `head_lan_ports`, printing the
+three commands above. `launcher/tests/test_whisper_cpu_guard.py` holds it. Run against the worker
+on 2026-09-30, it refused, as it should.
+
+## Verified end to end (2026-09-30, throwaway, nothing in production touched)
+
+**The deploy path, as `up` runs it.** `sync_files`, `build_images` and `ensure_model` were run
+from the committed script against the worker, with throwaway image tags, remote directory and
+model cache. It was the first build with BuildKit, which `up` uses (the earlier images were built
+with the legacy builder): sync 2 s, image 1 min 31 s, convert stage + conversion + both SHA-256
+checks 1 min 44 s. The converted f16 and q8_0 files reproduced their pins, and a second
+`ensure_model` found the verified file and converted nothing. The first attempt failed on a DNS
+blip (see Known limits).
+
+**The orchestrator's own router against a live replica.** A throwaway container from that image
+and model, started with the committed compose file (only the image tag, port 30200 and a loopback
+bind overridden), was reached over an SSH tunnel. Every setting applied as written: uid 10008,
+read-only root, cpuset 5-9,15-19, 8 CPUs, 4 GiB with no swap, oom_score_adj 850, cap_drop ALL,
+no-new-privileges, pids 256. It was ready 5.6 s after start. The two GPU replicas were stand-ins in
+the test process, speaking compose/whisper/server.py's contract, that could hold a clip (busy)
+or fail it (503). Every call went through the product's own entry points (`asr.transcribe`,
+`asr.transcribe_segments`, `asr.transcribe_session_window`):
+
+| # | scenario | result |
+|---|---|---|
+| 1 | a GPU replica is free | it takes the clip; the CPU replica is not touched |
+| 2 | both GPU replicas busy, a 10.4 s session window | CPU replica, WER 0 against the LibriSpeech reference, 6.9 s (estimate 13.2 s, ×1.5 = 19.8 s); `sent` |
+| 3 | a third clip while the CPU replica decodes | `cpu_busy`, queued on a GPU replica |
+| 4 | a clip whose estimate ×1.5 (19.8 s) misses its 15 s deadline | `too_long`, never sent to the CPU |
+| 5 | Hindi dictation (legacy path), GPUs busy | CPU replica, Devanagari, `hi`, 5.3 s (estimate 12.7 s) |
+| 6 | a 90 s video window, GPUs busy | CPU replica, 11 timestamped segments to 90.0 s, 23.8 s (RTF 0.27, estimate 49 s) |
+| 7 | 10 s of digital silence, dictation | gated on the CPU, decoded once more without the gate (CPU-costed), empty draft marked `silent` |
+| 8 | both GPU replicas answer 503 | the CPU replica is the last resort and answers; both GPUs stand down |
+| 9 | the CPU container stopped | the clip falls back to the GPU queue and the CPU stands down; the next overflow is `cpu_down`; `docker start` ready in 8 s |
+| 10 | the decoder killed mid-decode (90 s window) | 503, CPU stood down, the window finishes on a GPU replica; the next clip decodes on a fresh decoder |
+| 11 | three decoder deaths in a row | 503 ×3, the process ends, Docker restarts it (RestartCount 0 → 1), ready again in 6.1 s |
+
+**Two defects found this way, both fixed on this branch:**
+- **Silence became "you".** Asked again without the gate, the CPU replica answers 10 s of digital
+  silence with "you" timed 0.00-0.62 s. The GPU pipeline answers "Thank you." timed to the end
+  of its window (0.0-29.98 s). The same code with the same pins was run on CPU fp32 for 3, 10
+  and 30 s of silence, and each time the words ran to the end of the clip. The dictation retry
+  judged such text by words per covered second only, so "you" scored 1.0 words/s, exactly the
+  floor, and reached the composer as a low-confidence "you". `speech_is_plausible` now drops a
+  gated retry that is nothing but stock phrases, however it is timed. That is the rule a gated
+  session window already had (`window_is_plausible`). Every measured case keeps its verdict
+  (`test_asr_long_and_noisy.py::test_an_invention_timed_to_the_word_is_dropped_too`).
+- **A decoder that could not restart was a 500, never counted.** It is now a 503 that counts toward
+  the three-in-a-row exit (`test_whisper_cpu_server.py::test_a_decoder_that_cannot_restart_is_a_503_counted_toward_the_restart`).
 
 ## Checklist before enabling (not yet done)
 
-1. The host guard update above (sudo).
-2. `scripts/whisper-cpu.sh up` on the worker, then `verify`.
+1. The host guard update above (owner, sudo: `install-boot`, `apply`, `verify` on the worker).
+   `up` refuses until it is done.
+2. `scripts/whisper-cpu.sh up` on the head (it builds and runs on the worker), then `verify`.
 3. **Decide on the chat cost.** On the 27B it is about 5 % while the replica decodes (above),
    right at the gate the owner set for a head copy. A quiet-hours re-run with more pairs would
    narrow it. Fewer threads (`WHISPER_CPU_THREADS` and `cpus` in compose/compose.whisper-cpu.yaml)
@@ -463,3 +530,14 @@ replica. `down` empties the key.
   would pass a session window's 120 s and end as the caller's timeout or the watchdog's 503, where
   the GPU replica might have finished late. The loops the two replicas fall into are on different
   clips (one MUCS clip here).
+- **Building the image needs the network**: apt, GitHub (whisper.cpp at its pin), PyPI and the
+  PyTorch CPU index. A DNS blip on the worker fails it. On 2026-09-30 apt could not resolve
+  ports.ubuntu.com inside BuildKit for about 40 s; minutes later the same kind of build resolved
+  it (through 8.8.8.8, which Docker substitutes for the host's 127.0.0.53 stub), and the second
+  attempt went through. `up` then stops with "the image build failed on the worker". Run it
+  again: the build cache keeps every finished step, and nothing was started.
+- **Timestamps are the model's own, and they differ from the GPU pipeline's on inventions.** Both
+  replicas take segment times from the decoded timestamp tokens (whisper.cpp's token-level
+  timestamps are off). On silence, whisper.cpp ended its invented "you" at 0.62 s where the
+  pipeline ran "Thank you." to the end of the window. Anything that judges words per second of a
+  segment must not assume one engine's habit. The dictation retry no longer does (above).
