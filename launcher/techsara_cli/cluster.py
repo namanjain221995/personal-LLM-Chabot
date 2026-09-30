@@ -50,8 +50,10 @@ DEFAULT_GPU_MEMORY_UTILIZATION = "0.30"
 GPU_MEMORY_UTILIZATION_RANGE = (0.05, 0.95)
 DEFAULT_NCCL_DEBUG = "INFO"
 NCCL_DEBUG_LEVELS = ("VERSION", "WARN", "INFO", "TRACE")
-#: The MTP draft this checkpoint ships (``Qwen3_5MoeMTP``), as the value
-#: ``CLUSTER_SPECULATIVE_CONFIG`` takes to turn speculative decoding ON.
+#: The one-layer MTP draft the main checkpoint ships (``Qwen3_5MoeMTP`` on
+#: the 35B; nvidia/Qwen3.8-27B-NVFP4 carries ``mtp_num_hidden_layers: 1``
+#: too), as the value ``CLUSTER_SPECULATIVE_CONFIG`` takes to turn
+#: speculative decoding ON.
 MTP_SPECULATIVE_CONFIG = '{"method":"mtp","num_speculative_tokens":1}'
 #: Speculative decoding is OFF unless .env asks for it. Until 2026-09-11 the
 #: default was the MTP draft above. It was withdrawn during the GDN fault
@@ -720,10 +722,11 @@ def prefix_caching_argument(enabled: bool) -> str:
 
     vLLM's own default depends on the model: ON for a dense model, OFF
     (opt-in "while the feature matures") for a hybrid-Mamba one such as the
-    Qwen3.6-35B-A3B, where the engine labels prefix caching experimental
-    (``mamba_cache_mode=align``). Merely omitting the flag would therefore
-    mean different things on different profiles, so the launcher always
-    states the choice explicitly and the running command line shows it.
+    Qwen3.6-35B-A3B and the Qwen3.8-27B that replaced it (2026-09-30), where
+    the engine labels prefix caching experimental (``mamba_cache_mode=align``).
+    Merely omitting the flag would therefore mean different things on
+    different profiles, so the launcher always states the choice explicitly
+    and the running command line shows it.
     """
     return "--enable-prefix-caching" if enabled else "--no-enable-prefix-caching"
 

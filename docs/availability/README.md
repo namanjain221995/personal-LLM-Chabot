@@ -4,7 +4,8 @@ What was written after the main model's 11-minute outage of 2026-09-11 22:15Z,
 and the order to read it in. The subject is one vLLM engine, TP=2 across two
 DGX Sparks, and how it is detected dead, brought back, and how the requests
 that arrive while it reloads are kept and resumed — by the same model, because
-only `nvidia/Qwen3.6-35B-A3B-NVFP4` ever answers a person. The wider cluster
+only the main model ever answers a person (`nvidia/Qwen3.8-27B-NVFP4` since
+2026-09-30; `nvidia/Qwen3.6-35B-A3B-NVFP4` when this was written). The wider cluster
 (topology, interconnect, benchmarks, `CLUSTER_*` configuration) is
 [`../CLUSTER.md`](../CLUSTER.md); the observability platform is
 [`../MONITORING.md`](../MONITORING.md).

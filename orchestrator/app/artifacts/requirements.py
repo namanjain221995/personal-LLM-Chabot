@@ -874,7 +874,7 @@ def _strip_inline(text: str) -> str:
 async def build(job_row: Optional[dict], *, instruction: str, kind: str, formats: Sequence[str], operation: str,
                 parent_spec: Any = None, source_summary: str = "", effort: str = "fast", source_markdown: str = "",
                 proposer: Optional[Proposer] = None, busy: Optional[Callable[[], bool]] = None,
-                model_enabled: bool = True, timeout_s: float = 8.0) -> Checklist:
+                model_enabled: bool = True, timeout_s: float = 40.0) -> Checklist:
     """The checklist for one job. Fast never calls the model; Think/Max
     call the proposer once unless chat is busy or the flag is off."""
     checklist = Checklist()

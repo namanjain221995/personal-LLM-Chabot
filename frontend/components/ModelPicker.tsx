@@ -3,8 +3,10 @@
 /**
  * Composer effort picker.
  *
- * There is ONE model (Qwen3.6-35B-A3B), so this is no longer a model chooser —
- * it chooses how much work that model is allowed to do. The old separate
+ * There is ONE main model (nvidia/Qwen3.8-27B-NVFP4 since 2026-09-30), so this
+ * is no longer a model chooser — it chooses how much work that model is allowed
+ * to do: Fast answers without thinking, Think thinks at the model's medium
+ * reasoning effort, Max at its highest (xhigh) and drafts several answers. The old separate
  * "Fast" model entry is gone; Fast is now the lowest of four levels:
  *
  *   Fast    answer directly — no reasoning pass, no tools

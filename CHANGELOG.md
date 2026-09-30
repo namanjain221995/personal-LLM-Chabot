@@ -1,5 +1,50 @@
 # Changelog
 
+## The main model is nvidia/Qwen3.8-27B-NVFP4 — Fast off, Think medium, Max xhigh, and a 1M window sized for it (2026-09-30)
+
+Owner decision, 2026-09-30: the `dgx-spark` main model becomes
+`nvidia/Qwen3.8-27B-NVFP4` (revision `482ca0f3832238542f8f5295dde86b5f22711d80`)
+permanently, replacing the Qwen3.6-35B-A3B MoE, with the ~4× slower decode of a
+dense 27B accepted (24–27 tok/s at TP=2 measured in August — with MTP on, which
+stays off now — against 101–107 for the MoE). The 35B's weights stay on disk; no
+switch back is planned.
+
+**The swap.** The manifest key `dgx-qwen38-27b-nvfp4` now names NVIDIA's own
+checkpoint (the same weights and geometry as the RadixArk repack it named in
+August; `chat_template.jinja` and `preprocessor_config.json` are now required
+files), served under its own id, and the `dgx-spark` profile selects it. The
+1M window is the launcher's arithmetic on the checkpoint's own config: YaRN
+factor 3.82 with the multimodal rope kept, and a KV budget that must hold one
+full window — 16,384 bytes per token per node, so `CLUSTER_KV_CACHE_MEMORY_GIB`
+must be **18** (the 35B ran on 8; `up` refuses 8 and names 18). MTP stays off.
+
+**Thinking levels.** The 27B's chat template reads `reasoning_effort` and
+accepts only xhigh, medium and low — anything else, `high` included, is an
+exception inside the template and a 400 for the whole request. Fast still
+sends thinking off; a Think call sends medium, a Max call and every best-of-N
+candidate xhigh, and a thinking call that names no level medium (the
+template's own default would be xhigh on every helper call). Every request to
+the main model passes one guard at the choke point that maps a foreign level
+onto the template's (high/max → xhigh, minimal → low, none → thinking off),
+drops an unreadable one, and takes a top-level `reasoning_effort` off before
+vLLM can let it override the template key. `/v1` keeps refusing the field by
+name.
+
+**Deploys.** A routine deploy (`TECHSARA_PRESERVE_MAIN_MODEL`) now refuses —
+before anything is downloaded, written or restarted — when the running engine
+does not serve the model the manifest names: its readiness probe asked the old
+engine for the new name, read the 404 as "not serving", and reloaded the pair
+with deploy.sh's automatic rollback armed behind it. The swap is applied on
+purpose: `./techsara up` from the deploy root. `MAIN_MODEL_SERVED_ALIASES`
+(opt-in) lets the engine also answer to old names for callers outside this
+repository that use the raw port (the interview-analysis tenant, the
+litellm-dgx proxy).
+
+**Defaults that followed the old model.** `MAIN_MODEL`'s fallback is the 27B
+and `VISION_MODEL` now follows `MAIN_MODEL` instead of a literal. The public
+`/v1` id stays `techsara-35b`: it names the product, and renaming it is a
+contract change (allowlists, narrow-only disable rows, usage history).
+
 ## The model becomes something other programs can call: a keyed `/v1` API with quotas, streaming, background responses and signed webhooks — and the audit's security fixes that had to come first (2026-09-13)
 
 Until this release the only way to use the main model was to sign in and type.

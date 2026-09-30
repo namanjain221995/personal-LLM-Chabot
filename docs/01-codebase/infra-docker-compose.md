@@ -109,7 +109,7 @@ probe fails.
 
 | Service | Internal port | Model/role | Host port |
 |---|---:|---|---|
-| `vllm` | 30000 | Qwen3.6 35B-A3B NVFP4 MoE main (`nvidia/Qwen3.6-35B-A3B-NVFP4`, served as `Qwen/Qwen3.6-35B-A3B-NVFP4`) | none (`expose` only) |
+| `vllm` | 30000 | dense Qwen3.8-27B NVFP4 main (`nvidia/Qwen3.8-27B-NVFP4`, served under the same id, since 2026-09-30; the Qwen3.6 35B-A3B MoE before it) | none (`expose` only) |
 | `vllm-router` | 30002 | Qwen3-VL 8B FP8 router/vision | none |
 | `vllm-embed` | 30003 | Qwen3 Embedding 0.6B; profile `embeddings` | none |
 | `vllm-reranker` | 30005 | Qwen3 Reranker 0.6B (`/score`); profile `reranker` | none |

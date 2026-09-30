@@ -17,7 +17,7 @@ services:
     image: ${CLUSTER_VLLM_IMAGE:?CLUSTER_VLLM_IMAGE must be set (run scripts/cluster-sync.sh)}
     command: >
       ${MAIN_MODEL_CONTAINER_PATH:?MAIN_MODEL_CONTAINER_PATH must be set}
-      --served-model-name ${MAIN_MODEL:?MAIN_MODEL must be set}
+      --served-model-name ${MAIN_MODEL_SERVED_NAMES:-${MAIN_MODEL:?MAIN_MODEL must be set}}
       ${CLUSTER_ENGINE_ARGS:?CLUSTER_ENGINE_ARGS must be set}
       --node-rank 1
       --headless

@@ -23,7 +23,12 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import environment as environment_module
 from .cluster import CLUSTER_COMPOSE_OVERLAY, discover_cluster_peer, resolve_cluster_mode
-from .compose import ComposeManager, docker_project_has_running_models, foreign_checkout_owner
+from .compose import (
+    ComposeManager,
+    docker_project_has_running_models,
+    foreign_checkout_owner,
+    running_head_served_names,
+)
 from .environment import (
     DGX_COMPOSE_OVERLAY,
     ENGINE_CONTROLLER_CODE_SHA_KEY,
@@ -804,6 +809,8 @@ def _cmd_up_dry(args: argparse.Namespace, *, root: Path) -> int:
         reuse_running_models=_project_has_running_models(persistent),
     )
     _verbose(args, f"selected {profile.id} with runtime {profile.runtime_backend}")
+    # A plan the real run would refuse is not a valid plan.
+    _guard_routine_deploy_model_change(profile)
     _, runtimes = load_model_manifest(root)
     user_env = parse_env_file(root / ".env")
     secrets = parse_env_file(persistent.secrets_env)
@@ -2008,6 +2015,48 @@ def _guard_foreign_checkout(args: argparse.Namespace, *, root: Path) -> None:
     )
 
 
+#: What scripts/deploy.sh sets for every routine (non --full) deploy.
+PRESERVE_MAIN_MODEL_ENV = "TECHSARA_PRESERVE_MAIN_MODEL"
+
+
+def _guard_routine_deploy_model_change(profile: SelectedProfile) -> None:
+    """Refuse a ROUTINE deploy that would change which model the main engine serves.
+
+    WHY (2026-09-30, the swap to nvidia/Qwen3.8-27B-NVFP4). A routine deploy
+    sets TECHSARA_PRESERVE_MAIN_MODEL and keeps a serving head; a change to its
+    definition waits for --full. But the preserve probe asks the running
+    engine for the NEW MAIN_MODEL, so a changed model makes a healthy engine
+    look "not serving": the flag was dropped and the routine deploy reloaded
+    the pair, with deploy.sh's automatic rollback -- a second reload, back onto
+    the old model -- armed behind it, and the pipeline's verify job failing
+    the run as "RESTARTED during a rolling deploy". Keeping the old engine is
+    no better: the orchestrator would be recreated to call a model name that
+    engine does not serve. So the change is refused here, before anything is
+    downloaded, written or restarted, and the operator applies it on purpose.
+    A head that serves the new name (among its --served-model-name values) or
+    no running head at all is not a change, and nothing is refused.
+    """
+    if not _truthy(os.environ.get(PRESERVE_MAIN_MODEL_ENV)):
+        return
+    wanted = profile.main_model.api_model_id if profile.main_model else ""
+    if not wanted:
+        return
+    served = running_head_served_names()
+    # vLLM's FIRST --served-model-name is the model actually answering; an
+    # alias naming the wanted model does not make a different engine the
+    # wanted one (swap review 2026-09-30).
+    if not served or served[0] == wanted:
+        return
+    raise TechSaraError(
+        f"the main model changes from {served[0]} to {wanted}, and this is a routine deploy "
+        f"({PRESERVE_MAIN_MODEL_ENV} is set): a routine deploy never reloads the engine, and it "
+        "cannot keep the running one either, because the orchestrator would then call a model "
+        "name that engine does not serve. Nothing was downloaded, written or restarted. Apply "
+        "the swap on purpose from the deploy root: ./techsara up (without the flag), or "
+        "scripts/deploy.sh --full"
+    )
+
+
 def _cmd_up(args: argparse.Namespace, *, root: Path) -> int:
     print("TechSara AI platform bootstrap")
     if args.dry_run:
@@ -2026,6 +2075,7 @@ def _cmd_up(args: argparse.Namespace, *, root: Path) -> int:
             skip_ocr=args.skip_ocr, reuse_running_models=reuse,
         )
         _verbose(args, f"selected {profile.id} with runtime {profile.runtime_backend}")
+        _guard_routine_deploy_model_change(profile)
         models, runtimes = load_model_manifest(root)
         user_env = parse_env_file(root / ".env")
         secrets, secret_warnings = prepare_local_secrets(layout, profile, user_env)

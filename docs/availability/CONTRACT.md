@@ -1,5 +1,12 @@
 # Engine availability — the shared contract (v2, strict one-model mode)
 
+> **Amended 2026-09-30 (owner decision): the one model is now
+> `nvidia/Qwen3.8-27B-NVFP4`** (MAIN_MODEL, still one TP=2 instance across the
+> two Sparks). Every rule below applies to it unchanged; where the text names
+> `nvidia/Qwen3.6-35B-A3B-NVFP4`, read "the main model". The orchestrator never
+> identified the model by name — the hold, the breaker and the controller key
+> on the main ENGINE — so the swap needed no change to this contract's code.
+
 > **v2 (2026-09-12 06:15 IST).** Product requirement: **only `nvidia/Qwen3.6-35B-A3B-NVFP4` may generate a user answer**, as one TP=2 instance (Spark 1 = rank 0, Spark 2 = rank 1). No 8B fallback answer, no external model, no second answer-generating model. The router stays an internal classifier only. During a recovery, requests are accepted and **durably queued**, the person reads a truthful message, and the **same logical generation resumes** when the main model is READY. v1 sections that spoke of a fallback answer are superseded by §8.3 v2 and §2 v2 below; v1 text is kept where it still holds.
 
 Every workstream in the 2026-09-12 availability programme builds against this
