@@ -512,6 +512,39 @@ def test_the_retry_happens_once_and_what_it_invents_from_silence_is_dropped(monk
     assert len(wire.requests) == 2
 
 
+def test_an_invention_timed_to_the_word_is_dropped_too(monkeypatch):
+    """Measured end to end on the worker, 2026-09-30: the CPU replica (whisper.cpp q8_0) answers
+    the same 10 s of digital silence, gate off, with "you" at 0.00-0.62 s, where the GPU
+    pipeline says "Thank you." to the end of its window (0.0-29.98 s; the same code on the same
+    pins, run on CPU fp32). Judged by density alone, "you" over max(0.62, 1) s is 1.0 words/s,
+    exactly the floor, and it reached the composer as a low-confidence "you" whenever a silent
+    dictation overflowed to the CPU. Text that is nothing but stock phrases, from a clip the gate
+    called silent, is an invention however the engine times it (window_is_plausible's rule for a
+    gated session window)."""
+    wire = _Wire(monkeypatch)
+    silent = dict(GATED, duration=10.0, no_speech_prob=0.71)
+    invented = {"text": "you", "language": "english", "language_code": "en",
+                "duration": 10.0, "no_speech_prob": 0.0,
+                "segments": [{"id": 0, "start": 0.0, "end": 0.62, "text": "you", "language": "en"}]}
+    wire.scripts["c"] = [(200, silent), (200, invented)]
+    cpu = asr.VLLMAudioProvider(base_url="http://c:30008/v1", model=MODEL, name="whisper", timeout_s=600.0,
+                                tier="cpu", fixed_s=8.5, s_per_audio_s=0.45)
+
+    result = _dictate(cpu)
+
+    assert result.text == ""
+    assert result.confidence == asr.CONFIDENCE_SILENT
+    assert len(wire.requests) == 2
+    # The rule, for either engine's timing; real words beside a stock phrase still count.
+    assert not asr.speech_is_plausible("you", 10.0, invented["segments"], engine_heard_speech=False)
+    assert not asr.speech_is_plausible("Thank you.", 3.0, [{"start": 0.0, "end": 0.6, "text": "Thank you."}],
+                                       engine_heard_speech=False)
+    assert asr.speech_is_plausible("Thank you. I will call you back at five.", 4.0,
+                                   [{"start": 0.0, "end": 0.6, "text": "Thank you."},
+                                    {"start": 0.8, "end": 3.9, "text": "I will call you back at five."}],
+                                   engine_heard_speech=False)
+
+
 def test_punctuation_alone_is_not_speech(monkeypatch):
     """Measured: pink and fan noise at -35 dBFS decode, gate off, as ". ."."""
     wire = _Wire(monkeypatch)

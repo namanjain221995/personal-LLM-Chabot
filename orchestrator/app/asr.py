@@ -942,6 +942,16 @@ def speech_is_plausible(
         if no_speech_prob is not None and no_speech_prob < _CONFIDENT_SPEECH_NSP:
             return True
         return not (seconds >= _STOCK_PHRASE_MIN_SECONDS and _only_stock_phrases(text))
+    # Nothing but stock phrases, from a clip the gate called silent, is an
+    # invention however the engine times it: window_is_plausible's rule for a
+    # gated session window. The density below caught it only while every
+    # engine timed such a phrase to the end of its window, as the GPU
+    # pipeline does ("Thank you." at 0-29.98 s over 10 s of digital silence,
+    # 0.2 words/s). whisper.cpp, the CPU replica, times it to the word: "you"
+    # at 0.00-0.62 s over the same clip is 1.0 words/s, and it was kept
+    # (measured end to end on the worker, 2026-09-30).
+    if _only_stock_phrases(text):
+        return False
     # A stock phrase that is not all of the text is the decoder filling a
     # quiet stretch: live, a 60 s dictation (32 s quiet, then 52 words of real
     # speech) came back with "Thank you." spanning 0-29.98 s, which made it
