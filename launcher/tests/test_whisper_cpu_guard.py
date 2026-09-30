@@ -236,7 +236,9 @@ class TheReplicaIsNeverStartedOnAnUnguardedPortTests(unittest.TestCase):
         self.assertIsNotNone(up, "whisper-cpu.sh has no `up)` case")
         body = up.group(1)
         guard_at = body.index("require_host_guard")
-        for later in ("sync_files", "build_images", "ensure_model", 'compose_worker "$bind" up -d', "_set_env"):
+        # What reaches the worker: its files, its image, its model, its container. (How the endpoint
+        # is then recorded in .env is not pinned here; it happens after the container is up.)
+        for later in ("sync_files", "build_images", "ensure_model", 'compose_worker "$bind" up -d'):
             self.assertLess(guard_at, body.index(later), later)
 
 
