@@ -916,6 +916,18 @@ describe('photos the server stored by itself (STORE-ALWAYS §2)', () => {
     expect(byIntent.size).toBe(2);
   });
 
+  it('a turn of many photos (no limit, 999 ceiling) keeps every ix- photo in numeric send order', () => {
+    // The server mints ix-<intent>-0..N-1 for N up to MAX_IMAGES, so indexes
+    // reach three digits: 10 sorts after 9, never after 1, and 998 is the last.
+    const indexes = [...Array(120).keys(), MAX_IMAGES - 1];
+    const shuffled = [...indexes].sort((a, b) => String(a).localeCompare(String(b)));
+    const byIntent = serverPhotosByIntent(shuffled.map((i) => ({ attachment_id: ix(i) })));
+    expect(byIntent.get(INTENT)?.map((image) => image.attachment_id)).toEqual(indexes.map((i) => ix(i)));
+    expect(ix(MAX_IMAGES - 1)).toHaveLength(39);
+    // Past the ceiling is never a server-minted id.
+    expect(serverPhotosByIntent([{ attachment_id: ix(MAX_IMAGES + 1) }]).size).toBe(0);
+  });
+
   it('the lookup tells found, none and not-known-yet apart', () => {
     const known = serverPhotoLookup(serverPhotosByIntent([{ attachment_id: ix(0) }]));
     expect(known(oldPageTurn())).toEqual([{ attachment_id: ix(0) }]);

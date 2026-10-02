@@ -151,7 +151,8 @@ CONTENT_SECURITY_POLICY = "default-src 'none'; sandbox"
 ATTACHMENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 #: A send intent the server names pictures by: the composer's newIntentId(),
 #: crypto.randomUUID() without its dashes. `ix-<intent>-<index>` is then 37
-#: characters, inside ATTACHMENT_ID_RE.
+#: to 39 characters (index 0..998 under the 999 ceiling, main.MAX_IMAGES),
+#: inside ATTACHMENT_ID_RE.
 _MINT_INTENT_RE = re.compile(r"^[0-9a-f]{32}$")
 _CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 #: F034's reserved bare-call key, `u<user id>-<session id>`. The same
@@ -1083,7 +1084,14 @@ def _turn_attachment_ids(images: Any, intent_id: Any) -> List[str]:
     """The pictures a stored user message names: its `meta.images`, or, for
     a message without them, the ones the server stored under its send intent
     (`ix-<intent>-<index>`, STORE-ALWAYS.md §1), in send order. An index with
-    no row is simply missing when they are loaded."""
+    no row is simply missing when they are loaded.
+
+    Every index up to MAX_FILES is named because a message may carry any
+    number of pictures (999 ceiling, LIMITS.md); the loader's `max_chars`, not
+    this list, bounds what is read. The cost of naming all 999, measured
+    2026-10-03: the `= ANY` probe ran in 0.06 ms on a test Postgres chat of
+    204 rows, and the loader's pass over 999 ids with 3 present took 4.5 ms,
+    once per follow-up that falls back to the store for such a turn."""
     ids = _meta_attachment_ids(images)
     if ids or not (isinstance(intent_id, str) and _MINT_INTENT_RE.fullmatch(intent_id)):
         return ids

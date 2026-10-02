@@ -498,6 +498,45 @@ def test_minting_keeps_ownership_and_the_reserved_key_refusal(engines, as_user):
     assert not metrics._counters.get("chat_media_writes_total")
 
 
+def test_a_turn_of_many_pictures_without_ids_gets_one_minted_id_each(engines, as_user):
+    """Store-always at the no-limits scale (LIMITS.md, 999 ceiling): every
+    inline picture of an id-less turn is named, ix-<intent>-0..N-1, past both
+    old caps (5, then 20) and into three-digit indexes, whose 39 characters
+    are still an attachment id. Nothing is dropped or renumbered."""
+    as_user("alice")
+    n = 101
+    pictures = [_png(colour=(i, 3, 7), size=(8, 8)) for i in range(n)]
+    minted = [f"ix-{INTENT}-{i}" for i in range(n)]
+    assert len(minted[-1]) == 39 and chat_media.ATTACHMENT_ID_RE.fullmatch(minted[-1])
+    with TestClient(app) as client:
+        resp = _chat(
+            client, message="what are these?", conversation_id="conv-old-many", intent_id=INTENT,
+            images=[_data_url(p) for p in pictures],
+        )
+        assert resp.status_code == 200, resp.text
+        assert len(engines["vision"][-1]["images"]) == n
+        rows = _wait_rows("conv-old-many", n, timeout=60.0)
+        _wait_settled(timeout=60.0)
+        assert sorted(r["attachment_id"] for r in rows) == sorted(minted)
+        # Each id names the picture at its own place in the send.
+        for i in (0, 9, 10, 99, 100):
+            assert client.get(f"/chat-media/conv-old-many/{minted[i]}").content == pictures[i]
+        # Once a device has written them into `meta.images`, a regenerate
+        # names all of them by reference: the 1..999 id validators take the
+        # 39-character ids, the engine gets every picture in send order, and
+        # a ref turn mints nothing under its own intent.
+        resp = _chat(
+            client, message="what are these?", conversation_id="conv-old-many", intent_id="cd" * 16,
+            image_refs=minted,
+        )
+        assert resp.status_code == 200, resp.text
+        assert [_decoded(url) for url in engines["vision"][-1]["images"]] == pictures
+        _wait_settled(timeout=60.0)
+    assert len(_rows("conv-old-many")) == n
+    assert _counter("chat_media_writes_total", source="chat", result="stored") == n
+    assert _counter("chat_media_writes_total", source="chat", result="unlinked") == 0
+
+
 # ----------------------------------------------------------- stored by ref --
 
 
@@ -1021,3 +1060,31 @@ def test_latest_turn_images_takes_a_photo_the_server_named_by_the_message_intent
     assert [_decoded(i) for i in found["images"]] == [photo, second]
     assert found["turns_after"] == 1
     assert chat_media.latest_turn_images(int(bob["id"]), "conv-ix") is None
+
+
+def test_the_fallback_reads_every_picture_the_server_named_in_index_order_within_its_budget(as_user):
+    """Store-always and no limits together: an old page's turn may hold any
+    number of `ix-` pictures (twelve here, past the old five). The store
+    fallback reads them all, in index order (10 and 11 after 9, not after 1),
+    and still stops at the caller's budget (`max_chars`, image_memory's
+    process budget), so a huge turn is never read into memory whole."""
+    alice = as_user("alice")
+    uid = int(alice["id"])
+    pictures = [_png(colour=(i * 20, 9, 9)) for i in range(12)]
+    with TestClient(app) as client:
+        assert client.post("/history/conversations", json={"id": "conv-ix-many", "title": "t"}).status_code == 200
+        # One per POST, out of order: the list order must not decide it.
+        for i in (11, 2, 10, 0, 7, 1, 9, 3, 8, 4, 6, 5):
+            _upload(client, "conv-ix-many", f"ix-{INTENT}-{i}", pictures[i])
+    _say("conv-ix-many", "user", "Read these", {"intent": {"id": INTENT, "state": "answered"}})
+    _say("conv-ix-many", "assistant", "Twelve receipts")
+    found = chat_media.latest_turn_images(uid, "conv-ix-many")
+    assert found is not None
+    assert [_decoded(i) for i in found["images"]] == pictures
+    path = [("user", "Read these"), ("assistant", "Twelve receipts"), ("user", "and the total?")]
+    found = chat_media.latest_turn_images(uid, "conv-ix-many", path)
+    assert [_decoded(i) for i in found["images"]] == pictures
+    budget = sum(len(_data_url(p)) for p in pictures[:3])
+    for visible in (None, path):
+        bounded = chat_media.latest_turn_images(uid, "conv-ix-many", visible, max_chars=budget)
+        assert [_decoded(i) for i in bounded["images"]] == pictures[:3]
