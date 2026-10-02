@@ -24,6 +24,8 @@ never the model):
 from __future__ import annotations
 
 import base64
+import contextlib
+import hashlib
 import io
 import json
 import time
@@ -537,6 +539,30 @@ def test_a_turn_of_many_pictures_without_ids_gets_one_minted_id_each(engines, as
     assert len(_rows("conv-old-many")) == n
     assert _counter("chat_media_writes_total", source="chat", result="stored") == n
     assert _counter("chat_media_writes_total", source="chat", result="unlinked") == 0
+
+
+def test_a_send_refused_for_an_intent_from_elsewhere_stores_nothing(engines, as_user):
+    """The 409 for an intent that belongs to another account or to another
+    chat comes before the turn's pictures are stored (QA, 2026-10-03: they were
+    stored under `ix-<that intent>-0` in the sender's chat). A refused send has
+    no message to show them on: with ids or without, nothing is stored."""
+    as_user("bob")
+    with TestClient(app) as client:
+        assert _chat(client, message="hi", conversation_id="conv-intent-bobs", intent_id=INTENT).status_code == 200
+        as_user("alice")
+        later = "cd" * 16
+        assert _chat(client, message="hi", conversation_id="conv-intent-first", intent_id=later).status_code == 200
+        image = [_data_url(_png())]
+        for intent in (INTENT, later):  # Bob's; Alice's own, from her other chat
+            for ids in ({}, {"image_ids": ["att-refused-1"]}):
+                resp = _chat(
+                    client, message="what is it", conversation_id="conv-intent-second",
+                    intent_id=intent, images=image, **ids,
+                )
+                assert resp.status_code == 409, resp.text
+        _wait_settled()
+    assert _rows("conv-intent-second") == []
+    assert not metrics._counters.get("chat_media_writes_total")
 
 
 # ----------------------------------------------------------- stored by ref --
@@ -1143,11 +1169,11 @@ def test_the_fallback_reads_every_picture_the_server_named_in_index_order_within
 
 
 def test_a_follow_up_on_photos_the_server_named_counts_the_stored_pictures(engines, as_user, monkeypatch):
-    """No limits x store-always: an `ix-` turn's candidates are every index
-    up to MAX_FILES, and the follow-up's "N of M" note counts against the
-    turn's total. The total is the pictures stored under the intent (three
-    here), never the 999 candidates: counting those told the model it saw
-    "1 of the 999 pictures" of a three-photo message."""
+    """No limits x store-always: the follow-up's "N of M" note counts against
+    the turn's total, and for an `ix-` turn that is the pictures stored under
+    its intent (three here), never every index below MAX_FILES. The first
+    merge of the two tracks counted those and told the model it saw "1 of
+    the 999 pictures" of a three-photo message."""
     alice = as_user("alice")
     uid = int(alice["id"])
     pictures = [_png(colour=(i * 40, 90, 9)) for i in range(3)]
@@ -1194,3 +1220,109 @@ def test_a_follow_up_on_photos_the_server_named_counts_the_stored_pictures(engin
     for seen in (None, visible):
         found = chat_media.latest_turn_images(uid, "conv-ix-total", seen, max_chars=1)
         assert len(found["images"]) == 1 and found["total"] == 3
+
+
+# ------------------------------- the store fallback's cost on a long chat --
+
+
+def _recorded_reads(monkeypatch) -> list:
+    """Every statement run on a read connection from here on, with its
+    parameters, so a test can EXPLAIN exactly what the code ran."""
+    seen: list = []
+    real = db.read_connection
+
+    class _Recording:
+        def __init__(self, con):
+            self._con = con
+
+        def execute(self, sql, params=None):
+            seen.append((sql, params))
+            return self._con.execute(sql, params)
+
+    @contextlib.contextmanager
+    def recording():
+        with real() as con:
+            yield _Recording(con)
+
+    monkeypatch.setattr(db, "read_connection", recording)
+    return seen
+
+
+def _chat_media_loops(plan) -> list:
+    """The "Actual Loops" of every chat_media scan in an EXPLAIN (ANALYZE, FORMAT JSON) tree."""
+    if isinstance(plan, dict):
+        own = [int(plan["Actual Loops"])] if plan.get("Relation Name") == "chat_media" else []
+        return own + [n for v in plan.values() if isinstance(v, (dict, list)) for n in _chat_media_loops(v)]
+    if isinstance(plan, list):
+        return [n for v in plan for n in _chat_media_loops(v)]
+    return []
+
+
+def test_the_store_fallback_reads_the_chats_pictures_once_not_once_per_turn(as_user, monkeypatch):
+    """Nearly every user turn since V29 carries a 32-hex intent, so the test
+    for "a photo the server named" ran a correlated EXISTS on chat_media for
+    every user message it passed, before the first token (QA, 2026-10-03:
+    2.9 ms became 38 ms over 10,000 turns). The chat's `ix-` rows are read
+    once per statement now. Pinned by the plan, not the clock: on both paths,
+    no chat_media scan runs more than once."""
+    alice = as_user("alice")
+    uid = int(alice["id"])
+    conv = "conv-long-photo"
+    photo = _png(colour=(9, 99, 9))
+    turns = 200
+    with TestClient(app) as client:
+        assert client.post("/history/conversations", json={"id": conv, "title": "t"}).status_code == 200
+        _upload(client, conv, f"ix-{hashlib.md5(b'0').hexdigest()}-0", photo)
+    with db.connection() as con:
+        # The old page's photo turn ("turn 0", intent md5('0')), then text
+        # turns, each with an intent of its own as the composer writes them.
+        con.execute(
+            "INSERT INTO messages (conversation_id, role, content, meta, created_at) "
+            "SELECT %s, CASE WHEN g %% 2 = 0 THEN 'user' ELSE 'assistant' END, 'turn ' || g, "
+            "CASE WHEN g %% 2 = 0 THEN jsonb_build_object('intent', jsonb_build_object('id', md5(g::text))) "
+            "ELSE '{}'::jsonb END, now() FROM generate_series(0, %s) g",
+            (conv, 2 * turns - 1),
+        )
+    path = [("user" if g % 2 == 0 else "assistant", f"turn {g}") for g in range(2 * turns)]
+    seen = _recorded_reads(monkeypatch)
+    for visible in (None, path + [("user", "what was in the photo?")]):
+        found = chat_media.latest_turn_images(uid, conv, visible)
+        assert [_decoded(i) for i in found["images"]] == [photo]
+        assert found["turns_after"] == turns - 1
+    reads = [(sql, params) for sql, params in seen if sql.lstrip().upper().startswith("SELECT")]
+    assert len(reads) == len(seen) >= 2
+    for sql, params in reads:
+        with db.connection() as con:
+            plan = next(iter(con.execute("EXPLAIN (ANALYZE, FORMAT JSON) " + sql, params).fetchone().values()))
+        assert max(_chat_media_loops(plan), default=0) <= 1, sql
+
+
+def test_the_store_fallback_asks_only_for_the_pictures_a_turn_has(as_user, monkeypatch):
+    """A photo turn with no `meta.images` was read as every index below
+    MAX_FILES, `ix-<intent>-0..MAX_FILES-1`, most of them rows that do not
+    exist: 999 ids per follow-up where a message may carry 999 pictures
+    (release/2026-10-03-nolimits). The loader is asked for the rows the turn
+    has, in index order."""
+    alice = as_user("alice")
+    uid = int(alice["id"])
+    first, second = _png(colour=(5, 50, 5)), _png(colour=(50, 5, 5))
+    with TestClient(app) as client:
+        assert client.post("/history/conversations", json={"id": "conv-ix-ids", "title": "t"}).status_code == 200
+        _upload(client, "conv-ix-ids", f"ix-{INTENT}-1", second)
+        _upload(client, "conv-ix-ids", f"ix-{INTENT}-0", first)
+    _say("conv-ix-ids", "user", "Read these", {"intent": {"id": INTENT, "state": "answered"}})
+    _say("conv-ix-ids", "assistant", "They say hello")
+    monkeypatch.setattr(chat_media, "MAX_FILES", 999)
+    asked: list = []
+    real = chat_media.rows_by_attachment
+
+    def rows_by_attachment(user_id, conversation_id, attachment_ids):
+        asked.append(list(attachment_ids))
+        return real(user_id, conversation_id, attachment_ids)
+
+    monkeypatch.setattr(chat_media, "rows_by_attachment", rows_by_attachment)
+    path = [("user", "Read these"), ("assistant", "They say hello"), ("user", "and the second one?")]
+    for visible in (None, path):
+        found = chat_media.latest_turn_images(uid, "conv-ix-ids", visible)
+        assert [_decoded(i) for i in found["images"]] == [first, second]
+    assert asked == [[f"ix-{INTENT}-0", f"ix-{INTENT}-1"]] * 2

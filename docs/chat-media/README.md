@@ -174,8 +174,10 @@ The admin route:
 **`/chat`** gained two fields:
 
 - **`image_ids`.** These are the attachment ids of the inline pictures.
-  - At intake, after the feature gate and the ownership check, the turn's
-    pictures are stored **in a background task**.
+  - At intake, after the feature gate, the ownership check and the send
+    intent check, the turn's pictures are stored **in a background task**. A
+    send refused with 409 (its `intent_id` belongs to another chat or account)
+    stores nothing; a retry of the same send stores again (`duplicate`).
   - This applies on every route: vision, document plus picture, and artifact.
   - The first token waits on none of it. A failure is logged and counted, and
     never surfaces as a chat error.
@@ -220,9 +222,12 @@ the person sees: `/chat`'s `messages` are passed as `visible`, and
 stored under it), with that turn's question and answer. A picture turn is a
 user message with `meta.images`, or, with none, one whose `meta.intent.id`
 has the viewer's `ix-<intent>-*` rows (a photo from a page that wrote no
-`meta.images`); its pictures are then read in index order, every index up to
-the 999 ceiling, until image_memory's `max_chars` budget is spent. A picture on
-an edited-away branch is never read into a later turn. `turns_after` counts user
+`meta.images`); its pictures are then the `ix-` rows that exist, read in index
+order until image_memory's `max_chars` budget is spent, and their count is the
+turn's total for the follow-up's "N of M pictures" note. The chat's `ix-`
+intents are read once per statement, never once per message (a plan test pins
+it). A picture on an edited-away branch is never read into a later turn.
+`turns_after` counts user
 turns on the path after it, not the question being asked now. Only the 20
 newest picture turns are compared, and nothing is written back to the V41 row.
 A request with no `messages` keeps the stored-order behaviour. A chat with no
@@ -444,6 +449,7 @@ Each is deliberate and recorded in NOTES.md under the named track.
 | §5 `image_refs` "same order" as inline images | Refs come first, then inline pictures; the frontend never sends both in one request | be-media |
 | §5 (not covered) | ATTACHMENTS feature off clears `image_ids`/`image_refs` (no 422); a ref-only turn with no words gets "Analyze the attached image." | be-media, fix-be |
 | §5 "a length mismatch is ignored for storage" | Absent or mismatched `image_ids` with the browser's 32-hex `intent_id` store under `ix-<intent>-<index>`; otherwise counted `unlinked`; never on a ref turn | store-always |
+| §5 store "after the ATTACHMENTS feature gate and the F034 check" | Also after the V29 send intent check: a send refused with 409 stores nothing | store-always |
 | §6 "the newest USER message ... whose `meta.images` is non-empty" | Also a user message with no `meta.images` whose `meta.intent.id` has the viewer's `ix-` rows | store-always |
 | §6 "the newest USER message ... whose `meta.images` is non-empty" | The newest picture turn on the branch the person sees (`visible`), at most 20 compared; `turns_after` excludes the question being asked | fix-be |
 | §7 `PRIVATE_META_KEYS` gains `images` | Also: `sharing.evaluate` reads provenance from empty messages, so a photo-only chat cannot be shared | fix-be |

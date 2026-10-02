@@ -1147,7 +1147,7 @@ describe('photos the server stored by itself (STORE-ALWAYS §2)', () => {
       ),
     );
     expect(await listChatMedia(CONV)).toEqual([
-      { attachment_id: ix(0), mime: 'image/png', width: 640, height: 480 },
+      { attachment_id: ix(0), mime: 'image/png', width: 640, height: 480, bytes: 9 },
       { attachment_id: ix(1) },
     ]);
   });
@@ -1241,6 +1241,94 @@ describe('photos the server stored by itself (STORE-ALWAYS §2)', () => {
     expect(upload.mock.calls[0][1][0].blob.type).toBe('image/jpeg');
     expect(saves[0].messages[0].meta?.images).toBeUndefined();
     expect(saves[0].messages[2].meta?.images).toHaveLength(1);
+  });
+
+  // QA 2026-10-03: the server kept ix-…-0 and lost ix-…-1 (a transient
+  // error, a full disk). The sender adopted [ix-…-0] and uploaded nothing, so
+  // the second photo was gone for every other device although this browser
+  // held it; meta.images is written once.
+  describe('a turn the server stored only in part', () => {
+    const twoPhotos = (extra: Partial<ChatMessage> = {}) =>
+      oldPageTurn({ imageDataUrls: [PNG, JPEG], ...extra });
+    const sizeOf = (dataUrl: string) => Buffer.from(dataUrl.split(',')[1], 'base64').length;
+    const keptFirst = (extra: Partial<ListedMediaItem> = {}) =>
+      listed({ attachment_id: ix(0), mime: 'image/png', width: 640, height: 480, ...extra });
+
+    it('stores the photo it lost under the id it minted, and writes the turn whole', async () => {
+      const threads = { [CONV]: [twoPhotos(), answer('they differ', 'vision')] };
+      const { host, saves } = fakeHost(threads, { [CONV]: new Map([[0, [PNG, JPEG]]]) });
+      const upload = storingUpload();
+      expect(
+        await createBackfill(host, { upload, media: keptFirst(), schedule: now, locks: null }).runNow(CONV),
+      ).toBe('done');
+      expect(upload).toHaveBeenCalledTimes(1);
+      const [conv, parts, source] = upload.mock.calls[0];
+      expect(conv).toBe(CONV);
+      expect(source).toBe('backfill');
+      expect(parts.map((p) => p.attachmentId)).toEqual([ix(1)]);
+      expect(parts[0].blob.type).toBe('image/jpeg');
+      expect(saves).toHaveLength(1);
+      expect(saves[0].messages[0].meta?.images).toEqual([
+        { attachment_id: ix(0), mime: 'image/png', width: 640, height: 480 },
+        { attachment_id: ix(1), mime: 'image/png', width: 640, height: 480 },
+      ]);
+    });
+
+    it('trusts an older unnamed record only when the stored photo’s size proves it is that send', async () => {
+      const run = async (bytes: number) => {
+        const threads = { [CONV]: [twoPhotos({ imageDataUrls: undefined }), answer('they differ', 'vision')] };
+        const { host, saves } = fakeHost(threads, {});
+        // A record written before records named their turn (the old tab's own).
+        host.localImages = async () => new Map([[0, { urls: [PNG, JPEG] }]]);
+        const upload = storingUpload();
+        await createBackfill(host, { upload, media: keptFirst({ bytes }), schedule: now, locks: null }).runNow(CONV);
+        return { upload, refs: saves.at(-1)?.messages[0].meta?.images?.map((i) => i.attachment_id) };
+      };
+      const proven = await run(sizeOf(PNG));
+      expect(proven.upload.mock.calls[0][1].map((p) => p.attachmentId)).toEqual([ix(1)]);
+      expect(proven.refs).toEqual([ix(0), ix(1)]);
+      // A different size: not provably this send's photos. Nothing goes up
+      // under the minted id; the turn gets what the server has, as before.
+      const unproven = await run(sizeOf(PNG) + 1);
+      expect(unproven.upload).not.toHaveBeenCalled();
+      expect(unproven.refs).toEqual([ix(0)]);
+    });
+
+    it('never completes when the listed photos do not pair with the held ones', async () => {
+      const cases: ListedMediaItem[][] = [
+        // The listed type disagrees with the bytes held at that place.
+        [{ attachment_id: ix(0), mime: 'image/jpeg' }],
+        // A listed photo beyond the ones held here.
+        [{ attachment_id: ix(2), mime: 'image/png' }],
+      ];
+      for (const items of cases) {
+        const threads = { [CONV]: [twoPhotos(), answer('they differ', 'vision')] };
+        const { host } = fakeHost(threads, { [CONV]: new Map([[0, [PNG, JPEG]]]) });
+        const upload = storingUpload();
+        await createBackfill(host, { upload, media: listed(...items), schedule: now, locks: null }).runNow(CONV);
+        expect(upload).not.toHaveBeenCalled();
+      }
+    });
+
+    it('a stop writes nothing for the turn, so a later open can complete it', async () => {
+      const threads = { [CONV]: [twoPhotos(), answer('they differ', 'vision')] };
+      const { host, saves } = fakeHost(threads, { [CONV]: new Map([[0, [PNG, JPEG]]]) });
+      const upload = vi.fn(async () => ({ kind: 'failed', status: 502 }) as MediaUploadOutcome);
+      expect(
+        await createBackfill(host, { upload, media: keptFirst(), schedule: now, locks: null }).runNow(CONV),
+      ).toBe('later');
+      expect(saves).toHaveLength(0);
+      expect(threads[CONV][0].meta?.images).toBeUndefined();
+    });
+
+    it('a refusal writes the photos the server has', async () => {
+      const threads = { [CONV]: [twoPhotos(), answer('they differ', 'vision')] };
+      const { host, saves } = fakeHost(threads, { [CONV]: new Map([[0, [PNG, JPEG]]]) });
+      const upload = vi.fn(async () => ({ kind: 'refused', status: 415 }) as MediaUploadOutcome);
+      await createBackfill(host, { upload, media: keptFirst(), schedule: now, locks: null }).runNow(CONV);
+      expect(saves).toHaveLength(1);
+      expect(saves[0].messages[0].meta?.images?.map((i) => i.attachment_id)).toEqual([ix(0)]);
+    });
   });
 
   it('never reads the list for a chat whose turns carry no usable intent', async () => {
