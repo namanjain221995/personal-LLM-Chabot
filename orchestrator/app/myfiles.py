@@ -61,9 +61,12 @@ planner settings, 25 runs): the first page of a person with 2,000 uploads and
 uploads 45.7-65.0 ms. Production held 8 upload rows in total on 2026-09-30.
 The keys are fetched first and only the page's rows are decorated (<0.5 ms
 for 51 rows); availability is up to 100 stat() calls, 0.135 ms p50 for a
-50-row page on the head's NVMe. When one person passes ~10,000 uploads or the
-myfiles_list_seconds p95 passes 50 ms, add uploads.user_id with an index on
-(user_id, created_at DESC, id DESC): 0.68-0.92 ms at every measured scale.
+50-row page on the head's NVMe. One chat of 5,000 read documents and 5,000
+uploads is 10-61 ms a request (the fold is a hashed NOT IN, see
+_TEXT_BRANCH; it was 7.7 s, or the 15 s timeout). When one person passes
+~10,000 uploads or the myfiles_list_seconds p95 passes 50 ms, add
+uploads.user_id with an index on (user_id, created_at DESC, id DESC):
+0.68-0.92 ms at every measured scale.
 """
 from __future__ import annotations
 
@@ -112,8 +115,9 @@ RECORDING_NAME = "Voice recording"
 #: 4,916 characters of one was refused by the next request (QA, 2026-09-30),
 #: stalling "Name, A to Z" for good. 512 characters of JSON kept as UTF-8
 #: (ensure_ascii=False; the default \uXXXX escapes made a CJK name six times
-#: longer) keep a cursor under ~2.8 KB, far below this bound and Node's 16 KB
-#: header limit, which answered 431 before the proxy ran.
+#: longer) keep a cursor under ~4.2 KB (512 control characters, which JSON
+#: still escapes; 4-byte characters come to ~2.8 KB), far below this bound
+#: and Node's 16 KB header limit, which answered 431 before the proxy ran.
 _CURSOR_MAX_CHARS = 16_384
 _NAME_KEY_CHARS = 512
 #: Upload ids are uuid4().hex and text rows are a bigint; anything in this
@@ -163,6 +167,18 @@ class ListQuery:
 # ------------------------------------------------------------- parsing --
 
 
+def _utf8(value: str) -> bool:
+    """False for a lone surrogate ("\\ud800"). JSON's \\uXXXX escape can carry
+    one (a forged cursor), UTF-8 cannot: psycopg raised UnicodeEncodeError
+    binding it, a 500 (QA, 2026-10-01). Starlette already replaces bad bytes
+    in the query string, so over HTTP only a cursor can bring one."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _text(params: Mapping[str, Any], name: str) -> Optional[str]:
     value = params.get(name)
     if value is None:
@@ -172,6 +188,8 @@ def _text(params: Mapping[str, Any], name: str) -> Optional[str]:
         # PostgreSQL text cannot hold NUL: bound as a parameter it raised
         # psycopg.DataError, a 500 (QA, 2026-09-30).
         raise BadRequest(f"{name} must not contain a NUL character.")
+    if not _utf8(value):
+        raise BadRequest(f"{name} must be valid text.")
     return value or None
 
 
@@ -266,7 +284,7 @@ def decode_cursor(text: str, sort: str) -> Tuple[Any, str, str]:
     elif sort == "largest":
         if isinstance(key, bool) or not isinstance(key, int) or not -1 <= key <= _BIGINT_MAX:
             raise invalid
-    elif not isinstance(key, str) or len(key) > _NAME_KEY_CHARS or "\x00" in key:
+    elif not isinstance(key, str) or len(key) > _NAME_KEY_CHARS or "\x00" in key or not _utf8(key):
         raise invalid
     return key, source, item_id
 
@@ -315,17 +333,39 @@ _UPLOADS_SEARCH = """
 # it is an archive's manifest ("x.zip (archive contents)"). Only under an
 # upload that is itself listed ('ready'): folding it under a rejected or
 # failed upload of the same name hid the text entirely (QA, 2026-09-30).
+#
+# NOT IN against the caller's ready (chat, name) pairs, one per candidate
+# name: PostgreSQL runs an uncorrelated NOT IN as a hashed SubPlan, so the
+# pairs are hashed once and each document makes three probes, whatever the
+# planner estimates. The NOT EXISTS with an IN-list this replaced could hash
+# on the chat alone and compared every document with every ready upload of
+# its chat: one chat of 5,000 read documents and 5,000 uploads was 25 million
+# comparisons, over the 15 s statement timeout, a 500 for the whole page (QA,
+# 2026-10-01). Three equality NOT EXISTS hash on both columns but stack
+# anti-joins whose row estimates shrink at each step (694, 348, 174 against
+# 6,000 real), the road to a nested loop. NOT IN's NULL trap cannot apply:
+# every column compared is NOT NULL. The hash is kept while one person's ready
+# uploads fit in hash_mem (32 MB in production: about 250,000 names of
+# ordinary length).
+_READY_NAMES = """ready_names AS (
+    SELECT u.conversation_id, u.filename
+      FROM uploads u
+      JOIN conversations c ON c.id = u.conversation_id
+     WHERE c.user_id = %(uid)s AND u.status = 'ready' AND u.conversation_id !~ '^u[0-9]+-'
+)"""
+
 _TEXT_BRANCH = """
     SELECT 'text'::text AS source, d.id::text AS item_id, d.conversation_id, d.filename AS name,
            NULL::bigint AS bytes, d.created_at, 'document'::text AS kind
       FROM documents d
       JOIN conversations c ON c.id = d.conversation_id
      WHERE c.user_id = %(uid)s AND d.conversation_id !~ '^u[0-9]+-'
-       AND NOT EXISTS (
-             SELECT 1 FROM uploads u2
-              WHERE u2.conversation_id = d.conversation_id AND u2.status = 'ready'
-                AND u2.filename IN (d.filename, split_part(d.filename, '/', 1),
-                                    regexp_replace(d.filename, ' \\(archive contents\\)$', '')))"""
+       AND (d.conversation_id, d.filename)
+           NOT IN (SELECT conversation_id, filename FROM ready_names)
+       AND (d.conversation_id, split_part(d.filename, '/', 1))
+           NOT IN (SELECT conversation_id, filename FROM ready_names)
+       AND (d.conversation_id, regexp_replace(d.filename, ' \\(archive contents\\)$', ''))
+           NOT IN (SELECT conversation_id, filename FROM ready_names)"""
 
 _TEXT_SEARCH = """
        AND (d.filename ILIKE %(pat)s ESCAPE '\\' OR c.title ILIKE %(pat)s ESCAPE '\\')"""
@@ -356,7 +396,7 @@ SELECT p.source, p.item_id, p.conversation_id, c.title AS conversation_title, p.
        p.created_at, p.kind, p.sort_key,
        up.has_profile, CASE WHEN p.source = 'text' THEN p.name ELSE up.text_name END AS text_name,
        va.content_hash, COALESCE(va.status, vs.status) AS media_status,
-       COALESCE(va.duration_ms::bigint, vs.audio_ms) AS media_ms
+       COALESCE(va.duration_ms::bigint, vs.audio_ms) AS media_ms, vs.outcome AS media_outcome
   FROM page p
   LEFT JOIN conversations c ON c.id = p.conversation_id
   LEFT JOIN LATERAL (
@@ -379,19 +419,22 @@ SELECT p.source, p.item_id, p.conversation_id, c.title AS conversation_title, p.
 
 
 def _mine(filters: Filters, user_id: int) -> Tuple[str, Dict[str, Any], List[str]]:
-    """The caller's rows as one UNION ALL (`mine`), the conditions the outer
-    query applies to it, and every parameter both need. At least one branch
-    always exists: every kind belongs to one."""
+    """The WITH clause holding the caller's rows as one UNION ALL (`mine`,
+    after `ready_names` when the text branch needs it), the conditions the
+    outer query applies to it, and every parameter both need. At least one
+    branch always exists: every kind belongs to one."""
     params: Dict[str, Any] = {"uid": int(user_id)}
     selected = filters.selected
     search = filters.q is not None
     if search:
         params["pat"] = db.like_contains_pattern(filters.q)
+    ctes: List[str] = []
     branches: List[str] = []
     if selected & _UPLOAD_KINDS:
         params["audio_re"] = _audio_name_pattern()
         branches.append(_UPLOADS_BRANCH + (_UPLOADS_SEARCH if search else ""))
     if "document" in selected:
+        ctes.append(_READY_NAMES)
         branches.append(_TEXT_BRANCH + (_TEXT_SEARCH if search else ""))
     if "recording" in selected:
         params["recording_name"] = RECORDING_NAME
@@ -414,7 +457,7 @@ def _mine(filters: Filters, user_id: int) -> Tuple[str, Dict[str, Any], List[str
         params["max_bytes"] = filters.max_bytes
         where.append("bytes < %(max_bytes)s")
     union = "\n    UNION ALL".join(branches)
-    return f"WITH mine AS ({union}\n)", params, where
+    return "WITH " + ",\n".join([*ctes, f"mine AS ({union}\n)"]), params, where
 
 
 def list_statement(query: ListQuery, user_id: int) -> Tuple[str, Dict[str, Any]]:
@@ -500,11 +543,39 @@ def availability(row: Mapping[str, Any]) -> str:
     return "expired"
 
 
+#: What a finished recording's outcome says about its transcript text.
+#: dictation's _finalize writes 'transcribed' only when the text has words and
+#: 'no_speech' / 'no_words' only when it has none; 'transcribed_with_gaps'
+#: (a decoder that stopped part way, or some windows failed) can end either
+#: way, so that one outcome is not in this table.
+_WORDS_BY_OUTCOME = {"transcribed": True, "no_speech": False, "no_words": False}
+
+
+def has_transcript(row: Mapping[str, Any], user_id: int) -> bool:
+    """True when the Recordings page shows this recording's text: it is done
+    and its transcript has words (lib/recordings.ts transcriptView). A done
+    recording that heard no speech was shown "with its transcript" (QA,
+    2026-10-01). Decided from the row wherever the outcome settles it; only
+    a recording with gaps reads its saved transcript, through dictation."""
+    if row.get("media_status") != "done":
+        return False
+    known = _WORDS_BY_OUTCOME.get(row.get("media_outcome"))
+    if known is not None:
+        return known
+    from . import dictation
+
+    try:
+        text = dictation.transcript_of({"user_id": int(user_id), "id": row["item_id"]}).get("text")
+    except (OSError, ValueError):
+        return False
+    return bool(str(text or "").strip())
+
+
 def _iso(value: Any) -> Optional[str]:
     return value.astimezone(timezone.utc).isoformat() if isinstance(value, datetime) else None
 
 
-def _item(row: Mapping[str, Any]) -> Dict[str, Any]:
+def _item(row: Mapping[str, Any], user_id: int) -> Dict[str, Any]:
     state = availability(row)
     source, kind = row["source"], row["kind"]
     preview: Optional[str] = None
@@ -524,6 +595,8 @@ def _item(row: Mapping[str, Any]) -> Dict[str, Any]:
             "status": row.get("media_status"),
             "duration_ms": int(media_ms) if media_ms is not None else None,
         }
+        if source == "recording":
+            media["has_transcript"] = has_transcript(row, user_id)
     conversation = None
     if row.get("conversation_id"):
         conversation = {"id": row["conversation_id"], "title": row.get("conversation_title") or ""}
@@ -577,7 +650,7 @@ def list_files(user_id: int, query: ListQuery) -> Dict[str, Any]:
         last = rows[-1]
         next_cursor = encode_cursor(query.sort, last["sort_key"], last["source"], last["item_id"])
     return {
-        "items": [_item(row) for row in rows],
+        "items": [_item(row, user_id) for row in rows],
         "next_cursor": next_cursor,
         "retention": retention(),
     }
