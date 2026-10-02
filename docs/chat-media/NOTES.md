@@ -101,6 +101,21 @@ stops all new writes (507 / skipped) with no deploy; reads, deletion and the
 reaper keep working. `IMAGE_MEMORY_STORE_FALLBACK=0` turns off the follow-up
 fallback.
 
+Late fact, for anyone who relies on Pillow to reject a cut file (found by the
+related-suite run, 2026-10-02): WeasyPrint sets the process-wide
+`PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True` when it is imported
+(weasyprint/images.py), and the artifact renderer imports it inside the
+orchestrator. From then on Pillow decodes a JPEG cut to a third, or a GIF cut
+anywhere, without an error. `chat_media.inspect` therefore checks the file's
+own end structure first (`_ends_whole`: JPEG EOI after the last scan, PNG
+IEND+CRC, GIF block walk to the trailer, WebP RIFF size) and never toggles the
+switch (the renderer's threads rely on it). Any other check in this process
+that trusts `load()` to catch truncation has the same hole.
+
+Read after the frontend notes below: the frontend never sends inline images
+and `image_refs` in one request, so the "refs first" merge order only matters
+to other clients. Nothing here needs to change for fe-images or fe-files.
+
 ## fe-images (frontend: meta.images, render, resend, backfill, proxies, RC-3a, RC-3c)
 
 What the browser sends and stores, as built:

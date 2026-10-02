@@ -58,11 +58,19 @@ orientation applied, alpha kept, and the first frame of a GIF. For a smaller
 picture, `size=thumb` serves the full file.
 
 **What is accepted.** Only JPEG, PNG, WebP and GIF are kept, and only when all
-three of these agree:
+four of these agree:
 
 1. the file's magic bytes;
-2. Pillow, opened for that one format only, and its `verify()`;
-3. a full decode that reaches the end of the data. A truncated JPEG fails here.
+2. the file ends the way a whole file of that format ends: a JPEG EOI after
+   its last scan, the PNG `IEND` chunk with its CRC, a GIF whose blocks walk to
+   the trailer, a WebP as long as its RIFF size. A truncated file fails here;
+3. Pillow, opened for that one format only, and its `verify()`;
+4. a full decode.
+
+Step 2 does not trust Pillow. Pillow's truncation check is the process-wide
+switch `ImageFile.LOAD_TRUNCATED_IMAGES`, and WeasyPrint turns it on when it is
+imported, which the artifact renderer does in this process. With it on, Pillow
+decodes a cut JPEG or GIF without an error.
 
 Everything else is refused: SVG, HTML renamed `.png`, HEIC, BMP, TIFF, and
 truncated files. Further limits:
