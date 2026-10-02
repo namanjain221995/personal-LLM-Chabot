@@ -410,6 +410,11 @@ def isolated_app_db(app_database, tmp_path, monkeypatch):
     # the head: a test that stores a picture or erases a chat writes there.
     monkeypatch.setattr(settings, "chat_media_dir", str(tmp_path / "chat-media"))
     monkeypatch.setattr(settings, "chat_files_dir", str(tmp_path / "chat-files"))
+    # Their free-space floor (250 GiB) is measured on whatever disk runs the
+    # suite, and a hosted CI runner has about 84 GiB free: every store would
+    # be refused there and pass here (the Files watermark hung PR #66 CI the
+    # same way). A test of the floor sets it back itself.
+    monkeypatch.setattr(settings, "chat_media_min_free_gib", 0.0)
     with db.connection() as con:
         con.execute(
             f"TRUNCATE TABLE {', '.join(_APP_TABLES)} RESTART IDENTITY CASCADE"

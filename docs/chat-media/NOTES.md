@@ -82,7 +82,12 @@ For the files track (CONTRACT §9):
   `chat_media.reap_loop()`; the files track can add its pass there or start
   its own loop beside it.
 - tests/conftest.py now points `settings.chat_media_dir` and
-  `settings.chat_files_dir` at the test's tmp_path for every test.
+  `settings.chat_files_dir` at the test's tmp_path for every test, and sets
+  `settings.chat_media_min_free_gib = 0.0`: a hosted CI runner has ~84 GiB
+  free, under the 250 GiB floor, so a store test that passes locally would be
+  refused on CI. A test OF the floor sets it back itself (see
+  test_chat_media_api.test_below_the_free_space_floor_new_bytes_are_507,
+  which also monkeypatches `shutil.disk_usage`).
 
 Metrics beyond CONTRACT §11 (closed, in `metrics._LABELS_BY_METRIC`):
 `chat_media_erase_total{store=media|files, result=ok|error}` (chat deletion's
