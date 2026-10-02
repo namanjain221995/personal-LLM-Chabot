@@ -482,3 +482,26 @@ frontend/tests/attack-myfiles-real-rows.test.ts). None is a cross-user leak or d
   `picturesKept` are true.
 - Shared-worktree note: another agent's uncommitted app/chat_media.py edit briefly made a 32x24
   PNG answer 415 during this run. A retry passed. Treat a sudden 415 in a picture test as that.
+
+## security-files (attack on be-files lasting copies, 2026-10-02 22:30 IST)
+
+Proof file (uncommitted): orchestrator/tests/test_attack_lasting_files_sec.py. No cross-user leak found.
+
+- Disk: a lasting copy is a hard link, so the workspace quota (WORKSPACE_QUOTA_GB 20) and the 24 h
+  TTL now free nothing for documents and datasets: eviction drops the workspace link (nlink 2 -> 1)
+  and every byte stays. Nothing per member bounds the lasting store; the only guard is the global
+  CHAT_MEDIA_MIN_FREE_GIB floor on a root filesystem (3.7 TiB, 2.4 TiB free here) that also holds
+  the OS, Postgres and the models. One member can keep ~2.1 TiB, and at the floor every member's
+  new photos and lasting copies are skipped (/chat silently, uploads revert to 24 h expiry). This
+  is the owner's "no per-user quota" default; flag it before release, or cap lasting bytes per user.
+- `lasting_path` and `erase_conversation_files` use `_CONVERSATION_ID_RE.match` (`$` admits a
+  trailing "\n"); `_own` does too, so a direct API call can own `conv\n`. Its workspace copy sits
+  at the SANITISED `uploads/conv/...` while its lasting copy is `chat-files/conv\n/...`; erase then
+  misses the workspace copy, and the reaper (`fullmatch`) never collects the lasting dir. Self-only
+  impact (frontend ids are UUIDs and the Next proxies refuse "\n"). Fix: `fullmatch` in both.
+- Held: authz on every byte path (row + conversation owner; a re-claimed id after delete reaches
+  nothing), the admin route (owner re-derived, audited before the response, no-store at the Next
+  proxy), html/svg/quoted names served `attachment` with a guessed type from the lasting copy on
+  200 and 206 (member and admin), Starlette 1.6 Range (max 100 ranges, merged, streamed 64 KiB),
+  reaper containment (symlinked chat/upload dirs and an `original` symlink untouched; 3.12 rmtree
+  is fd-based), My files picture rows (double-scoped, F034 excluded, bound params).
