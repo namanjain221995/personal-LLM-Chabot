@@ -22,9 +22,17 @@
  * (available), only the text the chat read (text_only), only a spreadsheet's
  * summary (summary_only), a recording still being made (processing), or
  * nothing (expired). The page never offers an action the row cannot back.
+ *
+ * PICTURES (2026-10-02, docs/chat-media/CONTRACT.md §9). A photo sent in a
+ * chat is now kept on the server for the life of the chat (the `chat_media`
+ * table), so it is listed here too: kind `image`, shown by its thumbnail,
+ * previewed at full size. Its URLs are BUILT here from the chat and the
+ * photo's attachment id (lib/chatMedia), never taken from the row, so an
+ * `<img src>` on this page only ever points at this app's own photo route.
  */
 
 import { previewKindFor, uploadFileUrl, type UploadRef } from './attachments';
+import { ATTACHMENT_ID, CONVERSATION_ID, chatMediaUrl, type MediaRef } from './chatMedia';
 import {
   MAX_TABLE_COLUMNS,
   MAX_TABLE_ROWS,
@@ -50,12 +58,19 @@ export const SEARCH_MAX_CHARS = 100;
  */
 export const BYTE_PREVIEW_MAX_BYTES = 25 * 1024 * 1024;
 
-export const FILE_KINDS = ['document', 'dataset', 'video', 'audio', 'recording'] as const;
+export const FILE_KINDS = ['document', 'dataset', 'image', 'video', 'audio', 'recording'] as const;
 export type FileKind = (typeof FILE_KINDS)[number];
-export type FileSource = 'upload' | 'text' | 'recording';
+/**
+ * `media` is a stored chat picture (a `chat_media` row). The backend files
+ * track was building those rows alongside this page, so the two spellings it
+ * might reasonably have chosen for the source are read as the same thing
+ * (docs/chat-media/NOTES.md, fe-files).
+ */
+export type FileSource = 'upload' | 'text' | 'recording' | 'media';
+const MEDIA_SOURCES = ['media', 'image', 'chat_media'];
 export const AVAILABILITIES = ['available', 'text_only', 'summary_only', 'processing', 'expired'] as const;
 export type Availability = (typeof AVAILABILITIES)[number];
-export type ServerPreview = 'text' | 'summary' | 'audio' | null;
+export type ServerPreview = 'text' | 'summary' | 'audio' | 'image' | null;
 export const SORTS = ['newest', 'oldest', 'largest', 'name'] as const;
 export type FileSort = (typeof SORTS)[number];
 export const SIZE_BUCKETS = ['under_1mb', '1_10mb', '10_100mb', 'over_100mb'] as const;
@@ -85,15 +100,30 @@ export interface MyFile {
   uploadId: string | null;
   /** Derived from `id`: the recording session's id. */
   recordingId: string | null;
+  /**
+   * A stored chat picture's reference: its chat and attachment id, which is
+   * what every picture URL is built from. null for every other kind.
+   */
+  picture: MediaRef | null;
 }
 
 export interface Retention {
   uploadHours: number;
+  /**
+   * 2026-10-02 (CONTRACT §9): documents and datasets get a lasting copy that
+   * stays while their chat exists, so `uploadHours` then describes only
+   * files sent before that (or skipped when the server was short of space).
+   * Read from `files_kept_with_chat`; false from an orchestrator without it.
+   */
+  filesKeptWithChat: boolean;
   /** 0 keeps recordings until their owner deletes them. */
   recordingDays: number;
   videoKeptWithChat: boolean;
   videoGraceHours: number | null;
+  /** An orchestrator from before pictures were stored (`"browser_only"`). */
   picturesBrowserOnly: boolean;
+  /** Pictures are kept with their chat and listed here (any other value). */
+  picturesKept: boolean;
   pictureMemoryHours: number | null;
 }
 
@@ -113,6 +143,12 @@ export interface MyFilesSummary {
   kinds: Record<FileKind, KindCount>;
   total: KindCount;
   retention: Retention | null;
+  /**
+   * The kinds the server actually counted. A missing one still reads as zero
+   * in `kinds`, but the page does not offer to FILTER by a kind the server
+   * never named: an orchestrator without picture rows refuses `kind=image`.
+   */
+  reported: FileKind[];
 }
 
 /** What the page URL holds. `from`/`to` are calendar days, YYYY-MM-DD. */
@@ -132,6 +168,7 @@ export const DEFAULT_FILTERS: Filters = { q: '', kind: null, from: '', to: '', s
 export const KIND_LABEL: Record<FileKind, string> = {
   document: 'Document',
   dataset: 'Spreadsheet or data',
+  image: 'Picture',
   video: 'Video',
   audio: 'Audio',
   recording: 'Voice recording',
@@ -140,6 +177,7 @@ export const KIND_LABEL: Record<FileKind, string> = {
 export const KIND_FILTER_LABEL: Record<FileKind, string> = {
   document: 'Documents',
   dataset: 'Spreadsheets & data',
+  image: 'Pictures',
   video: 'Videos',
   audio: 'Audio',
   recording: 'Voice recordings',
@@ -192,10 +230,23 @@ function hours(n: number): string {
  * given.
  */
 export function retentionSentences(r: Retention): string[] {
-  const out = [
-    `Files you attach to a chat are kept for up to ${hours(r.uploadHours)}; after that the chat keeps what it read (a document's text, a spreadsheet's summary).`,
-  ];
-  if (r.videoKeptWithChat) out.push('Videos and audio files stay while their chat exists.');
+  const out = r.filesKeptWithChat
+    ? [
+        `Files you attach to a chat stay while the chat exists. A file that was not kept that way (sent before it was, or when the server was short of space) was removed after up to ${hours(r.uploadHours)}, and the chat keeps what it read of it (a document's text, a spreadsheet's summary).`,
+      ]
+    : [
+        `Files you attach to a chat are kept for up to ${hours(r.uploadHours)}; after that the chat keeps what it read (a document's text, a spreadsheet's summary).`,
+      ];
+  if (r.videoKeptWithChat && !r.filesKeptWithChat) {
+    out.push('Videos and audio files stay while their chat exists.');
+  }
+  if (r.picturesKept) {
+    // The backfill (lib/chatMedia): a photo sent before pictures were stored
+    // reaches the server only from the browser that still holds it.
+    out.push(
+      'Pictures stay while their chat exists. A picture sent before pictures were kept on the server appears here once the browser that sent it opens its chat again.',
+    );
+  }
   out.push('Deleting a chat takes its files off this list at once; the server erases their stored copies later.');
   out.push(
     r.recordingDays > 0
@@ -213,8 +264,14 @@ const ARCHIVE_NAME = /\.(zip|tar|tgz|tar\.gz)$/i;
  * file, and what of it is left. null for a stored file.
  */
 export function availabilityNote(file: MyFile, retention: Retention | null): string | null {
-  // Not "removed after N hours": the quota can evict a file sooner.
-  const why = retention ? ` (chat files are kept for up to ${hours(retention.uploadHours)})` : '';
+  // Not "removed after N hours": the quota can evict a file sooner. Once files
+  // stay with their chat, the rule is no longer every file's, so the note
+  // speaks about THIS file instead.
+  const why = !retention
+    ? ''
+    : retention.filesKeptWithChat
+      ? ` (it was kept for up to ${hours(retention.uploadHours)})`
+      : ` (chat files are kept for up to ${hours(retention.uploadHours)})`;
   switch (file.availability) {
     case 'text_only':
       return file.source === 'text'
@@ -227,6 +284,7 @@ export function availabilityNote(file: MyFile, retention: Retention | null): str
     case 'processing':
       return 'Still being recorded or transcribed.';
     case 'expired':
+      if (file.kind === 'image') return 'This picture is no longer stored.';
       return file.kind === 'video' || file.kind === 'audio'
         ? 'This file is no longer stored.'
         : `The file was removed${why}, and nothing of it was kept.`;
@@ -337,7 +395,15 @@ export function chatUrl(conversationId: string): string {
 /* ----------------------------------------------------------- parsing */
 
 const HEX32 = /^[0-9a-f]{32}$/;
-const ID_SHAPE = /^(upload|text|recording):([A-Za-z0-9_-]{1,64})$/;
+const ID_SHAPE = /^(upload|text|recording|media|image|chat_media):([A-Za-z0-9_-]{1,64})$/;
+/** A picture URL the server may send instead of the bare attachment id. */
+const PICTURE_URL = /\/chat-media\/([A-Za-z0-9_-]{1,64})\/([A-Za-z0-9_-]{8,64})(?:[?#]|$)/;
+const EXTENSION_BY_MIME: Record<string, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+};
 
 const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
@@ -350,14 +416,48 @@ function parseRetention(raw: unknown): Retention | null {
   const uploadHours = num(r.upload_hours);
   const recordingDays = num(r.recording_days);
   if (uploadHours === null || recordingDays === null) return null;
+  const pictures = str(r.pictures);
   return {
     uploadHours,
+    filesKeptWithChat: r.files_kept_with_chat === true,
     recordingDays,
     videoKeptWithChat: r.video_kept_with_chat === true,
     videoGraceHours: num(r.video_grace_hours),
-    picturesBrowserOnly: r.pictures === 'browser_only',
+    picturesBrowserOnly: pictures === 'browser_only',
+    // Any other word means the server keeps them; only an explicit
+    // "browser_only" (or no word at all) keeps the old sentence.
+    picturesKept: Boolean(pictures) && pictures !== 'browser_only',
     pictureMemoryHours: num(r.picture_memory_hours),
   };
+}
+
+/**
+ * A stored picture's reference: the attachment id the row names (or, from a
+ * server that sent a URL instead, the one in that URL — and only when it is
+ * a URL for this same chat). null when there is none to be had, which drops
+ * the row: without it the page can neither show nor open the picture.
+ */
+function pictureRef(r: Record<string, unknown>, conversationId: string): MediaRef | null {
+  if (!CONVERSATION_ID.test(conversationId)) return null;
+  const media = record(r.media);
+  const named = [r.attachment_id, media?.attachment_id].find(
+    (v): v is string => typeof v === 'string' && ATTACHMENT_ID.test(v),
+  );
+  if (named) return { conversationId, attachmentId: named };
+  for (const url of [r.thumb_url, r.thumbnail_url]) {
+    const m = typeof url === 'string' ? PICTURE_URL.exec(url) : null;
+    if (m && m[1] === conversationId) return { conversationId, attachmentId: m[2]! };
+  }
+  return null;
+}
+
+/** A picture's name, which the server may not have (chat_media keeps none). */
+function pictureName(r: Record<string, unknown>): string {
+  const named = str(r.name)?.trim();
+  if (named) return named;
+  const mime = (str(record(r.media)?.mime) ?? str(r.mime) ?? '').toLowerCase();
+  const ext = EXTENSION_BY_MIME[mime];
+  return ext ? `Picture.${ext}` : 'Picture';
 }
 
 function parseFile(raw: unknown): MyFile | null {
@@ -368,11 +468,16 @@ function parseFile(raw: unknown): MyFile | null {
   const source = str(r.source);
   const kind = oneOf(FILE_KINDS, str(r.kind));
   const availability = oneOf(AVAILABILITIES, str(r.availability));
-  const name = str(r.name);
   const createdAt = str(r.created_at);
   const can = record(r.can);
-  if (!id || !shape || shape[1] !== source || !kind || !availability || !name || !createdAt || !can) return null;
+  if (!id || !shape || shape[1] !== source || !kind || !availability || !createdAt || !can) return null;
   if (Number.isNaN(Date.parse(createdAt))) return null;
+  // A picture comes from the picture store and nothing else does: a mismatch
+  // either way is a row this page would act on wrongly.
+  const isPicture = MEDIA_SOURCES.includes(source);
+  if (isPicture !== (kind === 'image')) return null;
+  const name = isPicture ? pictureName(r) : str(r.name);
+  if (!name) return null;
   // A recording is named by a server id the audio routes accept, and nothing
   // else; a chat file cannot be opened, previewed or downloaded without its chat.
   if (source === 'recording' && (kind !== 'recording' || !HEX32.test(shape[2]!))) return null;
@@ -380,11 +485,13 @@ function parseFile(raw: unknown): MyFile | null {
   const conversation =
     conv && typeof conv.id === 'string' && conv.id ? { id: conv.id, title: str(conv.title) ?? '' } : null;
   if (source !== 'recording' && !conversation) return null;
-  const media = record(r.media);
-  const preview = oneOf(['text', 'summary', 'audio'] as const, str(can.preview));
+  const picture = isPicture && conversation ? pictureRef(r, conversation.id) : null;
+  if (isPicture && !picture) return null;
+  const media = isPicture ? null : record(r.media);
+  const preview = oneOf(['text', 'summary', 'audio', 'image'] as const, str(can.preview));
   return {
     id,
-    source: source as FileSource,
+    source: isPicture ? 'media' : (source as FileSource),
     kind,
     name,
     bytes: num(r.bytes),
@@ -397,6 +504,7 @@ function parseFile(raw: unknown): MyFile | null {
     textName: preview === 'text' ? str(r.text_name) || null : null,
     uploadId: source === 'upload' ? shape[2]! : null,
     recordingId: source === 'recording' ? shape[2]! : null,
+    picture,
   };
 }
 
@@ -421,7 +529,12 @@ export function parseSummary(body: unknown): MyFilesSummary | null {
   const kinds = record(b?.kinds);
   if (!b || !kinds) return null;
   const parsed = Object.fromEntries(FILE_KINDS.map((k) => [k, parseCount(kinds[k])])) as Record<FileKind, KindCount>;
-  return { kinds: parsed, total: parseCount(b.total), retention: parseRetention(b.retention) };
+  return {
+    kinds: parsed,
+    total: parseCount(b.total),
+    retention: parseRetention(b.retention),
+    reported: FILE_KINDS.filter((k) => record(kinds[k]) !== null),
+  };
 }
 
 /** Append an older page without repeating a row the list already shows. */
@@ -446,6 +559,7 @@ function uploadRef(file: MyFile): UploadRef | null {
 export function downloadUrl(file: MyFile): string | null {
   if (!file.can.download) return null;
   if (file.source === 'recording' && file.recordingId) return recordingAudioUrl(file.recordingId);
+  if (file.picture) return chatMediaUrl(file.picture, 'full');
   const ref = uploadRef(file);
   return ref ? uploadFileUrl(ref) : null;
 }
@@ -458,7 +572,9 @@ export type PreviewPlan =
   /** The profile stored when a spreadsheet or dataset arrived. */
   | { kind: 'summary'; conversationId: string; uploadId: string }
   /** A recording's own player. */
-  | { kind: 'audio'; url: string };
+  | { kind: 'audio'; url: string }
+  /** A stored chat picture, opened at full size from the picture route. */
+  | { kind: 'picture'; ref: MediaRef };
 
 /**
  * The preview a row gets, best first. Bytes only for the formats the
@@ -471,6 +587,11 @@ export function previewPlanFor(file: MyFile): PreviewPlan | null {
     return file.can.preview === 'audio' && file.recordingId
       ? { kind: 'audio', url: recordingAudioUrl(file.recordingId) }
       : null;
+  }
+  if (file.picture) {
+    // Only verified rasters are stored (CONTRACT §3), at most 10 MiB each, so
+    // a stored picture always previews while the server says it is there.
+    return file.availability === 'available' ? { kind: 'picture', ref: file.picture } : null;
   }
   const ref = uploadRef(file);
   const drawable = ['image', 'pdf', 'text'].includes(previewKindFor(file.name));

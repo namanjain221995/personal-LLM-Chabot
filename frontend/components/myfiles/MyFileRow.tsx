@@ -15,6 +15,11 @@
  *
  * NOTHING IS FETCHED BY RENDERING. The player is preload="none" (an hour of
  * dictation is ~58 MB) and a preview asks the server only when opened.
+ *
+ * One exception, by design (2026-10-02): a stored chat PICTURE shows its
+ * thumbnail, the 512 px copy the chat bubble uses, lazily (only once the row
+ * scrolls near the screen) and from the browser's cache after the first time
+ * (the route answers `private, immutable`). Preview opens the full picture.
  */
 
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
@@ -28,6 +33,7 @@ import {
   IconZoomIn,
 } from '@/components/icons';
 import { fetchUploadBlob, previewKindFor, previewMimeFor, type ResolvedAttachment } from '@/lib/attachments';
+import { chatMediaUrl, fetchChatMediaBlob } from '@/lib/chatMedia';
 import { fileKind, formatBytes, formatWhen } from '@/lib/format';
 import {
   AVAILABILITY_LABEL,
@@ -95,6 +101,71 @@ function IconWave({ size = 18 }: { size?: number }) {
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
       <path d="M3 12h2M7 8v8M11 5v14M15 9v6M19 7v10M21 12h0" />
     </svg>
+  );
+}
+
+/** A framed landscape — a picture. Same 24-grid and stroke as components/icons. */
+function IconPicture({ size = 18 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <circle cx="9" cy="10" r="1.5" />
+      <path d="m21 16-5-5-9 9" />
+    </svg>
+  );
+}
+
+/**
+ * A stored picture's tile: its own thumbnail, in the same 40 px square every
+ * other kind's icon takes, so a list of pictures and documents lines up.
+ * Decorative (the row's heading names it); a thumbnail that fails to load, or
+ * a picture the server no longer has, falls back to the picture icon.
+ */
+function PictureTile({ file, onOpen }: { file: MyFile; onOpen?: () => void }) {
+  const [failed, setFailed] = useState(false);
+  const tile = 'flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg';
+  if (!file.picture || file.availability !== 'available' || failed) {
+    return (
+      <span aria-hidden className={`${tile} bg-accent/15 text-accent`}>
+        <IconPicture />
+      </span>
+    );
+  }
+  const thumb = (
+    // A same-origin URL with its own cache lifetime: next/image would only add
+    // a second, server-side copy of a private photo.
+    // eslint-disable-next-line @next/next/no-img-element
+    <img
+      src={chatMediaUrl(file.picture, 'thumb')}
+      alt=""
+      width={40}
+      height={40}
+      loading="lazy"
+      decoding="async"
+      onError={() => setFailed(true)}
+      className="h-10 w-10 object-cover"
+    />
+  );
+  if (!onOpen) {
+    return (
+      <span aria-hidden className={`${tile} border border-border bg-surface-2`}>
+        {thumb}
+      </span>
+    );
+  }
+  // The thumbnail opens the picture too, as a photo in the chat does. It is
+  // out of the tab order: the row's Preview button is the keyboard's way in,
+  // and one stop per action is enough.
+  return (
+    <button
+      type="button"
+      tabIndex={-1}
+      onClick={onOpen}
+      aria-label={`Preview ${file.name}`}
+      className={`${tile} border border-border bg-surface-2 transition-opacity duration-ts hover:opacity-90`}
+    >
+      {thumb}
+    </button>
   );
 }
 
@@ -169,11 +240,17 @@ export function MyFileRow({ file, retention, fetchFn, onDeleted, onExpired }: My
   // A recording still being made or transcribed: its DELETE stops it first.
   const inProgress = file.availability === 'processing';
 
+  // The row's own words say what is gone (`availabilityNote`), so these
+  // loaders report nothing more about it; the dialog adds no second note.
+  const textLoaders = (conversationId: string, name: string): ServerPreviewLoaders => ({
+    loadDocumentText: async (signal) => ({ value: await fetchDocumentText(conversationId, name, signal) }),
+  });
+
   function openPreview() {
     if (!plan || plan.kind === 'audio') return;
     const blank: ResolvedAttachment = { name: file.name, mime: '', blob: null, size: file.bytes, kind: 'none' };
     if (plan.kind === 'text') {
-      setLoaders({ loadDocumentText: (signal) => fetchDocumentText(plan.conversationId, plan.name, signal) });
+      setLoaders(textLoaders(plan.conversationId, plan.name));
       setSource(blank);
       return;
     }
@@ -181,21 +258,52 @@ export function MyFileRow({ file, retention, fetchFn, onDeleted, onExpired }: My
       setLoaders({
         loadWorkbook: async (signal) => {
           const found = await fetchUploadProfile(plan.conversationId, plan.uploadId, signal);
-          return found ? summaryFromProfile(found.profile, found.filename || file.name) : null;
+          return { value: found ? summaryFromProfile(found.profile, found.filename || file.name) : null };
         },
       });
       setSource(blank);
       return;
     }
-    // The bytes: downloaded once, when asked, and aborted if the dialog closes.
     setLoaders({});
     setSource({ ...blank, kind: 'loading' });
     previewAbort.current?.abort();
     const controller = new AbortController();
     previewAbort.current = controller;
+    if (plan.kind === 'picture') {
+      // The full picture, once, when asked. Its type is the server's: only
+      // verified rasters are stored, and anything else gets the honest card.
+      void fetchChatMediaBlob(plan.ref, 'full', controller.signal).then((outcome) => {
+        if (controller.signal.aborted) return;
+        if (outcome.status === 'missing') {
+          setSource({ ...blank, kind: 'missing' });
+          onExpired(file);
+          return;
+        }
+        if (outcome.status !== 'ok') {
+          setSource({ ...blank, kind: 'unavailable' });
+          return;
+        }
+        const mime = outcome.blob.type;
+        setSource({
+          name: file.name,
+          mime,
+          blob: outcome.blob,
+          size: outcome.blob.size,
+          kind: previewKindFor('', mime) === 'image' ? 'image' : 'none',
+        });
+      });
+      return;
+    }
+    // The bytes: downloaded once, when asked, and aborted if the dialog closes.
     void fetchUploadBlob(plan.ref, controller.signal).then((outcome) => {
       if (controller.signal.aborted) return;
       if (outcome.status === 'expired') {
+        // Swept while the page was open (2026-10-02): if the chat kept the
+        // text, the dialog shows it under the "expired" line rather than
+        // stopping at the sentence.
+        if (file.can.preview === 'text' && file.conversation) {
+          setLoaders(textLoaders(file.conversation.id, file.textName ?? file.name));
+        }
         setSource({ ...blank, kind: 'expired' });
         onExpired(file);
         return;
@@ -250,7 +358,11 @@ export function MyFileRow({ file, retention, fetchFn, onDeleted, onExpired }: My
   return (
     <li className="px-4 py-4 sm:px-5" aria-labelledby={titleId} aria-busy={deleting || undefined}>
       <div className="flex gap-3">
-        <KindTile file={file} />
+        {file.kind === 'image' ? (
+          <PictureTile file={file} onOpen={plan?.kind === 'picture' ? openPreview : undefined} />
+        ) : (
+          <KindTile file={file} />
+        )}
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-3">
             <h2

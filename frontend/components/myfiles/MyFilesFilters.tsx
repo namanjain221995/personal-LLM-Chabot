@@ -90,9 +90,16 @@ export function MyFilesFilters({
     else onChange({ to: value });
   }
 
+  // Pictures (2026-10-02) are offered as a type only once the server's counts
+  // name them: an orchestrator from before pictures were stored refuses
+  // `kind=image`. A link that already chose it keeps the choice visible, so
+  // it can be undone.
+  const offered = FILE_KINDS.filter(
+    (kind) => kind !== 'image' || filters.kind === 'image' || Boolean(summary?.reported.includes('image')),
+  );
   const choices: Array<{ value: FileKind | null; label: string; count: number | undefined }> = [
     { value: null, label: 'All', count: summary?.total.count },
-    ...FILE_KINDS.map((kind) => ({ value: kind, label: KIND_FILTER_LABEL[kind], count: summary?.kinds[kind].count })),
+    ...offered.map((kind) => ({ value: kind, label: KIND_FILTER_LABEL[kind], count: summary?.kinds[kind].count })),
   ];
 
   return (

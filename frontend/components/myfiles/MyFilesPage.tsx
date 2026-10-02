@@ -394,13 +394,18 @@ export function MyFilesPage({ fetchFn = fetch }: MyFilesPageProps) {
                 </div>
               ) : (
                 <>
+                  {/* 2026-10-02: pictures are listed once the server says it
+                      keeps them; an older orchestrator still says it does not. */}
                   <p className="mx-auto mt-1.5 max-w-md text-sm text-muted">
-                    Documents, spreadsheets, videos and audio files you attach to a chat appear here, and so do
-                    your voice recordings.
+                    {retention?.picturesKept
+                      ? 'Documents, pictures, spreadsheets, videos and audio files you attach to a chat appear here, and so do your voice recordings.'
+                      : 'Documents, spreadsheets, videos and audio files you attach to a chat appear here, and so do your voice recordings.'}
                   </p>
-                  <p className="mx-auto mt-2 max-w-md text-sm text-muted">
-                    Pictures stay only in the browser you sent them from, so they are not listed.
-                  </p>
+                  {!retention?.picturesKept && (
+                    <p className="mx-auto mt-2 max-w-md text-sm text-muted">
+                      Pictures stay only in the browser you sent them from, so they are not listed.
+                    </p>
+                  )}
                 </>
               )}
             </div>
