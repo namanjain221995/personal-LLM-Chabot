@@ -302,8 +302,8 @@ export function MyFileRow({ file, retention, fetchFn, onDeleted, onExpired }: My
                 href="/recordings"
                 className={`rounded font-medium text-accent underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${TOUCH_LINK}`}
               >
-                {/* A failed or unfinished recording has no transcript to promise. */}
-                {file.media?.status === 'done' ? 'Also in Recordings, with its transcript' : 'Also in Recordings'}
+                {/* Only a transcript with words: a done recording can have heard no speech. */}
+                {file.media?.hasTranscript ? 'Also in Recordings, with its transcript' : 'Also in Recordings'}
               </a>
             )}
           </p>

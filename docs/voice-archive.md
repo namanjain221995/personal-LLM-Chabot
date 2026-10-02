@@ -126,7 +126,7 @@ the row.
 | The head file exists (every `local` or `copied` recording) | `FileResponse`, as before |
 | `archived` | The store's copy streamed through (one pooled client per event loop, up to 32 connections, 64 KiB chunks). `Range` and `If-Range` are forwarded; 200/206/416 with `Content-Range`, `Content-Length` and `Accept-Ranges` are passed back, and a multi-range answer keeps its `multipart/byteranges` type. A Range the store refuses (400, malformed) gets the same 400 the head gives. `Content-Disposition`, `Cache-Control: no-store` and `X-Recording-Complete` are unchanged. |
 | The store is down, answers 5xx or times out | **503 `archive_unavailable`**, `Retry-After: 30`, "This recording is kept on the archive server, which isn't answering right now. Nothing is lost; try again in a few minutes." |
-| All 32 connections are carrying recordings (waited 5 s) | **503 `archive_busy`**, `Retry-After: 5`, "Many recordings are playing from the archive server right now. Nothing is lost; try again in a moment." |
+| All 32 connections are carrying recordings (waited 5 s), or the store is at its own connection limit (its 503) | **503 `archive_busy`**, `Retry-After: 5`, "Many recordings are playing from the archive server right now. Nothing is lost; try again in a moment." |
 | The store has no copy of an `archived` recording | **410 `audio_missing`**, counted, and the row flagged `remote_missing` |
 | The recording was deleted | 410 `audio_deleted`, as before |
 
@@ -138,8 +138,21 @@ connection for its whole stream, and a paused player keeps its connection
 until the browser lets it go (about 20 s in Chromium). With the first
 build's 8, the ninth listener waited out the pool (30 s) and was told the
 archive "isn't answering" while it was fine (review 2026-09-30, real
-Chromium). The store serves 64 at once (`LIMIT_CONCURRENCY` in
-`server.py`): a full pool from each of the two event loops that talk to it.
+Chromium).
+
+**The store's limit.** `LIMIT_CONCURRENCY` in `server.py` is
+`2 * 32 + 16` = 80. uvicorn answers 503 to a request once it has that many
+connections open, idle kept-alive ones included, so it serves 79. Two of the
+orchestrator's event loops can each fill a pool of 32: the request loop
+(players) and the archive loop (the mover, restores for retranscriptions,
+deletes). Both full pools fit, and the other 15 are for what else talks to
+the store now and then: a continuation's restore on the session runner's
+loop, a CLI run inside the container, `voice-store.sh verify`. The first fix
+round's 64 served 63, so with both pools full the 64th stream got the
+store's own 503 and was told `archive_unavailable` (review 2026-10-01). The
+store answers a read with 503 only at that limit, so the proxy now reports
+any store 503 as `archive_busy`. A test holds both pools full against a real
+uvicorn at the store's own limit.
 
 One narrow race is left on purpose. If the head copy is released in the
 milliseconds between the existence check and the file being opened, that one
@@ -170,6 +183,15 @@ first. It never creates a session folder, the same rule as
   `copied` with the hold.
   - Below the head's `VOICE_MIN_FREE_BYTES` floor (250 GiB): 507 `storage_full`.
   - Store down: 503 `archive_unavailable`.
+  - **A failing store is asked once per 30 s.** After a restore meets a
+    failing store (down, timing out, refusing: the reasons that also stop
+    a pass), every restore in the orchestrator is refused at once for 30 s,
+    the `Retry-After` that refusal already names, with the same 503 and
+    without asking the store (`_RESTORE_PAUSE_S`). A restore that gets its
+    bytes ends the pause. Before this, every "Try again" during an outage
+    ran a full restore inside the person's lock, on a thread of the shared
+    worker pool, for up to 32 s against a hung store: 12 presses at once
+    made 12 store attempts (review 2026-10-01). Now they make one.
 
 Callers:
 
@@ -178,6 +200,7 @@ Callers:
   If the store is down, it answers 503 and the row is unchanged, and the
   refusal does not count against the hourly retries
   (`VOICE_RETRANSCRIBE_PER_HOUR`): they are counted once the audio is here.
+  What caps the attempts while the store is failing is the 30 s pause above.
   If the head's disk fills during the download, it answers 507
   `storage_full` and leaves nothing behind. After the retranscription the
   next pass releases the file again **without a second upload**: the bytes
@@ -264,10 +287,34 @@ docker exec sf-local-ai-orchestrator-1 python -m app.voice_archive quarantine-pu
 
 Never change or delete the `voice_archive_owner` row. A new owner would make
 every stored recording belong to "another deployment". Nothing would be
-lost, but none of them could be deleted: deletes would stay pending and
-`VoiceArchivePurgeStuck` would fire. `scripts/e2e-stack.sh` no longer
-inherits `VOICE_ARCHIVE_ENABLED` from production. A stack that should run
-the mover says so in its `E2E_EXTRA_ENV_FILE`.
+lost, and they would all still play: the reconcile counts a recording
+another owner stored as `other_owner`, never as `remote_missing` (the first
+fix round flagged every one of them, and `VoiceArchiveCopiesMissing` would
+have fired: review 2026-10-01). But none of them could be deleted from here:
+deletes would stay pending and `VoiceArchivePurgeStuck` would fire, and the
+reconcile logs an error every day: "N recording(s) this database has rows
+for are stored under another owner". To recover, put the old owner back:
+
+```bash
+# On the head: the id of any recording that moved.
+docker exec sf-local-ai-postgres-1 psql -U techsara -d techsara -Atc \
+  "SELECT user_id || '/' || id FROM voice_sessions WHERE archive_state = 'archived' LIMIT 1"
+# On the worker: the owner that stored it.
+python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["owner"])' \
+  ~/techsara-data/voice/<uid>/<sid>/manifest.json
+```
+
+```sql
+UPDATE voice_archive_owner SET owner = '<the owner from manifest.json>' WHERE id = 1;
+```
+
+Then restart the orchestrator (`./techsara up`): each process reads the
+owner once and keeps it. The next reconcile finds the recordings its own
+again.
+
+`scripts/e2e-stack.sh` no longer inherits `VOICE_ARCHIVE_ENABLED` from
+production. A stack that should run the mover says so in its
+`E2E_EXTRA_ENV_FILE`.
 
 **A copy of production's database is the one case the owner cannot tell
 apart.** A restored backup or a clone carries production's owner row, and
@@ -648,6 +695,11 @@ scripts/voice-store.sh up            # recreate (idempotent; keeps token, certif
 
 When it is back, the next pass drains the purge and the backlog by itself.
 
+If the store is up and `VoiceArchivePurgeStuck` still fires while
+`voice_archive_errors_total{reason="conflict"}` rises, the store is refusing
+the deletes as another owner's: this database's `voice_archive_owner` row
+was changed. "Who owns a recording" says how to put it back.
+
 ### When recordings stop moving
 
 `VoiceArchiveBacklogOverdue`, `VoiceArchivePassStalled`.
@@ -707,6 +759,53 @@ at `quarantine-list --all`, then `quarantine-restore <uid>/<sid>` each one
   deployment's can be touched by it, and nothing of its is touched here.
   Take the settings out of that stack. Its recordings can be removed by
   hand on the worker. Leftovers of a `verify` run that died are user `0`.
+  If the other owner holds recordings THIS database has rows for, the
+  orchestrator's log says so ("stored under another owner"): the owner row
+  was changed, and "Who owns a recording" says how to put it back.
+
+### A database that ran another V43
+
+The orchestrator refuses to start, and its log says: "This database records
+migration V43 but has no voice_archive_owner table, so its V43 is not the
+one this code carries", followed by which one it found.
+
+Two different migrations have run as V43 before this one was released, and
+the migration runner keeps no checksum, so it cannot tell them apart:
+
+- **A draft of this V43.** V43 was edited in place before release: the fix
+  round of 2026-09-30 added the `voice_archive_owner` table and changed the
+  predicate of `idx_voice_sessions_archive_purge` after the first build had
+  run on test databases. Such a database has the archive's columns but not
+  the table.
+- **Another branch's V43.** The meeting-transcripts branches
+  (`feat/realtime-voice-r2`, dropped before release) numbered their own
+  migration 43 (`voice_sessions.kind`). Such a database has none of the
+  archive's columns.
+
+Before this check, either kind started cleanly. With the draft, every store
+call that names the owner then raised `UndefinedTable`, which also stopped
+the mover's pass and the purge. With the other branch's, every query of a
+recording raised `UndefinedColumn`, since dictation reads the archive's
+columns. No production database ran either: production was at
+V42 on 2026-10-01 (`SELECT version FROM schema_migrations` gave 42, 41, 40).
+On 2026-10-01 ten test databases on the worker-hosted test server had one
+of them: `vqab_test`, `trackb_test`, `trackb_base_test`, `trackb_s2_test`
+and `trackb_s3_test` (the draft), and `rtvoice_d_test`, `rtvoice_e2e_test`,
+`rtvoice_r2_test`, `r2sec_test` and `r2sec_probe_test` (the other branch's).
+The e2e stack's volume (`techsara-e2e_pgdata`) was not checked.
+
+- A test database: drop it, and let the suite create it again.
+- A database to keep: run this in it, then start again. This V43 runs in
+  full (it is idempotent), and the purge index comes back with the released
+  predicate. Whatever another branch's V43 made (a `kind` column, a wider
+  `ended_by` check) stays as it is.
+
+```sql
+DROP INDEX IF EXISTS idx_voice_sessions_archive_purge; DELETE FROM schema_migrations WHERE version = 43;
+```
+
+The check (`db._refuse_another_v43`) runs only on a database that had V43
+before this start-up; a database that runs V43 now runs all of it.
 
 ## Rollback
 
@@ -721,7 +820,11 @@ answers 410 for anything archived.
    deletes the store's copies unless you pass `--keep-remote`, and it exits
    non-zero if any recording failed. It refuses (exit 2) while
    `VOICE_ARCHIVE_ENABLED` is still on, because the next pass would move
-   everything out again; `--force` overrides that.
+   everything out again; `--force` overrides that. If the store fails during
+   the run, the recordings after that failure are refused at once for 30 s
+   (the restore pause, "Bringing a recording back") and counted as failed:
+   run it again once the store answers. It takes only what is not `local`
+   yet.
 3. Only then roll back the code. V43's columns are additive and can stay.
 4. `scripts/voice-store.sh down` stops the store. The data stays on the
    worker's disk until it is removed by hand.
