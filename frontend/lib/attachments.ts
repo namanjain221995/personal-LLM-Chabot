@@ -506,6 +506,13 @@ export type PreviewKind = 'image' | 'pdf' | 'text' | 'none';
  */
 export type ResolvedKind =
   | PreviewKind
+  /**
+   * 2026-10-02: a video or audio file, PLAYED from the server by URL
+   * (`ResolvedAttachment.url`) and never fetched as bytes — see
+   * `streamedPlayerFor`. Not a `PreviewKind`: those are decided from bytes,
+   * and a player never holds the file.
+   */
+  | MediaKind
   | 'unavailable'
   | 'expired'
   /**
@@ -738,6 +745,11 @@ export interface ResolvedAttachment {
   blob: Blob | null;
   size: number | null;
   kind: ResolvedKind;
+  /**
+   * 2026-10-02: the same-origin URL a `video` or `audio` player streams
+   * from. Set for those two kinds only; every other kind renders from `blob`.
+   */
+  url?: string;
 }
 
 /* --------------------------------------------------------- the server tier
@@ -761,6 +773,37 @@ export interface UploadRef {
 /** Where the Phase 3 proxy lives. Same-origin; the cookie rides automatically. */
 export function uploadFileUrl(ref: UploadRef): string {
   return `/api/uploads/${encodeURIComponent(ref.conversationId)}/${encodeURIComponent(ref.uploadId)}/file`;
+}
+
+/**
+ * 2026-10-02 (chat media, CONTRACT §10): a sent video or audio file, as a
+ * player the preview dialog draws — or null when this is not media, or the
+ * server holds no copy of it yet (no upload id).
+ *
+ * Opening one used to DOWNLOAD it: the ladder below fetched the whole file
+ * into a Blob (a video may be 4 GB), only for the dialog to say "Preview is
+ * not available for this file type", on the sending device and every other
+ * one. Nothing is fetched here at all. The player is handed the streaming
+ * proxy's URL and asks for byte ranges itself as it plays and seeks
+ * (app/api/uploads/.../file relays the 206s).
+ *
+ * The URL is same-origin because it has to be: the page's CSP has no
+ * `media-src`, so media falls back to `default-src 'self'`, which admits this
+ * route and refuses a `blob:` URL (lib/csp.ts). A player over an object URL
+ * would not even start.
+ *
+ * Audio travels on the video rail (`kind: 'video'` in meta, B12), so which
+ * player is decided by the NAME; a nameless file, or an extension the list
+ * does not know, on a row the rail marked `video` is still a video.
+ */
+export function streamedPlayerFor(
+  name: string,
+  upload: UploadRef | null | undefined,
+  railKind?: string,
+): ResolvedAttachment | null {
+  const media = mediaKindFor(name) ?? (railKind === 'video' ? 'video' : null);
+  if (!media || !upload) return null;
+  return { name, mime: '', blob: null, size: null, kind: media, url: uploadFileUrl(upload) };
 }
 
 /** `expired` is its own outcome: the row is real, the bytes are swept. */

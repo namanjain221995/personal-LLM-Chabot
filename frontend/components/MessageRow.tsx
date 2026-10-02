@@ -30,7 +30,9 @@ import {
 import { keepsCitations, linkCitations, stripCitations } from '@/lib/citations';
 import {
   attachmentFile,
+  previewKindFor,
   resolveAttachmentAsync,
+  streamedPlayerFor,
   uploadRefFor,
   writeInternalAttachment,
   fileBadgeFor,
@@ -47,11 +49,8 @@ import {
 } from '@/lib/chatMedia';
 import type { MessageImage } from '@/lib/types';
 import { AttachmentPreview, type ServerPreviewLoaders } from './AttachmentPreview';
-import {
-  fetchDocumentText,
-  fetchUploadProfile,
-  workbookFromProfile,
-} from '@/lib/previewData';
+import { fetchDocumentText, fetchUploadProfile } from '@/lib/previewData';
+import { summaryFromProfile } from '@/lib/myfiles';
 import { AgentTimeline } from './AgentTimeline';
 import { ActivityPanel } from './ActivityPanel';
 import { countSources, ResearchPanel } from './ResearchPanel';
@@ -186,6 +185,7 @@ function OpenableAttachment({
   upload,
   media,
   space = 'file',
+  rail,
   loaders,
   children,
 }: {
@@ -193,6 +193,12 @@ function OpenableAttachment({
   index: number;
   /** What to call the file in the accessible name. */
   name: string;
+  /**
+   * 2026-10-02: the rail the file travelled on (`meta.attachments[i].kind`).
+   * Only `video` matters: such a file opens in a player even when its name
+   * does not say what it is.
+   */
+  rail?: string;
   /** The message's own persisted preview, when it has one (images do). */
   dataUrl?: string;
   /**
@@ -239,10 +245,26 @@ function OpenableAttachment({
    * document's extracted text) skips the byte fetch entirely: the dialog is
    * about to ask for something smaller and more useful, and downloading 50 MB
    * of .xlsx to then not read it would be pure waste.
+   *
+   * 2026-10-02 (CONTRACT §10), the same rule for everything else:
+   *   · a video or audio file is PLAYED, by URL — the player streams byte
+   *     ranges as it plays, and this fetches nothing (it used to pull the
+   *     whole file, up to 4 GB, into a Blob to then say "no preview");
+   *   · a format the dialog cannot draw from bytes at all (.zip, .pptx,
+   *     .html, .parquet) is not downloaded just to say so;
+   *   · a PDF or text file still fetches its bytes, and only if those are
+   *     gone does the dialog fall back to the text the chat read (`loaders`).
    */
   function open() {
+    const player = streamedPlayerFor(name, upload, rail);
+    if (player) {
+      setSource(player);
+      return;
+    }
     const local = resolveAttachment(messageId, index, { name, dataUrl, space });
-    if (loaders || local.kind !== 'unavailable' || (!upload && !media)) {
+    // A stored photo is drawable whatever it is called ("Attached image 1").
+    const drawable = Boolean(media) || previewKindFor(name) !== 'none';
+    if (!drawable || local.kind !== 'unavailable' || (!upload && !media)) {
       setSource(local);
       return;
     }
@@ -406,6 +428,15 @@ function StoredImage({
  *
  * Returns undefined without a conversation to ask about, so a row rendered
  * outside a chat behaves exactly as it did before this existed.
+ *
+ * 2026-10-02 (CONTRACT §10): the same two sources are now also the FALLBACK
+ * for a file the dialog draws from bytes, once those bytes turn out to be
+ * gone — a PDF or text document reads as the text the chat read from it, and
+ * a CSV dataset as the table the server profiled. The dialog asks only then
+ * (AttachmentPreview runs a loader for `expired` and `unavailable`, never
+ * over a PDF it can show). The formats above stay unreachable: nothing here
+ * is offered for a name `previewKindFor` answers `none` for, .xlsx and .docx
+ * aside.
  */
 function serverPreviewLoaders(
   conversationId: string | null,
@@ -414,7 +445,9 @@ function serverPreviewLoaders(
   name: string,
 ): ServerPreviewLoaders | undefined {
   if (!conversationId) return undefined;
-  if (/\.xlsx$/i.test(name)) {
+  const rail = message.meta?.attachments?.[index]?.kind;
+  const drawable = previewKindFor(name) !== 'none';
+  if (/\.xlsx$/i.test(name) || (rail === 'dataset' && drawable)) {
     const upload = uploadRefFor(conversationId, message, index);
     if (!upload) return undefined;
     return {
@@ -424,15 +457,27 @@ function serverPreviewLoaders(
           upload.uploadId,
           signal,
         );
-        if (!found || found.expired) return null;
-        return workbookFromProfile(found.profile, found.filename || name);
+        if (!found) return { value: null };
+        // The profile is a database row and OUTLIVES the bytes, so a swept
+        // workbook still previews from it. This used to return null for an
+        // `expired` row, and the dialog then blamed "this browser session";
+        // the flag now goes with the summary, and the dialog says the file
+        // itself is gone.
+        return {
+          value: summaryFromProfile(found.profile, found.filename || name),
+          expired: found.expired,
+        };
       },
     };
   }
-  if (/\.docx$/i.test(name)) {
+  if (/\.docx$/i.test(name) || (rail !== 'dataset' && rail !== 'video' && drawable)) {
+    // A small document rides INSIDE the chat request and its upload is best
+    // effort, so on another device (or after the sweep) a PDF may have no
+    // bytes anywhere — but the chat stored the text it read, by name.
     return {
-      loadDocumentText: (signal) =>
-        fetchDocumentText(conversationId, name, signal),
+      loadDocumentText: async (signal) => ({
+        value: await fetchDocumentText(conversationId, name, signal),
+      }),
     };
   }
   return undefined;
@@ -881,6 +926,7 @@ function MessageRowImpl({
                     messageId={message.id}
                     index={i}
                     name={entry.name ?? `Document ${i + 1}`}
+                    rail={entry.kind}
                     onReuse={
                       onReuseAttachment ? () => onReuseAttachment(i) : undefined
                     }
@@ -928,6 +974,7 @@ function MessageRowImpl({
                 messageId={message.id}
                 index={0}
                 name={message.pdfName}
+                rail={message.meta?.attachments?.[0]?.kind}
                 onReuse={
                   onReuseAttachment ? () => onReuseAttachment(0) : undefined
                 }
