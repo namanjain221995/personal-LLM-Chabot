@@ -424,7 +424,7 @@ def test_vision_route_meta_reports_vision_model_and_applied_effort(monkeypatch):
 
     async def fake_vision_engine(
         message, image_base64, history, emit, *, effort="think", max_tokens=None,
-        conversation_id=None,
+        conversation_id=None, total_pictures=0,
     ):
         await emit("token", {"text": "An invoice."})
         await emit("meta", {"route": "vision"})

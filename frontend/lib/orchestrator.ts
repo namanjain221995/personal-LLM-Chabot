@@ -35,7 +35,7 @@ export interface ChatRequestBody {
   deep_research?: boolean;
   /** 2026-08-06: Live Salesforce toggle — query the org, not the copy. */
   sf_live?: boolean;
-  /** 2026-08-05: all attached images (max 5); `image` stays the first one. */
+  /** 2026-08-05: all attached images (max MAX_IMAGES); `image` stays the first one. */
   images?: string[];
   /**
    * 2026-10-02 (chat media, docs/chat-media/CONTRACT.md §5): the attachment
@@ -158,11 +158,37 @@ const ARTIFACT_ID_RE = /^[a-f0-9]{32}$/;
 
 /** A client-minted attachment id (docs/chat-media/CONTRACT.md §3). */
 const ATTACHMENT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
-/** The orchestrator's MAX_IMAGES: inline and referenced photos together. */
-const MAX_IMAGES = 5;
+/**
+ * Photos per message, inline and referenced together. There is NO product
+ * limit (owner, 2026-10-03, docs/chat-media/LIMITS.md: "no limit, users can
+ * upload unlimited"; it was 5, then briefly 20). 999 is a technical ceiling,
+ * not a rule anyone is told about below it: vLLM's per-prompt image maximum,
+ * which the orchestrator's MAX_IMAGES (main.py) validates against too.
+ */
+export const MAX_IMAGES = 999;
 
 /**
- * A list of attachment ids as it may be forwarded: an array of 1..5
+ * Documents, datasets, archives, videos and audio per message: no product
+ * limit either (2026-10-03, LIMITS.md). The same 999 technical ceiling bounds
+ * the composer's list and the orchestrator's `pdf_uploads` / `video_uploads`
+ * validation.
+ */
+export const MAX_DOCUMENTS = 999;
+
+/**
+ * The most base64 one /chat body may carry inline, 48 MiB (2026-10-03,
+ * docs/chat-media/LIMITS.md). Cloudflare refuses a request body over 100 MB,
+ * and a hundred shrunk photos weigh about that much as base64, more when the
+ * browser could not shrink them. Over this, the photos are stored first
+ * (POST /api/chat-media, in batches of at most this many file bytes) and the
+ * turn names them in `image_refs`; at or under it nothing changes and the
+ * bytes ride inline as before. The one inline document counts towards it,
+ * but only photos ever move.
+ */
+export const INLINE_IMAGE_BUDGET_BYTES = 48 * 1024 * 1024;
+
+/**
+ * A list of attachment ids as it may be forwarded: an array of 1..MAX_IMAGES
  * well-formed ids, or null. All or nothing — dropping one bad id would shift
  * every id after it onto the wrong photo, so a list with one is not sent.
  */
@@ -272,7 +298,7 @@ export function toOrchestratorChatRequest(
   // see currentUserContent. `.trim()` lives in there so whitespace cannot
   // masquerade as a question and rob an attachment of its fallback.
   const text = currentUserContent(body);
-  // 2026-08-05: `images` (max 5) wins over the single `image` spelling.
+  // 2026-08-05: `images` (max MAX_IMAGES) wins over the single `image` spelling.
   const images = body.images?.length
     ? body.images
     : body.image

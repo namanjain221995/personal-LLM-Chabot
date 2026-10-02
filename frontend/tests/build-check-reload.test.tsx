@@ -13,7 +13,10 @@
  *     draft, and reloads by itself once the send has finished and the
  *     composer is empty — never during the stream;
  *   · the banner's Reload keeps the typed text across the reload;
- *   · one request at a time, none while hidden, failures silent.
+ *   · one request at a time, none while hidden, failures silent;
+ *   · QA 2026-10-03: a reload by itself never goes ahead over text typed
+ *     while it waited for the history store, and the Reload button keeps
+ *     what was typed in that wait.
  */
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
@@ -175,6 +178,23 @@ async function type(text: string) {
   });
 }
 
+/** Hold the history store's flush until the returned function is called. */
+function holdFlush(): () => Promise<void> {
+  let release: () => void = () => undefined;
+  flush.mockImplementation(
+    () =>
+      new Promise<undefined>((resolve) => {
+        release = () => resolve(undefined);
+      }),
+  );
+  return async () => {
+    await act(async () => {
+      release();
+      await new Promise((r) => setTimeout(r, 30));
+    });
+  };
+}
+
 beforeEach(() => {
   stored = [];
   versionReads = 0;
@@ -182,6 +202,7 @@ beforeEach(() => {
   releaseStream = null;
   versionAnswer = () => Response.json({ build: 'build-old' });
   flush.mockClear();
+  flush.mockImplementation(async () => undefined);
   vi.mocked(reloadPage).mockClear();
   clearAttachments();
   stubBrowser();
@@ -319,6 +340,63 @@ describe('a tab left behind by a deploy', () => {
       timeout: 4000,
     });
     expect(window.sessionStorage.getItem(RELOAD_DRAFT_KEY)).toBeNull();
+  });
+
+  it('never reloads by itself over text typed while the store finished its pushes', async () => {
+    // QA 2026-10-03: the reload waited up to 3 s for the history store, then
+    // went ahead without asking again — and the next question typed in that
+    // wait was gone.
+    renderApp();
+    await screen.findByRole('textbox', { name: 'Message' });
+    const releaseFlush = holdFlush();
+    await cameBack();
+    await waitFor(() => expect(flush).toHaveBeenCalled(), { timeout: 4000 });
+    await type('and what is the due date on it');
+    await releaseFlush();
+    expect(reloads()).toBe(0);
+    expect(box().value).toBe('and what is the due date on it');
+    expect(screen.getByTestId('new-version-banner')).toBeTruthy();
+
+    // Once nothing would be lost, it reloads by itself after all.
+    flush.mockImplementation(async () => undefined);
+    await type('');
+    await waitFor(() => expect(reloads()).toBe(1), { timeout: 4000 });
+  });
+
+  it('the banner’s Reload keeps what was typed while the store finished its pushes', async () => {
+    renderApp();
+    await screen.findByRole('textbox', { name: 'Message' });
+    await type('half a question');
+    await cameBack();
+    await screen.findByTestId('new-version-banner', undefined, { timeout: 4000 });
+    const releaseFlush = holdFlush();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Reload' }));
+    });
+    await type('half a question about the invoice total');
+    await releaseFlush();
+    await waitFor(() => expect(reloads()).toBe(1), { timeout: 4000 });
+    expect(window.sessionStorage.getItem(RELOAD_DRAFT_KEY)).toContain(
+      'half a question about the invoice total',
+    );
+  });
+
+  it('the banner’s Reload keeps the typed text when the store fails its pushes', async () => {
+    renderApp();
+    await screen.findByRole('textbox', { name: 'Message' });
+    await type('a question the push will not save');
+    await cameBack();
+    await screen.findByTestId('new-version-banner', undefined, { timeout: 4000 });
+    flush.mockImplementation(async () => {
+      throw new Error('push refused');
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Reload' }));
+    });
+    await waitFor(() => expect(reloads()).toBe(1), { timeout: 4000 });
+    expect(window.sessionStorage.getItem(RELOAD_DRAFT_KEY)).toContain(
+      'a question the push will not save',
+    );
   });
 
   it('reloads by itself at most once per server build: no loop behind a cache', async () => {

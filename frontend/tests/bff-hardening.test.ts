@@ -566,10 +566,16 @@ describe('/api/chat bounds its body', () => {
 
   it('admits everything the composer can actually attach', async () => {
     const { MAX_CHAT_BODY_BYTES } = await chatRoute();
-    // Composer.tsx: five images at MAX_IMAGE_BYTES (10 MiB) plus one document
-    // at INLINE_DOC_BYTES (25 MiB), all base64, is what one turn can carry.
-    const worstCase = Math.ceil((5 * 10 + 25) * 1024 * 1024 * (4 / 3));
-    expect(MAX_CHAT_BODY_BYTES).toBeGreaterThan(worstCase);
+    const { INLINE_IMAGE_BUDGET_BYTES } = await import('@/lib/orchestrator');
+    // 2026-10-03 (LIMITS.md): photos plus the one inline document ride inline
+    // only up to INLINE_IMAGE_BUDGET_BYTES of base64; past it the photos are
+    // stored first and named by reference, leaving at most the document
+    // (INLINE_DOC_BYTES, 25 MiB, as base64). Either way, well under the cap
+    // and under Cloudflare's 100 MB edge limit.
+    const document = Math.ceil(25 * 1024 * 1024 * (4 / 3));
+    const worstCase = Math.max(INLINE_IMAGE_BUDGET_BYTES, document);
+    expect(MAX_CHAT_BODY_BYTES).toBeGreaterThan(worstCase + 16 * 1024 * 1024);
+    expect(worstCase).toBeLessThan(100_000_000 - 16 * 1024 * 1024);
   });
 });
 
@@ -636,8 +642,9 @@ describe('/api/upload bounds its body', () => {
 
   it('admits every single-shot upload the client can start', async () => {
     const { MAX_UPLOAD_BODY_BYTES } = await uploadRoute();
-    // A dataset never chunks: ChatApp.tsx posts it here whole, up to
-    // MAX_DATASET_BYTES (Composer.tsx) = 512 MiB.
+    // A dataset chunks past CHUNK_THRESHOLD_BYTES since 2026-10-03 (no size
+    // limit, LIMITS.md); a tab loaded before that posts one here whole, up to
+    // the 512 MiB it allowed then, and is still admitted.
     expect(MAX_UPLOAD_BODY_BYTES).toBeGreaterThan(512 * 1024 * 1024);
     // Documents and videos chunk above the threshold and their parts go to
     // /api/upload/chunked/… — both still have to fit if they arrive here.

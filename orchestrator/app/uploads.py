@@ -533,32 +533,48 @@ async def _finalise_dataset(
         # run on the event loop, a legitimate 100k-row .xlsx held every user's
         # stream for ~8.5 s (dataset review, 2026-09-19). They run in a thread.
         lower = filename.lower()
-        if archive.is_zip_container(raw_path) and not lower.endswith(".xlsx"):
-            plan = archive.extract(raw_path, extract_dir)
-        elif lower.endswith((".tar", ".tar.gz", ".tgz")) or (
-            archive.sniff_format(raw_path) == "gzip"
-        ):
-            plan = archive.extract(raw_path, extract_dir)
-        else:
-            # A single data file. An .xlsx IS a zip container, so it faces the
-            # same bomb/member caps HERE — before it is stored or read — and a
-            # hostile one is rejected outright rather than quietly skipped
-            # during profiling.
-            if archive.is_zip_container(raw_path):
-                archive.check_zip_container(raw_path, label="spreadsheet")
-            os.makedirs(extract_dir, exist_ok=True)
-            shutil.copy2(raw_path, os.path.join(extract_dir, filename))
-            plan = None
+        try:
+            if archive.is_zip_container(raw_path) and not lower.endswith(".xlsx"):
+                plan = archive.extract(raw_path, extract_dir)
+            elif lower.endswith((".tar", ".tar.gz", ".tgz")) or (
+                archive.sniff_format(raw_path) == "gzip"
+            ):
+                plan = archive.extract(raw_path, extract_dir)
+            else:
+                # A single data file. An .xlsx IS a zip container, so it faces
+                # the same bomb/member caps HERE — before it is read — and a
+                # hostile one is rejected outright rather than quietly skipped
+                # during profiling.
+                if archive.is_zip_container(raw_path):
+                    archive.check_zip_container(raw_path, label="spreadsheet")
+                os.makedirs(extract_dir, exist_ok=True)
+                shutil.copy2(raw_path, os.path.join(extract_dir, filename))
+                plan = None
+        except archive.ArchiveTooLarge as exc:
+            # Past a READING cap (parts, expanded bytes, one part's
+            # expansion), not hostile: the file is kept whole and
+            # downloadable and only profiling is skipped. It was deleted
+            # with a 400 that stated a limit (QA 2026-10-03, LIMITS.md).
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            notes.append(f"stored whole but not profiled: {exc.reason}")
+            return None, [], 0
 
-        return plan, profiler.profile_directory(extract_dir)
+        files = sum(len(names) for _dir, _sub, names in os.walk(extract_dir))
+        return plan, profiler.profile_directory(extract_dir), files
 
     try:
-        plan, profiles = await asyncio.to_thread(_extract_and_profile)
+        plan, profiles, files = await asyncio.to_thread(_extract_and_profile)
         if plan is not None:
             for name, why in plan.skipped:
                 notes.append(f"skipped {name}: {why}")
             for name in plan.nested_archives:
                 notes.append(f"nested archive listed but not opened: {name}")
+        if files > len(profiles):
+            # PROFILE_MAX_FILES bounds the work, not the upload: say so.
+            notes.append(
+                f"profiled the first {len(profiles):,} of {files:,} files; "
+                "the others are stored but not profiled"
+            )
     except archive.ArchiveError as exc:
         shutil.rmtree(root, ignore_errors=True)
         await db.run_in_thread(
@@ -824,9 +840,12 @@ def list_uploads(
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 #: Comfortably under the 100 MB edge wall, with room for multipart overhead.
 _PART_CAP = 90 * 1024 * 1024
-#: 128 x 90 MiB = 11 GiB of headroom on the server side; the client's
-#: 64 MiB parts make a 4 GB video 60 parts (2026-09-09).
-_MAX_PARTS = 128
+#: Parts one session may have. Not a size rule: `_cap_total` (UPLOAD_MAX_MB,
+#: production 100 GB) is the only one since 2026-10-03
+#: (docs/chat-media/LIMITS.md). 128 until then, which at the client's 64 MiB
+#: parts silently capped every upload at 8 GiB; 16,384 x 64 MiB is 1 TiB, so
+#: the count never binds before the size does.
+_MAX_PARTS = 16_384
 #: Where a session's parts live under its upload root. Each accepted part is
 #: the file `<index>`; a part still streaming is `<index>.<nonce>.tmp`.
 _PARTS_DIR = "_parts"

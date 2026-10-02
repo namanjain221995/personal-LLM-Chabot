@@ -83,8 +83,13 @@ db.py (so `delete_conversation` deletes the rows), and `schema_parity.py invaria
   size) must agree on jpeg, png, webp or gif. Everything else (heic, svg, bmp, tiff, html renamed
   .png, truncated files) is refused: 415 on the upload route; skipped with a metric on the `/chat`
   path (the chat itself never fails because of storage).
-- Limits: <= 10 MiB decoded per image (the composer's `MAX_IMAGE_BYTES`), <= 5 per request
-  (`MAX_IMAGES`). Pillow's decompression-bomb guard stays on.
+- Limits: <= 10 MiB decoded per image as sent (the composer's `MAX_IMAGE_BYTES`; it shrinks the
+  original, which may be any size), and since 2026-10-03 no count limit: 999 per request is only
+  the technical ceiling (`MAX_IMAGES`, LIMITS.md); a request is bounded by its bytes (48 MiB batch
+  budget) and, on the upload route, by the pixels its pictures' headers claim, read before any is
+  decoded (`MAX_REQUEST_PIXELS`, 4,000 MP, ~45-60 s of verification; the browser's fullest batch,
+  999 pictures of at most 1600 x 1600, is 2,558 MP and never reaches it). Pillow's
+  decompression-bomb guard stays on.
 - Thumbnail: when the long edge > 512 px or the file > 200 KB, write `thumb.webp`, long edge 512 px,
   quality 80, EXIF orientation applied, alpha kept, first frame for GIF. Otherwise `has_thumb=false`
   and `size=thumb` serves the full file.
@@ -106,8 +111,9 @@ Common rules for every route below:
    part `source` = `upload` (default) or `backfill`.
    200: `{"items":[{"attachment_id","media_id","mime","width","height","bytes","sha256","created"}]}`
    — `created:false` when (user, conv, attachment_id) already existed (idempotent retry; the stored
-   item is returned unchanged). Errors: 400 bad shape, 404 not yours, 413 too large, 415 unsupported
-   type, 507 insufficient storage. Add a `body_cap_for` entry of 64 MiB and pin it in
+   item is returned unchanged). Errors: 400 bad shape, 404 not yours, 413 too large (one picture
+   over 10 MiB, or `Send these pictures in smaller batches.` past `MAX_REQUEST_PIXELS`), 415
+   unsupported type, 507 insufficient storage. Add a `body_cap_for` entry of 64 MiB and pin it in
    `tests/test_orchestrator_hardening.py`.
 2. `GET /chat-media/{conversation_id}` — the viewer's items for that chat:
    `{"items":[{"attachment_id","media_id","mime","width","height","bytes","created_at"}]}`.
@@ -135,8 +141,11 @@ Common rules for every route below:
   (vision, document+image, artifact, ...), so hook it at request intake, not inside one engine branch.
 - `image_refs: Optional[List[str]] = Field(default=None, fail_fast=True)` — attachment_ids of images
   ALREADY stored for (viewer, conversation), sent INSTEAD of bytes (regenerate/edit/retry on a device
-  without local bytes). Before routing, the server loads them (thumb is NOT used; the full file) and
-  treats them exactly like inline `images` (same order, same `MAX_IMAGES` cap counted together with
+  without local bytes). Before routing, the server loads them (the full file, up to
+  `chat_media.REFS_FULL_CHARS` of data-URL characters a turn; past it each further picture is its
+  stored thumbnail, read and never decoded, so hundreds of refs never decode hundreds of originals
+  before the stream exists; each distinct id is read once however often it is named) and treats
+  them exactly like inline `images` (same order, same `MAX_IMAGES` cap counted together with
   inline images). If any ref cannot be loaded, answer HTTP 422
   `{"detail":{"code":"image_ref_missing","missing":["<attachment_id>", ...]}}` BEFORE the stream
   starts, so the client can ask the person to attach the image again.
@@ -144,7 +153,10 @@ Common rules for every route below:
 
 ## 6. The AI reads stored images later (`engines/image_memory.py`)
 
-V41 semantics stay as they are. Add a fallback in `hydrate`: when neither the process nor the V41 row
+V41 semantics stay as they are, with one addition (2026-10-03): the row's `images` holds one slot
+per picture of the turn, `''` for one past the durable budget, so the turn's TOTAL survives a
+restart; a follow-up that sees fewer pictures than the turn carried says how many of how many
+(`vision.FittedImages.earlier`). Add a fallback in `hydrate`: when neither the process nor the V41 row
 has a live entry for (viewer, conversation), find the newest USER message in that conversation's
 stored history (`messages` table) whose `meta.images` is non-empty; load those attachment_ids'
 full files from `chat_media` (viewer-scoped); context = that message's content + the next assistant

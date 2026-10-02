@@ -13,7 +13,9 @@ never the model):
     route and on a document + picture turn alike, and a storage failure never
     fails the chat;
   * `image_refs` loads stored pictures into the same path as inline ones,
-    counts against the same five-picture cap, and answers 422
+    counts against the same 999-picture technical ceiling (five, then
+    twenty, until 2026-10-03: no limit in the app since, docs/chat-media/LIMITS.md),
+    and answers 422
     image_ref_missing before anything starts when one cannot be loaded;
   * the request snapshot holds ids and never bytes;
   * image_memory reads the stored picture for a follow-up after its V41 row
@@ -22,6 +24,8 @@ never the model):
 from __future__ import annotations
 
 import base64
+import contextlib
+import hashlib
 import io
 import json
 import time
@@ -60,8 +64,10 @@ def engines(monkeypatch):
     """Every engine these turns can reach, faked to record what it was handed."""
     seen: dict = {"vision": [], "document": [], "chat": []}
 
-    async def fake_vision(message, images, history, emit, *, effort="think", max_tokens=None, conversation_id=None):
-        seen["vision"].append({"message": message, "images": list(images)})
+    async def fake_vision(
+        message, images, history, emit, *, effort="think", max_tokens=None, conversation_id=None, total_pictures=0
+    ):
+        seen["vision"].append({"message": message, "images": list(images), "total_pictures": total_pictures})
         text = ANSWER1 if message == TURN1 else "vision answer"
         await emit("token", {"text": text})
         await emit("meta", {"route": "vision"})
@@ -341,7 +347,7 @@ def test_mismatched_image_ids_store_nothing_and_are_never_a_4xx(engines, as_user
 def test_a_malformed_image_id_is_a_422(engines, as_user):
     as_user("alice")
     with TestClient(app) as client:
-        for ids in (["no"], ["../../etc"], [f"att-{i:08d}" for i in range(6)]):
+        for ids in (["no"], ["../../etc"], [f"att-{i:08d}" for i in range(1000)]):
             resp = _chat(
                 client, message="x", conversation_id="conv-bad-id",
                 images=[_data_url(_png())], image_ids=ids,
@@ -496,6 +502,69 @@ def test_minting_keeps_ownership_and_the_reserved_key_refusal(engines, as_user):
     assert not metrics._counters.get("chat_media_writes_total")
 
 
+def test_a_turn_of_many_pictures_without_ids_gets_one_minted_id_each(engines, as_user):
+    """Store-always at the no-limits scale (LIMITS.md, 999 ceiling): every
+    inline picture of an id-less turn is named, ix-<intent>-0..N-1, past both
+    old caps (5, then 20) and into three-digit indexes, whose 39 characters
+    are still an attachment id. Nothing is dropped or renumbered."""
+    as_user("alice")
+    n = 101
+    pictures = [_png(colour=(i, 3, 7), size=(8, 8)) for i in range(n)]
+    minted = [f"ix-{INTENT}-{i}" for i in range(n)]
+    assert len(minted[-1]) == 39 and chat_media.ATTACHMENT_ID_RE.fullmatch(minted[-1])
+    with TestClient(app) as client:
+        resp = _chat(
+            client, message="what are these?", conversation_id="conv-old-many", intent_id=INTENT,
+            images=[_data_url(p) for p in pictures],
+        )
+        assert resp.status_code == 200, resp.text
+        assert len(engines["vision"][-1]["images"]) == n
+        rows = _wait_rows("conv-old-many", n, timeout=60.0)
+        _wait_settled(timeout=60.0)
+        assert sorted(r["attachment_id"] for r in rows) == sorted(minted)
+        # Each id names the picture at its own place in the send.
+        for i in (0, 9, 10, 99, 100):
+            assert client.get(f"/chat-media/conv-old-many/{minted[i]}").content == pictures[i]
+        # Once a device has written them into `meta.images`, a regenerate
+        # names all of them by reference: the 1..999 id validators take the
+        # 39-character ids, the engine gets every picture in send order, and
+        # a ref turn mints nothing under its own intent.
+        resp = _chat(
+            client, message="what are these?", conversation_id="conv-old-many", intent_id="cd" * 16,
+            image_refs=minted,
+        )
+        assert resp.status_code == 200, resp.text
+        assert [_decoded(url) for url in engines["vision"][-1]["images"]] == pictures
+        _wait_settled(timeout=60.0)
+    assert len(_rows("conv-old-many")) == n
+    assert _counter("chat_media_writes_total", source="chat", result="stored") == n
+    assert _counter("chat_media_writes_total", source="chat", result="unlinked") == 0
+
+
+def test_a_send_refused_for_an_intent_from_elsewhere_stores_nothing(engines, as_user):
+    """The 409 for an intent that belongs to another account or to another
+    chat comes before the turn's pictures are stored (QA, 2026-10-03: they were
+    stored under `ix-<that intent>-0` in the sender's chat). A refused send has
+    no message to show them on: with ids or without, nothing is stored."""
+    as_user("bob")
+    with TestClient(app) as client:
+        assert _chat(client, message="hi", conversation_id="conv-intent-bobs", intent_id=INTENT).status_code == 200
+        as_user("alice")
+        later = "cd" * 16
+        assert _chat(client, message="hi", conversation_id="conv-intent-first", intent_id=later).status_code == 200
+        image = [_data_url(_png())]
+        for intent in (INTENT, later):  # Bob's; Alice's own, from her other chat
+            for ids in ({}, {"image_ids": ["att-refused-1"]}):
+                resp = _chat(
+                    client, message="what is it", conversation_id="conv-intent-second",
+                    intent_id=intent, images=image, **ids,
+                )
+                assert resp.status_code == 409, resp.text
+        _wait_settled()
+    assert _rows("conv-intent-second") == []
+    assert not metrics._counters.get("chat_media_writes_total")
+
+
 # ----------------------------------------------------------- stored by ref --
 
 
@@ -580,19 +649,106 @@ def test_a_ref_whose_file_is_gone_is_missing(engines, as_user):
         assert resp.json()["detail"]["missing"] == ["att-stored-1"]
 
 
-def test_refs_and_inline_pictures_share_the_five_picture_cap(engines, as_user):
+def _upload_many(client, conv: str, pictures: list) -> list:
+    """One POST of several pictures: [(attachment_id, payload), ...]."""
+    resp = client.post(
+        f"/chat-media/{conv}",
+        files=[("file", (f"p{i}.png", payload, "image/png")) for i, (_a, payload) in enumerate(pictures)],
+        data={"attachment_id": [a for a, _p in pictures]},
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["items"]
+
+
+def test_refs_and_inline_pictures_share_the_one_ceiling(engines, as_user):
+    """No limit in the app (docs/chat-media/LIMITS.md): 999 is only vLLM's
+    per-prompt ceiling, and inline pictures and refs count against it together."""
     as_user("alice")
     with TestClient(app) as client:
-        for i in range(3):
-            _upload(client, "conv-cap", f"att-stored-{i}", _png(colour=(i, 0, 0)))
-        inline = [_data_url(_png(colour=(0, i, 0))) for i in range(3)]
-        refs = [f"att-stored-{i}" for i in range(3)]
+        _upload_many(client, "conv-cap", [(f"att-stored-{i:02d}", _png(colour=(i, 0, 0))) for i in range(10)])
+        inline = [_data_url(_png(colour=(0, 1, 0)))] * 990
+        refs = [f"att-stored-{i:02d}" for i in range(10)]
         over = _chat(client, message="all", conversation_id="conv-cap", images=inline, image_refs=refs)
         assert over.status_code == 422
-        assert "at most 5 images" in over.text
-        ok = _chat(client, message="all", conversation_id="conv-cap", images=inline[:2], image_refs=refs)
+        assert "at most 999 images per message" in over.text
+        ok = _chat(client, message="all", conversation_id="conv-cap", images=inline[:30], image_refs=refs)
         assert ok.status_code == 200, ok.text
-        assert len(engines["vision"][-1]["images"]) == 5
+        assert len(engines["vision"][-1]["images"]) == 40
+
+
+def test_a_hundred_stored_pictures_go_by_reference_in_one_turn(engines, as_user):
+    """LIMITS.md: 100 photos in one message. A send over the inline budget
+    uploads its pictures first (one POST holds any number within the byte
+    budget) and sends `image_refs` only; every one is stored, every one is
+    listed for a second device, and the engine gets every picture, in order."""
+    alice = as_user("alice")
+    with TestClient(app) as client:
+        pictures = [(f"att-batch-{i:03d}", _png(colour=(i, 5, 5))) for i in range(100)]
+        items = _upload_many(client, "conv-hundred", pictures)
+        assert len(items) == 100 and all(item["created"] for item in items)
+        refs = [a for a, _p in pictures]
+        resp = _chat(client, message="compare them", conversation_id="conv-hundred", image_refs=refs)
+        assert resp.status_code == 200, resp.text
+        assert _route(resp) == "vision"
+        sent = engines["vision"][-1]["images"]
+        assert [_decoded(url) for url in sent] == [p for _a, p in pictures]
+        # A second device lists all hundred.
+        listed = client.get("/chat-media/conv-hundred")
+        assert listed.status_code == 200, listed.text
+        assert {i["attachment_id"] for i in listed.json()["items"]} == set(refs)
+        # image_memory's store fallback reads no more than its budget can
+        # keep: it stops once the loaded data URLs reach `max_chars`.
+        one = len(sent[0])
+        loaded, missing = chat_media._load_refs(int(alice["id"]), "conv-hundred", refs, max_chars=3 * one)
+        assert len(loaded) == 3 and missing == []
+        assert chat_media._load_refs(int(alice["id"]), "conv-hundred", refs)[0] == sent
+
+
+def test_many_large_refs_are_read_as_model_sized_copies_past_the_memory_budget(engines, as_user, monkeypatch):
+    """Head memory: past REFS_FULL_CHARS of originals a /chat turn reads each
+    further stored picture as a small copy, never all originals at once: the
+    thumbnail the store wrote beside it, read and never decoded (QA
+    2026-10-03: decoding a 16 MP original cost ~0.14 s each, 990 of them
+    before /chat's stream existed)."""
+    alice = as_user("alice")
+    monkeypatch.setattr(chat_media, "REFS_FULL_CHARS", 1)
+    with TestClient(app) as client:
+        pictures = [(f"att-big-{i:03d}", _png(colour=(i, 9, 9), size=(1200, 900))) for i in range(4)]
+        _upload_many(client, "conv-big", pictures)
+        decoded: list = []
+        monkeypatch.setattr(vision, "shrink_picture", lambda payload, edge: decoded.append(edge))
+        loaded, missing = chat_media._load_refs(
+            int(alice["id"]), "conv-big", [a for a, _p in pictures], None, chat_media.REFS_FULL_CHARS
+        )
+    assert missing == [] and len(loaded) == 4
+    assert _decoded(loaded[0]) == pictures[0][1]  # the first, as stored
+    assert decoded == []
+    for url in loaded[1:]:
+        assert url.startswith("data:image/webp;base64,")
+        assert max(Image.open(io.BytesIO(_decoded(url))).size) <= chat_media.THUMB_EDGE
+
+
+def test_a_picture_named_many_times_is_read_once(engines, as_user, monkeypatch):
+    """QA 2026-10-03: image_refs naming one stored picture 999 times read its
+    original 999 times and decoded it ~990 times (135 s for an 8 MiB PNG)
+    before /chat sent a byte. The backfill names one picture twice when a
+    turn carried it twice, so names are not refused: each distinct picture
+    is read once as stored and once as its thumbnail past REFS_FULL_CHARS,
+    and every name still gets its copy, in order."""
+    alice = as_user("alice")
+    monkeypatch.setattr(chat_media, "REFS_FULL_CHARS", 1)
+    with TestClient(app) as client:
+        _upload_many(client, "conv-dup", [("att-dup-0001", _png(size=(1200, 900)))])
+    reads, decodes = [], []
+    real_read = chat_media.read_full
+    monkeypatch.setattr(chat_media, "read_full", lambda row: reads.append(1) or real_read(row))
+    monkeypatch.setattr(vision, "shrink_picture", lambda payload, edge: decodes.append(edge))
+    ids = ["att-dup-0001"] * 999 + ["att-gone-0001"] * 5
+    loaded, missing = chat_media._load_refs(int(alice["id"]), "conv-dup", ids, None, chat_media.REFS_FULL_CHARS)
+    assert (len(reads), len(decodes)) == (1, 0)
+    assert len(loaded) == 999 and missing == ["att-gone-0001"]
+    assert loaded[0].startswith("data:image/png;base64,")
+    assert all(url is loaded[1] for url in loaded[1:]) and loaded[1].startswith("data:image/webp;base64,")
 
 
 def test_an_account_without_attachments_cannot_read_a_ref_into_a_turn(engines, as_user, monkeypatch):
@@ -696,6 +852,27 @@ def test_the_follow_up_reads_the_stored_picture_after_a_restart(engines, as_user
         _chat(client, message="Is the date in the photo legible?", conversation_id="conv-restart")
         assert len(engines["vision"]) == 2
         assert [_decoded(i) for i in engines["vision"][-1]["images"]] == [payload]
+
+
+def test_a_follow_up_is_told_how_many_pictures_its_turn_carried(engines, as_user, monkeypatch):
+    """QA 2026-10-03: image_memory keeps a turn's first pictures that fit its
+    budget, and a follow-up read them as if they were all. /chat now hands
+    the vision engine the turn's total, which its notes count against."""
+    as_user("alice")
+    pictures = [_png(colour=(i * 40, 9, 9)) for i in range(3)]
+    monkeypatch.setenv("IMAGE_MEMORY_MAX_CHARS", str(len(_data_url(pictures[0]))))
+    with TestClient(app) as client:
+        assert client.post("/history/conversations", json={"id": "conv-three", "title": "t"}).status_code == 200
+        _upload_many(client, "conv-three", [(f"att-three-{i:03d}", p) for i, p in enumerate(pictures)])
+        _say("conv-three", "user", TURN1, {"images": [{"attachment_id": f"att-three-{i:03d}"} for i in range(3)]})
+        _say("conv-three", "assistant", ANSWER1, {"route": "vision"})
+        _restart()
+        resp = _chat(client, message=FOLLOW, conversation_id="conv-three")
+        assert resp.status_code == 200, resp.text
+        assert _route(resp) == "vision"
+    last = engines["vision"][-1]
+    assert [_decoded(i) for i in last["images"]] == pictures[:1]
+    assert last["total_pictures"] == 3
 
 
 def test_the_fallback_switch_restores_the_old_behaviour(engines, as_user, monkeypatch):
@@ -961,3 +1138,191 @@ def test_latest_turn_images_takes_a_photo_the_server_named_by_the_message_intent
     assert [_decoded(i) for i in found["images"]] == [photo, second]
     assert found["turns_after"] == 1
     assert chat_media.latest_turn_images(int(bob["id"]), "conv-ix") is None
+
+
+def test_the_fallback_reads_every_picture_the_server_named_in_index_order_within_its_budget(as_user):
+    """Store-always and no limits together: an old page's turn may hold any
+    number of `ix-` pictures (twelve here, past the old five). The store
+    fallback reads them all, in index order (10 and 11 after 9, not after 1),
+    and still stops at the caller's budget (`max_chars`, image_memory's
+    process budget), so a huge turn is never read into memory whole."""
+    alice = as_user("alice")
+    uid = int(alice["id"])
+    pictures = [_png(colour=(i * 20, 9, 9)) for i in range(12)]
+    with TestClient(app) as client:
+        assert client.post("/history/conversations", json={"id": "conv-ix-many", "title": "t"}).status_code == 200
+        # One per POST, out of order: the list order must not decide it.
+        for i in (11, 2, 10, 0, 7, 1, 9, 3, 8, 4, 6, 5):
+            _upload(client, "conv-ix-many", f"ix-{INTENT}-{i}", pictures[i])
+    _say("conv-ix-many", "user", "Read these", {"intent": {"id": INTENT, "state": "answered"}})
+    _say("conv-ix-many", "assistant", "Twelve receipts")
+    found = chat_media.latest_turn_images(uid, "conv-ix-many")
+    assert found is not None
+    assert [_decoded(i) for i in found["images"]] == pictures
+    path = [("user", "Read these"), ("assistant", "Twelve receipts"), ("user", "and the total?")]
+    found = chat_media.latest_turn_images(uid, "conv-ix-many", path)
+    assert [_decoded(i) for i in found["images"]] == pictures
+    budget = sum(len(_data_url(p)) for p in pictures[:3])
+    for visible in (None, path):
+        bounded = chat_media.latest_turn_images(uid, "conv-ix-many", visible, max_chars=budget)
+        assert [_decoded(i) for i in bounded["images"]] == pictures[:3]
+
+
+def test_a_follow_up_on_photos_the_server_named_counts_the_stored_pictures(engines, as_user, monkeypatch):
+    """No limits x store-always: the follow-up's "N of M" note counts against
+    the turn's total, and for an `ix-` turn that is the pictures stored under
+    its intent (three here), never every index below MAX_FILES. The first
+    merge of the two tracks counted those and told the model it saw "1 of
+    the 999 pictures" of a three-photo message."""
+    alice = as_user("alice")
+    uid = int(alice["id"])
+    pictures = [_png(colour=(i * 40, 90, 9)) for i in range(3)]
+    monkeypatch.setenv("IMAGE_MEMORY_MAX_CHARS", str(len(_data_url(pictures[0]))))
+    with TestClient(app) as client:
+        resp = _chat(
+            client,
+            message=TURN1,
+            conversation_id="conv-ix-total",
+            intent_id=INTENT,
+            images=[_data_url(p) for p in pictures],
+        )
+        assert resp.status_code == 200, resp.text
+        assert [r["attachment_id"] for r in _wait_rows("conv-ix-total", 3)] == [
+            f"ix-{INTENT}-{i}" for i in range(3)
+        ]
+        _wait_settled()
+        pushed = client.put(
+            "/history/conversations/conv-ix-total/messages",
+            json={
+                "messages": [
+                    {"role": "user", "content": TURN1, "meta": {"intent": {"id": INTENT, "state": "answered"}}},
+                    {"role": "assistant", "content": ANSWER1, "meta": {"route": "vision"}},
+                ]
+            },
+        )
+        assert pushed.status_code == 200, pushed.text
+        image_memory._writer_pool().submit(lambda: None).result(timeout=15)
+        with db.connection() as con:
+            con.execute("DELETE FROM conversation_images WHERE conversation_id = 'conv-ix-total'")
+        _restart()
+        path = [
+            {"role": "user", "content": TURN1},
+            {"role": "assistant", "content": ANSWER1},
+            {"role": "user", "content": FOLLOW},
+        ]
+        resp = _chat(client, message=FOLLOW, conversation_id="conv-ix-total", messages=path)
+        assert resp.status_code == 200, resp.text
+        assert _route(resp) == "vision"
+    last = engines["vision"][-1]
+    assert [_decoded(i) for i in last["images"]] == pictures[:1]
+    assert last["total_pictures"] == 3
+    visible = [("user", TURN1), ("assistant", ANSWER1), ("user", FOLLOW)]
+    for seen in (None, visible):
+        found = chat_media.latest_turn_images(uid, "conv-ix-total", seen, max_chars=1)
+        assert len(found["images"]) == 1 and found["total"] == 3
+
+
+# ------------------------------- the store fallback's cost on a long chat --
+
+
+def _recorded_reads(monkeypatch) -> list:
+    """Every statement run on a read connection from here on, with its
+    parameters, so a test can EXPLAIN exactly what the code ran."""
+    seen: list = []
+    real = db.read_connection
+
+    class _Recording:
+        def __init__(self, con):
+            self._con = con
+
+        def execute(self, sql, params=None):
+            seen.append((sql, params))
+            return self._con.execute(sql, params)
+
+    @contextlib.contextmanager
+    def recording():
+        with real() as con:
+            yield _Recording(con)
+
+    monkeypatch.setattr(db, "read_connection", recording)
+    return seen
+
+
+def _chat_media_loops(plan) -> list:
+    """The "Actual Loops" of every chat_media scan in an EXPLAIN (ANALYZE, FORMAT JSON) tree."""
+    if isinstance(plan, dict):
+        own = [int(plan["Actual Loops"])] if plan.get("Relation Name") == "chat_media" else []
+        return own + [n for v in plan.values() if isinstance(v, (dict, list)) for n in _chat_media_loops(v)]
+    if isinstance(plan, list):
+        return [n for v in plan for n in _chat_media_loops(v)]
+    return []
+
+
+def test_the_store_fallback_reads_the_chats_pictures_once_not_once_per_turn(as_user, monkeypatch):
+    """Nearly every user turn since V29 carries a 32-hex intent, so the test
+    for "a photo the server named" ran a correlated EXISTS on chat_media for
+    every user message it passed, before the first token (QA, 2026-10-03:
+    2.9 ms became 38 ms over 10,000 turns). The chat's `ix-` rows are read
+    once per statement now. Pinned by the plan, not the clock: on both paths,
+    no chat_media scan runs more than once."""
+    alice = as_user("alice")
+    uid = int(alice["id"])
+    conv = "conv-long-photo"
+    photo = _png(colour=(9, 99, 9))
+    turns = 200
+    with TestClient(app) as client:
+        assert client.post("/history/conversations", json={"id": conv, "title": "t"}).status_code == 200
+        _upload(client, conv, f"ix-{hashlib.md5(b'0').hexdigest()}-0", photo)
+    with db.connection() as con:
+        # The old page's photo turn ("turn 0", intent md5('0')), then text
+        # turns, each with an intent of its own as the composer writes them.
+        con.execute(
+            "INSERT INTO messages (conversation_id, role, content, meta, created_at) "
+            "SELECT %s, CASE WHEN g %% 2 = 0 THEN 'user' ELSE 'assistant' END, 'turn ' || g, "
+            "CASE WHEN g %% 2 = 0 THEN jsonb_build_object('intent', jsonb_build_object('id', md5(g::text))) "
+            "ELSE '{}'::jsonb END, now() FROM generate_series(0, %s) g",
+            (conv, 2 * turns - 1),
+        )
+    path = [("user" if g % 2 == 0 else "assistant", f"turn {g}") for g in range(2 * turns)]
+    seen = _recorded_reads(monkeypatch)
+    for visible in (None, path + [("user", "what was in the photo?")]):
+        found = chat_media.latest_turn_images(uid, conv, visible)
+        assert [_decoded(i) for i in found["images"]] == [photo]
+        assert found["turns_after"] == turns - 1
+    reads = [(sql, params) for sql, params in seen if sql.lstrip().upper().startswith("SELECT")]
+    assert len(reads) == len(seen) >= 2
+    for sql, params in reads:
+        with db.connection() as con:
+            plan = next(iter(con.execute("EXPLAIN (ANALYZE, FORMAT JSON) " + sql, params).fetchone().values()))
+        assert max(_chat_media_loops(plan), default=0) <= 1, sql
+
+
+def test_the_store_fallback_asks_only_for_the_pictures_a_turn_has(as_user, monkeypatch):
+    """A photo turn with no `meta.images` was read as every index below
+    MAX_FILES, `ix-<intent>-0..MAX_FILES-1`, most of them rows that do not
+    exist: 999 ids per follow-up where a message may carry 999 pictures
+    (release/2026-10-03-nolimits). The loader is asked for the rows the turn
+    has, in index order."""
+    alice = as_user("alice")
+    uid = int(alice["id"])
+    first, second = _png(colour=(5, 50, 5)), _png(colour=(50, 5, 5))
+    with TestClient(app) as client:
+        assert client.post("/history/conversations", json={"id": "conv-ix-ids", "title": "t"}).status_code == 200
+        _upload(client, "conv-ix-ids", f"ix-{INTENT}-1", second)
+        _upload(client, "conv-ix-ids", f"ix-{INTENT}-0", first)
+    _say("conv-ix-ids", "user", "Read these", {"intent": {"id": INTENT, "state": "answered"}})
+    _say("conv-ix-ids", "assistant", "They say hello")
+    monkeypatch.setattr(chat_media, "MAX_FILES", 999)
+    asked: list = []
+    real = chat_media.rows_by_attachment
+
+    def rows_by_attachment(user_id, conversation_id, attachment_ids):
+        asked.append(list(attachment_ids))
+        return real(user_id, conversation_id, attachment_ids)
+
+    monkeypatch.setattr(chat_media, "rows_by_attachment", rows_by_attachment)
+    path = [("user", "Read these"), ("assistant", "They say hello"), ("user", "and the second one?")]
+    for visible in (None, path):
+        found = chat_media.latest_turn_images(uid, "conv-ix-ids", visible)
+        assert [_decoded(i) for i in found["images"]] == [first, second]
+    assert asked == [[f"ix-{INTENT}-0", f"ix-{INTENT}-1"]] * 2

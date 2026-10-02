@@ -32,15 +32,22 @@ export const dynamic = 'force-dynamic';
  * actually put in a body rather than picked, because a cap below the real
  * client limit is a bug dressed up as a fix:
  *
- *   5 images   × MAX_IMAGE_BYTES  10 MiB  (Composer.tsx, MAX_IMAGES)
- *   1 document × INLINE_DOC_BYTES 25 MiB  (anything larger streams to
+ *   photos and the one inline document, as base64, at most
+ *     INLINE_IMAGE_BUDGET_BYTES 48 MiB    (2026-10-03, lib/orchestrator.ts:
+ *                                          over it the photos are stored
+ *                                          first and named in `image_refs`,
+ *                                          so a message of any number of
+ *                                          photos never rides here whole)
+ *   or the document alone, INLINE_DOC_BYTES 25 MiB × 4/3 ≈ 33 MiB
+ *                                         (anything larger streams to
  *                                          /api/upload and travels by
  *                                          reference, not in this body)
- *   base64 inflates all of that by 4/3    ≈ 100 MiB
  *   plus the visible transcript, which carries pasted text that has no cap of
  *   its own anywhere on the input path (2026-09-05).
  *
- * 128 MiB leaves that its headroom and still refuses an unbounded body.
+ * 128 MiB leaves that its headroom and still refuses an unbounded body. It
+ * matches the orchestrator's `_CHAT_MAX_BODY_BYTES`: the two caps refuse the
+ * same request.
  */
 export const MAX_CHAT_BODY_BYTES = 128 * 1024 * 1024;
 

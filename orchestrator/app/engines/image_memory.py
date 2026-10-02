@@ -154,8 +154,11 @@ def max_db_chars() -> int:
     retention are different problems. This is a new copy of the person's
     picture, so the durable one is the one a browser already produces —
     `MAX_IMAGE_EDGE` in frontend/lib/images.ts is 1600 px, and five such
-    uploads (the per-turn maximum) are comfortably under 8 M characters
-    (~6 MB). A picture above this budget is stored as the same 1600 px copy
+    uploads are comfortably under 8 M characters (~6 MB). A message may carry
+    any number since 2026-10-03: the row then keeps the turn's first pictures that
+    fit, in order (`_fit`), and never fails the turn; the chat's stored
+    pictures (app/chat_media.py) still hold every one. A picture above this
+    budget is stored as the same 1600 px copy
     `_smaller_copy` already makes for the in-process budget; when even that
     cannot be produced the ROW is still written with no images, and the
     follow-up says the picture is no longer attached rather than pretending
@@ -214,6 +217,11 @@ class _Remembered:
     #: turn main.py asks `images_for_followup` about). "That chart" points
     #: at the picture only while the picture is the last thing shown.
     turns_after: int = 0
+    #: Pictures the turn carried; `images` holds its first ones that fit the
+    #: budget. A follow-up is told how many it can see of how many
+    #: (QA 2026-10-03: it read 13 of 100 photos as if they were all). 0 is
+    #: "as many as were kept".
+    total: int = 0
 
 
 #: NOT named `_store`: `tests/test_exclusion_invariants.py` proves that the
@@ -357,18 +365,18 @@ def _prune_expired_rows() -> None:
         log.debug("image memory: prune failed: %s", type(exc).__name__)
 
 
-def _persist(ident: "Optional[tuple]", kept: List[str], context: str) -> None:
+def _persist(ident: "Optional[tuple]", kept: List[str], context: str, total: int = 0) -> None:
     """Write this turn's picture to its row (see `_persist_now`)."""
     if ident is None or not durable_enabled():
         return
     key = f"u{ident[0]}:{ident[1]}"
     token = object()
     _durable_latest[key] = token
-    _run_durable(_persist_now, ident, kept, context, key, token)
+    _run_durable(_persist_now, ident, kept, context, key, token, total)
 
 
 def _persist_now(
-    ident: tuple, kept: List[str], context: str, key: str, token: object
+    ident: tuple, kept: List[str], context: str, key: str, token: object, total: int = 0
 ) -> None:
     """The durable write itself, in a worker thread.
 
@@ -380,13 +388,18 @@ def _persist_now(
     A picture that cannot be reduced at all writes the row with NO images
     rather than no row: that is what lets a later process say "the picture is
     no longer attached" instead of answering as if none had been sent.
+
+    The row holds one slot per picture of the turn, '' for one past the
+    budget, so the TOTAL survives a restart with no new column (`hydrate`
+    drops the empty slots and counts them).
     """
     if _durable_latest.get(key) is not token:
         return  # a newer image turn for this conversation already won
     try:
         stored = kept if sum(map(len, kept)) <= max_db_chars() else _fit(kept, max_db_chars())
+        stored = stored + [""] * (max(total, len(kept)) - len(stored))
         _db().save_conversation_image(ident[0], ident[1], stored, context)
-        if not stored:
+        if not any(stored):
             log.info(
                 "image memory: picture too large for the durable budget; the "
                 "next turn will ask for it again"
@@ -528,13 +541,16 @@ async def hydrate(
             await _hydrate_from_store(key, ident, visible)
         return
     _remembered_images[key] = _Remembered(
-        images=list(row["images"]),
+        # One slot per picture of the turn, '' where the budget kept none
+        # (`_persist_now`).
+        images=[image for image in row["images"] if image],
         context=row["context"],
         # The age the DATABASE measured, translated into this process's
         # monotonic clock, so `_sweep_expired` and `recall` keep working on
         # a hydrated entry exactly as on a local one.
         at=time.monotonic() - row["age_s"],
         turns_after=row["turns_after"],
+        total=len(row["images"]),
     )
     _remembered_images.move_to_end(key)
     _evict()
@@ -548,7 +564,9 @@ def _stored_read(ident: tuple, visible: "Optional[Sequence[tuple]]" = None) -> "
     try:
         from .. import chat_media
 
-        found = chat_media.latest_turn_images(ident[0], ident[1], visible)
+        # Read no more pictures than the budget below can keep: a turn may
+        # hold any number of stored originals of up to 10 MiB each (2026-10-03).
+        found = chat_media.latest_turn_images(ident[0], ident[1], visible, max_chars=max_chars())
     except Exception as exc:  # noqa: BLE001 — never a failed turn
         log.debug("image memory: could not read the stored pictures: %s", type(exc).__name__)
         return None
@@ -576,6 +594,7 @@ async def _hydrate_from_store(
         # Fresh in this process: the TTL bounds how long this process holds
         # the bytes, and the store will hand them back after it if asked.
         turns_after=int(found["turns_after"]),
+        total=int(found.get("total") or 0),
     )
     _remembered_images.move_to_end(key)
     _evict()
@@ -613,13 +632,14 @@ def remember(
     ident = _durable_identity(conversation_id, user_id)
     token = object()
     _latest[key] = token
+    total = len(images)
     if sum(len(img) for img in images) <= max_chars():
-        _keep(key, token, _fit(images), context, ident)
+        _keep(key, token, _fit(images), context, ident, total)
         return
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        _keep(key, token, _fit(images), context, ident)
+        _keep(key, token, _fit(images), context, ident, total)
         return
     _remembered_images.pop(key, None)
     # BOTH halves drop the previous picture at once, not just this process's.
@@ -629,7 +649,7 @@ def remember(
     # replaced. The new row lands behind this delete (one writer thread).
     _forget_durable(ident)
     job = loop.run_in_executor(None, _fit, images)
-    job.add_done_callback(lambda done: _keep_when_fitted(key, token, done, context, ident))
+    job.add_done_callback(lambda done: _keep_when_fitted(key, token, done, context, ident, total))
 
 
 #: The newest remember() per key. A downscale that finishes after a newer
@@ -638,13 +658,13 @@ _latest: "dict[str, object]" = {}
 
 
 def _keep_when_fitted(
-    key: str, token: object, done, context: str, ident: "Optional[tuple]" = None
+    key: str, token: object, done, context: str, ident: "Optional[tuple]" = None, total: int = 0
 ) -> None:
     if done.cancelled() or done.exception() is not None:
         if _latest.get(key) is token:
             _latest.pop(key, None)
         return
-    _keep(key, token, done.result(), context, ident)
+    _keep(key, token, done.result(), context, ident, total)
 
 
 def _keep(
@@ -653,16 +673,17 @@ def _keep(
     kept: List[str],
     context: str,
     ident: "Optional[tuple]" = None,
+    total: int = 0,
 ) -> None:
     if _latest.get(key) is not token:
         return
     _latest.pop(key, None)
     if not kept:
         return
-    _remembered_images[key] = _Remembered(images=kept, context=context)
+    _remembered_images[key] = _Remembered(images=kept, context=context, total=total)
     _remembered_images.move_to_end(key)
     _evict()
-    _persist(ident, kept, context)
+    _persist(ident, kept, context, total)
 
 
 def _fit(images: Sequence[str], budget: "Optional[int]" = None) -> List[str]:
@@ -1154,6 +1175,9 @@ class Followup:
 
     images: List[str] = field(default_factory=list)
     unavailable: bool = False
+    #: Pictures the remembered turn carried; `images` may be its first few
+    #: (the budget). The vision engine counts its notes against this.
+    total: int = 0
 
     @property
     def about_the_picture(self) -> bool:
@@ -1189,7 +1213,7 @@ def followup(
         _note_durable_turn(_durable_identity(conversation_id, user_id), 1)
     if not _points_at_the_picture(text, entry.context, just_shown=just_shown):
         return Followup()
-    return Followup(images=images, unavailable=not images)
+    return Followup(images=images, unavailable=not images, total=max(entry.total, len(images)))
 
 
 def is_about_the_image(

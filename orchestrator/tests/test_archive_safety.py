@@ -167,7 +167,7 @@ def test_a_lying_header_is_caught_while_streaming(tmp_path, monkeypatch):
     # …then shrink the budget so only the STREAMING guard can stop it.
     real_check = archive.check_zip_container
     monkeypatch.setattr(
-        archive, "check_zip_container", lambda p, label="archive": real_check(p)
+        archive, "check_zip_container", lambda p, label="archive", **_kw: real_check(p)
     )
     monkeypatch.setattr(settings, "archive_max_uncompressed_mb", 1)
     with pytest.raises(archive.ArchiveError) as exc:

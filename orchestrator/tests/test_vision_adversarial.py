@@ -178,7 +178,9 @@ def engines(monkeypatch):
     # remembers that answer and the word test reads it.
     answers = {TURN1: ANSWER1, TURN_DASH: ANSWER_DASH}
 
-    async def fake_vision(message, images, history, emit, *, effort="think", max_tokens=None, conversation_id=None):
+    async def fake_vision(
+        message, images, history, emit, *, effort="think", max_tokens=None, conversation_id=None, total_pictures=0
+    ):
         seen["vision"].append({"message": message, "images": list(images), "conversation_id": conversation_id})
         text = answers.get(message, "vision answer")
         await emit("token", {"text": text})

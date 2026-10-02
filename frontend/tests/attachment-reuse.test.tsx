@@ -480,10 +480,10 @@ describe('P4A · re-attaching a file you already sent', () => {
     ]);
     await reuseByDrag();
     // 10 MB, not 25: the fixture above is an 11 MB IMAGE, and the document
-    // rail no longer rejects at 25 MB (MAX_PDF_BYTES is 512 MB, with 25 MB
-    // only the inline/stream threshold). Composer's cap message for an
-    // oversized image is '10 MB'.
-    expect(await screen.findByText(/the limit is 10 MB/i)).toBeTruthy();
+    // rail has no size rule in the app at all since 2026-10-03 (25 MB is only
+    // the inline/stream threshold). jsdom cannot shrink a photo, and a photo
+    // sent as it is keeps the server's 10 MB rule (LIMITS.md).
+    expect(await screen.findByText(/can be at most 10 MB/i)).toBeTruthy();
     expect(composerChips().length).toBe(0);
   });
 

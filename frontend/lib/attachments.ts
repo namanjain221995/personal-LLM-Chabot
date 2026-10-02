@@ -591,8 +591,8 @@ function normaliseMime(mime?: string | null): string {
    voice memo out was this side: the composer knew no audio at all, so an
    .m4a fell through to the document fallback and came back as "binary file,
    not readable as text". Audio therefore travels EXACTLY like a video
-   (purpose=video, the 4 GB cap, the VIDEO_ANALYSIS gate); `audio` only
-   changes what the chip says. */
+   (purpose=video, no size limit in the app since 2026-10-03, the
+   VIDEO_ANALYSIS gate); `audio` only changes what the chip says. */
 const VIDEO_EXTENSIONS = new Set([
   'mp4', 'm4v', 'mov', 'webm', 'mkv', 'avi', 'mpg', 'mpeg', '3gp', 'ogv',
 ]);

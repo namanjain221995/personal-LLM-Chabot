@@ -485,7 +485,8 @@ def test_the_second_question_about_the_same_image_goes_to_the_vision_engine(monk
     seen: list = []
 
     async def fake_engine(
-        message, images, history, emit, *, effort="think", max_tokens=None, conversation_id=None
+        message, images, history, emit, *, effort="think", max_tokens=None, conversation_id=None,
+        total_pictures=0,
     ):
         seen.append({"message": message, "images": list(images), "conversation_id": conversation_id})
         await emit("token", {"text": "TS-2291, Thursday 11:15"})
@@ -530,7 +531,8 @@ def test_an_unrelated_question_after_an_image_turn_routes_normally(monkeypatch):
     seen: list = []
 
     async def fake_engine(
-        message, images, history, emit, *, effort="think", max_tokens=None, conversation_id=None
+        message, images, history, emit, *, effort="think", max_tokens=None, conversation_id=None,
+        total_pictures=0,
     ):
         seen.append(message)
         await emit("token", {"text": "seen"})

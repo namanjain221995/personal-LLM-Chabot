@@ -22,7 +22,10 @@ import {
   createBackfill,
   createMediaListCache,
   fetchChatMediaBlob,
+  imagesGoByReference,
   imagesMetaFor,
+  MAX_MEDIA_BYTES_PER_REQUEST,
+  MAX_MEDIA_PER_REQUEST,
   legacyPhotoNoteId,
   listChatMedia,
   needsServerPhotoLookup,
@@ -34,7 +37,9 @@ import {
   storedAttachmentIds,
   storedImagesOf,
   thumbBox,
+  storeImagesForSend,
   uploadChatMedia,
+  uploadChatMediaInBatches,
   withBackfilledImages,
   withImagesMeta,
   type BackfillHost,
@@ -42,6 +47,9 @@ import {
   type MediaUploadOutcome,
 } from '@/lib/chatMedia';
 import { turnFingerprint } from '@/lib/idbCache';
+import { INLINE_IMAGE_BUDGET_BYTES, MAX_IMAGES } from '@/lib/orchestrator';
+import { MAX_ATTEMPTS } from '@/lib/uploadDocument';
+import { MAX_MEDIA_BODY_BYTES } from '@/app/api/chat-media/_media';
 import type { ChatMessage } from '@/lib/types';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -208,6 +216,68 @@ describe('the legacy photo note', () => {
     expect(legacyPhotoNoteId(withStoredPhoto)).toBeNull();
     expect(legacyPhotoNoteId([user('hi'), answer('hello')])).toBeNull();
   });
+
+  // S7 (real browser, 2026-10-03): the document engine answers under route
+  // 'vision' too, and turns of 5 and 50 documents with no photo carried the
+  // line on both devices.
+  const docs = (...kinds: Array<'pdf' | 'dataset' | 'video'>) => ({
+    attachments: kinds.map((kind, i) => ({ name: `file-${i}`, kind })),
+  });
+  const documentAnswer = (content: string): ChatMessage => ({
+    ...answer(content, 'vision'),
+    meta: {
+      route: 'vision',
+      document: { filename: 'file-0 (+4 more)', total_pages: 5, ocr_pages: 0, pages: [] },
+    },
+  });
+
+  it('a turn of documents never gets the line, whatever the document engine answered', () => {
+    const fiveDocs = user('compare these', { meta: docs('pdf', 'pdf', 'pdf', 'pdf', 'pdf') });
+    expect(showsLegacyPhotoNote(fiveDocs, documentAnswer('they agree'))).toBe(false);
+    // The engine's refusal carries the route and nothing else.
+    expect(showsLegacyPhotoNote(fiveDocs, answer('no readable content', 'vision'))).toBe(false);
+    // A document answer is not a photo answer even where the turn's own
+    // record of its files is gone (another device, a turn older than
+    // meta.attachments).
+    expect(showsLegacyPhotoNote(user('summarise this'), documentAnswer('a summary'))).toBe(false);
+    // A V8 turn on the device that sent it: the PDF's chip name, no meta.
+    expect(
+      showsLegacyPhotoNote(user('summarise', { pdfName: 'scan.pdf' }), answer('a', 'vision')),
+    ).toBe(false);
+    expect(legacyPhotoNoteId([fiveDocs, documentAnswer('they agree')])).toBeNull();
+  });
+
+  it('a dataset turn under the vision engine still had a photo with it', () => {
+    // A dataset never answers through 'vision' by itself: a photo sent with
+    // it took the turn there (main.py's dataset path stands down for one).
+    expect(showsLegacyPhotoNote(user('q', { meta: docs('dataset') }), answer('a', 'vision'))).toBe(
+      true,
+    );
+    expect(
+      showsLegacyPhotoNote(user('q', { pdfName: 'sales.csv', meta: docs('dataset') }), answer('a', 'vision')),
+    ).toBe(true);
+  });
+
+  it('a document exchange above does not hide the old photo turn under it', () => {
+    const legacy = user('is this leaf healthy?');
+    const thread = [
+      user('compare these', { meta: docs('pdf', 'pdf') }),
+      documentAnswer('they agree'),
+      legacy,
+      answer('healthy', 'vision'),
+    ];
+    expect(legacyPhotoNoteId(thread)).toBe(legacy.id);
+    expect(showsLegacyPhotoNote(legacy, thread[3], thread.slice(0, 2))).toBe(true);
+    // A photo answer above still marks a follow-up, as before.
+    const photoAbove = [user('leaf'), answer('healthy', 'vision'), ...thread.slice(0, 2)];
+    expect(showsLegacyPhotoNote(legacy, thread[3], photoAbove)).toBe(false);
+    const storedAbove = [
+      user('leaf', { meta: { images: [{ attachment_id: 'img-aaaa-0001' }] } }),
+      answer('healthy', 'vision'),
+      ...thread,
+    ];
+    expect(legacyPhotoNoteId(storedAbove)).toBeNull();
+  });
 });
 
 /* ======================================================= reading the bytes */
@@ -284,6 +354,259 @@ describe('uploadChatMedia', () => {
       }),
     );
     expect((await uploadChatMedia(CONV, [], 'backfill')).kind).toBe('offline');
+  });
+});
+
+describe('uploads in batches under the budget (2026-10-03, LIMITS.md)', () => {
+  /** A blob that claims `size` bytes without allocating them. */
+  const sized = (size: number) => {
+    const blob = new Blob(['x'], { type: 'image/png' });
+    Object.defineProperty(blob, 'size', { value: size });
+    return blob;
+  };
+  const part = (i: number, size: number) => ({
+    attachmentId: `img-limit-${String(i).padStart(4, '0')}`,
+    blob: sized(size),
+    name: `image-${i}.png`,
+  });
+  /** Stores every POST; the list (GET) names `held`, or fails when null. */
+  function stubStore(held: string[] | null = []) {
+    const forms: FormData[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        if ((init?.method ?? 'GET') === 'GET') {
+          return held
+            ? Response.json({ items: held.map((attachment_id) => ({ attachment_id })) })
+            : Response.json({}, { status: 503 });
+        }
+        const form = init?.body as FormData;
+        forms.push(form);
+        return Response.json({
+          items: (form.getAll('attachment_id') as string[]).map((attachment_id) => ({ attachment_id })),
+        });
+      }),
+    );
+    return forms;
+  }
+  /** Yield (setImmediate is never faked here) until `ready`, or 2 s of real time. */
+  async function until(ready: () => boolean): Promise<void> {
+    const deadline = Date.now() + 2000;
+    while (!ready() && Date.now() < deadline) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+  /** Run a pending upload to its end under fake timers, a backoff at a time. */
+  async function drain<T>(pending: Promise<T>): Promise<T> {
+    let settled = false;
+    void pending.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    const deadline = Date.now() + 4000;
+    while (!settled && Date.now() < deadline) {
+      await vi.advanceTimersByTimeAsync(8_001);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    return pending;
+  }
+
+  it('a batch is cut by its bytes, and by the 999 ceiling only past that', async () => {
+    // No count limit in the app: 999 is the technical ceiling, the server's
+    // chat_media.MAX_FILES too. Bytes are what bound one request.
+    expect(MAX_MEDIA_PER_REQUEST).toBe(MAX_IMAGES);
+    expect(MAX_IMAGES).toBe(999);
+    expect(MAX_MEDIA_BYTES_PER_REQUEST).toBe(INLINE_IMAGE_BUDGET_BYTES);
+    const forms = stubStore();
+    const small = Array.from({ length: 1001 }, (_, i) => part(i, 1024));
+    const out = await uploadChatMediaInBatches(CONV, small, 'upload');
+    expect(out.kind).toBe('stored');
+    expect(forms.map((f) => f.getAll('file').length)).toEqual([999, 2]);
+    expect(out.kind === 'stored' && out.items.map((i) => i.attachment_id)).toEqual(
+      small.map((p) => p.attachmentId),
+    );
+
+    forms.length = 0;
+    const tenMiB = 10 * 1024 * 1024;
+    // 4 × 10 MiB = 40 MiB fits; the fifth would make 50 MiB > 48 MiB.
+    await uploadChatMediaInBatches(CONV, Array.from({ length: 7 }, (_, i) => part(i, tenMiB)), 'upload');
+    expect(forms.map((f) => f.getAll('file').length)).toEqual([4, 3]);
+  });
+
+  it('stops at the first request that is not stored and answers with it', async () => {
+    let calls = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        calls += 1;
+        return calls === 1 ? Response.json({ items: [] }) : Response.json({}, { status: 507 });
+      }),
+    );
+    const parts = Array.from({ length: 11 }, (_, i) => part(i, 10 * 1024 * 1024));
+    expect((await uploadChatMediaInBatches(CONV, parts, 'upload')).kind).toBe('no_space');
+    expect(calls).toBe(2);
+  });
+
+  it('a batch that fails for a passing reason goes again, alone, after a wait (QA 2026-10-03)', async () => {
+    // 40 photos the browser could not shrink, 10 MiB each: ten requests of
+    // four. Before, the 503 on the fifth failed the whole send, and the
+    // person's retry sent all 400 MiB again.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const tenMiB = 10 * 1024 * 1024;
+      const parts = Array.from({ length: 40 }, (_, i) => part(i, tenMiB));
+      const posted: string[][] = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (_url: string, init?: RequestInit) => {
+          const ids = (init?.body as FormData).getAll('attachment_id') as string[];
+          posted.push(ids);
+          if (posted.length === 5) return new Response('upstream', { status: 503 });
+          if (posted.length === 8) throw new TypeError('Failed to fetch');
+          return Response.json({ items: ids.map((attachment_id) => ({ attachment_id })) });
+        }),
+      );
+      const pending = uploadChatMediaInBatches(CONV, parts, 'upload');
+      await until(() => posted.length === 5 && vi.getTimerCount() === 1);
+      // Not at once: the chunked rail's backoff first.
+      expect(posted).toHaveLength(5);
+      expect(vi.getTimerCount()).toBe(1);
+
+      const out = await drain(pending);
+      expect(out.kind).toBe('stored');
+      expect(out.kind === 'stored' && out.items.map((i) => i.attachment_id)).toEqual(
+        parts.map((p) => p.attachmentId),
+      );
+      // Ten batches and the two that failed, each sent again on its own:
+      // 480 MiB in all, not 400 + 400.
+      expect(posted).toHaveLength(12);
+      expect(posted[5]).toEqual(posted[4]);
+      expect(posted[8]).toEqual(posted[7]);
+      expect(new Set(posted.flat()).size).toBe(40);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a passing failure is tried MAX_ATTEMPTS times; an answer is never asked again', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let calls = 0;
+      let status = 503;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => {
+          calls += 1;
+          return Response.json({}, { status });
+        }),
+      );
+      for (const passing of [429, 502, 503, 504]) {
+        calls = 0;
+        status = passing;
+        const out = await drain(uploadChatMediaInBatches(CONV, [part(0, 1024)], 'upload'));
+        expect(out).toEqual({ kind: 'failed', status: passing });
+        expect(calls).toBe(MAX_ATTEMPTS);
+      }
+      // A refusal, a missing chat, a dead session, a server error and a full
+      // disk say something about the request: one request, no wait.
+      for (const answer of [400, 413, 415, 404, 401, 403, 500, 507]) {
+        calls = 0;
+        status = answer;
+        await uploadChatMediaInBatches(CONV, [part(0, 1024)], 'upload');
+        expect(calls).toBe(1);
+        expect(vi.getTimerCount()).toBe(0);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('Stop during the wait ends it at once, and nothing goes again', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let calls = 0;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => {
+          calls += 1;
+          return Response.json({}, { status: 503 });
+        }),
+      );
+      const stop = new AbortController();
+      const pending = uploadChatMediaInBatches(CONV, [part(0, 1024)], 'upload', stop.signal);
+      await until(() => calls === 1 && vi.getTimerCount() === 1);
+      expect(vi.getTimerCount()).toBe(1); // waiting to try again
+      stop.abort();
+      // Settles with no timer advanced: the backoff did not run out.
+      expect((await pending).kind).toBe('failed');
+      expect(calls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('every batch fits the proxy (and the orchestrator) body cap with its framing', () => {
+    expect(MAX_MEDIA_BYTES_PER_REQUEST + 1024 * 1024).toBeLessThanOrEqual(MAX_MEDIA_BODY_BYTES);
+  });
+
+  it('decides by the inline bytes, and only for photos with ids in a real chat', () => {
+    const ids = ['img-limit-0001', 'img-limit-0002'];
+    const over = INLINE_IMAGE_BUDGET_BYTES + 1;
+    expect(imagesGoByReference(CONV, ['AAAA', 'BBBB'], ids, INLINE_IMAGE_BUDGET_BYTES)).toBe(false);
+    expect(imagesGoByReference(CONV, ['AAAA', 'BBBB'], ids, over)).toBe(true);
+    // No ids that pair with the bytes: nothing to name them by, so inline.
+    expect(imagesGoByReference(CONV, ['AAAA', 'BBBB'], ids.slice(0, 1), over)).toBe(false);
+    expect(imagesGoByReference(CONV, ['AAAA'], ['short'], over)).toBe(false);
+    // A bare /chat session key is never a media conversation (F034).
+    expect(imagesGoByReference('u7-abc', ['AAAA', 'BBBB'], ids, over)).toBe(false);
+    expect(imagesGoByReference(CONV, [], [], over)).toBe(false);
+  });
+
+  it('stores a send\'s base64 under its ids, with the real type, the same photo once', async () => {
+    const forms = stubStore();
+    const png = 'iVBORw0KGgoAAAANSUhEUg==';
+    const jpeg = '/9j/4AAQSkZJRgABAQ==';
+    const out = await storeImagesForSend(
+      CONV,
+      [png, jpeg, png],
+      ['img-limit-0001', 'img-limit-0002', 'img-limit-0001'],
+    );
+    expect(out.kind).toBe('stored');
+    const files = forms[0].getAll('file') as File[];
+    expect(forms[0].getAll('attachment_id')).toEqual(['img-limit-0001', 'img-limit-0002']);
+    expect(files.map((f) => f.type)).toEqual(['image/png', 'image/jpeg']);
+    expect(files.map((f) => f.name)).toEqual(['image-1.png', 'image-2.jpg']);
+    expect(forms[0].get('source')).toBe('upload');
+  });
+
+  it('a retried send sends only the photos the server does not hold yet (QA 2026-10-03)', async () => {
+    const png = 'iVBORw0KGgoAAAANSUhEUg==';
+    const jpeg = '/9j/4AAQSkZJRgABAQ==';
+    const images = [png, jpeg, png.replace('Ug', 'Ag'), jpeg.replace('AQ', 'AA')];
+    const ids = ['img-limit-0001', 'img-limit-0002', 'img-limit-0003', 'img-limit-0004'];
+
+    // An earlier attempt stored the first and third before it failed.
+    const forms = stubStore(['img-limit-0001', 'img-limit-0003']);
+    const out = await storeImagesForSend(CONV, images, ids);
+    expect(out.kind).toBe('stored');
+    expect(forms).toHaveLength(1);
+    expect(forms[0].getAll('attachment_id')).toEqual(['img-limit-0002', 'img-limit-0004']);
+    // A part keeps the name of its place in the message.
+    expect((forms[0].getAll('file') as File[]).map((f) => f.name)).toEqual([
+      'image-2.jpg',
+      'image-4.jpg',
+    ]);
+
+    // All of them landed (the answer was lost): nothing is sent again.
+    const none = stubStore(ids);
+    expect((await storeImagesForSend(CONV, images, ids)).kind).toBe('stored');
+    expect(none).toHaveLength(0);
+
+    // The server could not say: every photo goes, as before (an id it
+    // already holds comes back unchanged).
+    const all = stubStore(null);
+    expect((await storeImagesForSend(CONV, images, ids)).kind).toBe('stored');
+    expect(all.flatMap((f) => f.getAll('attachment_id'))).toEqual(ids);
   });
 });
 
@@ -811,6 +1134,18 @@ describe('photos the server stored by itself (STORE-ALWAYS §2)', () => {
     expect(byIntent.size).toBe(2);
   });
 
+  it('a turn of many photos (no limit, 999 ceiling) keeps every ix- photo in numeric send order', () => {
+    // The server mints ix-<intent>-0..N-1 for N up to MAX_IMAGES, so indexes
+    // reach three digits: 10 sorts after 9, never after 1, and 998 is the last.
+    const indexes = [...Array(120).keys(), MAX_IMAGES - 1];
+    const shuffled = [...indexes].sort((a, b) => String(a).localeCompare(String(b)));
+    const byIntent = serverPhotosByIntent(shuffled.map((i) => ({ attachment_id: ix(i) })));
+    expect(byIntent.get(INTENT)?.map((image) => image.attachment_id)).toEqual(indexes.map((i) => ix(i)));
+    expect(ix(MAX_IMAGES - 1)).toHaveLength(39);
+    // Past the ceiling is never a server-minted id.
+    expect(serverPhotosByIntent([{ attachment_id: ix(MAX_IMAGES + 1) }]).size).toBe(0);
+  });
+
   it('the lookup tells found, none and not-known-yet apart', () => {
     const known = serverPhotoLookup(serverPhotosByIntent([{ attachment_id: ix(0) }]));
     expect(known(oldPageTurn())).toEqual([{ attachment_id: ix(0) }]);
@@ -874,7 +1209,7 @@ describe('photos the server stored by itself (STORE-ALWAYS §2)', () => {
       ),
     );
     expect(await listChatMedia(CONV)).toEqual([
-      { attachment_id: ix(0), mime: 'image/png', width: 640, height: 480 },
+      { attachment_id: ix(0), mime: 'image/png', width: 640, height: 480, bytes: 9 },
       { attachment_id: ix(1) },
     ]);
   });
@@ -968,6 +1303,94 @@ describe('photos the server stored by itself (STORE-ALWAYS §2)', () => {
     expect(upload.mock.calls[0][1][0].blob.type).toBe('image/jpeg');
     expect(saves[0].messages[0].meta?.images).toBeUndefined();
     expect(saves[0].messages[2].meta?.images).toHaveLength(1);
+  });
+
+  // QA 2026-10-03: the server kept ix-…-0 and lost ix-…-1 (a transient
+  // error, a full disk). The sender adopted [ix-…-0] and uploaded nothing, so
+  // the second photo was gone for every other device although this browser
+  // held it; meta.images is written once.
+  describe('a turn the server stored only in part', () => {
+    const twoPhotos = (extra: Partial<ChatMessage> = {}) =>
+      oldPageTurn({ imageDataUrls: [PNG, JPEG], ...extra });
+    const sizeOf = (dataUrl: string) => Buffer.from(dataUrl.split(',')[1], 'base64').length;
+    const keptFirst = (extra: Partial<ListedMediaItem> = {}) =>
+      listed({ attachment_id: ix(0), mime: 'image/png', width: 640, height: 480, ...extra });
+
+    it('stores the photo it lost under the id it minted, and writes the turn whole', async () => {
+      const threads = { [CONV]: [twoPhotos(), answer('they differ', 'vision')] };
+      const { host, saves } = fakeHost(threads, { [CONV]: new Map([[0, [PNG, JPEG]]]) });
+      const upload = storingUpload();
+      expect(
+        await createBackfill(host, { upload, media: keptFirst(), schedule: now, locks: null }).runNow(CONV),
+      ).toBe('done');
+      expect(upload).toHaveBeenCalledTimes(1);
+      const [conv, parts, source] = upload.mock.calls[0];
+      expect(conv).toBe(CONV);
+      expect(source).toBe('backfill');
+      expect(parts.map((p) => p.attachmentId)).toEqual([ix(1)]);
+      expect(parts[0].blob.type).toBe('image/jpeg');
+      expect(saves).toHaveLength(1);
+      expect(saves[0].messages[0].meta?.images).toEqual([
+        { attachment_id: ix(0), mime: 'image/png', width: 640, height: 480 },
+        { attachment_id: ix(1), mime: 'image/png', width: 640, height: 480 },
+      ]);
+    });
+
+    it('trusts an older unnamed record only when the stored photo’s size proves it is that send', async () => {
+      const run = async (bytes: number) => {
+        const threads = { [CONV]: [twoPhotos({ imageDataUrls: undefined }), answer('they differ', 'vision')] };
+        const { host, saves } = fakeHost(threads, {});
+        // A record written before records named their turn (the old tab's own).
+        host.localImages = async () => new Map([[0, { urls: [PNG, JPEG] }]]);
+        const upload = storingUpload();
+        await createBackfill(host, { upload, media: keptFirst({ bytes }), schedule: now, locks: null }).runNow(CONV);
+        return { upload, refs: saves.at(-1)?.messages[0].meta?.images?.map((i) => i.attachment_id) };
+      };
+      const proven = await run(sizeOf(PNG));
+      expect(proven.upload.mock.calls[0][1].map((p) => p.attachmentId)).toEqual([ix(1)]);
+      expect(proven.refs).toEqual([ix(0), ix(1)]);
+      // A different size: not provably this send's photos. Nothing goes up
+      // under the minted id; the turn gets what the server has, as before.
+      const unproven = await run(sizeOf(PNG) + 1);
+      expect(unproven.upload).not.toHaveBeenCalled();
+      expect(unproven.refs).toEqual([ix(0)]);
+    });
+
+    it('never completes when the listed photos do not pair with the held ones', async () => {
+      const cases: ListedMediaItem[][] = [
+        // The listed type disagrees with the bytes held at that place.
+        [{ attachment_id: ix(0), mime: 'image/jpeg' }],
+        // A listed photo beyond the ones held here.
+        [{ attachment_id: ix(2), mime: 'image/png' }],
+      ];
+      for (const items of cases) {
+        const threads = { [CONV]: [twoPhotos(), answer('they differ', 'vision')] };
+        const { host } = fakeHost(threads, { [CONV]: new Map([[0, [PNG, JPEG]]]) });
+        const upload = storingUpload();
+        await createBackfill(host, { upload, media: listed(...items), schedule: now, locks: null }).runNow(CONV);
+        expect(upload).not.toHaveBeenCalled();
+      }
+    });
+
+    it('a stop writes nothing for the turn, so a later open can complete it', async () => {
+      const threads = { [CONV]: [twoPhotos(), answer('they differ', 'vision')] };
+      const { host, saves } = fakeHost(threads, { [CONV]: new Map([[0, [PNG, JPEG]]]) });
+      const upload = vi.fn(async () => ({ kind: 'failed', status: 502 }) as MediaUploadOutcome);
+      expect(
+        await createBackfill(host, { upload, media: keptFirst(), schedule: now, locks: null }).runNow(CONV),
+      ).toBe('later');
+      expect(saves).toHaveLength(0);
+      expect(threads[CONV][0].meta?.images).toBeUndefined();
+    });
+
+    it('a refusal writes the photos the server has', async () => {
+      const threads = { [CONV]: [twoPhotos(), answer('they differ', 'vision')] };
+      const { host, saves } = fakeHost(threads, { [CONV]: new Map([[0, [PNG, JPEG]]]) });
+      const upload = vi.fn(async () => ({ kind: 'refused', status: 415 }) as MediaUploadOutcome);
+      await createBackfill(host, { upload, media: keptFirst(), schedule: now, locks: null }).runNow(CONV);
+      expect(saves).toHaveLength(1);
+      expect(saves[0].messages[0].meta?.images?.map((i) => i.attachment_id)).toEqual([ix(0)]);
+    });
   });
 
   it('never reads the list for a chat whose turns carry no usable intent', async () => {

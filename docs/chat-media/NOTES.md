@@ -927,6 +927,179 @@ skips the list read (ChatApp checkForUpdates), so a turn sent in that window wou
 after the next focus or reopen. The orchestrator log's Files API PermissionError was the
 harness (no PUBLIC_API_FILES root set), not this branch.
 
+## coordinator (limits, 2026-10-03 02:10 IST)
+- Another session's branch (whisper accuracy) edits frontend/components/Composer.tsx (the voice
+  language control), VoiceBar.tsx, useVoiceRecorder.ts, lib/voice.ts, asr.py, dictation.py, config.py
+  and audio_api.py. Keep Composer.tsx changes to the attachment caps and their checks only; do not
+  reformat or move other code there. Avoid config.py unless a new setting is unavoidable.
+
+## limits: backend (orchestrator, 2026-10-03)
+
+The numbers the frontend track reads (LIMITS.md):
+
+- **Inline budget per request: 48 MiB = 50,331,648 bytes of picture payload.**
+  - On `/chat` it is the sum of the inline data URLs' lengths (`image` + `images`, base64
+    characters, prefix included). A send over it goes by reference: the pictures go to
+    `POST /api/chat-media/{conv}` first, then `/chat` carries `image_refs` and no inline bytes.
+  - On `POST /chat-media/{conv}` it is the sum of one batch's raw `file` bytes. Batch so that each
+    POST stays at or under 48 MiB. One picture is at most 10 MiB (`chat_media.MAX_IMAGE_BYTES`,
+    unchanged, checked on the bytes sent), so a batch always holds at least four.
+- **Server caps behind it (unchanged numbers):** `/chat` body 128 MiB; `POST /chat-media/{conv}`
+  body 64 MiB (48 MiB of pictures plus the framing of 20 parts fits); Cloudflare 100 MB.
+- **Counts on the server:**
+  - `main.MAX_IMAGES = 20`, inline and `image_refs` together. Over it: pydantic 422 whose text
+    holds `at most 20 images per message`.
+  - `image_ids` and `image_refs` each hold 1..20 ids (`at most 20 image ids per message`). The Next
+    proxy's id-list filter must allow 1..20.
+  - `chat_media.MAX_FILES = 20` `file` parts per POST (400 `At most 20 pictures per request.`).
+  - `pdf_uploads`: at most 20 per message (`A message can carry at most 20 documents.`).
+  - `video_uploads` (video and audio): at most 20 per message (was 3;
+    `A message can carry at most 20 videos.`).
+  - Datasets ride no `/chat` field; the server has no per-message dataset count.
+
+Backend as built (limits, 2026-10-03):
+
+- `chat_media.BATCH_BUDGET_BYTES = 48 MiB` is the number above, in code; a test pins that
+  `body_cap_for("POST", "/chat-media/c")` (64 MiB) holds it plus framing, that it is under the
+  /chat cap and under 100 MB. `_FORM_MAX_FIELDS` is `MAX_FILES + 11` (20 ids, a source, the old
+  slack); a 21st `file` part is Starlette's 400, re-wrapped as `bad_request`.
+- `engines/document.MAX_DOCS` 12 -> 24 (20 references, the inline PDF, an archive's manifest and
+  members). All documents still share ONE `DOC_CONTEXT_CHARS` (48,000) excerpt; page images come
+  from the first PDF only. Video: the pinned block and the answer frames were already shared
+  budgets (`engines/video.py`), so 20 videos are 20 lookups, not 20 budgets.
+- **The router never saw turn pictures.** `engines/router.route_request` gets `has_image` only (an
+  image forces `vision` with no model call), and every `router_chat_completion` caller sends text.
+  The only images the router reads are video frames, one per call (`video/screen.py`). It is now
+  also a rule in code: `router_chat_completion` keeps at most `context.CLASSIFICATION_MAX_IMAGES`
+  (8, = `publicapi.registry.ROUTER_MAX_IMAGES`) image parts, the newest.
+- image_memory with 20 photos keeps the turn's first pictures that fit, in order: the process
+  budget (`IMAGE_MEMORY_MAX_CHARS`, 24 M characters) usually holds all twenty shrunk photos; the
+  V41 row (`IMAGE_MEMORY_DB_CHARS`, 8 M) holds the first 8-30, by how large the shrunk photos are
+  (0.25-1 M characters each). Never a failed turn. The
+  store fallback now stops reading pictures once it has the process budget's worth
+  (`latest_turn_images(..., max_chars=)`), so twenty 10 MiB originals are never all in memory.
+  Honest limit: after a restart within the row's two hours, a follow-up hydrates the ROW, so it
+  sees only the pictures the row kept; the store fallback runs only when there is no row.
+- **Measured once on the production main model** (Qwen/Qwen3.6-35B-A3B-NVFP4, 127.0.0.1:8000,
+  2026-10-03, one other request running): 20 synthetic 1600x1200 JPEGs (3.50 MB, 4.67 M base64
+  characters, body 4.67 MB), `max_tokens` 16, thinking off, streamed: **38,063 prompt tokens
+  (~1,900 per picture), time to first token 22.08 s**, total 22.14 s, answer "there are 20
+  pictures attached". No restart needed (vLLM's per-prompt image limit is 999). A twenty-photo
+  turn therefore waits about 20 s before its first word even at Fast (the SSE heartbeat keeps the
+  connection), and a follow-up that re-sends the remembered pictures pays most of it again: the
+  engine runs `--no-enable-prefix-caching` (`prefix_cache_queries_total` 0); only vLLM's
+  multimodal processor cache can be hit.
+
+## limits: frontend, NO limit (2026-10-03)
+
+What the browser does now (replaces the 20-per-message version of this section):
+
+- **No count limit.** `frontend/lib/orchestrator.ts` `MAX_IMAGES = MAX_DOCUMENTS = 999`, the
+  technical ceiling only (the backend's `main.MAX_IMAGES`, `chat_media.MAX_FILES`). The proxy's
+  id-list filter (`forwardableAttachmentIds`) passes 1..999 ids. The composer says nothing about
+  a number below it; only a pick past 999 is told "One message can carry 999 photos — send the
+  rest in the next message." (or "999 files"). The "You can attach up to N" toasts are gone.
+- **No size limit on what streams.** The composer's 512 MB (documents, datasets, archives) and
+  4 GB (video, audio) checks and their toasts are gone; the server's `UPLOAD_MAX_MB` is the only
+  size rule and its refusal reaches the chip in its words. Datasets used to post whole to
+  `/api/upload` (dead past Cloudflare's 100 MB): over `CHUNK_THRESHOLD_BYTES` (90 MiB) they now
+  take the chunked rail with `purpose=dataset` (`uploadDocumentFile`, `DocumentRef.files` carries
+  the profiled-table count); smaller ones post once, as before. `/api/upload`'s 513 MiB cap stays
+  for tabs loaded before this change.
+- **Photo size:** unchanged from the 20-step: measured on what is sent. A shrunk photo is accepted
+  whatever the original weighed; one the browser cannot shrink keeps the server's 10 MiB
+  stored-file rule ("<name> is 11.0 MB and this browser couldn’t make it smaller. A photo sent as
+  it is can be at most 10 MB.").
+- **Many photos, many big files, one tab:** at most 3 photos decode at once
+  (`images.MAX_PARALLEL_DECODES`: a decoded 48 MP photo is ~190 MB of pixels) and at most 2
+  chunked parts are read for their SHA-256 at once across all uploads
+  (`uploadDocument.MAX_PARALLEL_HASHES`: 64 MiB each). The composer's chip row scrolls past three
+  rows (`max-h-48`), so the box and Send stay on screen with 100 chips, phone included.
+- **By reference over the budget:** as in the 20-step (inline at or under 48 MiB of base64,
+  otherwise `POST /api/chat-media` first, then `image_refs`), but a batch is now cut by its BYTES
+  only (`MAX_MEDIA_BYTES_PER_REQUEST` = 48 MiB; `MAX_MEDIA_PER_REQUEST` = the 999 ceiling).
+- **Real browser (Chromium, built app + fake orchestrator, 2026-10-03 ~02:40 IST):** 100 photos
+  (95 noisy 2400x1800 JPEGs + five 40 MB 8000x6000 originals, 411 MB picked) became 100 chips in
+  about 11 s, no toast, chip row 192 px, box and Send in view at 1280x900 and at 390x844, no
+  horizontal scroll. The send stored them by reference and posted one ~4 KB `/chat` with 100
+  `image_refs`; the bubble showed 100 photos and the answer's code block, table and mermaid
+  diagram rendered. 50 documents (a 600 MB PDF + 49 small) and a 5 GB video attached with no
+  toast; the PDF went chunked (`init` purpose=document, 629,145,600 bytes, 10 parts, complete) and
+  `/chat` carried 50 `pdf_uploads`. A 600 MB CSV went chunked with purpose=dataset and no
+  single-shot `/api/upload`. The 100 photos (shrunk in the browser) went as two
+  `POST /chat-media`, 61 files in a 47.9 MiB body and 39 in 31.6 MiB.
+- **Not done here:** the 100-photo bubble is 160 px thumbnails, about 50 rows tall on a desktop; a
+  compact grid for many photos is a design follow-up. The model-context fit of 100 photos is the
+  backend's (smaller sizes); not exercised against the real model from the browser.
+
+## limits: backend, NO limit (orchestrator, 2026-10-03 03:00 IST)
+
+Replaces the "Counts on the server" list above (20 everywhere). For the frontend track:
+
+- **Counts are a technical ceiling only, 999 (vLLM's per-prompt image maximum):**
+  `main.MAX_IMAGES = 999` (inline + `image_refs` together; 422 `at most 999 images per message`
+  only at 1,000), `image_ids` / `image_refs` 1..999 ids each, `chat_media.MAX_FILES = 999` `file`
+  parts per POST (`_FORM_MAX_FIELDS = MAX_FILES + 11`), `pdf_uploads` 999, `video_uploads` 999.
+  The Next proxy's id-list filter may allow 1..999. Nothing below 1,000 is refused for its count.
+- **Bytes still bound a request (not user limits):** batch at `chat_media.BATCH_BUDGET_BYTES`
+  (48 MiB) per `POST /chat-media` and inline per `/chat`; body caps unchanged (`/chat` 128 MiB,
+  `/chat-media` 64 MiB: 48 MiB plus the framing of 999 parts and their ids fits). One picture AS
+  SENT is still at most 10 MiB (`chat_media.MAX_IMAGE_BYTES`); the original may be any size.
+- **Chunked rail:** `uploads._MAX_PARTS` 128 -> 16,384. At the browser's 64 MiB parts 128 parts
+  silently capped every upload at 8 GiB; `init` reports `max_parts` = 16,384 now. The only size
+  rule is `UPLOAD_MAX_MB` (production 102400).
+- **Video/audio:** `VIDEO_MAX_UPLOAD_MB` unset follows `UPLOAD_MAX_MB` (production .env does not
+  set it). A file longer than `VIDEO_MAX_DURATION_S` (4 h) is accepted, kept whole, and its first
+  4 h analysed (`-t` on the audio and frame extraction); the probe stage no longer fails, and the
+  overview, the pinned block and every answer's prompt say "only its first 4:00:00 of 6:12:00
+  was analysed".
+- **What the model reads of many pictures (engines/vision.py `fit_images`, code, not the model):**
+  the turn's pictures go as they came while their image tokens fit the turn's budget, else ALL of
+  them at 896, 640 or 448 px on the long edge (the largest that fits), and only when even 448 px
+  cannot hold them, the first ones that fit. The budget is `VISION_IMAGE_TOKEN_BUDGET` (default
+  65,536 image tokens, never more than the window minus the answer's reserve), not the whole 1M
+  window: vLLM's processor turns every picture into float32 patches in the HEAD's memory (~24 KB a
+  token, in the API server and again in the engine core) and the prefill runs ~1,300-1,700 image
+  tokens a second, so 65,536 is ~1.6 GB of patches per copy and ~40-50 s: 34 photos at 1600 px,
+  110 at 896, 215 at 640, 414 at 448 (4:3). The whole window would be minutes and tens of GB; the
+  owner can raise the knob. The model is told the size ("sent all 100 pictures at 896 px") or how
+  many it got; when pictures were left out the ANSWER ends with a sentence counted by code: "_I
+  read the first 414 of the 999 pictures in this message; the other 585 did not fit in one
+  question. Send them in another message to ask about them._" (a picture that needed shrinking and
+  would not decode is named as "could not be opened as a picture"). The same fit runs on pictures
+  attached beside documents (engines/document.py). The table pre-pass (superlatives) runs only up
+  to 5 pictures.
+- **Measured once on the production main model** (127.0.0.1:8000, Qwen3.6-35B-A3B-NVFP4,
+  2026-10-03 ~03:20 IST, one other request running, `max_tokens` 16, thinking off, streamed):
+  40 synthetic 1600x1200 JPEGs fitted to 896 px: body 0.55 MB, **23,623 prompt tokens** (the code's
+  estimate 23,680), **TTFT 17.93 s**, total 18.24 s.
+- **Stored pictures by reference:** `/chat` reads originals until `chat_media.REFS_FULL_CHARS`
+  (96 Mi data-URL characters), then each further one as a 448 px copy, so 999 refs never put
+  999 originals in memory.
+- **Router:** besides the 8-picture share, at most `context.CLASSIFICATION_MAX_IMAGE_TOKENS`
+  (32,768, half its 65,536 window) of image tokens, newest first.
+- **Documents (head memory):** a turn reads at most `DOC_WHOLE_READ_BYTES` (256 MiB) of documents
+  into memory whole (every ordinary turn unchanged); past it a document is a `DocFile` the engine
+  reads from disk: PDF opened by path (PDFium reads on demand) up to `DOC_MAX_PAGES` 2,000 pages,
+  DOCX streamed through a pull parser that stops at the text budget, text read only as far as the
+  budget. All of a turn's documents share `DOC_TURN_TEXT_CHARS` (8 M characters): 20 documents keep
+  400,000 each as before, 50 keep 160,000, 999 keep 8,000. A document read in part says so in the
+  prompt header and in a closing line of the answer ("_Read in part — **huge.txt**: only its first
+  400,000 characters were read (600 MB file). The files are kept whole and can be downloaded._").
+  The engine no longer drops documents past 24 in silence (`MAX_DOCS` 1,024, named if exceeded);
+  a file turn (artifacts) reads every document attached to it (was 5) and reads a CSV dataset
+  only up to 64 MB, saying how many rows.
+- **Archives:** an archive past `ARCHIVE_MAX_FILES` or `ARCHIVE_MAX_UNCOMPRESSED_MB` is unpacked up
+  to them and the rest listed ("15 more file(s): not unpacked: only the first 10,000 entries are
+  (the archive itself is kept whole)"), not refused; a bomb-shaped member, a lying header and an
+  .xlsx past the caps are still refused. A dataset archive with more files than
+  `PROFILE_MAX_FILES` says "profiled the first 40 of N files".
+- **Datasets:** the DuckDB profiler runs with `memory_limit` 2 GB (`PROFILE_DUCKDB_MEMORY`) and
+  spills to `<tmp>/duckdb-profile-spill`; its default was 80% of the machine (97 GiB here).
+- **Not changed:** the /v1 Files API (`apifiles/`, its own documented limits, e.g. office files
+  512 MiB), `_MAX_ARCHIVE_IMAGES` (4 pictures attached from an archive; the rest are listed), and
+  image_memory's budgets (a follow-up re-sends the first pictures that fit, as before).
+
 ## store-always (backend, STORE-ALWAYS.md §1, 2026-10-03)
 
 What the orchestrator does now, for the frontend side to rely on:
@@ -958,8 +1131,10 @@ What the orchestrator does now, for the frontend side to rely on:
   visible-path and the stored-order queries) treats a user message with no
   `meta.images` as a picture turn when its `meta.intent.id` is 32 hex and the
   viewer has `ix-<that intent>-*` rows in that chat; it loads indexes 0..4 in
-  order. A message WITH `meta.images` uses those ids as before, so once the
-  frontend writes `meta.images` (ix- ids) nothing changes for the model.
+  order (0..998 within `max_chars` since the merge with no limits: see
+  "integrator, no limits + store-always" below). A message WITH
+  `meta.images` uses those ids as before, so once the frontend writes
+  `meta.images` (ix- ids) nothing changes for the model.
 - Not changed, known: `sharing.evaluate` blocks a public link by
   `meta.images`, so a chat whose only photo is an `ix-` row with no
   `meta.images` yet is shareable exactly as an old-tab photo chat was before
@@ -1043,3 +1218,268 @@ says "FILE" (`fileBadgeFor(name)`), as for `bf-` backfills. A regenerate or
 edit before the backfill has written the refs (its idle tick, under 10 s)
 takes the old "missing" path. A turn with only some of its `ix-` rows shows
 those.
+
+## integrator, no limits + store-always (release/2026-10-03-nolimits, 2026-10-03 03:50 IST)
+
+Merge 53930008 = feat/upload-limits a941ae36 + fix/image-store-always 943f7eb9; follow-ups
+56132f45 (backend tests, two comments) and c9baf51a (browser tests). Code under test: c9baf51a;
+the docs commit after it changes no code.
+
+Conflicts, both sides kept: `chat_media._latest_visible_turn_images` and `latest_turn_images`
+name a turn's pictures by `_turn_attachment_ids` (its `meta.images`, else the `ix-` rows under
+its intent) AND pass image_memory's `max_chars`; ChatApp.tsx's imports (`CHUNK_THRESHOLD_BYTES`
+beside the build-check imports); this file (both sections).
+
+Where the two tracks meet. No rule disagrees, so no precedence was needed; each meeting point is
+now a test:
+
+- **Ref turns never mint.** An over-budget send stores its photos under the composer's ids
+  (`POST /chat-media`) and sends only `image_refs`: no inline picture reaches
+  `schedule_inline_store`, and `by_reference` is true. A regenerate naming 101 `ix-` ids by
+  reference passes the 1..999 id validators and mints nothing.
+- **Minting has no count of its own.** Every inline picture of an id-less turn is named, so N is
+  bounded only by `main.MAX_IMAGES` (999): `ix-<32 hex>-998` is 39 characters, inside
+  `^[A-Za-z0-9_-]{8,64}$`; the browser's `SERVER_MINTED_ID` takes 1-3 digits and sorts by
+  number. Test: 101 pictures, 101 rows, each id naming the picture at its place.
+- **The store fallback reads every index, bounded by characters.** `_turn_attachment_ids` names
+  indexes 0..998 (`MAX_FILES`); `_load_refs(..., max_chars)` stops at image_memory's budget.
+  Test: twelve `ix-` pictures uploaded out of order come back 0..11; with a three-picture
+  budget, the first three. Cost of naming all 999, measured on pg-test-hand: the `= ANY` probe
+  0.06 ms to execute (0.3-0.6 ms to plan) on a chat of 204 rows, and the loader's pass over 999
+  ids with 3 present 4.5 ms; once per follow-up that falls back to the store for a turn whose
+  `meta.images` no device has written yet.
+- **No double render.** MessageRow shows local bytes, else the turn's own `meta.images`, else
+  `serverImages`, never two of them. ChatApp computes `serverImages` only for a turn with no
+  `meta.images`, no local bytes and a 32-hex intent, and every send from this build writes
+  `meta.images` before its request, inline or by reference. Test: a by-reference turn whose
+  intent also has `ix-` rows shows its 6 references once, 0 list reads, no "not stored" line.
+  Mutations it catches: a lookup despite the turn's own references (1 list read); MessageRow
+  joining both sources (12 thumbnails for 6 photos).
+- **The reload cannot cut a by-reference send.** From Send to the /chat request the composer is
+  empty and no upload is pending; `startStream` registers the stream before
+  `storeImagesForSend`, and `useBuildCheck`'s quiet check needs `streamingIds()` empty. Test: a
+  deploy noticed mid-upload shows the banner; the 6 photos land, /chat names them, and the tab
+  reloads once, after the answer. Mutation it catches: the stream dropped from the quiet check
+  (a reload during the upload).
+
+Fail before, pass after (each parent exported with `git archive`, plus the merged test file):
+store-always alone fails both new backend tests (422 "at most 5 images per message"; 5 of 12
+pictures read), no limits alone fails both (0 rows minted; no picture turn found); 2 passed on
+the merge.
+
+Gates on c9baf51a (head DGX, test DB rel2_int_test on pg-test-hand):
+- Backend (test_chat_media_api/chat/lifecycle, test_image_memory_restart, test_multi_image,
+  test_orchestrator_hardening, test_chat_requests, and every test file no limits added or
+  changed): 304 passed, 1 skipped (ffmpeg not installed), 0 failed. The bare merge 53930008:
+  302 passed, 1 skipped, 0 failed.
+- Goldens and contracts (test_context_assembly_golden, test_prompt_final_send, test_contract,
+  test_publicapi_contract): 241 passed, 0 failed.
+- Frontend: vitest 214 files, 4105 passed, 11 skipped, 0 failed (the bare merge: 213 files, 4102
+  passed, 11 skipped); `tsc --noEmit` 0 errors; lint clean; `next build` OK (TypeScript
+  included, `/api/version` in the route list).
+- ruff_gate clean (0 documented findings); schema_parity invariants V1..V44 contiguous; `bash -n`
+  44 files, 0 failed; gitleaks 8.30.1 over 6da0e929..c9baf51a: 13 commits with a patch, ~305 KB,
+  no leaks, and over the merge's own combined diff (`git show --cc`, ~28 KB, which `git log -p`
+  leaves out): no leaks.
+
+Not run here: the full orchestrator shards (artifact and chart suites), the Schema job (no
+migration changed; V44 is still the newest) and a real browser.
+
+Open:
+- `GET /chat-media/{conv}` is not paginated, and store-always reads it once per chat per page
+  load whenever a turn could have `ix-` photos (nearly every text turn). One item is ~228 bytes
+  of JSON, so 999 stored photos are ~228 KB per read and 10,000 ~2.3 MB, now that a chat has no
+  count limit.
+
+## limits: frontend fix, photo batches (QA low, 2026-10-03 03:40 IST)
+
+- **A batch that fails for a passing reason goes again, alone.** `uploadChatMediaInBatches` re-sends
+  a `POST /chat-media/{conv}` that answered 429/502/503/504 or dropped the connection, up to
+  `MAX_ATTEMPTS` (5) with the chunked rail's backoff (waits of 0.25-0.5, 0.5-1, 1-2 and 2-4 s;
+  `lib/uploadDocument.ts` exports the same constants). Any other status is an answer and stops the
+  send as before. The batches before it are not re-sent. The backfill uses the same function, so it
+  retries the same way.
+- **A retried send skips what landed.** `storeImagesForSend` (the by-reference path of a send) now
+  reads `GET /chat-media/{conv}` once before its POSTs and sends only the ids the server does not list;
+  an unknown answer (any failure) sends them all. For the backend: every by-reference send now costs
+  one list read, and that list is unpaginated (about 200 bytes per picture in the chat).
+
+## limits: backend fixes after the NO-limit QA attack (orchestrator, 2026-10-03 04:15 IST)
+
+For the frontend track and the release:
+
+- **Documents never read on the event loop.** Every PDFium call (text layer, page renders, OCR
+  renders), the DOCX reader and the base64 round trips run in worker threads, from
+  `_resolve_document_refs` through the engine and the upload prewarm (`core.pdf.PDFIUM_LOCK` still
+  serialises PDFium). QA's 50 x 40-page PDFs: longest loop stall 6.01 s -> 0.02 s. Only the first
+  document that renders is rendered now; the others' renders were ~80% of reading a PDF and were
+  thrown away.
+- **A follow-up on many photos says how many it sees.** image_memory remembers the turn's total. The
+  V41 row's `images` holds one slot per picture of the turn, `''` for one past the durable budget,
+  so the total survives a restart with no new column; the store fallback reports `total` from
+  `meta.images`. The model is told, and the answer ends with a counted sentence: "_I could see 13 of
+  the 100 pictures from that message here; send the others again to ask about them._"
+- **`image_refs`:** each distinct id is read once however often it is named (the backfill names one
+  picture twice when a turn carried it twice; 999 copies of one id were 999 reads and 990 decodes,
+  ~135 s before /chat answered). Past `REFS_FULL_CHARS` a ref is its stored thumbnail (512 px
+  WebP, `data:image/webp`), read and never decoded.
+- **Zips are never listed whole.** `core.archive.open_zip` parses at most `ARCHIVE_MAX_FILES`
+  central-directory entries and 16 MiB of directory; past either it opens a view of the file whose
+  new zip64 end records name only those first entries. QA's 300,000-entry zip: listing peak 170 MiB
+  -> 6 MiB. Same results on Python 3.11.16 and 3.12.3 (it uses zipfile's `_EndRecData` and
+  `_ECD_*`, so a Python upgrade must keep `test_listing_a_huge_archive_parses_only_the_entries_it_unpacks`
+  green). The .docx readers (`core.docx`, the on-disk document sniff) use it too: a crafted .docx
+  listing 70,000 parts held 78 MB, now under 16 MiB.
+- **Datasets past a reading cap are kept.** An .xlsx past the caps (entries, expanded bytes, a sheet
+  past the expansion ratio) or a dataset archive with a bomb-shaped member is kept whole and
+  downloadable and answered **200** with `files: 0`, `profile: []` and one note
+  `stored whole but not profiled: <reason>` (it was deleted with a 400 stating a limit). Hostile
+  structure (sizes that lie, an unreadable zip) is still refused. The frontend may show a dataset
+  chip with no tables and that note.
+- **`POST /chat-media`:** a request whose pictures' headers claim more than `MAX_REQUEST_PIXELS`
+  (4,000 MP, each picture counted at most 16 MP) is refused before any decode:
+  413 `{"detail": "Send these pictures in smaller batches."}`. The browser's fullest batch (999 x
+  1600 x 1600 = 2,558 MP) never reaches it, so the frontend needs no change.
+- **Open (not changed here):** `core.docx.extract_docx_text` (whole-read path, at most 256 MiB of
+  documents a turn) still inflates `word/document.xml` whole, so a .docx bomb is a memory risk there;
+  `artifacts/material_in._kind_of` still parses the directory of bytes it already holds. The
+  follow-up re-sends the pictures image_memory kept, not the turn's stored copies by reference.
+
+## store-always (backend fixes from the QA attack, 2026-10-03)
+
+Commits 59425bb6 and d5239301, orchestrator only. What the other side and the
+release may rely on:
+
+- `/chat` now stores a turn's pictures AFTER the V29 send intent check, not
+  before it. A send refused with 409 "intent_id belongs to another
+  conversation" (another account's intent, or the same person's from another
+  chat) stores and counts nothing, with or without `image_ids`. A retry of
+  the same intent in the same chat still stores again, ahead of the attach,
+  replay and retry paths (`duplicate`, or a lost file healed).
+- The store fallback (`chat_media.latest_turn_images`, both paths) no longer
+  runs a correlated EXISTS on chat_media for every user turn.
+  `_PICTURE_TURN_SQL` is an uncorrelated IN over the chat's `ix-` rows,
+  hashed once per statement. The test is the same as before: a 32-hex intent
+  with a row starting `ix-<intent>-`. The fragment takes the named parameters
+  `user_id` and `conversation_id`, so both queries now pass a dict. Measured
+  on 10,000 user turns, with the photo on the oldest turn and 31 stored photos
+  in the chat (medians of 7 warm calls): stored order went from 65.7 to
+  9.0 ms, and the visible path from 178.5 to 15.3 ms. On QA's own 10k test,
+  the first (cold) call went from 68.5 to about 30 ms in stored order, and
+  from 40.6 to 7-11 ms on the visible path.
+- The ids of an intent-only picture turn are now the `ix-<intent>-<n>` rows
+  that exist (`_minted_ids_stored`, one indexed read). They come in index
+  order, below MAX_FILES. This replaces "it loads indexes 0..4" in the
+  backend store-always note above. `_turn_attachment_ids` now takes
+  `(user_id, conversation_id, images, intent_id)`.
+- Merging this into release/2026-10-03-nolimits, which already merged
+  943f7eb9:
+  - `main.py` merges cleanly. The release's main.py hunks all sit above line
+    3300.
+  - `chat_media.py` conflicts in three places, all mechanical.
+    `_turn_attachment_ids`: take this branch's signature and body, and drop
+    the release's paragraph on "the cost of naming all 999", which no longer
+    applies. The two `_load_refs(...)` call sites: keep the release's
+    `max_chars` argument, and pass
+    `_turn_attachment_ids(user_id, conversation_id, row["images"], row["intent_id"])`
+    as the ids.
+  - `tests/test_chat_media_chat.py` conflicts only where both sides added
+    tests at the same place: keep both.
+  - Checked without touching either worktree: `git merge-tree` of the
+    release and d5239301, resolved as above in a scratch copy, then
+    `tests/test_chat_media_chat.py` gave 42 passed. That includes the
+    release's twelve `ix-` pictures in index order and its 101-picture turn.
+- Left unchanged on the server: the fallback finds an `ix-` photo through
+  the turn's `meta.intent.id` or its `meta.images`. QA's
+  `test_qa_regenerate_rekeys_the_turn_and_the_fallback_loses_the_photo`
+  rewrites the intent of a turn that has neither. The browser closed that gap
+  in e1967cfc: regenerate, retry and edit write the `ix-` photos into
+  `meta.images` first.
+
+## store-always (frontend fixes from the QA attack, 2026-10-03)
+
+Commits 1daab005, e1967cfc and 79df761a, frontend only. What the other side
+and the release may rely on:
+
+- **Regenerate, retry and edit of an `ix-` turn (e1967cfc).** A user turn
+  that needs the photo lookup (no `meta.images`, no bytes here, a 32-hex
+  intent) waits for the page's one list read (`mediaListRef`, normally
+  answered already), then gets its `ix-<intent>-<n>` photos written onto it
+  as `meta.images` before anything reads it. The request carries them as
+  `image_refs` (no inline bytes), and the turn keeps them when the
+  regenerate's new intent replaces `meta.intent.id`. So the server sees a
+  ref turn with a new `intent_id` and never mints for it, and the fallback
+  then finds the photo through `meta.images`. This closes the residual "A
+  regenerate or edit before the backfill has written the refs…" of the
+  frontend note above.
+  - The list cannot be read: a regenerate or retry of a turn whose answer
+    is `route: 'vision'` is refused with the toast "The server could not be
+    reached. Check the connection and retry." and nothing changes (no
+    request, the intent stays). Any other turn is re-asked as before, so
+    text regenerates never depend on the photo list. An edit goes ahead as
+    before: the original keeps its intent and its photos.
+  - While the list is read, the chat counts as mid-send
+    (`pendingSendRef`), so a second click, a send, the backfill and an
+    automatic reload wait.
+- **The sender completes a partly stored `ix-` turn (79df761a).** When the
+  list holds `ix-<intent>-0` but not `-1` and this browser holds both
+  photos, the backfill POSTs the missing ones to `/chat-media/{conv}` with
+  `attachment_id` = `ix-<intent>-<i>` and `source=backfill`, then writes the
+  whole set in send order in its one save. Two things the server must keep
+  for that:
+  - the upload route accepts a client-sent `ix-` id (the attachment id
+    pattern admits it). A 400 there is handled as a refusal: the turn gets
+    the photos the server listed, as before;
+  - the list's `bytes` is the stored full file's size, equal to the decoded
+    bytes as sent (`decode_inline` then `_commit(len(data))`). The browser
+    reads it now (`ListedMediaItem.bytes`). An older IndexedDB record that
+    names no turn (every record a pre-V44 page wrote) is used only when each
+    listed photo has the same type and the same size at the same index. If
+    the server ever trimmed or re-encoded, the completion would simply not
+    happen.
+  - A stop (offline, 5xx, 507) writes nothing for that turn, so a later
+    open can still complete it; `meta.images` is written once.
+- **Build check (1daab005).** An automatic reload asks "would this lose
+  anything?" again after its wait for the history store (up to 3 s), and
+  lets the 1 s quiet poll retry when the person typed, attached or sent in
+  that wait. The banner's Reload saves the draft after the wait, so text
+  typed during it is kept; a failed flush still keeps it.
+
+Proof in a real Chromium (Playwright 1.63, scratch venv) against the
+production layout of this branch (`.next/standalone` + static + public,
+`node --require ./server-preload.cjs server.js`) and a fake orchestrator,
+torn down after:
+- "Try again" on the old-page photo turn with idle callbacks held back (the
+  backfill never ran first): the orchestrator's `/chat` body had
+  `image_refs` = [ix-0, ix-1] and no inline image; both thumbs stayed; the
+  stored question had both refs and the new intent; a second device at
+  390 px showed both photos, with no horizontal scroll.
+- List down (502): the toast showed, no `/chat`, intent unchanged. List
+  back: the next click sent both refs and the thumbs showed.
+- Reload while a PUT took 2.5 s: text typed in the wait was not reloaded
+  away (banner up, text in the composer); emptied, the page reloaded
+  0.21 s later.
+- Code block, table, mermaid diagram and the artifact panel (page 1 drawn)
+  all rendered. No page errors.
+
+Tests: `tests/store-always-ix-photos.test.tsx` (11),
+`tests/chat-media.test.ts` (56), `tests/build-check-reload.test.tsx` (13).
+Every new case for a fixed behavior failed on the code before its fix; the
+guards (a text turn, unpaired photos, a refusal, a failed flush) pass on
+both. Full suite: 212 files,
+4093 passed, 11 skipped. `tsc --noEmit` clean, `eslint .` 0 errors (the
+34 warnings are in files these commits do not touch).
+
+Residuals:
+- A list read that fails when a chat opens is retried only at the next ask:
+  a "Try again", the next open, or a focus when the chat is stale. Until
+  then that chat's `ix-` photos stay hidden and nothing is said.
+- A regenerate of an old-page photo turn whose answer is not `vision`
+  (a photo with a document, an artifact) while the list cannot be read is
+  re-asked without the photos, and its new intent cuts the turn off from
+  them.
+- A device without the bytes can adopt a partial `ix-` set before the sender
+  completes it; `meta.images` is then written once, with part of the photos.
+- `listChatMedia` never reads the body of a failed response. People see no
+  effect, but Playwright keeps that request pending, so a browser test
+  must not wait for network idle while the list is down.

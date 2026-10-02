@@ -4,10 +4,15 @@
  *
  *   GET  — the viewer's photos in this chat: `{items:[{attachment_id,
  *          media_id, mime, width, height, bytes, created_at}]}`.
- *   POST — store up to five photos (multipart: `file` + `attachment_id`
- *          parts in the same order, optional `source`). Used by the backfill
- *          for photos sent before they were stored; a new photo is stored by
- *          the orchestrator straight from the /chat body instead.
+ *   POST — store a batch of photos (multipart: `file` + `attachment_id`
+ *          parts in the same order, optional `source`; the browser cuts a
+ *          batch at MAX_MEDIA_BYTES_PER_REQUEST of file bytes). Used by the backfill
+ *          for photos sent before they were stored, and since 2026-10-03 by a
+ *          send whose photos would push the /chat body past
+ *          INLINE_IMAGE_BUDGET_BYTES (any number of photos: they go first, in
+ *          batches of at most that many file bytes, and the turn names them
+ *          in `image_refs`). Any other new photo is stored by the orchestrator
+ *          straight from the /chat body.
  *
  * The multipart body STREAMS through (duplex 'half'), counted against
  * MAX_MEDIA_BODY_BYTES as it passes and never held: 64 MiB of photos crosses

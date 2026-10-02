@@ -166,8 +166,16 @@ describe('the proxy translation', () => {
       toOrchestratorChatRequest({ ...base, image_refs: ['img-aaaa-0001', 'img-aaaa-0002'] })?.image_refs,
     ).toEqual(['img-aaaa-0001', 'img-aaaa-0002']);
     expect(toOrchestratorChatRequest({ ...base, image_refs: ['short'] })).not.toHaveProperty('image_refs');
+    // No limit since 2026-10-03 (LIMITS.md), only the 999 technical ceiling:
+    // 100 and 999 pass, 1000 does not.
+    for (const n of [100, 999]) {
+      expect(
+        toOrchestratorChatRequest({ ...base, image_refs: Array(n).fill('img-aaaa-0001') })
+          ?.image_refs,
+      ).toHaveLength(n);
+    }
     expect(
-      toOrchestratorChatRequest({ ...base, image_refs: Array(6).fill('img-aaaa-0001') }),
+      toOrchestratorChatRequest({ ...base, image_refs: Array(1000).fill('img-aaaa-0001') }),
     ).not.toHaveProperty('image_refs');
     // No photo fields in, no photo fields out: the v1 key set is untouched.
     const plain = toOrchestratorChatRequest(base)!;

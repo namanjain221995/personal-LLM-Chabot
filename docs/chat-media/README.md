@@ -87,8 +87,11 @@ truncated files. Further limits:
   (`chat_media.DECODE_WORKERS`), so a burst queues instead of filling the
   default executor with ~0.5 GiB decodes.
 - A multi-picture JPEG (Pillow's `MPO`) is stored as `image/jpeg`, `full.jpg`.
-- At most 10 MiB per picture and 5 per request. These are the composer's own
-  `MAX_IMAGE_BYTES` and `MAX_IMAGES`.
+- At most 10 MiB per picture, checked on the bytes sent (the composer has
+  already shrunk a photo to 1600 px; the original may be any size). No count
+  limit since 2026-10-03 ([`LIMITS.md`](LIMITS.md)): 999 per request is only
+  the technical ceiling. The browser batches its uploads so one POST holds at
+  most `chat_media.BATCH_BUDGET_BYTES` (48 MiB) of pictures.
 
 **Write order.** The steps run in this order:
 
@@ -133,7 +136,7 @@ Every other case gets **the same 404 body**:
 
 | Route | What it does |
 |---|---|
-| `POST /chat-media/{conv}` | Multipart. Up to 5 `file` parts, then `attachment_id` text parts in the same order. `source` is `upload` (default) or `backfill`. Every picture is checked before any is stored. An `attachment_id` that already has a row answers that row with `created:false`; its bytes are compared only when the row's file is gone (the heal above). **400** bad shape (count mismatch, a bad or duplicate id, more than 5 files, a bad `source`); **403** the account may not attach; **404** not yours; **408** the body was cut off; **413** over 10 MiB; **415** not a verified raster; **507** below the free-space floor; **500** `store_failed`. Every refusal is `{"code","detail"}` except 403 and 408, which keep the upload rail's `{"detail"}`. Body cap: **64 MiB** (`main.body_cap_for`). |
+| `POST /chat-media/{conv}` | Multipart. Any number of `file` parts (999 ceiling) within the byte budget, then `attachment_id` text parts in the same order. `source` is `upload` (default) or `backfill`. Every picture is checked before any is stored. An `attachment_id` that already has a row answers that row with `created:false`; its bytes are compared only when the row's file is gone (the heal above). **400** bad shape (count mismatch, a bad or duplicate id, more than 999 files, a bad `source`); **403** the account may not attach; **404** not yours; **408** the body was cut off; **413** over 10 MiB; **415** not a verified raster; **507** below the free-space floor; **500** `store_failed`. Every refusal is `{"code","detail"}` except 403 and 408, which keep the upload rail's `{"detail"}`. Body cap: **64 MiB** (`main.body_cap_for`): one 48 MiB batch plus framing. |
 | `GET /chat-media/{conv}` | The viewer's pictures in that chat, oldest first. |
 | `GET /chat-media/{conv}/{attachment_id}?size=thumb\|full` | The bytes, streamed with `FileResponse`. |
 | `GET /admin/api/members/{user_id}/chat-media/{conv}/{attachment_id}?size=` | The same response, for the audited conversation viewer. See below. |
@@ -171,14 +174,17 @@ The admin route:
 **`/chat`** gained two fields:
 
 - **`image_ids`.** These are the attachment ids of the inline pictures.
-  - At intake, after the feature gate and the ownership check, the turn's
-    pictures are stored **in a background task**.
+  - At intake, after the feature gate, the ownership check and the send
+    intent check, the turn's pictures are stored **in a background task**. A
+    send refused with 409 (its `intent_id` belongs to another chat or account)
+    stores nothing; a retry of the same send stores again (`duplicate`).
   - This applies on every route: vision, document plus picture, and artifact.
   - The first token waits on none of it. A failure is logged and counted, and
     never surfaces as a chat error.
   - **No usable ids** (absent, or a count that does not match): the server
     names the pictures itself, `ix-<intent_id>-<index>` (index 0..N-1 in send
-    order), when the request's own `intent_id` is the composer's shape (32
+    order; N may be anything up to the 999 ceiling, so an id is 37 to 39
+    characters), when the request's own `intent_id` is the composer's shape (32
     lowercase hex). That is what a page loaded before V44 sends: the bytes,
     the intent, and no ids ([`STORE-ALWAYS.md`](STORE-ALWAYS.md)). The
     browser keeps the intent on the user message (`meta.intent.id`), so any
@@ -193,7 +199,9 @@ The admin route:
   bytes.
   - They are loaded before anything durable happens: full files, never
     thumbnails.
-  - They go ahead of any inline pictures, and count against the same cap of 5.
+  - They go ahead of any inline pictures, and count against the same 999
+    ceiling (`main.MAX_IMAGES`; 5, then 20, until 2026-10-03). A send whose
+    inline pictures would pass the 48 MiB budget goes by reference.
   - A ref that cannot be loaded answers 422
     `{"detail":{"code":"image_ref_missing","missing":[…]}}` before a stream or
     a `chat_requests` row exists.
@@ -203,7 +211,7 @@ The admin route:
     question, like an inline picture.
 - An account without the ATTACHMENTS feature has both lists cleared with the
   rest of its attachments (the usual "Photos and files" notice), never a 422.
-- Each list holds at most 5 ids matching `^[A-Za-z0-9_-]{8,64}$`; anything else
+- Each list holds at most 999 ids matching `^[A-Za-z0-9_-]{8,64}$`; anything else
   is pydantic's 422 (a malformed body), which the Next proxy never forwards.
 
 **Follow-up questions.** `image_memory.hydrate` falls back to the store when
@@ -214,8 +222,12 @@ the person sees: `/chat`'s `messages` are passed as `visible`, and
 stored under it), with that turn's question and answer. A picture turn is a
 user message with `meta.images`, or, with none, one whose `meta.intent.id`
 has the viewer's `ix-<intent>-*` rows (a photo from a page that wrote no
-`meta.images`); its pictures are then read in index order. A picture on an
-edited-away branch is never read into a later turn. `turns_after` counts user
+`meta.images`); its pictures are then the `ix-` rows that exist, read in index
+order until image_memory's `max_chars` budget is spent, and their count is the
+turn's total for the follow-up's "N of M pictures" note. The chat's `ix-`
+intents are read once per statement, never once per message (a plan test pins
+it). A picture on an edited-away branch is never read into a later turn.
+`turns_after` counts user
 turns on the path after it, not the question being asked now. Only the 20
 newest picture turns are compared, and nothing is written back to the V41 row.
 A request with no `messages` keeps the stored-order behaviour. A chat with no
@@ -437,6 +449,7 @@ Each is deliberate and recorded in NOTES.md under the named track.
 | §5 `image_refs` "same order" as inline images | Refs come first, then inline pictures; the frontend never sends both in one request | be-media |
 | §5 (not covered) | ATTACHMENTS feature off clears `image_ids`/`image_refs` (no 422); a ref-only turn with no words gets "Analyze the attached image." | be-media, fix-be |
 | §5 "a length mismatch is ignored for storage" | Absent or mismatched `image_ids` with the browser's 32-hex `intent_id` store under `ix-<intent>-<index>`; otherwise counted `unlinked`; never on a ref turn | store-always |
+| §5 store "after the ATTACHMENTS feature gate and the F034 check" | Also after the V29 send intent check: a send refused with 409 stores nothing | store-always |
 | §6 "the newest USER message ... whose `meta.images` is non-empty" | Also a user message with no `meta.images` whose `meta.intent.id` has the viewer's `ix-` rows | store-always |
 | §6 "the newest USER message ... whose `meta.images` is non-empty" | The newest picture turn on the branch the person sees (`visible`), at most 20 compared; `turns_after` excludes the question being asked | fix-be |
 | §7 `PRIVATE_META_KEYS` gains `images` | Also: `sharing.evaluate` reads provenance from empty messages, so a photo-only chat cannot be shared | fix-be |
