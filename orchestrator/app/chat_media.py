@@ -671,8 +671,13 @@ _inflight: "set[asyncio.Task]" = set()
 
 
 async def _store_inline(user_id: int, conversation_id: str, pairs: List[Tuple[str, str]]) -> None:
-    for attachment_id, value in pairs:
-        await asyncio.to_thread(_store_inline_one, user_id, conversation_id, attachment_id, value)
+    try:
+        for attachment_id, value in pairs:
+            await asyncio.to_thread(_store_inline_one, user_id, conversation_id, attachment_id, value)
+    except asyncio.CancelledError:
+        raise  # shutdown: what was not stored is the next send's, or a backfill's
+    except Exception:  # noqa: BLE001 — the executor itself refused (shutting down)
+        log.warning("chat media: the background store stopped early", exc_info=True)
 
 
 def schedule_inline_store(
