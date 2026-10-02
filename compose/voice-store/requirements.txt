@@ -1,10 +1,11 @@
 # The voice archive store (compose/voice-store/server.py). Every package is
 # pinned, transitive ones included: Starlette and uvicorn at the versions the
 # production orchestrator image runs (2026-09-30: starlette 1.7.0, uvicorn
-# 0.46.0, h11 0.16.0, anyio 4.13.0), resolved on Python 3.12. No FastAPI and
+# 0.46.0, h11 0.16.0, anyio 4.13.0), resolved on Python 3.12;
+# anyio raised to 4.14.2 on 2026-10-02 for CVE-2026-63374 (CRITICAL). No FastAPI and
 # no pydantic: the store needs routing, Range responses and a request stream,
 # which are Starlette's, and nothing else.
-anyio==4.13.0
+anyio==4.14.2
 click==8.5.0
 h11==0.16.0
 idna==3.20
