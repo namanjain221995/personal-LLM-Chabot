@@ -351,6 +351,78 @@ def _sniff(data: bytes) -> Optional[str]:
     return None
 
 
+#: The last chunk of every PNG, with its CRC (which is constant: IEND is empty).
+_PNG_IEND = b"IEND\xaeB`\x82"
+
+
+def _gif_reaches_trailer(data: bytes) -> bool:
+    """Walk a GIF's blocks to its trailer (0x3B). A cut file runs out first.
+    Every block is length-prefixed, so this is ~40,000 steps for 10 MiB."""
+    if len(data) < 13:
+        return False
+    pos = 13
+    flags = data[10]
+    if flags & 0x80:  # a global colour table follows the screen descriptor
+        pos += 3 * (2 << (flags & 0x07))
+    while pos < len(data):
+        block = data[pos]
+        if block == 0x3B:
+            return True
+        if block == 0x21:  # extension: its label, then data sub-blocks
+            pos += 2
+        elif block == 0x2C:  # image: 10-byte descriptor, local table, LZW code size
+            if pos + 10 > len(data):
+                return False
+            local = data[pos + 9]
+            pos += 10
+            if local & 0x80:
+                pos += 3 * (2 << (local & 0x07))
+            pos += 1
+        else:
+            return False
+        while True:  # sub-blocks, up to the zero-length terminator
+            if pos >= len(data):
+                return False
+            size = data[pos]
+            pos += 1 + size
+            if size == 0:
+                break
+    return False
+
+
+def _ends_whole(fmt: str, data: bytes) -> bool:
+    """Does the data END the way a whole file of this format ends?
+
+    Judged from the file's own structure, never by Pillow alone: Pillow's
+    truncation check is the process-wide switch ImageFile.LOAD_TRUNCATED_IMAGES,
+    and WeasyPrint turns it ON when it is imported (weasyprint/images.py), which
+    the artifact renderer does in this same process. With it on (measured
+    2026-10-02, Pillow 12.3), a JPEG cut to a third and a GIF cut anywhere
+    decoded "successfully", and a PNG cut inside its last chunk did too.
+    Flipping the switch back around our own decode would race the renderer's
+    threads, so the check does not touch it.
+
+      JPEG  an EOI (FF D9) after the last start-of-scan (FF DA). Neither pair
+            can occur inside entropy-coded data, where every FF is followed by
+            00 or a restart marker, so a scan cut short has no EOI after it.
+      PNG   the IEND chunk, CRC included.
+      GIF   the block walk reaches the trailer.
+      WebP  libwebp decodes the whole buffer itself and refuses a short one
+            whatever the switch says (measured); its RIFF size is checked
+            anyway, because it costs nothing.
+    """
+    if fmt == "JPEG":
+        last_scan = data.rfind(b"\xff\xda")
+        return last_scan > 0 and data.rfind(b"\xff\xd9") > last_scan
+    if fmt == "PNG":
+        return data.rfind(_PNG_IEND) > 8
+    if fmt == "GIF":
+        return _gif_reaches_trailer(data)
+    if fmt == "WEBP":
+        return len(data) >= 8 + int.from_bytes(data[4:8], "little")
+    return False
+
+
 def _orientation(image) -> int:
     try:
         return int(image.getexif().get(0x0112, 1) or 1)
@@ -385,16 +457,17 @@ def inspect(data: bytes) -> Picture:
     """Verify `data` is a JPEG, PNG, WebP or GIF and measure it, or raise
     Refused. CPU work: call it from a worker thread.
 
-    Three agreements, not one. The magic bytes name a format; Pillow, allowed
-    to open ONLY that format, must agree and pass `verify()`; and a real
-    decode must reach the end of the data, which is where a truncated JPEG
-    fails (`verify()` does not read JPEG scan data). The thumbnail is made from
-    that same decode, so a large picture is decoded once.
+    Four agreements, not one. The magic bytes name a format; the data must
+    end as a whole file of that format ends (`_ends_whole`, which is where a
+    truncated file fails whatever Pillow's process-wide switch says); Pillow,
+    allowed to open ONLY that format, must agree and pass `verify()`; and a
+    real decode must succeed. The thumbnail is made from that same decode, so
+    a large picture is decoded once.
     """
     if len(data) > MAX_IMAGE_BYTES:
         raise Refused("too_large")
     fmt = _sniff(data)
-    if fmt is None:
+    if fmt is None or not _ends_whole(fmt, data):
         raise Refused("unsupported")
     from PIL import Image
 

@@ -185,22 +185,29 @@ def test_a_png_named_jpg_is_stored_as_the_png_it_is(login_client):
     assert resp.headers["content-disposition"] == 'inline; filename="image.png"'
 
 
-@pytest.mark.parametrize(
-    "name,payload,ctype",
-    [
-        (
-            "drawing.svg",
-            b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
-            "image/svg+xml",
-        ),
-        ("page.png", b"<!doctype html><html><script>alert(document.cookie)</script></html>", PNG_CTYPE),
-        ("photo.heic", b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic" + b"\x00" * 64, "image/heic"),
-        ("scan.bmp", b"BM" + b"\x00" * 80, "image/bmp"),
-        ("cut.jpg", _jpeg(300, 200, noise=True)[:9000], "image/jpeg"),
-        ("cut.png", _png(300, 200)[:-20], PNG_CTYPE),
-        ("magic-only.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 200, PNG_CTYPE),
-    ],
-)
+def _gif(width: int = 300, height: int = 200) -> bytes:
+    out = io.BytesIO()
+    Image.effect_noise((width, height), 64).convert("P").save(out, format="GIF")
+    return out.getvalue()
+
+
+_REFUSED = [
+    (
+        "drawing.svg",
+        b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+        "image/svg+xml",
+    ),
+    ("page.png", b"<!doctype html><html><script>alert(document.cookie)</script></html>", PNG_CTYPE),
+    ("photo.heic", b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic" + b"\x00" * 64, "image/heic"),
+    ("scan.bmp", b"BM" + b"\x00" * 80, "image/bmp"),
+    ("cut.jpg", _jpeg(300, 200, noise=True)[:9000], "image/jpeg"),
+    ("cut.png", _png(300, 200)[:-20], PNG_CTYPE),
+    ("cut.gif", _gif()[:-40], "image/gif"),
+    ("magic-only.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 200, PNG_CTYPE),
+]
+
+
+@pytest.mark.parametrize("name,payload,ctype", _REFUSED, ids=[case[0] for case in _REFUSED])
 def test_anything_but_a_verified_raster_is_refused_with_415(login_client, name, payload, ctype):
     alice = login_client("alice")
     _chat(alice, "conv-refused")
@@ -209,6 +216,29 @@ def test_anything_but_a_verified_raster_is_refused_with_415(login_client, name, 
     assert resp.json()["code"] == "unsupported_type"
     assert _rows("conv-refused") == []
     assert not os.path.exists(os.path.join(settings.chat_media_dir, str(_uid("alice")), "conv-refused"))
+
+
+def test_a_cut_file_is_refused_even_after_weasyprint_relaxed_pillow(monkeypatch):
+    """WeasyPrint sets Pillow's process-wide ImageFile.LOAD_TRUNCATED_IMAGES
+    to True when it is imported, and the artifact renderer imports it in this
+    process. With it on, Pillow decodes a cut JPEG or GIF without complaint:
+    this test failed in the full suite (accepted, 200) while passing alone.
+    The store's own end-of-file check must hold whatever the switch says."""
+    from PIL import ImageFile
+
+    monkeypatch.setattr(ImageFile, "LOAD_TRUNCATED_IMAGES", True)
+    whole = {
+        "jpeg-small": _jpeg(300, 200, noise=True),
+        "jpeg-large": _jpeg(1200, 900, orientation=6, noise=True),
+        "png": _png(300, 200),
+        "gif": _gif(),
+    }
+    for label, data in whole.items():
+        assert chat_media.inspect(data).sha256, label  # a whole file still passes
+        for cut in (len(data) // 3, len(data) // 2, len(data) - 40, len(data) - 2):
+            with pytest.raises(chat_media.Refused) as refused:
+                chat_media.inspect(data[:cut])
+            assert refused.value.result == "unsupported", (label, cut)
 
 
 def test_one_refused_picture_stores_none_of_the_request(login_client):
