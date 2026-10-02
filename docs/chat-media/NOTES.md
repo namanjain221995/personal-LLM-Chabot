@@ -926,3 +926,9 @@ Not tested: a sidebar click inside the 5 s `UPDATE_CHECK_MIN_MS` window after an
 skips the list read (ChatApp checkForUpdates), so a turn sent in that window would show only
 after the next focus or reopen. The orchestrator log's Files API PermissionError was the
 harness (no PUBLIC_API_FILES root set), not this branch.
+
+## coordinator (limits, 2026-10-03 02:10 IST)
+- Another session's branch (whisper accuracy) edits frontend/components/Composer.tsx (the voice
+  language control), VoiceBar.tsx, useVoiceRecorder.ts, lib/voice.ts, asr.py, dictation.py, config.py
+  and audio_api.py. Keep Composer.tsx changes to the attachment caps and their checks only; do not
+  reformat or move other code there. Avoid config.py unless a new setting is unavoidable.
