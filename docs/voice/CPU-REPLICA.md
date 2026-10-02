@@ -128,8 +128,12 @@ video windows and the legacy dictation's second pass. The legacy dictation's fir
 the independent verifier's re-run of the committed image reproduced the recorded verbose_json
 answers on 10 of 10 clips, and in json mode came back with different text on 8 of 24
 (punctuation, case and three Hindi words). **json mode has not been paired against the GPU replica's json mode.**
-json-mode pairing: not measured yet (for the measuring agent to fill in: clips per set, CPU − GPU
-WER in pp with the paired-bootstrap 95 % CI, and identical text n/N).
+json-mode pairing (2026-10-02, image e7fbe776 on cpus 5-9,15-19 with 8 threads, against the
+worker's production GPU replica, both called with the model field only as the legacy first pass
+does, 15 clips per set, the same normaliser): CPU − GPU WER is +0.31 pp on LibriSpeech (95 % CI
++0.00 to +1.05, GPU 1.57 %, identical text 10/15), +0.00 pp on FLEURS en (CI +0.00 to +0.00,
+GPU 5.52 %, identical 12/15) and +0.83 pp on FLEURS hi (CI −0.53 to +2.15, GPU 43.53 %,
+identical 6/15), so json mode is no worse than the verbose_json pairs above within these CIs.
 
 **The worker was shared while this was measured.** Other tracks' throwaway GPU whisper replicas,
 test Postgres servers and benchmarks were running, and they added one to two and a half cores of
