@@ -321,3 +321,35 @@ fe-files, as built (2026-10-02 evening):
   override, >64 chars, bad `size`): 400 before any fetch, all three routes.
 - `npm run build` rewrites `frontend/next-env.d.ts` (`.next/dev/types` ->
   `.next/types`); put the committed copy back after a build.
+
+## security-attack (image store, proxies, 2026-10-02 22:00 IST)
+
+- `chat_media.inspect` admits any raster up to 40 MP (89 MP for JPEG) and
+  decodes it in the DEFAULT asyncio executor with no concurrency bound. A
+  38-byte lossless WebP of 16383x2440 costs ~600 MiB peak per inspect, a
+  1 MiB progressive JPEG of 9450x9450 ~505 MiB (draft does not cap a
+  progressive scan's coefficient buffer), a 166 KiB PNG of 6320x6320
+  ~460 MiB. 16 at once in one process: +9.5 GiB. The composer never sends
+  more than 1600 px on the long edge, so the store needs neither ceiling;
+  a lower store ceiling plus a small process-wide semaphore around
+  `inspect` (and around image_memory's `_fit` of stored originals) closes it.
+- The byte routes' `private, max-age=31536000, immutable` keeps every photo
+  in the browser's HTTP cache for a year AFTER logout. Logout wipes
+  IndexedDB "for the next person at this keyboard" but sends no
+  `Clear-Site-Data: "cache"`. The admin route has the same header, so a
+  second view by the admin is served from cache and never audited.
+- The backfill reads IndexedDB image records by MESSAGE INDEX. Those
+  records are write-once and dropped only past the thread's end, so after a
+  thread was rewritten elsewhere (edit, then regrown) a stale photo is
+  uploaded and written into an unrelated text turn's `meta.images`.
+- Sharing: `sharing.evaluate` skips empty-content turns, so a photo-only
+  turn's `meta.images` never blocks a public link; `vision` is not in
+  `PRIVATE_ROUTES` either. Confirmed with a pure `evaluate` call.
+- Held: authz on every attachment_id -> bytes path (viewer-scoped rows plus
+  conversation owner), F034, path building from validated ids only, reaper
+  symlink handling (`is_dir(follow_symlinks=False)` + rmtree's fd walk),
+  the free-space floor on both write paths, CSRF (orchestrator Origin
+  check on :8080, `Sec-Fetch-Site` on the Next POST), nosniff and the
+  sandbox CSP on 200, and logs without names. gitleaks `dir` over every
+  in-scope file: no leaks. Gitleaks `git` in this worktree scans nothing
+  (the .git file points outside the mount).
