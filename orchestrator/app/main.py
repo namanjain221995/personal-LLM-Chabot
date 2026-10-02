@@ -5732,10 +5732,20 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # pays it once, on the first turn after a deploy. Never on the
             # fast lane (it must add nothing to a greeting's latency), and
             # never on a turn that carries its own images, which replace
-            # whatever was remembered anyway.
+            # whatever was remembered anyway. The path the browser sent rides
+            # along: the V44 store fallback takes only a picture on it, never
+            # one on a branch the person edited away.
             image_followup = image_memory.Followup()
             if conv_key and not lane.entered and not request.images_data:
-                await image_memory.hydrate(conv_key, viewer)
+                await image_memory.hydrate(
+                    conv_key,
+                    viewer,
+                    visible=(
+                        [(m.role, m.content) for m in request.messages]
+                        if request.messages is not None
+                        else None
+                    ),
+                )
             if (
                 request.text
                 and not request.images_data

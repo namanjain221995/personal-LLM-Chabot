@@ -613,3 +613,127 @@ def test_latest_turn_images_reads_the_newest_picture_turn_and_counts_the_turns_s
     # thread, is not a turn SINCE the picture.
     _say("conv-count", "user", "what was the total again?")
     assert chat_media.latest_turn_images(uid, "conv-count")["turns_after"] == 1
+
+
+# ------------------------------------- the store fallback follows the branch --
+
+
+def _branch(self_id: str, parent: str) -> dict:
+    return {"branch": {"self": self_id, "parent": parent}}
+
+
+def test_a_photo_on_a_branch_the_person_edited_away_is_never_read_into_a_turn(engines, as_user):
+    """The stored list is flat and append-only (lib/branching.ts): editing an
+    EARLIER message adds a sibling and keeps the old versions. The fallback
+    took the newest picture message in that list, so a photo on a branch
+    nobody sees any more was handed to the model ("what does the photo
+    show?" -> vision with it). It now takes only a picture on the path the
+    browser sent."""
+    as_user("alice")
+    photo = _png(colour=(9, 99, 9))
+    with TestClient(app) as client:
+        assert client.post("/history/conversations", json={"id": "conv-branch", "title": "t"}).status_code == 200
+        _upload(client, "conv-branch", "att-branch-01", photo)
+        _say("conv-branch", "user", "hi", _branch("b-1", ""))
+        _say("conv-branch", "assistant", "hello", _branch("b-2", "b-1"))
+        _say("conv-branch", "user", TURN1, {"images": [{"attachment_id": "att-branch-01"}], **_branch("b-3", "b-2")})
+        _say("conv-branch", "assistant", ANSWER1, {"route": "vision", **_branch("b-4", "b-3")})
+        # The person edits the FIRST message: the photo turn leaves the path.
+        _say("conv-branch", "user", "tell me about paris", _branch("b-5", ""))
+        _say("conv-branch", "assistant", "paris is a city", _branch("b-6", "b-5"))
+        _restart()
+        edited_path = [
+            {"role": "user", "content": "tell me about paris"},
+            {"role": "assistant", "content": "paris is a city"},
+            {"role": "user", "content": FOLLOW},
+        ]
+        resp = _chat(client, message=FOLLOW, conversation_id="conv-branch", messages=edited_path)
+        assert resp.status_code == 200
+        assert _route(resp) == "chat"
+        assert not engines["vision"]
+
+        # Switched back to the photo's branch, the same question reads it.
+        _restart()
+        photo_path = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": TURN1},
+            {"role": "assistant", "content": ANSWER1},
+            {"role": "user", "content": FOLLOW},
+        ]
+        resp = _chat(client, message=FOLLOW, conversation_id="conv-branch", messages=photo_path)
+        assert _route(resp) == "vision"
+        assert [_decoded(i) for i in engines["vision"][-1]["images"]] == [photo]
+
+
+def test_a_photo_with_no_words_is_found_on_the_path_by_its_answer(engines, as_user):
+    # The browser drops an empty turn from `messages`, so a photo sent with
+    # no words is placed on the path by the answer stored under it.
+    as_user("alice")
+    photo = _png(colour=(90, 9, 9))
+    with TestClient(app) as client:
+        assert client.post("/history/conversations", json={"id": "conv-wordless", "title": "t"}).status_code == 200
+        _upload(client, "conv-wordless", "att-wordless1", photo)
+        _say("conv-wordless", "user", "", {"images": [{"attachment_id": "att-wordless1"}]})
+        _say("conv-wordless", "assistant", ANSWER1, {"route": "vision"})
+        _restart()
+        resp = _chat(
+            client,
+            message=FOLLOW,
+            conversation_id="conv-wordless",
+            messages=[{"role": "assistant", "content": ANSWER1}, {"role": "user", "content": FOLLOW}],
+        )
+        assert _route(resp) == "vision"
+        assert [_decoded(i) for i in engines["vision"][-1]["images"]] == [photo]
+
+
+def test_the_visible_path_match_and_its_turn_count(as_user):
+    alice = as_user("alice")
+    uid = int(alice["id"])
+    photo = _png(colour=(3, 33, 133))
+    with TestClient(app) as client:
+        assert client.post("/history/conversations", json={"id": "conv-path", "title": "t"}).status_code == 200
+        _upload(client, "conv-path", "att-path-0001", photo)
+    _say("conv-path", "user", "Read this", {"images": [{"attachment_id": "att-path-0001"}], **_branch("p-1", "")})
+    _say("conv-path", "assistant", "First answer", _branch("p-2", "p-1"))
+    # "Try again" on that answer: a sibling stored at the END of the list.
+    _say("conv-path", "user", "unrelated", _branch("p-3", "p-2"))
+    _say("conv-path", "assistant", "Second answer", _branch("p-4", "p-1"))
+    path = [
+        # A pasted block is folded in front of the words by the browser.
+        ("user", "pasted log line\n\nRead this"),
+        ("assistant", "Second answer"),
+        ("user", "a text turn"),
+        ("assistant", "a text answer"),
+        ("user", "what did it say?"),  # the question being asked now
+    ]
+    found = chat_media.latest_turn_images(uid, "conv-path", path)
+    assert [_decoded(i) for i in found["images"]] == [photo]
+    assert found["context"] == "read this\nsecond answer"
+    assert found["turns_after"] == 1
+    # Words that only END the same way are a different turn.
+    assert chat_media.latest_turn_images(uid, "conv-path", [("user", "please Read this"), ("user", "q")]) is None
+    # No history sent: the stored order alone, as before.
+    assert chat_media.latest_turn_images(uid, "conv-path")["images"]
+    assert chat_media.latest_turn_images(uid, "conv-path", []) is None
+
+
+def test_a_wordless_photo_is_found_by_a_regenerated_answer_stored_later(as_user):
+    alice = as_user("alice")
+    uid = int(alice["id"])
+    photo = _png(colour=(13, 13, 113))
+    with TestClient(app) as client:
+        assert client.post("/history/conversations", json={"id": "conv-regen", "title": "t"}).status_code == 200
+        _upload(client, "conv-regen", "att-regen-001", photo)
+    _say("conv-regen", "user", "", {"images": [{"attachment_id": "att-regen-001"}], **_branch("r-1", "")})
+    _say("conv-regen", "assistant", "First answer", _branch("r-2", "r-1"))
+    _say("conv-regen", "user", "more", _branch("r-3", "r-2"))
+    _say("conv-regen", "assistant", "more answer", _branch("r-4", "r-3"))
+    # "Try again" on the photo's answer, stored at the end; it is what shows.
+    _say("conv-regen", "assistant", "Regenerated answer", _branch("r-5", "r-1"))
+    found = chat_media.latest_turn_images(uid, "conv-regen", [("assistant", "Regenerated answer"), ("user", "q")])
+    assert [_decoded(i) for i in found["images"]] == [photo]
+    assert found["context"] == "\nregenerated answer"
+    assert found["turns_after"] == 0
+    # An answer that is not stored under the photo does not place it.
+    assert chat_media.latest_turn_images(uid, "conv-regen", [("assistant", "more answer"), ("user", "q")]) is None

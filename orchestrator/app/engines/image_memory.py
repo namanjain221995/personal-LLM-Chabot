@@ -471,7 +471,10 @@ def _hydrate_read(ident: tuple) -> "Optional[dict]":
 
 
 async def hydrate(
-    conversation_id: "Optional[str]", user_id: "Optional[object]" = None
+    conversation_id: "Optional[str]",
+    user_id: "Optional[object]" = None,
+    *,
+    visible: "Optional[Sequence[tuple]]" = None,
 ) -> None:
     """Load this conversation's picture back into the process, if it has one.
 
@@ -495,6 +498,12 @@ async def hydrate(
     costs one statement that finds nothing and behaves exactly as before.
     The entry is NOT written back to the V41 row: the store already holds the
     bytes, and a second copy in the database would buy nothing.
+
+    `visible` is the path the browser sent with this turn ((role, content)
+    pairs, /chat `messages`). The stored list keeps every edited-away
+    version, so the fallback takes only a picture turn on that path and
+    counts the turns since on it (chat_media.latest_turn_images); None, for
+    a caller that sent no history, keeps the stored order alone.
     """
     durable = durable_enabled()
     fallback = store_fallback_enabled()
@@ -514,7 +523,7 @@ async def hydrate(
         return
     if row is None:
         if fallback:
-            await _hydrate_from_store(key, ident)
+            await _hydrate_from_store(key, ident, visible)
         return
     _remembered_images[key] = _Remembered(
         images=list(row["images"]),
@@ -529,14 +538,15 @@ async def hydrate(
     _evict()
 
 
-def _stored_read(ident: tuple) -> "Optional[dict]":
-    """The chat's newest stored pictures, fitted to this process's budget, or
-    None — the STORE half of `hydrate`, in a worker thread. Same rule as
+def _stored_read(ident: tuple, visible: "Optional[Sequence[tuple]]" = None) -> "Optional[dict]":
+    """The chat's newest stored pictures on the visible path, fitted to this
+    process's budget, or None — the STORE half of `hydrate`, on the chat
+    media decode pool (`_fit` may decode a 10 MiB original). Same rule as
     `_hydrate_read`: it reads, and never touches `_remembered_images`."""
     try:
         from .. import chat_media
 
-        found = chat_media.latest_turn_images(ident[0], ident[1])
+        found = chat_media.latest_turn_images(ident[0], ident[1], visible)
     except Exception as exc:  # noqa: BLE001 — never a failed turn
         log.debug("image memory: could not read the stored pictures: %s", type(exc).__name__)
         return None
@@ -550,8 +560,12 @@ def _stored_read(ident: tuple) -> "Optional[dict]":
     return {**found, "images": images}
 
 
-async def _hydrate_from_store(key: str, ident: tuple) -> None:
-    found = await asyncio.to_thread(_stored_read, ident)
+async def _hydrate_from_store(
+    key: str, ident: tuple, visible: "Optional[Sequence[tuple]]" = None
+) -> None:
+    from .. import chat_media
+
+    found = await chat_media.run_decode(_stored_read, ident, visible)
     if found is None or key in _remembered_images:
         return
     _remembered_images[key] = _Remembered(

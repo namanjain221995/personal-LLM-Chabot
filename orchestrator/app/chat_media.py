@@ -989,7 +989,112 @@ def _meta_attachment_ids(images: Any) -> List[str]:
     return out
 
 
-def latest_turn_images(user_id: int, conversation_id: str) -> Optional[Dict[str, Any]]:
+#: Picture turns compared with the path the browser sent, newest first.
+_VISIBLE_CANDIDATES = 20
+
+
+def _visible_path(visible: Sequence[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """The turns the browser sent as (role, stripped content), without empty
+    ones (the browser drops those itself) and without the trailing user turn,
+    which is the question being asked now."""
+    path = [
+        (str(role or ""), str(content or "").strip())
+        for role, content in visible
+    ]
+    path = [(role, content) for role, content in path if role in ("user", "assistant") and content]
+    if path and path[-1][0] == "user":
+        path.pop()
+    return path
+
+
+def _place_on_path(
+    question: str, answers: Sequence[str], path: List[Tuple[str, str]]
+) -> Optional[Tuple[int, str]]:
+    """Where a stored picture turn sits on the visible path: (index of the
+    last path turn that is it, its answer as the path shows it), or None.
+
+    A turn with words is matched by them. The browser folds pasted blocks and
+    a quoted excerpt in FRONT of the words (lib/selectedContext.ts
+    foldTurnForModel, joined by a blank line), so a path turn that ends with
+    them after a blank line is the same turn. A photo with no words is not on
+    the path at all (the browser drops empty turns), so it is matched by its
+    answer: one of the assistant messages stored under it."""
+    if question:
+        for i in range(len(path) - 1, -1, -1):
+            role, content = path[i]
+            if role == "user" and (content == question or content.endswith("\n\n" + question)):
+                following = path[i + 1] if i + 1 < len(path) else ("", "")
+                return i, following[1] if following[0] == "assistant" else ""
+        return None
+    wanted = {a.strip() for a in answers if isinstance(a, str) and a.strip()}
+    for i in range(len(path) - 1, -1, -1):
+        role, content = path[i]
+        if role == "assistant" and content in wanted:
+            return i, content
+    return None
+
+
+def _latest_visible_turn_images(
+    user_id: int, conversation_id: str, visible: Sequence[Tuple[str, str]]
+) -> Optional[Dict[str, Any]]:
+    """`latest_turn_images` restricted to the path the browser sent.
+
+    The stored list is flat and append-only (lib/branching.ts): an edit adds
+    a sibling and keeps every edited-away version, so "the newest picture
+    message" may be on a branch nobody sees any more. Only a picture turn
+    that is on the path the person is looking at may be handed to the model.
+    Its answers are the assistant messages stored under it: by `meta.branch`
+    parent when it has one, and the physically next message (a message
+    without branch fields is a child of whatever precedes it)."""
+    path = _visible_path(visible)
+    if not path:
+        return None
+    with db.read_connection() as con:
+        rows = con.execute(
+            "SELECT m.content, m.meta -> 'images' AS images, "
+            "(SELECT coalesce(jsonb_agg(a.content), '[]'::jsonb) FROM messages a "
+            "  WHERE btrim(coalesce(m.content, '')) = '' "
+            "    AND a.conversation_id = m.conversation_id AND a.id > m.id "
+            "    AND a.role = 'assistant' "
+            "    AND (a.id = (SELECT n.id FROM messages n "
+            "                  WHERE n.conversation_id = m.conversation_id AND n.id > m.id "
+            "                  ORDER BY n.id LIMIT 1) "
+            "         OR (m.meta -> 'branch' ->> 'self' IS NOT NULL "
+            "             AND a.meta -> 'branch' ->> 'parent' = m.meta -> 'branch' ->> 'self'))"
+            ") AS answers "
+            "FROM messages m JOIN conversations c ON c.id = m.conversation_id "
+            "WHERE m.conversation_id = %s AND c.user_id = %s AND m.role = 'user' "
+            "  AND jsonb_typeof(m.meta -> 'images') = 'array' "
+            "  AND (m.meta -> 'images') -> 0 IS NOT NULL "
+            "  AND EXISTS (SELECT 1 FROM chat_media s "
+            "               WHERE s.conversation_id = %s AND s.user_id = %s) "
+            "ORDER BY m.id DESC LIMIT %s",
+            (conversation_id, user_id, conversation_id, user_id, _VISIBLE_CANDIDATES),
+        ).fetchall()
+    for row in rows:
+        question = (row["content"] or "").strip()
+        placed = _place_on_path(question, row["answers"] or [], path)
+        if placed is None:
+            continue
+        index, answer = placed
+        # The newest picture on the path is the one "the photo" means; if its
+        # files are gone, an older one would be the wrong picture.
+        loaded, _missing = _load_refs(user_id, conversation_id, _meta_attachment_ids(row["images"]))
+        if not loaded:
+            return None
+        return {
+            "images": loaded,
+            "context": f"{row['content'] or ''}\n{answer}".lower(),
+            "turns_after": sum(1 for role, _ in path[index + 1:] if role == "user"),
+        }
+    return None
+
+
+def latest_turn_images(
+    user_id: int,
+    conversation_id: str,
+    visible: Optional[Sequence[Tuple[str, str]]] = None,
+) -> Optional[Dict[str, Any]]:
     """image_memory's store fallback (CONTRACT §6): the newest USER message
     of this chat whose `meta.images` is non-empty, with its stored pictures.
 
@@ -999,6 +1104,12 @@ def latest_turn_images(user_id: int, conversation_id: str) -> Optional[Dict[str,
     a chat with no stored picture: the EXISTS is evaluated once, before any
     message is read.
 
+    `visible` is the path the browser sent with the turn (/chat `messages`,
+    as (role, content)). When given, only a picture turn ON that path counts,
+    and `turns_after` is counted on it (`_latest_visible_turn_images`): a
+    photo on a branch the person edited away is never read into a turn. None
+    (a caller that sent no history) keeps the stored order alone.
+
     `turns_after` leaves out a trailing UNANSWERED user message: that is the
     turn being asked now, when the browser's history push beat /chat to the
     database, and counting it would make an immediate follow-up look one turn
@@ -1006,6 +1117,8 @@ def latest_turn_images(user_id: int, conversation_id: str) -> Optional[Dict[str,
     """
     if not _valid_conversation(conversation_id):
         return None
+    if visible is not None:
+        return _latest_visible_turn_images(int(user_id), conversation_id, visible)
     with db.read_connection() as con:
         row = con.execute(
             "SELECT t.content, t.images, "
