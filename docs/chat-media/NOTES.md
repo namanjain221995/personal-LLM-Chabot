@@ -932,3 +932,27 @@ harness (no PUBLIC_API_FILES root set), not this branch.
   language control), VoiceBar.tsx, useVoiceRecorder.ts, lib/voice.ts, asr.py, dictation.py, config.py
   and audio_api.py. Keep Composer.tsx changes to the attachment caps and their checks only; do not
   reformat or move other code there. Avoid config.py unless a new setting is unavoidable.
+
+## limits: backend (orchestrator, 2026-10-03)
+
+The numbers the frontend track reads (LIMITS.md):
+
+- **Inline budget per request: 48 MiB = 50,331,648 bytes of picture payload.**
+  - On `/chat` it is the sum of the inline data URLs' lengths (`image` + `images`, base64
+    characters, prefix included). A send over it goes by reference: the pictures go to
+    `POST /api/chat-media/{conv}` first, then `/chat` carries `image_refs` and no inline bytes.
+  - On `POST /chat-media/{conv}` it is the sum of one batch's raw `file` bytes. Batch so that each
+    POST stays at or under 48 MiB. One picture is at most 10 MiB (`chat_media.MAX_IMAGE_BYTES`,
+    unchanged, checked on the bytes sent), so a batch always holds at least four.
+- **Server caps behind it (unchanged numbers):** `/chat` body 128 MiB; `POST /chat-media/{conv}`
+  body 64 MiB (48 MiB of pictures plus the framing of 20 parts fits); Cloudflare 100 MB.
+- **Counts on the server:**
+  - `main.MAX_IMAGES = 20`, inline and `image_refs` together. Over it: pydantic 422 whose text
+    holds `at most 20 images per message`.
+  - `image_ids` and `image_refs` each hold 1..20 ids (`at most 20 image ids per message`). The Next
+    proxy's id-list filter must allow 1..20.
+  - `chat_media.MAX_FILES = 20` `file` parts per POST (400 `At most 20 pictures per request.`).
+  - `pdf_uploads`: at most 20 per message (`A message can carry at most 20 documents.`).
+  - `video_uploads` (video and audio): at most 20 per message (was 3;
+    `A message can carry at most 20 videos.`).
+  - Datasets ride no `/chat` field; the server has no per-message dataset count.
