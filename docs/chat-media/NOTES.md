@@ -733,3 +733,44 @@ Failed (3 of 3 runs), for whoever owns history sync:
   may predate this branch.
 - Not run: video/audio playback (step 7). The stub stack has VIDEO_ANALYSIS_ENABLED=false and no
   ffmpeg on the head, and audio/video travel on the video rail.
+
+## integrator (every CI gate over the branch, 2026-10-02 23:15 IST)
+
+Code under test: 1348a56d (everything after it is docs only: 6684411e, 702149af, 47b18433).
+Untracked attack proofs excluded by path everywhere (shard plan from a `git archive` of HEAD;
+vitest `--exclude 'tests/attack-*'`). No gate failed, so no code was changed.
+
+- Orchestrator, CI's 3 shards in parallel (shard_tests.py plan, 489 files, 163 each,
+  `--check --of 3` OK), one DB each on pg-test-hand:
+  s1 5459 passed, 23 skipped, 3 xfailed, 0 failed (1262 s);
+  s2 5776 passed, 9 skipped, 0 failed (1152 s);
+  s3 5679 passed, 12 skipped, 4 xfailed, 0 failed (1455 s).
+  Total 16914 passed, 44 skipped, 7 xfailed, 0 failed. Every skip is an opt-in live test or a
+  host tool (ffmpeg, pandoc, fonts); none is a chat-media, files, My files or sharing test.
+  None of the known flakes fired.
+- Goldens and contracts (also inside the shards): test_context_assembly_golden 44,
+  test_prompt_final_send 56, test_contract 54, test_publicapi_contract 87: 241 passed.
+- ruff_gate (pipeline paths, compose/voice-store included): clean, 0 documented findings.
+  schema_parity invariants: V1..V44 contiguous. Schema job: fresh 0 -> 44, staged V20 -> 44,
+  compare IDENTICAL (1996 structural lines), re-run 44 -> 44.
+- Policy job: bash -n 43 files 0 failed; workflow_policy OK (P1-P8); CI-scripts unittest gate
+  710 executed / floor 698; rollback rehearsal 9 scenarios; monitoring 35 / floor 33;
+  launcher 694 executed, 1 skipped / floor 450; compose/voice-store 40 passed / floor 33.
+  sync-worker not run here (the venv has no PyJWT); sync-worker/, launcher/, monitoring/,
+  .github/ and scripts/ are identical to main 4df0e3d6.
+- Frontend: vitest 207 files, 4023 passed, 11 skipped, 0 failed; tsc 0 errors; npm run lint
+  0 problems; `eslint .` 0 errors, 41 warnings (34 in untouched test files, 7 in the untracked
+  attack-chat-media-fe.test.tsx, 0 in any file this branch changed); npm run build OK (warm in
+  the worktree, then cold over a `git archive` of HEAD: compiled 6.0 s, TypeScript 7.1 s,
+  53 pages). frontend/next-env.d.ts restored from HEAD.
+- gitleaks (pinned digest, from the main checkout read-only): 21800739..feat/chat-media =
+  45 commits, 0 findings. secret_gate over that report fails only on 27 STALE baseline
+  entries, which a range scan cannot report by construction. Full history of feat/chat-media:
+  850 commits, 27 findings, all baselined, 0 new, 0 stale, gate rc 0.
+- Leftovers: no debug prints, console.log, TODO/FIXME, .only/.skip or new suppressions beyond
+  the codebase's `# noqa: BLE001` pattern; no unused imports added (the 4 F401 hits in changed
+  files predate the branch); no unreferenced new function.
+- README (702149af + this commit): stale statements fixed (40/89 MP ceiling, share-policy gap,
+  per-chat upload list, lasting reaper's home) and a "Where the build differs from
+  CONTRACT.md" table added. Its last row records the e2e run's open RC-3c failure: whoever
+  fixes RC-3c removes that row.
