@@ -67,6 +67,7 @@ import {
   serverPhotosByIntent,
   storedAttachmentIds,
   storedImagesOf,
+  withAdoptedPhotos,
   withImagesMeta,
   type Backfill,
   type ListedMediaItem,
@@ -138,6 +139,7 @@ import type {
   ArtifactRef,
   ChatMessage,
   ConversationSummary,
+  MessageImage,
   SelectedContext,
   SendIntent,
   SendIntentState,
@@ -235,6 +237,26 @@ type EarlyUpload = Attachment & { uploadConversationId?: string | null };
  */
 const UPDATE_CHECK_MIN_MS = 5_000;
 
+/**
+ * STORE-ALWAYS (QA 2026-10-03): said instead of a regenerate or retry when the
+ * turn may have photos the server stored by itself (`answeredFromPhoto`) and
+ * the chat's list of them could not be read (see `serverPhotosForResend`).
+ * Re-asking without them would cut the turn off from its photos for good.
+ */
+const PHOTOS_UNCHECKED = 'The server could not be reached. Check the connection and retry.';
+
+/**
+ * Was the answer under the question at `at` about a photo? The vision route's
+ * mark, the same hint the legacy "not stored" line reads. Asked only when the
+ * chat's list of photos could not be read: such a turn may have photos the
+ * server stored by itself, so it waits; any other turn is re-asked as before,
+ * rather than tying every regenerate to the photo list.
+ */
+function answeredFromPhoto(view: readonly ChatMessage[], at: number): boolean {
+  const next = view[at + 1];
+  return next?.role === 'assistant' && next.meta?.route === 'vision';
+}
+
 /** The row callbacks ChatApp caches per message id — see `rowHandlers`. */
 interface RowHandlers {
   onRegenerate: () => void;
@@ -317,6 +339,23 @@ export function intentForRegenerate(
   question: ChatMessage,
 ): string {
   return intentAnswered(all, question) ? newIntentId() : intentForRetry(question);
+}
+
+/**
+ * Where, in `view`, the question a regenerate of `messageId` re-asks sits; -1
+ * when there is none.
+ *
+ * `messageId` is normally the ANSWER (the "Try again" button). Since
+ * 2026-09-03 it may also be the USER turn itself — an edit submitted with its
+ * text unchanged is a regenerate, and that turn may not have an answer under
+ * it yet. Either way the question is the nearest user turn at or above the id.
+ */
+function questionIndex(view: readonly ChatMessage[], messageId: string): number {
+  const idx = view.findIndex((m) => m.id === messageId);
+  if (idx === -1) return -1;
+  let userIdx = view[idx].role === 'user' ? idx : idx - 1;
+  while (userIdx >= 0 && view[userIdx].role !== 'user') userIdx--;
+  return userIdx;
 }
 
 export function newIntentId(): string {
@@ -2626,25 +2665,70 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
     };
   }, [onEditArtifact]);
 
+  /**
+   * STORE-ALWAYS (QA 2026-10-03): the photos to write onto a turn before it is
+   * re-sent: those the server stored by itself under the turn's intent
+   * (`ix-<intent>-<n>`) because a page too old to write `meta.images` sent
+   * them.
+   *
+   * Such a turn shows its photos through the chat's list until the backfill
+   * writes its references (an idle tick later; never while the list cannot
+   * be read). Re-sent from the turn alone it carried no photo, and "Try
+   * again" then gave the turn a NEW intent (lib/streams patchIntent), after
+   * which nothing found those photos again: not this view, not another
+   * device, not the orchestrator's image memory. Written onto the turn first,
+   * they go by reference (`image_refs`) and stay on the turn whatever its
+   * intent becomes.
+   *
+   * The page's one read of the list (`mediaListRef`), normally answered long
+   * before a button is pressed. While it is asked the chat counts as
+   * mid-send, so a second click, a send or the backfill waits. `[]`: nothing
+   * to write. null: the list could not be read, and the caller decides
+   * (`answeredFromPhoto`).
+   */
+  const serverPhotosForResend = useCallback(
+    async (conversationId: string, turn: ChatMessage): Promise<MessageImage[] | null> => {
+      const intent = needsServerPhotoLookup(turn) ? serverPhotoIntentOf(turn) : null;
+      if (!intent) return [];
+      pendingSendRef.current.add(conversationId);
+      try {
+        const items = await mediaListRef.current.get(conversationId);
+        return items ? (serverPhotosByIntent(items).get(intent) ?? []) : null;
+      } finally {
+        pendingSendRef.current.delete(conversationId);
+      }
+    },
+    [],
+  );
+
   /** Re-run the turn that produced the assistant message at `messageId`. */
   const runRegenerate = useCallback(
     async (messageId: string, options?: { allowPartial?: boolean }) => {
       const id = activeIdRef.current;
-      if (!id || isStreaming(id)) return;
-      const all = messagesRef.current;
+      if (!id || isStreaming(id) || pendingSendRef.current.has(id)) return;
+      const shown = threadRef.current;
+      const at = questionIndex(shown, messageId);
+      if (at < 0) return;
+      const asked = shown[at];
+      // Photos the server stored by itself for this question are written onto
+      // it before anything below reads it (serverPhotosForResend). Only such a
+      // turn waits for the list; every other regenerate starts as it did.
+      let photos: MessageImage[] = [];
+      if (needsServerPhotoLookup(asked)) {
+        const found = await serverPhotosForResend(id, asked);
+        if (!found && answeredFromPhoto(shown, at)) {
+          toast(PHOTOS_UNCHECKED, 'error');
+          return;
+        }
+        if (activeIdRef.current !== id || isStreaming(id)) return;
+        photos = found ?? [];
+      }
+      const all = withAdoptedPhotos(messagesRef.current, asked, photos);
       // Located in the VISIBLE path: "the answer above this one" means the
       // one on screen, not whichever message happens to sit there in storage
       // once a conversation has more than one branch.
-      const view = threadRef.current;
-      const idx = view.findIndex((m) => m.id === messageId);
-      if (idx === -1) return;
-      // `messageId` is normally the ANSWER (the "Try again" button). Since
-      // 2026-09-03 it may also be the USER turn itself — an edit submitted
-      // with its text unchanged is a regenerate, and that turn may not have
-      // an answer under it yet. Either way the question is the nearest user
-      // turn at or above the id, and everything from here is identical.
-      let userIdx = view[idx].role === 'user' ? idx : idx - 1;
-      while (userIdx >= 0 && view[userIdx].role !== 'user') userIdx--;
+      const view = withAdoptedPhotos(threadRef.current, asked, photos);
+      const userIdx = questionIndex(view, messageId);
       if (userIdx < 0) return;
       const context = view.slice(0, userIdx + 1);
 
@@ -2728,7 +2812,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         dataset: resend.dataset,
       });
     },
-    [toast],
+    [serverPhotosForResend, toast],
   );
 
   /**
@@ -2782,6 +2866,20 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       let original = all.find((m) => m.id === messageId);
       if (!original || original.role !== 'user') return;
 
+      // Photos the server stored by itself for the original are written onto
+      // it first, so the edit inherits them and sends them by reference
+      // (serverPhotosForResend). A list that cannot be read leaves the edit
+      // as it was: the original keeps its intent, so unlike a regenerate
+      // nothing is cut off from its photos.
+      let photos: MessageImage[] = [];
+      if (needsServerPhotoLookup(original)) {
+        photos = (await serverPhotosForResend(id, original)) ?? [];
+        if (activeIdRef.current !== id || isStreaming(id)) return;
+        all = withAdoptedPhotos(messagesRef.current, original, photos);
+        original = all.find((m) => m.id === messageId);
+        if (!original || original.role !== 'user') return;
+      }
+
       // Re-ask the question WITH whatever was attached to it. Images survive
       // as their own previews; a PDF's bytes do not outlive a reload and a
       // dataset only ever lived server-side, so both report `missing` and the
@@ -2814,7 +2912,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
           return;
         }
         if (activeIdRef.current !== id || isStreaming(id)) return;
-        all = messagesRef.current;
+        all = withAdoptedPhotos(messagesRef.current, original, photos);
         original = all.find((m) => m.id === messageId);
         if (!original || original.role !== 'user') return;
       }
@@ -2909,7 +3007,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         dataset: resend.dataset,
       });
     },
-    [persist, toast],
+    [persist, serverPhotosForResend, toast],
   );
 
   /**
@@ -2995,16 +3093,31 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
   }, [unreachable, thread]);
 
   /** Retry: re-send the last user turn, attachment included. */
-  const retryLastTurn = useCallback(() => {
+  const retryLastTurn = useCallback(async () => {
     const id = activeIdRef.current;
-    if (!id || isStreaming(id)) return;
-    const all = messagesRef.current;
-    const view = threadRef.current;
+    if (!id || isStreaming(id) || pendingSendRef.current.has(id)) return;
+    let all = messagesRef.current;
+    let view = threadRef.current;
     let userIdx = view.length - 1;
     while (userIdx >= 0 && view[userIdx].role !== 'user') userIdx--;
     if (userIdx < 0) {
       setUnreachable(false);
       return;
+    }
+    // As in runRegenerate: photos the server stored by itself for the turn
+    // are written onto it first (serverPhotosForResend).
+    const asked = view[userIdx];
+    if (needsServerPhotoLookup(asked)) {
+      const photos = await serverPhotosForResend(id, asked);
+      if (!photos && answeredFromPhoto(view, userIdx)) {
+        toast(PHOTOS_UNCHECKED, 'error');
+        return;
+      }
+      if (activeIdRef.current !== id || isStreaming(id)) return;
+      all = withAdoptedPhotos(messagesRef.current, asked, photos ?? []);
+      view = withAdoptedPhotos(threadRef.current, asked, photos ?? []);
+      userIdx = view.findIndex((m) => m.id === asked.id);
+      if (userIdx < 0) return;
     }
     const resend = resendOptionsFor(view[userIdx]);
     if (resend.missing) {
@@ -3048,7 +3161,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       videoUploads: resend.videoUploads,
       dataset: resend.dataset,
     });
-  }, [toast]);
+  }, [serverPhotosForResend, toast]);
 
   // Leaving a chat NEVER stops its generation (ChatGPT behavior): it keeps
   // streaming in the background with a spinner on its sidebar row, and its

@@ -476,6 +476,27 @@ export function serverPhotoLookup(
   };
 }
 
+/**
+ * `messages` with `images`, the photos the server stored by itself for
+ * `turn`, written onto that turn as its `meta.images`: found by id, and only
+ * while it still has the same words and no references of its own
+ * (`withBackfilledImages`). The SAME array when nothing changed.
+ *
+ * QA 2026-10-03: a resend (regenerate, retry, edit) of such a turn writes
+ * them first, so the request names the photos (`image_refs`) and the turn
+ * keeps them when the resend gives it a new intent.
+ */
+export function withAdoptedPhotos(
+  messages: ChatMessage[],
+  turn: Pick<ChatMessage, 'id' | 'content'>,
+  images: MessageImage[],
+): ChatMessage[] {
+  if (images.length === 0) return messages;
+  const index = messages.findIndex((m) => m.id === turn.id);
+  if (index === -1) return messages;
+  return withBackfilledImages(messages, new Map([[index, { content: turn.content, images }]]));
+}
+
 /* ------------------------------------------------------- uploading photos */
 
 /** One photo in a POST /api/chat-media/{conversation} batch. */
