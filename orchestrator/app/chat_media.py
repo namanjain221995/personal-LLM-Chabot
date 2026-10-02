@@ -11,7 +11,7 @@ for display. Production chat 4ab7ac45 had a vision answer and no bytes
 anywhere: no uploads row, no conversation_images row, no file.
 
 WHAT THIS MODULE IS. The store, its routes and its housekeeping:
-  * POST /chat-media/{conversation}   store up to five pictures (the upload
+  * POST /chat-media/{conversation}   store up to MAX_FILES pictures (upload
                                       route; a browser backfilling the photos
                                       it still holds from before V44 uses it);
   * GET  /chat-media/{conversation}   the viewer's pictures in that chat;
@@ -108,11 +108,20 @@ router = APIRouter(prefix="/chat-media", tags=["chat-media"])
 
 log = logging.getLogger(__name__)
 
-#: The composer's own ceilings (frontend/components/Composer.tsx
-#: MAX_IMAGE_BYTES and MAX_IMAGES; main.MAX_IMAGES on /chat). Spelled out, not
-#: imported: main imports this module.
+#: The ceilings per picture and per request. MAX_IMAGE_BYTES applies to the
+#: bytes actually sent, which the composer has already shrunk to 1600 px
+#: (frontend/components/Composer.tsx). MAX_FILES is main.MAX_IMAGES, the
+#: pictures one message may carry: 20 since 2026-10-03 (5 before,
+#: docs/chat-media/LIMITS.md). Spelled out, not imported: main imports this
+#: module.
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
-MAX_FILES = 5
+MAX_FILES = 20
+#: Picture bytes one request may carry inline: the browser's batch budget for
+#: a POST here, and for the inline images of one /chat body (as base64
+#: characters there). A send over it goes by reference (`image_refs`). Well
+#: under Cloudflare's 100 MB request wall; main's 64 MiB body cap for this
+#: route is this plus the framing of MAX_FILES parts (a test pins that).
+BATCH_BUDGET_BYTES = 48 * 1024 * 1024
 
 #: The chat bubble's rendition: long edge, the size past which one is made,
 #: and its WebP quality.
@@ -175,9 +184,10 @@ _decode_executor_lock = threading.Lock()
 #: An inline data URL's prefix (what the composer sends), or none.
 _DATA_URL_PREFIX = re.compile(r"^data:[\w.+/-]*;base64,", re.I)
 
-#: The form parser's bounds: five pictures, and beside them five ids and a
-#: source. Every extra part is another spool file or another string in memory.
-_FORM_MAX_FIELDS = 16
+#: The form parser's bounds: MAX_FILES pictures, and beside them as many ids
+#: and a source, with the slack the five-picture form had (16 fields for 6).
+#: Every extra part is another spool file or another string in memory.
+_FORM_MAX_FIELDS = MAX_FILES + 11
 _FORM_MAX_FIELD_BYTES = 4 * 1024
 
 #: The reaper's first pass waits this long after start-up, so a deploy's
@@ -944,12 +954,22 @@ def _data_url(row: Dict[str, Any], data: bytes) -> str:
 
 
 def _load_refs(
-    user_id: int, conversation_id: str, attachment_ids: Sequence[str]
+    user_id: int,
+    conversation_id: str,
+    attachment_ids: Sequence[str],
+    max_chars: Optional[int] = None,
 ) -> Tuple[List[str], List[str]]:
+    """(data URLs in order, ids that could not be loaded). With `max_chars`
+    (image_memory's fallback) it stops reading once the loaded data URLs
+    reach that many characters: the caller keeps only what fits its budget,
+    so twenty 10 MiB originals are never all in memory at once."""
     rows = rows_by_attachment(user_id, conversation_id, attachment_ids)
     loaded: List[str] = []
     missing: List[str] = []
+    held = 0
     for attachment_id in attachment_ids:
+        if max_chars is not None and held >= max_chars:
+            break
         row = rows.get(attachment_id)
         data = read_full(row) if row is not None else None
         if data is None:
@@ -957,6 +977,7 @@ def _load_refs(
                 missing.append(attachment_id)
         else:
             loaded.append(_data_url(row, data))
+            held += len(loaded[-1])
     return loaded, missing
 
 
@@ -1035,7 +1056,10 @@ def _place_on_path(
 
 
 def _latest_visible_turn_images(
-    user_id: int, conversation_id: str, visible: Sequence[Tuple[str, str]]
+    user_id: int,
+    conversation_id: str,
+    visible: Sequence[Tuple[str, str]],
+    max_chars: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """`latest_turn_images` restricted to the path the browser sent.
 
@@ -1079,7 +1103,9 @@ def _latest_visible_turn_images(
         index, answer = placed
         # The newest picture on the path is the one "the photo" means; if its
         # files are gone, an older one would be the wrong picture.
-        loaded, _missing = _load_refs(user_id, conversation_id, _meta_attachment_ids(row["images"]))
+        loaded, _missing = _load_refs(
+            user_id, conversation_id, _meta_attachment_ids(row["images"]), max_chars
+        )
         if not loaded:
             return None
         return {
@@ -1094,6 +1120,7 @@ def latest_turn_images(
     user_id: int,
     conversation_id: str,
     visible: Optional[Sequence[Tuple[str, str]]] = None,
+    max_chars: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """image_memory's store fallback (CONTRACT §6): the newest USER message
     of this chat whose `meta.images` is non-empty, with its stored pictures.
@@ -1114,11 +1141,14 @@ def latest_turn_images(
     turn being asked now, when the browser's history push beat /chat to the
     database, and counting it would make an immediate follow-up look one turn
     late ("that chart" would stop meaning the picture).
+
+    `max_chars` stops reading pictures once that many data-URL characters
+    are loaded (see `_load_refs`); the turn's first pictures come first.
     """
     if not _valid_conversation(conversation_id):
         return None
     if visible is not None:
-        return _latest_visible_turn_images(int(user_id), conversation_id, visible)
+        return _latest_visible_turn_images(int(user_id), conversation_id, visible, max_chars)
     with db.read_connection() as con:
         row = con.execute(
             "SELECT t.content, t.images, "
@@ -1142,7 +1172,7 @@ def latest_turn_images(
     if row is None:
         return None
     ids = _meta_attachment_ids(row["images"])
-    loaded, _missing = _load_refs(int(user_id), conversation_id, ids)
+    loaded, _missing = _load_refs(int(user_id), conversation_id, ids, max_chars)
     if not loaded:
         return None
     following = row["next_message"] or {}
@@ -1312,7 +1342,7 @@ async def _upload(viewer: int, conversation_id: str, form) -> Any:
     if source not in ("upload", "backfill"):
         return _error(400, "bad_request", "source must be upload or backfill.")
     if not files or any(not isinstance(f, UploadFile) for f in files):
-        return _error(400, "bad_request", "Send one to five pictures as `file` parts.")
+        return _error(400, "bad_request", f"Send one to {MAX_FILES} pictures as `file` parts.")
     if len(files) > MAX_FILES:
         return _error(400, "bad_request", f"At most {MAX_FILES} pictures per request.")
     if len(ids) != len(files):

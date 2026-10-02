@@ -792,8 +792,9 @@ _DEFAULT_MAX_BODY_BYTES = _MIB
 
 #: POST /chat, for a signed-in caller: 128 MiB.
 #:
-#: /chat carries its attachments INLINE as base64 — images (`images`, up to
-#: MAX_IMAGES), a small PDF (`pdf`) — which is why
+#: /chat carries its attachments INLINE as base64 — images (`images`, at most
+#: `chat_media.BATCH_BUDGET_BYTES` of them inline; more go by `image_refs`), a
+#: small PDF (`pdf`) — which is why
 #: `frontend/app/api/chat/route.ts` sets MAX_CHAT_BODY_BYTES to exactly this
 #: number. Base64 costs a third on top of the bytes, so 128 MiB of body is
 #: ~96 MiB of attachment; anything larger already streams to `/uploads` and
@@ -818,9 +819,11 @@ _HISTORY_MESSAGES_PATH_RE = _re.compile(r"^/history/conversations/[^/]+/messages
 _CHUNKED_PART_PATH_RE = _re.compile(r"^/uploads/chunked/[^/]+/[^/]+/part/[^/]+$")
 
 #: POST /chat-media/{conversation}, for a signed-in caller: 64 MiB (V44,
-#: docs/chat-media/CONTRACT.md §4.1). Five pictures of at most 10 MiB each
-#: (the composer's MAX_IMAGES x MAX_IMAGE_BYTES) is 50 MiB of bytes plus the
-#: multipart framing; the Next proxy caps the same route at the same number.
+#: docs/chat-media/CONTRACT.md §4.1). Since 2026-10-03 one POST carries up to
+#: twenty pictures, and the browser batches them so each POST holds at most
+#: `chat_media.BATCH_BUDGET_BYTES` (48 MiB) of picture bytes
+#: (docs/chat-media/LIMITS.md); that plus the multipart framing of twenty
+#: parts fits here. The Next proxy caps the same route at the same number.
 _CHAT_MEDIA_MAX_BODY_BYTES = 64 * _MIB
 _CHAT_MEDIA_UPLOAD_PATH_RE = _re.compile(r"^/chat-media/[^/]+$")
 
@@ -2619,10 +2622,14 @@ class ChatMessage(BaseModel):
     content: str = ""
 
 
-# Composer multi-upload cap (2026-08-05): base64 images ride in the JSON chat
-# body, so five 10 MB uploads ≈ 67 MB of payload — a deliberate ceiling, not
-# an arbitrary one.
-MAX_IMAGES = 5
+# Pictures per message, inline and `image_refs` together. 5 since the
+# composer's multi-upload (2026-08-05); 20 since 2026-10-03
+# (docs/chat-media/LIMITS.md). The body is no longer what bounds it: the
+# browser sends a turn's pictures inline only while they fit a 48 MiB budget
+# and otherwise uploads them to /chat-media first and sends `image_refs`.
+# frontend/components/Composer.tsx and frontend/lib/orchestrator.ts hold the
+# same number; chat_media.MAX_FILES is the per-upload twin.
+MAX_IMAGES = 20
 
 
 class ChatRequest(BaseModel):
@@ -2677,8 +2684,9 @@ class ChatRequest(BaseModel):
     pdf_filename: Optional[str] = None
     # 2026-09-02: LARGE documents stream to /uploads (purpose=document) first
     # and the chat request carries REFERENCES — 512 MB of base64 through a
-    # JSON body would kill the browser tab and both servers. Up to five per
-    # message: [{"upload_id": "<32 hex>", "name": "contract.pdf"}, ...].
+    # JSON body would kill the browser tab and both servers. Up to
+    # `_MAX_DOC_REFS` (20) per message:
+    # [{"upload_id": "<32 hex>", "name": "contract.pdf"}, ...].
     # Small documents may still ride inline in `pdf` exactly as before.
     pdf_uploads: Optional[List[dict]] = Field(default=None, fail_fast=True)
     # 2026-09-09: videos ALWAYS stream to /uploads (purpose=video) first —
@@ -2851,10 +2859,12 @@ class ChatRequest(BaseModel):
 
 
 
-#: How a message may reference streamed documents: at most five. One of them
-#: may be an ARCHIVE, whose members then count against the engine's own,
-#: larger cap — five zips of twelve files each is a report, not a question.
-_MAX_DOC_REFS = 5
+#: How a message may reference streamed documents: at most twenty (5 until
+#: 2026-10-03, docs/chat-media/LIMITS.md). An ARCHIVE's members count against
+#: the engine's own cap (engines/document.MAX_DOCS), and every document shares
+#: one context budget (DOC_CONTEXT_CHARS): twenty documents are not twenty
+#: budgets.
+_MAX_DOC_REFS = 20
 
 #: Archive members read as documents / attached as images. Extensions the
 #: expander trusts as text-bearing; everything else is sniffed, and true
@@ -3224,7 +3234,11 @@ def _carries_a_file_to_read(
     return bool(_NAMES_AN_UPLOAD_RE.search(text))
 
 
-_MAX_VIDEO_REFS = 3
+#: Videos (and audio) a message may reference: 20 since 2026-10-03 (3 before,
+#: docs/chat-media/LIMITS.md). Each analysis is a detached job started at
+#: upload time, so this bounds the turn's lookups, not the work: the engine
+#: shares one pinned budget and one frame budget across them (engines/video.py).
+_MAX_VIDEO_REFS = 20
 
 
 async def _resolve_video_refs(

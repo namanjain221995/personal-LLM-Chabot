@@ -1,5 +1,5 @@
-"""Documents at ChatGPT scale: 512 MB files, five per message, chunked over
-the tunnel.
+"""Documents at ChatGPT scale: 512 MB files, twenty per message (five until
+2026-10-03), chunked over the tunnel.
 
 WHY (owner request 2026-09-02). The chat attach path capped documents at
 25 MB because a PDF travelled as base64 INSIDE the chat JSON — a limit set by
@@ -248,13 +248,48 @@ def test_a_swept_reference_is_one_clear_sentence():
     assert "gone.pdf" in err and "re-attach" in err
 
 
-def test_more_than_five_documents_is_refused():
+def test_more_than_twenty_documents_is_refused():
     from app.main import _resolve_document_refs
     import asyncio
 
-    refs = [{"upload_id": "a" * 32, "name": f"d{i}.pdf"} for i in range(6)]
+    refs = [{"upload_id": "a" * 32, "name": f"d{i}.pdf"} for i in range(21)]
     docs, _images, err = asyncio.run(_resolve_document_refs(_Req(pdf_uploads=refs), "c"))
-    assert docs == [] and "at most 5" in err
+    assert docs == [] and err == "A message can carry at most 20 documents."
+
+
+def test_twenty_documents_in_one_message_are_all_read(monkeypatch):
+    """docs/chat-media/LIMITS.md (2026-10-03): 20 documents per message, every
+    one resolved and merged into the one question, sharing ONE context
+    budget (the excerpt is not twenty budgets long)."""
+    import asyncio
+
+    from app.engines import document as eng
+    from app.main import _resolve_document_refs
+
+    ids = [_stored_document("conv-20", f"facts of file {i}".encode(), f"f{i:02d}.txt") for i in range(20)]
+    refs = [{"upload_id": u, "name": f"f{i:02d}.txt"} for i, u in enumerate(ids)]
+    docs, images, err = asyncio.run(_resolve_document_refs(_Req(pdf_uploads=refs), "conv-20"))
+    assert err is None and images == []
+    assert [name for name, _ in docs] == [f"f{i:02d}.txt" for i in range(20)]
+
+    seen = {}
+
+    async def fake_stream(messages, **kw):
+        seen["messages"] = messages
+        yield ("token", "ok")
+
+    async def emit(kind, payload):
+        pass
+
+    monkeypatch.setattr(eng.llm, "stream_chat_events", fake_stream)
+    monkeypatch.setattr("app.db.save_document", lambda *a, **k: None)
+    assert asyncio.run(eng.run_pdf_engine_multi("compare them", docs, [], emit)) == "ok"
+    user = seen["messages"][-1]["content"]
+    text = " ".join(p.get("text", "") for p in user if p.get("type") == "text")
+    assert "20 documents were uploaded and ALL were read" in text
+    assert "===== Document 20: f19.txt =====" in text
+    excerpt = text.split("Document text (most relevant sections):", 1)[1]
+    assert len(excerpt) <= eng.DOC_CONTEXT_CHARS + 200
 
 
 def test_inline_pdf_still_rides_along():

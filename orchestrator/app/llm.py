@@ -2069,14 +2069,19 @@ async def router_chat_completion(
     reads comes from it; `stream_chat_events` refuses to stream from its
     URL. A long message is CLIPPED rather than sent whole — the opening of a
     message determines its class, and the router's window is far smaller
-    than the main model's.
+    than the main model's. For the same reason it never carries more than
+    `context.CLASSIFICATION_MAX_IMAGES` pictures (the newest ones).
     """
     client = _client(settings.router_base_url)
     # Sized like a sidecar too: on a profile that points the router at the
     # main URL, an OPEN breaker means one refused attempt, not a /tokenize.
     sized, budget = await _fit(
         normalize_system(
-            clip_message_contents(messages, settings.router_input_char_cap)
+            clip_message_contents(
+                messages,
+                settings.router_input_char_cap,
+                max_images=context.CLASSIFICATION_MAX_IMAGES,
+            )
         ),
         base_url=settings.router_base_url,
         model=settings.router_model,

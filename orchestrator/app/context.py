@@ -815,8 +815,20 @@ def _longest_content_index(messages: Sequence[dict]) -> Optional[int]:
     return best
 
 
-def clip_message_contents(messages: Sequence[dict], cap: int) -> List[dict]:
-    """Clip every text content to `cap` characters (classification calls)."""
+#: Pictures one classification call may carry: the router's safe share, the
+#: number /v1 publishes for it (publicapi.registry.ROUTER_MAX_IMAGES; a test
+#: pins that they agree). Its window is small and an image part cannot be
+#: clipped like text, so since a message may carry 20 pictures (2026-10-03)
+#: the router is never handed more than this.
+CLASSIFICATION_MAX_IMAGES = 8
+
+
+def clip_message_contents(
+    messages: Sequence[dict], cap: int, *, max_images: Optional[int] = None
+) -> List[dict]:
+    """Clip every text content to `cap` characters (classification calls),
+    and keep at most `max_images` image parts, the newest ones (the turn
+    being classified is last)."""
     out: List[dict] = []
     for m in messages:
         content = m.get("content")
@@ -824,6 +836,22 @@ def clip_message_contents(messages: Sequence[dict], cap: int) -> List[dict]:
             out.append({**m, "content": content[:cap] + "\n…[truncated]"})
         else:
             out.append(dict(m))
+    if max_images is None:
+        return out
+    room = max(0, int(max_images))
+    for i in range(len(out) - 1, -1, -1):
+        content = out[i].get("content")
+        if not isinstance(content, list):
+            continue
+        kept: List[Any] = []
+        for part in reversed(content):
+            if _is_image_part(part):
+                if room == 0:
+                    continue
+                room -= 1
+            kept.append(part)
+        if len(kept) != len(content):
+            out[i] = {**out[i], "content": list(reversed(kept)) or ""}
     return out
 
 

@@ -164,7 +164,7 @@ def build_user_content(
     message: str, images: "str | Sequence[str]"
 ) -> List[dict]:
     """OpenAI multimodal content parts: text + one image_url per image
-    (2026-08-05: the composer sends up to 5). A bare string is accepted for
+    (2026-08-05; up to main.MAX_IMAGES, 20). A bare string is accepted for
     the single-image callers that predate the list form."""
     imgs = [images] if isinstance(images, str) else list(images)
     return [

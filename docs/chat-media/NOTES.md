@@ -956,3 +956,36 @@ The numbers the frontend track reads (LIMITS.md):
   - `video_uploads` (video and audio): at most 20 per message (was 3;
     `A message can carry at most 20 videos.`).
   - Datasets ride no `/chat` field; the server has no per-message dataset count.
+
+Backend as built (limits, 2026-10-03):
+
+- `chat_media.BATCH_BUDGET_BYTES = 48 MiB` is the number above, in code; a test pins that
+  `body_cap_for("POST", "/chat-media/c")` (64 MiB) holds it plus framing, that it is under the
+  /chat cap and under 100 MB. `_FORM_MAX_FIELDS` is `MAX_FILES + 11` (20 ids, a source, the old
+  slack); a 21st `file` part is Starlette's 400, re-wrapped as `bad_request`.
+- `engines/document.MAX_DOCS` 12 -> 24 (20 references, the inline PDF, an archive's manifest and
+  members). All documents still share ONE `DOC_CONTEXT_CHARS` (48,000) excerpt; page images come
+  from the first PDF only. Video: the pinned block and the answer frames were already shared
+  budgets (`engines/video.py`), so 20 videos are 20 lookups, not 20 budgets.
+- **The router never saw turn pictures.** `engines/router.route_request` gets `has_image` only (an
+  image forces `vision` with no model call), and every `router_chat_completion` caller sends text.
+  The only images the router reads are video frames, one per call (`video/screen.py`). It is now
+  also a rule in code: `router_chat_completion` keeps at most `context.CLASSIFICATION_MAX_IMAGES`
+  (8, = `publicapi.registry.ROUTER_MAX_IMAGES`) image parts, the newest.
+- image_memory with 20 photos keeps the turn's first pictures that fit, in order: the process
+  budget (`IMAGE_MEMORY_MAX_CHARS`, 24 M characters) usually holds all twenty shrunk photos; the
+  V41 row (`IMAGE_MEMORY_DB_CHARS`, 8 M) holds the first 8-30, by how large the shrunk photos are
+  (0.25-1 M characters each). Never a failed turn. The
+  store fallback now stops reading pictures once it has the process budget's worth
+  (`latest_turn_images(..., max_chars=)`), so twenty 10 MiB originals are never all in memory.
+  Honest limit: after a restart within the row's two hours, a follow-up hydrates the ROW, so it
+  sees only the pictures the row kept; the store fallback runs only when there is no row.
+- **Measured once on the production main model** (Qwen/Qwen3.6-35B-A3B-NVFP4, 127.0.0.1:8000,
+  2026-10-03, one other request running): 20 synthetic 1600x1200 JPEGs (3.50 MB, 4.67 M base64
+  characters, body 4.67 MB), `max_tokens` 16, thinking off, streamed: **38,063 prompt tokens
+  (~1,900 per picture), time to first token 22.08 s**, total 22.14 s, answer "there are 20
+  pictures attached". No restart needed (vLLM's per-prompt image limit is 999). A twenty-photo
+  turn therefore waits about 20 s before its first word even at Fast (the SSE heartbeat keeps the
+  connection), and a follow-up that re-sends the remembered pictures pays most of it again: the
+  engine runs `--no-enable-prefix-caching` (`prefix_cache_queries_total` 0); only vLLM's
+  multimodal processor cache can be hit.

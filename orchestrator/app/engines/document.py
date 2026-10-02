@@ -81,9 +81,10 @@ OCR_PAGE_BUDGET = 40
 #: Per-question char budget for document context in the answer prompt.
 DOC_CONTEXT_CHARS = 48_000
 #: Documents the ENGINE will merge into one question. A chat request carries
-#: at most five references, but one of them may be an ARCHIVE whose expansion
-#: legitimately yields more members than that.
-MAX_DOCS = 12
+#: at most 20 references (main._MAX_DOC_REFS, 5 until 2026-10-03) and an
+#: inline PDF, and an ARCHIVE among them adds its manifest and members; so
+#: this stays above 21. Every document shares the one DOC_CONTEXT_CHARS budget.
+MAX_DOCS = 24
 #: Page renders a Think/Max answer keeps for a born-digital PDF: enough to
 #: see the letterhead and the first table's layout, not a picture of every
 #: paragraph the text layer already carries.
