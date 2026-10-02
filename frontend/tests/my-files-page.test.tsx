@@ -78,15 +78,18 @@ const hex = (n: number) => n.toString(16).padStart(32, '0');
 
 interface Row {
   id: string;
-  source: 'upload' | 'text' | 'recording';
-  kind: 'document' | 'dataset' | 'video' | 'audio' | 'recording';
+  source: 'upload' | 'text' | 'recording' | 'media';
+  kind: 'document' | 'dataset' | 'image' | 'video' | 'audio' | 'recording';
   name: string;
   bytes: number | null;
   created_at: string;
   conversation: { id: string; title: string } | null;
   availability: 'available' | 'text_only' | 'summary_only' | 'processing' | 'expired';
   media: { status: string | null; duration_ms: number | null } | null;
-  can: { download: boolean; preview: 'text' | 'summary' | 'audio' | null; delete: boolean };
+  can: { download: boolean; preview: 'text' | 'summary' | 'audio' | 'image' | null; delete: boolean };
+  /** A stored chat picture's id (docs/chat-media/NOTES.md, fe-files). */
+  attachment_id?: string;
+  text_name?: string;
 }
 
 function at(hoursAgo: number): string {
@@ -153,6 +156,9 @@ class FakeFiles {
   /** Extra rows served on the second page, to prove the page de-duplicates. */
   overlapOnSecondPage = false;
   fileStatus = 200;
+  /** An orchestrator with picture rows counts them; an older one does not. */
+  knowsPictures = false;
+  pictureStatus = 200;
 
   constructor(rows: Row[]) {
     this.rows = rows;
@@ -196,7 +202,9 @@ class FakeFiles {
     if (url.pathname === '/api/files/mine/summary' && method === 'GET') {
       const all = this.matching(new URL(`http://app.test/?q=${encodeURIComponent(url.searchParams.get('q') ?? '')}`));
       const kinds: Record<string, { count: number; bytes: number }> = {};
-      for (const kind of ['document', 'dataset', 'video', 'audio', 'recording']) {
+      const counted = ['document', 'dataset', 'video', 'audio', 'recording'];
+      if (this.knowsPictures) counted.push('image');
+      for (const kind of counted) {
         const of = all.filter((r) => r.kind === kind);
         kinds[kind] = { count: of.length, bytes: of.reduce((n, r) => n + (r.bytes ?? 0), 0) };
       }
@@ -234,6 +242,15 @@ class FakeFiles {
               },
             ],
           })),
+      });
+    }
+    const pictureMatch = url.pathname.match(/^\/api\/chat-media\/([^/]+)\/([A-Za-z0-9_-]+)$/);
+    if (pictureMatch && method === 'GET') {
+      if (this.pictureStatus !== 200) return json({ code: 'not_found' }, this.pictureStatus);
+      // Bytes, not a jsdom Blob: undici's Response cannot read jsdom's Blob.
+      return new Response(new Uint8Array([0xff, 0xd8, 0xff]), {
+        status: 200,
+        headers: { 'content-type': 'image/jpeg' },
       });
     }
     const fileMatch = url.pathname.match(/^\/api\/uploads\/([^/]+)\/([0-9a-f]{32})\/file$/);
@@ -584,5 +601,136 @@ describe('deleting a recording', () => {
       };
       expect(deleteConfirmBody(live)).toContain(` ${IN_PROGRESS_DELETE_NOTE} `);
     }
+  });
+});
+
+/* ---------------------------------------------------------- pictures */
+
+/**
+ * 2026-10-02 (docs/chat-media/CONTRACT.md §9): photos sent in a chat are kept
+ * on the server and listed here, as kind `image`, with their thumbnail.
+ */
+describe('stored chat pictures', () => {
+  const ATT = 'img-leaf-0001';
+
+  function picture(n: number, over: Partial<Row> = {}): Row {
+    return {
+      id: `media:${hex(5000 + n)}`,
+      source: 'media',
+      kind: 'image',
+      name: `leaf-${n}.jpg`,
+      bytes: 400_000 + n,
+      created_at: at(n),
+      conversation: { id: 'conv-1', title: 'Leaf health' },
+      availability: 'available',
+      media: null,
+      can: { download: true, preview: 'image', delete: false },
+      attachment_id: ATT,
+      ...over,
+    };
+  }
+
+  let objectUrls: string[] = [];
+  beforeEach(() => {
+    objectUrls = [];
+    // jsdom has no object URLs; the dialog mints one for the full picture.
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: (blob: Blob) => {
+        const url = `blob:mock/${blob.type}/${objectUrls.length}`;
+        objectUrls.push(url);
+        return url;
+      },
+    });
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: () => undefined });
+  });
+
+  it('shows its thumbnail lazily, opens the full picture, and downloads from the picture route', async () => {
+    const fake = new FakeFiles([picture(1)]);
+    fake.knowsPictures = true;
+    await renderPage(fake);
+    const row = rowFor('leaf-1.jpg');
+    expect(within(row).getByText('Picture')).toBeTruthy();
+    expect(within(row).getByText('Stored')).toBeTruthy();
+    const thumb = row.querySelector('img')!;
+    expect(thumb.getAttribute('src')).toBe(`/api/chat-media/conv-1/${ATT}?size=thumb`);
+    expect(thumb.getAttribute('loading')).toBe('lazy');
+    expect(thumb.getAttribute('decoding')).toBe('async');
+    // The thumbnail is decorative: the row's heading names the picture.
+    expect(thumb.getAttribute('alt')).toBe('');
+    // Rendering fetched nothing (the browser loads the <img> itself).
+    expect(fake.calls.some((c) => c.url.pathname.startsWith('/api/chat-media/'))).toBe(false);
+
+    const download = within(row).getByRole('link', { name: 'Download leaf-1.jpg' });
+    expect(download.getAttribute('href')).toBe(`/api/chat-media/conv-1/${ATT}?size=full`);
+    expect(download.hasAttribute('download')).toBe(true);
+
+    fireEvent.click(within(row).getByRole('button', { name: 'Preview leaf-1.jpg' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Preview of leaf-1.jpg' });
+    await waitFor(() => expect(dialog.querySelector('img')).not.toBeNull());
+    expect(dialog.querySelector('img')!.getAttribute('src')).toBe(objectUrls[0]);
+    const read = fake.calls.find((c) => c.url.pathname === `/api/chat-media/conv-1/${ATT}`);
+    expect(read!.url.searchParams.get('size')).toBe('full');
+  });
+
+  it('a picture the server no longer has says so, and its row turns into Removed', async () => {
+    const fake = new FakeFiles([picture(1)]);
+    fake.pictureStatus = 410;
+    await renderPage(fake);
+    fireEvent.click(within(rowFor('leaf-1.jpg')).getByRole('button', { name: 'Preview leaf-1.jpg' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Preview of leaf-1.jpg' });
+    await waitFor(() => expect(within(dialog).getByText(/no longer stored on the server/)).toBeTruthy());
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close preview' }));
+    await waitFor(() => expect(within(rowFor('leaf-1.jpg')).getByText('Removed')).toBeTruthy());
+    expect(within(rowFor('leaf-1.jpg')).queryByRole('link', { name: /^Download/ })).toBeNull();
+    expect(within(rowFor('leaf-1.jpg')).getByText('This picture is no longer stored.')).toBeTruthy();
+    // ...and it no longer asks for a thumbnail that is not there.
+    expect(rowFor('leaf-1.jpg').querySelector('img')).toBeNull();
+  });
+
+  it('offers a Pictures type only once the server counts pictures', async () => {
+    const old = new FakeFiles([upload(1)]);
+    await renderPage(old);
+    let group = screen.getByRole('group', { name: 'Type' });
+    await waitFor(() => expect(within(group).getByRole('radio', { name: /Documents.*1/ })).toBeTruthy());
+    expect(within(group).queryByRole('radio', { name: /Pictures/ })).toBeNull();
+    cleanup();
+
+    const now = new FakeFiles([upload(1), picture(2), picture(3)]);
+    now.knowsPictures = true;
+    await renderPage(now);
+    group = screen.getByRole('group', { name: 'Type' });
+    await waitFor(() => expect(within(group).getByRole('radio', { name: /Pictures.*2/ })).toBeTruthy());
+    fireEvent.click(within(group).getByRole('radio', { name: /Pictures/ }));
+    expect(nav.replace).toHaveBeenLastCalledWith('/files?kind=image', { scroll: false });
+    await waitFor(() => expect(items()).toHaveLength(2));
+    expect(now.listCalls().at(-1)!.searchParams.get('kind')).toBe('image');
+  });
+
+  it('a server that keeps pictures: the page lists them, and stops saying they stay in the browser', async () => {
+    const fake = new FakeFiles([]);
+    fake.retention = { ...RETENTION, pictures: 'kept_with_chat' };
+    await renderPage(fake);
+    expect(
+      screen.getByText(/Documents, pictures, spreadsheets, videos and audio files you attach to a chat appear here/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Pictures stay only in the browser you sent them from/)).toBeNull();
+    expect(screen.getByText(/Pictures stay while their chat exists\./)).toBeTruthy();
+  });
+});
+
+describe('a file swept while the page was open', () => {
+  it('shows the text the chat kept, under the expired line, instead of stopping at the sentence', async () => {
+    const fake = new FakeFiles([
+      upload(1, { name: 'Q3 report.pdf', can: { download: true, preview: 'text', delete: false }, text_name: 'Q3 report.pdf' }),
+    ]);
+    fake.fileStatus = 410;
+    await renderPage(fake);
+    fireEvent.click(within(rowFor('Q3 report.pdf')).getByRole('button', { name: 'Preview Q3 report.pdf' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Preview of Q3 report.pdf' });
+    await waitFor(() => expect(within(dialog).getByText('The text the chat read.')).toBeTruthy());
+    expect(within(dialog).getByText(/The file itself has expired and is no longer stored/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close preview' }));
+    await waitFor(() => expect(within(rowFor('Q3 report.pdf')).getByText('Text only')).toBeTruthy());
   });
 });

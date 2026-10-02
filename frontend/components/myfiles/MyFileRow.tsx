@@ -153,19 +153,18 @@ function PictureTile({ file, onOpen }: { file: MyFile; onOpen?: () => void }) {
       </span>
     );
   }
-  // The thumbnail opens the picture too, as a photo in the chat does. It is
-  // out of the tab order: the row's Preview button is the keyboard's way in,
-  // and one stop per action is enough.
+  // The thumbnail opens the picture too, as a photo in the chat does — for a
+  // pointer only. It stays hidden from assistive technology and out of the
+  // tab order: the row's Preview button is the one way in for a keyboard or a
+  // screen reader, and two controls with one name would be read twice.
   return (
-    <button
-      type="button"
-      tabIndex={-1}
+    <span
+      aria-hidden
       onClick={onOpen}
-      aria-label={`Preview ${file.name}`}
-      className={`${tile} border border-border bg-surface-2 transition-opacity duration-ts hover:opacity-90`}
+      className={`${tile} cursor-pointer border border-border bg-surface-2 transition-opacity duration-ts hover:opacity-90`}
     >
       {thumb}
-    </button>
+    </span>
   );
 }
 
