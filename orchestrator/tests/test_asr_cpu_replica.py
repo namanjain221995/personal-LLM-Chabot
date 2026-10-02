@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import io
+import time
 import wave
 
+import httpx
 import pytest
 
 from app import asr, metrics
-from app.config import settings
+from app.config import Settings, settings
 
 
 def wav_bytes(seconds: float, *, list_chunk: bool = False) -> bytes:
@@ -312,10 +314,217 @@ def test_no_cpu_key_means_no_cpu_replica(monkeypatch):
         asr.set_provider(None)
 
 
-def test_the_dictation_pool_gains_exactly_the_cpu_replicas_one_slot(monkeypatch):
+def test_a_cpu_replica_listed_twice_is_one_replica_with_one_router_slot(monkeypatch):
+    """Verifier, 2026-09-30 (finding 4): "http://cpu/v1, http://cpu/v1/" gave one replica, which
+    decodes one clip at a time, two router slots, so a second clip queued inside it."""
+    monkeypatch.setenv("ASR_CPU_BASE_URLS", "http://cpu/v1, http://cpu/v1/ ,, http://cpu-b/v1,http://cpu/v1")
+    fresh = Settings()
+    assert fresh.asr_cpu_base_urls == ("http://cpu/v1", "http://cpu-b/v1")
+    monkeypatch.setattr(settings, "asr_base_urls", ("http://gpu-a/v1",))
+    monkeypatch.setattr(settings, "asr_cpu_base_urls", fresh.asr_cpu_base_urls)
+    asr.set_provider(None)
+    try:
+        assert [(r["endpoint"], r["tier"]) for r in asr.provider().stats()] == [
+            ("http://gpu-a/v1", "gpu"), ("http://cpu/v1", "cpu"), ("http://cpu-b/v1", "cpu"),
+        ]
+    finally:
+        asr.set_provider(None)
+
+
+# -- the replica's busy refusal, seen from the router ------------------------------------------------
+
+def test_a_decode_the_router_let_go_of_meets_a_busy_refusal_and_the_clip_takes_the_gpu_queue(monkeypatch):
+    """Verifier, 2026-09-30 (finding 1). The router's only picture of the CPU replica is its own
+    in-flight count, so after a cancelled call it offers the next overflow clip to a replica whose
+    one-clip lock the abandoned decode still holds (live: the next 30 s window timed out at 120 s
+    behind it). The replica now answers such a clip 503 at once (compose/whisper-cpu/server.py,
+    test_whisper_cpu_server.py), and the router takes it to the GPU queue in the same call."""
+    calls = []
+
+    async def replica(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if len(calls) == 1:
+            await asyncio.sleep(3600)  # the long decode its caller lets go of, below
+        return httpx.Response(503, json={"detail": "busy: the CPU replica is decoding another clip"})
+
+    transport = httpx.MockTransport(replica)
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *args, **kwargs: real(*args, **{**kwargs, "transport": transport}))
+    replica_cpu = asr.VLLMAudioProvider(base_url="http://cpu:30008/v1", model="openai/whisper-large-v3",
+                                        timeout_s=600.0, tier="cpu", fixed_s=8.5, s_per_audio_s=0.45)
+    a, b = Engine("http://a/v1"), Engine("http://b/v1")
+    router = asr.RoutedProvider([a, b], [replica_cpu])
+
+    async def drive():
+        first = await hold(router, a, wav_bytes(20.0))
+        second = await hold(router, b, wav_bytes(20.0))
+        abandoned = asyncio.create_task(router.transcribe(wav_bytes(200.0), filename="l.wav", content_type="audio/wav"))
+        while not calls:
+            await asyncio.sleep(0.01)
+        assert router._active[2] == 1
+        abandoned.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await abandoned
+        # The premise: the router believes the replica is free, and offers it the next clip first.
+        assert router._active[2] == 0 and router.stats()[2]["available"] is True
+        assert router._order(10.0, 120.0)[0] == 2
+        started = time.monotonic()
+        window = asyncio.create_task(router.transcribe_window(wav_bytes(10.0), filename="w.wav",
+                                                              content_type="audio/wav", timeout_s=120.0))
+        while len(calls) < 2:
+            await asyncio.sleep(0.01)
+        refused_after = time.monotonic() - started
+        a.release.set(); b.release.set()
+        result = await window
+        await first; await second
+        return result, refused_after
+
+    result, refused_after = asyncio.run(drive())
+    assert result.text == "http://a/v1", "the window finished on a GPU replica, not behind the decode"
+    assert refused_after < 5.0
+    assert router.stats()[2]["available"] is False, "the refusing replica stands down"
+    assert router._active == {0: 0, 1: 0, 2: 0}
+
+
+# -- the legacy dictation pool ---------------------------------------------------------------------
+
+#: The legacy path's container: WebM, whose length is unknown until it is decoded.
+LEGACY_CLIP = b"\x1aE\xdf\xa3" + b"\x00" * 100
+
+
+def _legacy_burst(monkeypatch, router: asr.RoutedProvider, engines, clips: int):
+    """`clips` legacy dictations at once through asr.transcribe (the pool, then the router), each
+    engine holding what it is given. Returns the router's in-flight counts once every admitted
+    clip is placed, the pool's lent count then, and how many callers were told busy."""
+    monkeypatch.setattr(settings, "asr_queue_wait_s", 0.2)
+    asr.POOL.reset_for_tests()
+    asr.set_provider(router)
+
+    async def drive():
+        for engine in engines:
+            engine.release.clear()
+        tasks = [
+            asyncio.create_task(asr.transcribe(LEGACY_CLIP, filename=f"{i}.webm", content_type="audio/webm"))
+            for i in range(clips)
+        ]
+        for _ in range(10):
+            await asyncio.sleep(0)
+        placed, lent = dict(router._active), getattr(asr.POOL, "lent", 0)
+        await asyncio.sleep(0.6)  # past the pool's queue wait: whoever still waits is refused
+        for engine in engines:
+            engine.release.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return placed, lent, sum(isinstance(r, asr.ASRBusy) for r in results)
+
+    try:
+        return asyncio.run(drive())
+    finally:
+        asr.set_provider(None)
+        asr.POOL.reset_for_tests()
+
+
+@pytest.fixture()
+def two_gpus_one_cpu(monkeypatch):
+    monkeypatch.setattr(settings, "asr_max_concurrent", 2)
+    monkeypatch.setattr(settings, "asr_base_urls", ("http://a/v1", "http://b/v1"))
+    monkeypatch.setattr(settings, "asr_cpu_base_urls", ("http://cpu/v1",))
+
+
+def test_the_pools_permits_are_the_gpu_replicas_alone(monkeypatch):
     monkeypatch.setattr(settings, "asr_max_concurrent", 2)
     monkeypatch.setattr(settings, "asr_base_urls", ("http://a/v1", "http://b/v1"))
     monkeypatch.setattr(settings, "asr_cpu_base_urls", ())
     assert asr.POOL._size() == 4
     monkeypatch.setattr(settings, "asr_cpu_base_urls", ("http://cpu/v1",))
-    assert asr.POOL._size() == 5
+    assert asr.POOL._size() == 4, "a CPU replica's slot is lent (below), never a permit"
+
+
+def test_the_dictation_pool_lends_the_cpu_slot_to_the_clip_the_cpu_takes(monkeypatch, two_gpus_one_cpu):
+    """With the CPU replica free, the pool holds what it did with the slot counted: five at once,
+    one decoding and one ready per GPU replica, and one on the CPU."""
+    a, b, c = Engine("http://a/v1"), Engine("http://b/v1"), cpu()
+    placed, lent, busy = _legacy_burst(monkeypatch, asr.RoutedProvider([a, b], [c]), (a, b, c), clips=6)
+    assert placed == {0: 2, 1: 2, 2: 1} and lent == 1
+    assert busy == 1
+
+
+def test_the_dictation_pool_admits_no_extra_clip_while_the_cpu_is_standing_down(monkeypatch, two_gpus_one_cpu):
+    """Verifier, 2026-09-30 (finding 5): with the CPU slot counted in the semaphore, the fifth
+    clip was admitted while the CPU replica stood down and went to a GPU replica as its third in
+    flight ({0: 3, 1: 2, 2: 0}), past ASR_MAX_CONCURRENT's one decoding, one ready."""
+    a, b, c = Engine("http://a/v1"), Engine("http://b/v1"), cpu(fail=True)
+    router = asr.RoutedProvider([a, b], [c])
+    router._down_until[2] = time.monotonic() + 600
+    placed, lent, busy = _legacy_burst(monkeypatch, router, (a, b), clips=5)
+    assert placed == {0: 2, 1: 2, 2: 0} and lent == 0
+    assert busy == 1
+
+
+def test_the_dictation_pool_admits_no_extra_clip_while_the_cpu_decodes_someone_elses(monkeypatch, two_gpus_one_cpu):
+    """A video or session window on the CPU replica is not the pool's: its slot is not lent."""
+    a, b, c = Engine("http://a/v1"), Engine("http://b/v1"), cpu()
+    router = asr.RoutedProvider([a, b], [c])
+    router._active[2] = 1  # a window from another path, decoding there
+    placed, lent, busy = _legacy_burst(monkeypatch, router, (a, b), clips=5)
+    assert placed == {0: 2, 1: 2, 2: 1} and lent == 0
+    assert busy == 1
+
+
+def test_a_clip_admitted_after_a_wait_that_the_cpu_takes_hands_its_permit_on(two_gpus_one_cpu):
+    a, b, c = Engine("http://a/v1"), Engine("http://b/v1"), cpu()
+    router = asr.RoutedProvider([a, b], [c])
+    router._active.update({0: 2, 1: 2, 2: 1})  # every permit's clip placed; the CPU busy with a window
+    asr.POOL.reset_for_tests()
+    asr.set_provider(router)
+
+    async def drive():
+        sem = asr.POOL._semaphore()
+        for _ in range(4):
+            await sem.acquire()
+        entered, leave, seen = asyncio.Event(), asyncio.Event(), {}
+
+        async def dictation():
+            async with asr.POOL:
+                seen.update(handed_on=sem._value, lent=asr.POOL.lent)
+                entered.set()
+                await leave.wait()
+
+        task = asyncio.create_task(dictation())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert asr.POOL.waiting == 1
+        router._active.update({0: 1, 2: 0})  # the window on the CPU ends, and one GPU clip
+        sem.release()                       # ...whose permit wakes the waiter
+        await entered.wait()
+        leave.set()
+        await task
+        return seen["handed_on"], seen["lent"], asr.POOL.lent, sem._value
+
+    try:
+        handed_on, lent, lent_after, value_after = asyncio.run(drive())
+    finally:
+        asr.set_provider(None)
+        asr.POOL.reset_for_tests()
+    # Every GPU replica still has a clip and the CPU is free: the router sends this clip there, so
+    # it holds the lent slot and its permit went back for the next caller.
+    assert (handed_on, lent) == (1, 1)
+    assert (lent_after, value_after) == (0, 1)
+
+
+def test_the_pools_question_to_the_router_is_the_routers_rule_and_counts_nothing():
+    a, b, c = Engine("http://a/v1"), Engine("http://b/v1"), cpu()
+    router = asr.RoutedProvider([a, b], [c])
+    before = dict(metrics._counters.get("asr_cpu_overflow_total", {}))
+    assert router.cpu_takes_next() is False  # a GPU replica is free
+    router._active.update({0: 1, 1: 1})
+    assert router.cpu_takes_next() is True
+    router._active[2] = 1
+    assert router.cpu_takes_next() is False  # the CPU replica is busy
+    router._active[2] = 0
+    router._down_until[2] = time.monotonic() + 60
+    assert router.cpu_takes_next() is False  # standing down
+    slow = asr.RoutedProvider([a], [cpu(s_per_audio_s=2.2)])
+    slow._active[0] = 1
+    assert slow.cpu_takes_next() is False  # a clip of unknown length would miss the engine timeout
+    assert asr.RoutedProvider([a]).cpu_takes_next() is False  # no CPU replica
+    assert dict(metrics._counters.get("asr_cpu_overflow_total", {})) == before

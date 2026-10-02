@@ -37,8 +37,9 @@ services:
       OMP_WAIT_POLICY: PASSIVE
     network_mode: host
     # THE TEN CORTEX-X925 CORES, AND EIGHT CORES' WORTH OF TIME ON THEM. cpus 0-4 and 10-14 are the
-    # slower A725 cluster, where the chat model's worker-rank threads, dockerd and the OCR engine's
-    # host side keep running untouched. The quota leaves two X925 cores' worth of time free
+    # slower A725 cluster. Nothing pins the chat model's worker rank to them (its container has no
+    # cpuset), so its threads may run on these ten too; the measured chat cost includes that.
+    # The quota leaves two X925 cores' worth of time free
     # inside the set as well.
     cpuset: "5-9,15-19"
     cpus: 8

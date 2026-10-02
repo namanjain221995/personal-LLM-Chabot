@@ -14,9 +14,10 @@ worker's fast cores, GPU replicas preferred, the same accuracy measured before i
 
 - **Chat pays for every GPU decode.** The chat model is tensor-parallel across both Sparks, so a
   busy GPU speech replica on either one slows every chat answer (107 → 53 tok/s for one, 28 for
-  both, measured 2026-09-28 on the previous main model, Qwen3.6-35B-A3B). A CPU decode does not
-  touch the GPU. Its cost is memory bandwidth, and that cost is measured below on the current main
-  model, Qwen3.8-27B.
+  both, measured 2026-09-28 on the main model, Qwen3.6-35B-A3B). A CPU decode does not touch the
+  GPU. Its cost is memory bandwidth, and that cost is measured below, mostly on
+  nvidia/Qwen3.8-27B-NVFP4, which was the main model only from 15:49 to 22:38 IST on 2026-09-30.
+  The main model is Qwen3.6-35B-A3B again, so those numbers do not describe the running model.
 - **The GPU replicas decode one clip at a time.** When both are busy, for example during a video
   analysis (`VIDEO_ASR_CONCURRENCY=2`, one clip per Spark), the next dictation waits behind a clip of
   up to 90 s. The CPU copy can take that dictation instead.
@@ -40,8 +41,12 @@ worker's fast cores, GPU replicas preferred, the same accuracy measured before i
 - **Worker only.** The head's memory is off limits for new services (owner, 2026-09-16), and
   `scripts/whisper-cpu.sh` refuses anything but dual mode.
 - **The ten Cortex-X925 cores** (cpus 5-9 and 15-19, 3.9 GHz), with a quota of eight cores' worth
-  of time. cpus 0-4 and 10-14 are the slower A725 cluster, where the chat model's worker-rank
-  threads, dockerd and the OCR engine's host side keep running.
+  of time. cpus 0-4 and 10-14 are the slower A725 cluster. **Nothing keeps the chat model's
+  worker rank off the X925 cores:** its container has no cpuset (`docker inspect` shows
+  `CpusetCpus` empty), so the scheduler may run its threads on the same ten cores as this replica.
+  Its busiest thread was on cpu 3 when sampled, but that is the scheduler's choice, not a rule.
+  The measured chat cost below includes whatever sharing happened. Pinning the vLLM worker away
+  from these cores would need a model restart and a new chat-cost measurement, so it is not done.
 - **Its own Compose project** (`sf-local-ai-whisper-cpu`, `compose/compose.whisper-cpu.yaml`), on
   its own port (30008). It binds the worker's management address itself with host networking, the
   same as the GPU replica and for the same reason: a published port does not survive a reboot there.
@@ -69,7 +74,8 @@ worker's fast cores, GPU replicas preferred, the same accuracy measured before i
 - **A decoder that cannot be restarted counts as a death too.** Before 2026-09-30 it was a 500
   that was never counted, so a replica whose decoder could no longer start (its model gone from
   the bind mount, a load that dies) answered 500 to every clip and Docker never restarted it.
-  Found and fixed in the end-to-end run below.
+  Found and fixed in the end-to-end run below. A restart that never says ready is killed after
+  60 s (the hang budget's fixed part) and counted the same way (fixed 2026-10-01).
 
 ## The same model, the same decode, the same contract
 
@@ -113,6 +119,15 @@ evenly, 576 s). Hindi was then widened to 200 FLEURS utterances. The GPU numbers
 and the gate on. The 160 added Hindi utterances came from a throwaway replica of the production
 image, whose server.py is byte-identical. The GPU totals reproduce the published baselines
 exactly: 4.21 / 6.81 / 41.93 %. The comparison is therefore paired, utterance by utterance.
+
+**Every pair below is `response_format=verbose_json`**, the format of recording-session windows,
+video windows and the legacy dictation's second pass. The legacy dictation's first pass asks for
+`json` (timestamps off for clips under 30 s), and whisper.cpp's text is not the same in that mode:
+the independent verifier's re-run of the committed image reproduced the recorded verbose_json
+answers on 10 of 10 clips, and in json mode came back with different text on 8 of 24
+(punctuation, case and three Hindi words). **json mode has not been paired against the GPU replica's json mode.**
+json-mode pairing: not measured yet (for the measuring agent to fill in: clips per set, CPU − GPU
+WER in pp with the paired-bootstrap 95 % CI, and identical text n/N).
 
 **The worker was shared while this was measured.** Other tracks' throwaway GPU whisper replicas,
 test Postgres servers and benchmarks were running, and they added one to two and a half cores of
@@ -310,8 +325,9 @@ probe the GPU use of both nodes was sampled (`nvidia-smi pmon`), and in the seco
 vLLM engine's own token counters, so a probe that shared the engine with another user's prefill
 could be seen.
 
-**The current main model, nvidia/Qwen3.8-27B-NVFP4 (dense, tensor-parallel across both Sparks),
-2026-09-30 17:51-18:25, 30 pairs in two batches, the image's decoder:**
+**nvidia/Qwen3.8-27B-NVFP4 (dense, tensor-parallel across both Sparks), the main model from 15:49
+to 22:38 IST on 2026-09-30 and not since, 17:51-18:25, 30 pairs in two batches, the image's
+decoder.** These numbers describe the 27B only:
 
 | state | probes | decode tok/s, mean (median) | of which no GPU whisper decoding at either sample: mean |
 |---|---:|---:|---:|
@@ -344,8 +360,9 @@ batch), and another track's throwaway GPU whisper replica on the worker was deco
 quiet engine, counting only probes that ran alone, would narrow the interval; the head-copy branch
 (`feat/cpu-whisper-head`) carries `scripts/whisper-cpu-chat-gate.py` for exactly that gate.
 
-**The previous main model** (Qwen3.6-35B-A3B, morning, 26 pairs, the upstream decoder): −3.6 %,
-95 % CI −11.6 % to +5.3 %, chat at 55-93 tok/s with another track's GPU replica decoding.
+**The main model now, Qwen3.6-35B-A3B** (back since 22:38 IST on 2026-09-30; measured that
+morning, 26 pairs, the upstream decoder): −3.6 %, 95 % CI −11.6 % to +5.3 %, chat at 55-93 tok/s
+with another track's GPU replica decoding. This is the only measurement on the running model.
 
 ## How the orchestrator uses it
 
@@ -362,7 +379,17 @@ quiet engine, counting only probes that ran alone, would narrow the interval; th
      clip of unknown length is costed at `ASR_MAX_AUDIO_SECONDS`.
 
    Otherwise the clip queues on the least busy GPU replica as before. **A clip that would miss its
-   deadline is never sent to the CPU.**
+   deadline is not sent to the CPU while the router's picture of the replica is right.** That
+   picture is the router's own in-flight count, and it forgets a decode whose caller let go of it
+   (a cancelled call, a read timeout, an orchestrator restart) while the replica keeps decoding,
+   up to the hang watchdog's `60 s + 2.5 × seconds`. Such a replica is costed as free. It used to
+   queue the next clip behind the abandoned decode (the independent verifier: a 30 s window timed
+   out at 120 s behind an abandoned 298 s dictation). **Now the replica refuses any clip while it
+   is decoding, with a 503 at once** ("busy: the CPU replica is decoding another clip",
+   `compose/whisper-cpu/server.py`), and the router takes that clip to the GPU queue in the same
+   call. So a clip is never left waiting behind a decode on the CPU. The cost: the replica stands
+   down after the refusal (20 s, doubling on repeats up to 600 s, as for any failure), so it may
+   sit idle a while after the abandoned decode ends.
 3. **The CPU replica is the last resort after every GPU replica has failed the same call**, under
    the same deadline rule.
 4. **A CPU failure falls back to the GPU queue.** A CPU read timeout is not re-sent: the replica
@@ -370,9 +397,18 @@ quiet engine, counting only probes that ran alone, would narrow the interval; th
    replica.
 5. **Dictation's optional second decode** (gated clips) is costed with the CPU's own numbers
    (`VLLMAudioProvider.decode_cost_s`) when it runs on the CPU. GPU replicas keep the loaded GPU rate.
-6. **Pool sizes.** The legacy dictation pool gains exactly the CPU replica's one slot. The
-   recording-session gate (`VOICE_SESSION_ASR_CONCURRENCY`) and the video pool
-   (`VIDEO_ASR_CONCURRENCY`) are unchanged, and `/v1` still routes over `ASR_BASE_URLS` only.
+6. **Pool sizes.** The legacy dictation pool's permits are the GPU replicas' alone
+   (`ASR_MAX_CONCURRENT` × GPU replicas), as before. A CPU replica's one slot is **lent** to a
+   clip only when the router would send that clip to the CPU replica first at that moment, and
+   given back when the clip ends (`asr._Pool`, `RoutedProvider.cpu_takes_next`). With the CPU
+   replica free the pool holds five clips on a two-GPU fleet, as before. While the CPU replica
+   stands down, decodes someone else's window or cannot meet the deadline, the pool holds four and
+   the fifth caller is told "busy" after `ASR_QUEUE_WAIT_S`. The first version counted the CPU's
+   slot as a permit, and that fifth clip went to a GPU replica as its third in flight, past "one
+   decoding, one ready" (the independent verifier). The recording-session gate
+   (`VOICE_SESSION_ASR_CONCURRENCY`) and the video pool (`VIDEO_ASR_CONCURRENCY`) are unchanged,
+   and `/v1` still routes over `ASR_BASE_URLS` only. `ASR_CPU_BASE_URLS` lists each replica once:
+   a URL listed twice, with or without a trailing slash, is one replica.
 
 ### When "every GPU replica is busy" actually happens
 
@@ -488,26 +524,60 @@ or fail it (503). Every call went through the product's own entry points (`asr.t
   of its window (0.0-29.98 s). The same code with the same pins was run on CPU fp32 for 3, 10
   and 30 s of silence, and each time the words ran to the end of the clip. The dictation retry
   judged such text by words per covered second only, so "you" scored 1.0 words/s, exactly the
-  floor, and reached the composer as a low-confidence "you". `speech_is_plausible` now drops a
-  gated retry that is nothing but stock phrases, however it is timed. That is the rule a gated
-  session window already had (`window_is_plausible`). Every measured case keeps its verdict
+  floor, and reached the composer as a low-confidence "you". On the CPU replica,
+  `speech_is_plausible` now drops a gated retry that is nothing but stock phrases, however it is
+  timed. That is the rule a gated session window already had (`window_is_plausible`). Every
+  measured case keeps its verdict
   (`test_asr_long_and_noisy.py::test_an_invention_timed_to_the_word_is_dropped_too`).
+  **The GPU replicas are not affected.** The first version applied the rule to every replica, so a
+  real quiet "Okay.", "Thank you." or "Bye." that a GPU replica's retry recovered came back empty
+  and marked silent. It now runs only when `VLLMAudioProvider.tier` is "cpu", and GPU dictation is
+  what it was before this branch: 0 of 200,000 random cases and none of the verifier's eight
+  changed their verdict against the fork point
+  (`test_the_stock_phrase_drop_is_the_cpu_tiers_alone`,
+  `test_a_gpu_replicas_recovered_short_reply_still_reaches_the_composer`). The builder's owner
+  action 5 (accept that change on GPU dictation) is therefore no longer needed.
 - **A decoder that could not restart was a 500, never counted.** It is now a 503 that counts toward
   the three-in-a-row exit (`test_whisper_cpu_server.py::test_a_decoder_that_cannot_restart_is_a_503_counted_toward_the_restart`).
+
+**Found by the independent verifier (2026-09-30) and fixed (2026-10-01):**
+- **A busy replica queued callers** (medium). A clip that arrived while the replica decoded one
+  its caller had let go of waited behind it and could miss its deadline. The replica now answers
+  503 "busy" at once, checked before the upload is read and again with no await before the lock
+  (`test_a_second_clip_while_one_decodes_is_refused_at_once_not_queued`), and the router takes the
+  clip to the GPU queue in the same call
+  (`test_a_decode_the_router_let_go_of_meets_a_busy_refusal_and_the_clip_takes_the_gpu_queue`).
+- **The stock-phrase rule changed GPU dictation** (low). Now the CPU tier's alone (above).
+- **The hang watchdog did not cover a decoder restart** (low). A restart that never printed its
+  ready line held the lock with no bound while `/health` said ready. The restart is now under the
+  same kind of timer, bounded by the hang budget's fixed part (60 s; a load takes ~9 s): killed at
+  the bound, "decoder did not become ready", a 503 counted toward the three-in-a-row exit
+  (`test_a_decoder_restart_that_never_says_ready_is_killed_at_its_bound_and_counted`).
+- **Duplicate entries in `ASR_CPU_BASE_URLS`** (low) gave one replica two router slots. Each URL is
+  now kept once (`test_a_cpu_replica_listed_twice_is_one_replica_with_one_router_slot`).
+- **The legacy pool counted the CPU's slot while the CPU could not take a clip** (low). The slot is
+  now lent only to a clip the router sends there (How the orchestrator uses it, item 6;
+  `test_the_dictation_pool_admits_no_extra_clip_while_the_cpu_is_standing_down`).
+- **json-mode accuracy is unpaired** (low): stated under Measured, with a placeholder for the pairing.
+- **The A725 sentence** (info): nothing pins the chat model's worker rank; corrected under Where it
+  runs. The worker rank is not pinned now (that would restart the model).
 
 ## Checklist before enabling (not yet done)
 
 1. The host guard update above (owner, sudo: `install-boot`, `apply`, `verify` on the worker).
    `up` refuses until it is done.
 2. `scripts/whisper-cpu.sh up` on the head (it builds and runs on the worker), then `verify`.
-3. **Decide on the chat cost.** On the 27B it is about 5 % while the replica decodes (above),
-   right at the gate the owner set for a head copy. A quiet-hours re-run with more pairs would
-   narrow it. Fewer threads (`WHISPER_CPU_THREADS` and `cpus` in compose/compose.whisper-cpu.yaml)
-   would lower it and slow the replica, and the router's estimate would then have to be
-   re-measured.
-4. Re-read the paired accuracy table if the GPU replica's decode settings change first (the
+3. **Decide on the chat cost.** It was about 5 % on the 27B while the replica decoded (above), but
+   the 27B is no longer the main model. On the running Qwen3.6-35B-A3B the one measurement is
+   −3.6 % (CI −11.6 % to +5.3 %, 26 pairs, the upstream decoder). A quiet-hours re-run on it with
+   more pairs would narrow that. Fewer threads (`WHISPER_CPU_THREADS` and `cpus` in
+   compose/compose.whisper-cpu.yaml) would lower it and slow the replica, and the router's
+   estimate would then have to be re-measured.
+4. **Pair json mode** (the legacy dictation's first pass) against the GPU replica, as described
+   under Measured.
+5. Re-read the paired accuracy table if the GPU replica's decode settings change first (the
    whisper-accuracy work).
-5. Record the GPU replica's long form of the two MUCS spans (five minutes of worker GPU, off-hours)
+6. Record the GPU replica's long form of the two MUCS spans (five minutes of worker GPU, off-hours)
    to pair the one long-form Hindi-English row.
 
 ## Known limits
@@ -516,7 +586,8 @@ or fail it (503). Every call went through the product's own entry points (`asr.t
   GPU replica. That is the point of "overflow only". A person waits for the CPU only when they
   would otherwise have waited behind someone else's clip.
 - **One clip at a time.** whisper.cpp could decode two clips on four threads each, but the total
-  would not be higher, and the chat cost would be.
+  would not be higher, and the chat cost would be. A second clip is refused with a 503, never
+  queued (How the orchestrator uses it, item 2).
 - **No batching, no streaming**, the same as the GPU replica.
 - **Other workloads on the worker slow it.** The estimate above was measured with 1-2.5 cores of
   other load present, and one evening run was 1.4 times slower than the morning's on the same
@@ -540,4 +611,6 @@ or fail it (503). Every call went through the product's own entry points (`asr.t
   replicas take segment times from the decoded timestamp tokens (whisper.cpp's token-level
   timestamps are off). On silence, whisper.cpp ended its invented "you" at 0.62 s where the
   pipeline ran "Thank you." to the end of the window. Anything that judges words per second of a
-  segment must not assume one engine's habit. The dictation retry no longer does (above).
+  segment must not assume one engine's habit. The dictation retry no longer does on the CPU
+  replica (above). On a GPU replica it still relies on the pipeline's habit, which is what its
+  density rule was measured on.

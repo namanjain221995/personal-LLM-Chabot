@@ -12,7 +12,10 @@ THE CONTRACT IS compose/whisper/server.py's, EXACTLY. Same routes, same form fie
 response fields (text, language, language_code, duration, no_speech_prob, segments, processing_ms,
 task), the same no-speech gate at the same threshold, the same limits and the same error statuses,
 so the orchestrator's client (`VLLMAudioProvider`) cannot tell which replica answered except by
-the time it took. Anything added here is additive (/health carries a few more keys).
+the time it took. Anything added here is additive (/health carries a few more keys). One
+difference is deliberate: a clip that arrives while another is decoding gets a 503 at once instead
+of waiting behind it, because this copy is overflow and the GPU queue is the place to wait
+(`_cpu_lock`).
 
     POST /v1/audio/transcriptions   multipart: file, [model], [language],
                                     [response_format=json|text|verbose_json],
@@ -99,7 +102,16 @@ NO_SPEECH_THRESHOLD = float(os.environ.get("WHISPER_NO_SPEECH_THRESHOLD", "0.6")
 
 #: One clip at a time, as on the GPU replica. The cores are the resource here, and two decodes
 #: sharing eight threads would each take twice as long.
+#:
+#: A SECOND CLIP IS REFUSED, NEVER QUEUED (2026-10-01). The orchestrator's router admits a clip
+#: here only when its own in-flight count for this replica is zero, and costs it as if this
+#: replica were free. That count forgets a decode the caller let go of (a cancelled call, a read
+#: timeout, an orchestrator restart), while this process keeps decoding it: a clip queued behind
+#: it here missed its deadline (a 30 s session window timed out at 120 s behind an abandoned
+#: 298 s dictation, measured on the worker). So `transcriptions` answers 503 while this lock is
+#: held, and the router takes that clip to the GPU queue in the same call.
 _cpu_lock = asyncio.Lock()
+BUSY_DETAIL = "busy: the CPU replica is decoding another clip"
 
 #: Worker failures in a row before the process gives up and lets Docker restart it (the GPU
 #: replica's CUDA_DEATH_THRESHOLD, for a native decoder that keeps dying).
@@ -138,8 +150,14 @@ def _sha256(path: str) -> str:
     return digest.hexdigest()
 
 
-def _start_worker() -> None:
-    """Start wcpp-worker and wait for its ready line. Raises on failure."""
+def _start_worker(ready_within_s: Optional[float] = None) -> None:
+    """Start wcpp-worker and wait for its ready line. Raises on failure.
+
+    A RESTART IS BOUNDED (2026-10-01). `_ask_worker` restarts the decoder under `_cpu_lock` and
+    passes `ready_within_s`; a decoder that has not said ready by then is killed, and the start is
+    a `WorkerDied`, counted like a death in a decode. Without the bound a restart that never
+    answered held the lock for good while /health said ready. The start at boot is not bounded
+    here: until it returns the server does not listen at all, which the healthcheck sees."""
     proc = subprocess.Popen(
         [WORKER_BIN, "--model", MODEL_FILE, "--threads", str(THREADS)],
         stdin=subprocess.PIPE,
@@ -150,7 +168,24 @@ def _start_worker() -> None:
         env={**os.environ, "WCPP_QUIET": "1", "OMP_NUM_THREADS": str(THREADS)},
     )
     assert proc.stdout is not None
-    line = proc.stdout.readline()
+    hung = threading.Event()
+    watchdog: Optional[threading.Timer] = None
+    if ready_within_s is not None:
+
+        def _kill_hung() -> None:
+            hung.set()
+            proc.kill()
+
+        watchdog = threading.Timer(ready_within_s, _kill_hung)
+        watchdog.daemon = True
+        watchdog.start()
+    try:
+        line = proc.stdout.readline()
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+    if hung.is_set():
+        raise WorkerDied("decoder did not become ready")
     try:
         hello = json.loads(line)
     except (ValueError, TypeError):
@@ -207,7 +242,10 @@ def _ask_worker(audio: np.ndarray, language: Optional[str], *, timestamps: bool,
         proc = _state.get("worker")
         if proc is None or proc.poll() is not None:
             try:
-                _start_worker()
+                # Bounded like a decode, by the hang budget's fixed part: a load takes ~9 s.
+                _start_worker(ready_within_s=HANG_FIXED_S)
+            except WorkerDied:
+                raise
             except RuntimeError as exc:
                 # A decoder that cannot be RESTARTED is the same failure as one that dies in a
                 # decode: a 503, counted, so three in a row end the process and Docker restarts
@@ -431,6 +469,10 @@ async def transcriptions(
             detail=_state["error"] or "model is still loading",
         )
 
+    if _cpu_lock.locked():
+        # Overflow only: refused before the upload is even read (see `_cpu_lock`).
+        raise HTTPException(status_code=503, detail=BUSY_DETAIL)
+
     payload = await file.read()
     if not payload:
         raise HTTPException(status_code=400, detail="empty upload")
@@ -446,6 +488,10 @@ async def transcriptions(
             detail=f"audio is {seconds:.0f}s; the limit is {MAX_AUDIO_SECONDS:.0f}s",
         )
 
+    # Checked again after the awaits above, and with no await between this check and the
+    # acquire, so no clip ever waits on the lock.
+    if _cpu_lock.locked():
+        raise HTTPException(status_code=503, detail=BUSY_DETAIL)
     async with _cpu_lock:
         _state["busy_since"] = time.monotonic()
         try:

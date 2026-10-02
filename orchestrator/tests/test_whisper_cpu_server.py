@@ -169,10 +169,13 @@ FAKE_WORKER = textwrap.dedent(
     """\
     #!/usr/bin/env python3
     # wcpp-worker's protocol, with canned answers: silence scores 0.71 (the measured digital-silence
-    # number), anything else is "hello world" in English; n_samples == 12345 makes it die and
-    # n_samples == 23456 makes it hang. FAKE_WCPP_NO_START makes it exit before its ready line,
-    # like a decoder killed while it loads the model.
+    # number), anything else is "hello world" in English; n_samples == 12345 makes it die,
+    # n_samples == 23456 makes it hang and n_samples == 34567 makes it take 3 s. FAKE_WCPP_NO_START
+    # makes it exit before its ready line, like a decoder killed while it loads the model, and
+    # FAKE_WCPP_HANG_START=<s> makes it wait that long before its ready line.
     import json, os, struct, sys, time
+    if os.environ.get("FAKE_WCPP_HANG_START"):
+        time.sleep(float(os.environ["FAKE_WCPP_HANG_START"]))
     if os.environ.get("FAKE_WCPP_NO_START"):
         sys.exit(1)
     print(json.dumps({"ready": True, "load_ms": 1.0, "system_info": "fake"}), flush=True)
@@ -184,6 +187,8 @@ FAKE_WORKER = textwrap.dedent(
             sys.exit(9)
         if n == 23456:
             time.sleep(120)
+        if n == 34567:
+            time.sleep(3)
         samples = struct.unpack("<%df" % n, raw)
         silent = max(abs(x) for x in samples) == 0.0
         nsp = 0.71 if silent else 0.01
@@ -375,6 +380,86 @@ def test_a_hung_decoder_is_killed_at_its_bound_and_the_next_clip_gets_a_fresh_on
     assert health["busy"] is False and health["worker_failures"] == 1
     assert _post(client, _wav(1.0)).json()["text"] == "hello world"
     assert client.get("/health").json()["worker_failures"] == 0
+
+
+def test_a_decoder_restart_that_never_says_ready_is_killed_at_its_bound_and_counted(server, monkeypatch):
+    """Verifier, 2026-09-30 (finding 3): the watchdog was armed only after a restart returned, so
+    a decoder whose restart never printed its ready line held the one-clip lock with no bound
+    while /health said ready (8.0 s held with a 1 s bound). The restart is now under the same
+    kind of timer: killed at the bound, a 503 counted toward the three-in-a-row exit."""
+    module, client = server
+    exits = []
+    monkeypatch.setattr(module, "_exit_soon", lambda *args, **kwargs: exits.append(args))
+    module.HANG_FIXED_S = 2.0
+    module.HANG_S_PER_AUDIO_S = 0.0
+    assert _post(client, _wav(0, samples=12345)).status_code == 503  # the running decoder dies
+    monkeypatch.setenv("FAKE_WCPP_HANG_START", "60")  # every restart from here on hangs
+    for failures in (2, 3):
+        started = time.monotonic()
+        r = _post(client, _wav(1.0))
+        took = time.monotonic() - started
+        assert r.status_code == 503, r.text
+        assert r.json()["detail"] == "transcription failed: decoder did not become ready"
+        assert took < 15, f"the restart held the request {took:.1f}s against a 2 s bound"
+        health = client.get("/health").json()
+        assert health["worker_failures"] == failures and health["busy"] is False
+    assert len(exits) == 1, "three in a row end the process so Docker restarts it"
+    assert client.get("/health").json()["ready"] is False
+
+
+def test_a_decoder_restart_after_a_hung_one_serves_again(server, monkeypatch):
+    module, client = server
+    module.HANG_FIXED_S = 2.0
+    module.HANG_S_PER_AUDIO_S = 0.0
+    assert _post(client, _wav(0, samples=12345)).status_code == 503
+    monkeypatch.setenv("FAKE_WCPP_HANG_START", "60")
+    assert _post(client, _wav(1.0)).status_code == 503
+    monkeypatch.delenv("FAKE_WCPP_HANG_START")
+    assert _post(client, _wav(1.0)).json()["text"] == "hello world"
+    assert client.get("/health").json()["worker_failures"] == 0
+
+
+def test_a_second_clip_while_one_decodes_is_refused_at_once_not_queued(server):
+    """Verifier, 2026-09-30 (finding 1): the router costs a clip as if this replica were free, but
+    its in-flight count forgets a decode the caller let go of while this process keeps decoding
+    it. A clip that queued here behind such a decode missed its deadline (a 30 s session window
+    timed out at 120 s behind an abandoned 298 s dictation). It is refused with a 503 at once,
+    which the orchestrator reads as ASRUnavailable and takes to the GPU queue in the same call."""
+    import threading
+
+    _module, client = server
+    out = {}
+    slow = threading.Thread(target=lambda: out.setdefault("first", _post(client, _wav(0, samples=34567))))
+    slow.start()
+    deadline = time.monotonic() + 10
+    while not client.get("/health").json()["busy"]:
+        assert time.monotonic() < deadline, "the first decode never started"
+        time.sleep(0.02)
+    started = time.monotonic()
+    second = _post(client, _wav(1.0))
+    took = time.monotonic() - started
+    slow.join(timeout=30)
+    assert second.status_code == 503, second.text
+    assert second.json()["detail"] == "busy: the CPU replica is decoding another clip"
+    assert took < 1.0, f"the second clip waited {took:.2f}s"
+    assert out["first"].status_code == 200 and out["first"].json()["text"] == "hello world"
+    # A refusal is not a decoder failure, and the replica takes the next clip once it is free.
+    health = client.get("/health").json()
+    assert health["worker_failures"] == 0 and health["busy"] is False
+    assert _post(client, _wav(1.0)).status_code == 200
+
+
+def test_the_busy_refusal_is_checked_before_the_upload_and_again_before_the_lock():
+    """Both checks, and nothing awaited between the second one and the acquire: a clip is never
+    queued on the lock (the refusal above would otherwise be a race)."""
+    fn = _function(_tree(CPU_SERVER), "transcriptions")
+    body = ast.unparse(fn)
+    check = "if _cpu_lock.locked():"
+    assert body.count(check) == 2
+    first, second = body.index(check), body.rindex(check)
+    assert first < body.index("await file.read()") < second
+    between = body[second:body.index("async with _cpu_lock:")]
+    assert "await" not in between, between
 
 
 def test_the_watchdog_leaves_a_decode_inside_its_bound_alone(server):

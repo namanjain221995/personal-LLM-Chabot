@@ -67,6 +67,7 @@ PCM it cut itself — see `transcribe_segments` and the BATCH pool.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import dataclasses
 import logging
 import re
@@ -593,6 +594,7 @@ class VLLMAudioProvider:
             heard_again.duration_s or heard.duration_s or 0.0,
             second.segments,
             engine_heard_speech=False,
+            tier=self.tier,
         ):
             metrics.inc("asr_gated_retry_total", "silence-gated dictations decoded again", result="accepted")
             # A plain Transcript, the shape dictation always returns: the
@@ -924,6 +926,7 @@ def speech_is_plausible(
     *,
     engine_heard_speech: bool,
     no_speech_prob: Optional[float] = None,
+    tier: str = "gpu",
 ) -> bool:
     """Whether a dictation transcript is speech rather than Whisper's invention.
 
@@ -933,7 +936,8 @@ def speech_is_plausible(
     was not sure was speech (`no_speech_prob`). False: the gate called the
     clip silent and the text comes from the ungated retry, so the words must
     be as dense as speech — measured over the audio the segments cover, or
-    the whole clip when the reply carries no segments.
+    the whole clip when the reply carries no segments. `tier` is the replica
+    that decoded it ("gpu" or "cpu", `VLLMAudioProvider.tier`).
     """
     units = _speech_units(text)
     if units == 0:
@@ -942,15 +946,17 @@ def speech_is_plausible(
         if no_speech_prob is not None and no_speech_prob < _CONFIDENT_SPEECH_NSP:
             return True
         return not (seconds >= _STOCK_PHRASE_MIN_SECONDS and _only_stock_phrases(text))
-    # Nothing but stock phrases, from a clip the gate called silent, is an
-    # invention however the engine times it: window_is_plausible's rule for a
-    # gated session window. The density below caught it only while every
-    # engine timed such a phrase to the end of its window, as the GPU
-    # pipeline does ("Thank you." at 0-29.98 s over 10 s of digital silence,
-    # 0.2 words/s). whisper.cpp, the CPU replica, times it to the word: "you"
-    # at 0.00-0.62 s over the same clip is 1.0 words/s, and it was kept
-    # (measured end to end on the worker, 2026-09-30).
-    if _only_stock_phrases(text):
+    # ON THE CPU REPLICA ONLY: nothing but stock phrases, from a clip the gate
+    # called silent, is an invention however the engine times it. The density
+    # below catches it while the engine times such a phrase to the end of its
+    # window, as the GPU pipeline does ("Thank you." at 0-29.98 s over 10 s of
+    # digital silence, 0.2 words/s). whisper.cpp, the CPU replica, times it to
+    # the word: "you" at 0.00-0.62 s over the same clip is 1.0 words/s, and it
+    # was kept (measured end to end on the worker, 2026-09-30). Not on a GPU
+    # replica (verifier, 2026-09-30): there the density already drops the
+    # invention, and the rule would drop a real quiet "Okay." or "Thank you."
+    # that the retry recovered, a change nobody asked for on the GPU path.
+    if tier == "cpu" and _only_stock_phrases(text):
         return False
     # A stock phrase that is not all of the text is the decoder filling a
     # quiet stretch: live, a 60 s dictation (32 s quiet, then 52 words of real
@@ -1172,13 +1178,16 @@ class RoutedProvider:
         clip = self._longest_clip_s if seconds is None else float(seconds)
         return float(estimate(clip)) * self._cpu_margin <= float(deadline_s)
 
-    def _order(self, seconds: Optional[float] = None, deadline_s: Optional[float] = None) -> List[int]:
+    def _order(
+        self, seconds: Optional[float] = None, deadline_s: Optional[float] = None, *, count: bool = True
+    ) -> List[int]:
         """Healthy engines first, freest first; then the ones standing down.
 
         The stood-down engines stay on the end rather than being dropped, so a
         fleet where every engine is cooling off still tries one instead of
         failing a request nobody had to lose. CPU replicas are placed by the
         rule above; with none configured this is exactly the order it always was.
+        `count=False` asks without counting an overflow (`cpu_takes_next`).
         """
         now = time.monotonic()
         gpu = [i for i in range(len(self._engines)) if self._tier[i] == "gpu"]
@@ -1199,6 +1208,8 @@ class RoutedProvider:
         if any(self._active[i] == 0 for i in healthy):
             # A GPU replica is free: it takes the clip. The CPU only backs the GPUs up.
             return order + usable
+        if not count:
+            return usable + order
         if usable:
             outcome = "sent"
         elif not any(self._down_until[i] <= now for i in cpus):
@@ -1213,6 +1224,14 @@ class RoutedProvider:
             outcome=outcome,
         )
         return usable + order
+
+    def cpu_takes_next(self) -> bool:
+        """Whether a clip of unknown length routed NOW goes to a CPU replica first: every GPU
+        replica is busy or standing down, and a CPU replica is up, free and fast enough for the
+        engine timeout. `_order`'s own rule, uncounted. The dictation pool asks it before lending
+        a CPU replica's slot (`_Pool`)."""
+        order = self._order(None, self._deadline_s({}), count=False)
+        return bool(order) and self._tier[order[0]] == "cpu"
 
     async def transcribe(
         self, audio: bytes, *, filename: str, content_type: str, language: str = ""
@@ -1382,13 +1401,34 @@ class RoutedProvider:
 
 
 class _Pool:
-    """A semaphore that reports its own depth, and refuses rather than hangs."""
+    """A semaphore that reports its own depth, and refuses rather than hangs.
+
+    A CPU REPLICA'S SLOT IS LENT, NOT ADDED TO THE SEMAPHORE (2026-10-01).
+    The permits are the GPU replicas' alone (`_size`), as before the CPU
+    replica existed. A clip is admitted WITHOUT a permit only when the router
+    would send it to a CPU replica first at that moment (`_lend`), and it
+    gives that slot back when it leaves. The router places the clip in the
+    same synchronous run, so the lent slot is the one the clip uses. Adding
+    the CPU's slot to the semaphore instead (the first version) admitted it
+    while the CPU could not take a clip (standing down, busy with a video or
+    session window, or too slow for the deadline), and that clip went to a
+    GPU replica as the third in flight, past ASR_MAX_CONCURRENT's "one
+    decoding, one ready" (verifier, 2026-09-30). A lent clip whose CPU call
+    fails still falls back to the GPU queue, like any failed engine.
+    """
 
     def __init__(self) -> None:
         self._sem: Optional[asyncio.Semaphore] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.waiting = 0
         self.active = 0
+        #: Clips in flight on a lent CPU slot rather than a permit.
+        self.lent = 0
+        #: Per task, innermost last: whether each admission was lent a slot,
+        #: so `__aexit__` gives back the kind it took.
+        self._held: contextvars.ContextVar[Tuple[bool, ...]] = contextvars.ContextVar(
+            f"asr_pool_held_{id(self)}", default=()
+        )
 
     #: How many may be in flight at once. Dictation's pool scales with the
     #: fleet (see below); the batch pool does NOT — see `BATCH_POOL`.
@@ -1396,10 +1436,16 @@ class _Pool:
         # Per engine, times the fleet: two nodes carry twice the work at
         # the same pressure each. `settings.asr_base_urls` is never empty
         # (config falls back to the single URL), so this is at least one.
-        # A CPU replica adds the one clip it decodes at a time, and no more:
-        # it takes a clip only when the GPU replicas are all busy.
-        gpu = max(1, settings.asr_max_concurrent) * max(1, len(settings.asr_base_urls))
-        return gpu + RoutedProvider._CPU_MAX_ACTIVE * len(getattr(settings, "asr_cpu_base_urls", ()) or ())
+        return max(1, settings.asr_max_concurrent) * max(1, len(settings.asr_base_urls))
+
+    def _lend(self) -> bool:
+        """Whether this admission takes a CPU replica's slot instead of a
+        permit: one is configured and the router would send a clip arriving
+        now to it first (`RoutedProvider.cpu_takes_next`)."""
+        if not getattr(settings, "asr_cpu_base_urls", ()):
+            return False
+        router = _provider
+        return isinstance(router, RoutedProvider) and router.cpu_takes_next()
 
     def _semaphore(self) -> asyncio.Semaphore:
         loop = asyncio.get_running_loop()
@@ -1412,19 +1458,29 @@ class _Pool:
 
     async def __aenter__(self) -> "_Pool":
         sem = self._semaphore()
-        self.waiting += 1
-        metrics.set_gauge("asr_queue_depth", self.waiting, "requests waiting for a slot")
-        try:
-            # asyncio.timeout, not asyncio.wait_for: on Python 3.11 (CI's
-            # interpreter) wait_for can swallow a cancellation that arrives in
-            # the same pass as the timeout, which hung a CI run once.
-            async with asyncio.timeout(settings.asr_queue_wait_s):
-                await sem.acquire()
-        except TimeoutError as exc:
-            raise ASRBusy("every transcription slot is busy") from exc
-        finally:
-            self.waiting -= 1
+        lent = self._lend()
+        if not lent:
+            self.waiting += 1
             metrics.set_gauge("asr_queue_depth", self.waiting, "requests waiting for a slot")
+            try:
+                # asyncio.timeout, not asyncio.wait_for: on Python 3.11 (CI's
+                # interpreter) wait_for can swallow a cancellation that arrives in
+                # the same pass as the timeout, which hung a CI run once.
+                async with asyncio.timeout(settings.asr_queue_wait_s):
+                    await sem.acquire()
+            except TimeoutError as exc:
+                raise ASRBusy("every transcription slot is busy") from exc
+            finally:
+                self.waiting -= 1
+                metrics.set_gauge("asr_queue_depth", self.waiting, "requests waiting for a slot")
+            # Admitted after a wait, into a fleet whose next clip goes to a
+            # CPU replica: this one does, so its permit goes to the next caller.
+            lent = self._lend()
+            if lent:
+                sem.release()
+        if lent:
+            self.lent += 1
+        self._held.set(self._held.get() + (lent,))
         self.active += 1
         metrics.set_gauge("asr_active_requests", self.active, "transcriptions in flight")
         return self
@@ -1432,7 +1488,11 @@ class _Pool:
     async def __aexit__(self, *_exc: Any) -> None:
         self.active -= 1
         metrics.set_gauge("asr_active_requests", self.active, "transcriptions in flight")
-        if self._sem is not None:
+        held = self._held.get()
+        self._held.set(held[:-1])
+        if held and held[-1]:
+            self.lent -= 1
+        elif self._sem is not None:
             self._sem.release()
 
     def reset_for_tests(self) -> None:
@@ -1440,6 +1500,7 @@ class _Pool:
         self._loop = None
         self.waiting = 0
         self.active = 0
+        self.lent = 0
 
 
 POOL = _Pool()
@@ -1461,6 +1522,11 @@ class _BatchPool(_Pool):
 
     def _size(self) -> int:
         return max(1, settings.video_asr_concurrency)
+
+    def _lend(self) -> bool:
+        # Video's windows reach a CPU replica through the router as before;
+        # this pool's size is VIDEO_ASR_CONCURRENCY and nothing else.
+        return False
 
 
 BATCH_POOL = _BatchPool()

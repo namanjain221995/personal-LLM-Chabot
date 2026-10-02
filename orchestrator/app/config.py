@@ -337,11 +337,16 @@ class Settings:
         # ITS OWN KEY, NOT AN ENTRY IN ASR_BASE_URLS. That list sizes the
         # dictation pool per GPU engine and is what /v1 routes over; neither
         # should count a replica that exists for overflow.
-        self.asr_cpu_base_urls: tuple[str, ...] = tuple(
+        #
+        # Each replica ONCE, in the order listed: "http://cpu/v1, http://cpu/v1/"
+        # would give one replica, which decodes one clip at a time, two router
+        # slots and a second clip to wait behind the first (verifier,
+        # 2026-09-30).
+        self.asr_cpu_base_urls: tuple[str, ...] = tuple(dict.fromkeys(
             url.strip().rstrip("/")
             for url in os.environ.get("ASR_CPU_BASE_URLS", "").split(",")
             if url.strip()
-        )
+        ))
         # How long the CPU replica takes for a clip when it is free, as
         # ASR_CPU_FIXED_S + seconds x ASR_CPU_S_PER_AUDIO_S. Measured
         # 2026-09-30 on the worker with the replica's own decoder, 8 threads

@@ -518,9 +518,9 @@ def test_an_invention_timed_to_the_word_is_dropped_too(monkeypatch):
     pipeline says "Thank you." to the end of its window (0.0-29.98 s; the same code on the same
     pins, run on CPU fp32). Judged by density alone, "you" over max(0.62, 1) s is 1.0 words/s,
     exactly the floor, and it reached the composer as a low-confidence "you" whenever a silent
-    dictation overflowed to the CPU. Text that is nothing but stock phrases, from a clip the gate
-    called silent, is an invention however the engine times it (window_is_plausible's rule for a
-    gated session window)."""
+    dictation overflowed to the CPU. On the CPU replica, text that is nothing but stock phrases,
+    from a clip the gate called silent, is an invention however the engine times it
+    (window_is_plausible's rule for a gated session window)."""
     wire = _Wire(monkeypatch)
     silent = dict(GATED, duration=10.0, no_speech_prob=0.71)
     invented = {"text": "you", "language": "english", "language_code": "en",
@@ -535,14 +535,53 @@ def test_an_invention_timed_to_the_word_is_dropped_too(monkeypatch):
     assert result.text == ""
     assert result.confidence == asr.CONFIDENCE_SILENT
     assert len(wire.requests) == 2
-    # The rule, for either engine's timing; real words beside a stock phrase still count.
-    assert not asr.speech_is_plausible("you", 10.0, invented["segments"], engine_heard_speech=False)
+    # The rule on the CPU tier, for either engine's timing; real words beside a stock phrase
+    # still count.
+    assert not asr.speech_is_plausible("you", 10.0, invented["segments"], engine_heard_speech=False, tier="cpu")
     assert not asr.speech_is_plausible("Thank you.", 3.0, [{"start": 0.0, "end": 0.6, "text": "Thank you."}],
-                                       engine_heard_speech=False)
+                                       engine_heard_speech=False, tier="cpu")
     assert asr.speech_is_plausible("Thank you. I will call you back at five.", 4.0,
                                    [{"start": 0.0, "end": 0.6, "text": "Thank you."},
                                     {"start": 0.8, "end": 3.9, "text": "I will call you back at five."}],
-                                   engine_heard_speech=False)
+                                   engine_heard_speech=False, tier="cpu")
+
+
+#: Real short replies a GPU replica's gate emptied and its ungated retry recovered, timed to the
+#: word (the verifier's plaus.py, 2026-09-30). Before the CPU replica existed every one was kept,
+#: and on a GPU replica every one still is.
+_REAL_SHORT_REPLIES = [
+    ("Okay.", 5.0, [{"start": 2.0, "end": 2.6, "text": "Okay."}]),
+    ("Thank you.", 10.0, [{"start": 3.0, "end": 3.8, "text": "Thank you."}]),
+    ("Bye.", 4.0, [{"start": 1.0, "end": 1.4, "text": "Bye."}]),
+    ("Okay, thank you.", 6.0, [{"start": 0.5, "end": 1.6, "text": "Okay, thank you."}]),
+]
+
+
+@pytest.mark.parametrize("text,seconds,segments", _REAL_SHORT_REPLIES)
+def test_the_stock_phrase_drop_is_the_cpu_tiers_alone(text, seconds, segments):
+    """Verifier, 2026-09-30 (finding 2): the drop above first applied to every replica, so a real
+    quiet reply recovered by a GPU replica's retry came back empty and 'silent'. GPU dictation
+    must be what it was before this branch: the drop is for the CPU replica's timing only."""
+    assert asr.speech_is_plausible(text, seconds, segments, engine_heard_speech=False)
+    assert asr.speech_is_plausible(text, seconds, segments, engine_heard_speech=False, tier="gpu")
+    assert not asr.speech_is_plausible(text, seconds, segments, engine_heard_speech=False, tier="cpu")
+
+
+def test_a_gpu_replicas_recovered_short_reply_still_reaches_the_composer(monkeypatch):
+    """End to end on the legacy path: the gate empties a 5 s clip, the retry finds a real "Okay."
+    at 2.0-2.6 s, and a GPU replica returns it as a draft to check, as before this branch."""
+    wire = _Wire(monkeypatch)
+    silent = dict(GATED, duration=5.0, no_speech_prob=0.65)
+    recovered = {"text": "Okay.", "language": "english", "language_code": "en",
+                 "duration": 5.0, "no_speech_prob": 0.0,
+                 "segments": [{"id": 0, "start": 2.0, "end": 2.6, "text": "Okay.", "language": "en"}]}
+    wire.scripts["w"] = [(200, silent), (200, recovered)]
+
+    result = _dictate(_engine("w"))
+
+    assert result.text == "Okay."
+    assert result.confidence == asr.CONFIDENCE_LOW
+    assert len(wire.requests) == 2
 
 
 def test_punctuation_alone_is_not_speech(monkeypatch):

@@ -220,9 +220,18 @@ ASR_CPU_S_PER_AUDIO_S) x ASR_CPU_DEADLINE_MARGIN` fits the clip's deadline: the
 session window timeout (`VOICE_SESSION_WINDOW_TIMEOUT_S`) for a recording
 window, `ASR_TIMEOUT_S` otherwise. A WAV clip's length is read from its header;
 a clip of unknown length (WebM on the legacy path) is costed at
-`ASR_MAX_AUDIO_SECONDS`. A clip that does not fit is never sent: it waits for a
-GPU replica exactly as before. While a GPU replica is free the CPU replica is
+`ASR_MAX_AUDIO_SECONDS`. A clip that does not fit is not sent: it waits for a
+GPU replica exactly as before. That judgement assumes the replica is free when
+the router's own in-flight count says so, and the count forgets a decode whose
+caller let go of it (a cancelled call, a read timeout, an orchestrator
+restart). So the replica refuses any clip with a 503 while it is decoding,
+and the router takes that clip to the GPU queue in the same call: no clip
+waits behind a decode on the CPU. While a GPU replica is free the CPU replica is
 only the last resort after every GPU replica has failed the same call.
+`ASR_CPU_BASE_URLS` lists each replica once (a repeated URL, with or without
+a trailing slash, is dropped). The legacy dictation pool lends a CPU replica's
+slot only to a clip the router is about to send there, so `ASR_MAX_CONCURRENT`
+per GPU replica still holds when the CPU replica cannot take a clip.
 
 **Measured basis for `ASR_TIMEOUT_S` (2026-09-18, the worker Spark).**
 Whisper's sequential long-form pass took 0.45 s per second of audio on a
