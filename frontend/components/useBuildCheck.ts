@@ -70,6 +70,14 @@ export function useBuildCheck(
     } catch {
       // Preparing is a courtesy; the old code must still go.
     }
+    // QA 2026-10-03: preparing waits for the history store (up to 3 s), and
+    // the person may start typing, attaching or sending in that time. A
+    // reload nobody asked for is never worth that: let it go, and the quiet
+    // poll below tries again once nothing would be lost.
+    if (!keepDraft && !quietRef.current()) {
+      reloading.current = false;
+      return;
+    }
     markReloadedFor(server);
     reloadPage();
   }, []);

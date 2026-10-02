@@ -3537,12 +3537,17 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       !draftTextRef.current.trim() &&
       !(composerRef.current?.hasDraft() ?? false),
     async (keepDraft) => {
-      if (keepDraft) saveReloadDraft(draftTextRef.current);
-      // Let the store finish what it is pushing; never wait long for it.
-      await Promise.race([
-        getHistoryStore().flush(),
-        new Promise((resolve) => window.setTimeout(resolve, 3_000)),
-      ]);
+      try {
+        // Let the store finish what it is pushing; never wait long for it.
+        await Promise.race([
+          getHistoryStore().flush(),
+          new Promise((resolve) => window.setTimeout(resolve, 3_000)),
+        ]);
+      } finally {
+        // Kept AFTER the wait (QA 2026-10-03): what was typed during it is
+        // part of the draft, and a failed flush must not cost the text.
+        if (keepDraft) saveReloadDraft(draftTextRef.current);
+      }
     },
   );
   // The text a reload the person asked for kept: back into the composer,
