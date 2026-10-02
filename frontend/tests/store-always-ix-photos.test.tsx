@@ -432,3 +432,46 @@ describe('a second device opens a chat whose photo an old page sent', () => {
     expect(puts).toHaveLength(0);
   });
 });
+
+/* ======================= a turn the no-limits release sent by reference */
+
+describe('a turn sent by reference over the inline budget (no limits)', () => {
+  // docs/chat-media/LIMITS.md: such a send stores its photos under the
+  // composer's ids first and writes them into `meta.images`, like any send.
+  const REF = (i: number) => `img-ref-${String(i).padStart(4, '0')}`;
+  const photo = (attachment_id: string) => ({
+    attachment_id,
+    mime: 'image/png',
+    width: 800,
+    height: 600,
+  });
+
+  it('shows its own references once: no list read, no ix- lookup, no "not stored" line', async () => {
+    server.set(CONV, { title: 'Receipts', rows: [], version: 1 });
+    addRows(CONV, [
+      {
+        role: 'user',
+        content: QUESTION,
+        meta: {
+          intent: { id: INTENT, state: 'completed' },
+          images: Array.from({ length: 6 }, (_, i) => photo(REF(i))),
+        },
+      },
+      { role: 'assistant', content: ANSWER, meta: { route: 'vision', intent_id: INTENT } },
+    ]);
+    // The server ALSO holds ix- rows under the same intent (a send whose ids
+    // did not fit its pictures): the turn's own references still decide.
+    mediaItems = [
+      ...Array.from({ length: 6 }, (_, i) => photo(REF(i))),
+      ...Array.from({ length: 6 }, (_, i) => photo(IX(i))),
+    ];
+    await openApp();
+    await drain();
+    expect(thumbs()).toEqual(
+      Array.from({ length: 6 }, (_, i) => `/api/chat-media/${CONV}/${REF(i)}?size=thumb`),
+    );
+    expect(screen.queryByTestId('legacy-photo-note')).toBeNull();
+    expect(listReads()).toBe(0);
+    expect(puts).toHaveLength(0);
+  });
+});
