@@ -505,3 +505,72 @@ Proof file (uncommitted): orchestrator/tests/test_attack_lasting_files_sec.py. N
   200 and 206 (member and admin), Starlette 1.6 Range (max 100 ranges, merged, streamed 64 KiB),
   reaper containment (symlinked chat/upload dirs and an `original` symlink untouched; 3.12 rmtree
   is fd-based), My files picture rows (double-scoped, F034 excluded, bound params).
+
+## fix-be (backend fixes from the QA and security attacks, 2026-10-02 22:40 IST)
+
+Commits e132b958, fa0a749b, 6c7eae31. What changed that other tracks may rely on:
+
+- Store ceiling: `chat_media.MAX_STORE_PIXELS = 16_000_000` for EVERY format,
+  JPEG included, judged from the header before `verify`/`load`. Above it the
+  picture is refused as `unsupported` (415 on POST, skipped + counted on
+  /chat). The old 40 MP / 89 MP ceilings are gone from chat_media
+  (image_memory keeps its own for inline pictures).
+- Decode pool: `chat_media.run_decode(fn, *args)` runs on a 2-worker
+  ThreadPoolExecutor (`DECODE_WORKERS`, threads `chat-media-decode_N`). The
+  POST route's `inspect`, the whole /chat background store per picture
+  (`_store_inline_one`), a heal, and image_memory's store-fallback read
+  (`_stored_read`, which may `_fit` a 10 MiB original) all go through it. A
+  burst queues; it never fills the default executor.
+- JPEG end check is a marker-segment walk to the PRIMARY picture's EOI
+  (`_jpeg_reaches_eoi`); bytes after it are ignored. MPO (Pillow's name for
+  a multi-picture JPEG) is stored as `image/jpeg`, `full.jpg`. A cut file is
+  still refused, with or without an EXIF thumbnail or a trailer.
+- Heal: when a row exists but its full file is gone, a retry of the SAME
+  bytes (sha256 equal) under the same attachment id rewrites `full.<ext>`
+  (and `thumb.webp` when the row has one) into the row's own directory. POST
+  answers `created: false` with the unchanged row; the metric counts
+  `result="stored"`. Different bytes never replace it (the row stays 410).
+  The frontend's new repair (32e3d9d5) only re-sends ids the LIST lacks, so
+  a row-without-file is healed only by a send/backfill/upload retry of the
+  same bytes; nothing re-sends those on its own today.
+  If-None-Match still answers 304 for a row whose file is gone: the tag is
+  the sha256, so the browser's cached copy is exactly right.
+- 16-bit greyscale PNG thumbnails are scaled to 8 bits (were pure white).
+- /chat: a ref-only turn with no words gets "Analyze the attached image."
+  like an inline one.
+- image_memory store fallback follows the branch: `hydrate(conv, viewer,
+  visible=[(role, content), ...])` from /chat `messages`;
+  `chat_media.latest_turn_images(uid, conv, visible)`. A picture turn counts
+  only when it is on that path: by its words (exact, or the end of a turn
+  after a blank line, which covers the browser's paste/quote folding), or,
+  for a photo with no words, by an assistant message stored under it
+  (`meta.branch.parent` = its `self`, or the physically next message) whose
+  text is on the path. `turns_after` = user turns on the path after it,
+  not counting the trailing question. `visible=None` (no `messages` sent)
+  keeps the old stored-order behaviour; `[]` finds nothing. Only the 20
+  newest picture turns are compared.
+- sharing.evaluate reads provenance (PRIVATE_META_KEYS, PRIVATE_ROUTES,
+  has_attachment) from EVERY user/assistant message, empty ones included.
+  `shareable_messages`, the empty-chat refusal and the secret scan still use
+  the non-empty ones. A photo-only chat now answers 422 "uploaded photos".
+
+Not done here (files I may not edit), exact change:
+
+- `orchestrator/app/authn/admin_api.py` `member_chat_media`: before
+  `return response`, add `response.headers["Cache-Control"] = "private, no-store"`
+  (the recordings rail's rule, audio_api.py). Today an admin's second view is
+  served from the browser cache for a year and never audited. Test: two GETs
+  of the admin route both answer 200 with `cache-control: private, no-store`
+  and write two `admin_viewed_chat_media` audit rows.
+
+Seen, not in my list, not fixed: `decode_inline` accepts only
+`data:<type>;base64,` prefixes, so a data URL with parameters
+(`data:image/png;name=x.png;base64,...`) is counted `unsupported` and not
+stored (tests/test_attack_chat_media_be.py::test_data_url_with_parameters_is_stored
+fails on e132b958 too). The composer never sends one (lib/images.ts checks
+`data:${mime};base64,`). A `^data:[^,]*;base64,` prefix would accept it.
+
+The uncommitted attack proofs that assert the OLD behaviour now fail as
+intended: test_attack_chat_media_be.py::test_row_without_file_is_never_healed_by_a_retry,
+::test_fallback_hands_the_model_a_picture_from_an_edited_away_branch (route
+chat, 0 vision calls), and all three in test_attack_chat_media_sec.py.
