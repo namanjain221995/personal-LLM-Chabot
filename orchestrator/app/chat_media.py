@@ -1033,27 +1033,56 @@ def _meta_attachment_ids(images: Any) -> List[str]:
     return out
 
 
-def _turn_attachment_ids(images: Any, intent_id: Any) -> List[str]:
+#: The index at the end of a minted id, as `minted_attachment_id` writes it.
+_MINTED_INDEX_RE = re.compile(r"0|[1-9][0-9]*")
+
+
+def _minted_ids_stored(user_id: int, conversation_id: str, intent_id: str) -> List[str]:
+    """The viewer's `ix-<intent>-<index>` ids in this chat, in index order:
+    the rows that exist, below MAX_FILES like the ids /chat mints."""
+    prefix = f"ix-{intent_id}-"  # minted_attachment_id without its index
+    with db.read_connection() as con:
+        rows = con.execute(
+            "SELECT attachment_id FROM chat_media "
+            "WHERE user_id = %s AND conversation_id = %s AND starts_with(attachment_id, %s)",
+            (int(user_id), conversation_id, prefix),
+        ).fetchall()
+    found = []
+    for row in rows:
+        index = row["attachment_id"][len(prefix):]
+        if _MINTED_INDEX_RE.fullmatch(index) and int(index) < MAX_FILES:
+            found.append((int(index), row["attachment_id"]))
+    return [attachment_id for _, attachment_id in sorted(found)]
+
+
+def _turn_attachment_ids(
+    user_id: int, conversation_id: str, images: Any, intent_id: Any
+) -> List[str]:
     """The pictures a stored user message names: its `meta.images`, or, for
     a message without them, the ones the server stored under its send intent
-    (`ix-<intent>-<index>`, STORE-ALWAYS.md §1), in send order. An index with
-    no row is simply missing when they are loaded."""
+    (`ix-<intent>-<index>`, STORE-ALWAYS.md §1), in send order. Only the
+    `ix-` rows that exist are named, never every index up to MAX_FILES."""
     ids = _meta_attachment_ids(images)
     if ids or not (isinstance(intent_id, str) and _MINT_INTENT_RE.fullmatch(intent_id)):
         return ids
-    return [minted_attachment_id(intent_id, i) for i in range(MAX_FILES)]
+    return _minted_ids_stored(user_id, conversation_id, intent_id)
 
 
-#: A user message `m` (of conversation `c`) that names stored pictures: by
-#: its `meta.images`, or, with none, by the viewer's `ix-` rows under its
-#: send intent: a photo from a page that wrote no `meta.images` (a tab loaded
-#: before V44), which the server stored under ids it named itself.
+#: A user message `m` that names stored pictures: by its `meta.images`, or,
+#: with none, by the viewer's `ix-` rows under its send intent: a photo from a
+#: page that wrote no `meta.images` (a tab loaded before V44), which the
+#: server stored under ids it named itself. The chat's `ix-` intents are read
+#: ONCE per statement (an uncorrelated IN, which PostgreSQL hashes), never
+#: once per message: nearly every user turn since V29 has a 32-hex intent,
+#: and a correlated EXISTS here ran for each of them (QA, 2026-10-03: 38 ms
+#: instead of 3 over 10,000 turns, before the first token). Exactly the old
+#: test: a 32-hex intent with a row starting `ix-<intent>-`. Named parameters
+#: `user_id` and `conversation_id`.
 _PICTURE_TURN_SQL = (
     "((jsonb_typeof(m.meta -> 'images') = 'array' AND (m.meta -> 'images') -> 0 IS NOT NULL) "
-    " OR ((m.meta -> 'intent' ->> 'id') ~ '^[0-9a-f]{32}$' "
-    "     AND EXISTS (SELECT 1 FROM chat_media x "
-    "                  WHERE x.user_id = c.user_id AND x.conversation_id = m.conversation_id "
-    "                    AND starts_with(x.attachment_id, 'ix-' || (m.meta -> 'intent' ->> 'id') || '-'))))"
+    " OR (m.meta -> 'intent' ->> 'id') IN (SELECT substr(x.attachment_id, 4, 32) FROM chat_media x "
+    "     WHERE x.user_id = %(user_id)s AND x.conversation_id = %(conversation_id)s "
+    "       AND x.attachment_id ~ '^ix-[0-9a-f]{32}-'))"
 )
 
 #: Picture turns compared with the path the browser sent, newest first.
@@ -1130,12 +1159,13 @@ def _latest_visible_turn_images(
             "             AND a.meta -> 'branch' ->> 'parent' = m.meta -> 'branch' ->> 'self'))"
             ") AS answers "
             "FROM messages m JOIN conversations c ON c.id = m.conversation_id "
-            "WHERE m.conversation_id = %s AND c.user_id = %s AND m.role = 'user' "
+            "WHERE m.conversation_id = %(conversation_id)s AND c.user_id = %(user_id)s "
+            "  AND m.role = 'user' "
             f"  AND {_PICTURE_TURN_SQL} "
             "  AND EXISTS (SELECT 1 FROM chat_media s "
-            "               WHERE s.conversation_id = %s AND s.user_id = %s) "
-            "ORDER BY m.id DESC LIMIT %s",
-            (conversation_id, user_id, conversation_id, user_id, _VISIBLE_CANDIDATES),
+            "               WHERE s.conversation_id = %(conversation_id)s AND s.user_id = %(user_id)s) "
+            "ORDER BY m.id DESC LIMIT %(limit)s",
+            {"conversation_id": conversation_id, "user_id": user_id, "limit": _VISIBLE_CANDIDATES},
         ).fetchall()
     for row in rows:
         question = (row["content"] or "").strip()
@@ -1146,7 +1176,9 @@ def _latest_visible_turn_images(
         # The newest picture on the path is the one "the photo" means; if its
         # files are gone, an older one would be the wrong picture.
         loaded, _missing = _load_refs(
-            user_id, conversation_id, _turn_attachment_ids(row["images"], row["intent_id"])
+            user_id,
+            conversation_id,
+            _turn_attachment_ids(user_id, conversation_id, row["images"], row["intent_id"]),
         )
         if not loaded:
             return None
@@ -1202,16 +1234,18 @@ def latest_turn_images(
             "FROM (SELECT m.id, m.conversation_id, m.content, m.meta -> 'images' AS images, "
             "             m.meta -> 'intent' ->> 'id' AS intent_id "
             "        FROM messages m JOIN conversations c ON c.id = m.conversation_id "
-            "       WHERE m.conversation_id = %s AND c.user_id = %s AND m.role = 'user' "
+            "       WHERE m.conversation_id = %(conversation_id)s AND c.user_id = %(user_id)s "
+            "         AND m.role = 'user' "
             f"        AND {_PICTURE_TURN_SQL} "
             "         AND EXISTS (SELECT 1 FROM chat_media s "
-            "                      WHERE s.conversation_id = %s AND s.user_id = %s) "
+            "                      WHERE s.conversation_id = %(conversation_id)s "
+            "                        AND s.user_id = %(user_id)s) "
             "       ORDER BY m.id DESC LIMIT 1) t",
-            (conversation_id, int(user_id), conversation_id, int(user_id)),
+            {"conversation_id": conversation_id, "user_id": int(user_id)},
         ).fetchone()
     if row is None:
         return None
-    ids = _turn_attachment_ids(row["images"], row["intent_id"])
+    ids = _turn_attachment_ids(int(user_id), conversation_id, row["images"], row["intent_id"])
     loaded, _missing = _load_refs(int(user_id), conversation_id, ids)
     if not loaded:
         return None
