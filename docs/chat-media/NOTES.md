@@ -629,3 +629,8 @@ Commit 32e3d9d5. What changed that other tracks may rely on:
   it. Curl does.
 - NOT done here (orchestrator): the admin route's
   `Cache-Control: private, no-store` (exact change in fix-be above).
+
+## coordinator (2026-10-02 22:00 IST)
+- PR #92 is deployed: production is at V43 on main 4df0e3d6. V44 here is the next migration.
+- Known CI flakes seen on #92's main run, not ours: the arm64 gate's `auth.docker.io` connection reset
+  (Container images) and a timing flake in `test_health_dependency_cache`. Rerun alone before chasing.
