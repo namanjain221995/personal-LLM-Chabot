@@ -4329,17 +4329,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 detail={"code": "image_ref_missing", "missing": missing},
             )
         request.images = loaded + list(request.images_data)
-    # 2. This turn's inline pictures are stored BEHIND the turn: a background
-    #    task, all file work in a worker thread, nothing awaited here, so the
-    #    first token waits on none of it. A failure is logged and counted
-    #    (chat_media_writes_total), never a chat error. Pictures sent with no
-    #    ids that fit them (a page loaded before V44) are named after the
-    #    browser's send intent: `request.intent_id`, never the one minted
-    #    above for a client that sent none (docs/chat-media/STORE-ALWAYS.md).
-    _chat_media.schedule_inline_store(
-        viewer, request.conversation_id, inline_images, request.image_ids,
-        intent_id=request.intent_id, by_reference=bool(request.image_refs),
-    )
+    # 2. This turn's inline pictures are stored once the send intent is
+    #    known to be this chat's (below, after the V29 409).
 
     # DURABLE INTENT (V29). Record the send before anything runs, so the
     # request survives the process that accepted it (RC-3). A KNOWN intent
@@ -4390,6 +4381,22 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             raise HTTPException(
                 status_code=409, detail="intent_id belongs to another conversation"
             )
+    # CHAT MEDIA, 2 (see 1 above). This turn's inline pictures are stored
+    # BEHIND the turn: a background task, all file work in a worker thread,
+    # nothing awaited here, so the first token waits on none of it. A failure
+    # is logged and counted (chat_media_writes_total), never a chat error.
+    # Pictures sent with no ids that fit them (a page loaded before V44) are
+    # named after the browser's send intent: `request.intent_id`, never the
+    # one minted above for a client that sent none
+    # (docs/chat-media/STORE-ALWAYS.md). After the 409 just above: a send
+    # under another chat's intent has no message to show them on. Before the
+    # attach / replay / retry paths below: a retry of the same send stores
+    # again (a `duplicate`, or a lost file healed).
+    _chat_media.schedule_inline_store(
+        viewer, request.conversation_id, inline_images, request.image_ids,
+        intent_id=request.intent_id, by_reference=bool(request.image_refs),
+    )
+    if row is None:
         live = _live_generation_for(known["generation_id"])
         if live is not None:
             # accepted/running and still in this process: the same stream,

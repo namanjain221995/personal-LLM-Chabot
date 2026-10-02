@@ -496,6 +496,30 @@ def test_minting_keeps_ownership_and_the_reserved_key_refusal(engines, as_user):
     assert not metrics._counters.get("chat_media_writes_total")
 
 
+def test_a_send_refused_for_an_intent_from_elsewhere_stores_nothing(engines, as_user):
+    """The 409 for an intent that belongs to another account or to another
+    chat comes before the turn's pictures are stored (QA, 2026-10-03: they were
+    stored under `ix-<that intent>-0` in the sender's chat). A refused send has
+    no message to show them on: with ids or without, nothing is stored."""
+    as_user("bob")
+    with TestClient(app) as client:
+        assert _chat(client, message="hi", conversation_id="conv-intent-bobs", intent_id=INTENT).status_code == 200
+        as_user("alice")
+        later = "cd" * 16
+        assert _chat(client, message="hi", conversation_id="conv-intent-first", intent_id=later).status_code == 200
+        image = [_data_url(_png())]
+        for intent in (INTENT, later):  # Bob's; Alice's own, from her other chat
+            for ids in ({}, {"image_ids": ["att-refused-1"]}):
+                resp = _chat(
+                    client, message="what is it", conversation_id="conv-intent-second",
+                    intent_id=intent, images=image, **ids,
+                )
+                assert resp.status_code == 409, resp.text
+        _wait_settled()
+    assert _rows("conv-intent-second") == []
+    assert not metrics._counters.get("chat_media_writes_total")
+
+
 # ----------------------------------------------------------- stored by ref --
 
 
