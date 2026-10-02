@@ -29,11 +29,13 @@ sweep triggered by somebody else's upload.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import shutil
 import tempfile
+import uuid
 from typing import Any, Optional
 
 from ..config import settings
@@ -74,10 +76,10 @@ def artifacts_dir(content_hash: str) -> str:
 def source_path(content_hash: str) -> Optional[str]:
     """The stored source file, whatever its extension, or None.
 
-    Never `source.<ext>.part`: adopt_source copies into that name and renames
-    it, so one left behind is a copy a crash cut short. Matching it served a
-    third of a video as the whole file, and made adopt_source hand the
-    pipeline that third as "already stored" (QA, 2026-09-30).
+    Never a `source.<ext>[.<id>].part` name: adopt_source links or copies into
+    one and renames it, so one left behind is what a crash cut short. Matching
+    it served a third of a video as the whole file, and made adopt_source hand
+    the pipeline that third as "already stored" (QA, 2026-09-30).
     """
     root = analysis_dir(content_hash)
     try:
@@ -97,6 +99,16 @@ def adopt_source(content_hash: str, path: str, filename: str) -> str:
     free, instant, and the workspace sweep removing its link leaves ours.
     A copy otherwise. Idempotent: an existing source is left alone, which is
     what "the same video uploaded twice is analysed once" rests on.
+
+    The link or copy lands on a temporary name of THIS call's own, then is
+    renamed into place. With one shared `source.<ext>.part`, a crash between
+    the link and the rename left that name as a hard link holding a whole
+    file; the next adopt's link then met it, and the copy it fell back to
+    raised SameFileError on the same upload, or truncated and rewrote a
+    different upload's own file through the link (QA, 2026-10-01). Two
+    adopters of one video at the same moment shared it as well. Leftover
+    `.part` names are removed once a source is in place; a concurrent adopter
+    whose name that removes finds the source already there.
     """
     existing = source_path(content_hash)
     if existing:
@@ -107,13 +119,35 @@ def adopt_source(content_hash: str, path: str, filename: str) -> str:
     if not ext or len(ext) > 8 or not ext[1:].isalnum():
         ext = ".bin"
     dest = os.path.join(root, "source" + ext)
-    tmp = dest + ".part"
+    tmp = f"{dest}.{uuid.uuid4().hex}.part"
     try:
         os.link(path, tmp)
     except OSError:
         shutil.copyfile(path, tmp)
-    os.replace(tmp, dest)
+    try:
+        os.replace(tmp, dest)
+    except FileNotFoundError:
+        # Another adopter of the same bytes put its source in place first and
+        # removed the leftovers, this call's name among them.
+        existing = source_path(content_hash)
+        if existing is None:
+            raise
+        return existing
+    _remove_leftover_parts(root)
     return dest
+
+
+def _remove_leftover_parts(root: str) -> None:
+    """Unlink every `source.*.part` in `root`. Unlinking removes a name only:
+    a leftover hard link to some upload never touches that upload's bytes."""
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return
+    for entry in entries:
+        if entry.name.startswith("source.") and entry.name.endswith(".part"):
+            with contextlib.suppress(OSError):
+                os.unlink(entry.path)
 
 
 def read_json(path: str) -> Optional[Any]:

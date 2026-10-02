@@ -50,9 +50,15 @@ The server decides `availability` the same way the download route does:
 Rules behind the table:
 - A video or audio file stays `available` after the 24 h workspace sweep while
   any chat links its analysis. Its bytes are hard-linked into
-  `VIDEO_DATA_DIR/<sha256>/source.<ext>`. A leftover `source.<ext>.part` (a
-  cross-device copy that a crash cut short) never counts, for this list, the
-  download route or the pipeline (`video.store.source_path`).
+  `VIDEO_DATA_DIR/<sha256>/source.<ext>`. A leftover `.part` name (a link or
+  copy that a crash cut short before its rename) never counts, for this list,
+  the download route or the pipeline (`video.store.source_path`).
+  `video.store.adopt_source` links or copies onto a temporary name of its own
+  call, never a shared one, and removes leftover `.part` names once the source
+  is in place. With the old shared `source.<ext>.part`, a leftover hard link
+  made the next adopt of the same upload fail with `SameFileError`, or made an
+  adopt of another upload truncate and rewrite that upload's file through the
+  link; two adopters of one video at once also collided on it.
 - A text-only document folds only under an upload that is itself listed
   (`status='ready'`). A rejected or failed upload of the same name no longer
   hides the text the chat kept.
@@ -73,22 +79,35 @@ Rules behind the table:
 The sentence at the top of the page is built from the deployment's settings,
 which come with every response. It stays true when a TTL changes:
 
-> Files you attach to a chat are kept for up to 24 hours; after that the chat
-> keeps what it read (a document's text, a spreadsheet's summary). Videos and
-> audio files stay while their chat exists. Deleting a chat takes its files off
-> this list at once; the server erases their stored copies later. Voice
-> recordings stay until you delete them. Pictures stay only in the browser you
-> sent them from.
+> Files you attach to a chat are kept for 24 hours, then removed the next time
+> the server clears out old files; after that the chat keeps what it read (a
+> document's text, a spreadsheet's summary). Videos and audio files stay while
+> their chat exists. Deleting a chat takes its files off this list at once; the
+> server erases their stored copies later. Voice recordings stay until you
+> delete them. Pictures stay only in the browser you sent them from.
 
-"Up to", because the sweep also enforces `WORKSPACE_QUOTA_GB` and a large
-upload can evict a file sooner. For the same reason a swept row's note says
-"The file was removed (chat files are kept for up to 24 hours)", not "removed
-after 24 hours". A recording links to Recordings "with its transcript" only
-once its transcription is `done`.
+What the workspace sweep (`core/repo.enforce_quota_and_ttl`) does, and so what
+the sentence says:
+- It never removes an upload whose `uploads` row is younger than
+  `WORKSPACE_TTL_HOURS`, not even to get back under `WORKSPACE_QUOTA_GB`: such
+  an upload is live (`core/repo._upload_is_live`), and the quota pass skips it.
+- It runs only when someone uploads a file through `POST /uploads` or a
+  repository is cloned. On a quiet server a file stays stored past its hours,
+  and this page lists it as Stored until the next sweep removes it.
+
+So the page promises the hours as a minimum and gives no removal time. An
+earlier wording, "kept for up to 24 hours", stated a maximum that nothing
+enforces, for a reason the code contradicts (QA, 2026-10-01). A swept row's
+note says "The file was removed after 24 hours", which is true as worded.
+
+A recording links to Recordings "with its transcript" only when
+`media.has_transcript` is true: the recording is `done` and its transcript
+has words, which is when the Recordings page shows text. A done recording that
+heard no speech (outcome `no_speech` or `no_words`) has none.
 
 | Setting | Production value | Effect |
 |---|---|---|
-| `WORKSPACE_TTL_HOURS` | 24 | uploaded originals are swept after this many hours; the sweep also enforces `WORKSPACE_QUOTA_GB` (20), so a large upload can evict sooner |
+| `WORKSPACE_TTL_HOURS` | 24 | an uploaded original is kept at least this many hours, whatever `WORKSPACE_QUOTA_GB` (20) says; after that a sweep removes it, and the sweep runs only when someone uploads a file or clones a repository |
 | `VOICE_RETENTION_DAYS` | 0 | 0 keeps recordings until the owner deletes them |
 | `VIDEO_ORPHAN_TTL_HOURS` | 72 | video bytes are reaped this long after the last chat link goes |
 | `IMAGE_MEMORY_TTL_S` | 7200 | how long the server remembers a picture for follow-up questions |
@@ -116,8 +135,11 @@ them, the rule `/audio/sessions` follows.
 | `limit` | 1-100, default 50 |
 | `cursor` | the previous page's `next_cursor`; one minted under another sort is refused |
 
-A NUL character in any parameter, or in a cursor's name key, is a 400:
-PostgreSQL text cannot hold one, and it used to surface as a 500.
+A NUL character or a lone surrogate in any parameter, or in a cursor's name
+key, is a 400: PostgreSQL text cannot hold the first and UTF-8 cannot encode
+the second, and both used to surface as a 500. Over HTTP only a forged cursor
+can carry a lone surrogate (JSON's `\ud800` escape); Starlette replaces bad
+bytes in the query string before the route sees them.
 
 The name sort's key is `left(lower(name), 512)`, in the `ORDER BY` and in the
 keyset comparison alike, and the cursor's JSON keeps it as UTF-8
@@ -126,7 +148,8 @@ the key and `(source, item_id)` orders them, so paging stays exact. Before
 this bound the key was the whole name: a 4,916-character archive member path,
 or 2,500 CJK characters escaped to a 20,063-character cursor, made the next
 page a 400 (or Node's 431), and "Name, A to Z" stopped there for good. A
-cursor is now at most about 2.8 KB.
+cursor is now at most about 4.2 KB: 512 control characters, each still escaped
+as `\u00XX` (a name of 4-byte characters is about 2.8 KB).
 
 Anything else in the query string is ignored. There is no `user_id` parameter.
 
@@ -143,7 +166,12 @@ Anything else in the query string is ignored. There is no `user_id` parameter.
 
 Field notes:
 - `id` is `upload:<id>`, `text:<n>` or `recording:<id>`.
-- `media` is `{status, duration_ms}` for video, audio and recordings.
+- `media` is `{status, duration_ms}` for video, audio and recordings. A
+  recording's also carries `has_transcript`: true only when it is `done` and
+  its transcript has words. The outcome settles it (`transcribed` has words;
+  `no_speech` and `no_words` have none); a `transcribed_with_gaps` recording,
+  which can end either way, reads its saved transcript through
+  `dictation.transcript_of`.
 - `text_name` names the `documents` row a text preview reads, and is set only
   when `can.preview` is `"text"`. It is not always the file's own name: the
   composer sends a `.zip` on the DOCUMENT rail, and the chat then keeps
@@ -237,6 +265,31 @@ settings, 25 runs, first page, wall time including the tunnel):
 | 2,000 (+300 recordings) | 5.6 ms | 8.2 ms |
 | 20,000 | 45.7-65.0 ms | 69.7 ms |
 
+**Many read documents in one chat.** A document's text is folded under a
+ready upload of the same chat. The fold was one `NOT EXISTS` whose `IN`-list
+PostgreSQL could hash on the chat alone, so it compared every document with
+every ready upload of that chat. It now tests the document's three candidate
+names with `NOT IN` against the person's ready `(chat, name)` pairs
+(`ready_names`), which PostgreSQL runs as a hashed SubPlan: the pairs are
+hashed once and each document makes three probes. No migration or index was
+needed. Measured on the private test database (production's planner
+settings), one chat of 5,000 documents and 5,000 ready uploads:
+
+| Names | Before: each request | After: list newest / name / summary (median of 3, over HTTP) |
+|---|---|---|
+| distinct, short | 15.0 s, statement timeout, 500 (EXPLAIN 19.1 s: `Rows Removed by Join Filter: 25000000`) | 25 / 34 / 24 ms |
+| each text under its upload (the normal case) | 7.7 s | 16 / 14 / 10 ms |
+| archive members and manifests | 15.0 s, timeout, 500 (EXPLAIN 19.7 s) | 27 / 30 / 30 ms |
+| 628 characters, distinct | 15.0 s, timeout, 500 (EXPLAIN 75.6 s) | 46 / 61 / 38 ms |
+
+The plan no longer depends on row estimates. With one person holding 1,000
+small chats and that big chat, among 20 other people with 2,000 uploads each,
+the three requests took 42 / 29 / 37 ms. Rewrites that joined `uploads` per
+candidate name were fast on one chat but not there: 3.7 s. Paging all 10,000
+rows of the big chat by name takes 82 ms a page. The hash holds while one
+person's ready uploads fit in `hash_mem` (32 MB in production: about 250,000
+names of ordinary length).
+
 Other costs:
 - Decorating the page's rows costs under 0.5 ms.
 - Availability is at most two `stat()` calls per row: 0.135 ms for a 50-row
@@ -297,9 +350,9 @@ sum(rate(myfiles_list_total{result="error"}[15m]))
 
 ## Verified
 
-- **Orchestrator:** `tests/test_myfiles_api.py` (69 tests) and
-  `tests/test_uploads_video_download.py` (8), after the verification fix round
-  below (61 and 6 before it).
+- **Orchestrator:** `tests/test_myfiles_api.py` (74 tests) and
+  `tests/test_uploads_video_download.py` (11), after the two fix rounds below
+  (61 and 6 before them).
   - Run against the code of `main` 30cee881 (the branch rebased onto it, the
     two test files copied in), 61 of the first 67 fail: the routes answer 404 and a
     swept video 410. The other 6 pass on both sides because they pin
@@ -367,6 +420,29 @@ sum(rate(myfiles_list_total{result="error"}[15m]))
     row-note tests in `my-files-lib.test.ts` and `my-files-page.test.tsx`.
   - The same video twice in one chat, and ASCII-only case folding, are
     listed under *Known limits*.
+- **Re-verification (2026-10-01) found five lows. All are fixed, each with
+  tests that failed on the previous commit (9 orchestrator, 6 frontend) and
+  pass now:**
+  - A crash between `adopt_source`'s link and rename left a whole-file hard
+    link under the shared `.part` name:
+    `test_adopt_source_recovers_from_a_crash_between_link_and_rename`
+    (`shutil.SameFileError` before),
+    `test_a_leftover_link_to_another_upload_is_never_written_through` (the
+    earlier upload's file rewritten before) and
+    `test_two_adopters_of_one_video_at_once_both_get_the_whole_file`
+    (`FileNotFoundError` before).
+  - A lone surrogate in a forged name cursor was a 500
+    (`UnicodeEncodeError`): `test_a_lone_surrogate_in_a_forged_name_cursor_is_a_400`
+    and `test_a_lone_surrogate_is_never_a_500` (both routes).
+  - The fold cost documents × ready uploads per chat:
+    `test_one_chat_with_thousands_of_read_documents_answers_in_linear_time`
+    (10.26 s for one request before; it also asserts that no join filter
+    discards rows). See *Cost*.
+  - "Kept for up to N hours" stated a maximum nothing enforces: the retention
+    and row-note tests in `my-files-lib.test.ts` and `my-files-page.test.tsx`.
+  - "With its transcript" on a done recording that heard no speech:
+    `test_a_recording_promises_its_transcript_only_when_it_has_words`, and the
+    parse and row tests in `my-files-lib.test.ts` and `my-files-page.test.tsx`.
 
 ---
 
