@@ -1043,3 +1043,53 @@ says "FILE" (`fileBadgeFor(name)`), as for `bf-` backfills. A regenerate or
 edit before the backfill has written the refs (its idle tick, under 10 s)
 takes the old "missing" path. A turn with only some of its `ix-` rows shows
 those.
+
+## store-always (backend fixes from the QA attack, 2026-10-03)
+
+Commits 59425bb6 and d5239301, orchestrator only. What the other side and the
+release may rely on:
+
+- `/chat` now stores a turn's pictures AFTER the V29 send intent check, not
+  before it. A send refused with 409 "intent_id belongs to another
+  conversation" (another account's intent, or the same person's from another
+  chat) stores and counts nothing, with or without `image_ids`. A retry of
+  the same intent in the same chat still stores again, ahead of the attach,
+  replay and retry paths (`duplicate`, or a lost file healed).
+- The store fallback (`chat_media.latest_turn_images`, both paths) no longer
+  runs a correlated EXISTS on chat_media for every user turn.
+  `_PICTURE_TURN_SQL` is an uncorrelated IN over the chat's `ix-` rows,
+  hashed once per statement. The test is the same as before: a 32-hex intent
+  with a row starting `ix-<intent>-`. The fragment takes the named parameters
+  `user_id` and `conversation_id`, so both queries now pass a dict. Measured
+  on 10,000 user turns, with the photo on the oldest turn and 31 stored photos
+  in the chat (medians of 7 warm calls): stored order went from 65.7 to
+  9.0 ms, and the visible path from 178.5 to 15.3 ms. On QA's own 10k test,
+  the first (cold) call went from 68.5 to about 30 ms in stored order, and
+  from 40.6 to 7-11 ms on the visible path.
+- The ids of an intent-only picture turn are now the `ix-<intent>-<n>` rows
+  that exist (`_minted_ids_stored`, one indexed read). They come in index
+  order, below MAX_FILES. This replaces "it loads indexes 0..4" in the
+  backend store-always note above. `_turn_attachment_ids` now takes
+  `(user_id, conversation_id, images, intent_id)`.
+- Merging this into release/2026-10-03-nolimits, which already merged
+  943f7eb9:
+  - `main.py` merges cleanly. The release's main.py hunks all sit above line
+    3300.
+  - `chat_media.py` conflicts in three places, all mechanical.
+    `_turn_attachment_ids`: take this branch's signature and body, and drop
+    the release's paragraph on "the cost of naming all 999", which no longer
+    applies. The two `_load_refs(...)` call sites: keep the release's
+    `max_chars` argument, and pass
+    `_turn_attachment_ids(user_id, conversation_id, row["images"], row["intent_id"])`
+    as the ids.
+  - `tests/test_chat_media_chat.py` conflicts only where both sides added
+    tests at the same place: keep both.
+  - Checked without touching either worktree: `git merge-tree` of the
+    release and d5239301, resolved as above in a scratch copy, then
+    `tests/test_chat_media_chat.py` gave 42 passed. That includes the
+    release's twelve `ix-` pictures in index order and its 101-picture turn.
+- Seen and not changed (not a backend finding): if a regenerate rewrites an
+  un-adopted turn's `meta.intent.id` (QA's
+  `test_qa_regenerate_rekeys_the_turn_and_the_fallback_loses_the_photo`), the
+  fallback can no longer reach that turn's `ix-` photo until a device writes
+  `meta.images` for it.
