@@ -131,23 +131,47 @@ def _classify(name: str) -> Optional[str]:
     return None
 
 
-def check_zip_container(path: str, *, label: str = "archive") -> ArchivePlan:
+def _unpacked_part(left: int, max_total: int, max_files: int, by_count: bool) -> Tuple[str, str]:
+    """The `skipped` line for what a partial extraction left packed: the
+    entries past the count cap (one line), or one member past the byte cap."""
+    why = (
+        f"not unpacked: only the first {max_files:,} entries are"
+        if by_count
+        else f"not unpacked: only {max_total // (1024 * 1024):,} MB of an archive are"
+    )
+    return (f"{left:,} more file(s)", why + " (the archive itself is kept whole)")
+
+
+def _past_the_bytes(name: str, max_total: int) -> Tuple[str, str]:
+    return (name, _unpacked_part(0, max_total, 0, False)[1])
+
+
+def check_zip_container(path: str, *, label: str = "archive", partial: bool = False) -> ArchivePlan:
     """Apply the bomb/traversal caps to a zip WITHOUT extracting anything.
 
     Used for real archives and for .xlsx — an xlsx is a zip, so opening one
     with a spreadsheet reader before this check would bypass every cap.
+
+    `partial` (an uploaded ARCHIVE, never an .xlsx): an archive with more
+    entries or more bytes than the caps is not refused (no upload limit since
+    2026-10-03, docs/chat-media/LIMITS.md): the first ones within the caps
+    are planned and the rest listed in `skipped`. The caps still bound what
+    is unpacked, and a bomb-shaped member or a lying header is still refused.
     """
     max_total, max_files, max_ratio = _limits()
     plan = ArchivePlan()
     try:
         with zipfile.ZipFile(path) as zf:
             infos = zf.infolist()
-            if len(infos) > max_files:
+            if len(infos) > max_files and not partial:
                 raise ArchiveError(
                     f"This {label} contains {len(infos):,} entries; the limit is "
                     f"{max_files:,}."
                 )
-            for info in infos:
+            for index, info in enumerate(infos):
+                if partial and index >= max_files:
+                    plan.skipped.append(_unpacked_part(len(infos) - index, max_total, max_files, True))
+                    break
                 if info.is_dir():
                     continue
                 mode = info.external_attr >> 16
@@ -170,6 +194,11 @@ def check_zip_container(path: str, *, label: str = "archive") -> ArchivePlan:
                             f"This {label} looks like a decompression bomb: "
                             f"'{safe}' expands {ratio:,.0f}x."
                         )
+                if partial and plan.total_uncompressed + info.file_size > max_total:
+                    # Past the byte cap: this member stays packed, and a
+                    # smaller one after it may still fit.
+                    plan.skipped.append(_past_the_bytes(safe, max_total))
+                    continue
                 plan.total_uncompressed += info.file_size
                 if plan.total_uncompressed > max_total:
                     raise ArchiveError(
@@ -209,9 +238,9 @@ def _write_member(src, dest_path: str, budget: List[int]) -> None:
             out.write(chunk)
 
 
-def extract_zip(path: str, dest: str) -> ArchivePlan:
+def extract_zip(path: str, dest: str, partial: bool = False) -> ArchivePlan:
     """Extract a zip after check_zip_container, streaming with a live budget."""
-    plan = check_zip_container(path)
+    plan = check_zip_container(path, partial=True) if partial else check_zip_container(path)
     os.makedirs(dest, exist_ok=True)
     budget = [settings.archive_max_uncompressed_mb * 1024 * 1024]
     extracted: List[MemberPlan] = []
@@ -230,8 +259,9 @@ def extract_zip(path: str, dest: str) -> ArchivePlan:
     return plan
 
 
-def extract_tar(path: str, dest: str) -> ArchivePlan:
-    """Extract a tar/tar.gz with the same guarantees as extract_zip."""
+def extract_tar(path: str, dest: str, partial: bool = False) -> ArchivePlan:
+    """Extract a tar/tar.gz with the same guarantees as extract_zip
+    (`partial` as in `check_zip_container`)."""
     max_total, max_files, max_ratio = _limits()
     plan = ArchivePlan()
     os.makedirs(dest, exist_ok=True)
@@ -242,6 +272,10 @@ def extract_tar(path: str, dest: str) -> ArchivePlan:
             for member in tf:
                 count += 1
                 if count > max_files:
+                    if partial:
+                        # A tar has no directory to count ahead: say "more".
+                        plan.skipped.append(("more files", _unpacked_part(0, max_total, max_files, True)[1]))
+                        break
                     raise ArchiveError(
                         f"This archive contains more than {max_files:,} entries."
                     )
@@ -266,6 +300,9 @@ def extract_tar(path: str, dest: str) -> ArchivePlan:
                 if not resolves_inside(dest, safe):
                     plan.skipped.append((safe, "escapes the extraction root"))
                     continue
+                if partial and plan.total_uncompressed + member.size > max_total:
+                    plan.skipped.append(_past_the_bytes(safe, max_total))
+                    continue
                 src = tf.extractfile(member)
                 if src is None:
                     continue
@@ -283,10 +320,13 @@ def extract_tar(path: str, dest: str) -> ArchivePlan:
 
 
 def extract(path: str, dest: str) -> ArchivePlan:
-    """Extract any supported archive; raises ArchiveError on hostile input."""
+    """Extract any supported archive; raises ArchiveError on hostile input.
+
+    An archive larger than the caps is unpacked up to them, never refused
+    (`partial`): what was left packed is in `plan.skipped`."""
     fmt = sniff_format(path)
     if fmt == "zip":
-        return extract_zip(path, dest)
+        return extract_zip(path, dest, partial=True)
     if fmt == "gzip" or tarfile.is_tarfile(path):
-        return extract_tar(path, dest)
+        return extract_tar(path, dest, partial=True)
     raise ArchiveError("Unsupported archive format — upload a .zip or .tar.gz.")

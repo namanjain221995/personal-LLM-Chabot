@@ -289,6 +289,12 @@ def estimate_image_tokens(part: dict) -> int:
     image whose size cannot be read (a remote URL, a truncated or unknown
     format) is charged the processor's ceiling.
     """
+    return image_tokens_for(image_part_dimensions(part))
+
+
+def image_part_dimensions(part: dict) -> Optional[Tuple[int, int]]:
+    """(width, height) read from the header of an `image_url` part's base64
+    data: URL, or None (a remote URL, a truncated or unknown format)."""
     image = part.get("image_url")
     url = image.get("url") if isinstance(image, dict) else image
     dims = None
@@ -300,6 +306,13 @@ def estimate_image_tokens(part: dict) -> int:
         with contextlib.suppress(binascii.Error, ValueError, struct.error, IndexError):
             dims = _image_dimensions(base64.b64decode(payload))
     if not dims or dims[0] <= 0 or dims[1] <= 0:
+        return None
+    return int(dims[0]), int(dims[1])
+
+
+def image_tokens_for(dims: Optional[Tuple[int, int]]) -> int:
+    """Prefill tokens for an image of `dims` pixels; unknown is the ceiling."""
+    if not dims:
         return _IMAGE_MAX_TOKENS + _IMAGE_OVERHEAD_TOKENS
     edge = _IMAGE_PIXELS_PER_TOKEN_EDGE
     patches = (-(-dims[0] // edge)) * (-(-dims[1] // edge))
@@ -744,6 +757,13 @@ async def count_tokens(
         return estimate_messages(messages), _window_cache.get(base_url)
 
 
+def known_window(base_url: str) -> int:
+    """The window `model_window` has cached for this endpoint, else the
+    configured one. No request: for sizing that must not wait on the engine
+    (engines/vision.py fits a turn's pictures before the call is built)."""
+    return int(_window_cache.get(base_url) or settings.model_max_context)
+
+
 async def model_window(base_url: str, model: str) -> int:
     """The serving model's context window, cached per base URL."""
     cached = _window_cache.get(base_url)
@@ -818,17 +838,27 @@ def _longest_content_index(messages: Sequence[dict]) -> Optional[int]:
 #: Pictures one classification call may carry: the router's safe share, the
 #: number /v1 publishes for it (publicapi.registry.ROUTER_MAX_IMAGES; a test
 #: pins that they agree). Its window is small and an image part cannot be
-#: clipped like text, so since a message may carry 20 pictures (2026-10-03)
-#: the router is never handed more than this.
+#: clipped like text, so since a message may carry any number of pictures
+#: (2026-10-03) the router is never handed more than this...
 CLASSIFICATION_MAX_IMAGES = 8
+#: ...nor more image tokens than half its 65,536-token window (the router
+#: engine's max-model-len), so the text and the answer have the other half:
+#: eight pictures of unknown size are charged 16,388 tokens each, 131,104 in
+#: all, which no count alone prevents.
+CLASSIFICATION_MAX_IMAGE_TOKENS = 32_768
 
 
 def clip_message_contents(
-    messages: Sequence[dict], cap: int, *, max_images: Optional[int] = None
+    messages: Sequence[dict],
+    cap: int,
+    *,
+    max_images: Optional[int] = None,
+    max_image_tokens: Optional[int] = None,
 ) -> List[dict]:
     """Clip every text content to `cap` characters (classification calls),
-    and keep at most `max_images` image parts, the newest ones (the turn
-    being classified is last)."""
+    and keep at most `max_images` image parts and `max_image_tokens` of their
+    estimated tokens, the newest ones first (the turn being classified is
+    last)."""
     out: List[dict] = []
     for m in messages:
         content = m.get("content")
@@ -836,9 +866,10 @@ def clip_message_contents(
             out.append({**m, "content": content[:cap] + "\n…[truncated]"})
         else:
             out.append(dict(m))
-    if max_images is None:
+    if max_images is None and max_image_tokens is None:
         return out
-    room = max(0, int(max_images))
+    room = max(0, int(max_images)) if max_images is not None else None
+    tokens = max(0, int(max_image_tokens)) if max_image_tokens is not None else None
     for i in range(len(out) - 1, -1, -1):
         content = out[i].get("content")
         if not isinstance(content, list):
@@ -846,9 +877,13 @@ def clip_message_contents(
         kept: List[Any] = []
         for part in reversed(content):
             if _is_image_part(part):
-                if room == 0:
+                cost = estimate_image_tokens(part) if tokens is not None else 0
+                if room == 0 or (tokens is not None and cost > tokens):
                     continue
-                room -= 1
+                if room is not None:
+                    room -= 1
+                if tokens is not None:
+                    tokens -= cost
             kept.append(part)
         if len(kept) != len(content):
             out[i] = {**out[i], "content": list(reversed(kept)) or ""}

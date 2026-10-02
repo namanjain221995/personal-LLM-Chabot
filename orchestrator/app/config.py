@@ -580,7 +580,12 @@ class Settings:
         # alone is an hour of speech-engine time on a GPU the chat model
         # shares.
         self.video_max_duration_s: int = _int("VIDEO_MAX_DURATION_S", 4 * 3600)
-        self.video_max_upload_mb: int = _int("VIDEO_MAX_UPLOAD_MB", 4096)
+        # A video or audio file may be as large as any upload: unset, this
+        # FOLLOWS UPLOAD_MAX_MB (no app limit since 2026-10-03,
+        # docs/chat-media/LIMITS.md; 4096 before). VIDEO_MAX_DURATION_S is
+        # the analysis window, not a refusal: a longer file is kept whole and
+        # its first window is analysed (video/pipeline.py).
+        self.video_max_upload_mb: int = _int("VIDEO_MAX_UPLOAD_MB", _int("UPLOAD_MAX_MB", 200))
         # ONE JOB AT A TIME. A saturated speech engine on either node takes
         # the chat model from 71 to 24 tok/s (measured 2026-09-08); two
         # videos at once would double that. Raise only on a deployment where

@@ -113,6 +113,21 @@ def _duration_s(row: dict) -> float:
     return float(row.get("duration_ms") or 0) / 1000.0
 
 
+def window_note(row: dict) -> str:
+    """'' or what part of a file longer than the analysis window was read
+    (VIDEO_MAX_DURATION_S, video/pipeline.py `_stage_probe`): the file is
+    kept whole, and the answer must not imply the rest was watched."""
+    probe = row.get("probe") if isinstance(row.get("probe"), dict) else {}
+    try:
+        analysed = float(probe.get("analysed_s") or 0)
+        full = float(probe.get("full_duration_s") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if analysed <= 0 or full <= analysed:
+        return ""
+    return f"only its first {_mmss(analysed)} of {_mmss(full)} was analysed"
+
+
 def _display_name(row: dict) -> str:
     return str(row.get("display_name") or row.get("filename") or "video")
 
@@ -184,6 +199,8 @@ def pinned_block(videos: Sequence[dict], *, max_chars: int) -> str:
             head += f", {u.content_type.replace('_', ' ')}"
         if row.get("language"):
             head += f", {row['language']}"
+        if window_note(row):
+            head += f"; {window_note(row)}"
         head += ")"
         if row.get("status") != "done":
             parts.append(f"{head} — analysis {row.get('status')}{': ' + row['error'] if row.get('error') else ''}")
@@ -220,7 +237,7 @@ def overview_markdown(row: dict, *, files: Sequence[dict] = ()) -> str:
         head[0] += f" · {u.content_type.replace('_', ' ')}"
     if row.get("language"):
         head[0] += f" · {row['language']}"
-    facts = []
+    facts = [window_note(row)] if window_note(row) else []
     if row.get("has_audio") is False:
         facts.append("no audio track")
     elif not counts.get("segments"):
@@ -459,6 +476,11 @@ async def build_question_prompt(
             lines.append("  Chapters: " + "; ".join(f"[{_mmss(c.start_s)}] {c.title}" for c in u.chapters[:30]))
         if u.not_covered:
             lines.append(f"  Not covered: {u.not_covered.strip()}")
+        if window_note(v):
+            lines.append(
+                f"  Analysed: {window_note(v)}; nothing after that is in the evidence, "
+                "so say so if the question is about a later part."
+            )
     pending = [v for v in videos if v.get("status") != "done"]
     for v in pending:
         lines.append(f"- {_display_name(v)}: analysis {v.get('status')}" + (f" ({v.get('error')})" if v.get("error") else ""))

@@ -155,7 +155,7 @@ def max_db_chars() -> int:
     picture, so the durable one is the one a browser already produces —
     `MAX_IMAGE_EDGE` in frontend/lib/images.ts is 1600 px, and five such
     uploads are comfortably under 8 M characters (~6 MB). A message may carry
-    twenty since 2026-10-03: the row then keeps the turn's first pictures that
+    any number since 2026-10-03: the row then keeps the turn's first pictures that
     fit, in order (`_fit`), and never fails the turn; the chat's stored
     pictures (app/chat_media.py) still hold every one. A picture above this
     budget is stored as the same 1600 px copy
@@ -550,7 +550,7 @@ def _stored_read(ident: tuple, visible: "Optional[Sequence[tuple]]" = None) -> "
         from .. import chat_media
 
         # Read no more pictures than the budget below can keep: a turn may
-        # hold twenty stored originals of up to 10 MiB each (2026-10-03).
+        # hold any number of stored originals of up to 10 MiB each (2026-10-03).
         found = chat_media.latest_turn_images(ident[0], ident[1], visible, max_chars=max_chars())
     except Exception as exc:  # noqa: BLE001 — never a failed turn
         log.debug("image memory: could not read the stored pictures: %s", type(exc).__name__)

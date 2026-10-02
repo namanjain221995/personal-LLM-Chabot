@@ -2070,7 +2070,8 @@ async def router_chat_completion(
     URL. A long message is CLIPPED rather than sent whole — the opening of a
     message determines its class, and the router's window is far smaller
     than the main model's. For the same reason it never carries more than
-    `context.CLASSIFICATION_MAX_IMAGES` pictures (the newest ones).
+    `context.CLASSIFICATION_MAX_IMAGES` pictures or
+    `context.CLASSIFICATION_MAX_IMAGE_TOKENS` of them (the newest ones).
     """
     client = _client(settings.router_base_url)
     # Sized like a sidecar too: on a profile that points the router at the
@@ -2081,6 +2082,7 @@ async def router_chat_completion(
                 messages,
                 settings.router_input_char_cap,
                 max_images=context.CLASSIFICATION_MAX_IMAGES,
+                max_image_tokens=context.CLASSIFICATION_MAX_IMAGE_TOKENS,
             )
         ),
         base_url=settings.router_base_url,

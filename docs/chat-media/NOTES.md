@@ -1031,3 +1031,71 @@ What the browser does now (replaces the 20-per-message version of this section):
 - **Not done here:** the 100-photo bubble is 160 px thumbnails, about 50 rows tall on a desktop; a
   compact grid for many photos is a design follow-up. The model-context fit of 100 photos is the
   backend's (smaller sizes); not exercised against the real model from the browser.
+
+## limits: backend, NO limit (orchestrator, 2026-10-03 03:00 IST)
+
+Replaces the "Counts on the server" list above (20 everywhere). For the frontend track:
+
+- **Counts are a technical ceiling only, 999 (vLLM's per-prompt image maximum):**
+  `main.MAX_IMAGES = 999` (inline + `image_refs` together; 422 `at most 999 images per message`
+  only at 1,000), `image_ids` / `image_refs` 1..999 ids each, `chat_media.MAX_FILES = 999` `file`
+  parts per POST (`_FORM_MAX_FIELDS = MAX_FILES + 11`), `pdf_uploads` 999, `video_uploads` 999.
+  The Next proxy's id-list filter may allow 1..999. Nothing below 1,000 is refused for its count.
+- **Bytes still bound a request (not user limits):** batch at `chat_media.BATCH_BUDGET_BYTES`
+  (48 MiB) per `POST /chat-media` and inline per `/chat`; body caps unchanged (`/chat` 128 MiB,
+  `/chat-media` 64 MiB: 48 MiB plus the framing of 999 parts and their ids fits). One picture AS
+  SENT is still at most 10 MiB (`chat_media.MAX_IMAGE_BYTES`); the original may be any size.
+- **Chunked rail:** `uploads._MAX_PARTS` 128 -> 16,384. At the browser's 64 MiB parts 128 parts
+  silently capped every upload at 8 GiB; `init` reports `max_parts` = 16,384 now. The only size
+  rule is `UPLOAD_MAX_MB` (production 102400).
+- **Video/audio:** `VIDEO_MAX_UPLOAD_MB` unset follows `UPLOAD_MAX_MB` (production .env does not
+  set it). A file longer than `VIDEO_MAX_DURATION_S` (4 h) is accepted, kept whole, and its first
+  4 h analysed (`-t` on the audio and frame extraction); the probe stage no longer fails, and the
+  overview, the pinned block and every answer's prompt say "only its first 4:00:00 of 6:12:00
+  was analysed".
+- **What the model reads of many pictures (engines/vision.py `fit_images`, code, not the model):**
+  the turn's pictures go as they came while their image tokens fit the turn's budget, else ALL of
+  them at 896, 640 or 448 px on the long edge (the largest that fits), and only when even 448 px
+  cannot hold them, the first ones that fit. The budget is `VISION_IMAGE_TOKEN_BUDGET` (default
+  65,536 image tokens, never more than the window minus the answer's reserve), not the whole 1M
+  window: vLLM's processor turns every picture into float32 patches in the HEAD's memory (~24 KB a
+  token, in the API server and again in the engine core) and the prefill runs ~1,300-1,700 image
+  tokens a second, so 65,536 is ~1.6 GB of patches per copy and ~40-50 s: 34 photos at 1600 px,
+  110 at 896, 215 at 640, 414 at 448 (4:3). The whole window would be minutes and tens of GB; the
+  owner can raise the knob. The model is told the size ("sent all 100 pictures at 896 px") or how
+  many it got; when pictures were left out the ANSWER ends with a sentence counted by code: "_I
+  read the first 414 of the 999 pictures in this message; the other 585 did not fit in one
+  question. Send them in another message to ask about them._" (a picture that needed shrinking and
+  would not decode is named as "could not be opened as a picture"). The same fit runs on pictures
+  attached beside documents (engines/document.py). The table pre-pass (superlatives) runs only up
+  to 5 pictures.
+- **Measured once on the production main model** (127.0.0.1:8000, Qwen3.6-35B-A3B-NVFP4,
+  2026-10-03 ~03:20 IST, one other request running, `max_tokens` 16, thinking off, streamed):
+  40 synthetic 1600x1200 JPEGs fitted to 896 px: body 0.55 MB, **23,623 prompt tokens** (the code's
+  estimate 23,680), **TTFT 17.93 s**, total 18.24 s.
+- **Stored pictures by reference:** `/chat` reads originals until `chat_media.REFS_FULL_CHARS`
+  (96 Mi data-URL characters), then each further one as a 448 px copy, so 999 refs never put
+  999 originals in memory.
+- **Router:** besides the 8-picture share, at most `context.CLASSIFICATION_MAX_IMAGE_TOKENS`
+  (32,768, half its 65,536 window) of image tokens, newest first.
+- **Documents (head memory):** a turn reads at most `DOC_WHOLE_READ_BYTES` (256 MiB) of documents
+  into memory whole (every ordinary turn unchanged); past it a document is a `DocFile` the engine
+  reads from disk: PDF opened by path (PDFium reads on demand) up to `DOC_MAX_PAGES` 2,000 pages,
+  DOCX streamed through a pull parser that stops at the text budget, text read only as far as the
+  budget. All of a turn's documents share `DOC_TURN_TEXT_CHARS` (8 M characters): 20 documents keep
+  400,000 each as before, 50 keep 160,000, 999 keep 8,000. A document read in part says so in the
+  prompt header and in a closing line of the answer ("_Read in part — **huge.txt**: only its first
+  400,000 characters were read (600 MB file). The files are kept whole and can be downloaded._").
+  The engine no longer drops documents past 24 in silence (`MAX_DOCS` 1,024, named if exceeded);
+  a file turn (artifacts) reads every document attached to it (was 5) and reads a CSV dataset
+  only up to 64 MB, saying how many rows.
+- **Archives:** an archive past `ARCHIVE_MAX_FILES` or `ARCHIVE_MAX_UNCOMPRESSED_MB` is unpacked up
+  to them and the rest listed ("15 more file(s): not unpacked: only the first 10,000 entries are
+  (the archive itself is kept whole)"), not refused; a bomb-shaped member, a lying header and an
+  .xlsx past the caps are still refused. A dataset archive with more files than
+  `PROFILE_MAX_FILES` says "profiled the first 40 of N files".
+- **Datasets:** the DuckDB profiler runs with `memory_limit` 2 GB (`PROFILE_DUCKDB_MEMORY`) and
+  spills to `<tmp>/duckdb-profile-spill`; its default was 80% of the machine (97 GiB here).
+- **Not changed:** the /v1 Files API (`apifiles/`, its own documented limits, e.g. office files
+  512 MiB), `_MAX_ARCHIVE_IMAGES` (4 pictures attached from an archive; the rest are listed), and
+  image_memory's budgets (a follow-up re-sends the first pictures that fit, as before).

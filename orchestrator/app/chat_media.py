@@ -110,12 +110,15 @@ log = logging.getLogger(__name__)
 
 #: The ceilings per picture and per request. MAX_IMAGE_BYTES applies to the
 #: bytes actually sent, which the composer has already shrunk to 1600 px
-#: (frontend/components/Composer.tsx). MAX_FILES is main.MAX_IMAGES, the
-#: pictures one message may carry: 20 since 2026-10-03 (5 before,
-#: docs/chat-media/LIMITS.md). Spelled out, not imported: main imports this
+#: (frontend/components/Composer.tsx): the ORIGINAL photo may be any size.
+#: MAX_FILES is main.MAX_IMAGES, the technical ceiling of pictures one
+#: message may carry: no limit in the app since 2026-10-03 (5, then 20,
+#: before; docs/chat-media/LIMITS.md), 999 being vLLM's per-prompt maximum.
+#: What bounds one POST is its bytes (BATCH_BUDGET_BYTES under the 64 MiB
+#: body cap), not its count. Spelled out, not imported: main imports this
 #: module.
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
-MAX_FILES = 20
+MAX_FILES = 999
 #: Picture bytes one request may carry inline: the browser's batch budget for
 #: a POST here, and for the inline images of one /chat body (as base64
 #: characters there). A send over it goes by reference (`image_refs`). Well
@@ -186,7 +189,9 @@ _DATA_URL_PREFIX = re.compile(r"^data:[\w.+/-]*;base64,", re.I)
 
 #: The form parser's bounds: MAX_FILES pictures, and beside them as many ids
 #: and a source, with the slack the five-picture form had (16 fields for 6).
-#: Every extra part is another spool file or another string in memory.
+#: Every extra part is another spool file or another string in memory, and
+#: the 64 MiB body cap bounds them all: 1,010 fields of at most 4 KiB is
+#: under 4 MiB, and the files are the batch's own bytes.
 _FORM_MAX_FIELDS = MAX_FILES + 11
 _FORM_MAX_FIELD_BYTES = 4 * 1024
 
@@ -953,16 +958,29 @@ def _data_url(row: Dict[str, Any], data: bytes) -> str:
     return f"data:{row['mime']};base64," + base64.b64encode(data).decode("ascii")
 
 
+#: Data-URL characters of stored originals one /chat turn reads into memory
+#: as they are; past it every further picture is read as a model-sized copy
+#: (engines/vision.FIT_EDGES' smallest edge, tens of KB). A message may carry
+#: any number of pictures (2026-10-03), and 999 originals of up to 10 MiB
+#: would otherwise be 13 GB of base64 in the orchestrator. Twice the inline
+#: budget: every turn the browser could have sent inline loads unchanged.
+REFS_FULL_CHARS = 2 * BATCH_BUDGET_BYTES
+
+
 def _load_refs(
     user_id: int,
     conversation_id: str,
     attachment_ids: Sequence[str],
     max_chars: Optional[int] = None,
+    full_chars: Optional[int] = None,
 ) -> Tuple[List[str], List[str]]:
     """(data URLs in order, ids that could not be loaded). With `max_chars`
     (image_memory's fallback) it stops reading once the loaded data URLs
     reach that many characters: the caller keeps only what fits its budget,
-    so twenty 10 MiB originals are never all in memory at once."""
+    so many 10 MiB originals are never all in memory at once. With
+    `full_chars` (/chat) it reads on past that point, each further picture as
+    a model-sized copy (`REFS_FULL_CHARS`); one that will not shrink is read
+    as it is."""
     rows = rows_by_attachment(user_id, conversation_id, attachment_ids)
     loaded: List[str] = []
     missing: List[str] = []
@@ -975,9 +993,14 @@ def _load_refs(
         if data is None:
             if attachment_id not in missing:
                 missing.append(attachment_id)
-        else:
-            loaded.append(_data_url(row, data))
-            held += len(loaded[-1])
+            continue
+        small = None
+        if full_chars is not None and held >= full_chars:
+            from .engines.vision import FIT_EDGES, shrink_picture
+
+            small = shrink_picture(data, FIT_EDGES[-1])
+        loaded.append(small or _data_url(row, data))
+        held += len(loaded[-1])
     return loaded, missing
 
 
@@ -993,7 +1016,9 @@ async def load_refs(
         return [], []
     if not _valid_conversation(conversation_id):
         return [], list(dict.fromkeys(ids))
-    return await asyncio.to_thread(_load_refs, int(user_id), str(conversation_id), ids)
+    return await asyncio.to_thread(
+        _load_refs, int(user_id), str(conversation_id), ids, None, REFS_FULL_CHARS
+    )
 
 
 def _meta_attachment_ids(images: Any) -> List[str]:

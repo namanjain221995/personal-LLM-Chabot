@@ -244,7 +244,7 @@ def test_only_the_routes_that_carry_large_bodies_get_a_larger_cap_once_signed_in
     upload is what `_stream_to_disk` keeps (UPLOAD_MAX_MB, for EVERY purpose —
     the old `max(upload, video)` ceiling was 20x anything the route accepted),
     a chunked part is `_PART_CAP`, and a chat-media upload (V44) is the
-    browser's batch budget (48 MiB of pictures, up to twenty, since
+    browser's batch budget (48 MiB of pictures, any number of them since
     2026-10-03) plus framing, the Next proxy's own 64 MiB."""
     monkeypatch.delenv("MAX_REQUEST_BODY_BYTES", raising=False)
     monkeypatch.delenv("CHAT_MAX_REQUEST_BODY_BYTES", raising=False)
@@ -255,7 +255,11 @@ def test_only_the_routes_that_carry_large_bodies_get_a_larger_cap_once_signed_in
     assert cap("POST", "/history/conversations/c1/messages").signed_in == 32 * MIB
     assert cap("POST", "/audio/transcribe").signed_in == max(MIB, settings.asr_max_upload_bytes)
     assert cap("POST", "/uploads").signed_in == settings.upload_max_mb * MIB + MIB
-    assert cap("POST", "/uploads").signed_in < uploads_module._cap_total("video")
+    # A video may be as large as any upload since 2026-10-03 (VIDEO_MAX_UPLOAD_MB
+    # unset follows UPLOAD_MAX_MB, docs/chat-media/LIMITS.md); the single-shot
+    # cap is still the upload size plus framing, never a separate video size.
+    if "VIDEO_MAX_UPLOAD_MB" not in os.environ:
+        assert uploads_module._cap_total("video") == uploads_module._cap_total("document")
     assert cap("PUT", "/uploads/chunked/c1/u1/part/3").signed_in == uploads_module._PART_CAP
     assert cap("POST", "/chat-media/c1").signed_in == 64 * MIB
     # One batch of the browser's (docs/chat-media/LIMITS.md) always fits, and

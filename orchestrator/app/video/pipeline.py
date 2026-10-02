@@ -678,18 +678,26 @@ async def _stage_probe(ctx: _Ctx, progress) -> _StageResult:
     from . import media
 
     probe = await media.probe(ctx.source, timeout_s=60.0)
-    if probe.duration_s > settings.video_max_duration_s:
-        # B12: an audio file rides this rail too, and this sentence reaches
-        # the person ("I couldn't analyse memo.m4a: …").
-        kind = "video" if probe.has_video else "recording"
-        return _StageResult(
-            "failed",
-            f"the {kind} is {art.fmt_ts(probe.duration_s)} long; the limit is {art.fmt_ts(settings.video_max_duration_s)}",
-        )
     summary = probe.summary()
+    window = float(settings.video_max_duration_s)
+    windowed = window > 0 and probe.duration_s > window
+    if windowed:
+        # NOT A REFUSAL since 2026-10-03 (docs/chat-media/LIMITS.md): the
+        # file is kept whole and its first VIDEO_MAX_DURATION_S seconds are
+        # analysed, so one upload cannot hold the single job slot for a day.
+        # probe.json carries the window as `duration_s` (every later stage
+        # sizes its work, and ffmpeg its `-t`, by it) and the file's own
+        # length as `full_duration_s`; the row keeps the file's length, and
+        # engines/video.py says what part was read.
+        summary = {**summary, "duration_s": round(window, 3), "full_duration_s": round(probe.duration_s, 3), "analysed_s": round(window, 3)}
     store.write_json(store.stage_path(ctx.content_hash, "probe.json"), {**summary, "raw": probe.raw})
     ctx.probe = {**summary, "raw": probe.raw}
     detail = f"{art.fmt_ts(probe.duration_s)}"
+    if windowed:
+        # B12: an audio file rides this rail too, and this sentence reaches
+        # the person.
+        kind = "video" if probe.has_video else "recording"
+        detail = f"the {kind} is {art.fmt_ts(probe.duration_s)} long; its first {art.fmt_ts(window)} is analysed"
     if probe.has_video:
         detail += f" · {probe.width}x{probe.height} {probe.video_codec}"
     detail += f" · {'with' if probe.has_audio else 'NO'} audio"
@@ -717,7 +725,10 @@ async def _stage_audio(ctx: _Ctx, progress) -> _StageResult:
     wav = store.stage_path(ctx.content_hash, "audio.wav")
     duration = float(probe.get("duration_s") or 0.0)
     timeout = max(120.0, duration * 0.5 + 60.0)
-    samples = await media.extract_audio(ctx.source, wav, timeout_s=timeout, threads=settings.video_ffmpeg_threads)
+    samples = await media.extract_audio(
+        ctx.source, wav, timeout_s=timeout, threads=settings.video_ffmpeg_threads,
+        limit_s=probe.get("analysed_s"),
+    )
     ctx.counts["audio_samples"] = int(samples)
     return _StageResult("done", f"{art.fmt_ts(samples / 16000)} of audio")
 
@@ -826,6 +837,7 @@ async def _stage_frames(ctx: _Ctx, progress) -> _StageResult:
         keyframes_only=keyframes_only,
         timeout_s=max(300.0, duration * 1.5 + 120.0),
         threads=settings.video_ffmpeg_threads,
+        limit_s=probe.get("analysed_s"),
     )
     await progress(70.0, f"{len(extracted)} candidate frames · hashing")
     kept, report = await asyncio.to_thread(fr.select, extracted, total_s=duration, cap=cap, distance=settings.video_frame_hash_distance)

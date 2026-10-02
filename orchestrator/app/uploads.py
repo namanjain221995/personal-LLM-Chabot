@@ -550,15 +550,22 @@ async def _finalise_dataset(
             shutil.copy2(raw_path, os.path.join(extract_dir, filename))
             plan = None
 
-        return plan, profiler.profile_directory(extract_dir)
+        files = sum(len(names) for _dir, _sub, names in os.walk(extract_dir))
+        return plan, profiler.profile_directory(extract_dir), files
 
     try:
-        plan, profiles = await asyncio.to_thread(_extract_and_profile)
+        plan, profiles, files = await asyncio.to_thread(_extract_and_profile)
         if plan is not None:
             for name, why in plan.skipped:
                 notes.append(f"skipped {name}: {why}")
             for name in plan.nested_archives:
                 notes.append(f"nested archive listed but not opened: {name}")
+        if files > len(profiles):
+            # PROFILE_MAX_FILES bounds the work, not the upload: say so.
+            notes.append(
+                f"profiled the first {len(profiles):,} of {files:,} files; "
+                "the others are stored but not profiled"
+            )
     except archive.ArchiveError as exc:
         shutil.rmtree(root, ignore_errors=True)
         await db.run_in_thread(
@@ -824,9 +831,12 @@ def list_uploads(
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
 #: Comfortably under the 100 MB edge wall, with room for multipart overhead.
 _PART_CAP = 90 * 1024 * 1024
-#: 128 x 90 MiB = 11 GiB of headroom on the server side; the client's
-#: 64 MiB parts make a 4 GB video 60 parts (2026-09-09).
-_MAX_PARTS = 128
+#: Parts one session may have. Not a size rule: `_cap_total` (UPLOAD_MAX_MB,
+#: production 100 GB) is the only one since 2026-10-03
+#: (docs/chat-media/LIMITS.md). 128 until then, which at the client's 64 MiB
+#: parts silently capped every upload at 8 GiB; 16,384 x 64 MiB is 1 TiB, so
+#: the count never binds before the size does.
+_MAX_PARTS = 16_384
 #: Where a session's parts live under its upload root. Each accepted part is
 #: the file `<index>`; a part still streaming is `<index>.<nonce>.tmp`.
 _PARTS_DIR = "_parts"

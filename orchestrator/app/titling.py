@@ -125,7 +125,7 @@ def clip(text: str, limit: int) -> str:
 def build_messages(user_text: str, assistant_text: str) -> list:
     """The two-message request. TEXT ONLY, deliberately.
 
-    Qwen3-VL is multimodal and a first turn may carry up to five base64
+    Qwen3-VL is multimodal and a first turn may carry any number of base64
     images; re-sending them would cost thousands of prefill tokens for a
     six-token output. An image-only turn falls back to "(empty)" and the title
     comes from the assistant's description of it.

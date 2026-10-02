@@ -83,8 +83,10 @@ db.py (so `delete_conversation` deletes the rows), and `schema_parity.py invaria
   size) must agree on jpeg, png, webp or gif. Everything else (heic, svg, bmp, tiff, html renamed
   .png, truncated files) is refused: 415 on the upload route; skipped with a metric on the `/chat`
   path (the chat itself never fails because of storage).
-- Limits: <= 10 MiB decoded per image (the composer's `MAX_IMAGE_BYTES`), <= 5 per request
-  (`MAX_IMAGES`). Pillow's decompression-bomb guard stays on.
+- Limits: <= 10 MiB decoded per image as sent (the composer's `MAX_IMAGE_BYTES`; it shrinks the
+  original, which may be any size), and since 2026-10-03 no count limit: 999 per request is only
+  the technical ceiling (`MAX_IMAGES`, LIMITS.md); a request is bounded by its bytes (48 MiB batch
+  budget). Pillow's decompression-bomb guard stays on.
 - Thumbnail: when the long edge > 512 px or the file > 200 KB, write `thumb.webp`, long edge 512 px,
   quality 80, EXIF orientation applied, alpha kept, first frame for GIF. Otherwise `has_thumb=false`
   and `size=thumb` serves the full file.

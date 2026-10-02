@@ -78,7 +78,18 @@ log = logging.getLogger(__name__)
 PREVIOUS_ANSWER_MAX_CHARS = 120_000
 MAX_UPLOAD_ROWS = 200_000
 GATHER_DEADLINE_S = 15.0
+#: The conversation's EARLIER documents and datasets a file turn pulls in
+#: when this turn attaches none: the most recent (or named) few.
 _MAX_UPLOADS = 5
+#: The files and photos attached to THIS turn: no limit in the app since
+#: 2026-10-03 (`_MAX_UPLOADS` before; docs/chat-media/LIMITS.md), 999 being
+#: the request ceiling. The gather deadline and the row budget bound the
+#: work, and each says what it left out.
+_MAX_TURN_UPLOADS = 999
+#: Bytes of one CSV dataset read into memory: MAX_UPLOAD_ROWS rows of a wide
+#: table fit, and a file of any size is never read whole (head memory is off
+#: limits); past it the note says the rest was not read.
+_CSV_READ_BYTES = 64 * 1024 * 1024
 
 
 @dataclass
@@ -878,7 +889,7 @@ async def gather(
     if md and not from_image:
         out.answer_tables = await asyncio.to_thread(tables_from_markdown, md, id_prefix="answer", source_id="assistant_answer")
 
-    items = list(pdf_uploads or ())[:_MAX_UPLOADS]
+    items = list(pdf_uploads or ())[:_MAX_TURN_UPLOADS]
     if pdf_data:
         items.append(pdf_data)
     budget = MAX_UPLOAD_ROWS
@@ -888,6 +899,19 @@ async def gather(
             for item in items:
                 name, raw, pre = _decode_upload(item)
                 out.upload_names.append(name)
+                from ..engines.document import DocFile
+
+                if isinstance(pre, DocFile):
+                    # A document past the turn's whole-read budget: read
+                    # from disk within the text budget, never whole.
+                    from ..engines.document import extract_document_file
+
+                    pre, err = await extract_document_file(pre.name, pre.path)
+                    if pre is None:
+                        out.notes.append(err or f"{name} could not be read.")
+                        continue
+                    if pre.note:
+                        out.notes.append(f"{name}: {pre.note}.")
                 if raw is None and pre is not None:
                     read.append({"name": name, "kind": "text", "doc": None, "text": getattr(pre, "full_text", "") or "",
                                  "tables": [], "notes": [], "pages": int(getattr(pre, "total", 0) or 0)})
@@ -907,7 +931,7 @@ async def gather(
                 read.append(res)
                 out.upload_tables.extend(res["tables"])
                 budget -= sum(len(t.rows) for t in res["tables"])
-            for name, body in list(image_texts or ())[:_MAX_UPLOADS]:
+            for name, body in list(image_texts or ())[:_MAX_TURN_UPLOADS]:
                 # Read like a markdown upload: the transcript's pipe tables
                 # are the rows the file is built from, copied by code.
                 out.upload_names.append(str(name))
@@ -1179,7 +1203,14 @@ def _workspace_tables(workspace: str, conversation_id: str, start: int, budget: 
                     more, n = read_xlsx(str(path), name=name, start=start + len(tables), row_budget=budget)
                 else:
                     with open(path, "rb") as fh:
-                        t, n = read_csv_bytes(fh.read(), name=name, table_id=f"upload{start + len(tables)}", row_budget=budget)
+                        raw = fh.read(_CSV_READ_BYTES + 1)
+                    cut = len(raw) > _CSV_READ_BYTES
+                    if cut:
+                        # Whole rows only: the last line may be a fragment.
+                        raw = raw[: raw.rfind(b"\n", 0, _CSV_READ_BYTES) + 1]
+                    t, n = read_csv_bytes(raw, name=name, table_id=f"upload{start + len(tables)}", row_budget=budget)
+                    if cut and t is not None and len(t.rows) < budget:
+                        n = list(n) + [f"{name}: only its first {len(t.rows):,} rows were read (the first {_CSV_READ_BYTES / (1024 * 1024):,.0f} MB of the file)."]
                     more = [t] if t is not None else []
             except Exception as exc:  # noqa: BLE001 — one bad file is a note
                 notes.append(f"{name} could not be read ({type(exc).__name__}).")

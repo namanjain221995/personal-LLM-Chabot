@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import threading
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
 #: PDFium is NOT thread-safe: two threads inside the library at once
 #: corrupt its state and the process dies (SIGSEGV/SIGABRT reproduced on
@@ -34,8 +35,19 @@ def _strip_data_url(b64: str) -> str:
     return b64.split(",", 1)[-1] if b64.startswith("data:") else b64
 
 
+def _open(pdfium, source: "Union[str, os.PathLike]"):
+    """A PdfDocument from base64 (optionally a data: URL), or from a FILE
+    PATH: PDFium then reads the file on demand, so a document of any size is
+    never held in memory whole (2026-10-03, docs/chat-media/LIMITS.md)."""
+    if isinstance(source, os.PathLike):
+        return pdfium.PdfDocument(os.fspath(source))
+    return pdfium.PdfDocument(base64.b64decode(_strip_data_url(source)))
+
+
 def extract_pdf_pages(
-    pdf_base64: str, max_chars: int = 400_000
+    pdf_base64: "Union[str, os.PathLike]",
+    max_chars: int = 400_000,
+    max_pages: "int | None" = None,
 ) -> Tuple[List[str], int]:
     """Text layer of EVERY page → (per-page texts, total page count).
 
@@ -43,17 +55,18 @@ def extract_pdf_pages(
     a 36-page PRD answered from its first 6 pages (owner report 2026-08-07).
     Text extraction is cheap even for hundreds of pages; only the IMAGE
     rendering stays capped. `max_chars` bounds the total so a pathological
-    PDF cannot flood memory; pages past the cap return ''.
+    PDF cannot flood memory; pages past the cap return ''. `max_pages` does
+    the same by page count (a scan has no text to reach `max_chars` with).
     """
     import pypdfium2 as pdfium  # lazy: arm64 wheel, no system deps
 
     with PDFIUM_LOCK:
-        pdf = pdfium.PdfDocument(base64.b64decode(_strip_data_url(pdf_base64)))
+        pdf = _open(pdfium, pdf_base64)
         try:
             pages: List[str] = []
             used = 0
             for i in range(len(pdf)):
-                if used >= max_chars:
+                if used >= max_chars or (max_pages is not None and i >= max_pages):
                     pages.append("")
                     continue
                 page = pdf[i]
@@ -69,12 +82,12 @@ def extract_pdf_pages(
             pdf.close()
 
 
-def render_pdf_pages(pdf_base64: str, indices: List[int]) -> List[str]:
+def render_pdf_pages(pdf_base64: "Union[str, os.PathLike]", indices: List[int]) -> List[str]:
     """Render just the given page indices to PNG data URLs (for targeted OCR)."""
     import pypdfium2 as pdfium  # lazy
 
     with PDFIUM_LOCK:
-        pdf = pdfium.PdfDocument(base64.b64decode(_strip_data_url(pdf_base64)))
+        pdf = _open(pdfium, pdf_base64)
         try:
             images: List[str] = []
             for i in indices:
@@ -96,7 +109,7 @@ def render_pdf_pages(pdf_base64: str, indices: List[int]) -> List[str]:
 
 
 def render_pdf(
-    pdf_base64: str, max_pages: int = MAX_PDF_PAGES
+    pdf_base64: "Union[str, os.PathLike]", max_pages: int = MAX_PDF_PAGES
 ) -> Tuple[List[str], str, int]:
     """Render a base64 PDF to (page image data URLs, extracted text, total pages).
 
@@ -105,9 +118,8 @@ def render_pdf(
     """
     import pypdfium2 as pdfium  # lazy: arm64 wheel, no system deps
 
-    pdf_bytes = base64.b64decode(_strip_data_url(pdf_base64))
     with PDFIUM_LOCK:
-        pdf = pdfium.PdfDocument(pdf_bytes)
+        pdf = _open(pdfium, pdf_base64)
         try:
             total = len(pdf)
             n = min(total, max_pages)

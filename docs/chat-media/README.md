@@ -88,9 +88,10 @@ truncated files. Further limits:
   default executor with ~0.5 GiB decodes.
 - A multi-picture JPEG (Pillow's `MPO`) is stored as `image/jpeg`, `full.jpg`.
 - At most 10 MiB per picture, checked on the bytes sent (the composer has
-  already shrunk a photo to 1600 px), and 20 per request (5 until 2026-10-03,
-  [`LIMITS.md`](LIMITS.md)). The browser batches its uploads so one POST holds
-  at most `chat_media.BATCH_BUDGET_BYTES` (48 MiB) of pictures.
+  already shrunk a photo to 1600 px; the original may be any size). No count
+  limit since 2026-10-03 ([`LIMITS.md`](LIMITS.md)): 999 per request is only
+  the technical ceiling. The browser batches its uploads so one POST holds at
+  most `chat_media.BATCH_BUDGET_BYTES` (48 MiB) of pictures.
 
 **Write order.** The steps run in this order:
 
@@ -135,7 +136,7 @@ Every other case gets **the same 404 body**:
 
 | Route | What it does |
 |---|---|
-| `POST /chat-media/{conv}` | Multipart. Up to 20 `file` parts, then `attachment_id` text parts in the same order. `source` is `upload` (default) or `backfill`. Every picture is checked before any is stored. An `attachment_id` that already has a row answers that row with `created:false`; its bytes are compared only when the row's file is gone (the heal above). **400** bad shape (count mismatch, a bad or duplicate id, more than 20 files, a bad `source`); **403** the account may not attach; **404** not yours; **408** the body was cut off; **413** over 10 MiB; **415** not a verified raster; **507** below the free-space floor; **500** `store_failed`. Every refusal is `{"code","detail"}` except 403 and 408, which keep the upload rail's `{"detail"}`. Body cap: **64 MiB** (`main.body_cap_for`): one 48 MiB batch plus framing. |
+| `POST /chat-media/{conv}` | Multipart. Any number of `file` parts (999 ceiling) within the byte budget, then `attachment_id` text parts in the same order. `source` is `upload` (default) or `backfill`. Every picture is checked before any is stored. An `attachment_id` that already has a row answers that row with `created:false`; its bytes are compared only when the row's file is gone (the heal above). **400** bad shape (count mismatch, a bad or duplicate id, more than 999 files, a bad `source`); **403** the account may not attach; **404** not yours; **408** the body was cut off; **413** over 10 MiB; **415** not a verified raster; **507** below the free-space floor; **500** `store_failed`. Every refusal is `{"code","detail"}` except 403 and 408, which keep the upload rail's `{"detail"}`. Body cap: **64 MiB** (`main.body_cap_for`): one 48 MiB batch plus framing. |
 | `GET /chat-media/{conv}` | The viewer's pictures in that chat, oldest first. |
 | `GET /chat-media/{conv}/{attachment_id}?size=thumb\|full` | The bytes, streamed with `FileResponse`. |
 | `GET /admin/api/members/{user_id}/chat-media/{conv}/{attachment_id}?size=` | The same response, for the audited conversation viewer. See below. |
@@ -185,9 +186,9 @@ The admin route:
   bytes.
   - They are loaded before anything durable happens: full files, never
     thumbnails.
-  - They go ahead of any inline pictures, and count against the same cap of 20
-    (`main.MAX_IMAGES`; 5 until 2026-10-03). A send whose inline pictures
-    would pass the 48 MiB budget goes by reference.
+  - They go ahead of any inline pictures, and count against the same 999
+    ceiling (`main.MAX_IMAGES`; 5, then 20, until 2026-10-03). A send whose
+    inline pictures would pass the 48 MiB budget goes by reference.
   - A ref that cannot be loaded answers 422
     `{"detail":{"code":"image_ref_missing","missing":[…]}}` before a stream or
     a `chat_requests` row exists.
@@ -197,7 +198,7 @@ The admin route:
     question, like an inline picture.
 - An account without the ATTACHMENTS feature has both lists cleared with the
   rest of its attachments (the usual "Photos and files" notice), never a 422.
-- Each list holds at most 20 ids matching `^[A-Za-z0-9_-]{8,64}$`; anything else
+- Each list holds at most 999 ids matching `^[A-Za-z0-9_-]{8,64}$`; anything else
   is pydantic's 422 (a malformed body), which the Next proxy never forwards.
 
 **Follow-up questions.** `image_memory.hydrate` falls back to the store when

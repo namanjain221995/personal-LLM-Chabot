@@ -17,7 +17,7 @@ ChatGPT-style, and remembered for the rest of the conversation:
      (select_relevant), not a blind prefix — the budget goes where the
      question points.
 
-A message may carry SEVERAL documents (up to the composer's cap of five).
+A message may carry SEVERAL documents (any number since 2026-10-03).
 Each is extracted and remembered individually; the answer prompt sees one
 merged, per-document-labelled text so "compare the two contracts" is a
 single question, not five. Page images ride along only for the FIRST PDF —
@@ -80,11 +80,34 @@ TEXT_OK_CHARS = 200
 OCR_PAGE_BUDGET = 40
 #: Per-question char budget for document context in the answer prompt.
 DOC_CONTEXT_CHARS = 48_000
-#: Documents the ENGINE will merge into one question. A chat request carries
-#: at most 20 references (main._MAX_DOC_REFS, 5 until 2026-10-03) and an
-#: inline PDF, and an ARCHIVE among them adds its manifest and members; so
-#: this stays above 21. Every document shares the one DOC_CONTEXT_CHARS budget.
-MAX_DOCS = 24
+#: Documents the ENGINE will merge into one question. A message may carry any
+#: number since 2026-10-03 (main._MAX_DOC_REFS is the 999 ceiling, 5 before),
+#: plus an inline PDF, and an ARCHIVE among them adds its manifest and members.
+#: Every document shares the one DOC_CONTEXT_CHARS excerpt and the one
+#: DOC_TURN_TEXT_CHARS of memory; one past this is named as not read.
+MAX_DOCS = 1024
+#: Characters of text ONE document keeps (what is stored for later turns).
+DOC_MAX_CHARS = 400_000
+#: ...and ALL of one turn's documents together: twenty documents keep their
+#: 400,000 each, fifty keep 160,000, a thousand 8,000. Head memory is off
+#: limits (owner rule), so a thousand documents are not a thousand budgets.
+DOC_TURN_TEXT_CHARS = 8_000_000
+DOC_MIN_CHARS = 8_000
+#: Bytes of documents one turn reads into memory WHOLE (main.py's resolver):
+#: under it every document is read exactly as before; past it a document is
+#: read from disk (`extract_document_file`), never whole, within its text
+#: budget, and the answer says what part was read.
+DOC_WHOLE_READ_BYTES = 256 * 1024 * 1024
+#: Pages of one PDF read from disk: a scan with no text layer would otherwise
+#: load every page of a 100,000-page file under the one PDFium lock.
+DOC_MAX_PAGES = 2_000
+
+
+def doc_text_budget(count: int) -> int:
+    """Characters each of `count` documents may keep (see above)."""
+    return max(DOC_MIN_CHARS, min(DOC_MAX_CHARS, DOC_TURN_TEXT_CHARS // max(1, int(count))))
+
+
 #: Page renders a Think/Max answer keeps for a born-digital PDF: enough to
 #: see the letterhead and the first table's layout, not a picture of every
 #: paragraph the text layer already carries.
@@ -609,10 +632,18 @@ def page_images_wanted(
 
 
 async def _extract_pdf(
-    pdf_base64: str, emit: Optional[Emit], *, render_pages: int
+    pdf_base64: "Union[str, os.PathLike]",
+    emit: Optional[Emit],
+    *,
+    render_pages: int,
+    max_chars: int = DOC_MAX_CHARS,
+    pages_total: Optional[Tuple[List[str], int]] = None,
 ) -> tuple[str, List[str], int, int, List[str]]:
-    """→ (page-marked text, first-page images, total pages, ocr'd pages, pages)."""
-    pages, total = extract_pdf_pages(pdf_base64)
+    """→ (page-marked text, first-page images, total pages, ocr'd pages, pages).
+
+    `pdf_base64` may be a file PATH (PDFium then reads it on demand);
+    `pages_total` is a text layer the caller already extracted."""
+    pages, total = pages_total or extract_pdf_pages(pdf_base64, max_chars)
     images: List[str] = []
     if render_pages > 0:
         images, _text, _total = render_pdf(pdf_base64, max_pages=render_pages)
@@ -646,15 +677,18 @@ async def _extract_pdf(
 class _Doc:
     """One readable document, extracted."""
 
-    __slots__ = ("name", "full_text", "images", "total", "ocred", "raw_pages")
+    __slots__ = ("name", "full_text", "images", "total", "ocred", "raw_pages", "note")
 
-    def __init__(self, name, full_text, images, total, ocred, raw_pages):
+    def __init__(self, name, full_text, images, total, ocred, raw_pages, note=""):
         self.name = name
         self.full_text = full_text
         self.images = images
         self.total = total
         self.ocred = ocred
         self.raw_pages = raw_pages
+        #: '' when the whole document was read, else what part was
+        #: ("the first 312 of 5,000 pages"): the answer says so.
+        self.note = note
 
     def to_json(self) -> dict:
         return {
@@ -664,6 +698,7 @@ class _Doc:
             "total": int(self.total or 0),
             "ocred": int(self.ocred or 0),
             "raw_pages": list(self.raw_pages or []),
+            "note": self.note or "",
         }
 
     @classmethod
@@ -675,7 +710,50 @@ class _Doc:
             int(data.get("total") or 0),
             int(data.get("ocred") or 0),
             list(data.get("raw_pages") or []),
+            str(data.get("note") or ""),
         )
+
+    def trimmed(self, max_chars: int, *, keep_images: bool = True) -> "_Doc":
+        """This document within `max_chars` of text (a turn of many
+        documents shares one budget), with the note saying so."""
+        if len(self.full_text) <= max_chars and (keep_images or not self.images):
+            return self
+        note = self.note
+        if len(self.full_text) > max_chars:
+            note = note or _part_note(self.total, self.raw_pages, max_chars)
+        return _Doc(
+            self.name, self.full_text[:max_chars], list(self.images) if keep_images else [],
+            self.total, self.ocred, _pages_within(self.raw_pages, max_chars), note,
+        )
+
+
+def _pages_within(pages: Sequence[str], max_chars: int) -> List[str]:
+    out: List[str] = []
+    used = 0
+    for text in pages or []:
+        text = (text or "")[: max(0, max_chars - used)]
+        used += len(text)
+        out.append(text)
+    return out
+
+
+def _pages_read(pages: Sequence[str]) -> int:
+    """How many leading pages a budgeted text layer covers."""
+    last = max((i for i, t in enumerate(pages or []) if (t or "").strip()), default=-1)
+    return last + 1
+
+
+def _part_note(total: int, pages: Sequence[str], max_chars: int) -> str:
+    if total:
+        return (
+            f"only the first {_pages_read(_pages_within(pages, max_chars)):,} of its {total:,} "
+            f"pages were read (the first {max_chars:,} characters of text)"
+        )
+    return f"only its first {max_chars:,} characters were read"
+
+
+def _megabytes(size: int) -> str:
+    return f"{size / (1024 * 1024):,.0f} MB" if size >= 1024 * 1024 else f"{size:,} bytes"
 
 
 async def extract_document(
@@ -708,9 +786,14 @@ async def extract_document(
             return None, f"Could not read {label}: the file is damaged or is not a PDF."
         wanted = page_images_wanted(pages, total, effort, question)
         full_text, images, total, ocred, raw_pages = await _extract_pdf(
-            pdf_base64, emit, render_pages=wanted
+            pdf_base64, emit, render_pages=wanted, pages_total=(pages, total)
         )
-        return _Doc(name, full_text, images, total, ocred, raw_pages), None
+        note = (
+            _part_note(total, raw_pages, DOC_MAX_CHARS)
+            if sum(len(t) for t in pages) >= DOC_MAX_CHARS
+            else ""
+        )
+        return _Doc(name, full_text, images, total, ocred, raw_pages, note), None
 
     from ..core.docx import DocxError, extract_docx_text, is_docx
 
@@ -731,10 +814,104 @@ async def extract_document(
             )
         else:
             try:
-                full_text = raw.decode("utf-8", errors="replace")[:400_000]
+                full_text = raw.decode("utf-8", errors="replace")[:DOC_MAX_CHARS]
             except Exception:
                 full_text = ""
-    return _Doc(name, full_text, [], 0, 0, []), None
+    note = _part_note(0, [], DOC_MAX_CHARS) if len(full_text) >= DOC_MAX_CHARS else ""
+    return _Doc(name, full_text, [], 0, 0, [], note), None
+
+
+async def extract_document_file(
+    name: Optional[str],
+    path: str,
+    *,
+    effort: str = "think",
+    question: str = "",
+    emit: Optional[Emit] = None,
+    max_chars: int = DOC_MAX_CHARS,
+) -> Tuple[Optional[_Doc], Optional[str]]:
+    """`extract_document` for a document ON DISK, never read into memory
+    whole (2026-10-03, docs/chat-media/LIMITS.md: no size limit, and head
+    memory is off limits). A PDF is opened by path (PDFium reads pages on
+    demand) and read up to DOC_MAX_PAGES pages and `max_chars` characters; a
+    .docx is streamed (core.docx.extract_docx_file); text is read up to
+    `max_chars` characters' worth of bytes. The `_Doc.note` says what part
+    was read; the stored file stays whole and downloadable."""
+    import pathlib
+    import zipfile
+
+    label = name or "document"
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            head = fh.read(8192)
+    except OSError:
+        return None, f"Could not read {label}."
+
+    if head.startswith(b"%PDF"):
+        if emit is not None:
+            await emit("status", {"text": f"Reading {label}…"})
+        source = pathlib.Path(path)
+        try:
+            pages, total = await asyncio.to_thread(_pdf_text_bounded, source, max_chars)
+        except Exception:  # noqa: BLE001 — a broken PDF is a note, not a 500
+            log.info("unreadable PDF %s", label, exc_info=True)
+            return None, f"Could not read {label}: the file is damaged or is not a PDF."
+        wanted = page_images_wanted(pages, total, effort, question)
+        full_text, images, total, ocred, raw_pages = await _extract_pdf(
+            source, emit, render_pages=wanted, max_chars=max_chars, pages_total=(pages, total)
+        )
+        # The pages examined: up to the text budget when it was reached,
+        # else up to the page budget.
+        if sum(len(t) for t in pages) >= max_chars:
+            read = _pages_read(raw_pages)
+        else:
+            read = min(total, DOC_MAX_PAGES)
+        note = ""
+        if read < total:
+            note = f"only the first {read:,} of its {total:,} pages were read ({_megabytes(size)} file)"
+        return _Doc(name, full_text, images, total, ocred, raw_pages, note), None
+
+    if head.startswith(b"PK"):
+        try:
+            with zipfile.ZipFile(path) as zf:
+                is_docx = "word/document.xml" in zf.namelist()
+        except (zipfile.BadZipFile, OSError):
+            is_docx = False
+        if is_docx:
+            from ..core.docx import DocxError, extract_docx_file
+
+            try:
+                text, whole = await asyncio.to_thread(extract_docx_file, path, max_chars)
+            except DocxError as exc:
+                return None, f"Could not read {label} ({exc})."
+            note = "" if whole else f"only its first {len(text):,} characters were read ({_megabytes(size)} file)"
+            return _Doc(name, text, [], 0, 0, [], note), None
+
+    if b"\x00" in head:
+        return _Doc(
+            name,
+            f"[Binary file: {label}, {size:,} bytes — contents are not readable as text.]",
+            [], 0, 0, [],
+        ), None
+
+    def _head_text() -> str:
+        # UTF-8 spends at most four bytes a character: this many bytes
+        # always holds `max_chars` characters, and nothing past them is read.
+        with open(path, "rb") as fh:
+            return fh.read(max_chars * 4).decode("utf-8", errors="replace")
+
+    text = await asyncio.to_thread(_head_text)
+    note = ""
+    if len(text) > max_chars or size > max_chars * 4:
+        text = text[:max_chars]
+        note = f"only its first {len(text):,} characters were read ({_megabytes(size)} file)"
+    return _Doc(name, text, [], 0, 0, [], note), None
+
+
+def _pdf_text_bounded(source, max_chars: int) -> Tuple[List[str], int]:
+    """The text layer of a PDF on disk, at most DOC_MAX_PAGES pages."""
+    return extract_pdf_pages(source, max_chars, max_pages=DOC_MAX_PAGES)
 
 
 async def _read_one(
@@ -800,11 +977,24 @@ def load_document_cache(
 # ---------------------------------------------------------------------------
 
 
-DocInput = Union[Tuple[Optional[str], str], _Doc]
+class DocFile:
+    """A document ON DISK that the engine reads itself, within its share of
+    the turn's text budget and never whole (`extract_document_file`). The
+    resolver hands one over instead of (name, base64) once the turn has read
+    DOC_WHOLE_READ_BYTES of documents into memory."""
+
+    __slots__ = ("name", "path")
+
+    def __init__(self, name: Optional[str], path: str):
+        self.name = name
+        self.path = path
+
+
+DocInput = Union[Tuple[Optional[str], str], _Doc, DocFile]
 
 
 def _item_name(item: DocInput) -> Optional[str]:
-    if isinstance(item, _Doc):
+    if isinstance(item, (_Doc, DocFile)):
         return item.name
     return item[0] if isinstance(item, tuple) else None
 
@@ -853,15 +1043,30 @@ async def run_pdf_engine_multi(
     `search_allowed`: the pill is not off, the mode allows it, the rate limit
     is not hit). False — the default — means no outbound call of any kind.
     """
-    docs = list(docs)[:MAX_DOCS]
-    read: List[_Doc] = []
+    docs = list(docs)
     failures: List[str] = []
+    if len(docs) > MAX_DOCS:
+        failures.append(
+            f"{len(docs) - MAX_DOCS} more documents were not read: one question reads at most {MAX_DOCS}."
+        )
+        docs = docs[:MAX_DOCS]
+    read: List[_Doc] = []
+    # One text budget for the whole turn (DOC_TURN_TEXT_CHARS): with many
+    # documents each keeps its share, and page renders only for the first
+    # PDF, which is the only one whose pages the answer shows.
+    share = doc_text_budget(len(docs))
     for item in docs:
         if isinstance(item, _Doc):
             doc, err = item, None
+        elif isinstance(item, DocFile):
+            doc, err = await extract_document_file(
+                item.name, item.path, effort=effort, question=message, emit=emit, max_chars=share
+            )
         else:
             name, b64 = item
             doc, err = await _read_one(name, b64, emit, effort=effort, question=message)
+        if doc is not None:
+            doc = doc.trimmed(share, keep_images=not any(d.images for d in read))
         if doc is not None and (doc.full_text.strip() or doc.images):
             read.append(doc)
         elif err:
@@ -901,15 +1106,23 @@ async def run_pdf_engine_multi(
         # so nothing downstream (or in anyone's habits) shifts.
         doc = read[0]
         header = f"Document: {doc.name}\n" if doc.name else ""
-        if doc.total:
+        if doc.note:
+            header += f"(Read in part: {doc.note}. Say so if the question may be about the rest.)\n"
+        elif doc.total:
             header += f"({doc.total} pages — all were read.)\n"
         merged = doc.full_text
         images = doc.images
         image_owner = doc
     else:
-        lines = [f"{len(read)} documents were uploaded and ALL were read:"]
+        partial = any(d.note for d in read)
+        lines = [
+            f"{len(read)} documents were uploaded and ALL were read"
+            + (" (some only in part, as noted; say so if the question may be about the rest):" if partial else ":")
+        ]
         for i, doc in enumerate(read, 1):
             pages = f" ({doc.total} pages)" if doc.total else ""
+            if doc.note:
+                pages += f" — {doc.note}"
             lines.append(f"  {i}. {doc.name or f'document {i}'}{pages}")
         header = "\n".join(lines) + "\n"
         merged = "\n\n".join(
@@ -959,9 +1172,22 @@ async def run_pdf_engine_multi(
     for url in images:
         content.append({"type": "image_url", "image_url": {"url": url}})
     # Images found INSIDE an uploaded archive (data: URLs, already capped by
-    # the expander) — the model sees them exactly like attached images.
-    for url in extra_images or []:
-        content.append({"type": "image_url", "image_url": {"url": url}})
+    # the expander) and the pictures attached beside the documents — the
+    # model sees them exactly like attached images, fitted to what one call
+    # can read (engines/vision.fit_images): a message may carry any number.
+    fitted = None
+    if extra_images:
+        from .. import context as _context
+        from .vision import fit_for_model
+
+        reserved = sum(_context.estimate_image_tokens({"image_url": {"url": u}}) for u in images)
+        fitted = await fit_for_model(
+            extra_images, reserved_tokens=reserved + _context.estimate_tokens(excerpt)
+        )
+        for url in fitted.images:
+            content.append({"type": "image_url", "image_url": {"url": url}})
+        if fitted.model_note():
+            content.append({"type": "text", "text": fitted.model_note()})
     if image_owner is not None and image_owner.total > len(images) and images:
         owner_note = (
             f"\n\n(Images show the first {len(images)} of {image_owner.total} "
@@ -1025,6 +1251,17 @@ async def run_pdf_engine_multi(
         await emit(kind, {"text": delta})
         if kind == "token":
             parts.append(delta)
+    if fitted is not None and fitted.person_note():
+        parts.append(fitted.person_note())
+        await emit("token", {"text": fitted.person_note()})
+    in_part = [d for d in read if d.note]
+    if in_part:
+        # Said by the app, not left to the model: what part was read.
+        told = "; ".join(f"**{d.name or 'a document'}**: {d.note}" for d in in_part[:5])
+        more = f" (and {len(in_part) - 5} more)" if len(in_part) > 5 else ""
+        tail = f"\n\n_Read in part — {told}{more}. The files are kept whole and can be downloaded._"
+        parts.append(tail)
+        await emit("token", {"text": tail})
     answer = "".join(parts)
     meta: dict = {"route": "vision", "document": doc_meta}
     if web_sources:

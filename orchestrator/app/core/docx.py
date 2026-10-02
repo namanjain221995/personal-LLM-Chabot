@@ -58,18 +58,87 @@ def extract_docx_text(data: bytes, max_chars: int = 400_000) -> str:
     for child in body:
         if used >= max_chars:
             break
-        if child.tag == f"{_W}p":
-            text = "".join(t.text for t in child.iter(f"{_W}t") if t.text).strip()
-            if text:
-                blocks.append(text)
-                used += len(text)
-        elif child.tag == f"{_W}tbl":
-            for row in child.iter(f"{_W}tr"):
-                cells = [_cell_text(c) for c in row.iter(f"{_W}tc")]
-                line = "\t".join(cells).strip()
-                if line:
-                    blocks.append(line)
-                    used += len(line)
+        for line in _block_lines(child):
+            blocks.append(line)
+            used += len(line)
+    return _joined(blocks, max_chars)
+
+
+def _block_lines(child) -> list[str]:
+    """The text lines of one body child: a paragraph is one line, a table
+    one tab-separated line per row; anything else none."""
+    if child.tag == f"{_W}p":
+        text = "".join(t.text for t in child.iter(f"{_W}t") if t.text).strip()
+        return [text] if text else []
+    if child.tag == f"{_W}tbl":
+        lines = []
+        for row in child.iter(f"{_W}tr"):
+            line = "\t".join(_cell_text(c) for c in row.iter(f"{_W}tc")).strip()
+            if line:
+                lines.append(line)
+        return lines
+    return []
+
+
+def _joined(blocks: list[str], max_chars: int) -> str:
     text = "\n".join(blocks)[:max_chars]
     # Word documents love non-breaking spaces; normalize for the model.
     return re.sub(r"\xa0", " ", text)
+
+
+#: Bytes of word/document.xml fed to the streaming parser at a time.
+_XML_CHUNK = 1 << 20
+
+
+def extract_docx_file(path: str, max_chars: int = 400_000) -> tuple[str, bool]:
+    """`extract_docx_text` for a .docx ON DISK, never read whole: the zip's
+    directory is read, then word/document.xml is streamed through a pull
+    parser and parsing STOPS once `max_chars` of text is in hand. Memory is
+    one paragraph or table at a time, whatever the file's size (2026-10-03,
+    docs/chat-media/LIMITS.md). -> (text, whether the whole body was read)."""
+    try:
+        zf = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise DocxError("not a readable .docx file") from exc
+    blocks: list[str] = []
+    used = 0
+    skipped = False
+    with zf:
+        try:
+            src = zf.open("word/document.xml")
+        except KeyError as exc:
+            raise DocxError("not a readable .docx file") from exc
+        parser = ElementTree.XMLPullParser(events=("start", "end"))
+        depth = 0
+        body = None
+        with src:
+            while used < max_chars:
+                chunk = src.read(_XML_CHUNK)
+                if not chunk:
+                    return _joined(blocks, max_chars), not skipped and used <= max_chars
+                try:
+                    parser.feed(chunk)
+                    events = list(parser.read_events())
+                except ElementTree.ParseError as exc:
+                    if not blocks:
+                        raise DocxError("the .docx document XML is malformed") from exc
+                    break
+                for event, elem in events:
+                    if event == "start":
+                        depth += 1
+                        if depth == 2 and elem.tag == f"{_W}body":
+                            body = elem
+                        continue
+                    depth -= 1
+                    if depth == 2 and body is not None:
+                        # A whole body child: read it, then let it go.
+                        lines = _block_lines(elem)
+                        if used < max_chars:
+                            for line in lines:
+                                blocks.append(line)
+                                used += len(line)
+                        elif lines:
+                            skipped = True
+                        body.remove(elem)
+    # Stopped at the budget, with more of the file unread.
+    return _joined(blocks, max_chars), False

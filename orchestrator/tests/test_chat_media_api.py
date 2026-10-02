@@ -383,8 +383,9 @@ def test_the_shape_of_the_form_is_checked_before_anything_is_stored(login_client
     alice = login_client("alice")
     _chat(alice, "conv-shape")
     over = chat_media.MAX_FILES + 1
-    assert over == 21  # docs/chat-media/LIMITS.md: twenty per request since 2026-10-03
-    many = [(f"{i}.png", _png(colour=(i, i, i)), PNG_CTYPE) for i in range(over)]
+    assert over == 1000  # docs/chat-media/LIMITS.md: no limit since 2026-10-03, 999 the ceiling
+    tiny = _png()
+    many = [(f"{i}.png", tiny, PNG_CTYPE) for i in range(over)]
     resp = _post(alice, "conv-shape", many, [f"att-{i:08d}" for i in range(over)])
     assert resp.status_code in (400, 413), resp.text  # CONTRACT: >MAX_FILES files is 400/413
 

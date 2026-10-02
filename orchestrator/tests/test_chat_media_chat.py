@@ -13,8 +13,9 @@ never the model):
     route and on a document + picture turn alike, and a storage failure never
     fails the chat;
   * `image_refs` loads stored pictures into the same path as inline ones,
-    counts against the same twenty-picture cap (five until 2026-10-03,
-    docs/chat-media/LIMITS.md), and answers 422
+    counts against the same 999-picture technical ceiling (five, then
+    twenty, until 2026-10-03: no limit in the app since, docs/chat-media/LIMITS.md),
+    and answers 422
     image_ref_missing before anything starts when one cannot be loaded;
   * the request snapshot holds ids and never bytes;
   * image_memory reads the stored picture for a follow-up after its V41 row
@@ -339,7 +340,7 @@ def test_mismatched_image_ids_store_nothing_and_are_never_a_4xx(engines, as_user
 def test_a_malformed_image_id_is_a_422(engines, as_user):
     as_user("alice")
     with TestClient(app) as client:
-        for ids in (["no"], ["../../etc"], [f"att-{i:08d}" for i in range(21)]):
+        for ids in (["no"], ["../../etc"], [f"att-{i:08d}" for i in range(1000)]):
             resp = _chat(
                 client, message="x", conversation_id="conv-bad-id",
                 images=[_data_url(_png())], image_ids=ids,
@@ -452,41 +453,66 @@ def _upload_many(client, conv: str, pictures: list) -> list:
     return resp.json()["items"]
 
 
-def test_refs_and_inline_pictures_share_the_twenty_picture_cap(engines, as_user):
+def test_refs_and_inline_pictures_share_the_one_ceiling(engines, as_user):
+    """No limit in the app (docs/chat-media/LIMITS.md): 999 is only vLLM's
+    per-prompt ceiling, and inline pictures and refs count against it together."""
     as_user("alice")
     with TestClient(app) as client:
         _upload_many(client, "conv-cap", [(f"att-stored-{i:02d}", _png(colour=(i, 0, 0))) for i in range(10)])
-        inline = [_data_url(_png(colour=(0, i, 0))) for i in range(11)]
+        inline = [_data_url(_png(colour=(0, 1, 0)))] * 990
         refs = [f"att-stored-{i:02d}" for i in range(10)]
         over = _chat(client, message="all", conversation_id="conv-cap", images=inline, image_refs=refs)
         assert over.status_code == 422
-        assert "at most 20 images per message" in over.text
-        ok = _chat(client, message="all", conversation_id="conv-cap", images=inline[:10], image_refs=refs)
+        assert "at most 999 images per message" in over.text
+        ok = _chat(client, message="all", conversation_id="conv-cap", images=inline[:30], image_refs=refs)
         assert ok.status_code == 200, ok.text
-        assert len(engines["vision"][-1]["images"]) == 20
+        assert len(engines["vision"][-1]["images"]) == 40
 
 
-def test_twenty_stored_pictures_go_by_reference_in_one_turn(engines, as_user):
-    """LIMITS.md: a send whose inline payload would pass the budget uploads
-    its pictures first (one POST holds up to twenty) and sends `image_refs`
-    only; the engine gets every picture, in the order sent."""
+def test_a_hundred_stored_pictures_go_by_reference_in_one_turn(engines, as_user):
+    """LIMITS.md: 100 photos in one message. A send over the inline budget
+    uploads its pictures first (one POST holds any number within the byte
+    budget) and sends `image_refs` only; every one is stored, every one is
+    listed for a second device, and the engine gets every picture, in order."""
     alice = as_user("alice")
     with TestClient(app) as client:
-        pictures = [(f"att-batch-{i:02d}", _png(colour=(i * 10, 5, 5))) for i in range(20)]
-        items = _upload_many(client, "conv-twenty", pictures)
-        assert len(items) == 20 and all(item["created"] for item in items)
+        pictures = [(f"att-batch-{i:03d}", _png(colour=(i, 5, 5))) for i in range(100)]
+        items = _upload_many(client, "conv-hundred", pictures)
+        assert len(items) == 100 and all(item["created"] for item in items)
         refs = [a for a, _p in pictures]
-        resp = _chat(client, message="compare them", conversation_id="conv-twenty", image_refs=refs)
+        resp = _chat(client, message="compare them", conversation_id="conv-hundred", image_refs=refs)
         assert resp.status_code == 200, resp.text
         assert _route(resp) == "vision"
         sent = engines["vision"][-1]["images"]
         assert [_decoded(url) for url in sent] == [p for _a, p in pictures]
+        # A second device lists all hundred.
+        listed = client.get("/chat-media/conv-hundred")
+        assert listed.status_code == 200, listed.text
+        assert {i["attachment_id"] for i in listed.json()["items"]} == set(refs)
         # image_memory's store fallback reads no more than its budget can
         # keep: it stops once the loaded data URLs reach `max_chars`.
         one = len(sent[0])
-        loaded, missing = chat_media._load_refs(int(alice["id"]), "conv-twenty", refs, max_chars=3 * one)
+        loaded, missing = chat_media._load_refs(int(alice["id"]), "conv-hundred", refs, max_chars=3 * one)
         assert len(loaded) == 3 and missing == []
-        assert chat_media._load_refs(int(alice["id"]), "conv-twenty", refs)[0] == sent
+        assert chat_media._load_refs(int(alice["id"]), "conv-hundred", refs)[0] == sent
+
+
+def test_many_large_refs_are_read_as_model_sized_copies_past_the_memory_budget(engines, as_user, monkeypatch):
+    """Head memory: past REFS_FULL_CHARS of originals a /chat turn reads each
+    further stored picture as a small copy, never all originals at once."""
+    alice = as_user("alice")
+    monkeypatch.setattr(chat_media, "REFS_FULL_CHARS", 1)
+    with TestClient(app) as client:
+        pictures = [(f"att-big-{i:03d}", _png(colour=(i, 9, 9), size=(1200, 900))) for i in range(4)]
+        _upload_many(client, "conv-big", pictures)
+        loaded, missing = chat_media._load_refs(
+            int(alice["id"]), "conv-big", [a for a, _p in pictures], None, chat_media.REFS_FULL_CHARS
+        )
+    assert missing == [] and len(loaded) == 4
+    assert _decoded(loaded[0]) == pictures[0][1]  # the first, as stored
+    for url in loaded[1:]:
+        assert url.startswith("data:image/jpeg;base64,")
+        assert max(Image.open(io.BytesIO(_decoded(url))).size) <= vision.FIT_EDGES[-1]
 
 
 def test_an_account_without_attachments_cannot_read_a_ref_into_a_turn(engines, as_user, monkeypatch):
