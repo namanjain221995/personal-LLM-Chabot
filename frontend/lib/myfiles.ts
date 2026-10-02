@@ -232,7 +232,7 @@ function hours(n: number): string {
 export function retentionSentences(r: Retention): string[] {
   const out = r.filesKeptWithChat
     ? [
-        `Files you attach to a chat stay while the chat exists. A file that was not kept that way (sent before it was, or when the server was short of space) was removed after up to ${hours(r.uploadHours)}, and the chat keeps what it read of it (a document's text, a spreadsheet's summary).`,
+        `Files you attach to a chat stay while the chat exists. One that could not be kept was removed after up to ${hours(r.uploadHours)}; the chat keeps what it read of it (a document's text, a spreadsheet's summary).`,
       ]
     : [
         `Files you attach to a chat are kept for up to ${hours(r.uploadHours)}; after that the chat keeps what it read (a document's text, a spreadsheet's summary).`,
@@ -244,7 +244,7 @@ export function retentionSentences(r: Retention): string[] {
     // The backfill (lib/chatMedia): a photo sent before pictures were stored
     // reaches the server only from the browser that still holds it.
     out.push(
-      'Pictures stay while their chat exists. A picture sent before pictures were kept on the server appears here once the browser that sent it opens its chat again.',
+      'Pictures stay while their chat exists. One sent before pictures were kept appears here once the browser that sent it opens its chat again.',
     );
   }
   out.push('Deleting a chat takes its files off this list at once; the server erases their stored copies later.');

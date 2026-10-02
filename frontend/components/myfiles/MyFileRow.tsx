@@ -143,7 +143,8 @@ function PictureTile({ file, onOpen }: { file: MyFile; onOpen?: () => void }) {
       loading="lazy"
       decoding="async"
       onError={() => setFailed(true)}
-      className="h-10 w-10 object-cover"
+      // The tile's own box, inside its border: a fixed 40 px would be clipped.
+      className="h-full w-full object-cover"
     />
   );
   if (!onOpen) {
