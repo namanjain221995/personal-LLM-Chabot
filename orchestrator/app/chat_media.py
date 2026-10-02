@@ -62,8 +62,10 @@ nor an attachment id is an oracle.
 
 WHAT IT COSTS A SEND: nothing on the loop. /chat stores in a background task,
 every decode, hash and write runs in a worker thread, and a failure is logged
-and counted, never a chat error. Pillow's decompression-bomb guard stays on,
-and a decode is bounded in pixels the way image_memory bounds its own.
+and counted, never a chat error. Pillow's decompression-bomb guard stays on;
+a decode is bounded in pixels (MAX_STORE_PIXELS) and in concurrency (the
+DECODE_WORKERS pool), so a burst of tiny-on-the-wire, huge-in-memory pictures
+queues instead of exhausting the head node's memory.
 
 DELETION. A deleted chat's rows go in its delete transaction (db._SIDE_TABLES),
 its directory right after (history.py, best effort), and the reaper removes
@@ -77,6 +79,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import concurrent.futures
+import functools
 import hashlib
 import io
 import logging
@@ -84,6 +88,7 @@ import os
 import re
 import shutil
 import stat as stat_mode
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -149,13 +154,23 @@ _FORMATS = {
 }
 _EXT_BY_MIME = {mime: ext for mime, ext in _FORMATS.values()}
 
-#: Pixels decoded to verify a picture, read from its header first. The same
-#: ceilings as image_memory (measured there: an unbounded 13000 x 13000 PNG
-#: took 2.4 s and +1.5 GiB). A JPEG may be larger because `draft` decodes it
-#: at a fraction of its size. A composer picture is at most 1600 px on its
-#: long edge, so neither is near a real upload.
-_MAX_DECODE_PIXELS = 40_000_000
-_MAX_JPEG_PIXELS = 89_478_485
+#: Pixels this store will decode, read from the header before anything is
+#: decoded; above it a picture is refused as `unsupported`. One ceiling for
+#: every format, JPEG included: `draft` does not bound a PROGRESSIVE JPEG's
+#: coefficient buffer. The security review (2026-10-02) measured the old
+#: ceilings (40 MP, 89 MP for JPEG) at +601 MiB peak for ONE 38-byte lossless
+#: WebP of 16383x2440, +505 MiB for a 1 MiB progressive 9450x9450 JPEG, and
+#: +9.5 GiB for 16 at once. The composer sends at most 1600 px on the long
+#: edge (2.6 MP); 16 MP still takes a 12 MP phone photo whose downscale failed.
+MAX_STORE_PIXELS = 16_000_000
+
+#: Decodes (verification, thumbnail, image_memory's fit of a stored original)
+#: run on their own small pool, so a burst of pictures queues instead of
+#: decoding at once: peak memory is DECODE_WORKERS decodes, and the default
+#: executor every other `asyncio.to_thread` shares is never filled with them.
+DECODE_WORKERS = 2
+_decode_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_decode_executor_lock = threading.Lock()
 
 #: An inline data URL's prefix (what the composer sends), or none.
 _DATA_URL_PREFIX = re.compile(r"^data:[\w.+/-]*;base64,", re.I)
@@ -323,6 +338,24 @@ def has_room() -> bool:
 # ------------------------------------------------------------- inspection --
 
 
+def _decode_pool() -> concurrent.futures.ThreadPoolExecutor:
+    global _decode_executor
+    with _decode_executor_lock:
+        if _decode_executor is None:
+            _decode_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=DECODE_WORKERS, thread_name_prefix="chat-media-decode"
+            )
+        return _decode_executor
+
+
+async def run_decode(fn, *args):
+    """Await `fn(*args)` on the decode pool (see DECODE_WORKERS). For any
+    call that decodes a picture: `inspect`, a background store, image_memory's
+    read of a stored original."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_decode_pool(), functools.partial(fn, *args))
+
+
 @dataclass(frozen=True)
 class Picture:
     """A verified raster, ready to store."""
@@ -390,6 +423,52 @@ def _gif_reaches_trailer(data: bytes) -> bool:
     return False
 
 
+#: In a JPEG's entropy-coded data every FF is followed by 00 (a stuffed byte),
+#: a restart marker D0-D7, or another FF (fill before a marker). Anything else
+#: is the next marker.
+_JPEG_NEXT_MARKER = re.compile(rb"\xff[^\x00\xd0-\xd7\xff]")
+
+
+def _jpeg_reaches_eoi(data: bytes) -> bool:
+    """Walk a JPEG's marker segments from SOI to the EOI that ends the
+    PRIMARY picture. A cut file runs out first. Bytes after that EOI are not
+    looked at: an MPO's further pictures, a phone's motion-photo MP4 or
+    vendor trailer, all of which browsers ignore (an `rfind` over the whole
+    buffer used to find an FF DA inside such a trailer and refuse the photo).
+    Every segment is length-prefixed, and each scan's data is skipped by one
+    regex search, so this is a few hundred steps for 10 MiB."""
+    n = len(data)
+    pos = 2  # after SOI
+    while pos + 1 < n:
+        if data[pos] != 0xFF:
+            # Junk between segments, which Pillow skips too.
+            pos = data.find(b"\xff", pos)
+            if pos < 0:
+                return False
+            continue
+        marker = data[pos + 1]
+        if marker == 0xFF:  # fill byte
+            pos += 1
+            continue
+        if marker == 0xD9:  # EOI
+            return True
+        if marker in (0x00, 0x01, 0xD8) or 0xD0 <= marker <= 0xD7:  # no length
+            pos += 2
+            continue
+        if pos + 4 > n:
+            return False
+        length = int.from_bytes(data[pos + 2:pos + 4], "big")
+        if length < 2:
+            return False
+        pos += 2 + length
+        if marker == 0xDA:  # start of scan: its data runs to the next marker
+            following = _JPEG_NEXT_MARKER.search(data, pos)
+            if following is None:
+                return False
+            pos = following.start()
+    return False
+
+
 def _ends_whole(fmt: str, data: bytes) -> bool:
     """Does the data END the way a whole file of this format ends?
 
@@ -402,9 +481,10 @@ def _ends_whole(fmt: str, data: bytes) -> bool:
     Flipping the switch back around our own decode would race the renderer's
     threads, so the check does not touch it.
 
-      JPEG  an EOI (FF D9) after the last start-of-scan (FF DA). Neither pair
-            can occur inside entropy-coded data, where every FF is followed by
-            00 or a restart marker, so a scan cut short has no EOI after it.
+      JPEG  the segment walk reaches the EOI (FF D9) of the primary picture
+            (`_jpeg_reaches_eoi`). EOI cannot occur inside entropy-coded
+            data, where every FF is followed by 00 or a restart marker, so a
+            scan cut short never reaches one.
       PNG   the IEND chunk, CRC included.
       GIF   the block walk reaches the trailer.
       WebP  libwebp decodes the whole buffer itself and refuses a short one
@@ -412,8 +492,7 @@ def _ends_whole(fmt: str, data: bytes) -> bool:
             anyway, because it costs nothing.
     """
     if fmt == "JPEG":
-        last_scan = data.rfind(b"\xff\xda")
-        return last_scan > 0 and data.rfind(b"\xff\xd9") > last_scan
+        return _jpeg_reaches_eoi(data)
     if fmt == "PNG":
         return data.rfind(_PNG_IEND) > 8
     if fmt == "GIF":
@@ -438,6 +517,10 @@ def _thumbnail(image) -> Optional[bytes]:
         from PIL import Image, ImageOps
 
         frame = ImageOps.exif_transpose(image)
+        if frame.mode in ("I;16", "I;16B", "I;16L", "I;16N", "I"):
+            # 16-bit greyscale (PNG): a straight RGB convert clips every value
+            # over 255, so a near-black picture thumbnailed as pure white.
+            frame = frame.convert("I").point(lambda v: v * (1 / 256)).convert("L")
         if frame.mode in ("RGBA", "LA", "PA") or (
             frame.mode == "P" and "transparency" in frame.info
         ):
@@ -455,7 +538,7 @@ def _thumbnail(image) -> Optional[bytes]:
 
 def inspect(data: bytes) -> Picture:
     """Verify `data` is a JPEG, PNG, WebP or GIF and measure it, or raise
-    Refused. CPU work: call it from a worker thread.
+    Refused. CPU work: call it through `run_decode` (the bounded pool).
 
     Four agreements, not one. The magic bytes name a format; the data must
     end as a whole file of that format ends (`_ends_whole`, which is where a
@@ -471,15 +554,25 @@ def inspect(data: bytes) -> Picture:
         raise Refused("unsupported")
     from PIL import Image
 
+    # Pillow's JPEG opener answers MPO for a JPEG whose MPF names more than
+    # one picture (many camera and phone photos); browsers show its first
+    # picture, which is the one decoded here, so it is stored as a JPEG.
+    allowed = ("JPEG", "MPO") if fmt == "JPEG" else (fmt,)
     try:
         with Image.open(io.BytesIO(data), formats=(fmt,)) as image:
+            # The header's size is judged before anything is verified or
+            # decoded (MAX_STORE_PIXELS).
+            width, height = image.size
+            if (
+                (image.format or "").upper() not in allowed
+                or width < 1
+                or height < 1
+                or width * height > MAX_STORE_PIXELS
+            ):
+                raise Refused("unsupported")
             image.verify()
         with Image.open(io.BytesIO(data), formats=(fmt,)) as image:
-            if (image.format or "").upper() != fmt:
-                raise Refused("unsupported")
-            width, height = image.size
-            ceiling = _MAX_JPEG_PIXELS if fmt == "JPEG" else _MAX_DECODE_PIXELS
-            if width < 1 or height < 1 or width * height > ceiling:
+            if (image.format or "").upper() not in allowed or image.size != (width, height):
                 raise Refused("unsupported")
             orientation = _orientation(image)
             wants_thumb = max(width, height) > THUMB_EDGE or len(data) > THUMB_OVER_BYTES
@@ -661,6 +754,41 @@ def _commit(
     return False, existing
 
 
+def _file_present(row: Dict[str, Any]) -> bool:
+    """Is the row's full file on disk? One stat."""
+    try:
+        return stat_mode.S_ISREG(os.stat(file_path(row, "full")).st_mode)
+    except (OSError, ValueError, KeyError):
+        return False
+
+
+def _heal(row: Dict[str, Any], data: bytes) -> bool:
+    """Write a row's files again from a retry of the SAME bytes, when the
+    files are gone (a restored volume, a manual cleanup, a chat erase that
+    raced the store). Only the same bytes: the sha256 is the ETag and the
+    URL is cached as immutable, so different bytes under the same id stay
+    refused (the row keeps answering 410). True when the files were written.
+    Never raises; decodes, so it runs where `inspect` runs."""
+    try:
+        if hashlib.sha256(data).hexdigest() != row["sha256"] or not has_room():
+            return False
+        picture = inspect(data)
+        full = file_path(row, "full")
+        directory = _make_media_dir(row["user_id"], row["conversation_id"], row["media_id"])
+        _write_file(directory, os.path.basename(full), data)
+        if row["has_thumb"] and picture.thumb is not None:
+            _write_file(directory, "thumb.webp", picture.thumb)
+        _fsync_dir(directory)
+        _fsync_dir(os.path.dirname(directory))
+    except Refused:
+        return False
+    except Exception:  # noqa: BLE001 — a heal is a retry's bonus, never its failure
+        log.warning("chat media: could not restore a stored picture's files", exc_info=True)
+        return False
+    log.info("chat media: restored the files of a stored picture from a retry")
+    return True
+
+
 def _count_write(source: str, result: str) -> None:
     metrics.inc(
         "chat_media_writes_total",
@@ -688,8 +816,9 @@ def store_bytes(
     if not looked_up:
         existing = get_row(user_id, conversation_id, attachment_id)
         if existing is not None:
-            _count_write(source, "duplicate")
-            return "duplicate", existing
+            result = "duplicate" if _file_present(existing) or not _heal(existing, data) else "stored"
+            _count_write(source, result)
+            return result, existing
     started = time.monotonic()
     try:
         if len(data) > MAX_IMAGE_BYTES:
@@ -716,7 +845,8 @@ def store_bytes(
 def _store_inline_one(user_id: int, conversation_id: str, attachment_id: str, value: str) -> str:
     """One inline /chat picture, in a worker thread. Never raises."""
     try:
-        if get_row(user_id, conversation_id, attachment_id) is not None:
+        existing = get_row(user_id, conversation_id, attachment_id)
+        if existing is not None and _file_present(existing):
             _count_write("chat", "duplicate")
             return "duplicate"
         try:
@@ -724,6 +854,10 @@ def _store_inline_one(user_id: int, conversation_id: str, attachment_id: str, va
         except Refused as refused:
             _count_write("chat", refused.result)
             return refused.result
+        if existing is not None:
+            result = "stored" if _heal(existing, data) else "duplicate"
+            _count_write("chat", result)
+            return result
         result, _row = store_bytes(
             user_id, conversation_id, attachment_id, data, "chat", looked_up=True
         )
@@ -746,7 +880,7 @@ _inflight: "set[asyncio.Task]" = set()
 async def _store_inline(user_id: int, conversation_id: str, pairs: List[Tuple[str, str]]) -> None:
     try:
         for attachment_id, value in pairs:
-            await asyncio.to_thread(_store_inline_one, user_id, conversation_id, attachment_id, value)
+            await run_decode(_store_inline_one, user_id, conversation_id, attachment_id, value)
     except asyncio.CancelledError:
         raise  # shutdown: what was not stored is the next send's, or a backfill's
     except Exception:  # noqa: BLE001 — the executor itself refused (shutting down)
@@ -1041,7 +1175,8 @@ async def upload_media(
     text parts; `source` is `upload` (default) or `backfill`. Every picture
     is checked before ANY is stored, so a refused request stores nothing,
     and an attachment id that already has a row is answered with that row
-    (`created: false`) without its bytes being looked at again.
+    (`created: false`) without its bytes being looked at again, unless the
+    row's file is gone: then the very same bytes write it back (`_heal`).
     """
     viewer = int(user["id"])
     if not _valid_conversation(conversation_id):
@@ -1075,9 +1210,16 @@ async def _upload(viewer: int, conversation_id: str, form) -> Any:
         return _error(400, "bad_request", "Each attachment_id may appear once.")
 
     existing = await db.run_in_thread(rows_by_attachment, viewer, conversation_id, ids)
+    # A stored row whose file is gone is healed by a retry of the same bytes
+    # (`_heal`); every other existing row is answered without its bytes read.
+    heal: Dict[str, bytes] = {}
     pending: Dict[str, bytes] = {}
     for attachment_id, upload in zip(ids, files):
         if attachment_id in existing:
+            if not await asyncio.to_thread(_file_present, existing[attachment_id]):
+                data = await upload.read(MAX_IMAGE_BYTES + 1)
+                if len(data) <= MAX_IMAGE_BYTES:
+                    heal[attachment_id] = data
             continue
         data = await upload.read(MAX_IMAGE_BYTES + 1)
         if len(data) > MAX_IMAGE_BYTES:
@@ -1089,7 +1231,7 @@ async def _upload(viewer: int, conversation_id: str, form) -> Any:
     checked: Dict[str, Picture] = {}
     for attachment_id, data in pending.items():
         try:
-            checked[attachment_id] = await asyncio.to_thread(inspect, data)
+            checked[attachment_id] = await run_decode(inspect, data)
         except Refused as refused:
             _count_write(source, refused.result)
             return _error(415, "unsupported_type", "Only JPEG, PNG, WebP and GIF pictures are stored.")
@@ -1100,7 +1242,10 @@ async def _upload(viewer: int, conversation_id: str, form) -> Any:
     items: List[Dict[str, Any]] = []
     for attachment_id in ids:
         if attachment_id in existing:
-            _count_write(source, "duplicate")
+            healed = attachment_id in heal and await run_decode(
+                _heal, existing[attachment_id], heal[attachment_id]
+            )
+            _count_write(source, "stored" if healed else "duplicate")
             items.append(_stored_item(existing[attachment_id], created=False))
             continue
         try:

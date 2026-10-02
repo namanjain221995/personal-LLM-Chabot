@@ -14,10 +14,16 @@ the free-space floor, and the closed metric registry.
 """
 from __future__ import annotations
 
+import asyncio
+import base64
 import collections
 import io
 import os
+import random
+import shutil
 import stat
+import threading
+import time
 
 import pytest
 from PIL import Image
@@ -241,6 +247,114 @@ def test_a_cut_file_is_refused_even_after_weasyprint_relaxed_pillow(monkeypatch)
             assert refused.value.result == "unsupported", (label, cut)
 
 
+def _with_exif_thumbnail(jpeg: bytes) -> bytes:
+    """A camera JPEG: an APP1 EXIF segment holding a small JPEG of its own
+    (SOI .. SOS .. EOI) before the main picture's first scan."""
+    small = io.BytesIO()
+    Image.new("RGB", (160, 120), (5, 5, 5)).save(small, format="JPEG")
+    body = b"Exif\x00\x00" + small.getvalue()
+    app1 = b"\xff\xe1" + (len(body) + 2).to_bytes(2, "big") + body
+    return jpeg[:2] + app1 + jpeg[2:]
+
+
+def test_camera_and_phone_jpegs_browsers_show_are_stored_and_cut_ones_are_not(monkeypatch):
+    """Pillow names a JPEG with more than one picture in its MPF block "MPO"
+    (many camera and phone photos), and a phone's motion photo appends an MP4
+    after the picture's end. Both were refused: the first by the format
+    check, the second because the end check searched the whole buffer for the
+    last start-of-scan and found one inside the trailer. Browsers show both.
+    A cut picture is still refused, trailer or not, EXIF thumbnail or not."""
+    from PIL import ImageFile
+
+    monkeypatch.setattr(ImageFile, "LOAD_TRUNCATED_IMAGES", True)
+    out = io.BytesIO()
+    Image.new("RGB", (1200, 800), (200, 0, 0)).save(
+        out, format="MPO", save_all=True, append_images=[Image.new("RGB", (1200, 800), (0, 0, 200))]
+    )
+    mpo = out.getvalue()
+    base = _jpeg(1200, 800, noise=True)
+    trailer = b"\x00\x00\x00\x18ftypmp42" + random.Random(7).randbytes(200_000)
+    assert b"\xff\xda" in trailer
+    camera = _with_exif_thumbnail(base)
+    for label, data in {"mpo": mpo, "motion photo": base + trailer, "exif thumbnail": camera}.items():
+        picture = chat_media.inspect(data)
+        assert (picture.mime, picture.width, picture.height) == ("image/jpeg", 1200, 800), label
+    cut = len(base) // 2
+    for label, data in {
+        "cut + trailer": base[:cut] + trailer,
+        "exif thumbnail, main cut": camera[: len(camera) - len(base) // 2],
+        "mpo cut in its first picture": mpo[: len(mpo) // 4],
+    }.items():
+        with pytest.raises(chat_media.Refused):
+            chat_media.inspect(data)
+            pytest.fail(label)
+
+
+def test_a_sixteen_bit_grey_png_thumbnails_as_dark_as_it_is():
+    # 1000/65535 is near black; a straight RGB convert clipped it to white.
+    out = io.BytesIO()
+    Image.new("I;16", (1200, 800), 1000).save(out, format="PNG")
+    picture = chat_media.inspect(out.getvalue())
+    thumb = Image.open(io.BytesIO(picture.thumb)).convert("RGB")
+    assert max(high for _low, high in thumb.getextrema()) < 32, thumb.getextrema()
+
+
+def test_a_picture_over_the_store_ceiling_is_refused_before_it_is_decoded(monkeypatch):
+    """A 38-byte lossless WebP of 16383x2440 decoded to +601 MiB peak under
+    the old 40 MP ceiling (security review, 2026-10-02). The store now refuses
+    anything over MAX_STORE_PIXELS from its header, for every format, before
+    `verify` or `load` runs."""
+    bomb = io.BytesIO()
+    Image.new("RGBA", (16383, 2440), (10, 20, 30, 255)).save(bomb, format="WEBP", lossless=True, quality=0, method=0)
+    assert len(bomb.getvalue()) < 100
+    big_jpeg = io.BytesIO()
+    Image.new("RGB", (5000, 3300), (1, 2, 3)).save(big_jpeg, format="JPEG", progressive=True)
+    from PIL import ImageFile
+
+    def no_decode(self, *a, **k):
+        raise AssertionError("a picture over the ceiling was decoded")
+
+    monkeypatch.setattr(ImageFile.ImageFile, "load", no_decode)
+    for data in (bomb.getvalue(), big_jpeg.getvalue()):
+        with pytest.raises(chat_media.Refused) as refused:
+            chat_media.inspect(data)
+        assert refused.value.result == "unsupported"
+    assert chat_media.MAX_STORE_PIXELS == 16_000_000
+
+
+def test_decodes_run_on_their_own_small_pool(login_client, monkeypatch):
+    """At most DECODE_WORKERS pictures are decoded at once, whoever asks, and
+    never on the default executor every other to_thread shares."""
+    running = {"now": 0, "most": 0}
+    names = set()
+    lock = threading.Lock()
+    real = chat_media.inspect
+
+    def counted(data):
+        with lock:
+            running["now"] += 1
+            running["most"] = max(running["most"], running["now"])
+            names.add(threading.current_thread().name.rsplit("_", 1)[0])
+        try:
+            time.sleep(0.05)
+            return real(data)
+        finally:
+            with lock:
+                running["now"] -= 1
+
+    monkeypatch.setattr(chat_media, "inspect", counted)
+
+    async def burst():
+        return await asyncio.gather(*(chat_media.run_decode(chat_media.inspect, _png()) for _ in range(8)))
+
+    assert len(asyncio.run(burst())) == 8
+    assert running["most"] == chat_media.DECODE_WORKERS
+    alice = login_client("alice")
+    _chat(alice, "conv-pool")
+    _store_one(alice, "conv-pool")
+    assert names == {"chat-media-decode"}
+
+
 def test_one_refused_picture_stores_none_of_the_request(login_client):
     alice = login_client("alice")
     _chat(alice, "conv-all-or-none")
@@ -426,6 +540,49 @@ def test_a_row_whose_file_is_gone_is_410_media_missing(login_client):
         assert resp.json()["code"] == "media_missing"
     # Never a 410 for a picture that is not yours: that would confirm it exists.
     assert login_client("bob").get("/chat-media/conv-gone/att-00000001").status_code == 404
+
+
+def test_a_retry_of_the_same_bytes_restores_a_row_whose_file_is_gone(login_client):
+    """A row outlived its file (a restored volume, a manual cleanup, an erase
+    that raced the store). A retry of the very same bytes under the same id
+    used to answer `created: false` and write nothing, so the picture stayed
+    410 for good. Different bytes never restore it: the URL is immutable."""
+    alice = login_client("alice")
+    _chat(alice, "conv-heal")
+    big = _jpeg(1200, 900, noise=True)  # big enough to have a thumbnail
+    item = _store_one(alice, "conv-heal", payload=big)
+    directory = os.path.join(settings.chat_media_dir, str(_uid("alice")), "conv-heal", item["media_id"])
+    shutil.rmtree(directory)
+    assert alice.get("/chat-media/conv-heal/att-00000001").status_code == 410
+
+    other = _post(alice, "conv-heal", [("b.jpg", _jpeg(1200, 900, noise=True), "image/jpeg")], ["att-00000001"])
+    assert other.status_code == 200 and other.json()["items"][0]["created"] is False
+    assert alice.get("/chat-media/conv-heal/att-00000001").status_code == 410
+
+    again = _post(alice, "conv-heal", [("a.jpg", big, "image/jpeg")], ["att-00000001"])
+    assert again.status_code == 200, again.text
+    assert again.json()["items"][0] == {**item, "created": False}  # the same row, unchanged
+    full = alice.get("/chat-media/conv-heal/att-00000001")
+    assert full.status_code == 200 and full.content == big
+    thumb = alice.get("/chat-media/conv-heal/att-00000001?size=thumb")
+    assert thumb.status_code == 200 and thumb.headers["content-type"] == "image/webp"
+    assert sorted(os.listdir(directory)) == ["full.jpg", "thumb.webp"]
+
+
+def test_the_chat_path_restores_a_row_whose_file_is_gone(login_client):
+    # /chat's background store: the same picture sent again under its id.
+    alice = login_client("alice")
+    _chat(alice, "conv-heal-chat")
+    payload = _png()
+    item = _store_one(alice, "conv-heal-chat", payload=payload)
+    row = chat_media.get_row(_uid("alice"), "conv-heal-chat", "att-00000001")
+    os.unlink(chat_media.file_path(row, "full"))
+    value = "data:image/png;base64," + base64.b64encode(payload).decode("ascii")
+    assert chat_media._store_inline_one(_uid("alice"), "conv-heal-chat", "att-00000001", value) == "stored"
+    assert alice.get("/chat-media/conv-heal-chat/att-00000001").content == payload
+    # With the file back, the next retry is the plain duplicate again.
+    assert chat_media._store_inline_one(_uid("alice"), "conv-heal-chat", "att-00000001", value) == "duplicate"
+    assert chat_media.get_row(_uid("alice"), "conv-heal-chat", "att-00000001")["media_id"] == item["media_id"]
 
 
 def test_below_the_free_space_floor_new_bytes_are_507(login_client, monkeypatch):

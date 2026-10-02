@@ -4089,8 +4089,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     # its own (`_require_input` permits that), and without the gate the
     # placeholder became the request — so answering a clarifying question by
     # skipping it sent "Analyze the attached image." to the Salesforce planner
-    # as the thing the user wanted to know.
-    text = request.text or ("Analyze the attached image." if request.image_data else "")
+    # as the thing the user wanted to know. Stored pictures sent by reference
+    # (V44 `image_refs`) are images too; they load into `images` only later.
+    text = request.text or (
+        "Analyze the attached image." if (request.image_data or request.image_refs) else ""
+    )
 
     def meta_extras(route: Optional[str]) -> dict:
         """V2 §2: meta gains mode / model (served model id) / effort — merged

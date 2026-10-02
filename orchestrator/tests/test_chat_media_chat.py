@@ -395,6 +395,9 @@ def test_a_ref_only_turn_needs_no_message_text(engines, as_user):
         resp = _chat(client, conversation_id="conv-refs-only", image_refs=["att-stored-1"])
         assert resp.status_code == 200, resp.text
         assert _route(resp) == "vision"
+        # The engine still gets a question, as for an inline picture with no
+        # words (the placeholder was decided before the refs were loaded).
+        assert engines["vision"][-1]["message"] == "Analyze the attached image."
 
 
 def test_a_missing_ref_is_422_before_anything_starts(engines, as_user):
