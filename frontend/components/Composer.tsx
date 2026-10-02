@@ -177,6 +177,12 @@ export interface ComposerHandle {
    * answer is streaming, a chat is loading, or an upload is already in flight.
    */
   acceptFiles: (files: File[]) => void;
+  /**
+   * 2026-10-03 (STORE-ALWAYS §3): would a reload lose anything typed,
+   * attached, still being read, or being dictated? The page reloads by itself
+   * after a deploy only when this is false.
+   */
+  hasDraft: () => boolean;
 }
 
 export interface Attachment {
@@ -597,6 +603,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         caretToEnd.current = true;
       },
       acceptFiles,
+      hasDraft: () =>
+        Boolean(text.trim() || attachments.length || pendingAttach > 0 || voiceActive),
     }));
 
     const autogrow = useCallback(() => {

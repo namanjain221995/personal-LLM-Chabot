@@ -483,6 +483,40 @@ describe('the browser that still holds an old photo', () => {
   });
 });
 
+describe('the browser that still holds a photo the server stored by itself (STORE-ALWAYS)', () => {
+  // 2026-10-03: a page loaded before the deploy sent the photo with no
+  // image_ids; the server stored it as ix-<intent>-0 anyway. When this
+  // browser reloads with the new code, its backfill must adopt that row, not
+  // upload a bf- duplicate. Low-entropy intent for the secret scanner.
+  const INTENT = 'ab12'.repeat(8);
+  it('adopts the ix- row instead of uploading, and writes meta.images once', async () => {
+    const PNG = 'data:image/png;base64,iVBORw0KGgo=';
+    mediaList = [`ix-${INTENT}-0`];
+    seedThread([
+      {
+        id: 'srv-conv-1-0',
+        role: 'user',
+        content: 'what is the total on this invoice?',
+        imageDataUrl: PNG,
+        meta: { intent: { id: INTENT, state: 'completed' } },
+        createdAt: 1,
+      },
+      visionAnswer,
+    ]);
+    renderApp();
+    await waitFor(
+      () => expect(stored[0]?.meta?.images).toEqual([{ attachment_id: `ix-${INTENT}-0` }]),
+      { timeout: 4000 },
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    expect(mediaPosts).toHaveLength(0);
+    expect(mediaListReads).toBe(1);
+    // Still this browser's own copy on screen, and no legacy note.
+    expect(document.querySelector(`img[src="${PNG}"]`)).toBeTruthy();
+    expect(screen.queryByTestId('legacy-photo-note')).toBeNull();
+  });
+});
+
 describe('the browser that holds a photo whose store was lost', () => {
   // QA 2026-10-02: the turn already carries meta.images, so the backfill
   // skipped it, and every other device showed "Image unavailable" for good.
