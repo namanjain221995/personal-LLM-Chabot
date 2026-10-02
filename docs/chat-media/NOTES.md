@@ -574,3 +574,58 @@ The uncommitted attack proofs that assert the OLD behaviour now fail as
 intended: test_attack_chat_media_be.py::test_row_without_file_is_never_healed_by_a_retry,
 ::test_fallback_hands_the_model_a_picture_from_an_edited_away_branch (route
 chat, 0 vision calls), and all three in test_attack_chat_media_sec.py.
+
+## fix-fe (frontend fixes from the QA and security attacks, 2026-10-02 22:50 IST)
+
+Commit 32e3d9d5. What changed that other tracks may rely on:
+
+- Legacy line: `lib/chatMedia.legacyPhotoNoteId(thread)` picks AT MOST ONE turn
+  per thread as read: the first photo-less user turn under a `route: vision`
+  answer, and only when no earlier turn has a photo (local or `meta.images`)
+  or a vision answer. ChatApp passes `legacyPhoto={m.id === legacyPhotoTurn}`.
+  A second legacy photo turn further down gets no line (accepted trade-off).
+  An orchestrator tag on follow-up answers (`meta.image_followup: true` in
+  main.py's `elif image_followup_images` / `image_followup.unavailable`
+  branches) would make this exact. Nothing on the frontend needs it today.
+- Edit by reference: before it writes the new version, `runEdit` calls
+  `GET /api/chat-media/{conv}` once (`storedAttachmentIds`). If any ref is
+  missing from the list, it shows the re-attach toast and writes nothing. An
+  unreadable list (offline, 5xx, a body without `items`) lets the server
+  decide, as before. Residual: a row that is LISTED but whose file is gone
+  still passes the check, gets the 422, and leaves the stored version. If
+  the list skipped rows with no full file on disk, that would close it.
+- Repair (backfill): on chat open, for a user turn that HAS `meta.images` and
+  whose bytes this browser holds, the browser asks the list once per chat and
+  POSTs the missing ids with `source=backfill`, under the SAME ids. It writes
+  nothing to the thread. It skips: turns younger than 2 min
+  (`REPAIR_GRACE_MS`, by `createdAt`), bytes not proven to be that turn's
+  (see the next point), counts or recorded mimes that do not pair one to one,
+  and an unreadable list. 400/413/415 refuse that turn for the page session;
+  401/403/507 halt; 404/5xx mean try at the next open. It does NOT re-send
+  ids the list already has, so fix-be's heal of a row without its file is
+  not triggered by it.
+- IndexedDB image records now carry `fp` = `idbCache.turnFingerprint(m)`
+  (`role:len:fnv1a36(content)`), written by `put`. `loadAll` lays a record
+  only on the turn it names. `loadImages` returns `Map<idx, {urls, boundTo?}>`.
+  `history.localImages` returns a bare `string[]` for bytes carried by the
+  message itself, and the record (unvouched) where a record without `fp`
+  sits at that index. The backfill takes a named record only for its own
+  turn. An unnamed (pre-fix) record is used only under a vision answer and
+  never for a repair. No DB_VERSION bump.
+  Residual: records are still write-once, so a new photo sent at an index
+  that holds a stale record is not written to IndexedDB. It shows from the
+  server copy after a reload.
+- Stored thumbnails retry 3 times, after 2 s, 6 s and 15 s (`&retry=1..3`,
+  dropped by the proxy), before showing "Image unavailable". In a real
+  Chromium against a fake orchestrator, a photo whose store landed 5 s late
+  showed on the second retry at 8.6 s.
+- Logout: `app/api/auth/logout/route.ts` sets `Clear-Site-Data: "cache"` on
+  every answer (mock, 502 and 499 included). `handleSessionEnd` POSTs
+  `/api/auth/logout` for an access-ended account (removed or deactivated)
+  before it wipes local data. Checked in Chromium 153 against the built app:
+  without logout, a fresh page fetched a seen photo URL from cache with 0
+  orchestrator requests. After the logout answer, it made 1 request, so the
+  session check runs. Chromium consumes the header, so `fetch()` cannot see
+  it. Curl does.
+- NOT done here (orchestrator): the admin route's
+  `Cache-Control: private, no-store` (exact change in fix-be above).
