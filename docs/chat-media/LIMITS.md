@@ -1,55 +1,61 @@
-# Upload limits, raised safely (owner decision 2026-10-03)
+# Upload limits: NO limit (owner decision 2026-10-03, replaces the "raise safely" plan)
 
-The owner wants uploads unlimited. Per person they already are: no total, no per-user quota, kept for
-the life of the chat (PR #94, V44). For the limits per file and per message, the owner chose the
-"raise safely" option:
+The owner: "no limit, users can upload unlimited". This replaces the earlier 20-per-message plan.
+Per person there is already no limit (PR #94: no total, no quota, kept for the life of the chat).
+Now the per-file and per-message upload limits go too.
 
-| Limit | Before | After |
+| What | Before | After |
 |---|---|---|
-| One photo | 10 MB, checked on the ORIGINAL file | **any size**: the browser shrinks every photo to 1600 px first and the size rule applies to what is actually sent |
-| Photos per message | 5 | **20** |
-| Files per message (documents, datasets, archives, videos, audio) | 5 | **20** |
-| One document or spreadsheet | 512 MB | unchanged (bigger files risk the head's memory) |
-| One video | 4 GB / 4 h | unchanged (one long job blocks the single video slot) |
-| Per person, total | unlimited | unlimited |
+| One photo | 10 MB on the original | **any size** (the browser shrinks to 1600 px first; the stored-file checks apply to the shrunk file) |
+| Photos per message | 5 (this branch so far: 20) | **no limit in the app** (technical ceiling 999 = vLLM's per-prompt maximum; the UI never mentions it below that) |
+| Files per message | 5 (this branch so far: 20) | **no limit in the app** (same technical ceiling 999 for request validation) |
+| One document / spreadsheet / archive | 512 MB | **no app limit**: the server's `UPLOAD_MAX_MB` (production `.env`: 102400 = 100 GB) is the only size rule; big files go through the existing chunked upload |
+| One video / audio file | 4 GB / 4 h | **no app limit on size**: `VIDEO_MAX_UPLOAD_MB` follows `UPLOAD_MAX_MB`; a video longer than the analysis window is accepted and stored; the analysis covers the first `VIDEO_MAX_DURATION_S` (4 h) and the answer says so instead of refusing |
+| Per person total | unlimited | unlimited |
 
-Only the global free-disk floor (`CHAT_MEDIA_MIN_FREE_GIB`, 250 GiB) stays; it protects the database
-and the model from a full disk.
+What stays, and why (these are not user limits):
+- The global free-disk floor (`CHAT_MEDIA_MIN_FREE_GIB`, 250 GiB) protects the database and the model
+  from a full disk. 2.4 TB is free today.
+- Cloudflare refuses any single request body over 100 MB. Nothing may depend on one big request: photos
+  over the inline budget go by reference (`POST /api/chat-media` in batches under the budget, then
+  `image_refs` on `/chat`); documents and videos already use the chunked upload (64 MiB parts).
+- Reading has physical bounds, and they must degrade gracefully, never crash the server and never refuse
+  the upload:
+  - **Model context (1M tokens).** Many photos: when their image tokens would not fit the turn's budget,
+    send them to the model at a smaller size (e.g. 896 px ≈ 527 tokens each, 640 px ≈ 300) rather than
+    dropping any; if even that cannot fit, send what fits and say how many were read.
+  - **Router (Qwen3-VL-8B, 65,536 tokens).** Never hand it more images than fit; routing needs few.
+  - **Head memory is off limits** (owner rule). A huge document or dataset must never be read into
+    memory whole. Check every extraction path (PDF, DOCX, PPTX, text, CSV/TSV/XLSX/Parquet/JSON profile,
+    archive listing) for whole-file reads; bound them (stream, page/row/byte budgets) and let the answer
+    say what part was read. The stored file is always kept whole and downloadable on every device.
+  - **Video.** One analysis job at a time; the window above keeps one upload from holding the slot for a
+    day.
 
-## What must hold
+## Work already on this branch (keep what fits, change the numbers)
 
-- **Photo size.** A photo the browser can shrink is accepted whatever its original size (a 30 MB, 48 MP
-  phone photo must work). A photo the browser cannot decode or shrink (for example HEIC in desktop
-  Chrome) keeps a size rule on what would be sent (10 MB) and says so clearly. The server's stored-file
-  checks (`chat_media.MAX_IMAGE_BYTES`, pixel and decode bounds) stay: they apply to the shrunk file.
-- **20 photos.** Every cap that says 5 for photos becomes 20 and stays in one place per side where
-  possible: `frontend/components/Composer.tsx MAX_IMAGES`, `frontend/lib/orchestrator.ts MAX_IMAGES`,
-  `orchestrator/app/main.py MAX_IMAGES` (and the `image_ids` / `image_refs` validators),
-  `chat_media.py` per-POST `MAX_FILES` and any test pins. Find every other one (grep).
-- **No request-size wall.** Cloudflare refuses a request body over 100 MB, and `/api/chat` caps at
-  128 MiB. Twenty shrunk photos are about 10-20 MB of base64, which is fine, but twenty photos that could
-  not be shrunk could reach 270 MB. When the inline images of one send would exceed a safe budget (pick
-  one well under 100 MB, e.g. 48 MB of base64), the browser must upload them to `POST /api/chat-media`
-  first (batches that each stay under the budget) and send `image_refs` instead of inline bytes. The
-  server path for `image_refs` already exists and already loads the bytes for the engines.
-- **Bodies.** `body_cap_for` for `POST /chat-media/{conv}` and its pinned test must allow a batch of
-  photos up to the same budget; the Next proxy's POST cap likewise.
-- **The model.** vLLM accepts up to 999 images per prompt (`limit_per_prompt` default, vLLM
-  0.28.1rc1), so no model restart is needed. Check every engine that receives the turn's images:
-  - the main model (vision engine) gets all of them;
-  - the router (Qwen3-VL-8B, 65,536-token window) must not be sent 20 full-size images for routing; if
-    it receives images today, cap or shrink what it gets so the routing call cannot overflow;
-  - `image_memory` budgets (`IMAGE_MEMORY_MAX_CHARS`, `IMAGE_MEMORY_DB_CHARS`) must degrade gracefully
-    (keep what fits; the chat_media store fallback covers the rest) and never fail the turn.
-  Measure once against the real main model, briefly and at low traffic: one request with 20 shrunk
-  1600 px images and `max_tokens` small, report time to first token and prompt tokens. One request only.
-- **20 files.** Every per-message cap on documents/datasets/videos (`Composer.tsx MAX_DOCS`, the
-  `/chat` request lists such as `document_uploads` / `video_uploads` / `pdf_uploads` and their
-  `fail_fast` validators, any engine-side cap, the document context budget) becomes 20, or is shown to
-  be already higher. The document context budget is shared, not multiplied.
-- **Words.** Every toast or note that states a limit must state the new numbers. No message may
-  promise "unlimited" for things that are still capped (document 512 MB, video 4 GB).
-- **Tests.** Change every pinned test that encodes the old numbers so it encodes the new ones, and add
-  tests: a 30 MB original photo that shrinks is accepted; 20 photos accepted, the 21st refused with the
-  new wording; a send whose inline payload would exceed the budget goes by reference; 20 documents in
-  one message; the router never receives more than its safe share.
+- Backend commit 110436b7 raised the server counts to 20 and fb57ce62 wrote the request budget in
+  NOTES.md. Change every such cap to the "no limit" rule above (ceiling 999 where a bound is needed for
+  validation).
+- The frontend track's work is UNCOMMITTED in the worktree (by-reference sending over the budget, shrink-
+  first size rule, new wording, tests including `frontend/tests/upload-limits.test.tsx`). Continue from it:
+  review it, change 20 to "no limit", commit it.
+
+## Words
+
+No message may state a limit that no longer exists. Toasts like "You can attach up to N images" go
+away. Where reading is partial (huge document, very long video, too many photos for the model at full
+size), the answer or a note says exactly what was read.
+
+## Tests
+
+- 100 photos in one message: accepted, sent by reference over the budget, all stored, all shown on a
+  second device, the model call fits (smaller size), nothing refused.
+- A 30 MB original photo is accepted (shrunk).
+- 50 documents in one message: accepted, all chips on a second device; the document context budget is
+  shared, not multiplied.
+- A document larger than 512 MB (sparse file in tests) is accepted by the frontend and the server, stored
+  with its lasting copy, and its extraction stays within a memory bound (assert no whole-file read).
+- A video over 4 GB / longer than 4 h is accepted and stored; the analysis covers the window and says so.
+- No toast or doc still claims an old limit (grep the tree for "up to 5", "up to 20", "512 MB", "4 GB"
+  in user-facing strings).
