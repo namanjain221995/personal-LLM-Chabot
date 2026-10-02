@@ -534,6 +534,9 @@ def test_a_swept_document_is_still_an_honest_410(alice, conv):
     )
     upload_id = up_resp.json()["upload_id"]
     _shutil.rmtree(os.path.join(up.upload_root(conv, upload_id), "_original"))
+    # And its lasting copy (2026-10-02, docs/chat-media/CONTRACT.md §9), which
+    # otherwise outlives the sweep: nothing left on disk is an honest 410.
+    _shutil.rmtree(os.path.dirname(up.lasting_path(conv, upload_id)))
     assert alice.get(f"/uploads/{conv}/{upload_id}/file").status_code == 410
 
 

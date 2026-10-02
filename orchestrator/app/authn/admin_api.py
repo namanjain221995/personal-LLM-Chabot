@@ -1184,7 +1184,7 @@ async def download_member_upload(
 
     from fastapi.responses import FileResponse
 
-    from ..uploads import upload_root
+    from ..uploads import kept_original, upload_root
 
     await _inspectable_member(principal, user_id)
 
@@ -1206,7 +1206,14 @@ async def download_member_upload(
         os.path.basename(upload["filename"]),
     )
     if not os.path.isfile(path):
-        raise HTTPException(status_code=404, detail="The file has expired.")
+        # The member's own download's fallback (uploads.download_upload): the
+        # lasting copy, then a video's analysis store. Ownership was derived
+        # above from the upload row, and both stores are looked up by that
+        # row's (conversation, upload) pair.
+        stored = await kept_original(upload["conversation_id"], upload_id, upload.get("notes"))
+        if stored is None:
+            raise HTTPException(status_code=404, detail="The file has expired.")
+        path = str(stored)
     await db.run_in_thread(
         audit,
         principal,
