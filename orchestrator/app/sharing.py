@@ -258,8 +258,15 @@ def evaluate(
             shareable_messages=0,
         )
 
+    # Provenance reads EVERY user and assistant message, not only `completed`:
+    # a turn with no words can still carry private material. A phone's most
+    # common send is a photo with no text (content '', `meta.images`), and
+    # reading only the non-empty turns let its vision answer go public (chat
+    # media QA, 2026-10-02). Provenance can only add blocks.
     private_kinds: List[str] = []
-    for m in completed:
+    for m in messages:
+        if m.get("role") not in ("user", "assistant"):
+            continue
         meta = m.get("meta") or {}
         route = str(meta.get("route") or "")
         if route in PRIVATE_ROUTES:

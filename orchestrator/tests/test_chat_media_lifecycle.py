@@ -312,3 +312,26 @@ def test_a_chat_with_stored_photos_is_private_to_the_share_policy(login_client):
         ]
     )
     assert verdict.public_allowed is False
+
+
+def test_a_photo_with_no_words_still_makes_the_chat_private(login_client):
+    # A phone's usual send: a photo and no text. The user turn's content is
+    # empty, so it is not a "shareable" message, but its `meta.images` is
+    # still a private photo, and the vision answer below describes it.
+    owner = login_client("olive")
+    db.create_conversation(_uid("olive"), "conv-photo-only", "T")
+    _say("conv-photo-only", "user", "", {"images": [{"attachment_id": "att-00000001"}]})
+    _say("conv-photo-only", "assistant", "Number to call: +31 6 24 88 17 05.", {"route": "vision"})
+    resp = owner.post("/conversations/conv-photo-only/share", json={"visibility": "public", "expiry": "7d"})
+    assert resp.status_code == 422, resp.text
+    assert "uploaded photos" in resp.json()["detail"]
+
+    verdict = sharing.evaluate(
+        [
+            {"role": "user", "content": "", "meta": {"images": [{"attachment_id": "att-00000001"}]}},
+            {"role": "assistant", "content": "a prescription for 20 mg", "meta": {"route": "vision"}},
+        ],
+        policy={"public_enabled": True},
+    )
+    assert verdict.public_allowed is False
+    assert verdict.shareable_messages == 1  # the count is still of turns with words
