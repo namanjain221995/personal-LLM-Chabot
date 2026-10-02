@@ -774,3 +774,28 @@ vitest `--exclude 'tests/attack-*'`). No gate failed, so no code was changed.
   per-chat upload list, lasting reaper's home) and a "Where the build differs from
   CONTRACT.md" table added. Its last row records the e2e run's open RC-3c failure: whoever
   fixes RC-3c removes that row.
+
+## integrator (merge of origin/dev 3fead415, 2026-10-02 23:30 IST)
+
+dev brought the My files and voice archive fix rounds and the CPU whisper
+replica (no migration; V44 stays the only new one, V1..V44 contiguous). The
+four conflicts were resolved under the dev owner's rules:
+
+- myfiles.py: dev's `ready_names` CTE and hashed NOT IN fold stand as they
+  are; the picture branch (`_MEDIA_BRANCH`) joins `chat_media` to
+  `conversations` only, no document x upload join. `_DECORATE` selects both
+  `vs.outcome AS media_outcome` and the `cm.*` picture columns; `_item(row,
+  user_id)` sets `has_transcript` on recordings and `{width, height, mime}` on
+  pictures. The cursor gained no field (a `media` source with a 32-hex id
+  passes the existing checks, `_utf8` included).
+- Retention wording (frontend/lib/myfiles.ts): dev's two sentences win
+  verbatim, with or without `files_kept_with_chat`: "kept for N hours, then
+  removed the next time the server clears out old files" and the swept note
+  "The file was removed after N hours". fe-files' "stay while the chat
+  exists ... removed after up to N hours" and "(it was kept for up to N
+  hours)" are gone. With `files_kept_with_chat: true` the lasting copy gets
+  its own sentence: "Documents and spreadsheets also keep a copy that stays
+  while their chat exists, unless the server was short of space when they
+  were sent." The video sentence now shows whenever `video_kept_with_chat`
+  is set. Pinned in my-files-lib.test.ts ("a lasting copy gets its own
+  sentence ...").

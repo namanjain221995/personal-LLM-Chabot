@@ -219,6 +219,40 @@ class WorkerEngineBindTests(unittest.TestCase):
         self.assertNotIn(token, arguments)
         self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith(".secrets.")], [])
 
+    def _cpu_bind_address(self, **env: str) -> subprocess.CompletedProcess[str]:
+        """scripts/whisper-cpu.sh's bind_address: worker only, so it takes no node argument."""
+        program = "\n".join(
+            [
+                "set -euo pipefail",
+                'die() { printf "error: %s\\n" "$*" >&2; exit 2; }',
+                "ssh_worker() { ssh -o BatchMode=yes \"$CLUSTER_WORKER_SSH\" -- \"$@\"; }",
+                'WHISPER_MANAGEMENT_IFNAME="${WHISPER_MANAGEMENT_IFNAME:-enP7s7}"',
+                _function_source(SCRIPTS / "whisper-cpu.sh", "bind_address"),
+                "bind_address",
+            ]
+        )
+        environment = {
+            "PATH": self.path,
+            "HOME": str(self.root),
+            "CLUSTER_MODE": "dual",
+            "CLUSTER_WORKER_SSH": f"techsphere@{MANAGEMENT_LAN_ADDRESS}",
+            **env,
+        }
+        return subprocess.run(["bash", "-c", program], env=environment, capture_output=True, text=True, timeout=30)
+
+    def test_the_cpu_speech_replica_binds_the_management_address_like_the_gpu_replica(self) -> None:
+        result = self._cpu_bind_address(CLUSTER_WORKER_IP=RAIL_ADDRESS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, MANAGEMENT_LAN_ADDRESS)
+        self.assertIn("enP7s7", self.ssh_log.read_text(encoding="utf-8"))
+
+    def test_the_cpu_speech_replica_refuses_an_empty_wildcard_or_rail_address(self) -> None:
+        for answer in ("", "0.0.0.0", "::", RAIL_ADDRESS):
+            with self.subTest(ssh_answer=answer):
+                result = self._cpu_bind_address(FAKE_SSH_ANSWER=answer)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "", "nothing may be printed as a bind address")
+
     def test_the_head_engines_still_bind_the_docker_bridge_gateway(self) -> None:
         for script, function in (("ocr.sh", "ocr_bind_address"), ("whisper.sh", "whisper_bind_address")):
             with self.subTest(script=script):

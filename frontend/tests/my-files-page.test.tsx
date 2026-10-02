@@ -85,7 +85,7 @@ interface Row {
   created_at: string;
   conversation: { id: string; title: string } | null;
   availability: 'available' | 'text_only' | 'summary_only' | 'processing' | 'expired';
-  media: { status: string | null; duration_ms: number | null } | null;
+  media: { status: string | null; duration_ms: number | null; has_transcript?: boolean } | null;
   can: { download: boolean; preview: 'text' | 'summary' | 'audio' | 'image' | null; delete: boolean };
   /** A stored chat picture's id (docs/chat-media/NOTES.md, fe-files). */
   attachment_id?: string;
@@ -122,7 +122,7 @@ function recording(n: number, over: Partial<Row> = {}): Row {
     created_at: at(n),
     conversation: null,
     availability: 'available',
-    media: { status: 'done', duration_ms: 61_000 },
+    media: { status: 'done', duration_ms: 61_000, has_transcript: true },
     can: { download: true, preview: 'audio', delete: true },
     ...over,
   };
@@ -459,21 +459,29 @@ describe('each row', () => {
     expect(screen.getByText(/the server erases their stored copies later/)).toBeTruthy();
   });
 
-  it('says a recording is in Recordings "with its transcript" only once there is one', async () => {
+  it('says a recording is in Recordings "with its transcript" only when the transcript has words', async () => {
     await renderPage(
       new FakeFiles([
         recording(1),
-        recording(2, { media: { status: 'failed', duration_ms: 61_000 } }),
-        recording(3, {
+        // Done, but it heard no speech (outcome no_speech): the Recordings
+        // page says "No speech was detected", so there is no transcript to
+        // promise (QA 2026-10-01).
+        recording(2, { media: { status: 'done', duration_ms: 61_000, has_transcript: false } }),
+        recording(3, { media: { status: 'failed', duration_ms: 61_000, has_transcript: false } }),
+        recording(4, {
           availability: 'processing',
-          media: { status: 'finishing', duration_ms: null },
+          media: { status: 'finishing', duration_ms: null, has_transcript: false },
           can: { download: false, preview: null, delete: true },
         }),
+        // An older server that sends no flag promises nothing.
+        recording(5, { media: { status: 'done', duration_ms: 61_000 } }),
       ]),
     );
     const links = items().map((li) => within(li).getByRole('link', { name: /Recordings/ }));
     expect(links.map((a) => a.textContent)).toEqual([
       'Also in Recordings, with its transcript',
+      'Also in Recordings',
+      'Also in Recordings',
       'Also in Recordings',
       'Also in Recordings',
     ]);
@@ -533,7 +541,9 @@ describe('each row', () => {
     const fake = new FakeFiles([upload(1)]);
     fake.retention = { ...RETENTION, upload_hours: 36 };
     await renderPage(fake);
-    expect(screen.getByText(/Files you attach to a chat are kept for up to 36 hours/)).toBeTruthy();
+    expect(
+      screen.getByText(/Files you attach to a chat are kept for 36 hours, then removed the next time the server clears out old files;/),
+    ).toBeTruthy();
     expect(screen.getByText(/Pictures stay only in the browser you sent them from/)).toBeTruthy();
   });
 });

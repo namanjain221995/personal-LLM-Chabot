@@ -226,3 +226,114 @@ def test_adopt_source_replaces_a_leftover_partial_copy(tmp_path):
     assert Path(dest).read_bytes() == MP4
     assert store.source_path(content_hash) == dest
     assert not (root / "source.mp4.part").exists()
+
+
+class _Crash(Exception):
+    """The process dying at a given line, as far as adopt_source can tell."""
+
+
+def _parts(root) -> list:
+    return sorted(p.name for p in root.iterdir() if p.name.endswith(".part"))
+
+
+def _adopt_and_crash_before_the_rename(monkeypatch, content_hash: str, path) -> None:
+    """Run adopt_source until its link is made, then stop it where a crash
+    between os.link and os.replace would."""
+    import os
+
+    from app.video import store
+
+    def crash(*_args, **_kwargs):
+        raise _Crash
+
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "replace", crash)
+        with pytest.raises(_Crash):
+            store.adopt_source(content_hash, str(path), "clip.mp4")
+
+
+def test_adopt_source_recovers_from_a_crash_between_link_and_rename(tmp_path, monkeypatch):
+    """A crash between the link and the rename left `source.mp4.part` as a
+    hard link to the upload, holding the whole file. source_path skips a
+    .part, so the next adopt of the same upload ran again, met the leftover
+    at os.link, fell back to shutil.copyfile onto the same file and raised
+    SameFileError (QA, 2026-10-01)."""
+    import os
+    from pathlib import Path
+
+    from app.video import store
+
+    content_hash = "d" * 64
+    root = Path(store.analysis_dir(content_hash))
+    upload = tmp_path / "upload.mp4"
+    upload.write_bytes(MP4)
+    _adopt_and_crash_before_the_rename(monkeypatch, content_hash, upload)
+    (leftover,) = _parts(root)
+    assert os.path.samefile(root / leftover, upload), "the crash left a hard link to the upload"
+    assert store.source_path(content_hash) is None
+
+    dest = store.adopt_source(content_hash, str(upload), "clip.mp4")
+    assert Path(dest) == root / "source.mp4"
+    assert Path(dest).read_bytes() == MP4
+    assert _parts(root) == []
+    assert upload.read_bytes() == MP4
+
+
+def test_a_leftover_link_to_another_upload_is_never_written_through(tmp_path, monkeypatch):
+    """The leftover is a hard link to the EARLIER upload's workspace file.
+    Adopting a later upload of the same video copied through it, truncating
+    and rewriting the earlier upload's own file (QA, 2026-10-01)."""
+    import os
+    from pathlib import Path
+
+    from app.video import store
+
+    content_hash = "e" * 64
+    root = Path(store.analysis_dir(content_hash))
+    earlier = tmp_path / "earlier.mp4"
+    earlier.write_bytes(MP4)
+    _adopt_and_crash_before_the_rename(monkeypatch, content_hash, earlier)
+    os.utime(earlier, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+    before = os.stat(earlier)
+
+    later = tmp_path / "later.mp4"
+    later.write_bytes(MP4)
+    dest = store.adopt_source(content_hash, str(later), "clip.mp4")
+    after = os.stat(earlier)
+    assert (after.st_mtime_ns, after.st_size) == (before.st_mtime_ns, before.st_size), "written through the link"
+    assert earlier.read_bytes() == MP4
+    assert Path(dest).read_bytes() == MP4 and os.path.samefile(dest, later)
+    assert _parts(root) == []
+
+
+def test_two_adopters_of_one_video_at_once_both_get_the_whole_file(tmp_path, monkeypatch):
+    """The same video uploaded twice at the same moment: the second adopt runs
+    between the first one's link and its rename. With one shared temporary
+    name the second copied through the first one's link and renamed it away,
+    and the first then failed with FileNotFoundError."""
+    import os
+    from pathlib import Path
+
+    from app.video import store
+
+    content_hash = "f" * 64
+    root = Path(store.analysis_dir(content_hash))
+    first, second = tmp_path / "first.mp4", tmp_path / "second.mp4"
+    first.write_bytes(MP4)
+    second.write_bytes(MP4)
+    real_replace = os.replace
+    seen: dict = {}
+
+    def second_adopter_arrives(src, dst):
+        if not seen:  # the first rename only; the second adopter's own passes through
+            seen["second"] = None
+            seen["second"] = store.adopt_source(content_hash, str(second), "clip.mp4")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", second_adopter_arrives)
+    seen["first"] = store.adopt_source(content_hash, str(first), "clip.mp4")
+    monkeypatch.setattr(os, "replace", real_replace)
+    assert seen["first"] == seen["second"] == str(root / "source.mp4")
+    assert Path(seen["first"]).read_bytes() == MP4
+    assert first.read_bytes() == MP4 and second.read_bytes() == MP4
+    assert _parts(root) == []

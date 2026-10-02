@@ -134,11 +134,18 @@ WRITE_BATCH = 1 * MIB
 #: reuses one the store is closing at that moment.
 KEEP_ALIVE_TIMEOUT_S = 5
 
-#: Connections (and requests) uvicorn serves at once before it answers 503.
-#: The orchestrator keeps up to voice_archive._MAX_CONNECTIONS (32) per event
-#: loop, and two loops talk to the store (requests, and the mover with its
-#: restores): room for both, so a store that is fine never refuses a player.
-LIMIT_CONCURRENCY = 64
+#: uvicorn answers 503 to a request once len(connections) >= this (idle
+#: kept-alive connections count), so it serves one fewer than the number:
+#: at 64, two full pools of 32 had the 64th connection refused (review
+#: 2026-10-01). The orchestrator keeps up to voice_archive._MAX_CONNECTIONS
+#: (32) per event loop, and two of its loops can fill theirs: requests (a
+#: player holds one for its whole stream) and the archive loop (the mover,
+#: restores for retranscriptions, deletes). Both fit, so a store that is fine
+#: never refuses a player; the 16 on top are for what else talks to it now
+#: and then (a continuation's restore on the session runner's loop, a CLI
+#: run in the orchestrator container, voice-store.sh verify). A test holds
+#: both pools full against a real uvicorn at this limit.
+LIMIT_CONCURRENCY = 2 * 32 + 16
 
 #: The label values /metrics may carry; anything else is "other".
 OPS = ("put", "get", "head", "delete", "inventory", "quarantine", "quarantine_list", "unquarantine", "purge")

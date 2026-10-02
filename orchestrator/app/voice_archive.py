@@ -52,15 +52,16 @@ fsyncs, renames into place and marks the row copied with a hold of
 VOICE_ARCHIVE_HOLD_S. For any other row it only sets the hold, which is what
 stops a recording being released between a retranscription's checks and its
 own UPDATE. It never creates a session folder: a discarded recording must not
-come back.
+come back. After a restore met a failing store, restores are refused at once
+for the 30 s the refusal's Retry-After names (_RESTORE_PAUSE_S).
 
 READS. `recording_response` serves the head file when it exists (every local
 or copied recording), and otherwise streams the store's copy, forwarding
 Range and If-Range and passing 200/206/416 and their headers back (and the
 store's answer to a malformed Range, as the head gives it). Store down: 503
-archive_unavailable with Retry-After. Every pooled connection in use: 503
-archive_busy. Store has no copy: 410 audio_missing, counted, and flagged on
-the row for the reconcile.
+archive_unavailable with Retry-After. Every pooled connection in use, or the
+store at its own connection limit (its 503): 503 archive_busy. Store has no
+copy: 410 audio_missing, counted, and flagged on the row for the reconcile.
 
 DELETES keep dictation's order (row cancelled, then the folder), then ask the
 store to delete its copy at once without waiting; the purge step retries
@@ -166,8 +167,10 @@ _KEEPALIVE_EXPIRY_S = 2.0
 #: download holds one for its whole stream (a paused player too, until the
 #: browser lets it go), so with 8 the ninth listener waited out the pool and
 #: was told the archive "isn't answering" (review 2026-09-30, measured with
-#: real Chromium). The store serves compose/voice-store/server.py
-#: LIMIT_CONCURRENCY (64) at once: room for this loop's pool and the mover's.
+#: real Chromium). The store's compose/voice-store/server.py
+#: LIMIT_CONCURRENCY (2 x 32 + 16) is sized from this: a full pool from the
+#: request loop and one from the archive loop both fit, with room to spare
+#: (a test holds both against a real uvicorn at that limit).
 _MAX_CONNECTIONS = 32
 #: How long a request waits for a free connection before it is told the
 #: archive is busy (503 archive_busy), not that the archive is down.
@@ -1129,9 +1132,27 @@ async def _refresh_gauges() -> None:
 
 # ------------------------------------------------------------ restoring --
 
+#: After a restore met a failing store (a STOP_REASONS failure: down, timing
+#: out, refusing), every restore in this process is refused at once for this
+#: long, with the same 503 archive_unavailable and without asking the store:
+#: the Retry-After that answer already sends. Retranscriptions are counted
+#: against VOICE_RETRANSCRIBE_PER_HOUR only once their audio is here, so a
+#: "Try again" during an outage uses nothing up, and before this nothing else
+#: capped the attempts: each ran a full restore inside the person's lock, on
+#: a thread of the shared worker pool, for up to 32 s against a hung store
+#: (review 2026-10-01). A restore that gets its bytes clears it.
+_RESTORE_PAUSE_S = 30.0
+_restore_failed_at: Optional[float] = None
+
+
+def _restores_paused() -> bool:
+    failed_at = _restore_failed_at
+    return failed_at is not None and time.monotonic() - failed_at < _RESTORE_PAUSE_S
+
 
 async def _restore_file(row: Dict[str, Any], directory: str) -> None:
     """The store's copy into place at source.<ext>, checked. SessionError when it cannot."""
+    global _restore_failed_at
     size = int(row.get("bytes_stored") or 0)
     sha = row.get("source_sha256")
     source = dictation.source_path(row)
@@ -1145,6 +1166,9 @@ async def _restore_file(row: Dict[str, Any], directory: str) -> None:
     if free is not None and free - size < settings.voice_min_free_bytes:
         metrics.inc("voice_archive_restored_total", "recordings brought back to the head", result="no_space")
         raise _no_room()
+    if _restores_paused():
+        metrics.inc("voice_archive_restored_total", "recordings brought back to the head", result="unavailable")
+        raise _unavailable()
     temp = os.path.join(directory, f"{_RESTORE_PREFIX}{uuid.uuid4().hex}")
     try:
         try:
@@ -1167,8 +1191,11 @@ async def _restore_file(row: Dict[str, Any], directory: str) -> None:
                 metrics.inc("voice_archive_restored_total", "recordings brought back to the head", result="mismatch")
                 log.error("voice archive: the stored copy of %s does not hash to its sha256", row["id"])
                 raise _missing() from None
+            if exc.reason in STOP_REASONS:
+                _restore_failed_at = time.monotonic()
             metrics.inc("voice_archive_restored_total", "recordings brought back to the head", result="unavailable")
             raise _unavailable() from None
+        _restore_failed_at = None  # the store answered with the whole recording
 
         def place() -> None:
             os.replace(temp, source)
@@ -1188,8 +1215,9 @@ async def ensure_local(row: Dict[str, Any], *, hold_s: Optional[float] = None) -
 
     Returns the fresh row. dictation.SessionError: 410 audio_deleted (the
     recording or its folder is gone), 503 archive_unavailable (the store is
-    not answering), 410 audio_missing (the store has no good copy), 507
-    storage_full (no room on the head)."""
+    not answering, or a restore found it failing less than _RESTORE_PAUSE_S
+    ago), 410 audio_missing (the store has no good copy), 507 storage_full
+    (no room on the head)."""
     hold = float(settings.voice_archive_hold_s if hold_s is None else hold_s)
     user_id, session_id = int(row["user_id"]), row["id"]
     directory = dictation.session_dir(user_id, session_id)
@@ -1361,6 +1389,13 @@ async def _proxy(row: Dict[str, Any], request: Request, filename: str, headers: 
             await db.run_in_thread(_flag, row["id"], "remote_missing")
         error = _missing()
         return JSONResponse(status_code=error.status, content=error.body(), headers={"Cache-Control": "no-store"})
+    if status == 503:
+        # The store refuses a read only at its connection limit (uvicorn's
+        # limit_concurrency; its own 503s are for uploads): it is answering,
+        # and busy. Not "the archive isn't answering" (review 2026-10-01).
+        _error("busy")
+        counted("busy")
+        return _busy_response()
     _error(_status_reason(status))
     counted("unavailable")
     return _unavailable_response()
@@ -1454,7 +1489,8 @@ async def reconcile_once() -> Dict[str, int]:
     own database (an e2e stack, a candidate) used to delete production's
     recordings exactly that way (review 2026-09-30). So:
       * another deployment's object (its owner is not ours) is counted,
-        never touched, never taken for one of ours;
+        never touched, never taken for one of ours, and never makes a row
+        of ours that names it "missing" (it is there, and it plays);
       * one of OUR objects with no row is set aside on the store once it was
         stored _ORPHAN_GRACE_S ago (orphan_quarantined; kept whole, restorable,
         purged only by an operator), and counted until then (orphan_waiting);
@@ -1480,13 +1516,27 @@ async def reconcile_once() -> Dict[str, int]:
             user_id = int(item.get("user_id") or 0)
             owner = item.get("owner") if isinstance(item.get("owner"), str) else None
             row = rows.get(session_id)
+            # On the store, whoever stored it: a row whose object is here is
+            # not missing, and it plays (reads never ask the owner). Before,
+            # another owner's object was skipped ahead of this line, so after
+            # an owner-row change every archived recording was flagged
+            # remote_missing and VoiceArchiveCopiesMissing fired (review
+            # 2026-10-01).
+            seen.add(session_id)
             if owner is not None and owner != me:
+                # Never deleted, set aside or repaired from here: the store
+                # would refuse it (409 owner_mismatch) and this module never asks.
                 stats["other_owner"] += 1
-                claimed_elsewhere += row is not None
+                if row is not None:
+                    claimed_elsewhere += 1
+                    if (
+                        int(row["user_id"]) == user_id and (row.get("archive_state") or LOCAL) == ARCHIVED
+                        and row.get("archive_error") == "remote_missing"
+                    ):
+                        await db.run_in_thread(_flag, session_id, None)
                 continue
             if owner is None:
                 stats["unowned"] += 1
-            seen.add(session_id)
             if row is None:
                 if owner is None:
                     continue  # nobody's we can prove: left exactly as it is
@@ -1548,7 +1598,8 @@ async def reconcile_once() -> Dict[str, int]:
     if claimed_elsewhere:
         log.error(
             "voice archive: %d recording(s) this database has rows for are stored under another owner "
-            "(was the voice_archive_owner row changed?); they are left alone and cannot be deleted from here",
+            "(was the voice_archive_owner row changed?); they play, but they are left alone and cannot be "
+            "deleted from here (docs/voice-archive.md, \"Who owns a recording\")",
             claimed_elsewhere,
         )
     for name, count in stats.items():

@@ -88,7 +88,11 @@ export interface MyFile {
   /** The chat it was sent in; null for a voice recording. */
   conversation: { id: string; title: string } | null;
   availability: Availability;
-  media: { status: string | null; durationMs: number | null } | null;
+  /**
+   * `hasTranscript`: a recording whose transcript has words, which the
+   * Recordings page shows. The server decides; false for everything else.
+   */
+  media: { status: string | null; durationMs: number | null; hasTranscript: boolean } | null;
   can: { download: boolean; preview: ServerPreview; delete: boolean };
   /**
    * The stored text a `text` preview reads (GET /uploads/{conv}/document
@@ -223,23 +227,29 @@ function hours(n: number): string {
  * server sends them with every page), so the page stays true when a TTL
  * changes.
  *
- * Nothing here promises more than the server does (QA 2026-09-30): "up to",
- * because the sweep also enforces WORKSPACE_QUOTA_GB and a large upload can
- * evict a file sooner; and deleting a chat drops its rows at once but leaves
- * the bytes to the next sweep or the video reaper, so no erasure time is
- * given.
+ * Each sentence says what the server does, no more and no less. A chat
+ * file's stored copy is kept for WORKSPACE_TTL_HOURS: the sweep never removes
+ * an upload younger than that, not even to stay under WORKSPACE_QUOTA_GB
+ * (core/repo._upload_is_live). After that it goes the next time the sweep
+ * runs, which is only when someone uploads a file or a repository is cloned,
+ * so on a quiet server a file stays stored, and listed as Stored, past its
+ * hours. "Up to" stated a maximum nothing enforces (QA 2026-10-01). Deleting
+ * a chat drops its rows at once but leaves the bytes to the next sweep or the
+ * video reaper, so no erasure time is given.
  */
 export function retentionSentences(r: Retention): string[] {
-  const out = r.filesKeptWithChat
-    ? [
-        `Files you attach to a chat stay while the chat exists. One that could not be kept was removed after up to ${hours(r.uploadHours)}; the chat keeps what it read of it (a document's text, a spreadsheet's summary).`,
-      ]
-    : [
-        `Files you attach to a chat are kept for up to ${hours(r.uploadHours)}; after that the chat keeps what it read (a document's text, a spreadsheet's summary).`,
-      ];
-  if (r.videoKeptWithChat && !r.filesKeptWithChat) {
-    out.push('Videos and audio files stay while their chat exists.');
+  const out = [
+    `Files you attach to a chat are kept for ${hours(r.uploadHours)}, then removed the next time the server clears out old files; after that the chat keeps what it read (a document's text, a spreadsheet's summary).`,
+  ];
+  if (r.filesKeptWithChat) {
+    // The lasting copy (CONTRACT §9) gets its own sentence: the one above
+    // still holds for the workspace copy and for a file sent before copies
+    // were kept, or while the server was short of space.
+    out.push(
+      'Documents and spreadsheets also keep a copy that stays while their chat exists, unless the server was short of space when they were sent.',
+    );
   }
+  if (r.videoKeptWithChat) out.push('Videos and audio files stay while their chat exists.');
   if (r.picturesKept) {
     // The backfill (lib/chatMedia): a photo sent before pictures were stored
     // reaches the server only from the browser that still holds it.
@@ -264,30 +274,24 @@ const ARCHIVE_NAME = /\.(zip|tar|tgz|tar\.gz)$/i;
  * file, and what of it is left. null for a stored file.
  */
 export function availabilityNote(file: MyFile, retention: Retention | null): string | null {
-  // Not "removed after N hours": the quota can evict a file sooner. Once files
-  // stay with their chat, the rule is no longer every file's, so the note
-  // speaks about THIS file instead.
-  const why = !retention
-    ? ''
-    : retention.filesKeptWithChat
-      ? ` (it was kept for up to ${hours(retention.uploadHours)})`
-      : ` (chat files are kept for up to ${hours(retention.uploadHours)})`;
+  // True as worded: nothing removes a chat file before its hours are up.
+  const after = retention ? ` after ${hours(retention.uploadHours)}` : '';
   switch (file.availability) {
     case 'text_only':
       return file.source === 'text'
         ? 'Only the text the chat read was kept; the file itself was not stored.'
-        : `The file was removed${why}. The text the chat read is kept.`;
+        : `The file was removed${after}. The text the chat read is kept.`;
     case 'summary_only':
       return ARCHIVE_NAME.test(file.name)
         ? 'An archive is unpacked when it arrives, so the archive itself is not kept. The summary the chat made is.'
-        : `The file was removed${why}. The summary the chat made of it is kept.`;
+        : `The file was removed${after}. The summary the chat made of it is kept.`;
     case 'processing':
       return 'Still being recorded or transcribed.';
     case 'expired':
       if (file.kind === 'image') return 'This picture is no longer stored.';
       return file.kind === 'video' || file.kind === 'audio'
         ? 'This file is no longer stored.'
-        : `The file was removed${why}, and nothing of it was kept.`;
+        : `The file was removed${after}, and nothing of it was kept.`;
     default:
       return null;
   }
@@ -498,7 +502,13 @@ function parseFile(raw: unknown): MyFile | null {
     createdAt,
     conversation,
     availability,
-    media: media ? { status: str(media.status), durationMs: num(media.duration_ms) } : null,
+    media: media
+      ? {
+          status: str(media.status),
+          durationMs: num(media.duration_ms),
+          hasTranscript: media.has_transcript === true,
+        }
+      : null,
     // Only an explicit `true` grants an action.
     can: { download: can.download === true, preview, delete: can.delete === true },
     textName: preview === 'text' ? str(r.text_name) || null : null,

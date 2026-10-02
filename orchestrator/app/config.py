@@ -323,6 +323,48 @@ class Settings:
         # Per person, per minute. Dictation is bursty but not machine-fast.
         self.asr_rate_per_min: int = _int("ASR_RATE_PER_MIN", 20)
 
+        # -- The CPU overflow replica (2026-09-30) ------------------------------
+        #
+        # A third copy of whisper-large-v3 — the same pinned weights, as
+        # whisper.cpp q8_0 — on ten of the WORKER's CPU cores
+        # (compose/compose.whisper-cpu.yaml, scripts/whisper-cpu.sh, which
+        # writes this key). The GPU replicas above are always preferred: a
+        # clip goes here only when every one of them is already decoding (or
+        # standing down), and only when it can finish inside its deadline at
+        # the speed below (app/asr.RoutedProvider, THE CPU REPLICA). Empty =
+        # no CPU replica, and routing is exactly what it was.
+        #
+        # ITS OWN KEY, NOT AN ENTRY IN ASR_BASE_URLS. That list sizes the
+        # dictation pool per GPU engine and is what /v1 routes over; neither
+        # should count a replica that exists for overflow.
+        #
+        # Each replica ONCE, in the order listed: "http://cpu/v1, http://cpu/v1/"
+        # would give one replica, which decodes one clip at a time, two router
+        # slots and a second clip to wait behind the first (verifier,
+        # 2026-09-30).
+        self.asr_cpu_base_urls: tuple[str, ...] = tuple(dict.fromkeys(
+            url.strip().rstrip("/")
+            for url in os.environ.get("ASR_CPU_BASE_URLS", "").split(",")
+            if url.strip()
+        ))
+        # How long the CPU replica takes for a clip when it is free, as
+        # ASR_CPU_FIXED_S + seconds x ASR_CPU_S_PER_AUDIO_S. Measured
+        # 2026-09-30 on the worker with the replica's own decoder, 8 threads
+        # on the X925 cores, while other tenants shared them, 413 clips from
+        # 2 s to 5 min (docs/voice/CPU-REPLICA.md). 0.45 s/s is the slowest
+        # long-form rate measured (Hindi-English lectures, 0.41-0.46 before
+        # the 443-token window patch, 0.28 after; English long form ran
+        # 0.17-0.25). 406 of the 413 clips are under the line and 412 under
+        # the line x ASR_CPU_DEADLINE_MARGIN; the exception was a 9 s clip
+        # slowed 3x by other load. The fixed part is the no-speech / language
+        # pre-pass plus one 30 s encoder window, ~1.9 s each.
+        self.asr_cpu_fixed_s: float = max(0.0, _float("ASR_CPU_FIXED_S", 8.5))
+        self.asr_cpu_s_per_audio_s: float = max(0.01, _float("ASR_CPU_S_PER_AUDIO_S", 0.45))
+        # Head room on that estimate: a clip is sent to the CPU replica only
+        # when estimate x this still fits its deadline (the session window
+        # timeout, or ASR_TIMEOUT_S). Never below 1.
+        self.asr_cpu_deadline_margin: float = max(1.0, _float("ASR_CPU_DEADLINE_MARGIN", 1.5))
+
         # -- Recording sessions: chunked, stored dictation (2026-09-29) --------
         #
         # The composer's microphone opens a SESSION (app/dictation.py). The

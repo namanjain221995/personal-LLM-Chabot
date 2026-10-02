@@ -89,7 +89,7 @@ describe('parsing a page', () => {
           kind: 'recording',
           name: 'Voice recording',
           conversation: null,
-          media: { status: 'done', duration_ms: 61_000 },
+          media: { status: 'done', duration_ms: 61_000, has_transcript: true },
           can: { download: true, preview: 'audio', delete: true },
         }),
       ],
@@ -128,8 +128,27 @@ describe('parsing a page', () => {
       kind: 'recording',
       recordingId: REC,
       conversation: null,
-      media: { status: 'done', durationMs: 61_000 },
+      media: { status: 'done', durationMs: 61_000, hasTranscript: true },
     });
+  });
+
+  it('promises a transcript only when the server says one has words', () => {
+    const recordingRow = (media: Record<string, unknown>) =>
+      parsed({
+        id: `recording:${REC}`,
+        source: 'recording',
+        kind: 'recording',
+        name: 'Voice recording',
+        conversation: null,
+        media,
+        can: { download: true, preview: 'audio', delete: true },
+      });
+    expect(recordingRow({ status: 'done', duration_ms: 1, has_transcript: true }).media?.hasTranscript).toBe(true);
+    // A done recording that heard no speech (QA 2026-10-01), a flag that is
+    // not an explicit true, and an older server that sends none.
+    expect(recordingRow({ status: 'done', duration_ms: 1, has_transcript: false }).media?.hasTranscript).toBe(false);
+    expect(recordingRow({ status: 'done', duration_ms: 1, has_transcript: 'yes' }).media?.hasTranscript).toBe(false);
+    expect(recordingRow({ status: 'done', duration_ms: 1 }).media?.hasTranscript).toBe(false);
   });
 
   it('drops rows it could not act on, and refuses a body that is not a page', () => {
@@ -368,9 +387,13 @@ describe('words', () => {
   it('builds the retention sentences from the deployment', () => {
     const parsedRetention = parseMyFilesPage({ items: [], next_cursor: null, retention: RETENTION })!.retention!;
     const text = retentionSentences(parsedRetention).join(' ');
-    // "up to": the sweep also enforces WORKSPACE_QUOTA_GB, so a large upload
-    // can evict a file sooner (QA 2026-09-30).
-    expect(text).toContain('kept for up to 24 hours;');
+    // Not "up to": nothing removes a chat file before its hours are up, the
+    // quota included, and nothing removes it on the hour either: the sweep
+    // runs when someone next uploads (QA 2026-10-01).
+    expect(text).toContain(
+      "Files you attach to a chat are kept for 24 hours, then removed the next time the server clears out old files; after that the chat keeps what it read (a document's text, a spreadsheet's summary).",
+    );
+    expect(text).not.toContain('up to');
     // Deleting a chat is not erasure: the bytes wait for the server's clean-up.
     expect(text).toContain(
       'Deleting a chat takes its files off this list at once; the server erases their stored copies later.',
@@ -383,21 +406,24 @@ describe('words', () => {
       retention: { ...RETENTION, upload_hours: 1, recording_days: 30 },
     })!.retention!;
     const other = retentionSentences(monthly).join(' ');
-    expect(other).toContain('kept for up to 1 hour;');
+    expect(other).toContain('kept for 1 hour, then removed the next time the server clears out old files;');
     expect(other).toContain('Voice recordings are deleted automatically 30 days after they finish.');
   });
 });
 
 describe('the note under a row that is not simply stored', () => {
-  it('says a swept file was removed without promising when (the quota can evict sooner)', () => {
+  it('says a swept file was removed after its hours, which nothing shortens', () => {
     const retention = parseMyFilesPage({ items: [], next_cursor: null, retention: RETENTION })!.retention!;
     const none = { download: false, preview: null, delete: false };
     expect(availabilityNote(parsed({ availability: 'text_only', can: { ...none, preview: 'text' } }), retention)).toBe(
-      'The file was removed (chat files are kept for up to 24 hours). The text the chat read is kept.',
+      'The file was removed after 24 hours. The text the chat read is kept.',
     );
     expect(
       availabilityNote(parsed({ kind: 'dataset', name: 'sales.csv', availability: 'summary_only', can: { ...none, preview: 'summary' } }), retention),
-    ).toBe('The file was removed (chat files are kept for up to 24 hours). The summary the chat made of it is kept.');
+    ).toBe('The file was removed after 24 hours. The summary the chat made of it is kept.');
+    expect(availabilityNote(parsed({ availability: 'expired', can: none }), retention)).toBe(
+      'The file was removed after 24 hours, and nothing of it was kept.',
+    );
     // Without the server's retention block, no number is invented.
     expect(availabilityNote(parsed({ availability: 'expired', can: none }), null)).toBe(
       'The file was removed, and nothing of it was kept.',
@@ -584,20 +610,33 @@ describe('stored chat pictures', () => {
     expect(retentionSentences(silent).join(' ')).not.toContain('Pictures');
   });
 
-  it('retention: once files stay with their chat, no sentence claims every file goes after 24 hours', () => {
+  it('retention: a lasting copy gets its own sentence; the workspace sentence and the swept note stay as they are', () => {
+    // Precedence (merge of dev 3fead415, its owner's rule): the "kept for N
+    // hours, then removed the next time the server clears out old files"
+    // sentence and the "removed after N hours" note are never reworded for
+    // the lasting copy, which is said in a sentence of its own. None of them
+    // promises a deletion time.
     const kept = parseMyFilesPage({
       items: [],
       next_cursor: null,
       retention: { ...RETENTION, files_kept_with_chat: true },
     })!.retention!;
     expect(kept.filesKeptWithChat).toBe(true);
-    const text = retentionSentences(kept).join(' ');
-    expect(text).toContain('Files you attach to a chat stay while the chat exists.');
-    expect(text).not.toContain('Files you attach to a chat are kept for up to');
-    // A swept file's own note speaks about that file, not about the rule.
+    const sentences = retentionSentences(kept);
+    expect(sentences[0]).toBe(
+      "Files you attach to a chat are kept for 24 hours, then removed the next time the server clears out old files; after that the chat keeps what it read (a document's text, a spreadsheet's summary).",
+    );
+    expect(sentences[1]).toBe(
+      'Documents and spreadsheets also keep a copy that stays while their chat exists, unless the server was short of space when they were sent.',
+    );
+    expect(sentences).toContain('Videos and audio files stay while their chat exists.');
+    expect(sentences.join(' ')).not.toContain('up to');
     const none = { download: false, preview: null, delete: false };
     expect(availabilityNote(parsed({ availability: 'text_only', can: { ...none, preview: 'text' } }), kept)).toBe(
-      'The file was removed (it was kept for up to 24 hours). The text the chat read is kept.',
+      'The file was removed after 24 hours. The text the chat read is kept.',
     );
+    // Without the flag, no sentence speaks of a lasting copy.
+    const plain = parseMyFilesPage({ items: [], next_cursor: null, retention: RETENTION })!.retention!;
+    expect(retentionSentences(plain).join(' ')).not.toContain('also keep a copy');
   });
 });

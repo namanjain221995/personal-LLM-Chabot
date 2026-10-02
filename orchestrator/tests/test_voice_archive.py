@@ -26,6 +26,7 @@ import ast
 import asyncio
 import base64
 import concurrent.futures
+import contextlib
 import errno
 import importlib.util
 import json
@@ -155,7 +156,13 @@ def archive(voice, monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "voice_archive_after_s", DUE_NOW)
     monkeypatch.setattr(settings, "voice_archive_rate_bytes_per_s", 1 << 40)
     monkeypatch.setattr(settings, "voice_archive_batch", 20)
+    # A restore that met a failing store pauses restores in this process; one
+    # test's outage must not refuse the next test's restore.
+    monkeypatch.setattr(voice_archive, "_restore_failed_at", None)
     yield control
+    # No worker may still be writing when the next test's TRUNCATE runs: a
+    # worker's V19 INSERT against that TRUNCATE is a deadlock.
+    all_let_go()
     run(voice_archive.close_client())
 
 
@@ -178,10 +185,49 @@ def uid_of(name: str) -> int:
     return int(db.get_user_by_username(name)["id"])
 
 
+def let_go(sid: str, *, timeout: float = 30.0) -> None:
+    """Until this process's session worker has let go of `sid`'s row.
+
+    wait_done returns once the ROW says done, while the worker is still
+    unwinding: it records the V19 attempt (an INSERT into
+    voice_transcriptions), then clears its lease (an UPDATE of this row).
+    A pass in between found the row locked and skipped it (the claim is FOR
+    UPDATE SKIP LOCKED), and the next test's TRUNCATE could deadlock with
+    that INSERT: about 1 full run of this file in 6 failed (review
+    2026-10-01). The lease is cleared last, so a row with no lease and no
+    worker is one nothing in this process still writes."""
+    deadline = time.monotonic() + timeout
+    while sid in dictation.RUNNER.live or row_of(sid)["lease_owner"] is not None:
+        assert time.monotonic() < deadline, f"the session worker still holds {sid}"
+        time.sleep(0.01)
+
+
+def all_let_go(*, timeout: float = 60.0) -> None:
+    """`let_go` for every row this process's session workers hold."""
+    deadline = time.monotonic() + timeout
+    while True:
+        with db.connection() as con:
+            held = [r["id"] for r in con.execute(
+                "SELECT id FROM voice_sessions WHERE lease_owner = %s", (dictation._OWNER,)
+            ).fetchall()]
+        if not held and not dictation.RUNNER.live:
+            return
+        assert time.monotonic() < deadline, f"session workers still hold {held or list(dictation.RUNNER.live)}"
+        time.sleep(0.01)
+
+
+def settled(client, sid: str) -> Dict[str, Any]:
+    """wait_done, and then until the worker has let go of the row."""
+    done = wait_done(client, sid)
+    let_go(sid)
+    return done
+
+
 def finished(voice_env, client, seconds: float = 8.0, *, seed: int = 7) -> Tuple[str, bytes]:
     _script, data = recording(voice_env.tmp, seconds, seed=seed)
     sid, done, _ = dictate(client, data)
     assert done["status"] == "done", done
+    let_go(sid)
     return sid, data
 
 
@@ -211,6 +257,74 @@ def test_v43_adds_the_archive_columns_with_every_existing_row_local_and_runs_twi
             "SELECT indexname FROM pg_indexes WHERE tablename = 'voice_sessions'"
         ).fetchall()}
     assert {"idx_voice_sessions_archive_due", "idx_voice_sessions_archive_copied", "idx_voice_sessions_archive_purge"} <= indexes
+
+
+#: What a database whose V43 is not this one looks like, after the released
+#: V43 ran: the voice archive's draft (V43 recorded, no owner table, the old
+#: purge index), and the dropped meeting-transcripts branch's V43 (V43
+#: recorded, none of the archive's columns: that branch made voice_sessions.kind).
+_FOREIGN_V43 = {
+    "draft": (
+        "DROP TABLE voice_archive_owner; DROP INDEX idx_voice_sessions_archive_purge; "
+        "CREATE INDEX idx_voice_sessions_archive_purge ON voice_sessions (audio_deleted_at) "
+        "WHERE audio_deleted_at IS NOT NULL AND archive_state <> 'local' AND remote_purged_at IS NULL;",
+        "a draft of the voice archive's V43",
+    ),
+    "another_branch": (
+        "DROP TABLE voice_archive_owner; ALTER TABLE voice_sessions DROP CONSTRAINT voice_sessions_archive_state, "
+        "DROP COLUMN archive_state, DROP COLUMN archived_at, DROP COLUMN head_released_at, "
+        "DROP COLUMN head_hold_until, DROP COLUMN archive_attempts, DROP COLUMN archive_next_at, "
+        "DROP COLUMN archive_error, DROP COLUMN remote_purged_at; "
+        "ALTER TABLE voice_sessions ADD COLUMN kind text NOT NULL DEFAULT 'dictation';",
+        "another branch's migration numbered 43",
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_FOREIGN_V43))
+def test_a_database_whose_v43_is_not_this_one_is_refused_at_start_up_with_what_to_do(monkeypatch, shape):
+    """V43 was edited in place before release (the owner table and the purge
+    index's predicate came after a draft had run on test databases), and the
+    dropped meeting-transcripts branches numbered a different migration 43.
+    The runner keeps no checksum: such a database said "V43", started
+    cleanly, and then every store call that names the owner raised
+    UndefinedTable (review 2026-10-01; ten such test databases found).
+    Start-up now refuses it, says which it is and what to do, and doing that
+    brings it to this V43."""
+    leftover, diagnosis = _FOREIGN_V43[shape]
+    first = db.dsn()
+    other = _empty_database(f"v43_{shape}")
+    try:
+        monkeypatch.setattr(settings, "app_database_url", other)
+        db.init_schema()
+        db.init_schema()  # this V43, applied before this start-up: nothing to say
+        with db.connection() as con:
+            con.execute(leftover)
+        with pytest.raises(RuntimeError) as refused:
+            db.init_schema()
+        message = str(refused.value)
+        assert diagnosis in message and "drop it" in message and db.V43_REPAIR in message, message
+        with db.connection() as con:
+            assert con.execute("SELECT to_regclass('voice_archive_owner') AS t").fetchone()["t"] is None
+            con.execute(db.V43_REPAIR)  # what the message says to run
+        db.init_schema()
+        with db.connection() as con:
+            assert con.execute("SELECT max(version) AS v FROM schema_migrations").fetchone()["v"] == db.LATEST_SCHEMA_VERSION
+            assert con.execute("SELECT to_regclass('voice_archive_owner') AS t").fetchone()["t"] is not None
+            purge = con.execute(
+                "SELECT indexdef FROM pg_indexes WHERE indexname = 'idx_voice_sessions_archive_purge'"
+            ).fetchone()["indexdef"]
+            columns = {r["column_name"] for r in con.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'voice_sessions'"
+            ).fetchall()}
+        assert "archive_state" not in purge, purge
+        assert {"archive_state", "archived_at", "head_released_at", "head_hold_until", "archive_attempts",
+                "archive_next_at", "archive_error", "remote_purged_at"} <= columns
+        db.init_schema()
+    finally:
+        monkeypatch.setattr(settings, "app_database_url", first)
+        db.close_pool()
+        _drop_database(other)
 
 
 def test_the_store_accepts_exactly_the_extensions_dictation_stores():
@@ -500,7 +614,7 @@ def test_retranscribing_a_moved_recording_brings_it_back_and_it_moves_again_with
     assert row_of(sid)["archive_state"] == "archived"
     r = alice.post(f"/audio/sessions/{sid}/retranscribe", json={"scope": "all"})
     assert r.status_code == 202, r.text
-    done = wait_done(alice, sid)
+    done = settled(alice, sid)
     assert done["outcome"] == "transcribed", done
     row = row_of(sid)
     assert row["archive_state"] == "copied" and row["head_released_at"] is None and row["head_hold_until"]
@@ -598,7 +712,7 @@ def test_release_and_a_retranscription_never_leave_the_decoder_without_its_file(
         assert release.result(15) is False, "then finds the hold and leaves the file"
         assert request.result(15).status_code == 202
     monkeypatch.setattr(voice_archive, "_set_hold", real_hold)
-    assert wait_done(alice, sid)["outcome"] == "transcribed"
+    assert settled(alice, sid)["outcome"] == "transcribed"
 
     # 2. The release has the lock and is between its UPDATE and its unlink.
     sid2, data2 = _copied(voice, alice)
@@ -620,7 +734,7 @@ def test_release_and_a_retranscription_never_leave_the_decoder_without_its_file(
         go2.set()
         assert release2.result(15) is True
         assert request.result(30).status_code == 202
-    done = wait_done(alice, sid2)
+    done = settled(alice, sid2)
     assert done["outcome"] == "transcribed", done
     with open(dictation.source_path(row_of(sid2)), "rb") as fh:
         assert fh.read() == data2, "brought back byte for byte"
@@ -702,7 +816,7 @@ def _idle_closed_then_moved(voice_env, client, monkeypatch):
     monkeypatch.setattr(settings, "voice_session_idle_s", 0.0)
     time.sleep(0.05)
     dictation.RUNNER.submit(dictation.maintain_once()).result(10)
-    assert wait_done(client, first)["ended_by"] == "idle"
+    assert settled(client, first)["ended_by"] == "idle"
     monkeypatch.setattr(settings, "voice_session_idle_s", 600.0)
     run(voice_archive.archive_once())
     assert row_of(first)["archive_state"] == "archived"
@@ -730,7 +844,7 @@ def test_a_continuation_of_a_moved_recording_brings_it_back_and_keeps_it_while_i
     # stream must come after the first recording's bytes, so this continuation
     # needs them back on the head.
     second = _continue(alice, first, data[cut:])
-    done = wait_done(alice, second)
+    done = settled(alice, second)
     assert done["outcome"] == "transcribed", done
     assert abs(done["audio_ms"] - (40_000 - (cut - 44) * 1000 // (SR * 2))) <= 5
     assert row_of(first)["archive_state"] == "copied", "brought back, and held"
@@ -780,7 +894,7 @@ def test_a_continuation_that_read_its_recording_as_copied_survives_a_release_tha
         assert put(alice, second, seq, part).status_code == 200
     r = alice.post(f"/audio/sessions/{second}/finish", json={"last_part": len(parts) - 1, "ended_by": "person"})
     assert r.status_code == 202, r.text
-    done = wait_done(alice, second)
+    done = settled(alice, second)
     assert stale["left"] == 0, "the decoder read the recording it continues"
     assert done["outcome"] == "transcribed", done
     assert abs(done["audio_ms"] - (40_000 - (cut - 44) * 1000 // (SR * 2))) <= 5
@@ -789,6 +903,8 @@ def test_a_continuation_that_read_its_recording_as_copied_survives_a_release_tha
 
 def test_a_continuation_waits_for_the_archive_instead_of_failing(archive, voice, login_client, monkeypatch):
     monkeypatch.setattr(dictation, "_ARCHIVE_RETRY_S", 0.2)
+    # ...and a failed restore pauses restores that much, not 30 s.
+    monkeypatch.setattr(voice_archive, "_RESTORE_PAUSE_S", 0.2)
     alice = login_client("alice")
     first, data, cut = _idle_closed_then_moved(voice, alice, monkeypatch)
     archive.down = True
@@ -802,7 +918,7 @@ def test_a_continuation_waits_for_the_archive_instead_of_failing(archive, voice,
         time.sleep(0.1)
     assert seen and seen["waiting_on"] == "archive" and seen["status"] == "finishing", seen
     archive.down = False
-    done = wait_done(alice, second)
+    done = settled(alice, second)
     assert done["outcome"] == "transcribed", done
 
 
@@ -902,7 +1018,7 @@ def test_a_recording_retranscribed_during_its_copy_then_deleted_leaves_no_copy_o
     monkeypatch.setattr(voice_archive, "read_back", retranscribe_then_read_back)
     assert run(voice_archive.archive_once()) == {"busy_meanwhile": 1}
     monkeypatch.setattr(voice_archive, "read_back", real_read_back)
-    wait_done(alice, sid)
+    settled(alice, sid)
     assert archive.objects() == [(uid, sid)] and row_of(sid)["archive_state"] == "local"
     assert alice.delete(f"/audio/sessions/{sid}").status_code == 204
     assert run(voice_archive.archive_once()) == {"purged": 1}
@@ -1097,6 +1213,48 @@ async def _as_owner(owner: str, coro):
             voice_archive._OWNERS[key] = real
 
 
+def test_a_recording_another_owner_stored_is_never_called_missing_and_never_deleted(
+    archive, voice, login_client, caplog,
+):
+    """Review 2026-10-01. The reconcile skipped another owner's object before
+    it noted the object as present, so a row of ours whose object another
+    owner holds was flagged remote_missing: after a change of the owner row
+    (or in a copy of production's database made a deployment of its own)
+    every archived recording was, and VoiceArchiveCopiesMissing fired. The
+    object is there and plays; it is not missing. And nothing here deletes
+    it, not even for a row here that says it was deleted."""
+    alice = login_client("alice")
+    uid = uid_of("alice")
+    plays, data = finished(voice, alice, seed=41)
+    flagged, _ = finished(voice, alice, seed=42)
+    tombstone, _ = finished(voice, alice, seed=43)
+    assert run(voice_archive.archive_once()) == {"archived": 3}
+    theirs = "c" * 32
+    for sid in (plays, flagged, tombstone):
+        manifest = archive.root / str(uid) / sid / "manifest.json"
+        manifest.write_text(json.dumps({**json.loads(manifest.read_text()), "owner": theirs}))
+    sql("UPDATE voice_sessions SET archived_at = now() - interval '1 hour'")
+    sql("UPDATE voice_sessions SET archive_error = 'remote_missing' WHERE id = %s", flagged)  # an earlier flag
+    sql("UPDATE voice_sessions SET status = 'cancelled', audio_deleted_at = now() WHERE id = %s", tombstone)
+    missing_errors = _gauge('voice_archive_errors_total{reason="remote_missing"}') or 0.0
+    before = len(archive.requests)
+    stats = run(voice_archive.reconcile_once())
+    assert stats["other_owner"] == 3 and stats["remote_missing"] == 0, stats
+    assert _changes(archive, before) == [], "nothing of another owner's is deleted or set aside, tombstone or not"
+    assert row_of(plays)["archive_error"] is None
+    assert row_of(flagged)["archive_error"] is None, "there after all: the earlier flag is cleared"
+    assert _gauge("voice_archive_remote_missing") == 0.0
+    assert (_gauge('voice_archive_errors_total{reason="remote_missing"}') or 0.0) == missing_errors
+    assert "is not on the store" not in caplog.text
+    assert "3 recording(s) this database has rows for are stored under another owner" in caplog.text
+    got = alice.get(f"/audio/sessions/{plays}/audio")
+    assert got.status_code == 200 and got.content == data, "and it plays"
+    # The purge asks the store for the tombstone's copy; the store refuses another owner's.
+    assert run(voice_archive.archive_once()) == {"errors": 1}
+    assert row_of(tombstone)["remote_purged_at"] is None
+    assert {sid for _u, sid in archive.objects()} == {plays, flagged, tombstone}
+
+
 def test_a_copy_whose_row_vanished_is_kept_because_only_a_tombstone_deletes(archive, voice, login_client, monkeypatch):
     alice = login_client("alice")
     sid, _data = finished(voice, alice)
@@ -1185,8 +1343,65 @@ def test_retranscribe_refusals_while_the_store_is_down_do_not_use_up_the_hourly_
         r = alice.post(f"/audio/sessions/{sid}/retranscribe", json={"scope": "all"})
         assert r.status_code == 503 and r.json()["reason"] == "archive_unavailable", (attempt, r.text[:200])
     archive.down = False
+    # The refusals' Retry-After (30 s) has passed.
+    monkeypatch.setattr(voice_archive, "_restore_failed_at", time.monotonic() - voice_archive._RESTORE_PAUSE_S)
     r = alice.post(f"/audio/sessions/{sid}/retranscribe", json={"scope": "all"})
     assert r.status_code == 202, r.text[:200]
+    settled(alice, sid)
+
+
+def test_while_the_store_is_failing_try_again_is_refused_at_once_and_only_one_attempt_reaches_it(
+    archive, voice, login_client, monkeypatch,
+):
+    """Review 2026-10-01. Retranscriptions are counted against the hourly
+    limit only once their audio is here (the fix above), and then nothing
+    capped attempts on a failing store: every "Try again" ran a full restore
+    inside the person's lock, on a thread of the shared worker pool, for up
+    to 32 s against a hung store (12 at once: 12 store attempts, 12.3 s with
+    a 1 s failure). Now the first failure pauses restores for the 30 s its
+    Retry-After names, and the rest are refused at once without the store."""
+    monkeypatch.setattr(settings, "voice_retranscribe_per_hour", 1)
+    alice = login_client("alice")
+    sid, data = finished(voice, alice)
+    assert run(voice_archive.archive_once()) == {"archived": 1}
+    real_download = voice_archive.download_to
+    attempts: List[str] = []
+    in_store, give_up = threading.Event(), threading.Event()
+
+    async def hung_store(row, dest, size, digest):
+        attempts.append(row["id"])
+        in_store.set()
+        await asyncio.to_thread(give_up.wait, 30)
+        raise voice_archive.StoreError("timeout", "the store did not answer within the read timeout")
+
+    monkeypatch.setattr(voice_archive, "download_to", hung_store)
+
+    def try_again() -> httpx.Response:
+        return alice.post(f"/audio/sessions/{sid}/retranscribe", json={"scope": "all"})
+
+    with concurrent.futures.ThreadPoolExecutor(12) as pool:
+        presses = [pool.submit(try_again) for _ in range(12)]
+        assert in_store.wait(15), "the first press reached the store"
+        give_up.set()  # the store's read timeout
+        answers = [p.result(60) for p in presses]
+    assert [(a.status_code, a.json()["reason"]) for a in answers] == [(503, "archive_unavailable")] * 12
+    assert {a.json()["retry_after_s"] for a in answers} == {30}
+    assert attempts == [sid], f"one attempt reached the store, not {len(attempts)}"
+    refused = alice.post(f"/audio/sessions/{sid}/retranscribe", json={"scope": "all"})
+    assert refused.status_code == 503 and attempts == [sid], "inside the 30 s, still without the store"
+    row = row_of(sid)
+    assert row["archive_state"] == "archived" and row["status"] == "done" and row["retranscribe"] is None
+
+    # The store answers again, and the 30 s have passed: the next press
+    # restores it, and the refusals did not use up the hour (one allowed).
+    monkeypatch.setattr(voice_archive, "download_to", real_download)
+    monkeypatch.setattr(voice_archive, "_restore_failed_at", time.monotonic() - voice_archive._RESTORE_PAUSE_S)
+    r = alice.post(f"/audio/sessions/{sid}/retranscribe", json={"scope": "all"})
+    assert r.status_code == 202, r.text[:200]
+    assert voice_archive._restore_failed_at is None, "a restore that got its bytes ends the pause"
+    assert settled(alice, sid)["outcome"] == "transcribed"
+    with open(dictation.source_path(row_of(sid)), "rb") as fh:
+        assert fh.read() == data
 
 
 def test_one_unreadable_head_file_does_not_stop_every_other_recording_moving(archive, voice, login_client, monkeypatch):
@@ -1260,9 +1475,10 @@ def test_recall_all_refuses_while_the_mover_would_move_everything_back_out(archi
 # ------------------------------------------------- the pool, real HTTP --
 
 
-def _store_server(root: Path) -> Tuple[Any, threading.Thread, int]:
-    """The store's app on a real port. Its own concurrency limit is set well
-    above any client pool here, so what is measured is the CLIENT's pool."""
+def _store_server(root: Path, *, limit: int = 256, keep_alive: int = STORE.KEEP_ALIVE_TIMEOUT_S) -> Tuple[Any, threading.Thread, int]:
+    """The store's app on a real port. By default its own concurrency limit
+    is set well above any client pool here, so what is measured is the
+    CLIENT's pool."""
     import uvicorn
 
     app = STORE.create_app(STORE.Settings(root=str(root), tokens=(TOKEN,), min_free_bytes=0), background=False)
@@ -1271,7 +1487,7 @@ def _store_server(root: Path) -> Tuple[Any, threading.Thread, int]:
         port = probe.getsockname()[1]
     server = uvicorn.Server(uvicorn.Config(
         app, host="127.0.0.1", port=port, log_level="error", lifespan="off", http="h11", loop="asyncio",
-        limit_concurrency=256,
+        limit_concurrency=limit, timeout_keep_alive=keep_alive,
     ))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -1337,9 +1553,110 @@ def test_playback_is_not_capped_at_eight_listeners_and_a_full_pool_says_busy_not
     status, body, retry_after, waited = seen["full"]
     assert status == 503 and body["reason"] == "archive_busy" and retry_after == "5", seen
     assert waited < voice_archive._POOL_TIMEOUT_S + 3, "told promptly, not after the read timeout"
-    # And the store takes a full pool from each of the two loops that talk to
-    # it (requests; the mover with its restores) before it answers 503 itself.
-    assert STORE.LIMIT_CONCURRENCY >= 2 * voice_archive._MAX_CONNECTIONS
+
+
+class _LoopThread:
+    """An event loop on its own thread, as the orchestrator's request loop
+    and the archive's loop each are: each gets its own pooled client."""
+
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self.thread.start()
+
+    def run(self, coro, timeout: float = 30.0):
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
+
+    def close(self) -> None:
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(10)
+        self.loop.close()
+
+
+def _until(condition: Callable[[], bool], what: str, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, what
+        time.sleep(0.01)
+
+
+def test_the_store_serves_a_full_pool_from_both_loops_and_past_its_own_limit_a_player_hears_busy(tmp_path, monkeypatch):
+    """Review 2026-10-01. uvicorn answers 503 once len(connections) >=
+    limit_concurrency, so the store's 64 served 63: with the request loop's
+    pool and the archive loop's both full (32 + 32), the 64th stream got the
+    store's own 503, and the person was told the archive "isn't answering".
+    Real uvicorn at the limit server.main() gives it, the module's own
+    clients on two event loops, held streams as players hold them."""
+    tree = ast.parse((REPO / "compose" / "voice-store" / "server.py").read_text(encoding="utf-8"))
+    run_call = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "run"
+        and getattr(node.func.value, "id", None) == "uvicorn"
+    )
+    limit = {k.arg: k.value for k in run_call.keywords}["limit_concurrency"]
+    assert isinstance(limit, ast.Name) and limit.id == "LIMIT_CONCURRENCY", "the limit this test runs the store at"
+    pools = 2 * voice_archive._MAX_CONNECTIONS
+
+    root = tmp_path / "store-root"
+    sid = uuid.uuid4().hex
+    folder = root / "7" / sid
+    folder.mkdir(parents=True)
+    data = os.urandom(256 * 1024)
+    (folder / "source.webm").write_bytes(data)
+    (folder / "manifest.json").write_text(json.dumps({"name": "source.webm", "sha256": sha(data), "bytes": len(data)}))
+    # A long keep-alive: a held stream here is a connection the store counts
+    # whether or not its handler has finished writing this short body.
+    server, thread, port = _store_server(root, limit=STORE.LIMIT_CONCURRENCY, keep_alive=120)
+    monkeypatch.setattr(settings, "voice_archive_url", f"http://127.0.0.1:{port}")
+    monkeypatch.setattr(settings, "voice_archive_token", TOKEN)
+    monkeypatch.setattr(settings, "voice_archive_tls_cert_b64", "")
+    row = {"id": sid, "user_id": 7, "ext": "webm", "mime_type": "audio/webm", "status": "done", "archive_state": "archived"}
+
+    def request(rng: str) -> Request:
+        return Request({"type": "http", "method": "GET", "path": "/", "query_string": b"", "headers": [(b"range", rng.encode())]})
+
+    async def fill(held: List[Any]) -> List[int]:
+        while len(held) < voice_archive._MAX_CONNECTIONS:
+            held.append(await voice_archive._proxy(row, request("bytes=0-"), "r.webm", {}))
+        return sorted({r.status_code for r in held})
+
+    async def let_them_go(held: List[Any]) -> None:
+        for response in held:
+            if response.background is not None:
+                await response.background()
+        await voice_archive.close_client()
+
+    async def one_more() -> Tuple[int, Dict[str, Any], Optional[str]]:
+        try:
+            refused = await voice_archive._proxy(row, request("bytes=0-0"), "r.webm", {})
+            return refused.status_code, json.loads(refused.body), refused.headers.get("retry-after")
+        finally:
+            await voice_archive.close_client()
+
+    loops = {"requests": _LoopThread(), "archive": _LoopThread()}
+    held: Dict[str, List[Any]] = {name: [] for name in loops}
+    idle: List[socket.socket] = []
+    try:
+        assert loops["requests"].run(fill(held["requests"])) == [206]
+        assert loops["archive"].run(fill(held["archive"])) == [206], "the second full pool fits too"
+        _until(lambda: len(server.server_state.connections) == pools, "the store counts both pools")
+        assert STORE.LIMIT_CONCURRENCY - 1 > pools, "room left over for the rest of what talks to the store"
+        # Up to one below the store's own limit with connections that say nothing...
+        while len(idle) < STORE.LIMIT_CONCURRENCY - 1 - pools:
+            idle.append(socket.create_connection(("127.0.0.1", port), timeout=5))
+        _until(lambda: len(server.server_state.connections) == STORE.LIMIT_CONCURRENCY - 1, "the store counts them")
+        # ...and one more, from a third loop whose pool has room: the store refuses it itself.
+        status, body, retry_after = asyncio.run(one_more())
+        assert status == 503 and body["reason"] == "archive_busy" and retry_after == "5", (status, body)
+    finally:
+        for sock in idle:
+            sock.close()
+        for name, loop in loops.items():
+            with contextlib.suppress(Exception):
+                loop.run(let_them_go(held[name]))
+            loop.close()
+        server.should_exit = True
+        thread.join(10)
 
 
 # -------------------------------------------------------------- the pin --

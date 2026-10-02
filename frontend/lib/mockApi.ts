@@ -482,7 +482,10 @@ function mockFile(
   bytes: number | null,
   hoursAgo: number,
   availability: string,
-  extra: { preview?: string | null; media?: { status: string; duration_ms: number } } = {},
+  extra: {
+    preview?: string | null;
+    media?: { status: string; duration_ms: number; has_transcript?: boolean };
+  } = {},
 ) {
   const id = n.toString(16).padStart(32, '0');
   return {
@@ -508,7 +511,7 @@ const MOCK_FILES = [
   mockFile(1, 'upload', 'document', 'Q3 planning.pdf', 2_411_000, 1, 'available'),
   mockFile(2, 'recording', 'recording', 'Voice recording', 734_000, 3, 'available', {
     preview: 'audio',
-    media: { status: 'done', duration_ms: 61_000 },
+    media: { status: 'done', duration_ms: 61_000, has_transcript: true },
   }),
   mockFile(3, 'upload', 'dataset', 'sales-2026.csv', 184_320, 20, 'available', { preview: 'summary' }),
   mockFile(4, 'upload', 'video', 'stand-up.mp4', 48_234_000, 30, 'available', {

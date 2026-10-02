@@ -113,14 +113,16 @@ def document_row(conv: str, filename: str, *, at: datetime = T0, text: str = "th
 
 
 def recording_row(owner: str, *, status: str = "done", size: int = 4096, at: datetime = T0,
-                  audio_ms: int = 61_000, deleted: bool = False, session_id: str | None = None) -> str:
+                  audio_ms: int = 61_000, deleted: bool = False, session_id: str | None = None,
+                  outcome: str | None = None) -> str:
     session_id = session_id or uuid.uuid4().hex
     with db.connection() as con:
         con.execute(
             "INSERT INTO voice_sessions (id, user_id, client_key, status, mime_type, ext, bytes_stored, "
-            "audio_ms, created_at, audio_deleted_at) VALUES (%s, %s, %s, %s, 'audio/webm', 'webm', %s, %s, %s, %s)",
+            "audio_ms, created_at, audio_deleted_at, outcome) "
+            "VALUES (%s, %s, %s, %s, 'audio/webm', 'webm', %s, %s, %s, %s, %s)",
             (session_id, uid(owner), str(uuid.uuid4()), status, size, audio_ms, at,
-             at + timedelta(minutes=5) if deleted else None),
+             at + timedelta(minutes=5) if deleted else None, outcome),
         )
     return session_id
 
@@ -442,10 +444,56 @@ def test_recordings_list_by_status_and_hide_what_is_gone(login_client):
     }
     first = next(i for i in items if i["id"] == f"recording:{done}")
     assert first["kind"] == "recording" and first["conversation"] is None
-    assert first["media"] == {"status": "done", "duration_ms": 61_000}
+    # No outcome and no saved transcript: nothing to promise.
+    assert first["media"] == {"status": "done", "duration_ms": 61_000, "has_transcript": False}
     assert first["can"] == {"download": True, "preview": "audio", "delete": True}
     processing = next(i for i in items if i["id"] == f"recording:{live}")
     assert processing["can"]["download"] is False
+
+
+def test_a_recording_promises_its_transcript_only_when_it_has_words(login_client):
+    """The page said "Also in Recordings, with its transcript" for every done
+    recording, one that heard no speech included, while the Recordings page
+    said "No speech was detected in this recording." (QA, 2026-10-01).
+    media.has_transcript is true only when the text has words: the outcome
+    settles it, except for a recording with gaps, whose saved text decides."""
+    import os
+
+    from app import dictation
+
+    alice = login_client("alice")
+    owner = uid("alice")
+    cases = {
+        # label: (status, outcome, saved transcript text or None for no file)
+        "transcribed": ("done", "transcribed", "Minutes of the stand-up."),
+        "no_speech": ("done", "no_speech", ""),
+        "no_words": ("done", "no_words", ""),
+        "gaps_with_words": ("done", "transcribed_with_gaps", "The first half was heard."),
+        "gaps_without_words": ("done", "transcribed_with_gaps", "   "),
+        "gaps_never_saved": ("done", "transcribed_with_gaps", None),
+        "failed": ("failed", "engine_unavailable", None),
+        "finishing": ("finishing", None, None),
+    }
+    labels = {}
+    for n, (label, (status, outcome, text)) in enumerate(cases.items()):
+        session_id = recording_row("alice", status=status, outcome=outcome, at=T0 + timedelta(minutes=n))
+        labels[f"recording:{session_id}"] = label
+        if text is not None:
+            folder = dictation.session_dir(owner, session_id)
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, "transcript.json"), "w", encoding="utf-8") as fh:
+                json.dump({"final": True, "text": text, "segments": []}, fh)
+    got = {labels[i["id"]]: i["media"]["has_transcript"] for i in every(alice)[0]}
+    assert got == {
+        "transcribed": True,
+        "no_speech": False,
+        "no_words": False,
+        "gaps_with_words": True,
+        "gaps_without_words": False,
+        "gaps_never_saved": False,
+        "failed": False,
+        "finishing": False,
+    }
 
 
 def test_deleting_a_recording_removes_it_from_both_lists(login_client):
@@ -707,6 +755,35 @@ def test_a_nul_character_in_a_forged_name_cursor_is_a_400(login_client):
     assert resp.json()["reason"] == "bad_request"
 
 
+def test_a_lone_surrogate_in_a_forged_name_cursor_is_a_400(login_client):
+    """JSON's \\ud800 escape decodes to a lone surrogate, which UTF-8 cannot
+    encode: binding it raised UnicodeEncodeError, a 500 (QA, 2026-10-01). The
+    server never mints such a cursor; a forged one is refused like NUL."""
+    alice = login_client("alice")
+    upload_row(conversation("alice", "alice-chat"), "a.pdf", notes="document")
+    raw = '{"v":1,"sort":"name","k":["a\\ud800b","upload","' + "a" * 32 + '"]}'
+    cursor = base64.urlsafe_b64encode(raw.encode("ascii")).decode().rstrip("=")
+    resp = alice.get("/files/mine", params={"sort": "name", "cursor": cursor})
+    assert resp.status_code == 400, resp.text
+    assert resp.json() == {"detail": "The cursor is not valid. Load the list again.", "reason": "bad_request"}
+
+
+@pytest.mark.parametrize("path", ["/files/mine", "/files/mine/summary"])
+def test_a_lone_surrogate_is_never_a_500(login_client, path):
+    """Both routes. Over HTTP, surrogate bytes in the query string are replaced
+    before the route sees them; the route's own parser refuses a lone
+    surrogate from any caller that did not decode that way, as it refuses NUL."""
+    from app import myfiles
+
+    alice = login_client("alice")
+    upload_row(conversation("alice", "alice-chat"), "a.pdf", notes="document")
+    resp = alice.get(f"{path}?q=%ED%A0%80")
+    assert resp.status_code == 200, resp.text
+    parse = myfiles.parse_list_query if path == "/files/mine" else myfiles.parse_filters
+    with pytest.raises(myfiles.BadRequest, match=r"^q must be valid text\.$"):
+        parse({"q": "a\ud800b"})
+
+
 def test_a_cursor_from_another_sort_is_refused(login_client):
     alice = login_client("alice")
     _seed_mixed("alice", 12)
@@ -936,3 +1013,57 @@ def test_the_first_page_is_one_bounded_statement_at_two_thousand_uploads(login_c
     assert len(body["items"]) == 50 and body["next_cursor"]
     assert counter["statements"] <= 3, counter
     assert elapsed < 0.25, f"first page took {elapsed * 1000:.1f} ms"
+
+
+def _rows_removed_by_join_filters(plan) -> int:
+    """Sum of "Rows Removed by Join Filter" over an EXPLAIN (FORMAT JSON) tree."""
+    if isinstance(plan, dict):
+        own = int(plan.get("Rows Removed by Join Filter") or 0)
+        return own + sum(_rows_removed_by_join_filters(v) for v in plan.values() if isinstance(v, (dict, list)))
+    if isinstance(plan, list):
+        return sum(_rows_removed_by_join_filters(v) for v in plan)
+    return 0
+
+
+def test_one_chat_with_thousands_of_read_documents_answers_in_linear_time(login_client):
+    """A document's text folds under a ready upload of the same chat. The fold
+    was one NOT EXISTS whose IN-list PostgreSQL could hash on the chat alone,
+    so it compared every document with every ready upload of the chat. One
+    chat of 5,000 of each passed the 15 s statement timeout and the whole page
+    was a 500; 2,000 of each with long names took about 12 s (QA, 2026-10-01).
+    Both routes now answer in milliseconds, and the plan compares no document
+    with an upload it does not name."""
+    from app import myfiles
+
+    alice = login_client("alice")
+    conv = conversation("alice", "alice-big")
+    stem = "Board-Minutes-" * 45  # 630 characters: every comparison is a long one
+    n = 2000
+    with db.connection() as con:
+        with con.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO uploads (id, conversation_id, filename, bytes, status, notes, created_at) "
+                "VALUES (%s, %s, %s, 10, 'ready', 'document', %s)",
+                [(uuid.uuid4().hex, conv, f"{stem}{i:05d}.pdf", T0 + timedelta(seconds=i)) for i in range(n)],
+            )
+            # One document in four is the text of its upload and folds under it.
+            cur.executemany(
+                "INSERT INTO documents (conversation_id, filename, text, total_pages, created_at) "
+                "VALUES (%s, %s, 'x', 1, %s)",
+                [(conv, f"{stem}{i:05d}.{'pdf' if i % 4 == 0 else 'txt'}", T0 + timedelta(seconds=i))
+                 for i in range(n)],
+            )
+        con.execute("ANALYZE uploads")
+        con.execute("ANALYZE documents")
+    for path, params in (("/files/mine", {}), ("/files/mine", {"sort": "name"}), ("/files/mine/summary", {})):
+        started = time.perf_counter()
+        resp = alice.get(path, params=params)
+        elapsed = time.perf_counter() - started
+        assert resp.status_code == 200, resp.text
+        assert elapsed < 1.0, f"{path} {params} took {elapsed:.2f} s"
+    assert alice.get("/files/mine/summary").json()["kinds"]["document"]["count"] == n + n * 3 // 4
+    for sql, params in (myfiles.list_statement(myfiles.parse_list_query({"sort": "name"}), uid("alice")),
+                        myfiles.summary_statement(myfiles.parse_filters({}), uid("alice"))):
+        with db.connection() as con:
+            plan = next(iter(con.execute("EXPLAIN (ANALYZE, FORMAT JSON) " + sql, params).fetchone().values()))
+        assert _rows_removed_by_join_filters(plan) < n, "a join filter is comparing documents with uploads"
