@@ -156,22 +156,58 @@ function hasPhotos(message: ChatMessage): boolean {
 }
 
 /**
+ * Was `answer` (to `question`) the vision engine looking at a PICTURE — one
+ * sent with the question, or one the chat remembers from earlier?
+ *
+ * Route 'vision' alone cannot say: the document engine answers under it too
+ * (orchestrator engines/document.py renders pages for the same model), and a
+ * real-browser run (S7, 2026-10-03) found the legacy line on both devices
+ * under turns of 5 and 50 documents that never had a photo. Every document
+ * answer that read a file carries `meta.document`; the engine's refusal ("That
+ * document has no readable content.") carries only the route, so the
+ * question's own record of a document is the other half: a `meta.attachments`
+ * entry of kind 'pdf' (every document kind rides it), or — on a turn saved
+ * before `meta.attachments` existed — the V8 `pdfName` chip, which named PDFs
+ * only. A dataset or a video never answers through 'vision' by itself (the
+ * video engine answers as 'video'; main.py's dataset path stands down when a
+ * photo is attached), so under a dataset a vision answer still means a photo
+ * went with it.
+ */
+function answeredFromAPhoto(
+  answer: ChatMessage | undefined,
+  question: ChatMessage | undefined,
+): boolean {
+  if (answer?.role !== 'assistant' || answer.meta?.route !== 'vision') return false;
+  if (answer.meta.document) return false;
+  if (question?.role !== 'user') return true;
+  const files = question.meta?.attachments;
+  const namesADocument = files?.length
+    ? files.some((file) => file.kind === 'pdf')
+    : Boolean(question.pdfName);
+  return !namesADocument;
+}
+
+/**
  * Should this turn say that its photo was never stored?
  *
  * A turn sent before photos were saved has no `meta.images`, and on any device
  * but the one that sent it no local bytes either: it rendered as a bare
  * question under an answer about a picture nobody can see. When the answer
- * that follows was the vision route's (the hint the production row 16136
- * carries), one muted line says what happened instead of nothing. An image
- * sent with a document routes to the document engine, so this stays silent
- * there rather than guess.
+ * that follows was the vision engine looking at a photo (the hint the
+ * production row 16136 carries), one muted line says what happened instead of
+ * nothing. A document answer is not that hint (`answeredFromAPhoto`), so a
+ * turn of documents never gets the line — nor does an old turn that sent a
+ * photo WITH documents, which nothing on record tells apart from documents
+ * alone: silent there rather than guess.
  *
  * A vision answer is not proof of a photo, though: a text follow-up ABOUT an
  * earlier photo ("what colour is the stem?") is answered by the vision engine
  * too (orchestrator image memory, main.py `image_followup_images`), with the
  * same `route: 'vision'`. So once the thread before this turn (`earlier`, in
- * reading order) holds a photo or a vision answer, a photo-less turn under a
- * vision answer is taken for such a follow-up and gets no line.
+ * reading order) holds a photo or a vision answer about one, a photo-less turn
+ * under a vision answer is taken for such a follow-up and gets no line. Only
+ * the vision engine's own photo turns feed that memory (main.py
+ * `image_memory.remember`), so an earlier DOCUMENT answer does not count.
  */
 export function showsLegacyPhotoNote(
   message: ChatMessage,
@@ -180,9 +216,9 @@ export function showsLegacyPhotoNote(
 ): boolean {
   if (message.role !== 'user') return false;
   if (hasPhotos(message)) return false;
-  if (next?.role !== 'assistant' || next.meta?.route !== 'vision') return false;
-  return !earlier.some((m) =>
-    m.role === 'user' ? hasPhotos(m) : m.meta?.route === 'vision',
+  if (!answeredFromAPhoto(next, message)) return false;
+  return !earlier.some((m, i) =>
+    m.role === 'user' ? hasPhotos(m) : answeredFromAPhoto(m, earlier[i - 1]),
   );
 }
 
@@ -202,7 +238,7 @@ export function legacyPhotoNoteId(
   for (let i = 0; i < thread.length; i += 1) {
     const m = thread[i];
     if (m.role === 'user' && (hasPhotos(m) || (lookup?.(m)?.length ?? 0) > 0)) return null;
-    if (m.role === 'assistant' && m.meta?.route === 'vision') return null;
+    if (answeredFromAPhoto(m, thread[i - 1])) return null;
     if (showsLegacyPhotoNote(m, thread[i + 1])) {
       return lookup && lookup(m) === undefined ? null : m.id;
     }
