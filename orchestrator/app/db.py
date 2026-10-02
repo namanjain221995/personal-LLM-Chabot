@@ -2992,6 +2992,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_sessions_one_continuation
 """
 
 
+# V43 WAS EDITED IN PLACE before release: the fix round of 2026-09-30 added
+# voice_archive_owner and changed idx_voice_sessions_archive_purge's
+# predicate after a draft of V43 had run on a few TEST databases, and the
+# dropped meeting-transcripts branches (feat/realtime-voice-r2) numbered a
+# different migration 43. No production database ran either (production was
+# at V42 on 2026-10-01), and the runner keeps no checksum, so a database that
+# did says "V43" and lacks the owner table. `_refuse_another_v43` stops
+# start-up on one and says what to do (docs/voice-archive.md, "A database
+# that ran another V43").
 _MIGRATION_V43 = """
 -- V43 (2026-09-30): THE VOICE ARCHIVE -- where a finished recording's audio
 -- lives (app/voice_archive.py). Additive and idempotent: columns with
@@ -3601,6 +3610,49 @@ def _apply_migrations() -> None:
                 con.execute(
                     "INSERT INTO schema_migrations (version) VALUES (%s)", (version,)
                 )
+            if 43 in applied:
+                _refuse_another_v43(con)
+
+
+#: Start-up's answer to a database whose V43 is not this one (the note above
+#: _MIGRATION_V43), and the SQL it names: with V43 no longer recorded, the
+#: next start-up runs this V43 in full (it is idempotent), and the purge
+#: index, dropped first, comes back with the released predicate.
+V43_REPAIR = (
+    "DROP INDEX IF EXISTS idx_voice_sessions_archive_purge; DELETE FROM schema_migrations WHERE version = 43;"
+)
+V43_MISMATCH_ERROR = (
+    "This database records migration V43 but has no voice_archive_owner table, so its V43 is not "
+    "the one this code carries: {which} The migration runner keeps no checksum, so it cannot see "
+    "that. No production database ran such a V43 (production was at V42 on 2026-10-01). The "
+    "orchestrator does not start on this database, because what needs this V43's table or columns "
+    "would fail. If it is a test database, drop it and let it be created again. To keep it, run the following "
+    f"in it and start again; this code's V43 then runs in full: {V43_REPAIR} "
+    "See docs/voice-archive.md, \"A database that ran another V43\"."
+)
+_V43_DRAFT = (
+    "it ran a draft of the voice archive's V43 (branch feat/voice-archive before 2026-10-01; V43 was "
+    "edited in place before release)."
+)
+_V43_OTHER_BRANCH = (
+    "voice_sessions has no archive_state column, so it ran another branch's migration numbered 43 "
+    "(the meeting-transcripts branches, feat/realtime-voice-r2, used 43 too)."
+)
+
+
+def _refuse_another_v43(con: Any) -> None:
+    """Raise V43_MISMATCH_ERROR when V43 was applied BEFORE this start-up and
+    this V43's owner table is missing (a database that runs V43 now runs all
+    of it)."""
+    row = con.execute(
+        """SELECT to_regclass('voice_archive_owner') IS NOT NULL AS owner_table,
+                  EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_schema = current_schema() AND table_name = 'voice_sessions'
+                            AND column_name = 'archive_state') AS archive_columns"""
+    ).fetchone()
+    if not row["owner_table"]:
+        which = _V43_DRAFT if row["archive_columns"] else _V43_OTHER_BRANCH
+        raise RuntimeError(V43_MISMATCH_ERROR.format(which=which))
 
 
 def schema_version() -> int:
