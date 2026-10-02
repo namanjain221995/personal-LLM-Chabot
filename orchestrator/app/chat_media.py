@@ -598,18 +598,25 @@ def _count_write(source: str, result: str) -> None:
 
 
 def store_bytes(
-    user_id: int, conversation_id: str, attachment_id: str, data: bytes, source: str
+    user_id: int,
+    conversation_id: str,
+    attachment_id: str,
+    data: bytes,
+    source: str,
+    *,
+    looked_up: bool = False,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """Store one picture end to end and count it: (result, row). The row is
     the stored one for `stored` and `duplicate`, None for a refusal.
 
-    The existing row is looked for FIRST: a retry of a send or a second tab's
-    backfill is the common duplicate, and it should cost one indexed read,
-    not a decode."""
-    existing = get_row(user_id, conversation_id, attachment_id)
-    if existing is not None:
-        _count_write(source, "duplicate")
-        return "duplicate", existing
+    The existing row is looked for FIRST (unless the caller just did,
+    `looked_up`): a retry of a send or a second tab's backfill is the common
+    duplicate, and it should cost one indexed read, not a decode."""
+    if not looked_up:
+        existing = get_row(user_id, conversation_id, attachment_id)
+        if existing is not None:
+            _count_write(source, "duplicate")
+            return "duplicate", existing
     started = time.monotonic()
     try:
         if len(data) > MAX_IMAGE_BYTES:
@@ -644,7 +651,9 @@ def _store_inline_one(user_id: int, conversation_id: str, attachment_id: str, va
         except Refused as refused:
             _count_write("chat", refused.result)
             return refused.result
-        result, _row = store_bytes(user_id, conversation_id, attachment_id, data, "chat")
+        result, _row = store_bytes(
+            user_id, conversation_id, attachment_id, data, "chat", looked_up=True
+        )
         if result not in ("stored", "duplicate"):
             log.info(
                 "chat media: an inline picture of a chat turn was not stored (%s)", result

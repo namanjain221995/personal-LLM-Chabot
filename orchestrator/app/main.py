@@ -2737,9 +2737,9 @@ class ChatRequest(BaseModel):
     @field_validator("image_ids", "image_refs")
     @classmethod
     def _valid_attachment_ids(cls, value: Optional[List[str]]) -> Optional[List[str]]:
-        # The composer's attachment ids name directories' rows, never paths,
-        # but they are still client input: the stored shape, and no more of
-        # them than a turn may carry pictures.
+        # The composer's attachment ids name rows, never paths, but they are
+        # still client input: the stored shape, and no more of them than a
+        # turn may carry pictures.
         if value is None:
             return None
         if len(value) > MAX_IMAGES:
