@@ -8,6 +8,18 @@
  * never-existed, 410 for swept-by-TTL); this route validates the SHAPE of the
  * reference before anything is fetched, forwards the session, and passes the
  * answer through without editorialising the status.
+ *
+ * 2026-10-02 (chat media, CONTRACT §10): this URL is also the `src` of the
+ * chat's <video> and <audio> players, so it speaks byte RANGES. A player
+ * never downloads a file to play it: it asks for the first bytes (and, for an
+ * MP4 whose index sits at the end, the last ones), then for whatever range a
+ * seek lands in, so a 4 GB video is never pulled whole through this proxy.
+ * The orchestrator's FileResponse already answers a Range with 206 and the
+ * exact slice (Starlette 1.6); what this proxy adds is not losing that on the
+ * way through: `Range` and `If-Range` go up, and the 206 or 416 comes back
+ * with its `content-range` and `accept-ranges`. The pattern is the recording
+ * proxy's (app/api/audio/sessions/_forward.ts), which plays recordings the
+ * same way.
  */
 
 export const runtime = 'nodejs';
@@ -21,6 +33,23 @@ const SAFE_UPLOAD = /^[0-9a-f]{32}$/;
 export function isSafeUploadRef(conversation: string, upload: string): boolean {
   return SAFE_CONVERSATION.test(conversation) && SAFE_UPLOAD.test(upload);
 }
+
+/**
+ * The request headers that decide WHICH bytes come back; nothing else the
+ * browser sends goes up (the cookie is added on its own). `If-Range` rides
+ * with `Range` so a player resuming against a file that changed gets the
+ * whole new file rather than a slice of it spliced onto the old one.
+ */
+const FORWARDED_REQUEST_HEADERS = ['range', 'if-range'] as const;
+
+/** The response headers a download, a preview or a player reads. */
+const FORWARDED_RESPONSE_HEADERS = [
+  'content-type',
+  'content-disposition',
+  'content-length',
+  'content-range',
+  'accept-ranges',
+] as const;
 
 export async function GET(
   req: Request,
@@ -42,20 +71,39 @@ export async function GET(
   }
 
   const orchestratorUrl = process.env.ORCHESTRATOR_URL ?? 'http://localhost:8080';
+  const headers: Record<string, string> = {
+    // A byte range is a range of the STORED bytes. A compressed answer would
+    // make content-range and content-length describe bytes the browser never
+    // receives, because fetch() hands this proxy a decoded body.
+    'accept-encoding': 'identity',
+  };
+  // The OWNER check happens upstream; without the session the orchestrator
+  // answers 401 and the ladder falls back correctly.
   const cookie = req.headers.get('cookie');
+  if (cookie) headers.cookie = cookie;
+  for (const name of FORWARDED_REQUEST_HEADERS) {
+    const value = req.headers.get(name);
+    if (value) headers[name] = value;
+  }
+
   let upstream: Response;
   try {
     upstream = await fetch(
       `${orchestratorUrl}/uploads/${encodeURIComponent(conv)}/${encodeURIComponent(up)}/file`,
-      {
-        signal: req.signal,
-        // The OWNER check happens upstream; without the session the
-        // orchestrator answers 401 and the ladder falls back correctly.
-        headers: cookie ? { cookie } : {},
-      },
+      { signal: req.signal, headers },
     );
   } catch {
     return Response.json({ message: 'upload service unreachable' }, { status: 502 });
+  }
+
+  if (upstream.status === 416) {
+    // The player asked past the end of the file. The status and its
+    // `bytes */<size>` content-range ARE the answer (RFC 9110 §15.5.17): the
+    // player reads the size from it and asks again inside it.
+    const out = new Headers({ 'cache-control': 'no-store' });
+    const range = upstream.headers.get('content-range');
+    if (range) out.set('content-range', range);
+    return new Response(null, { status: 416, headers: out });
   }
 
   if (!upstream.ok) {
@@ -72,10 +120,16 @@ export async function GET(
     return Response.json({ message: 'upload unavailable' }, { status: upstream.status });
   }
 
-  const headers = new Headers({ 'cache-control': 'no-store' });
-  for (const name of ['content-type', 'content-disposition', 'content-length']) {
+  const out = new Headers({ 'cache-control': 'no-store' });
+  for (const name of FORWARDED_RESPONSE_HEADERS) {
     const value = upstream.headers.get(name);
-    if (value) headers.set(name, value);
+    if (value) out.set(name, value);
   }
-  return new Response(upstream.body, { status: 200, headers });
+  // fetch() hands back a DECODED body, and a length measured before decoding
+  // would cut it short. `identity` was asked for, so this only guards an
+  // upstream that compresses anyway.
+  if (upstream.headers.get('content-encoding')) out.delete('content-length');
+  // 200 for the whole file, 206 for a slice of it: the status is how a player
+  // learns its Range was honoured, so it passes through as it came.
+  return new Response(upstream.body, { status: upstream.status, headers: out });
 }
