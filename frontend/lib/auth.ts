@@ -425,6 +425,15 @@ export async function handleSessionEnd(
     return;
   }
   try {
+    // The session is already dead; this is for the answer's
+    // `Clear-Site-Data: "cache"` (app/api/auth/logout/route.ts), which empties
+    // the HTTP cache that holds every chat photo this browser showed — the
+    // part of this account's data no script can erase.
+    await fetchFn('/api/auth/logout', { method: 'POST', cache: 'no-store' });
+  } catch {
+    // Best-effort, like the wipe below.
+  }
+  try {
     const { clearActiveUserData } = await import('./history');
     await clearActiveUserData();
   } catch {

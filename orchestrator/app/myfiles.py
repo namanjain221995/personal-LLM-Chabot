@@ -24,10 +24,16 @@ WHAT IS LISTED — three sources in one keyset-paged statement:
                composer sends an archive on the DOCUMENT rail, so once the
                archive itself is swept its manifest is the text it keeps.
     recording  a `voice_sessions` row whose audio is still stored.
+    media      a `chat_media` row (V44, 2026-10-02): a picture sent in a chat,
+               kept on the server for the life of the chat
+               (docs/chat-media/CONTRACT.md). Kind `image`. The table keeps no
+               file name, so the row is named "Picture.<ext>" from its type,
+               the name the page would show for it anyway; the page builds
+               every picture URL itself from the chat and `attachment_id`.
 
-Pictures are not listed: they were never stored on the account (the only copy
-is the sending browser's IndexedDB, plus IMAGE_MEMORY_TTL_S of server memory
-for follow-up questions), and the retention block says so.
+Pictures are scoped twice: the row's own `user_id` AND the chat's owner must
+be the caller (a picture stored under an id someone else later claimed is the
+reaper's, not anybody's list).
 
 WHOSE. The caller's, from the session and nothing else: there is no user id
 parameter, and anything unknown in the query string is ignored. Uploads and
@@ -51,9 +57,12 @@ route decides it: the original bytes (`available`), only the text the chat
 read (`text_only`), only a spreadsheet's profile (`summary_only`), a
 recording still being made or transcribed (`processing`), or nothing
 (`expired`). Uploaded originals are swept WORKSPACE_TTL_HOURS after upload
-(24 h in production); a video's bytes also live in the analysis store while
-any chat links them, which is why its Download keeps working after the sweep
-(uploads.download_upload falls back to it since this change).
+(24 h in production), but since 2026-10-02 a document's or dataset's original
+also has a LASTING copy under CHAT_FILES_DIR for the life of the chat
+(uploads.keep_lasting_copy; none below the free-space floor), and a video's
+bytes live in the analysis store while any chat links them. The download
+route falls back to both, so both count as `available` here. A picture is
+`available` while its full file is on disk.
 
 COST, measured on the private test database (PostgreSQL 18.6, production's
 planner settings, 25 runs): the first page of a person with 2,000 uploads and
@@ -74,6 +83,7 @@ import base64
 import binascii
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -91,9 +101,9 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/files", tags=["files"])
 
-KINDS = ("document", "dataset", "video", "audio", "recording")
+KINDS = ("document", "dataset", "image", "video", "audio", "recording")
 _UPLOAD_KINDS = frozenset({"document", "dataset", "video", "audio"})
-SOURCES = ("upload", "text", "recording")
+SOURCES = ("upload", "text", "recording", "media")
 SORTS = ("newest", "oldest", "largest", "name")
 
 #: The sidebar search's own bound (history.py /history/search): long enough
@@ -107,6 +117,14 @@ LIMIT_MAX = 100
 #: title the page shows for it, so typing "recording" finds them and A-Z puts
 #: them under V rather than ahead of every file.
 RECORDING_NAME = "Voice recording"
+
+#: A stored picture's name: chat_media keeps none, so it is "Picture.<ext>"
+#: from its verified type, exactly what the page would show for a nameless
+#: picture, and what the list sorts and searches by.
+_PICTURE_NAME_SQL = (
+    "('Picture.' || CASE m.mime WHEN 'image/jpeg' THEN 'jpg' WHEN 'image/png' THEN 'png'"
+    " WHEN 'image/webp' THEN 'webp' WHEN 'image/gif' THEN 'gif' ELSE 'img' END)"
+)
 
 #: The largest cursor this route will decode. The name sort's key is the
 #: first _NAME_KEY_CHARS characters of the lowered name, not the whole name:
@@ -380,6 +398,19 @@ _RECORDINGS_BRANCH = """
 _RECORDINGS_SEARCH = """
        AND %(recording_name)s::text ILIKE %(pat)s ESCAPE '\\'"""
 
+# Stored chat pictures (V44). The caller's rows by their own user_id AND by
+# the chat's owner, with the reserved shape excluded like every branch here.
+_MEDIA_BRANCH = f"""
+    SELECT 'media'::text AS source, m.media_id AS item_id, m.conversation_id,
+           {_PICTURE_NAME_SQL}::text AS name, m.bytes::bigint AS bytes, m.created_at,
+           'image'::text AS kind
+      FROM chat_media m
+      JOIN conversations c ON c.id = m.conversation_id AND c.user_id = m.user_id
+     WHERE m.user_id = %(uid)s AND m.conversation_id !~ '^u[0-9]+-'"""
+
+_MEDIA_SEARCH = f"""
+       AND ({_PICTURE_NAME_SQL} ILIKE %(pat)s ESCAPE '\\' OR c.title ILIKE %(pat)s ESCAPE '\\')"""
+
 #: sort -> (key expression over the union's columns, direction, keyset operator).
 #: The ORDER BY and the keyset comparison use the SAME expression, so the
 #: bounded name key stays exact: names that agree on their first
@@ -396,7 +427,9 @@ SELECT p.source, p.item_id, p.conversation_id, c.title AS conversation_title, p.
        p.created_at, p.kind, p.sort_key,
        up.has_profile, CASE WHEN p.source = 'text' THEN p.name ELSE up.text_name END AS text_name,
        va.content_hash, COALESCE(va.status, vs.status) AS media_status,
-       COALESCE(va.duration_ms::bigint, vs.audio_ms) AS media_ms, vs.outcome AS media_outcome
+       COALESCE(va.duration_ms::bigint, vs.audio_ms) AS media_ms, vs.outcome AS media_outcome,
+       cm.user_id AS picture_user_id, cm.attachment_id, cm.mime AS picture_mime,
+       cm.width AS picture_width, cm.height AS picture_height, cm.has_thumb AS picture_has_thumb
   FROM page p
   LEFT JOIN conversations c ON c.id = p.conversation_id
   LEFT JOIN LATERAL (
@@ -415,6 +448,7 @@ SELECT p.source, p.item_id, p.conversation_id, c.title AS conversation_title, p.
            AND l.conversation_id = p.conversation_id AND l.upload_id = p.item_id
          LIMIT 1) va ON true
   LEFT JOIN voice_sessions vs ON p.source = 'recording' AND vs.id = p.item_id
+  LEFT JOIN chat_media cm ON p.source = 'media' AND cm.media_id = p.item_id AND cm.user_id = %(uid)s
  ORDER BY p.sort_key {direction}, p.source {direction}, p.item_id {direction}"""
 
 
@@ -439,6 +473,8 @@ def _mine(filters: Filters, user_id: int) -> Tuple[str, Dict[str, Any], List[str
     if "recording" in selected:
         params["recording_name"] = RECORDING_NAME
         branches.append(_RECORDINGS_BRANCH + (_RECORDINGS_SEARCH if search else ""))
+    if "image" in selected:
+        branches.append(_MEDIA_BRANCH + (_MEDIA_SEARCH if search else ""))
 
     where: List[str] = []
     if filters.kinds and selected != frozenset(KINDS):
@@ -506,6 +542,34 @@ def _stored(conversation_id: str, upload_id: str, filename: str, subdir: str) ->
         return False
 
 
+def _lasting(conversation_id: str, upload_id: str) -> bool:
+    """The upload's lasting copy (uploads.keep_lasting_copy), the download
+    route's fallback once the workspace copy is swept."""
+    from .uploads import lasting_file
+
+    try:
+        return lasting_file(conversation_id, upload_id) is not None
+    except (OSError, ValueError):
+        return False
+
+
+def _picture_stored(row: Mapping[str, Any]) -> bool:
+    """The picture route's own file (chat_media.file_path), full size."""
+    from . import chat_media
+
+    try:
+        path = chat_media.file_path({
+            "user_id": int(row["picture_user_id"]),
+            "conversation_id": row["conversation_id"],
+            "media_id": row["item_id"],
+            "mime": row["picture_mime"],
+            "has_thumb": bool(row.get("picture_has_thumb")),
+        })
+        return os.path.isfile(path)
+    except (KeyError, TypeError, ValueError, OSError):
+        return False
+
+
 def _in_video_store(content_hash: Optional[str]) -> bool:
     from .video import store
 
@@ -526,16 +590,22 @@ def availability(row: Mapping[str, Any]) -> str:
         # store's business, and a stat per recording would tie this list to
         # wherever that store lives.
         return "processing" if row.get("media_status") in ("recording", "finishing") else "available"
+    if source == "media":
+        return "available" if _picture_stored(row) else "expired"
     conv, upload_id, name = row["conversation_id"], row["item_id"], row["name"]
     if kind == "document":
-        if _stored(conv, upload_id, name, "_original"):
+        if _stored(conv, upload_id, name, "_original") or _lasting(conv, upload_id):
             return "available"
         return "text_only" if row.get("text_name") else "expired"
     if kind == "dataset":
-        # A single file is kept under extracted/<name>; an ARCHIVE's own bytes
-        # are deleted the moment it is extracted (uploads._finalise_dataset),
-        # so an archive is summary_only from its first minute.
-        if _stored(conv, upload_id, name, "extracted") or _stored(conv, upload_id, name, "_original"):
+        # A single file is kept under extracted/<name>; an ARCHIVE's workspace
+        # original is deleted the moment it is extracted
+        # (uploads._finalise_dataset), and only its lasting copy remains.
+        if (
+            _stored(conv, upload_id, name, "extracted")
+            or _stored(conv, upload_id, name, "_original")
+            or _lasting(conv, upload_id)
+        ):
             return "available"
         return "summary_only" if row.get("has_profile") else "expired"
     if _stored(conv, upload_id, name, "_original") or _in_video_store(row.get("content_hash")):
@@ -581,12 +651,15 @@ def _item(row: Mapping[str, Any], user_id: int) -> Dict[str, Any]:
     preview: Optional[str] = None
     if source == "recording":
         preview = "audio" if state == "available" else None
+    elif source == "media":
+        preview = "image" if state == "available" else None
     elif source == "text" or (kind == "document" and row.get("text_name")):
         preview = "text"
     elif kind == "dataset" and row.get("has_profile"):
         preview = "summary"
     downloadable = state == "available" and (
-        source == "recording" or (source == "upload" and bool(_HEX32_RE.fullmatch(row["item_id"] or "")))
+        source in ("recording", "media")
+        or (source == "upload" and bool(_HEX32_RE.fullmatch(row["item_id"] or "")))
     )
     media = None
     if kind in ("video", "audio", "recording"):
@@ -597,10 +670,16 @@ def _item(row: Mapping[str, Any], user_id: int) -> Dict[str, Any]:
         }
         if source == "recording":
             media["has_transcript"] = has_transcript(row, user_id)
+    elif source == "media":
+        media = {
+            "width": row.get("picture_width"),
+            "height": row.get("picture_height"),
+            "mime": row.get("picture_mime"),
+        }
     conversation = None
     if row.get("conversation_id"):
         conversation = {"id": row["conversation_id"], "title": row.get("conversation_title") or ""}
-    return {
+    item = {
         "id": f"{source}:{row['item_id']}",
         "source": source,
         "kind": kind,
@@ -615,6 +694,11 @@ def _item(row: Mapping[str, Any], user_id: int) -> Dict[str, Any]:
         # ?name=): the file's own text, or an archive's "(archive contents)".
         "text_name": row.get("text_name") if preview == "text" else None,
     }
+    if source == "media":
+        # What every picture URL is built from, by the page itself
+        # (/api/chat-media/<conversation>/<attachment_id>?size=thumb|full).
+        item["attachment_id"] = row.get("attachment_id")
+    return item
 
 
 def retention() -> Dict[str, Any]:
@@ -629,7 +713,11 @@ def retention() -> Dict[str, Any]:
         "recording_days": int(settings.voice_retention_days),
         "video_kept_with_chat": True,
         "video_grace_hours": int(settings.video_orphan_ttl_hours),
-        "pictures": "browser_only",
+        # Documents and datasets keep a lasting copy for the life of the chat
+        # (CONTRACT §9); one made below the free-space floor still goes with
+        # the workspace sweep, which the page's sentence allows for.
+        "files_kept_with_chat": True,
+        "pictures": "kept_with_chat",
         "picture_memory_hours": int(picture_hours) if picture_hours.is_integer() else round(picture_hours, 2),
     }
 

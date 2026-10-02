@@ -100,10 +100,12 @@ describe('parsing a page', () => {
     expect(page!.nextCursor).toBe('abc');
     expect(page!.retention).toEqual({
       uploadHours: 24,
+      filesKeptWithChat: false,
       recordingDays: 0,
       videoKeptWithChat: true,
       videoGraceHours: 72,
       picturesBrowserOnly: true,
+      picturesKept: false,
       pictureMemoryHours: 2,
     });
     const [doc, text, rec] = page!.items;
@@ -367,6 +369,7 @@ describe('words', () => {
     expect(KIND_LABEL).toEqual({
       document: 'Document',
       dataset: 'Spreadsheet or data',
+      image: 'Picture',
       video: 'Video',
       audio: 'Audio',
       recording: 'Voice recording',
@@ -468,5 +471,172 @@ describe('a spreadsheet or dataset summary from its stored profile', () => {
     ]);
     expect(summaryFromProfile('garbage', 'x.csv')).toBeNull();
     expect(summaryFromProfile([{ file: 'x.bin', kind: 'other' }], 'x.bin')).toBeNull();
+  });
+});
+
+/* ---------------------------------------------------------- pictures */
+
+/**
+ * 2026-10-02 (docs/chat-media/CONTRACT.md §9): a photo sent in a chat is kept
+ * on the server for the life of the chat and listed here as kind `image`.
+ * The row shape is the one written down for the backend in
+ * docs/chat-media/NOTES.md (fe-files).
+ */
+describe('stored chat pictures', () => {
+  const MEDIA = 'e'.repeat(32);
+  const ATT = 'img-leaf-0001';
+
+  function picture(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return row({
+      id: `media:${MEDIA}`,
+      source: 'media',
+      kind: 'image',
+      name: 'leaf.jpg',
+      bytes: 412_000,
+      attachment_id: ATT,
+      media: { width: 1600, height: 1200, mime: 'image/jpeg' },
+      can: { download: true, preview: 'image', delete: false },
+      ...over,
+    });
+  }
+
+  function only(raw: Record<string, unknown>): MyFile | null {
+    return parseMyFilesPage({ items: [raw], next_cursor: null, retention: RETENTION })!.items[0] ?? null;
+  }
+
+  it('reads a picture row and builds every URL from its chat and attachment id', () => {
+    const file = only(picture())!;
+    expect(file).toMatchObject({
+      id: `media:${MEDIA}`,
+      source: 'media',
+      kind: 'image',
+      name: 'leaf.jpg',
+      bytes: 412_000,
+      availability: 'available',
+      picture: { conversationId: 'conv-1', attachmentId: ATT },
+      uploadId: null,
+      recordingId: null,
+      media: null,
+    });
+    expect(file.can.preview).toBe('image');
+    // Preview opens the full picture; Download points at the same route.
+    expect(previewPlanFor(file)).toEqual({ kind: 'picture', ref: { conversationId: 'conv-1', attachmentId: ATT } });
+    expect(downloadUrl(file)).toBe(`/api/chat-media/conv-1/${ATT}?size=full`);
+    expect(availabilityNote(file, null)).toBeNull();
+  });
+
+  it('never takes a URL from the row: an id is read from a thumbnail URL of the SAME chat only', () => {
+    const fromUrl = only(
+      picture({ attachment_id: undefined, thumb_url: `/api/chat-media/conv-1/${ATT}?size=thumb` }),
+    )!;
+    expect(fromUrl.picture).toEqual({ conversationId: 'conv-1', attachmentId: ATT });
+    expect(downloadUrl(fromUrl)).toBe(`/api/chat-media/conv-1/${ATT}?size=full`);
+    expect(
+      only(picture({ attachment_id: undefined, thumbnail_url: `/chat-media/conv-1/${ATT}?size=thumb` }))!.picture,
+    ).toEqual({ conversationId: 'conv-1', attachmentId: ATT });
+    // Another chat's URL, an off-site URL and no id at all: nothing to show.
+    expect(only(picture({ attachment_id: undefined, thumb_url: `/api/chat-media/conv-2/${ATT}?size=thumb` }))).toBeNull();
+    expect(only(picture({ attachment_id: undefined, thumb_url: 'https://evil.example/x.png' }))).toBeNull();
+    expect(only(picture({ attachment_id: undefined }))).toBeNull();
+    expect(only(picture({ attachment_id: '../../etc' }))).toBeNull();
+    // ...but the id may also ride inside `media`.
+    expect(only(picture({ attachment_id: undefined, media: { attachment_id: ATT } }))!.picture?.attachmentId).toBe(ATT);
+  });
+
+  it('accepts the spellings the backend might use for the source, and nothing mixed', () => {
+    for (const source of ['image', 'chat_media']) {
+      const file = only(picture({ id: `${source}:${MEDIA}`, source }))!;
+      expect(file.source).toBe('media');
+      expect(file.kind).toBe('image');
+    }
+    // A picture from the upload store, or a document from the picture store.
+    expect(only(row({ kind: 'image' }))).toBeNull();
+    expect(only(picture({ kind: 'document' }))).toBeNull();
+    // The id's prefix still has to name its source.
+    expect(only(picture({ id: `upload:${MEDIA}` }))).toBeNull();
+    // A reserved-looking or malformed chat id is never put in a URL.
+    expect(only(picture({ conversation: { id: 'a/b', title: 'x' } }))).toBeNull();
+  });
+
+  it('names a picture the server kept no name for after its type', () => {
+    expect(only(picture({ name: null }))!.name).toBe('Picture.jpg');
+    expect(only(picture({ name: '  ', media: { mime: 'image/png' }, attachment_id: ATT }))!.name).toBe('Picture.png');
+    expect(only(picture({ name: undefined, media: null }))!.name).toBe('Picture');
+  });
+
+  it('a picture the server no longer has offers nothing and says so plainly', () => {
+    const file = only(picture({ availability: 'expired', can: { download: false, preview: null, delete: false } }))!;
+    expect(previewPlanFor(file)).toBeNull();
+    expect(downloadUrl(file)).toBeNull();
+    expect(availabilityNote(file, null)).toBe('This picture is no longer stored.');
+  });
+
+  it('the summary says which kinds the server counted, so a Pictures filter is offered only by a server that has them', () => {
+    const old = parseSummary({ kinds: { document: { count: 1, bytes: 9 } }, total: { count: 1, bytes: 9 } })!;
+    expect(old.reported).toEqual(['document']);
+    expect(old.kinds.image).toEqual({ count: 0, bytes: 0 });
+    const now = parseSummary({
+      kinds: { document: { count: 1, bytes: 9 }, image: { count: 4, bytes: 1_600_000 } },
+      total: { count: 5, bytes: 1_600_009 },
+    })!;
+    expect(now.reported).toEqual(['document', 'image']);
+    expect(now.kinds.image).toEqual({ count: 4, bytes: 1_600_000 });
+  });
+
+  it('the kind filter round-trips through the page URL', () => {
+    expect(filtersFromQuery(new URLSearchParams('kind=image')).kind).toBe('image');
+    expect(listRequestUrl({ ...DEFAULT_FILTERS, kind: 'image' }, null)).toContain('kind=image');
+  });
+
+  it('retention: a server that keeps pictures says so, and how an older one arrives', () => {
+    const kept = parseMyFilesPage({
+      items: [],
+      next_cursor: null,
+      retention: { ...RETENTION, pictures: 'kept_with_chat' },
+    })!.retention!;
+    expect(kept.picturesKept).toBe(true);
+    expect(kept.picturesBrowserOnly).toBe(false);
+    const text = retentionSentences(kept).join(' ');
+    expect(text).toContain('Pictures stay while their chat exists.');
+    expect(text).toContain('once the browser that sent it opens its chat again');
+    expect(text).not.toContain('only in the browser you sent them from');
+    // No word at all is not a promise either way.
+    const silent = parseMyFilesPage({
+      items: [],
+      next_cursor: null,
+      retention: { ...RETENTION, pictures: undefined },
+    })!.retention!;
+    expect(silent.picturesKept).toBe(false);
+    expect(retentionSentences(silent).join(' ')).not.toContain('Pictures');
+  });
+
+  it('retention: a lasting copy gets its own sentence; the workspace sentence and the swept note stay as they are', () => {
+    // Precedence (merge of dev 3fead415, its owner's rule): the "kept for N
+    // hours, then removed the next time the server clears out old files"
+    // sentence and the "removed after N hours" note are never reworded for
+    // the lasting copy, which is said in a sentence of its own. None of them
+    // promises a deletion time.
+    const kept = parseMyFilesPage({
+      items: [],
+      next_cursor: null,
+      retention: { ...RETENTION, files_kept_with_chat: true },
+    })!.retention!;
+    expect(kept.filesKeptWithChat).toBe(true);
+    const sentences = retentionSentences(kept);
+    expect(sentences[0]).toBe(
+      "Files you attach to a chat are kept for 24 hours, then removed the next time the server clears out old files; after that the chat keeps what it read (a document's text, a spreadsheet's summary).",
+    );
+    expect(sentences[1]).toBe(
+      'Documents and spreadsheets also keep a copy that stays while their chat exists, unless the server was short of space when they were sent.',
+    );
+    expect(sentences).toContain('Videos and audio files stay while their chat exists.');
+    expect(sentences.join(' ')).not.toContain('up to');
+    const none = { download: false, preview: null, delete: false };
+    expect(availabilityNote(parsed({ availability: 'text_only', can: { ...none, preview: 'text' } }), kept)).toBe(
+      'The file was removed after 24 hours. The text the chat read is kept.',
+    );
+    // Without the flag, no sentence speaks of a lasting copy.
+    const plain = parseMyFilesPage({ items: [], next_cursor: null, retention: RETENTION })!.retention!;
+    expect(retentionSentences(plain).join(' ')).not.toContain('also keep a copy');
   });
 });

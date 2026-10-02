@@ -89,7 +89,9 @@ function isTimeout(err: unknown): boolean {
  * flattens newlines and caps the length on the way out, so the screening that
  * remains here is only about finding the string at all.
  */
-async function upstreamMessage(upstream: Response): Promise<string> {
+async function upstreamMessage(
+  upstream: Response,
+): Promise<{ message: string; missingImages: string[] | null }> {
   const generic = `orchestrator responded with status ${upstream.status}`;
   try {
     const body = (await upstream.json()) as {
@@ -97,13 +99,41 @@ async function upstreamMessage(upstream: Response): Promise<string> {
       detail?: unknown;
     };
     const said = body.message ?? body.detail;
-    if (typeof said === 'string' && said.trim()) return said.trim();
-    if (said !== undefined) return JSON.stringify(said);
+    const missingImages = imageRefsMissing(upstream.status, body.detail);
+    if (typeof said === 'string' && said.trim()) {
+      return { message: said.trim(), missingImages };
+    }
+    if (said !== undefined) return { message: JSON.stringify(said), missingImages };
   } catch {
     // Not JSON (an intermediary's own error page) — the status still says
     // what happened, and the category is derived from it.
   }
-  return generic;
+  return { message: generic, missingImages: null };
+}
+
+/** A client-minted attachment id (docs/chat-media/CONTRACT.md §3). */
+const ATTACHMENT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+
+/**
+ * The one refusal the browser is told more than a category about
+ * (2026-10-02, docs/chat-media/CONTRACT.md §5): a resend named stored photos
+ * by `image_refs` and the orchestrator could not load them — 422
+ * `{"detail":{"code":"image_ref_missing","missing":[...]}}`, answered before
+ * any stream began. The browser asks the person to attach the photo again,
+ * so it needs to know that this is what happened.
+ *
+ * What crosses is the code and the ids, and the ids only in the shape the
+ * browser minted them: they are its own values echoed back, never upstream
+ * prose, which keeps this route's rule that no orchestrator sentence reaches
+ * the DOM.
+ */
+function imageRefsMissing(status: number, detail: unknown): string[] | null {
+  if (status !== 422 || typeof detail !== 'object' || detail === null) return null;
+  const { code, missing } = detail as { code?: unknown; missing?: unknown };
+  if (code !== 'image_ref_missing') return null;
+  return Array.isArray(missing)
+    ? missing.filter((id): id is string => typeof id === 'string' && ATTACHMENT_ID_RE.test(id))
+    : [];
 }
 
 function sseFrame(event: string, data: unknown): Uint8Array {
@@ -369,10 +399,19 @@ export async function POST(req: Request): Promise<Response> {
     // is loading, out of memory or over its context window — so it is kept,
     // and it is written to the SERVER log. It is not sent to the browser: the
     // user gets the status and the safe copy that goes with it.
+    const { message, missingImages } = await upstreamMessage(upstream);
+    if (missingImages) {
+      // Not a failure of this service: the person's stored photo is gone.
+      // No error log line — it is an answer, and the browser acts on it.
+      return Response.json(
+        { code: 'image_ref_missing', missing: missingImages },
+        { status: 422 },
+      );
+    }
     return failure(req, {
       status: upstream.status,
       category: categoryForStatus(upstream.status),
-      logMessage: await upstreamMessage(upstream),
+      logMessage: message,
       startedAt,
     });
   }

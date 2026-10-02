@@ -54,7 +54,17 @@ import {
   rememberAttachmentFiles,
   resolveAttachmentAsync,
   uploadRefFor,
+  withAttachmentPatched,
 } from '@/lib/attachments';
+import {
+  createBackfill,
+  imagesMetaFor,
+  legacyPhotoNoteId,
+  storedAttachmentIds,
+  storedImagesOf,
+  withImagesMeta,
+  type Backfill,
+} from '@/lib/chatMedia';
 import { uploadDocumentFile } from '@/lib/uploadDocument';
 import type { SendOptions as ComposerSendOptions } from './Composer';
 import {
@@ -209,13 +219,21 @@ import { ShareDialog } from './ShareDialog';
  */
 type EarlyUpload = Attachment & { uploadConversationId?: string | null };
 
+/**
+ * 2026-10-02 (second device): the least time between two "did another device
+ * write?" list reads — opening chats from the sidebar, the tab coming back
+ * into view. A focus and a visibilitychange arrive together; one read covers
+ * both.
+ */
+const UPDATE_CHECK_MIN_MS = 5_000;
+
 /** The row callbacks ChatApp caches per message id — see `rowHandlers`. */
 interface RowHandlers {
   onRegenerate: () => void;
   onRetry: () => void;
   /** Send an unsent turn with the attachments that reached the server. */
   onSendWithLanded: () => void;
-  onReuseAttachment: (index: number) => void;
+  onReuseAttachment: (index: number, space?: 'image') => void;
   onEditStart: () => void;
   onEditCancel: () => void;
   onEditSubmit: (text: string) => void;
@@ -486,6 +504,13 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
    * 2026-09-13). The poll leaves that id to the mount effect until it is done.
    */
   const bootReconcileRef = useRef<string | null>(null);
+  /**
+   * 2026-10-02 (second device): `ready` once the mount has bound the store to
+   * the signed-in account and refreshed it — a list read before that could
+   * land in the previous account's cache; `at`/`running` space the reads
+   * (checkForUpdates).
+   */
+  const updateCheckRef = useRef({ ready: false, at: 0, running: false });
   /**
    * A ?c= deep link named a conversation the server does not have (deleted, or
    * another account's — the same 404). Shown over the new chat that replaced
@@ -777,6 +802,13 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
     () => threadPath.map((i) => messages[i]),
     [threadPath, messages],
   );
+  /**
+   * The turn that says its photo was sent before photos were stored — at
+   * most one, decided from the whole thread as read: a photo-less turn under a
+   * vision answer is otherwise a text follow-up about an EARLIER photo, which
+   * the orchestrator answers through the same vision route.
+   */
+  const legacyPhotoTurn = useMemo(() => legacyPhotoNoteId(thread), [thread]);
   const threadRef = useRef<ChatMessage[]>([]);
   threadRef.current = thread;
   const activeIdRef = useRef<string | null>(null);
@@ -1227,6 +1259,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       await store.refresh();
       if (cancelled) return;
       refreshList();
+      updateCheckRef.current.ready = true;
 
       try {
         // After an account switch `wanted` names the PREVIOUS account's
@@ -1396,6 +1429,47 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       window.clearInterval(timer);
     };
   }, [reconcileConversation]);
+
+  /**
+   * 2026-10-02 (second device): did another device write to the open chat?
+   *
+   * The poll above never asks: a non-forced load serves the cache, and only
+   * the list says a chat moved on. So a desktop that had the chat open showed
+   * its cached thread without the photo and PDF a phone had just sent, for
+   * good. One list read here; the conversation itself is fetched only when
+   * the list says the server wrote it after this browser last read it.
+   * Called when a chat is opened from the sidebar and when the tab comes back
+   * into view — never on a timer.
+   */
+  const checkForUpdates = useCallback(async () => {
+    const check = updateCheckRef.current;
+    const now = Date.now();
+    if (!check.ready || check.running || now - check.at < UPDATE_CHECK_MIN_MS) return;
+    check.running = true;
+    check.at = now;
+    try {
+      const store = getHistoryStore();
+      if (!(await store.refreshActive?.())) return;
+      refreshList();
+      const id = activeIdRef.current;
+      if (!id || bootReconcileRef.current === id || isStreaming(id)) return;
+      if (store.isStale?.(id)) await reconcileConversation(id);
+    } finally {
+      check.running = false;
+    }
+  }, [reconcileConversation, refreshList]);
+
+  useEffect(() => {
+    const onReturn = () => {
+      if (!document.hidden) void checkForUpdates();
+    };
+    document.addEventListener('visibilitychange', onReturn);
+    window.addEventListener('focus', onReturn);
+    return () => {
+      document.removeEventListener('visibilitychange', onReturn);
+      window.removeEventListener('focus', onReturn);
+    };
+  }, [checkForUpdates]);
 
   // H-01: an upload indicator belongs to the chat it was started in; leaving
   // it on screen in another conversation would describe nothing.
@@ -1811,17 +1885,23 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       const quoted = selectedContextRef.current;
       selectedContextRef.current = null;
       setSelectedContext(null);
-      // Up to 5 images OR exactly one PDF/dataset (2026-08-05) — the
-      // Composer enforces the shape; `first` covers the exclusive kinds.
+      // What names a brand-new chat when the message has no words.
       const first = attachments[0] ?? null;
-      const isPdf = first?.kind === 'pdf';
-      const isDataset = first?.kind === 'dataset';
       // 2026-09-02: documents stack (up to five). ONE small document still
       // rides inline — byte-identical wire to every conversation before it.
       // Several documents, or any that skipped base64 for size, upload first
       // (chunked past the Cloudflare 100 MB edge cap) and the request sends
       // REFERENCES instead.
       const docAttachments = attachments.filter((a) => a.kind === 'pdf');
+      // RC-3a (2026-10-02): decided from the DOCUMENTS, never from
+      // `attachments[0]`. The composer keeps attach order, so a photo picked
+      // before a PDF made `first` the photo: no `meta.attachments`, no
+      // `pdfName`, and a small inline document that never reached the model
+      // or history at all. A dataset still stands alone (the composer
+      // enforces it), so finding it anywhere is the same as finding it first.
+      const isPdf = docAttachments.length > 0;
+      const dataset = attachments.find((a) => a.kind === 'dataset') ?? null;
+      const isDataset = dataset !== null;
       // 2026-09-09: videos ALWAYS travel by reference (purpose=video); the
       // server starts the analysis the moment the bytes land.
       const videoAttachments = attachments.filter((a) => a.kind === 'video');
@@ -1832,6 +1912,24 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       // Images and documents COEXIST in a message since 2026-09-02; only a
       // dataset still stands alone (it answers through its own engine).
       const images = attachments.filter((a) => a.kind === 'image');
+      /**
+       * Chat media (2026-10-02): the photos that actually TRAVEL — the ones
+       * with bytes — and, index for index, the ids the server stores them
+       * under (`image_ids`) and the turn records them by (`meta.images`).
+       * Built from one list so the three can never disagree about which id
+       * belongs to which photo.
+       */
+      const sentImages = images.filter((i) => i.base64);
+      const sentImageIds = sentImages.map((i) => i.attachment_id);
+      const imagesMeta = imagesMetaFor(
+        sentImages.map((i) => ({
+          attachment_id: i.attachment_id,
+          name: i.name,
+          dataUrl: i.dataUrl,
+          width: i.width,
+          height: i.height,
+        })),
+      );
       let conversationId = activeId;
       if (!conversationId) {
         const title = text || first?.name || '';
@@ -1883,9 +1981,14 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         imageDataUrl: images[0]?.dataUrl,
         imageDataUrls:
           images.length > 1 ? images.map((i) => i.dataUrl) : undefined,
-        // V8: a PDF attachment shows a chip (filename) in the bubble.
-        pdfName:
-          isPdf || isDataset || first?.kind === 'video' ? first?.name : undefined,
+        // V8: a PDF attachment shows a chip (filename) in the bubble — the
+        // name of `meta.attachments[0]`, which is what the history loader
+        // rebuilds it from on any other device (RC-3a: never a photo's).
+        pdfName: isPdf
+          ? docAttachments[0]?.name
+          : isDataset
+            ? dataset?.name
+            : videoAttachments[0]?.name,
         // 2026-08-21: attachments ride on meta, so the file card can be
         // rendered by any browser from server history — pdfName alone never
         // left this browser's cache. (`meta.pasted` rode here the same way
@@ -1911,20 +2014,20 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
                       attachments: isDataset
                         ? [
                             {
-                              name: first?.name ?? 'file',
+                              name: dataset?.name ?? 'file',
                               kind: 'dataset' as const,
-                              ...(first
+                              ...(dataset
                                 ? {
                                     // The composer's identity when it has one,
                                     // for the same reason as the loop above.
                                     attachment_id:
-                                      (first as Attachment & {
+                                      (dataset as Attachment & {
                                         attachment_id?: string;
                                       }).attachment_id ?? newIntentId(),
                                   }
                                 : {}),
-                              ...(first?.file
-                                ? { bytes: first.file.size }
+                              ...(dataset?.file
+                                ? { bytes: dataset.file.size }
                                 : {}),
                               upload_state: 'uploading' as const,
                             },
@@ -1954,17 +2057,26 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         ),
         createdAt: Date.now(),
       };
+      // Chat media (2026-10-02): the photos' references, written HERE by the
+      // browser so they ride this turn's first history push. Nothing else is
+      // added to a turn without photos, so its meta keeps its exact key set.
+      userMessage.meta = withImagesMeta(userMessage.meta, imagesMeta);
       // NEW-09: keep the original Files for this tab so the cards below can be
       // OPENED. Positional and keyed by message id, because two turns are
       // allowed to attach two different files both called `invoice.pdf`, and
-      // the order here is exactly the order MessageRow renders them in: the
-      // lone PDF/dataset, or the images in sequence.
+      // the order here is exactly the order MessageRow renders them in.
+      //
+      // RC-3a (2026-10-02): photos and files in SEPARATE index spaces. This
+      // stored `[first]` for a document turn and the photos otherwise, so a
+      // turn with both kept one list for two sets of cards: photo 0 and
+      // document 0 shared a slot, and clicking the photo opened the PDF.
+      const held = (list: Attachment[]) =>
+        list.map((a) => (a.file ? { name: a.name, mime: a.file.type, blob: a.file } : null));
       rememberAttachmentFiles(
         userMessage.id,
-        (isPdf || isDataset ? (first ? [first] : []) : images).map((a) =>
-          a.file ? { name: a.name, mime: a.file.type, blob: a.file } : null,
-        ),
+        held(isDataset ? [dataset] : docAttachments),
       );
+      rememberAttachmentFiles(userMessage.id, held(images), 'image');
       // Keep the payloads in memory so regenerate/retry re-send the same
       // question WITH its attachments (never persisted — see lib/attachments).
       //
@@ -1977,13 +2089,14 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       // share one.
       if (!isDataset) {
         rememberAttachments(userMessage.id, [
-          ...images
-            .filter((i) => i.base64)
-            .map((i) => ({
-              kind: 'image' as const,
-              name: i.name,
-              base64: i.base64,
-            })),
+          ...sentImages.map((i) => ({
+            kind: 'image' as const,
+            name: i.name,
+            base64: i.base64,
+            // The id the server stores this photo under, so a resend sends
+            // the same `image_ids` as the first send did.
+            attachment_id: i.attachment_id,
+          })),
           ...docAttachments
             .filter((d) => d.base64)
             .map((d) => ({
@@ -2026,7 +2139,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       setUnreachable(false);
       // A dataset has to be uploaded before a stream can exist, so say that
       // instead of claiming the model is already running (see datasetUpload).
-      const uploadsFirst = (isDataset && first?.file) || needsDocUpload;
+      const uploadsFirst = (isDataset && dataset?.file) || needsDocUpload;
       if (uploadsFirst) {
         setDatasetUpload({
           conversationId,
@@ -2171,7 +2284,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
           } else {
             try {
               const form = new FormData();
-              form.append('file', first.file as File);
+              form.append('file', dataset?.file as File);
               form.append('conversation_id', conversationId);
               const res = await fetch('/api/upload', { method: 'POST', body: form });
               const body = (await res.json()) as {
@@ -2190,7 +2303,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
                 persist(conversationId, turns);
               }
               toast(
-                `Profiled ${body.files ?? 0} file${body.files === 1 ? '' : 's'} from ${first.name}.`,
+                `Profiled ${body.files ?? 0} file${body.files === 1 ? '' : 's'} from ${dataset?.name}.`,
               );
             } catch (err) {
               toast(
@@ -2200,7 +2313,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
               // The name, never the upstream sentence: this is persisted and
               // exported, so it has to be copy we wrote. The server's own
               // words go to the toast, where they are read once.
-              failed.push(first?.name ?? 'the file');
+              failed.push(dataset?.name ?? 'the file');
               const entry = userMessage.meta?.attachments?.[0];
               if (entry && !entry.id) entry.upload_state = 'interrupted';
             }
@@ -2266,7 +2379,8 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
               ? {
                   pdfUploads: docRefs,
                   pdfName: docAttachments[0]?.name ?? null,
-                  images: images.map((i) => i.base64).filter(Boolean),
+                  images: sentImages.map((i) => i.base64),
+                  imageIds: sentImageIds,
                 }
               : {}),
             ...(videoRefs?.length
@@ -2274,7 +2388,10 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
                   videoUploads: videoRefs,
                   ...(docRefs?.length
                     ? {}
-                    : { images: images.map((i) => i.base64).filter(Boolean) }),
+                    : {
+                        images: sentImages.map((i) => i.base64),
+                        imageIds: sentImageIds,
+                      }),
                 }
               : {}),
           });
@@ -2290,18 +2407,29 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       // a failed background upload costs only the re-open, never the answer.
       if (isPdf && docAttachments[0]?.file && !needsDocUpload) {
         const durableDoc = docAttachments[0];
+        const durableId = attachmentIds.get(durableDoc.clientId);
         void (async () => {
           try {
             const ref = await uploadDocumentFile(
               durableDoc.file as File,
               conversationId,
             );
-            const entry = userMessage.meta?.attachments?.[0];
-            if (entry && !entry.id) {
-              entry.id = ref.upload_id;
-              entry.upload_state = 'uploaded';
-              persist(conversationId, turns);
-            }
+            const landed = { id: ref.upload_id, upload_state: 'uploaded' as const };
+            // The turn object itself first: the live stream holds it too, and
+            // the answer it saves when it finishes must carry the id.
+            const entry = userMessage.meta?.attachments?.find(
+              (a) => a.attachment_id === durableId,
+            );
+            if (entry && !entry.id) Object.assign(entry, landed);
+            // RC-3c (2026-10-02): then the LATEST stored thread, patched by
+            // this file's own id. This used to re-save `turns` — the list as
+            // it was at send, with no answer in it — so an upload landing
+            // after the answer shrank the thread, the history PUT was
+            // refused (409), and the id it came to record was lost.
+            const stored = getHistoryStore().get(conversationId)?.messages;
+            if (!stored || !durableId) return;
+            const patched = withAttachmentPatched(stored, durableId, landed);
+            if (patched !== stored) persist(conversationId, patched);
           } catch {
             /* the inline answer already has the bytes */
           }
@@ -2318,7 +2446,10 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         prefs: prefsRef.current,
         // 2026-09-02: images accompany documents now ("compare the chart to
         // the report") — the document engine takes them as extra_images.
-        images: images.map((i) => i.base64).filter(Boolean),
+        images: sentImages.map((i) => i.base64),
+        // Chat media: the id each photo is stored under, so this turn's
+        // `meta.images` resolves on every other device.
+        imageIds: sentImageIds,
         pdf: isPdf ? docAttachments[0]?.base64 ?? null : null,
         pdfName: isPdf ? docAttachments[0]?.name ?? null : null,
         clarification: clarification ?? null,
@@ -2532,6 +2663,17 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         announceBranch: plan.announceBranch,
         prefs: prefsRef.current,
         images: resend.images,
+        imageIds: resend.imageIds,
+        // Chat media: photos this tab holds no bytes for go by reference; a
+        // server that can no longer load one refuses before anything starts,
+        // and the person is asked for the photo exactly as when nothing here
+        // could rebuild it.
+        imageRefs: resend.imageRefs,
+        onImagesMissing: () =>
+          toast(
+            'Re-attach the file to regenerate this answer — its contents are no longer in memory.',
+            'error',
+          ),
         pdf: resend.pdf,
         pdfName: resend.pdfName,
         pdfUploads: resend.pdfUploads,
@@ -2591,9 +2733,9 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
   const runEdit = useCallback(
     async (messageId: string, text: string) => {
       const id = activeIdRef.current;
-      if (!id || isStreaming(id)) return;
-      const all = messagesRef.current;
-      const original = all.find((m) => m.id === messageId);
+      if (!id || isStreaming(id) || pendingSendRef.current.has(id)) return;
+      let all = messagesRef.current;
+      let original = all.find((m) => m.id === messageId);
       if (!original || original.role !== 'user') return;
 
       // Re-ask the question WITH whatever was attached to it. Images survive
@@ -2601,12 +2743,36 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       // dataset only ever lived server-side, so both report `missing` and the
       // edit stops rather than silently re-asking with nothing attached.
       const resend = resendOptionsFor(original);
-      if (resend.missing) {
+      const reattach = () =>
         toast(
           'Re-attach the file to edit this message — its contents are no longer in memory.',
           'error',
         );
+      if (resend.missing) {
+        reattach();
         return;
+      }
+      // Photos sent by reference must still be on the server BEFORE the
+      // version is written: an edit is stored (and pushed) before its stream
+      // starts, so a 422 `image_ref_missing` would come too late to take it
+      // back — an unanswered `2 / 2` the server will not let a push remove.
+      // One list read; an unknown answer lets the server decide, as before.
+      if (resend.imageRefs?.length) {
+        pendingSendRef.current.add(id);
+        let held: Set<string> | null;
+        try {
+          held = await storedAttachmentIds(id);
+        } finally {
+          pendingSendRef.current.delete(id);
+        }
+        if (held && resend.imageRefs.some((ref) => !held.has(ref))) {
+          reattach();
+          return;
+        }
+        if (activeIdRef.current !== id || isStreaming(id)) return;
+        all = messagesRef.current;
+        original = all.find((m) => m.id === messageId);
+        if (!original || original.role !== 'user') return;
       }
 
       const version = branchForVersion(all, original);
@@ -2681,6 +2847,15 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         announceBranch: true,
         prefs: prefsRef.current,
         images: resend.images,
+        imageIds: resend.imageIds,
+        // The edit inherits the original's `meta.images`, so a photo this tab
+        // never held is the same stored photo, named by the same id.
+        imageRefs: resend.imageRefs,
+        onImagesMissing: () =>
+          toast(
+            'Re-attach the file to edit this message — its contents are no longer in memory.',
+            'error',
+          ),
         pdf: resend.pdf,
         pdfName: resend.pdfName,
         pdfUploads: resend.pdfUploads,
@@ -2816,6 +2991,13 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       announceBranch: plan.announceBranch,
       prefs: prefsRef.current,
       images: resend.images,
+      imageIds: resend.imageIds,
+      imageRefs: resend.imageRefs,
+      onImagesMissing: () =>
+        toast(
+          'Re-attach the file to retry this message — its contents are no longer in memory.',
+          'error',
+        ),
       pdf: resend.pdf,
       pdfName: resend.pdfName,
       pdfUploads: resend.pdfUploads,
@@ -2890,13 +3072,22 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
           // harmless: click A then B, and A's response finds activeIdRef
           // pointing at B and does nothing at all.
           void reconcileConversation(id).finally(() => settleLoading(id));
+          // The cache's own verdict above is only as fresh as the last list:
+          // ask whether another device wrote to it since (2026-10-02).
+          void checkForUpdates();
         }
       }
       if (window.matchMedia('(max-width: 767px)').matches) {
         setSidebarOpen(false);
       }
     },
-    [attachOrExplain, reconcileConversation, setUrlConversation, settleLoading],
+    [
+      attachOrExplain,
+      checkForUpdates,
+      reconcileConversation,
+      setUrlConversation,
+      settleLoading,
+    ],
   );
 
   const renameConversation = useCallback(
@@ -3102,20 +3293,51 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
    * same front door a picked file does.
    */
   const reuseAttachment = useCallback(
-    async (messageId: string, index: number) => {
+    async (messageId: string, index: number, space?: 'image') => {
       const message = messagesRef.current.find((m) => m.id === messageId);
       if (!message) return;
-      const previews = message.imageDataUrls?.length
-        ? message.imageDataUrls
-        : message.imageDataUrl
-          ? [message.imageDataUrl]
-          : [];
-      const source = await resolveAttachmentAsync(messageId, index, {
-        name: message.meta?.attachments?.[index]?.name ?? message.pdfName,
-        dataUrl: previews[index],
-        upload: uploadRefFor(activeIdRef.current, message, index),
-      });
+      // RC-3a: a photo's index counts among the photos, a file's among the
+      // files — the two lists are rendered (and dragged) separately.
+      let source;
+      if (space === 'image') {
+        const previews = message.imageDataUrls?.length
+          ? message.imageDataUrls
+          : message.imageDataUrl
+            ? [message.imageDataUrl]
+            : [];
+        const stored = storedImagesOf(message)[index];
+        const conversationId = activeIdRef.current;
+        source = await resolveAttachmentAsync(messageId, index, {
+          name: stored?.name ?? `image-${index + 1}`,
+          dataUrl: previews[index],
+          // Chat media: on a device that never held the photo, the stored
+          // original is what goes back into the composer.
+          media:
+            stored && conversationId
+              ? { conversationId, attachmentId: stored.attachment_id }
+              : null,
+          space: 'image',
+        });
+        // The composer classifies by NAME, so a stored photo known only as
+        // "image-1" takes the extension its bytes actually have.
+        const ext = /^image\/(png|jpeg|webp|gif)$/.exec(source.mime)?.[1];
+        if (ext && !/\.[a-z0-9]{2,5}$/i.test(source.name)) {
+          source = { ...source, name: `${source.name}.${ext === 'jpeg' ? 'jpg' : ext}` };
+        }
+      } else {
+        source = await resolveAttachmentAsync(messageId, index, {
+          name: message.meta?.attachments?.[index]?.name ?? message.pdfName,
+          upload: uploadRefFor(activeIdRef.current, message, index),
+        });
+      }
 
+      if (source.kind === 'missing') {
+        toast(
+          'This photo is no longer stored on the server. Attach it from your computer instead.',
+          'error',
+        );
+        return;
+      }
       if (source.kind === 'expired') {
         toast(
           'This upload has expired and can no longer be attached again. Attach the file from your computer instead.',
@@ -3143,6 +3365,68 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
     },
     [toast],
   );
+
+  /**
+   * Chat media backfill (2026-10-02, docs/chat-media/CONTRACT.md §10).
+   *
+   * The server holds no copy of a photo sent before photos were stored; the
+   * browser that sent it may still hold one in IndexedDB. Opening one of the
+   * person's own chats here queues it, and at an idle moment those photos
+   * are uploaded and their turns given `meta.images` — after which the photo
+   * shows on every device. lib/chatMedia owns the rules (deterministic ids,
+   * one tab per chat, three chats per tick, stop on 507 or offline); this is
+   * only the app's side of it.
+   *
+   * Hosted HERE and nowhere else on purpose: ChatApp only ever shows the
+   * signed-in person's own conversations. A shared page or the admin
+   * transcript has no backfill to run.
+   */
+  const backfillRef = useRef<Backfill | null>(null);
+  if (backfillRef.current === null && typeof window !== 'undefined') {
+    backfillRef.current = createBackfill({
+      messages: (id) => getHistoryStore().get(id)?.messages ?? null,
+      localImages: async (id) => {
+        const store = getHistoryStore();
+        if (store.localImages) return store.localImages(id);
+        const out = new Map<number, string[]>();
+        store.get(id)?.messages.forEach((m, i) => {
+          const urls = m.imageDataUrls?.length
+            ? m.imageDataUrls
+            : m.imageDataUrl
+              ? [m.imageDataUrl]
+              : [];
+          if (urls.length) out.set(i, urls);
+        });
+        return out;
+      },
+      save: async (id, next) => {
+        const store = getHistoryStore();
+        // Amended, not saved: the same turns with richer meta must not move
+        // an old chat to the top of Recents.
+        const pushed = store.amendMessages
+          ? store.amendMessages(id, next)
+          : (store.saveMessages(id, next), store.flush());
+        // Folded into the view at once. A view still without the references
+        // would be what the next send saves — and erases them with.
+        if (activeIdRef.current === id && !isStreaming(id)) {
+          const stored = store.get(id)?.messages;
+          if (stored) adoptServerMessages(id, stored);
+        }
+        await pushed;
+      },
+      // A send owns the thread from the click until its stream ends; the
+      // backfill waits for the next open rather than race its saves.
+      idle: (id) =>
+        !isStreaming(id) &&
+        !pendingSendRef.current.has(id) &&
+        datasetUploadRef.current?.conversationId !== id,
+    });
+  }
+  // A chat counts as OPENED once its thread is on screen.
+  useEffect(() => {
+    if (!activeId || loadingId === activeId) return;
+    backfillRef.current?.request(activeId);
+  }, [activeId, loadingId]);
 
   /**
    * M-08 — per-row callbacks with STABLE identity.
@@ -3190,8 +3474,8 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       onRegenerate: () => rowApiRef.current.regenerate(id),
       onRetry: () => rowApiRef.current.regenerate(id),
       onSendWithLanded: () => rowApiRef.current.sendWithLanded(id),
-      onReuseAttachment: (index) => {
-        void rowApiRef.current.reuseAttachment(id, index);
+      onReuseAttachment: (index, space) => {
+        void rowApiRef.current.reuseAttachment(id, index, space);
       },
       onEditStart: () => rowApiRef.current.startEdit(id),
       onEditCancel: () => rowApiRef.current.cancelEdit(),
@@ -3285,7 +3569,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       // 4B: the drag's drop resolves through the SAME handler, on purpose.
       // (The visible "Attach again" button was removed 2026-09-03; this is
       // now the only entry point, and it is unchanged.)
-      void reuseAttachment(intent.ref.messageId, intent.ref.index);
+      void reuseAttachment(intent.ref.messageId, intent.ref.index, intent.ref.space);
       return;
     }
 
@@ -3562,8 +3846,13 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
                     onRetry={on.onRetry}
                     onReuseAttachment={on.onReuseAttachment}
                     // 4C: which conversation to ask for a workbook profile or a
-                    // document's extracted text.
+                    // document's extracted text — and, since 2026-10-02, to
+                    // show this turn's stored photos from.
                     conversationId={activeId}
+                    // A photo sent before photos were stored, on a device that
+                    // never held it: decided here because only the thread can
+                    // see the answer that follows the turn.
+                    legacyPhoto={m.id === legacyPhotoTurn}
                     uploadStatus={
                       datasetUpload?.messageId === m.id
                         ? datasetUpload.status

@@ -902,6 +902,29 @@ name, a search or a user.
 
 ---
 
+## Chat media (orchestrator `/metrics`, 2026-10-02)
+
+Pictures sent in a chat are stored under `CHAT_MEDIA_DIR` for the life of the
+chat (V44, [`chat-media/README.md`](chat-media/README.md)). All closed label
+sets (`metrics._LABELS_BY_METRIC`); no label carries a user, a chat, an
+attachment id or a file name.
+
+| metric | labels | what it answers |
+|---|---|---|
+| `chat_media_writes_total` | source = chat / upload / backfill, result = stored / duplicate / unsupported / too_large / no_space / error | pictures written, and why some were not (`chat` is `/chat`'s background store, which never fails a turn) |
+| `chat_media_write_seconds` | source | verify + durable write of one picture |
+| `chat_media_reads_total` | size = thumb / full, result = ok / not_modified / not_found / missing | byte reads, the admin route included; `missing` is a 410, a row whose file is gone |
+| `chat_media_erase_total` | store = media / files, result = ok / error | bytes removed at once when a chat is deleted; an error is finished by the reaper |
+| `chat_media_reaped_total` | kind = row / dir | orphans the reaper removed (past `CHAT_MEDIA_ORPHAN_GRACE_H`) |
+| `chat_files_lasting_total` | purpose = document / dataset, result = stored / no_space / error | lasting copies of document and dataset originals under `CHAT_FILES_DIR` (CONTRACT §9) |
+
+Worth an alert: any `chat_media_reads_total{result="missing"}` (a file
+vanished under a live row); `chat_media_writes_total{result=~"no_space|error"}`
+rising; `chat_media_erase_total{result="error"}`. `/data/chat-media` is on the
+head's root NVMe and is not in `scripts/backup-knowledge.sh`.
+
+---
+
 ## Knowledge pipeline metrics (orchestrator `/metrics`, ADR-0001 D12)
 
 All emitted by the orchestrator's own registry (`app/metrics.py`); labels in

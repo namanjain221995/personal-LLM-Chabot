@@ -156,6 +156,11 @@ PRIVATE_META_KEYS: Dict[str, str] = {
     "report_files": "generated files held in this workspace",
     "code_sources": "a private repository",
     "attachments": "uploaded files",
+    # V44 (2026-10-02): the browser writes `meta.images` on a user message that
+    # sent pictures, which the server now stores (app/chat_media.py). A chat
+    # with someone's photos is private like one with uploaded files; the
+    # snapshot never carries the pictures either way (it is an allowlist).
+    "images": "uploaded photos",
     "video": "an uploaded video",
 }
 
@@ -253,8 +258,15 @@ def evaluate(
             shareable_messages=0,
         )
 
+    # Provenance reads EVERY user and assistant message, not only `completed`:
+    # a turn with no words can still carry private material. A phone's most
+    # common send is a photo with no text (content '', `meta.images`), and
+    # reading only the non-empty turns let its vision answer go public (chat
+    # media QA, 2026-10-02). Provenance can only add blocks.
     private_kinds: List[str] = []
-    for m in completed:
+    for m in messages:
+        if m.get("role") not in ("user", "assistant"):
+            continue
         meta = m.get("meta") or {}
         route = str(meta.get("route") or "")
         if route in PRIVATE_ROUTES:

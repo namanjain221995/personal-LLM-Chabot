@@ -69,6 +69,16 @@ def _sweep(conv: str, upload_id: str) -> None:
     shutil.rmtree(upload_root(conv, upload_id))
 
 
+def _drop_lasting(conv: str, upload_id: str) -> None:
+    """An upload with no lasting copy (made before 2026-10-02, or below the
+    free-space floor): once swept, nothing of it is on disk."""
+    import os
+
+    from app.uploads import lasting_path
+
+    shutil.rmtree(os.path.dirname(lasting_path(conv, upload_id)))
+
+
 def test_a_swept_video_still_downloads_from_the_analysis_store(alice):
     conv = _chat(alice, "conv-video")
     upload_id = _upload(alice, conv, "Team stand-up.mp4", MP4, "video", "video/mp4")
@@ -112,7 +122,10 @@ def test_a_video_gone_from_both_stores_is_410(alice):
     assert alice.get(f"/uploads/{conv}/{upload_id}/file").status_code == 410
 
 
-def test_document_and_dataset_downloads_are_unchanged(alice):
+def test_document_and_dataset_downloads_outlive_the_sweep_from_their_lasting_copy(alice):
+    """Since 2026-10-02 (docs/chat-media/CONTRACT.md §9) a document's or
+    dataset's original is kept for the life of the chat, so the sweep alone no
+    longer makes it 410; with the lasting copy gone too it is 410 as before."""
     conv = _chat(alice, "conv-docs")
     pdf = b"%PDF-1.4 unchanged\n" * 40
     document = _upload(alice, conv, "contract.pdf", pdf, "document", "application/pdf")
@@ -123,6 +136,12 @@ def test_document_and_dataset_downloads_are_unchanged(alice):
     assert second.status_code == 200 and second.content == b"a,b\n1,2\n"
     _sweep(conv, document)
     _sweep(conv, table)
+    swept_doc = alice.get(f"/uploads/{conv}/{document}/file")
+    assert swept_doc.status_code == 200 and swept_doc.content == pdf
+    swept_table = alice.get(f"/uploads/{conv}/{table}/file")
+    assert swept_table.status_code == 200 and swept_table.content == b"a,b\n1,2\n"
+    _drop_lasting(conv, document)
+    _drop_lasting(conv, table)
     assert alice.get(f"/uploads/{conv}/{document}/file").status_code == 410
     assert alice.get(f"/uploads/{conv}/{table}/file").status_code == 410
 
@@ -155,6 +174,7 @@ def test_a_non_video_row_never_reads_the_analysis_store(alice):
         )
     assert store.source_path(content_hash)
     _sweep(conv, document)
+    _drop_lasting(conv, document)
     assert alice.get(f"/uploads/{conv}/{document}/file").status_code == 410
 
 

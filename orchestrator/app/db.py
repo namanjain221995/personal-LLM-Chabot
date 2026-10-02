@@ -3077,6 +3077,67 @@ CREATE TABLE IF NOT EXISTS voice_archive_owner (
 """
 
 
+_MIGRATION_V44 = """
+-- V44 (2026-10-02): CHAT MEDIA -- every picture sent in a chat, kept for the
+-- life of the chat (app/chat_media.py, docs/chat-media/CONTRACT.md).
+-- Additive and idempotent: one new table and one index, no backfill.
+--
+-- WHY. A photo sent from a phone showed on the phone and nowhere else: the
+-- only lasting copy was the sending browser's IndexedDB. The bytes reached
+-- this server inline in the /chat body, the request snapshot strips them, and
+-- the V41 row above keeps the latest picture for two hours for the MODEL's
+-- follow-ups, never for display. Production chat 4ab7ac45 had a vision answer
+-- and 0 uploads rows, 0 conversation_images rows, 0 bytes anywhere.
+--
+-- WHAT LIVES WHERE. The bytes are FILES under CHAT_MEDIA_DIR/<user_id>/
+-- <conversation_id>/<media_id>/ (full.<ext> and, for a large picture,
+-- thumb.webp), outside WORKSPACE_DIR so the 24 h sweep and the 20 GB quota
+-- never touch them. This row is the index: who owns the picture, which chat
+-- and which composer attachment it is, and what the bytes are. Not bytea: a
+-- 10 MiB photo in a row is a 10 MiB tuple every list read drags through
+-- shared buffers.
+--
+-- ATTACHMENT_ID IS THE CLIENT'S NAME FOR IT. The composer mints one when a
+-- picture is chosen and writes it into the user message's `meta.images`, so a
+-- second device finds the bytes from the message alone. The server never
+-- writes that reference itself: the history PUT replaces meta whole, last
+-- writer wins, and a reference the server added would be erased by the next
+-- push. UNIQUE (user_id, conversation_id, attachment_id) makes every store
+-- idempotent: a retried send or a second backfilling tab finds the row the
+-- first one wrote, and the FIRST write wins, so a media URL never changes
+-- content (which is what makes `immutable` caching safe). media_id is
+-- server-minted (uuid4().hex) and names the directory; nothing a client sends
+-- ever becomes a path.
+--
+-- SCOPE. Every read carries the viewer, as V41 does: `chat`'s conversation key
+-- is whatever the client sent, so the conversation id alone is not an
+-- identity. The users FK cascades, so a deleted ACCOUNT takes its rows with
+-- it (the reaper then removes the directories). `_SIDE_TABLES` clears the rows
+-- of a deleted CHAT; that loop matches on the conversation id alone, so a
+-- colliding client-chosen id can drop a different account's rows early --
+-- only an account that stored pictures under an id nobody owned yet, which the
+-- deleter then claimed. Early, never disclosed.
+CREATE TABLE IF NOT EXISTS chat_media (
+    media_id        text        PRIMARY KEY,
+    user_id         integer     NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    conversation_id text        NOT NULL,
+    attachment_id   text        NOT NULL,
+    sha256          text        NOT NULL,
+    mime            text        NOT NULL,
+    bytes           bigint      NOT NULL,
+    width           integer,
+    height          integer,
+    has_thumb       boolean     NOT NULL DEFAULT false,
+    source          text        NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT chat_media_owner_attachment UNIQUE (user_id, conversation_id, attachment_id),
+    CONSTRAINT chat_media_source CHECK (source IN ('chat','upload','backfill'))
+);
+-- Chat deletion (_SIDE_TABLES) and the follow-up fallback's existence check.
+CREATE INDEX IF NOT EXISTS chat_media_conversation ON chat_media (conversation_id);
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -3121,6 +3182,7 @@ _MIGRATIONS: tuple = (
     (41, _MIGRATION_V41),
     (42, _MIGRATION_V42),
     (43, _MIGRATION_V43),
+    (44, _MIGRATION_V44),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -3946,6 +4008,10 @@ _SIDE_TABLES = (
     # never anyone's picture disclosed, and early is the safe direction for a
     # cache — image_memory.forget stays the scoped delete.
     "conversation_images",
+    # V44: the pictures sent in this conversation. Rows only: the bytes are
+    # files, removed after this transaction by history.py (best effort) and
+    # by chat_media's reaper (the backstop), never inside a transaction.
+    "chat_media",
     # V31 artifacts, artifact_versions and artifact_jobs are DELIBERATELY
     # absent, for the reason report_files is: they are the person's
     # deliverables, addressed by id from GET /artifacts without their

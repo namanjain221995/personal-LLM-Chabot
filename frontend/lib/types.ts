@@ -322,8 +322,10 @@ export type AttachmentUploadState =
   | 'expired';
 
 export interface MessageAttachment {
-  /** Server-side upload id (uploads.id) — absent on PDFs and on turns
-      persisted before the upload response arrived. */
+  /** Server-side upload id (uploads.id) — absent until the upload lands
+      (documents, videos and datasets all get one), and on turns persisted
+      before the upload response arrived. Photos never appear here: they
+      ride `Meta.images`. */
   id?: string;
   name: string;
   kind: 'dataset' | 'pdf' | 'video';
@@ -344,6 +346,23 @@ export interface MessageAttachment {
   /** The browser's last knowledge of the bytes. Absent = uploaded, for
       rows written before this field existed (they carried `id`). */
   upload_state?: AttachmentUploadState;
+}
+
+/**
+ * 2026-10-02: one photo on a user turn, as `meta.images` stores it
+ * (docs/chat-media/CONTRACT.md §7).
+ *
+ * `attachment_id` is the composer's identity for the photo, minted at
+ * selection (or `bf-<sha256>` for a backfilled one); the server keys the
+ * stored bytes by it. `width`/`height` are the pixels as SENT, so another
+ * device can reserve the thumbnail's box before a byte arrives.
+ */
+export interface MessageImage {
+  attachment_id: string;
+  name?: string;
+  mime?: string;
+  width?: number;
+  height?: number;
 }
 
 /**
@@ -530,6 +549,28 @@ export interface Meta {
    * already durable server-side, keyed by conversation.
    */
   attachments?: MessageAttachment[];
+  /**
+   * 2026-10-02 (chat media, docs/chat-media/CONTRACT.md §7): the photos sent
+   * with this user turn, in the order they were sent, as references the
+   * server resolves — the bytes are stored server-side under (viewer,
+   * conversation, attachment_id) and shown through
+   * /api/chat-media/{conversation}/{attachment_id}. The URL is derived, never
+   * stored.
+   *
+   * Written by the BROWSER at send (or by the backfill for older photos), so
+   * it rides the first history push. A reference written by the server would
+   * be erased by the next whole-thread push: history stores `meta` verbatim
+   * and the last writer wins.
+   *
+   * A separate key from `attachments` on purpose. An image entry there would
+   * become the turn's `pdfName`, collide with the documents' raw indexes and
+   * count as an unfinished upload.
+   *
+   * NEVER volatile: no data URL, no server id, no progress, no timestamp. The
+   * history sync key hashes all of `meta`, so a field that changed on its own
+   * would re-push the whole thread on every save.
+   */
+  images?: MessageImage[];
   /**
    * 2026-09-09: this turn was saved BEFORE its uploads finished (so a reload
    * keeps the words and the chips), and the chat request only goes out once

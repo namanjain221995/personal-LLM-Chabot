@@ -38,6 +38,19 @@ export interface ChatRequestBody {
   /** 2026-08-05: all attached images (max 5); `image` stays the first one. */
   images?: string[];
   /**
+   * 2026-10-02 (chat media, docs/chat-media/CONTRACT.md §5): the attachment
+   * id of each inline image, index for index with `images` (or `[0]` with the
+   * single `image`). The orchestrator stores every photo it is sent under
+   * these, so the turn's `meta.images` resolves on any device.
+   */
+  image_ids?: string[];
+  /**
+   * 2026-10-02: photos the orchestrator ALREADY stores for this conversation,
+   * sent by attachment id instead of bytes (a regenerate, edit or retry on a
+   * device that never held them).
+   */
+  image_refs?: string[];
+  /**
    * NEW-14: the turn being sent has an uploaded dataset (.csv/.xlsx/.zip/…).
    *
    * INTERNAL to the frontend and its proxy — deliberately not forwarded, and
@@ -126,6 +139,10 @@ export interface OrchestratorChatRequest {
   sf_live?: boolean;
   /** 2026-08-05: all attached images; image_base64 remains the first. */
   images?: string[];
+  /** Chat media: the stored id of each inline image — see ChatRequestBody. */
+  image_ids?: string[];
+  /** Chat media: stored photos sent by reference — see ChatRequestBody. */
+  image_refs?: string[];
   /** Salesforce Intelligence Mode: answer to a pending clarifying question. */
   clarification?: Record<string, unknown>;
   /** The browser's send intent — see ChatRequestBody.intent_id. */
@@ -138,6 +155,25 @@ export interface OrchestratorChatRequest {
 
 /** An artifact id as the orchestrator issues them: 32 lowercase hex. */
 const ARTIFACT_ID_RE = /^[a-f0-9]{32}$/;
+
+/** A client-minted attachment id (docs/chat-media/CONTRACT.md §3). */
+const ATTACHMENT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+/** The orchestrator's MAX_IMAGES: inline and referenced photos together. */
+const MAX_IMAGES = 5;
+
+/**
+ * A list of attachment ids as it may be forwarded: an array of 1..5
+ * well-formed ids, or null. All or nothing — dropping one bad id would shift
+ * every id after it onto the wrong photo, so a list with one is not sent.
+ */
+export function forwardableAttachmentIds(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_IMAGES) {
+    return null;
+  }
+  return value.every((id) => typeof id === 'string' && ATTACHMENT_ID_RE.test(id))
+    ? (value as string[])
+    : null;
+}
 
 /**
  * `answer_branch` as it may be forwarded: exactly `{self, parent?}`, both
@@ -243,6 +279,10 @@ export function toOrchestratorChatRequest(
       ? [body.image]
       : [];
   const image = images[0] ?? null;
+  // Chat media: stored ids for the inline images (only when they pair with
+  // them exactly), and stored photos named instead of sent.
+  const imageIds = forwardableAttachmentIds(body.image_ids);
+  const imageRefs = forwardableAttachmentIds(body.image_refs);
   const pdf = body.pdf ?? null;
   const pdfUploads = body.pdf_uploads?.length ? body.pdf_uploads : null;
   const videoUploads = body.video_uploads?.length ? body.video_uploads : null;
@@ -251,7 +291,9 @@ export function toOrchestratorChatRequest(
   // inside this request outranks the one that only left a reference behind.
   const message =
     text ||
-    (image
+    // A photo sent by reference is still a photo: a wordless resend from
+    // another device asks the same thing its first send did.
+    (image || imageRefs
       ? IMAGE_ONLY_PROMPT
       : pdf || pdfUploads
         ? PDF_ONLY_PROMPT
@@ -278,6 +320,10 @@ export function toOrchestratorChatRequest(
     // Only sent when there genuinely are several — single-image requests
     // keep producing the exact v1 key set.
     ...(images.length > 1 ? { images } : {}),
+    // Chat media: only when present and well-formed, so every other request
+    // keeps its exact key set and a malformed id never reaches the 422.
+    ...(imageIds && imageIds.length === images.length ? { image_ids: imageIds } : {}),
+    ...(imageRefs ? { image_refs: imageRefs } : {}),
     // V2 §1 fields: include only when the client sent them so v1-shaped
     // requests keep producing the exact v1 key set.
     ...(body.conversation_id !== undefined

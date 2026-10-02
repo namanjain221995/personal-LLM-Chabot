@@ -348,6 +348,25 @@ SPECULATIVE_EMBED_WASTE_REASONS = frozenset(
 MYFILES_VIEWS = frozenset({"list", "summary"})
 MYFILES_RESULTS = frozenset({"ok", "bad_request", "error"})
 
+#: app/chat_media.py (V44, 2026-10-02; docs/chat-media/CONTRACT.md §11).
+#: Literal here so this module imports nothing; tests/test_chat_media_api.py
+#: pins chat_media's own tuples to these sets.
+#:   source  who sent the picture: /chat inline bytes, the upload route, or
+#:           a browser backfilling a photo it still holds from before V44;
+#:   result  how one write ended. `duplicate` is the idempotent retry (the
+#:           first write won); unsupported / too_large / no_space are
+#:           refusals, `error` is the server's own failure.
+CHAT_MEDIA_SOURCES = frozenset({"chat", "upload", "backfill"})
+CHAT_MEDIA_WRITE_RESULTS = frozenset({"stored", "duplicate", "unsupported", "too_large", "no_space", "error"})
+#: A read of the bytes route: which rendition, and how it ended. `missing` is
+#: a row whose file is gone (410), `not_found` everything that is not yours.
+CHAT_MEDIA_SIZES = frozenset({"thumb", "full"})
+CHAT_MEDIA_READ_RESULTS = frozenset({"ok", "not_modified", "not_found", "missing"})
+#: The lasting copy of a document or dataset original (CONTRACT §9, the files
+#: track): made, skipped under the free-space floor, or failed.
+CHAT_FILES_PURPOSES = frozenset({"document", "dataset"})
+CHAT_FILES_RESULTS = frozenset({"stored", "no_space", "error"})
+
 _ROUTE_EFFORT = {"route": set(CHAT_ROUTES), "effort": set(CHAT_EFFORTS)}
 
 #: The speech router's two tiers (app/asr.RoutedProvider): the GPU replicas in ASR_BASE_URLS and
@@ -397,6 +416,22 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
     # Never a file name, a user or a query — those are the person's content.
     "myfiles_list_seconds": {"view": set(MYFILES_VIEWS)},
     "myfiles_list_total": {"view": set(MYFILES_VIEWS), "result": set(MYFILES_RESULTS)},
+    # Chat media (app/chat_media.py, 2026-10-02). Never a user, a chat, an
+    # attachment id or a file name: those are the person's.
+    "chat_media_writes_total": {
+        "source": set(CHAT_MEDIA_SOURCES), "result": set(CHAT_MEDIA_WRITE_RESULTS),
+    },
+    "chat_media_reads_total": {"size": set(CHAT_MEDIA_SIZES), "result": set(CHAT_MEDIA_READ_RESULTS)},
+    "chat_media_write_seconds": {"source": set(CHAT_MEDIA_SOURCES)},
+    # Deleting a chat removes its bytes at once, best effort; a failure is
+    # counted here and the reaper finishes the job. `store` is which root.
+    "chat_media_erase_total": {"store": {"media", "files"}, "result": {"ok", "error"}},
+    # What the reaper removed: a row whose chat or account is gone, or a
+    # directory no row names (both only past CHAT_MEDIA_ORPHAN_GRACE_H).
+    "chat_media_reaped_total": {"kind": {"row", "dir"}},
+    "chat_files_lasting_total": {
+        "purpose": set(CHAT_FILES_PURPOSES), "result": set(CHAT_FILES_RESULTS),
+    },
     # Engine first token to the SSE write that carries it — the part of the
     # 105 -> 88 tok/s relay loss that is time, not throughput.
     "relay_overhead_seconds": dict(_ROUTE_EFFORT),

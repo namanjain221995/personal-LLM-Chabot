@@ -79,6 +79,34 @@ describe('handleSessionEnd', () => {
     await handleSessionEnd({ ok: false, status: 401 }, fetch, nav);
     expect(nav.assign).toHaveBeenCalledWith('/login');
   });
+
+  // 2026-10-02 (chat media): the logout answer carries
+  // `Clear-Site-Data: "cache"`, the only way to empty the HTTP cache that
+  // holds every chat photo this browser showed.
+  it('a removed account also asks for the logout answer that empties the HTTP cache', async () => {
+    const calls: Array<{ url: string; method?: string }> = [];
+    const fetchFn = (async (url: string, init?: RequestInit) => {
+      calls.push({ url: String(url), method: init?.method });
+      return new Response('{"ok":true}', { status: 200 });
+    }) as FetchLike;
+    const nav = { assign: vi.fn() };
+    await handleSessionEnd(removed, fetchFn, nav);
+    expect(calls).toEqual([{ url: '/api/auth/logout', method: 'POST' }]);
+    expect(nav.assign.mock.calls[0][0]).toMatch(/^\/access-removed\?/);
+
+    const failing = (async () => {
+      throw new TypeError('offline');
+    }) as FetchLike;
+    const nav2 = { assign: vi.fn() };
+    await handleSessionEnd(removed, failing, nav2);
+    expect(nav2.assign).toHaveBeenCalledTimes(1);
+  });
+
+  it('a plain end of session asks for nothing', async () => {
+    const fetchFn = vi.fn(async () => new Response('{}')) as unknown as FetchLike;
+    await handleSessionEnd({ ok: false, status: 401 }, fetchFn, { assign: vi.fn() });
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
 });
 
 describe('the page copy', () => {

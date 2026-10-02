@@ -126,6 +126,100 @@ export function withLocalBranches(
 }
 
 /**
+ * `next`, with the photo references (`meta.images`) that only `kept` still
+ * carries put back — 2026-10-02 (chat media).
+ *
+ * History stores `meta` verbatim and the last writer wins, so any copy of a
+ * thread written before a turn's photos were referenced — a view a render
+ * behind the store, a stream that captured the thread when the send began, a
+ * server copy adopted after a refused push — would erase the reference the
+ * moment it was saved, and the photo would vanish from every other device.
+ * A turn's photos never change once sent (an edit is a new message), so the
+ * reference is only ever carried forward, never taken away.
+ *
+ * Matched by POSITION and checked by identity of the turn: the same place in
+ * the flat, append-only thread, a user turn on both sides, the same words.
+ * Rows that need nothing keep their exact object, and the array itself is
+ * returned unchanged when no row did (M-08: the poll's no-op stays a no-op).
+ */
+export function withStoredImages(
+  next: ChatMessage[],
+  kept: ChatMessage[],
+): ChatMessage[] {
+  let changed = false;
+  const out = next.map((m, i) => {
+    if (m.role !== 'user' || m.meta?.images?.length) return m;
+    const k = kept[i];
+    if (!k || k === m || k.role !== 'user' || k.content !== m.content) return m;
+    if (!k.meta?.images?.length) return m;
+    changed = true;
+    return { ...m, meta: { ...(m.meta ?? {}), images: k.meta.images } };
+  });
+  return changed ? out : next;
+}
+
+/**
+ * `next`, with the upload ids that only `kept` knows put back on the same
+ * files — 2026-10-02 (RC-3c).
+ *
+ * A document uploads in the background and its id is written onto the turn
+ * AFTER the turn was appended. The push carrying the id is a whole-thread
+ * PUT, which the server refuses (409) whenever the conversation moved since
+ * this tab last read it: the tab's own append moves it, and so does the
+ * answer the server stores. The recovery adopted the server's copy, which
+ * still had the entry the append wrote (`upload_state: 'selected'`, no id),
+ * and the id was gone for good: no other device could open the file.
+ *
+ * Matched like `withStoredImages` (same position, a user turn on both sides,
+ * the same words) and then entry by entry on `attachment_id`. Only an entry
+ * with NO id takes one: an id is never replaced and never removed. Rows that
+ * need nothing keep their exact object, and so does the array.
+ */
+export function withStoredUploadIds(
+  next: ChatMessage[],
+  kept: ChatMessage[],
+): ChatMessage[] {
+  let changed = false;
+  const out = next.map((m, i) => {
+    const entries = m.meta?.attachments;
+    if (m.role !== 'user' || !entries?.some((a) => !a.id && a.attachment_id)) {
+      return m;
+    }
+    const k = kept[i];
+    if (!k || k === m || k.role !== 'user' || k.content !== m.content) return m;
+    const known = new Map<string, string>();
+    for (const a of k.meta?.attachments ?? []) {
+      if (a.id && a.attachment_id) known.set(a.attachment_id, a.id);
+    }
+    if (known.size === 0) return m;
+    let touched = false;
+    const patched = entries.map((a) => {
+      const id = !a.id && a.attachment_id ? known.get(a.attachment_id) : undefined;
+      if (!id) return a;
+      touched = true;
+      // An entry with an id IS uploaded; that is the only state to carry.
+      return { ...a, id, upload_state: 'uploaded' as const };
+    });
+    if (!touched) return m;
+    changed = true;
+    return { ...m, meta: { ...m.meta, attachments: patched } };
+  });
+  return changed ? out : next;
+}
+
+/**
+ * Both carries at once: what only `kept` holds about a turn (its photo
+ * references and its files' upload ids) put back onto `next`. Every path
+ * that saves or adopts an older copy, or the server's, goes through this.
+ */
+export function withStoredRefs(
+  next: ChatMessage[],
+  kept: ChatMessage[],
+): ChatMessage[] {
+  return withStoredUploadIds(withStoredImages(next, kept), kept);
+}
+
+/**
  * Server truth WITHOUT throwing away what only this tab knows — the reload
  * and poll path (fe-chat F1).
  *
@@ -184,6 +278,12 @@ export function reconcileThread(
   });
   // The tree positions this tab gave answers the server stored without one
   // (withLocalBranches) — so the poll never flips a version back into a
-  // stacked copy while the repaired thread is on its way to the server.
-  return [...withLocalBranches(local, merged), ...localOnlyTail(local, server)];
+  // stacked copy while the repaired thread is on its way to the server. And
+  // the photo references and upload ids a server copy does not carry yet
+  // (withStoredRefs), so the view never drops one the next save would then
+  // push away.
+  return [
+    ...withLocalBranches(local, withStoredRefs(merged, local)),
+    ...localOnlyTail(local, server),
+  ];
 }

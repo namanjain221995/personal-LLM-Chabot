@@ -30,19 +30,28 @@ import {
 import { keepsCitations, linkCitations, stripCitations } from '@/lib/citations';
 import {
   attachmentFile,
+  mediaKindFor,
+  previewKindFor,
   resolveAttachmentAsync,
+  streamedPlayerFor,
   uploadRefFor,
   writeInternalAttachment,
   fileBadgeFor,
   resolveAttachment,
+  type AttachmentSpace,
   type ResolvedAttachment,
 } from '@/lib/attachments';
-import { AttachmentPreview, type ServerPreviewLoaders } from './AttachmentPreview';
 import {
-  fetchDocumentText,
-  fetchUploadProfile,
-  workbookFromProfile,
-} from '@/lib/previewData';
+  chatMediaUrl,
+  localImagesOf,
+  storedImagesOf,
+  thumbBox,
+  type MediaRef,
+} from '@/lib/chatMedia';
+import type { MessageImage } from '@/lib/types';
+import { AttachmentPreview, type ServerPreviewLoaders } from './AttachmentPreview';
+import { fetchDocumentText, fetchUploadProfile } from '@/lib/previewData';
+import { summaryFromProfile } from '@/lib/myfiles';
 import { AgentTimeline } from './AgentTimeline';
 import { ActivityPanel } from './ActivityPanel';
 import { countSources, ResearchPanel } from './ResearchPanel';
@@ -175,6 +184,9 @@ function OpenableAttachment({
   className,
   onReuse,
   upload,
+  media,
+  space = 'file',
+  rail,
   loaders,
   children,
 }: {
@@ -182,8 +194,21 @@ function OpenableAttachment({
   index: number;
   /** What to call the file in the accessible name. */
   name: string;
+  /**
+   * 2026-10-02: the rail the file travelled on (`meta.attachments[i].kind`).
+   * Only `video` matters: such a file opens in a player even when its name
+   * does not say what it is.
+   */
+  rail?: string;
   /** The message's own persisted preview, when it has one (images do). */
   dataUrl?: string;
+  /**
+   * 2026-10-02: a photo the server stores — opened at full size from there
+   * when this tab holds neither the file nor a preview of it.
+   */
+  media?: MediaRef | null;
+  /** RC-3a: which list `index` counts in — photos and files are separate. */
+  space?: AttachmentSpace;
   className: string;
   /**
    * PHASE 4A/4B — can this file be put back in the composer?
@@ -221,10 +246,35 @@ function OpenableAttachment({
    * document's extracted text) skips the byte fetch entirely: the dialog is
    * about to ask for something smaller and more useful, and downloading 50 MB
    * of .xlsx to then not read it would be pure waste.
+   *
+   * 2026-10-02 (CONTRACT §10), the same rule for everything else:
+   *   · a video or audio file is PLAYED, by URL — the player streams byte
+   *     ranges as it plays, and this fetches nothing (it used to pull the
+   *     whole file, up to 4 GB, into a Blob to then say "no preview");
+   *   · a format the dialog cannot draw from bytes at all (.zip, .pptx,
+   *     .html, .parquet) is not downloaded just to say so;
+   *   · a PDF or text file still fetches its bytes, and only if those are
+   *     gone does the dialog fall back to the text the chat read (`loaders`).
    */
   function open() {
-    const local = resolveAttachment(messageId, index, { name, dataUrl });
-    if (loaders || local.kind !== 'unavailable' || !upload) {
+    const player = streamedPlayerFor(name, upload, rail);
+    if (player) {
+      setSource(player);
+      return;
+    }
+    const local = resolveAttachment(messageId, index, { name, dataUrl, space });
+    // A stored photo is drawable whatever it is called ("Attached image 1").
+    const drawable = Boolean(media) || previewKindFor(name) !== 'none';
+    if (!drawable && local.kind === 'unavailable' && !mediaKindFor(name)) {
+      // No bytes here, and none would help: what the dialog can say about a
+      // .zip is the same on every device, so it is not blamed on this one.
+      // (A video with no upload id yet keeps `unavailable`: it may play once
+      // its upload lands.) A .xlsx or .docx still gets its server preview —
+      // the dialog asks for it on `none` exactly as on `unavailable`.
+      setSource({ ...local, kind: 'none' });
+      return;
+    }
+    if (!drawable || local.kind !== 'unavailable' || (!upload && !media)) {
       setSource(local);
       return;
     }
@@ -233,6 +283,8 @@ function OpenableAttachment({
       name,
       dataUrl,
       upload,
+      media,
+      space,
     }).then(setSource);
   }
   return (
@@ -249,7 +301,10 @@ function OpenableAttachment({
           // Identity only — never a path, a blob: URL, or anything in
           // text/plain (NEW-10A: a drag whose readable part was text got
           // typed into the prompt).
-          if (!writeInternalAttachment(e.dataTransfer, { messageId, index })) {
+          const ref = space === 'image'
+            ? { messageId, index, space }
+            : { messageId, index };
+          if (!writeInternalAttachment(e.dataTransfer, ref)) {
             e.preventDefault();
           }
         }}
@@ -269,6 +324,115 @@ function OpenableAttachment({
   );
 }
 
+/** A photo card's own classes: the local preview's frame, plus its focus ring. */
+const IMAGE_CARD =
+  'block rounded-ts focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent';
+
+/**
+ * The fixed box a stored photo takes when its turn recorded no pixel size: a
+ * square the height of every other thumbnail, cropped to fill. It cannot
+ * shift either, it is merely less faithful to the photo's shape.
+ */
+const SQUARE_BOX = { width: '160px', height: '160px', maxWidth: '100%' } as const;
+
+/**
+ * 2026-10-02 (chat media): a photo this device never held, shown from the
+ * server's copy (docs/chat-media/CONTRACT.md §10).
+ *
+ * Fast is the whole brief, and each attribute below is part of it:
+ *   · the THUMBNAIL (long edge 512 px), never the original, in the bubble;
+ *   · `loading="lazy"`: a long chat fetches only what scrolls into view;
+ *   · `decoding="async"`: decoding never holds up the frame that paints it;
+ *   · the box is sized from the stored width and height BEFORE a byte
+ *     arrives (`thumbBox`), so nothing below it moves when it lands;
+ *   · the URL is stable and immutable, so the browser's cache serves every
+ *     later view without a request.
+ *
+ * A 404 or 410 becomes an "Image unavailable" tile of the same size — after
+ * three retries, 2, 6 and 15 seconds apart: the orchestrator stores a sent
+ * photo in the background, behind the turn, and a second device polling the
+ * chat can see the reference before the row lands. Five large photos on a
+ * busy server take longer than one two-second retry covered. Each retry has
+ * its own URL (`&retry=N`, dropped by the proxy), so no cached failure
+ * answers it.
+ */
+const STORED_IMAGE_RETRY_MS = [2_000, 6_000, 15_000] as const;
+
+function StoredImage({
+  messageId,
+  index,
+  image,
+  media,
+  onReuse,
+}: {
+  messageId: string;
+  index: number;
+  image: MessageImage;
+  media: MediaRef;
+  onReuse?: () => void;
+}) {
+  const [state, setState] = useState<'loading' | 'shown' | 'retrying' | 'failed'>('loading');
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    if (state !== 'retrying') return;
+    const timer = window.setTimeout(() => {
+      setAttempt((n) => n + 1);
+      setState('loading');
+    }, STORED_IMAGE_RETRY_MS[attempt] ?? 0);
+    return () => window.clearTimeout(timer);
+  }, [state, attempt]);
+
+  const alt = `Attached image ${index + 1}`;
+  const box = thumbBox(image) ?? SQUARE_BOX;
+  if (state === 'failed') {
+    return (
+      <div
+        role="img"
+        aria-label={`${alt} — unavailable`}
+        data-testid="stored-image-unavailable"
+        style={box}
+        className="flex flex-col items-center justify-center gap-1 rounded-ts border border-dashed border-border bg-surface-2 px-2 text-center text-xs text-muted"
+      >
+        <IconAlert size={14} className="shrink-0 text-faint" />
+        <span>Image unavailable</span>
+      </div>
+    );
+  }
+  const src = chatMediaUrl(media, 'thumb');
+  return (
+    <OpenableAttachment
+      messageId={messageId}
+      index={index}
+      name={image.name ?? alt}
+      media={media}
+      space="image"
+      onReuse={onReuse}
+      className={IMAGE_CARD}
+    >
+      {/* A same-origin URL with its own cache lifetime — next/image would
+          only add a second, server-side copy of a private photo. */}
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={attempt === 0 ? src : `${src}&retry=${attempt}`}
+        alt={alt}
+        width={image.width}
+        height={image.height}
+        loading="lazy"
+        decoding="async"
+        data-testid="stored-image"
+        style={box}
+        onLoad={() => setState('shown')}
+        onError={() =>
+          setState(attempt < STORED_IMAGE_RETRY_MS.length ? 'retrying' : 'failed')
+        }
+        className={`rounded-ts border border-border bg-surface-2 object-cover ${
+          state === 'retrying' ? 'opacity-0' : ''
+        }`}
+      />
+    </OpenableAttachment>
+  );
+}
+
 /**
  * PHASE 4C — where a preview should ask for what the browser cannot read.
  *
@@ -281,6 +445,15 @@ function OpenableAttachment({
  *
  * Returns undefined without a conversation to ask about, so a row rendered
  * outside a chat behaves exactly as it did before this existed.
+ *
+ * 2026-10-02 (CONTRACT §10): the same two sources are now also the FALLBACK
+ * for a file the dialog draws from bytes, once those bytes turn out to be
+ * gone — a PDF or text document reads as the text the chat read from it, and
+ * a CSV dataset as the table the server profiled. The dialog asks only then
+ * (AttachmentPreview runs a loader for `expired` and `unavailable`, never
+ * over a PDF it can show). The formats above stay unreachable: nothing here
+ * is offered for a name `previewKindFor` answers `none` for, .xlsx and .docx
+ * aside.
  */
 function serverPreviewLoaders(
   conversationId: string | null,
@@ -289,7 +462,9 @@ function serverPreviewLoaders(
   name: string,
 ): ServerPreviewLoaders | undefined {
   if (!conversationId) return undefined;
-  if (/\.xlsx$/i.test(name)) {
+  const rail = message.meta?.attachments?.[index]?.kind;
+  const drawable = previewKindFor(name) !== 'none';
+  if (/\.xlsx$/i.test(name) || (rail === 'dataset' && drawable)) {
     const upload = uploadRefFor(conversationId, message, index);
     if (!upload) return undefined;
     return {
@@ -299,15 +474,27 @@ function serverPreviewLoaders(
           upload.uploadId,
           signal,
         );
-        if (!found || found.expired) return null;
-        return workbookFromProfile(found.profile, found.filename || name);
+        if (!found) return { value: null };
+        // The profile is a database row and OUTLIVES the bytes, so a swept
+        // workbook still previews from it. This used to return null for an
+        // `expired` row, and the dialog then blamed "this browser session";
+        // the flag now goes with the summary, and the dialog says the file
+        // itself is gone.
+        return {
+          value: summaryFromProfile(found.profile, found.filename || name),
+          expired: found.expired,
+        };
       },
     };
   }
-  if (/\.docx$/i.test(name)) {
+  if (/\.docx$/i.test(name) || (rail !== 'dataset' && rail !== 'video' && drawable)) {
+    // A small document rides INSIDE the chat request and its upload is best
+    // effort, so on another device (or after the sweep) a PDF may have no
+    // bytes anywhere — but the chat stored the text it read, by name.
     return {
-      loadDocumentText: (signal) =>
-        fetchDocumentText(conversationId, name, signal),
+      loadDocumentText: async (signal) => ({
+        value: await fetchDocumentText(conversationId, name, signal),
+      }),
     };
   }
   return undefined;
@@ -377,6 +564,7 @@ function MessageRowImpl({
   clarificationAnswer = '',
   onReuseAttachment,
   conversationId = null,
+  legacyPhoto = false,
   onOpenArtifact,
   activeArtifactKey = null,
   onEditArtifact,
@@ -465,13 +653,24 @@ function MessageRowImpl({
    * that is not there. The host's `reuseAttachment` is still reached on every
    * internal drop; this prop is what tells the card it may start such a drag.
    */
-  onReuseAttachment?: (index: number) => void;
+  onReuseAttachment?: (index: number, space?: 'image') => void;
   /**
    * PHASE 4C: which conversation this row belongs to, so a preview can ask the
    * server for a workbook profile or a document's extracted text. null (a row
    * rendered outside a chat) simply means no server-backed preview.
+   *
+   * 2026-10-02: also where a turn's stored photos are shown from. Without one
+   * a photo this device never held has no URL, and the row shows nothing for
+   * it — exactly what it showed before photos were stored.
    */
   conversationId?: string | null;
+  /**
+   * 2026-10-02: this turn's photo was sent before photos were stored, and
+   * this device does not hold it (no `meta.images`, no local bytes, and the
+   * answer below came from the vision route). Decided by the host, which can
+   * see the NEXT message — a row cannot (lib/chatMedia showsLegacyPhotoNote).
+   */
+  legacyPhoto?: boolean;
   /**
    * 2026-09-11 (Artifact Studio): open a generated file in ChatApp's side
    * panel. Omitted in contexts with no panel (previews, tests), where the
@@ -641,9 +840,14 @@ function MessageRowImpl({
      */
     const userText = message.content ?? '';
     const hasText = Boolean(userText.trim());
+    // 2026-10-02: a turn's photos are this device's own bytes when it still
+    // has them (instant, and the only copy of a photo sent before photos were
+    // stored), otherwise the server's copies through `meta.images`.
+    const localUrls = localImagesOf(message);
+    const storedImages = storedImagesOf(message);
     const hasAttachments = Boolean(
-      message.imageDataUrls?.length ||
-        message.imageDataUrl ||
+      localUrls.length ||
+        storedImages.length ||
         message.pdfName ||
         message.meta?.attachments?.length,
     );
@@ -662,19 +866,19 @@ function MessageRowImpl({
         {/* The editor needs room to be typed in, so it takes the full thread
             width; the sent bubble keeps hugging its own text. */}
         <div className={editing ? 'w-full' : 'max-w-[85%] sm:max-w-[70%]'}>
-          {(message.imageDataUrls?.length || message.imageDataUrl) && (
+          {localUrls.length > 0 ? (
             <div className="mb-1.5 flex flex-wrap justify-end gap-1.5">
               {/* 2026-08-05: up to 5 images per turn — `imageDataUrls` when
                   several, the legacy single `imageDataUrl` otherwise.
                   data: URL previews — next/image can't optimize these. */}
-              {(message.imageDataUrls?.length
-                ? message.imageDataUrls
-                : [message.imageDataUrl as string]
-              ).map((url, i) => {
-                // The real filename when this tab still holds the file;
-                // otherwise the position, which is all the message persists.
-                const held = attachmentFile(message.id, i);
-                const name = held?.name ?? `Attached image ${i + 1}`;
+              {localUrls.map((url, i) => {
+                // The real filename when this tab still holds the file, then
+                // the name the turn recorded, then the position. Photos count
+                // in their OWN index space (RC-3a): photo 0 and document 0
+                // are different files.
+                const held = attachmentFile(message.id, i, 'image');
+                const name =
+                  held?.name ?? storedImages[i]?.name ?? `Attached image ${i + 1}`;
                 return (
                   <OpenableAttachment
                     key={i}
@@ -682,11 +886,11 @@ function MessageRowImpl({
                     index={i}
                     name={name}
                     dataUrl={url}
+                    space="image"
                     onReuse={
-                      onReuseAttachment ? () => onReuseAttachment(i) : undefined
+                      onReuseAttachment ? () => onReuseAttachment(i, 'image') : undefined
                     }
-                    upload={uploadRefFor(conversationId, message, i)}
-                    className="block rounded-ts focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+                    className={IMAGE_CARD}
                   >
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
@@ -698,7 +902,30 @@ function MessageRowImpl({
                 );
               })}
             </div>
-          )}
+          ) : storedImages.length > 0 && conversationId ? (
+            <div className="mb-1.5 flex flex-wrap justify-end gap-1.5">
+              {storedImages.map((image, i) => (
+                <StoredImage
+                  key={`${image.attachment_id}-${i}`}
+                  messageId={message.id}
+                  index={i}
+                  image={image}
+                  media={{ conversationId, attachmentId: image.attachment_id }}
+                  onReuse={
+                    onReuseAttachment ? () => onReuseAttachment(i, 'image') : undefined
+                  }
+                />
+              ))}
+            </div>
+          ) : legacyPhoto ? (
+            <p
+              className="mb-1.5 text-right text-xs text-muted"
+              data-testid="legacy-photo-note"
+            >
+              Photo not stored on the server (sent before photos were saved), so
+              it only shows on the device that sent it.
+            </p>
+          ) : null}
           {(() => {
             // 2026-09-02: several documents per message. Each meta entry gets
             // its OWN chip at its own index, so every card opens, previews
@@ -716,6 +943,7 @@ function MessageRowImpl({
                     messageId={message.id}
                     index={i}
                     name={entry.name ?? `Document ${i + 1}`}
+                    rail={entry.kind}
                     onReuse={
                       onReuseAttachment ? () => onReuseAttachment(i) : undefined
                     }
@@ -763,6 +991,7 @@ function MessageRowImpl({
                 messageId={message.id}
                 index={0}
                 name={message.pdfName}
+                rail={message.meta?.attachments?.[0]?.kind}
                 onReuse={
                   onReuseAttachment ? () => onReuseAttachment(0) : undefined
                 }

@@ -23,14 +23,14 @@ changes.
 | an upload | an `uploads` row with `status='ready'`, in a chat the person owns | Document (`notes='document'`), Video (`notes='video'`), Audio (a `'video'` row whose name ends in one of `video.api.AUDIO_EXTENSIONS`), Spreadsheet or data (anything else) |
 | a text-only document | a `documents` row with no ready upload behind it: a PDF sent inside the chat request (every PDF before 2026-09-02), or one handed to the artifact studio. Only its extracted text was ever kept. | Document |
 | a recording | a `voice_sessions` row that is not cancelled and whose audio is not deleted | Voice recording |
+| a picture (since 2026-10-02) | a `chat_media` row (V44, docs/chat-media/) whose own `user_id` is the person AND whose chat the person owns | Picture, named `Picture.<ext>` from its type (the table keeps no file name), shown by its thumbnail |
 
 Archive members (`x.zip/a.txt`) and archive manifests (`x.zip (archive
 contents)`) fold under the archive's upload and are not listed on their own.
 
 **Not listed:**
-- **Pictures.** They were never stored on the account. The only copy is the
-  sending browser's IndexedDB, plus `IMAGE_MEMORY_TTL_S` (2 h) of server memory
-  for follow-up questions. The page says so.
+- A picture sent before 2026-10-02 until the browser that still holds it opens
+  its chat again (the backfill, docs/chat-media/CONTRACT.md §10).
 - `/v1` developer files. They belong to a project, not a person, and the `/api`
   console already lists them.
 - Generated artifacts and report files. They are not uploads.
@@ -41,13 +41,25 @@ The server decides `availability` the same way the download route does:
 
 | `availability` | Badge | Meaning | Actions |
 |---|---|---|---|
-| `available` | Stored | the original bytes are on disk | Download; Preview for PDFs, images and text up to 25 MB; a player for recordings |
-| `text_only` | Text only | the bytes were swept; the text the chat read is kept | Preview (the text) |
-| `summary_only` | Summary only | the bytes were swept (or the file was an archive, whose bytes are deleted on extraction); the spreadsheet profile is kept | Preview (the tables) |
+| `available` | Stored | the original bytes are on disk: the workspace copy, the lasting copy, the video store, or a picture's full file | Download; Preview for PDFs, images and text up to 25 MB; a player for recordings |
+| `text_only` | Text only | the bytes were swept and no lasting copy was kept; the text the chat read is kept | Preview (the text) |
+| `summary_only` | Summary only | the bytes were swept and no lasting copy was kept; the spreadsheet profile is kept | Preview (the tables) |
 | `processing` | Processing | a recording still being made or transcribed | none |
 | `expired` | Removed | nothing of it is kept | none |
 
 Rules behind the table:
+- Since 2026-10-02 a document or dataset (zip and tar included) gets a
+  **lasting copy** when its upload finishes, single-shot or chunked:
+  `<CHAT_FILES_DIR>/<conversation>/<upload>/original`, a hard link to the
+  workspace original (a fsynced copy across filesystems). It stays while the
+  chat exists, so such a row stays `available` after the 24 h sweep, and an
+  archive uploaded as a dataset is downloadable (its workspace original still
+  goes at extraction). Below `CHAT_MEDIA_MIN_FREE_GIB` free on that disk no
+  copy is made and the row ages exactly as before
+  (`chat_files_lasting_total{purpose,result="no_space"}`).
+- A picture is `available` while its full file is on disk under
+  `CHAT_MEDIA_DIR`, else `expired`. The page builds every picture URL itself
+  from the row's chat and `attachment_id`.
 - A video or audio file stays `available` after the 24 h workspace sweep while
   any chat links its analysis. Its bytes are hard-linked into
   `VIDEO_DATA_DIR/<sha256>/source.<ext>`. A leftover `.part` name (a link or
@@ -70,21 +82,36 @@ Rules behind the table:
   what was saved so far, in the Recordings page's own words
   (`lib/recordings.IN_PROGRESS_DELETE_NOTE`).
 - A chat's files leave this list when the chat is deleted, and each row says
-  so ("Deleting its chat removes it from this list."). No row promises an
-  erasure time: the bytes wait for the next sweep or the video reaper (see
-  *Operating it*).
+  so ("Deleting its chat removes it from this list."). The delete route then
+  erases, best effort and after the response, the chat's lasting copies, its
+  workspace upload copies and its pictures; a failure is counted
+  (`chat_media_erase_total`) and the reapers finish later. No row promises an
+  erasure time.
 
 ### Retention sentence
 
 The sentence at the top of the page is built from the deployment's settings,
-which come with every response. It stays true when a TTL changes:
+which come with every response (`frontend/lib/myfiles.ts retentionSentences`).
+It stays true when a TTL changes. With `files_kept_with_chat: true` and
+`pictures: "kept_with_chat"` (since 2026-10-02):
 
 > Files you attach to a chat are kept for 24 hours, then removed the next time
 > the server clears out old files; after that the chat keeps what it read (a
-> document's text, a spreadsheet's summary). Videos and audio files stay while
-> their chat exists. Deleting a chat takes its files off this list at once; the
-> server erases their stored copies later. Voice recordings stay until you
-> delete them. Pictures stay only in the browser you sent them from.
+> document's text, a spreadsheet's summary). Documents and spreadsheets also
+> keep a copy that stays while their chat exists, unless the server was short
+> of space when they were sent. Videos and audio files stay while their chat
+> exists. Pictures stay while their chat exists. One sent before pictures were
+> kept appears here once the browser that sent it opens its chat again.
+> Deleting a chat takes its files off this list at once; the server erases
+> their stored copies later. Voice recordings stay until you delete them.
+
+The first sentence is about the workspace copy and is never reworded for the
+lasting copy, which has its own sentence (only with `files_kept_with_chat:
+true`); a swept row's note stays "The file was removed after 24 hours". No
+sentence promises a deletion time. An orchestrator without
+`files_kept_with_chat` drops the lasting-copy sentence, and one that sends
+`pictures: "browser_only"` says "Pictures stay only in the browser you sent
+them from" instead of the two picture sentences.
 
 What the workspace sweep (`core/repo.enforce_quota_and_ttl`) does, and so what
 the sentence says:
@@ -111,6 +138,10 @@ heard no speech (outcome `no_speech` or `no_words`) has none.
 | `VOICE_RETENTION_DAYS` | 0 | 0 keeps recordings until the owner deletes them |
 | `VIDEO_ORPHAN_TTL_HOURS` | 72 | video bytes are reaped this long after the last chat link goes |
 | `IMAGE_MEMORY_TTL_S` | 7200 | how long the server remembers a picture for follow-up questions |
+| `CHAT_FILES_DIR` | `/data/chat-files` | lasting copies of document and dataset originals; outside `WORKSPACE_DIR`, so neither the sweep nor the 20 GB quota touches them |
+| `CHAT_MEDIA_MIN_FREE_GIB` | 250 | below this much free space no lasting copy (and no new picture) is stored |
+| `CHAT_MEDIA_ORPHAN_GRACE_H` | 24 | a lasting copy whose chat or uploads row is gone is reaped only after this many hours |
+| `CHAT_MEDIA_REAP_INTERVAL_S` | 3600 | at most one lasting-copy reaper pass per this many seconds per process |
 
 ---
 
@@ -127,7 +158,7 @@ them, the rule `/audio/sessions` follows.
 
 | Parameter | Meaning |
 |---|---|
-| `kind` | comma list of `document`, `dataset`, `video`, `audio`, `recording` |
+| `kind` | comma list of `document`, `dataset`, `image`, `video`, `audio`, `recording` |
 | `q` | at most 100 characters; matched literally (`%` and `_` are escaped) against the file name, and the chat title for chat files |
 | `since`, `until` | ISO 8601, half-open `[since, until)`; a time without a zone is UTC |
 | `min_bytes`, `max_bytes` | half-open `[min, max)`; a text-only document has no size and drops out of any size filter |
@@ -161,17 +192,32 @@ Anything else in the query string is ignored. There is no `user_id` parameter.
             "can": {"download": true, "preview": "text", "delete": false}}],
  "next_cursor": "…" ,
  "retention": {"upload_hours": 24, "recording_days": 0, "video_kept_with_chat": true,
-               "video_grace_hours": 72, "pictures": "browser_only", "picture_memory_hours": 2}}
+               "video_grace_hours": 72, "files_kept_with_chat": true,
+               "pictures": "kept_with_chat", "picture_memory_hours": 2}}
+```
+
+A picture row:
+
+```json
+{"id": "media:<32hex media_id>", "source": "media", "kind": "image",
+ "name": "Picture.png", "bytes": 48213, "created_at": "2026-10-02T09:14:00+00:00",
+ "conversation": {"id": "…", "title": "…"}, "availability": "available",
+ "media": {"width": 640, "height": 480, "mime": "image/png"}, "text_name": null,
+ "can": {"download": true, "preview": "image", "delete": false},
+ "attachment_id": "att-…"}
 ```
 
 Field notes:
-- `id` is `upload:<id>`, `text:<n>` or `recording:<id>`.
-- `media` is `{status, duration_ms}` for video, audio and recordings. A
-  recording's also carries `has_transcript`: true only when it is `done` and
-  its transcript has words. The outcome settles it (`transcribed` has words;
+- `id` is `upload:<id>`, `text:<n>`, `recording:<id>` or `media:<media_id>`.
+- `media` is `{status, duration_ms}` for video, audio and recordings, and
+  `{width, height, mime}` for a picture (the display size). A recording's
+  also carries `has_transcript`: true only when it is `done` and its
+  transcript has words. The outcome settles it (`transcribed` has words;
   `no_speech` and `no_words` have none); a `transcribed_with_gaps` recording,
   which can end either way, reads its saved transcript through
   `dictation.transcript_of`.
+- `attachment_id` is on picture rows only: the page builds
+  `/api/chat-media/<conversation>/<attachment_id>?size=thumb|full` from it.
 - `text_name` names the `documents` row a text preview reads, and is set only
   when `can.preview` is `"text"`. It is not always the file's own name: the
   composer sends a `.zip` on the DOCUMENT rail, and the chat then keeps
@@ -206,21 +252,34 @@ the shape `audio_api.py` uses.
   - Each new list request aborts the previous one.
   - Paging is keyset ("Show older files").
 
-### The video download fallback (`orchestrator/app/uploads.py`)
+### The download fallback (`orchestrator/app/uploads.py`)
 
-`GET /uploads/{conversation}/{upload}/file` used to answer 410 "expired" for a
-video or audio file once the 24 h sweep removed its workspace copy, even though
-the bytes were still in the video store.
+`GET /uploads/{conversation}/{upload}/file` used to answer 410 "expired" once
+the 24 h sweep removed the workspace copy. Its order is now (`kept_original`):
 
-It now falls back to that store, and only for a row the video rail wrote
-(`notes == 'video'`):
-- The fallback runs after ownership and the (conversation, upload) scoping
-  were checked.
-- It looks up `db.get_video_by_upload`, then `video.store.source_path(sha256)`.
-- It serves the file under the person's own filename.
+1. the workspace copy (`extracted/<name>`, then `_original/<name>`);
+2. the lasting copy, `<CHAT_FILES_DIR>/<conversation>/<upload>/original`
+   (documents and datasets, since 2026-10-02);
+3. for a row the video rail wrote (`notes == 'video'`) only, the video store:
+   `db.get_video_by_upload`, then `video.store.source_path(sha256)`;
+4. 410.
 
-The admin download route (`/admin/api/members/{id}/uploads/...`) is unchanged
-by instruction. It still reads `_original` only (follow-up).
+Every fallback runs after ownership and the (conversation, upload) scoping
+were checked, and serves the file under the person's own filename. The admin
+download (`/admin/api/members/{id}/uploads/{upload}/download`) shares the same
+fallback after `_original` and still answers 404 "The file has expired." when
+nothing is left. Both answer byte ranges (206 with `content-range`, 416 past
+the end): that is Starlette's own `FileResponse`, pinned by
+`tests/test_chat_files.py`, and the `<video>`/`<audio>` players depend on it.
+
+A lasting-copy reaper (`uploads.reap_lasting_files`) rides the ten-minute
+upload-session sweep main.py already runs, throttled to one pass per
+`CHAT_MEDIA_REAP_INTERVAL_S`. It removes `<conversation>/<upload>`
+directories whose chat or uploads row is gone, only past
+`CHAT_MEDIA_ORPHAN_GRACE_H`, only names it makes, never through a symbolic
+link, and asks the database once per chat directory with a candidate. A
+database error stops the pass without removing anything. Counted as
+`chat_media_reaped_total{kind="dir"}`.
 
 ---
 
@@ -231,13 +290,18 @@ by instruction. It still reads `_original` only (follow-up).
     `conversations.user_id`, the join the admin list trusts.
   - Super admins see only their own files here. Inspection stays on the
     audited admin routes.
-- **Reserved chat ids (the F034 IDOR):** both chat branches exclude
-  `conversation_id ~ '^u[0-9]+-'`.
+- **Reserved chat ids (the F034 IDOR):** every chat branch (uploads, text,
+  pictures) excludes `conversation_id ~ '^u[0-9]+-'`.
   - The risk: a legacy chat created as `u7-default` names its creator as
     owner, while user 7's bare `/chat` calls stored document text under that
     same key. Without the filter, the creator would see user 7's file names.
   - This mirrors `uploads._refuse_reserved_conversation_key`.
-  - Pinned by `test_a_reserved_shape_conversation_never_lists`.
+  - Pinned by `test_a_reserved_shape_conversation_never_lists` and
+    `test_the_reserved_conversation_shape_never_lists_a_picture`.
+- **Pictures are the caller's twice over:** the `chat_media` row's own
+  `user_id` and the chat's owner must both be the caller. A row stored under
+  an id somebody else later claimed lists for neither of them (the reaper
+  removes it). Pinned by `test_another_persons_pictures_are_never_listed`.
 - **No new id-based reads.** Every download, preview and delete goes to a route
   that already re-derives ownership. Cursors are typed, bound parameters that
   only position a keyset inside the caller's own rows.
@@ -473,14 +537,11 @@ sum(rate(myfiles_list_total{result="error"}[15m]))
    - delete the document text, archive members included;
    - unlink the video;
    - remove the upload directory inside `uploads._inside_uploads`.
-2. **Deleting a chat removes its bytes at once**, instead of at the next
-   sweep or reaper run.
-3. **Retention of originals:**
-   - (a) keep 24 h (today);
-   - (b) keep N days on the worker's 2.9 TB disk, with the storage track;
-   - (c) raise the TTL and quota on the head, which shares its disk with
-     production Postgres.
-4. **Pictures stored on the account**, which needs a storage location.
+2. ~~Deleting a chat removes its bytes at once~~: done 2026-10-02 (best
+   effort, reapers as backstop; docs/chat-media/).
+3. ~~Retention of originals~~: decided 2026-10-02, kept for the life of the
+   chat under `CHAT_FILES_DIR` (docs/chat-media/CONTRACT.md §9).
+4. ~~Pictures stored on the account~~: done 2026-10-02 (`chat_media`, V44).
 5. **"Made for you" and "Shared links" tabs.**
 6. **Unfinished chunked uploads, with Cancel** (v1.1). The
    `DELETE /uploads/chunked/{conv}/{id}` route already exists.

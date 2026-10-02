@@ -14,6 +14,14 @@
  * different answer.
  */
 
+import type { ChatMessage, MessageAttachment } from './types';
+import {
+  fetchChatMediaBlob,
+  isAttachmentId,
+  storedImagesOf,
+  type MediaRef,
+} from './chatMedia';
+
 export interface SentAttachment {
   kind: 'image' | 'pdf';
   name: string;
@@ -26,6 +34,10 @@ export interface SentAttachment {
    * which is all there ever was. When it IS present on both sides it wins:
    * a list filtered by `id` moves every index under a sibling that is still
    * uploading, and that is how a resend handed the model the wrong file.
+   *
+   * 2026-10-02: a photo carries its `meta.images[].attachment_id` here too,
+   * so a resend can send `image_ids` beside the bytes and the server stores
+   * (or, already holding it, ignores) the same photo under the same id.
    */
   attachment_id?: string;
 }
@@ -80,6 +92,14 @@ export interface AttachmentsLookup {
   /** Inline payloads to re-send (images, and a document with no upload id). */
   attachments: SentAttachment[];
   /**
+   * 2026-10-02: photos re-sent BY REFERENCE — the attachment ids of photos
+   * the server already stores for this conversation (`meta.images`), sent as
+   * `image_refs` when this tab holds no bytes for them (another device, a
+   * cleared cache). The server loads the stored originals and treats them
+   * exactly like inline images. Empty whenever the bytes travel inline.
+   */
+  imageRefs: string[];
+  /**
    * Documents re-sent BY REFERENCE — the durable upload ids the message
    * persists in `meta.attachments`. Same contract `send()` uses for several
    * documents (`pdf_uploads`), and the reason a document turn can now be
@@ -129,6 +149,8 @@ export interface ResendableMessage {
       /** 2026-09-10: the identity the bytes were remembered under. */
       attachment_id?: string;
     }>;
+    /** 2026-10-02: the photos the server stores for this turn. */
+    images?: Array<{ attachment_id?: string; name?: string }>;
   };
 }
 
@@ -152,9 +174,14 @@ export interface ResendableMessage {
  * by POSITION among the documents otherwise — never by name, because two
  * different files may share a filename.
  *
- * Images are unchanged: the persisted previews are the payloads and survive a
- * reload. Datasets are unchanged too — nothing is resent, the orchestrator
- * finds the upload through conversation_id (PHASE 3, see isDatasetTurn).
+ * Images: the bytes this tab remembered, else the persisted previews (they
+ * ARE the payloads and survive a reload), else — on a device that never held
+ * them — the references in `meta.images`, which the server resolves to the
+ * stored originals (2026-10-02, `image_refs`). Before that last rung existed
+ * a regenerate on another device silently re-asked the question with no
+ * photo at all (RC-3b). Datasets are unchanged — nothing is resent, the
+ * orchestrator finds the upload through conversation_id (PHASE 3, see
+ * isDatasetTurn).
  *
  * `missing` is only true when something genuinely cannot be rebuilt: a
  * document with neither an id nor remembered bytes (a legacy turn after a
@@ -168,21 +195,36 @@ export function attachmentsForResend(message: ResendableMessage): AttachmentsLoo
   const rememberedImages = remembered.filter((a) => a.kind === 'image');
   const rememberedPdfs = remembered.filter((a) => a.kind === 'pdf');
 
-  /* ---- images: remembered bytes, else the persisted previews ---- */
+  /* ---- images: remembered bytes, else the persisted previews, else the
+          server's stored copies by reference ---- */
   const previews = message.imageDataUrls?.length
     ? message.imageDataUrls
     : message.imageDataUrl
       ? [message.imageDataUrl]
       : [];
+  const stored = storedImagesOf(message);
   let images: SentAttachment[] = rememberedImages;
   let imagesMissing = false;
+  let imageRefs: string[] = [];
   if (images.length === 0 && previews.length > 0) {
+    // The stored ids line up with the previews only when both describe the
+    // same photos — the same count. Otherwise the bytes go without ids, as
+    // they always did, rather than under a wrong one.
+    const ids = stored.length === previews.length ? stored.map((i) => i.attachment_id) : [];
     const fromPreviews = previews
       .map((p) => base64FromDataUrl(p))
       .filter((b): b is string => Boolean(b))
-      .map((base64) => ({ kind: 'image' as const, name: 'image', base64 }));
+      .map((base64, i) => ({
+        kind: 'image' as const,
+        name: stored[i]?.name ?? 'image',
+        base64,
+        ...(ids[i] ? { attachment_id: ids[i] } : {}),
+      }));
     if (fromPreviews.length === previews.length) images = fromPreviews;
+    else if (stored.length > 0) imageRefs = stored.map((i) => i.attachment_id);
     else imagesMissing = true;
+  } else if (images.length === 0 && stored.length > 0) {
+    imageRefs = stored.map((i) => i.attachment_id);
   }
 
   /* ---- files: ONE decision per attachment, by its own kind and id ----
@@ -249,6 +291,7 @@ export function attachmentsForResend(message: ResendableMessage): AttachmentsLoo
 
   return {
     attachments: [...images, ...inlinePdfs],
+    imageRefs,
     pdfUploads,
     videoUploads,
     missing: imagesMissing || missingNames.length > 0,
@@ -300,6 +343,15 @@ function rememberedDocFor(
  */
 export function resendOptionsFor(message: ResendableMessage): {
   images: string[];
+  /**
+   * 2026-10-02: the attachment ids of `images`, index for index — sent as
+   * `image_ids` so the server stores the photos under them. null when any
+   * image has none (a turn from before ids), so a partial list can never
+   * pair a photo with someone else's id.
+   */
+  imageIds: string[] | null;
+  /** 2026-10-02: stored photos re-sent by reference (`image_refs`). */
+  imageRefs: string[] | null;
   pdf: string | null;
   pdfName: string | null;
   pdfUploads: DocumentRef[] | null;
@@ -309,16 +361,23 @@ export function resendOptionsFor(message: ResendableMessage): {
   /** The files this resend cannot carry, by name — see AttachmentsLookup. */
   missingNames: string[];
 } {
-  const { attachments, pdfUploads, videoUploads, missing, missingNames } =
+  const { attachments, imageRefs, pdfUploads, videoUploads, missing, missingNames } =
     attachmentsForResend(message);
   const inline = attachments.filter((a) => a.kind === 'pdf');
+  const inlineImages = attachments.filter((a) => a.kind === 'image');
+  const imageIds = inlineImages.map((a) => a.attachment_id);
   const firstInline = inline[0] ?? null;
   // Only ONE inline document can travel (the `pdf` field is single by
   // contract), so any further id-less document is named as missing rather
   // than dropped silently.
   const crowdedOut = inline.slice(1).map((a) => a.name);
   return {
-    images: attachments.filter((a) => a.kind === 'image').map((a) => a.base64),
+    images: inlineImages.map((a) => a.base64),
+    imageIds:
+      inlineImages.length > 0 && imageIds.every((id): id is string => isAttachmentId(id))
+        ? imageIds
+        : null,
+    imageRefs: imageRefs.length ? imageRefs : null,
     pdf: firstInline?.base64 ?? null,
     pdfName: firstInline?.name ?? pdfUploads[0]?.name ?? null,
     pdfUploads: pdfUploads.length ? pdfUploads : null,
@@ -375,22 +434,41 @@ export interface AttachmentBlob {
 const held = new Map<string, Array<AttachmentBlob | null>>();
 
 /**
+ * Which list an index counts in (RC-3a, 2026-10-02).
+ *
+ * A turn's photos and its documents are rendered as two lists, each counted
+ * from zero, and until now both were remembered under ONE positional slot
+ * per message: a document attached after a photo was held at index 0 next
+ * to — in fact instead of — the photo, so clicking the photo opened the PDF.
+ * Photos now live in their own space; documents, videos and datasets keep
+ * the original one, so every existing caller is unchanged.
+ */
+export type AttachmentSpace = 'file' | 'image';
+
+function heldKey(messageId: string, space: AttachmentSpace): string {
+  // NUL never occurs in a message id (uuids and `srv-<conv>-<n>`).
+  return space === 'image' ? `${messageId}\u0000image` : messageId;
+}
+
+/**
  * Keep the raw files of the attachments sent with `messageId`, in the order
- * they are rendered in.
+ * they are rendered in — documents by default, photos with `space: 'image'`.
  */
 export function rememberAttachmentFiles(
   messageId: string,
   files: Array<AttachmentBlob | null>,
+  space: AttachmentSpace = 'file',
 ): void {
-  if (files.some(Boolean)) held.set(messageId, files);
+  if (files.some(Boolean)) held.set(heldKey(messageId, space), files);
 }
 
 /** The file behind the Nth attachment of a message, while this tab lives. */
 export function attachmentFile(
   messageId: string,
   index: number,
+  space: AttachmentSpace = 'file',
 ): AttachmentBlob | null {
-  return held.get(messageId)?.[index] ?? null;
+  return held.get(heldKey(messageId, space))?.[index] ?? null;
 }
 
 /**
@@ -398,8 +476,10 @@ export function attachmentFile(
  * files have to follow it or the rewritten turn's card would go dead.
  */
 export function carryAttachmentFiles(fromId: string, toId: string): void {
-  const files = held.get(fromId);
-  if (files) held.set(toId, files);
+  for (const space of ['file', 'image'] as const) {
+    const files = held.get(heldKey(fromId, space));
+    if (files) held.set(heldKey(toId, space), files);
+  }
 }
 
 /* ----------------------------------------------------- what can be shown */
@@ -426,8 +506,21 @@ export type PreviewKind = 'image' | 'pdf' | 'text' | 'none';
  */
 export type ResolvedKind =
   | PreviewKind
+  /**
+   * 2026-10-02: a video or audio file, PLAYED from the server by URL
+   * (`ResolvedAttachment.url`) and never fetched as bytes — see
+   * `streamedPlayerFor`. Not a `PreviewKind`: those are decided from bytes,
+   * and a player never holds the file.
+   */
+  | MediaKind
   | 'unavailable'
   | 'expired'
+  /**
+   * 2026-10-02: a stored photo the server has no file for any more (its
+   * route answered 404/410). Not `expired` — photos do not expire — and not
+   * `unavailable`, whose sentence blames this browser session.
+   */
+  | 'missing'
   /** The dialog is open and the bytes are still on their way. */
   | 'loading';
 
@@ -652,6 +745,11 @@ export interface ResolvedAttachment {
   blob: Blob | null;
   size: number | null;
   kind: ResolvedKind;
+  /**
+   * 2026-10-02: the same-origin URL a `video` or `audio` player streams
+   * from. Set for those two kinds only; every other kind renders from `blob`.
+   */
+  url?: string;
 }
 
 /* --------------------------------------------------------- the server tier
@@ -675,6 +773,37 @@ export interface UploadRef {
 /** Where the Phase 3 proxy lives. Same-origin; the cookie rides automatically. */
 export function uploadFileUrl(ref: UploadRef): string {
   return `/api/uploads/${encodeURIComponent(ref.conversationId)}/${encodeURIComponent(ref.uploadId)}/file`;
+}
+
+/**
+ * 2026-10-02 (chat media, CONTRACT §10): a sent video or audio file, as a
+ * player the preview dialog draws — or null when this is not media, or the
+ * server holds no copy of it yet (no upload id).
+ *
+ * Opening one used to DOWNLOAD it: the ladder below fetched the whole file
+ * into a Blob (a video may be 4 GB), only for the dialog to say "Preview is
+ * not available for this file type", on the sending device and every other
+ * one. Nothing is fetched here at all. The player is handed the streaming
+ * proxy's URL and asks for byte ranges itself as it plays and seeks
+ * (app/api/uploads/.../file relays the 206s).
+ *
+ * The URL is same-origin because it has to be: the page's CSP has no
+ * `media-src`, so media falls back to `default-src 'self'`, which admits this
+ * route and refuses a `blob:` URL (lib/csp.ts). A player over an object URL
+ * would not even start.
+ *
+ * Audio travels on the video rail (`kind: 'video'` in meta, B12), so which
+ * player is decided by the NAME; a nameless file, or an extension the list
+ * does not know, on a row the rail marked `video` is still a video.
+ */
+export function streamedPlayerFor(
+  name: string,
+  upload: UploadRef | null | undefined,
+  railKind?: string,
+): ResolvedAttachment | null {
+  const media = mediaKindFor(name) ?? (railKind === 'video' ? 'video' : null);
+  if (!media || !upload) return null;
+  return { name, mime: '', blob: null, size: null, kind: media, url: uploadFileUrl(upload) };
 }
 
 /** `expired` is its own outcome: the row is real, the bytes are swept. */
@@ -719,9 +848,9 @@ export async function fetchUploadBlob(
 export function resolveAttachment(
   messageId: string,
   index: number,
-  fallback?: { name?: string; dataUrl?: string },
+  fallback?: { name?: string; dataUrl?: string; space?: AttachmentSpace },
 ): ResolvedAttachment {
-  const stored = attachmentFile(messageId, index);
+  const stored = attachmentFile(messageId, index, fallback?.space);
   if (stored) {
     return {
       name: stored.name,
@@ -751,7 +880,8 @@ export function resolveAttachment(
  *   1. the File this tab still holds        (instant, any format)
  *   2. the payload the message persists     (images: the preview IS the bytes)
  *   3. the orchestrator, by upload_id       (datasets, any device, until TTL)
- *   4. unavailable / expired                (an honest sentence, not a guess)
+ *      or, for a photo, its stored original (`media`, any device, 2026-10-02)
+ *   4. unavailable / expired / missing      (an honest sentence, not a guess)
  *
  * Async because only step 3 is, and steps 1-2 still return without awaiting
  * anything. Callers that cannot await (a render pass) must keep using the
@@ -760,10 +890,32 @@ export function resolveAttachment(
 export async function resolveAttachmentAsync(
   messageId: string,
   index: number,
-  fallback?: { name?: string; dataUrl?: string; upload?: UploadRef | null },
+  fallback?: {
+    name?: string;
+    dataUrl?: string;
+    upload?: UploadRef | null;
+    /** 2026-10-02: a photo the server stores, read at full size. */
+    media?: MediaRef | null;
+    space?: AttachmentSpace;
+  },
   signal?: AbortSignal,
 ): Promise<ResolvedAttachment> {
   const local = resolveAttachment(messageId, index, fallback);
+  if (local.kind === 'unavailable' && fallback?.media) {
+    const outcome = await fetchChatMediaBlob(fallback.media, 'full', signal);
+    if (outcome.status === 'missing') return { ...local, kind: 'missing' };
+    if (outcome.status === 'unavailable') return local;
+    // The server stores only verified rasters, so its type is a fact here;
+    // anything else is shown as the honest "no preview" card, never sniffed.
+    const mime = normaliseMime(outcome.blob.type);
+    return {
+      name: local.name,
+      mime,
+      blob: outcome.blob,
+      size: outcome.blob.size,
+      kind: IMAGE_MIME.has(mime) ? 'image' : 'none',
+    };
+  }
   if (local.kind !== 'unavailable' || !fallback?.upload) return local;
 
   const outcome = await fetchUploadBlob(fallback.upload, signal);
@@ -788,9 +940,11 @@ export async function resolveAttachmentAsync(
 /**
  * The upload this message's Nth attachment came from, when it has one.
  *
- * Only datasets ever get an id — an image or a PDF travels inside the chat
- * request and leaves no upload row — so this returns null for everything else,
- * and the ladder above simply stops one rung earlier.
+ * Documents, videos and datasets get an id once their upload lands; a photo
+ * never does (it is stored by the chat-media route and found through
+ * `meta.images` instead), so `index` here counts among `meta.attachments`
+ * only — never among the photos (RC-3a). No id, no rung: the ladder above
+ * simply stops one step earlier.
  */
 export function uploadRefFor(
   conversationId: string | null | undefined,
@@ -802,6 +956,37 @@ export function uploadRefFor(
   const att = message.meta?.attachments?.[index];
   if (!conversationId || !att?.id) return null;
   return { conversationId, uploadId: att.id };
+}
+
+/**
+ * RC-3c (2026-10-02): `messages` with ONE attachment entry patched, found by
+ * its `attachment_id` — on whichever user turn carries it, wherever that turn
+ * now sits. The SAME array when no entry matches.
+ *
+ * Built for an upload that lands in the background, after the send has
+ * moved on. Such a callback used to re-save the turn list it captured at
+ * send — which by then had no answer in it — so a late landing shrank the
+ * thread: the history PUT was refused (409), the store adopted the server's
+ * copy, and the upload id it had come to record was lost. The caller now
+ * reads the LATEST stored thread and patches only the entry that is its own.
+ */
+export function withAttachmentPatched(
+  messages: ChatMessage[],
+  attachmentId: string,
+  patch: Partial<MessageAttachment>,
+): ChatMessage[] {
+  let changed = false;
+  const out = messages.map((m) => {
+    if (changed || m.role !== 'user') return m;
+    const entries = m.meta?.attachments;
+    const at = entries?.findIndex((a) => a.attachment_id === attachmentId) ?? -1;
+    if (!entries || at === -1) return m;
+    changed = true;
+    const next = entries.slice();
+    next[at] = { ...entries[at], ...patch };
+    return { ...m, meta: { ...m.meta, attachments: next } };
+  });
+  return changed ? out : messages;
 }
 
 /* ==========================================================================
@@ -978,6 +1163,8 @@ export const INTERNAL_ATTACHMENT_MIME = 'application/x-techsara-attachment';
 export interface InternalAttachmentRef {
   messageId: string;
   index: number;
+  /** RC-3a: a photo's index counts among the photos (see AttachmentSpace). */
+  space?: 'image';
 }
 
 /** Put a sent attachment onto a drag. Returns false if the drag can't take it. */
@@ -1010,7 +1197,7 @@ export function readInternalAttachment(
   try {
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== 'object') return null;
-    const { messageId, index } = parsed as Record<string, unknown>;
+    const { messageId, index, space } = parsed as Record<string, unknown>;
     // Both are used to index our own in-memory store, so both are validated
     // rather than trusted: this string arrives from a DataTransfer, and a page
     // does not get to assume it wrote everything it reads.
@@ -1018,7 +1205,7 @@ export function readInternalAttachment(
     if (typeof index !== 'number' || !Number.isInteger(index) || index < 0) {
       return null;
     }
-    return { messageId, index };
+    return space === 'image' ? { messageId, index, space } : { messageId, index };
   } catch {
     return null;
   }

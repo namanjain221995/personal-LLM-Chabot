@@ -26,6 +26,7 @@ import {
 } from 'react';
 import type { ChatPrefs } from '@/lib/prefs';
 import { downscaleImageFile } from '@/lib/images';
+import { measureDataUrl } from '@/lib/chatMedia';
 import {
   applySlashCommand,
   completeCommand,
@@ -218,6 +219,14 @@ export interface Attachment {
   dataUrl: string;
   /** Raw base64 payload (no data: prefix) — what POST /chat expects. */
   base64: string;
+  /**
+   * 2026-10-02 (chat media): an image's pixel size AS SENT, recorded on the
+   * turn's `meta.images` so another device can reserve the thumbnail's box
+   * before a byte arrives. Known at once for a downscaled image; measured
+   * just after attaching otherwise, and simply absent if a send beats it.
+   */
+  width?: number;
+  height?: number;
   /**
    * The original browser File.
    *
@@ -967,7 +976,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         file.name && file.name.trim()
           ? file.name
           : `pasted-image-${Date.now()}.${imageExtFromMime(file.type)}`;
-      const attach = (dataUrl: string) => {
+      const attach = (dataUrl: string, size?: { width: number; height: number }) => {
         const att: Attachment = {
           clientId: newClientId(),
           attachment_id: newAttachmentId(),
@@ -979,6 +988,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           // NEW-09: kept so the card on the sent message can be opened. The
           // request payload above is unchanged.
           file,
+          ...(size ?? {}),
         };
         setAttachments((prev) => {
           // Documents stack to MAX_DOCS, images to MAX_IMAGES, and since
@@ -992,6 +1002,16 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           if (same.length >= cap) return prev; // raced past the cap
           return [...kept, att];
         });
+        if (!isPdf && !size) {
+          // Measured AFTER the chip exists, so a send is never held up by it:
+          // the size only lets another device draw the bubble without a jump.
+          void measureDataUrl(dataUrl).then((measured) => {
+            if (!measured) return;
+            setAttachments((prev) =>
+              prev.map((a) => (a.clientId === att.clientId ? { ...a, ...measured } : a)),
+            );
+          });
+        }
       };
       const readOriginal = () =>
         new Promise<string>((resolve, reject) => {
@@ -1011,7 +1031,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       void (async () => {
         try {
           const scaled = isPdf ? null : await downscaleImageFile(file);
-          attach(scaled ? scaled.dataUrl : await readOriginal());
+          if (scaled) {
+            attach(scaled.dataUrl, { width: scaled.width, height: scaled.height });
+          } else {
+            attach(await readOriginal());
+          }
         } catch {
           try {
             attach(await readOriginal());

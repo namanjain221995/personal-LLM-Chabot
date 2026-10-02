@@ -181,6 +181,13 @@ def workspace_copy(conv: str, upload_id: str) -> Path:
     return Path(upload_root(conv, upload_id))
 
 
+def lasting_copy(conv: str, upload_id: str) -> Path:
+    """The upload's lasting copy's directory (CONTRACT §9, 2026-10-02)."""
+    from app.uploads import lasting_path
+
+    return Path(lasting_path(conv, upload_id)).parent
+
+
 # ----------------------------------------------------------- authentication --
 
 
@@ -401,6 +408,11 @@ def test_an_archive_sent_as_a_document_keeps_its_contents_text(login_client):
     assert fresh[0]["can"]["preview"] == "text"
     assert fresh[0]["text_name"] == "export.zip (archive contents)"
     shutil.rmtree(workspace_copy(conv, upload_id))
+    # The archive's lasting copy (2026-10-02) still answers the download.
+    kept = every(alice)[0]
+    assert kept[0]["availability"] == "available"
+    assert kept[0]["can"] == {"download": True, "preview": "text", "delete": False}
+    shutil.rmtree(lasting_copy(conv, upload_id))
     swept = every(alice)[0]
     assert swept[0]["availability"] == "text_only"
     assert swept[0]["can"] == {"download": False, "preview": "text", "delete": False}
@@ -513,6 +525,10 @@ def test_availability_follows_what_is_really_stored(login_client):
 
     for swept in (swept_with_text, swept_bare, table_swept, video_store_only, video_gone):
         shutil.rmtree(workspace_copy(conv, swept))
+    # These three stand for uploads with no lasting copy (made before
+    # 2026-10-02, or below the free-space floor); the archive keeps its own.
+    for swept in (swept_with_text, swept_bare, table_swept):
+        shutil.rmtree(lasting_copy(conv, swept))
     gone_hash = db.get_video_by_upload(conv, video_gone)["content_hash"]
     from app.video import store
 
@@ -526,7 +542,8 @@ def test_availability_follows_what_is_really_stored(login_client):
         "swept-bare.pdf": "expired",
         "table.csv": "available",
         "table-swept.csv": "summary_only",
-        "archive.zip": "summary_only",
+        # Its workspace original goes at extraction; the lasting copy stays.
+        "archive.zip": "available",
         "kept.mp4": "available",
         "store-only.mp4": "available",
         "gone.mp4": "expired",
@@ -535,7 +552,7 @@ def test_availability_follows_what_is_really_stored(login_client):
     assert listed["swept-text.pdf"]["can"] == {"download": False, "preview": "text", "delete": False}
     assert listed["swept-bare.pdf"]["can"] == {"download": False, "preview": None, "delete": False}
     assert listed["table-swept.csv"]["can"] == {"download": False, "preview": "summary", "delete": False}
-    assert listed["archive.zip"]["can"]["download"] is False
+    assert listed["archive.zip"]["can"]["download"] is True
     assert listed["store-only.mp4"]["can"]["download"] is True
     assert listed["kept.mp4"]["media"]["status"] == "queued"
     assert listed["present.pdf"]["media"] is None
@@ -889,7 +906,8 @@ def test_the_retention_block_reports_the_deployment(login_client, monkeypatch):
         "recording_days": 30,
         "video_kept_with_chat": True,
         "video_grace_hours": 72,
-        "pictures": "browser_only",
+        "files_kept_with_chat": True,
+        "pictures": "kept_with_chat",
         "picture_memory_hours": 2,
     }
     assert alice.get("/files/mine/summary").json()["retention"] == retention

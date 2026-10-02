@@ -47,10 +47,206 @@ def upload_root(conversation_id: str, upload_id: str) -> str:
     return os.path.join(settings.workspace_dir, "uploads", safe_conv, upload_id)
 
 
+#: The lasting copy's name inside <CHAT_FILES_DIR>/<conversation>/<upload>/.
+#: Never the person's file name: that stays in the uploads row, and the
+#: download routes serve the copy under it.
+_LASTING_NAME = "original"
+
+
+def lasting_path(conversation_id: str, upload_id: str) -> Optional[str]:
+    """Where an upload's lasting original lives (docs/chat-media/CONTRACT.md
+    §9), or None for an id that cannot name one. Both ids are checked against
+    their shapes before they become path components, so nothing outside
+    CHAT_FILES_DIR can be named."""
+    if not _CONVERSATION_ID_RE.fullmatch(conversation_id or ""):
+        return None
+    if not _HEX32.fullmatch(upload_id or ""):
+        return None
+    return os.path.join(settings.chat_files_dir, conversation_id, upload_id, _LASTING_NAME)
+
+
+def lasting_free_bytes() -> Optional[int]:
+    """Free space on the filesystem that holds CHAT_FILES_DIR (its nearest
+    existing ancestor before the first copy), or None when it cannot be
+    measured. chat_media.has_room() measures CHAT_MEDIA_DIR, which may sit on
+    another filesystem."""
+    probe = settings.chat_files_dir
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        return int(shutil.disk_usage(probe or "/").free)
+    except OSError:
+        return None
+
+
+def lasting_has_room() -> bool:
+    """Above the CHAT_MEDIA_MIN_FREE_GIB floor. Unmeasurable counts as room,
+    as in chat_media.has_room: the copy itself then fails and is counted."""
+    free = lasting_free_bytes()
+    floor = int(float(settings.chat_media_min_free_gib) * 1024 ** 3)
+    return free is None or free >= floor
+
+
+def _count_lasting(purpose: str, result: str) -> None:
+    from . import metrics
+
+    metrics.inc(
+        "chat_files_lasting_total",
+        "uploads: lasting copies of document and dataset originals, by outcome",
+        purpose=purpose,
+        result=result,
+    )
+
+
+def _unlink_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def keep_lasting_copy(
+    conversation_id: str, upload_id: str, raw_path: str, purpose: str
+) -> Optional[str]:
+    """Keep an upload's original for the life of its chat (CONTRACT §9):
+    <CHAT_FILES_DIR>/<conversation>/<upload>/original, a HARD LINK to the
+    workspace copy (one filesystem in production, /data: no bytes are
+    written, and the 24 h sweep only drops the other link), or a fsynced copy
+    when a link is refused (another filesystem). Returns the path, or None.
+
+    Blocking: the finalisers run it through asyncio.to_thread. Never raises.
+    Below the free-space floor nothing is kept and the upload behaves as it
+    did before (gone with the workspace sweep). Each outcome is counted in
+    chat_files_lasting_total{purpose,result}.
+    """
+    dest = lasting_path(conversation_id, upload_id)
+    if dest is None:
+        return None
+    if not lasting_has_room():
+        _count_lasting(purpose, "no_space")
+        return None
+    tmp = dest + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
+        _unlink_quietly(tmp)
+        try:
+            os.link(raw_path, tmp)
+        except OSError:
+            shutil.copyfile(raw_path, tmp)
+            with open(tmp, "rb") as fh:
+                os.fsync(fh.fileno())
+        os.replace(tmp, dest)
+    except OSError:
+        log.warning("could not keep a lasting copy of an upload", exc_info=True)
+        _unlink_quietly(tmp)
+        _count_lasting(purpose, "error")
+        return None
+    _count_lasting(purpose, "stored")
+    return dest
+
+
+def lasting_file(conversation_id: str, upload_id: str):
+    """The lasting copy as a Path when it is on disk, else None. Blocking."""
+    from pathlib import Path
+
+    path = lasting_path(conversation_id, upload_id)
+    if path is None or not os.path.isfile(path):
+        return None
+    return Path(path)
+
+
+async def kept_original(conversation_id: str, upload_id: str, notes: Optional[str]):
+    """Where an upload's bytes are once its workspace copy is gone: the
+    lasting copy (documents, datasets), then, for a row the video rail wrote,
+    the analysis store. A Path, or None. Callers have already settled
+    ownership and the (conversation, upload) scoping; the member's download
+    and the admin download share this so the two never disagree."""
+    found = await asyncio.to_thread(lasting_file, conversation_id, upload_id)
+    if found is not None:
+        return found
+    if notes == "video":
+        return await _video_source(conversation_id, upload_id)
+    return None
+
+
+def erase_conversation_files(conversation_id: str) -> bool:
+    """Remove a deleted chat's upload bytes now: <CHAT_FILES_DIR>/<conv>, the
+    lasting copies of its document and dataset originals
+    (docs/chat-media/CONTRACT.md §8-9), and <WORKSPACE_DIR>/uploads/<conv>,
+    the workspace copies. A lasting copy is a hard link to the workspace
+    file, so removing it alone would leave the same bytes on disk until the
+    24 h sweep.
+
+    Called by history.py after the chat's rows are gone, in a worker thread.
+    Best effort: a failure is logged and counted (chat_media_erase_total
+    {store="files"}), returns False, and the reaper (lasting copies) or the
+    workspace sweep (workspace copies) removes the rest later. The id is
+    checked against the conversation-id shape before it becomes a path, so
+    nothing outside either root can be named.
+    """
+    from . import metrics
+
+    if not _CONVERSATION_ID_RE.fullmatch(conversation_id or ""):
+        return False
+    paths = (
+        os.path.join(settings.chat_files_dir, conversation_id),
+        os.path.join(settings.workspace_dir, "uploads", conversation_id),
+    )
+    try:
+        for path in paths:
+            try:
+                shutil.rmtree(path)
+            except FileNotFoundError:
+                pass
+    except OSError:
+        log.warning("could not erase a deleted chat's lasting files", exc_info=True)
+        metrics.inc(
+            "chat_media_erase_total",
+            "chat deletion: stored bytes removed at once, by store",
+            store="files",
+            result="error",
+        )
+        return False
+    metrics.inc(
+        "chat_media_erase_total",
+        "chat deletion: stored bytes removed at once, by store",
+        store="files",
+        result="ok",
+    )
+    return True
+
+
 def bytes_available(conversation_id: str, upload_id: str) -> bool:
     """True while the extracted files still exist (TTL has not swept them)."""
     root = upload_root(conversation_id, upload_id)
     return os.path.isdir(root) and any(os.scandir(root))
+
+
+#: The longest stored file name, in bytes: Linux's NAME_MAX (255) less room
+#: for the chunked rail's `<name>.assembling` temp file (_assemble).
+_NAME_MAX_BYTES = 240
+
+
+def _upload_filename(raw: Optional[str]) -> str:
+    """The name an upload is stored under: the basename of what the browser
+    sent, made safe for the filesystem. An empty name, "." or ".." (a
+    `dir/` or `..` upload landed on the directory itself) becomes
+    "upload.bin"; a name over _NAME_MAX_BYTES (ENAMETOOLONG) keeps its
+    extension and loses the end of its stem. Until this both answered 500."""
+    name = os.path.basename(raw or "")
+    if name in ("", ".", ".."):
+        return "upload.bin"
+    if len(name.encode("utf-8", "surrogateescape")) > _NAME_MAX_BYTES:
+        stem, ext = os.path.splitext(name)
+        if len(ext.encode("utf-8", "surrogateescape")) > 32:
+            stem, ext = name, ""
+        budget = _NAME_MAX_BYTES - len(ext.encode("utf-8", "surrogateescape"))
+        stem = stem.encode("utf-8", "surrogateescape")[:budget].decode("utf-8", "ignore")
+        name = (stem or "upload") + ext
+    return name
 
 
 async def _stream_to_disk(upload: UploadFile, dest: str) -> int:
@@ -204,7 +400,7 @@ async def _create_upload_from_form(request: Request, form, user: UserRow) -> dic
 
     upload_id = uuid.uuid4().hex
     root = upload_root(conversation_id, upload_id)
-    filename = os.path.basename(file.filename or "upload.bin")
+    filename = _upload_filename(file.filename)
     raw_path = os.path.join(root, "_original", filename)
 
     try:
@@ -281,10 +477,17 @@ async def _finalise_document(
     conversation_id: str, upload_id: str, filename: str, size: int
 ) -> dict:
     """A document keeps its original bytes; extraction is prewarmed behind
-    the response (2026-09-03) so the next send reads a cache."""
+    the response (2026-09-03) so the next send reads a cache. The original
+    also gets its lasting copy (CONTRACT §9), so the chat can still open it
+    on any device after the workspace sweep."""
     await db.run_in_thread(
         db.save_upload,
         upload_id, conversation_id, filename, size, "ready", None, "document",
+    )
+    await asyncio.to_thread(
+        keep_lasting_copy, conversation_id, upload_id,
+        os.path.join(upload_root(conversation_id, upload_id), "_original", filename),
+        "document",
     )
     _schedule_prewarm(conversation_id, upload_id, filename, size)
     return {
@@ -374,7 +577,11 @@ async def _finalise_dataset(
             status_code=400, detail="That file could not be read as a dataset."
         )
 
-    # The original archive is not needed once extracted; drop it to save quota.
+    # The original is kept for the life of the chat (CONTRACT §9) BEFORE the
+    # workspace copy goes: the lasting copy is a hard link, so dropping
+    # `_original` below only removes the link the quota counts.
+    await asyncio.to_thread(keep_lasting_copy, conversation_id, upload_id, raw_path, "dataset")
+    # The workspace's original is not needed once extracted; drop it to save quota.
     shutil.rmtree(os.path.join(root, "_original"), ignore_errors=True)
 
     await db.run_in_thread(
@@ -440,9 +647,15 @@ async def download_upload(
             settings.workspace_dir, conversation_id, upload_id, filename
         )
     except UploadPathError:
-        # A malformed id cannot name a real row, so this is effectively
-        # unreachable — and it stays a 404 rather than leaking the distinction.
-        raise HTTPException(status_code=404, detail="upload not found")
+        # Both ids are a real row's, so only the NAME can be refused here: a
+        # leading dot (".env") or a backslash, which the upload itself
+        # accepts. The lasting copy is named `original` and never needs the
+        # name, so it serves such a file; without one this stays the 404 it
+        # always was.
+        stored = await kept_original(conversation_id, upload_id, row.get("notes"))
+        if stored is None:
+            raise HTTPException(status_code=404, detail="upload not found")
+        path = stored
 
     if not path.is_file():
         # DOCUMENTS keep their bytes in `_original`, not `extracted` — the
@@ -456,23 +669,24 @@ async def download_upload(
         if original.is_file():
             path = original
 
-    if not path.is_file() and row.get("notes") == "video":
-        # A VIDEO (or an audio file on the video rail) is also hard-linked into
-        # the analysis store, where it stays while any chat links it
-        # (video/store.adopt_source). The workspace copy is swept after
-        # WORKSPACE_TTL_HOURS, and until 2026-09-30 this route then answered
-        # 410 for bytes that were still on disk. Ownership and the
-        # (conversation, upload) scoping were settled above; the link row is
+    if not path.is_file():
+        # The workspace copy is swept after WORKSPACE_TTL_HOURS. Two stores
+        # outlive it (kept_original): a document's or dataset's LASTING copy
+        # under CHAT_FILES_DIR, kept for the life of the chat (2026-10-02,
+        # docs/chat-media/CONTRACT.md §9), and, for a VIDEO (or an audio file
+        # on the video rail), the analysis store it is hard-linked into while
+        # any chat links it (video/store.adopt_source; until 2026-09-30 this
+        # route answered 410 for those bytes). Ownership and the
+        # (conversation, upload) scoping were settled above; both stores are
         # looked up by that same pair.
-        stored = await _video_source(conversation_id, upload_id)
+        stored = await kept_original(conversation_id, upload_id, row.get("notes"))
         if stored is not None:
             path = stored
 
     if not path.is_file():
-        # Two ways to get here, and the user can act on both the same way.
-        # Either the workspace TTL swept the files, or this upload was a
-        # DATASET ARCHIVE: the dataset finaliser deletes `_original` once it
-        # has extracted the members, so the .zip the user chose is not kept.
+        # The workspace TTL swept the files and no lasting copy was kept: an
+        # upload from before lasting copies, one made below the free-space
+        # floor (CHAT_MEDIA_MIN_FREE_GIB), or a video no chat links any more.
         raise HTTPException(
             status_code=410,
             detail=(
@@ -484,9 +698,14 @@ async def download_upload(
     # NEVER the type the browser declared at upload time — that value is
     # attacker-chosen. Guessed from the stored name, defaulting to a type no
     # browser will render, and served as an attachment (nosniff is set by the
-    # frontend for every response it proxies).
+    # frontend for every response it proxies). Starlette's FileResponse
+    # answers a Range request itself (206 + content-range, 416 past the end,
+    # If-Range), which the <video>/<audio> players need to seek; pinned in
+    # tests/test_chat_files.py.
     media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    return FileResponse(path, filename=filename, media_type=media_type)
+    return FileResponse(
+        path, filename=os.path.basename(filename) or "download", media_type=media_type
+    )
 
 
 async def _video_source(conversation_id: str, upload_id: str):
@@ -570,9 +789,15 @@ def list_uploads(
     if owner is None or owner != int(user["id"]):
         raise HTTPException(status_code=404, detail="conversation not found")
     uploads = db.get_uploads(conversation_id)
-    # Report expiry rather than pretending the bytes are still there.
+    # Report expiry rather than pretending the bytes are still there. A
+    # lasting copy (CONTRACT §9) is the bytes still being there: the file
+    # route serves it, so the workbook preview must not call it gone.
     for up in uploads:
-        if up["status"] == "ready" and not bytes_available(conversation_id, up["id"]):
+        if (
+            up["status"] == "ready"
+            and not bytes_available(conversation_id, up["id"])
+            and lasting_file(conversation_id, up["id"]) is None
+        ):
             up["status"] = "expired"
     return {"uploads": uploads}
 
@@ -667,7 +892,7 @@ async def _own(conversation_id: str, user: UserRow) -> None:
         raise HTTPException(status_code=422, detail="invalid conversation id")
     owner = await db.run_in_thread(db.conversation_owner, conversation_id)
     if owner is None:
-        if not _CONVERSATION_ID_RE.match(conversation_id or ""):
+        if not _CONVERSATION_ID_RE.fullmatch(conversation_id or ""):
             raise HTTPException(status_code=422, detail="invalid conversation id")
         try:
             await db.run_in_thread(
@@ -997,7 +1222,7 @@ async def chunked_init(
     session = await db.run_in_thread(
         db.create_upload_session,
         upload_id, int(user["id"]), conversation_id,
-        os.path.basename(filename or "upload.bin"), purpose,
+        _upload_filename(filename), purpose,
         expected_bytes=size, expected_parts=parts, part_size=part_size,
         ttl_hours=settings.upload_session_ttl_hours,
     )
@@ -1251,7 +1476,7 @@ async def _finalise_session(conversation_id: str, upload_id: str, user: UserRow)
     if session is None:
         raise HTTPException(status_code=404, detail="upload not found")
     purpose = session["purpose"]
-    filename = os.path.basename(session["filename"] or "upload.bin")
+    filename = _upload_filename(session["filename"])
     root = upload_root(conversation_id, upload_id)
     present = await asyncio.to_thread(_present_parts, session, root)
 
@@ -1402,4 +1627,125 @@ def sweep_expired_upload_sessions(limit: int = 50) -> int:
         )
         _count_session(str(session["purpose"]), "expired")
         swept += 1
+    # NOT the lasting-copy reaper: this function also runs inside upload
+    # requests (_sweep_quietly), and a reaper pass is one query per chat
+    # directory (1.2 s for 3000 chats, paid by one person's upload). main.py's
+    # _upload_session_sweep_loop runs maybe_reap_lasting_files after this.
     return swept
+
+
+# ------------------------------------------------------ lasting-copy reaper
+# CONTRACT §8-9: a lasting copy whose chat is gone (deleted, or its account
+# deleted: conversations cascade) or whose uploads row is gone, past
+# CHAT_MEDIA_ORPHAN_GRACE_H, is removed. The delete route erases a chat's
+# copies at once (erase_conversation_files); this is the backstop for an
+# erase that failed and for a crash between a copy and its row. The grace
+# also covers the moment between a copy and its uploads row.
+
+#: time.monotonic() before which this process runs no further pass; 0 means
+#: the first pass of main.py's upload-session sweep loop (ten minutes after
+#: start-up) runs one. Never called from a request.
+_LASTING_REAP_DUE = 0.0
+
+
+def _newest_mtime(path: str) -> float:
+    """The newest mtime of a directory and its direct entries, never
+    following a link (a directory's own mtime moves only when an entry is
+    added or removed)."""
+    newest = 0.0
+    try:
+        newest = os.stat(path, follow_symlinks=False).st_mtime
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return newest
+
+
+def _live_upload_ids(conversation_id: str) -> set:
+    """Ids of this chat's uploads rows while the chat itself exists; empty
+    once the conversations row is gone. A database error propagates: the
+    pass stops rather than remove anything on a guess."""
+    with db.read_connection() as con:
+        rows = con.execute(
+            "SELECT u.id FROM uploads u JOIN conversations c ON c.id = u.conversation_id "
+            "WHERE u.conversation_id = %s",
+            (conversation_id,),
+        ).fetchall()
+    return {r["id"] for r in rows}
+
+
+def reap_lasting_files() -> int:
+    """One pass over CHAT_FILES_DIR; returns how many upload directories it
+    removed. Synchronous (the session sweep runs in a thread; tests call it).
+
+    Only names this module makes are judged (<conversation-id shape>/<32
+    hex>), only real directories (never a symbolic link, so nothing outside
+    the root is reached), and only past the grace. The database is asked
+    once per chat directory that has a candidate old enough, never per file.
+    """
+    from . import metrics
+
+    root = settings.chat_files_dir
+    if not os.path.isdir(root):
+        return 0
+    grace_s = float(settings.chat_media_orphan_grace_h) * 3600.0
+    now = time.time()
+    removed = 0
+    with os.scandir(root) as entries:
+        chats = [
+            e for e in entries
+            if e.is_dir(follow_symlinks=False) and _CONVERSATION_ID_RE.fullmatch(e.name)
+        ]
+    for chat in chats:
+        try:
+            with os.scandir(chat.path) as entries:
+                kept = [
+                    e for e in entries
+                    if e.is_dir(follow_symlinks=False) and _HEX32.fullmatch(e.name)
+                ]
+        except OSError:
+            continue
+        stale = [e for e in kept if now - _newest_mtime(e.path) >= grace_s]
+        if stale:
+            live = _live_upload_ids(chat.name)
+            for entry in stale:
+                if entry.name in live:
+                    continue
+                try:
+                    shutil.rmtree(entry.path)
+                    removed += 1
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    log.warning("the lasting-copy reaper could not remove a directory", exc_info=True)
+        if now - _newest_mtime(chat.path) >= grace_s:
+            try:
+                os.rmdir(chat.path)
+            except OSError:
+                pass  # not empty, or already gone
+    for _ in range(removed):
+        metrics.inc("chat_media_reaped_total", "chat media: orphans the reaper removed", kind="dir")
+    return removed
+
+
+def maybe_reap_lasting_files() -> int:
+    """reap_lasting_files at most once per CHAT_MEDIA_REAP_INTERVAL_S in this
+    process. Never raises: a failed pass is logged and the next one runs."""
+    global _LASTING_REAP_DUE
+    now = time.monotonic()
+    if now < _LASTING_REAP_DUE:
+        return 0
+    _LASTING_REAP_DUE = now + float(settings.chat_media_reap_interval_s)
+    try:
+        removed = reap_lasting_files()
+    except Exception:  # noqa: BLE001 — housekeeping; the next pass retries
+        log.warning("lasting-copy reaper pass failed", exc_info=True)
+        return 0
+    if removed:
+        log.info("reaped %d orphan lasting upload copy(ies)", removed)
+    return removed

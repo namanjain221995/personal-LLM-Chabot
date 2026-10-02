@@ -42,6 +42,29 @@ export interface CachePersister {
   put(conversations: Conversation[]): void | Promise<void>;
   remove(ids: string[]): void | Promise<void>;
   clear(): void | Promise<void>;
+  /**
+   * 2026-10-02 (chat media backfill): the photo data URLs this persister
+   * holds for ONE conversation, by message index. Read straight from the
+   * `images` store, because the in-memory copy loses them whenever a server
+   * read replaces the thread (a hydrate carries no browser-only fields) while
+   * the write-once records stay on disk — and "this browser still holds the
+   * photo" is exactly the question the backfill asks. Each entry says which
+   * turn it was written for (`boundTo`), so the caller can refuse one that a
+   * replaced thread left under a different turn. Optional: a persister that
+   * keeps no separate image records (the legacy blob) has nothing to add to
+   * what the cache already shows.
+   */
+  loadImages?(convId: string): Promise<Map<number, HeldImageRecord>>;
+}
+
+/** One `images` record as `loadImages` hands it out. */
+export interface HeldImageRecord {
+  urls: string[];
+  /**
+   * `turnFingerprint` of the message the record was written for, or absent
+   * for a record written before records carried one (see ImageRecord.fp).
+   */
+  boundTo?: string;
 }
 
 interface ImageRecord {
@@ -50,6 +73,34 @@ interface ImageRecord {
   convId: string;
   single?: string;
   multi?: string[];
+  /**
+   * 2026-10-02: `turnFingerprint` of the message these photos were written
+   * with. The key is only an INDEX, and a record is write-once and dropped
+   * only past the thread's end — so when a thread is replaced under it (a
+   * 409 adopting another device's copy, an old truncate-then-regrow), the
+   * record survives under whatever turn now sits at that index. Before the
+   * server stored photos that was a local display slip; the backfill would
+   * upload it and write it into that unrelated turn on every device. A record
+   * whose fingerprint no longer matches its index is ignored. Absent on
+   * records written before this field existed.
+   */
+  fp?: string;
+}
+
+/**
+ * Which turn a photo record belongs to: its role and its exact words — the
+ * same identity `threadReconcile.withStoredImages` matches a turn by. A sent
+ * message's words never change (an edit is a new message), and the server
+ * stores them verbatim, so a hydrate reproduces the same fingerprint.
+ */
+export function turnFingerprint(m: Pick<ChatMessage, 'role' | 'content'>): string {
+  const text = typeof m.content === 'string' ? m.content : '';
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return `${m.role}:${text.length}:${(h >>> 0).toString(36)}`;
 }
 
 function hasImages(m: ChatMessage): boolean {
@@ -190,6 +241,8 @@ export function createIdbPersister(
             conv.messages = conv.messages.map((m, i) => {
               const rec = forConv.get(i);
               if (!rec) return m;
+              // Written for another turn that once sat at this index.
+              if (rec.fp !== undefined && rec.fp !== turnFingerprint(m)) return m;
               return {
                 ...m,
                 ...(rec.single !== undefined ? { imageDataUrl: rec.single } : {}),
@@ -226,7 +279,7 @@ export function createIdbPersister(
           conv.messages.forEach((m, i) => {
             const key = `${conv.id}#${i}`;
             if (!hasImages(m) || existing.has(key)) return;
-            const rec: ImageRecord = { key, convId: conv.id };
+            const rec: ImageRecord = { key, convId: conv.id, fp: turnFingerprint(m) };
             if (m.imageDataUrl !== undefined) rec.single = m.imageDataUrl;
             if (m.imageDataUrls !== undefined) rec.multi = m.imageDataUrls;
             imgStore.put(rec);
@@ -243,6 +296,28 @@ export function createIdbPersister(
         fail(err);
         return fallback.put(conversations);
       }
+    },
+
+    async loadImages(convId) {
+      const out = new Map<number, HeldImageRecord>();
+      if (broken) return out;
+      try {
+        const db = await openDb();
+        const tx = db.transaction(IMAGE_STORE, 'readonly');
+        const records = (await requestDone(
+          tx.objectStore(IMAGE_STORE).getAll(imageRange(convId)) as IDBRequest<ImageRecord[]>,
+        )) as ImageRecord[];
+        for (const rec of records) {
+          const idx = Number(rec.key.slice(convId.length + 1));
+          if (!Number.isInteger(idx) || rec.convId !== convId) continue;
+          const urls = rec.multi?.length ? rec.multi : rec.single ? [rec.single] : [];
+          if (urls.length) out.set(idx, rec.fp !== undefined ? { urls, boundTo: rec.fp } : { urls });
+        }
+      } catch {
+        // Best-effort, like every read here: no photos found is the answer
+        // that changes nothing.
+      }
+      return out;
     },
 
     async remove(ids) {
