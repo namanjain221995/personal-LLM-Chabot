@@ -1131,8 +1131,10 @@ What the orchestrator does now, for the frontend side to rely on:
   visible-path and the stored-order queries) treats a user message with no
   `meta.images` as a picture turn when its `meta.intent.id` is 32 hex and the
   viewer has `ix-<that intent>-*` rows in that chat; it loads indexes 0..4 in
-  order. A message WITH `meta.images` uses those ids as before, so once the
-  frontend writes `meta.images` (ix- ids) nothing changes for the model.
+  order (0..998 within `max_chars` since the merge with no limits: see
+  "integrator, no limits + store-always" below). A message WITH
+  `meta.images` uses those ids as before, so once the frontend writes
+  `meta.images` (ix- ids) nothing changes for the model.
 - Not changed, known: `sharing.evaluate` blocks a public link by
   `meta.images`, so a chat whose only photo is an `ix-` row with no
   `meta.images` yet is shareable exactly as an old-tab photo chat was before
@@ -1216,3 +1218,75 @@ says "FILE" (`fileBadgeFor(name)`), as for `bf-` backfills. A regenerate or
 edit before the backfill has written the refs (its idle tick, under 10 s)
 takes the old "missing" path. A turn with only some of its `ix-` rows shows
 those.
+
+## integrator, no limits + store-always (release/2026-10-03-nolimits, 2026-10-03 03:50 IST)
+
+Merge 53930008 = feat/upload-limits a941ae36 + fix/image-store-always 943f7eb9; follow-ups
+56132f45 (backend tests, two comments) and c9baf51a (browser tests). Code under test: c9baf51a;
+the docs commit after it changes no code.
+
+Conflicts, both sides kept: `chat_media._latest_visible_turn_images` and `latest_turn_images`
+name a turn's pictures by `_turn_attachment_ids` (its `meta.images`, else the `ix-` rows under
+its intent) AND pass image_memory's `max_chars`; ChatApp.tsx's imports (`CHUNK_THRESHOLD_BYTES`
+beside the build-check imports); this file (both sections).
+
+Where the two tracks meet. No rule disagrees, so no precedence was needed; each meeting point is
+now a test:
+
+- **Ref turns never mint.** An over-budget send stores its photos under the composer's ids
+  (`POST /chat-media`) and sends only `image_refs`: no inline picture reaches
+  `schedule_inline_store`, and `by_reference` is true. A regenerate naming 101 `ix-` ids by
+  reference passes the 1..999 id validators and mints nothing.
+- **Minting has no count of its own.** Every inline picture of an id-less turn is named, so N is
+  bounded only by `main.MAX_IMAGES` (999): `ix-<32 hex>-998` is 39 characters, inside
+  `^[A-Za-z0-9_-]{8,64}$`; the browser's `SERVER_MINTED_ID` takes 1-3 digits and sorts by
+  number. Test: 101 pictures, 101 rows, each id naming the picture at its place.
+- **The store fallback reads every index, bounded by characters.** `_turn_attachment_ids` names
+  indexes 0..998 (`MAX_FILES`); `_load_refs(..., max_chars)` stops at image_memory's budget.
+  Test: twelve `ix-` pictures uploaded out of order come back 0..11; with a three-picture
+  budget, the first three. Cost of naming all 999, measured on pg-test-hand: the `= ANY` probe
+  0.06 ms to execute (0.3-0.6 ms to plan) on a chat of 204 rows, and the loader's pass over 999
+  ids with 3 present 4.5 ms; once per follow-up that falls back to the store for a turn whose
+  `meta.images` no device has written yet.
+- **No double render.** MessageRow shows local bytes, else the turn's own `meta.images`, else
+  `serverImages`, never two of them. ChatApp computes `serverImages` only for a turn with no
+  `meta.images`, no local bytes and a 32-hex intent, and every send from this build writes
+  `meta.images` before its request, inline or by reference. Test: a by-reference turn whose
+  intent also has `ix-` rows shows its 6 references once, 0 list reads, no "not stored" line.
+  Mutations it catches: a lookup despite the turn's own references (1 list read); MessageRow
+  joining both sources (12 thumbnails for 6 photos).
+- **The reload cannot cut a by-reference send.** From Send to the /chat request the composer is
+  empty and no upload is pending; `startStream` registers the stream before
+  `storeImagesForSend`, and `useBuildCheck`'s quiet check needs `streamingIds()` empty. Test: a
+  deploy noticed mid-upload shows the banner; the 6 photos land, /chat names them, and the tab
+  reloads once, after the answer. Mutation it catches: the stream dropped from the quiet check
+  (a reload during the upload).
+
+Fail before, pass after (each parent exported with `git archive`, plus the merged test file):
+store-always alone fails both new backend tests (422 "at most 5 images per message"; 5 of 12
+pictures read), no limits alone fails both (0 rows minted; no picture turn found); 2 passed on
+the merge.
+
+Gates on c9baf51a (head DGX, test DB rel2_int_test on pg-test-hand):
+- Backend (test_chat_media_api/chat/lifecycle, test_image_memory_restart, test_multi_image,
+  test_orchestrator_hardening, test_chat_requests, and every test file no limits added or
+  changed): 304 passed, 1 skipped (ffmpeg not installed), 0 failed. The bare merge 53930008:
+  302 passed, 1 skipped, 0 failed.
+- Goldens and contracts (test_context_assembly_golden, test_prompt_final_send, test_contract,
+  test_publicapi_contract): 241 passed, 0 failed.
+- Frontend: vitest 214 files, 4105 passed, 11 skipped, 0 failed (the bare merge: 213 files, 4102
+  passed, 11 skipped); `tsc --noEmit` 0 errors; lint clean; `next build` OK (TypeScript
+  included, `/api/version` in the route list).
+- ruff_gate clean (0 documented findings); schema_parity invariants V1..V44 contiguous; `bash -n`
+  44 files, 0 failed; gitleaks 8.30.1 over 6da0e929..c9baf51a: 13 commits with a patch, ~305 KB,
+  no leaks, and over the merge's own combined diff (`git show --cc`, ~28 KB, which `git log -p`
+  leaves out): no leaks.
+
+Not run here: the full orchestrator shards (artifact and chart suites), the Schema job (no
+migration changed; V44 is still the newest) and a real browser.
+
+Open:
+- `GET /chat-media/{conv}` is not paginated, and store-always reads it once per chat per page
+  load whenever a turn could have `ix-` photos (nearly every text turn). One item is ~228 bytes
+  of JSON, so 999 stored photos are ~228 KB per read and 10,000 ~2.3 MB, now that a chat has no
+  count limit.

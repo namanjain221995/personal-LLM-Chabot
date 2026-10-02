@@ -181,7 +181,8 @@ The admin route:
     never surfaces as a chat error.
   - **No usable ids** (absent, or a count that does not match): the server
     names the pictures itself, `ix-<intent_id>-<index>` (index 0..N-1 in send
-    order), when the request's own `intent_id` is the composer's shape (32
+    order; N may be anything up to the 999 ceiling, so an id is 37 to 39
+    characters), when the request's own `intent_id` is the composer's shape (32
     lowercase hex). That is what a page loaded before V44 sends: the bytes,
     the intent, and no ids ([`STORE-ALWAYS.md`](STORE-ALWAYS.md)). The
     browser keeps the intent on the user message (`meta.intent.id`), so any
@@ -219,8 +220,9 @@ the person sees: `/chat`'s `messages` are passed as `visible`, and
 stored under it), with that turn's question and answer. A picture turn is a
 user message with `meta.images`, or, with none, one whose `meta.intent.id`
 has the viewer's `ix-<intent>-*` rows (a photo from a page that wrote no
-`meta.images`); its pictures are then read in index order. A picture on an
-edited-away branch is never read into a later turn. `turns_after` counts user
+`meta.images`); its pictures are then read in index order, every index up to
+the 999 ceiling, until image_memory's `max_chars` budget is spent. A picture on
+an edited-away branch is never read into a later turn. `turns_after` counts user
 turns on the path after it, not the question being asked now. Only the 20
 newest picture turns are compared, and nothing is written back to the V41 row.
 A request with no `messages` keeps the stored-order behaviour. A chat with no
