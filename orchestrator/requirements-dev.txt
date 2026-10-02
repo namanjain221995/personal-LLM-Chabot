@@ -41,7 +41,13 @@ lxml>=5
 # which has it. A test suite that validates a code path production does not run
 # is worse than a slow one. Skipping those tests instead would be worse still:
 # extraction accuracy would then be checked nowhere.
-trafilatura>=1.12
+# Pinned 2026-10-02: trafilatura 2.3.0 and htmldate 1.11.0 were published that day,
+# and unpinned installs picked them up in CI. They reorder extracted text (tables,
+# the augmentation pass), which moved 19 retrieval and extraction goldens. These
+# are the versions the production image runs. Move both pins deliberately, together
+# with the extraction and retrieval golden suites.
+trafilatura==2.2.0
+htmldate==1.10.0
 # Video understanding: the VAD wheel is pure C with no model to download, so
 # the windowing tests run it for real; pillow renders the synthetic frames the
 # perceptual-hash tests hash (it is in requirements.txt already — this file
