@@ -268,7 +268,11 @@ function fakeHost(
 
 /** An upload that stores everything and echoes a size back. */
 function storingUpload() {
-  return vi.fn(async (_conv: string, parts: MediaUploadPart[]): Promise<MediaUploadOutcome> => ({
+  return vi.fn(async (
+    _conv: string,
+    parts: MediaUploadPart[],
+    _source?: 'upload' | 'backfill',
+  ): Promise<MediaUploadOutcome> => ({
     kind: 'stored',
     items: parts.map((p) => ({
       attachment_id: p.attachmentId,
