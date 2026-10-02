@@ -1099,3 +1099,16 @@ Replaces the "Counts on the server" list above (20 everywhere). For the frontend
 - **Not changed:** the /v1 Files API (`apifiles/`, its own documented limits, e.g. office files
   512 MiB), `_MAX_ARCHIVE_IMAGES` (4 pictures attached from an archive; the rest are listed), and
   image_memory's budgets (a follow-up re-sends the first pictures that fit, as before).
+
+## limits: frontend fix, photo batches (QA low, 2026-10-03 03:40 IST)
+
+- **A batch that fails for a passing reason goes again, alone.** `uploadChatMediaInBatches` re-sends
+  a `POST /chat-media/{conv}` that answered 429/502/503/504 or dropped the connection, up to
+  `MAX_ATTEMPTS` (5) with the chunked rail's backoff (waits of 0.25-0.5, 0.5-1, 1-2 and 2-4 s;
+  `lib/uploadDocument.ts` exports the same constants). Any other status is an answer and stops the
+  send as before. The batches before it are not re-sent. The backfill uses the same function, so it
+  retries the same way.
+- **A retried send skips what landed.** `storeImagesForSend` (the by-reference path of a send) now
+  reads `GET /chat-media/{conv}` once before its POSTs and sends only the ids the server does not list;
+  an unknown answer (any failure) sends them all. For the backend: every by-reference send now costs
+  one list read, and that list is unpaginated (about 200 bytes per picture in the chat).

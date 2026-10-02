@@ -40,8 +40,9 @@ import type { AttachmentUploadState } from './types';
 export const CHUNK_THRESHOLD_BYTES = 90 * 1024 * 1024;
 export const CHUNK_PART_BYTES = 64 * 1024 * 1024;
 
-/** Five attempts, 0.5 s base, 8 s cap — see the retry note above. */
-const MAX_ATTEMPTS = 5;
+/** Five attempts, 0.5 s base, 8 s cap — see the retry note above. The
+    photo batches of a send follow the same rule (lib/chatMedia.ts). */
+export const MAX_ATTEMPTS = 5;
 const RETRY_BASE_MS = 500;
 const RETRY_CAP_MS = 8000;
 /**
@@ -50,7 +51,7 @@ const RETRY_CAP_MS = 8000;
  * us to slow down (429). Everything else — including 409, which means the
  * session has moved on — is a decision, and a decision is not retried.
  */
-const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+export const RETRYABLE_STATUS: ReadonlySet<number> = new Set([429, 502, 503, 504]);
 
 /** `dataset` since 2026-10-03: a dataset over CHUNK_THRESHOLD_BYTES takes
     this rail too (it has no size limit any more, LIMITS.md). */
@@ -194,7 +195,7 @@ function safeMessage(what: string, status: number): string {
 
 /** Wait, but let an abort cut the wait short — a cancelled upload must not
     sit through an 8-second backoff before it stops. */
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       signal?.removeEventListener('abort', onAbort);
@@ -210,7 +211,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 
 /** Full jitter on top of the doubling, so a hundred tabs that lost the same
     proxy do not come back in lockstep. */
-function backoffMs(attempt: number): number {
+export function backoffMs(attempt: number): number {
   const window = Math.min(RETRY_CAP_MS, RETRY_BASE_MS * 2 ** (attempt - 1));
   return Math.round(window * (0.5 + Math.random() * 0.5));
 }
