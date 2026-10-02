@@ -439,3 +439,46 @@ be-files needs (not done, files I may not edit):
   `TEST_DATABASE_ALLOW_SHARED_SERVER=chatmedia_qa_be_fresh,chatmedia_qa_be_v43`:
   another track created those two databases without the `_test` suffix, and
   conftest refuses a server holding non-test databases.
+
+## qa-files (attack on be-files: lasting originals, download fallback, reaper, My files pictures, 2026-10-02 22:10 IST)
+
+Confirmed by attack tests (uncommitted: orchestrator/tests/test_attack_chat_files_qa.py,
+frontend/tests/attack-myfiles-real-rows.test.ts). None is a cross-user leak or data loss.
+
+- The lasting-copy reaper runs INSIDE upload requests. `uploads._sweep_quietly()` awaits
+  `sweep_expired_upload_sessions` in POST /uploads and POST /uploads/chunked/init, and that now
+  ends in `maybe_reap_lasting_files()`. Each live chat directory with an upload older than the
+  grace costs one DB query per pass. With 3000 such chats on the test DB, the one upload that hits
+  a due pass took 1233 ms against 20 ms otherwise. The first upload after a restart always pays it
+  (`_LASTING_REAP_DUE = 0`). Moving the call into main.py's `_upload_session_sweep_loop` (or a
+  loop beside `chat_media.reap_loop()`) takes it off the request path.
+- Two places still call a kept file gone. `GET /uploads/{conv}` says `expired` after the sweep
+  while the file route serves the lasting copy, and a workbook (.xlsx) preview in the chat prints
+  "The file itself has expired and is no longer stored" over it. main.py `_resolve_document_refs`
+  reads only the workspace `_original`, so any regenerate, edit or retry of a document turn older
+  than WORKSPACE_TTL_HOURS fails with "<name> is no longer available on the server". The frontend
+  always resends a document that has an id by reference (`pdf_uploads`). Both need the lasting copy
+  as a fallback (`uploads.lasting_file`).
+- A file whose name the path resolver refuses (leading dot such as `.env`, or a backslash) gets a
+  lasting copy and lists on My files as `available` with `can.download: true`, but the member route
+  answers 404 "upload not found". `resolve_upload_file` raises before the lasting fallback is
+  reached. This was already true before this branch; the lasting copy (named `original`) could
+  serve it.
+- Starlette answers a Range with an unknown unit (`items=0-1`), a reversed range or a malformed
+  one with 400. RFC 9110 says an unknown unit MUST be ignored (200). This is Starlette's behaviour
+  and was already true; no browser player sends these.
+- Already true and unchanged: a 300-byte file name (ENAMETOOLONG), `..` and `dir/` crash POST
+  /uploads with a 500 (`_stream_to_disk`), before any lasting-copy code runs.
+- Held: suffix ranges, multi-range (multipart/byteranges), past the end (416), and If-Range across
+  the sweep (same inode, same validator, 206). Also held: chunked complete replayed after the
+  sweep (one copy, counted once), the EXDEV copy fallback (separate inode, no `.tmp` left), the
+  floor (zip dataset: counted no_space, then 410), and a chat id deleted by one user and recreated
+  by another (only the old copy is reaped; the new owner gets 404 for the old upload id). The
+  newest, oldest, largest and name sorts page correctly with pictures and uploads named
+  "Picture.png" (10 items, limit 2, no duplicates). `kind=image` works alone, and the summary
+  includes `image`. A picture stored under an unowned id that someone else later claims is listed
+  for nobody. The backend's real page and summary JSON parse in frontend/lib/myfiles.ts: the
+  picture's download URL is `/api/chat-media/<conv>/<att>?size=full`, and `filesKeptWithChat` and
+  `picturesKept` are true.
+- Shared-worktree note: another agent's uncommitted app/chat_media.py edit briefly made a 32x24
+  PNG answer 415 during this run. A retry passed. Treat a sudden 415 in a picture test as that.
