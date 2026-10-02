@@ -355,9 +355,13 @@ MYFILES_RESULTS = frozenset({"ok", "bad_request", "error"})
 #:           a browser backfilling a photo it still holds from before V44;
 #:   result  how one write ended. `duplicate` is the idempotent retry (the
 #:           first write won); unsupported / too_large / no_space are
-#:           refusals, `error` is the server's own failure.
+#:           refusals, `error` is the server's own failure; `unlinked` is a
+#:           /chat picture sent with no ids and no send intent to name it by
+#:           (docs/chat-media/STORE-ALWAYS.md), so it was not stored.
 CHAT_MEDIA_SOURCES = frozenset({"chat", "upload", "backfill"})
-CHAT_MEDIA_WRITE_RESULTS = frozenset({"stored", "duplicate", "unsupported", "too_large", "no_space", "error"})
+CHAT_MEDIA_WRITE_RESULTS = frozenset(
+    {"stored", "duplicate", "unsupported", "too_large", "no_space", "error", "unlinked"}
+)
 #: A read of the bytes route: which rendition, and how it ended. `missing` is
 #: a row whose file is gone (410), `not_found` everything that is not yours.
 CHAT_MEDIA_SIZES = frozenset({"thumb", "full"})

@@ -565,6 +565,7 @@ function MessageRowImpl({
   onReuseAttachment,
   conversationId = null,
   legacyPhoto = false,
+  serverImages = null,
   onOpenArtifact,
   activeArtifactKey = null,
   onEditArtifact,
@@ -671,6 +672,15 @@ function MessageRowImpl({
    * see the NEXT message — a row cannot (lib/chatMedia showsLegacyPhotoNote).
    */
   legacyPhoto?: boolean;
+  /**
+   * 2026-10-03 (STORE-ALWAYS §2): the photos the server stored for this turn
+   * by itself (`ix-<intent>-<index>`), found by the host in the chat's list,
+   * for a turn sent by a page too old to write `meta.images`. Shown exactly
+   * like `meta.images` until the host has written them there. Used only when
+   * the turn has no references of its own; must be STABLE (the row is
+   * memoised).
+   */
+  serverImages?: MessageImage[] | null;
   /**
    * 2026-09-11 (Artifact Studio): open a generated file in ChatApp's side
    * panel. Omitted in contexts with no panel (previews, tests), where the
@@ -844,7 +854,8 @@ function MessageRowImpl({
     // has them (instant, and the only copy of a photo sent before photos were
     // stored), otherwise the server's copies through `meta.images`.
     const localUrls = localImagesOf(message);
-    const storedImages = storedImagesOf(message);
+    const ownRefs = storedImagesOf(message);
+    const storedImages = ownRefs.length ? ownRefs : (serverImages ?? []);
     const hasAttachments = Boolean(
       localUrls.length ||
         storedImages.length ||

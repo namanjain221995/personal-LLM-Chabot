@@ -58,14 +58,22 @@ import {
 } from '@/lib/attachments';
 import {
   createBackfill,
+  createMediaListCache,
   imagesMetaFor,
   legacyPhotoNoteId,
+  needsServerPhotoLookup,
+  serverPhotoIntentOf,
+  serverPhotoLookup,
+  serverPhotosByIntent,
   storedAttachmentIds,
   storedImagesOf,
   withImagesMeta,
   type Backfill,
+  type ListedMediaItem,
 } from '@/lib/chatMedia';
 import { CHUNK_THRESHOLD_BYTES, uploadDocumentFile } from '@/lib/uploadDocument';
+import { saveReloadDraft, takeReloadDraft } from '@/lib/buildCheck';
+import { useBuildCheck } from './useBuildCheck';
 import type { SendOptions as ComposerSendOptions } from './Composer';
 import {
   ARTIFACT_EDIT_EVENT,
@@ -555,6 +563,8 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
   /** Turns the last successful compaction folded — a lasting popover line. */
   const [summaryOpen, setSummaryOpen] = useState(false);
   const draftTimer = useRef<number | null>(null);
+  /** The composer's text as of its last change, for a reload's draft. */
+  const draftTextRef = useRef('');
   /** Salesforce starter-card suggestions for the OPEN chat (server-filtered). */
   const [starterOptions, setStarterOptions] = useState<StarterOption[]>([]);
   /**
@@ -791,6 +801,30 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
    * actually picks up the new text, runs per frame.
    */
   const treeKey = useMemo(() => treeShape(messages), [messages]);
+  /**
+   * STORE-ALWAYS (2026-10-03, docs/chat-media/STORE-ALWAYS.md §2): the
+   * photos the server stored by itself for turns sent by a page too old to
+   * write `meta.images` (`ix-<intent>-<index>`). The chat's list is read once
+   * per conversation per page load (`mediaListRef`, shared with the
+   * backfill, which then writes the references); until it answers, such a
+   * turn shows nothing and says nothing.
+   */
+  const mediaListRef = useRef(createMediaListCache());
+  const [listedMedia, setListedMedia] = useState<{
+    conversationId: string;
+    items: ListedMediaItem[] | null;
+  } | null>(null);
+  const photoLookup = useMemo(
+    () =>
+      serverPhotoLookup(
+        listedMedia && listedMedia.conversationId === activeId && listedMedia.items
+          ? serverPhotosByIntent(listedMedia.items)
+          : undefined,
+      ),
+    [listedMedia, activeId],
+  );
+  const photoLookupRef = useRef(photoLookup);
+  photoLookupRef.current = photoLookup;
   const threadPath = useMemo(
     () => threadIndices(messages, branchSelection),
     // `treeKey` is a complete description of everything the walk reads from
@@ -808,7 +842,10 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
    * vision answer is otherwise a text follow-up about an EARLIER photo, which
    * the orchestrator answers through the same vision route.
    */
-  const legacyPhotoTurn = useMemo(() => legacyPhotoNoteId(thread), [thread]);
+  const legacyPhotoTurn = useMemo(
+    () => legacyPhotoNoteId(thread, photoLookup),
+    [thread, photoLookup],
+  );
   const threadRef = useRef<ChatMessage[]>([]);
   threadRef.current = thread;
   const activeIdRef = useRef<string | null>(null);
@@ -1453,7 +1490,12 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       refreshList();
       const id = activeIdRef.current;
       if (!id || bootReconcileRef.current === id || isStreaming(id)) return;
-      if (store.isStale?.(id)) await reconcileConversation(id);
+      if (store.isStale?.(id)) {
+        // Another device wrote to it: a turn sent from an old page may have
+        // photos the server stored after this page read the chat's list.
+        mediaListRef.current.forget(id);
+        await reconcileConversation(id);
+      }
     } finally {
       check.running = false;
     }
@@ -1665,6 +1707,8 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
 
   /** Debounced (300 ms) so typing doesn't re-render the meter per keystroke. */
   const handleDraftChange = useCallback((text: string) => {
+    // Undebounced: what a reload the person asks for must keep (useBuildCheck).
+    draftTextRef.current = text;
     if (draftTimer.current !== null) window.clearTimeout(draftTimer.current);
     draftTimer.current = window.setTimeout(() => setDraft(text), 300);
   }, []);
@@ -3311,7 +3355,10 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
           : message.imageDataUrl
             ? [message.imageDataUrl]
             : [];
-        const stored = storedImagesOf(message)[index];
+        // A photo the server stored by itself is reusable before its
+        // reference is written (STORE-ALWAYS §2).
+        const stored =
+          storedImagesOf(message)[index] ?? photoLookupRef.current(message)?.[index];
         const conversationId = activeIdRef.current;
         source = await resolveAttachmentAsync(messageId, index, {
           name: stored?.name ?? `image-${index + 1}`,
@@ -3426,6 +3473,9 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         !isStreaming(id) &&
         !pendingSendRef.current.has(id) &&
         datasetUploadRef.current?.conversationId !== id,
+    }, {
+      // The view's read of the chat's list, reused (one per page load).
+      media: (id) => mediaListRef.current.get(id),
     });
   }
   // A chat counts as OPENED once its thread is on screen.
@@ -3433,6 +3483,84 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
     if (!activeId || loadingId === activeId) return;
     backfillRef.current?.request(activeId);
   }, [activeId, loadingId]);
+
+  /**
+   * STORE-ALWAYS §2: read the chat's list when a turn on screen can only be
+   * shown from it — once per conversation per page load (the cache answers
+   * every later ask), never per turn. Keyed on those turns' intents, so a
+   * streamed token does not re-run it. When the list holds photos for a turn
+   * without references, the backfill writes them (one save, 409 re-applied);
+   * it is asked again once a stream here ends, because it leaves a chat
+   * alone while a send owns it.
+   */
+  const serverPhotoTurns = useMemo(
+    () =>
+      thread
+        .filter(needsServerPhotoLookup)
+        .map((m) => serverPhotoIntentOf(m))
+        .join(','),
+    [thread],
+  );
+  useEffect(() => {
+    if (!activeId || loadingId === activeId || !serverPhotoTurns) return;
+    let live = true;
+    void mediaListRef.current.get(activeId).then((items) => {
+      if (!live) return;
+      setListedMedia((prev) =>
+        prev && prev.conversationId === activeId && prev.items === items
+          ? prev
+          : { conversationId: activeId, items },
+      );
+      if (!items || streamingHere) return;
+      const byIntent = serverPhotosByIntent(items);
+      const unwritten = threadRef.current.some((m) => {
+        const intent = serverPhotoIntentOf(m);
+        return intent !== null && byIntent.has(intent);
+      });
+      if (unwritten) backfillRef.current?.request(activeId);
+    });
+    return () => {
+      live = false;
+    };
+  }, [activeId, loadingId, serverPhotoTurns, streamingHere]);
+
+  /**
+   * STORE-ALWAYS §3 (2026-10-03): a tab running an older build than the
+   * server's reloads — at once when that loses nothing, otherwise after the
+   * banner, by itself, once the send in progress is over and the composer is
+   * empty. "Loses nothing": no stream or send in this tab, no dataset
+   * uploading, no message open for editing, and nothing typed, attached or
+   * being dictated.
+   */
+  const editingRef = useRef(editingMessageId);
+  editingRef.current = editingMessageId;
+  const buildCheck = useBuildCheck(
+    () =>
+      streamingIds().length === 0 &&
+      pendingSendRef.current.size === 0 &&
+      datasetUploadRef.current?.status !== 'uploading' &&
+      editingRef.current === null &&
+      !draftTextRef.current.trim() &&
+      !(composerRef.current?.hasDraft() ?? false),
+    async (keepDraft) => {
+      if (keepDraft) saveReloadDraft(draftTextRef.current);
+      // Let the store finish what it is pushing; never wait long for it.
+      await Promise.race([
+        getHistoryStore().flush(),
+        new Promise((resolve) => window.setTimeout(resolve, 3_000)),
+      ]);
+    },
+  );
+  // The text a reload the person asked for kept: back into the composer,
+  // once, as soon as the composer is there to take it.
+  const reloadDraftRef = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    if (reloadDraftRef.current === undefined) reloadDraftRef.current = takeReloadDraft();
+    if (reloadDraftRef.current && composerRef.current) {
+      composerRef.current.prefill(reloadDraftRef.current);
+      reloadDraftRef.current = null;
+    }
+  });
 
   /**
    * M-08 — per-row callbacks with STABLE identity.
@@ -3746,6 +3874,32 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
               onClose={() => setShareOpen(false)}
             />
           )}
+          {/* STORE-ALWAYS §3: this tab runs an older build than the server.
+              Floats over the top of the thread, so nothing moves; the page
+              reloads by itself once the composer is empty and no answer is
+              streaming, and the button does it now, keeping typed text. */}
+          {buildCheck.newBuild && (
+            <div className="pointer-events-none relative z-20">
+              <div className="absolute inset-x-0 top-2 flex justify-center px-4">
+                <div
+                  role="status"
+                  data-testid="new-version-banner"
+                  className="pointer-events-auto flex max-w-full items-center gap-3 rounded-full border border-border bg-surface py-1 pl-4 pr-1 text-sm shadow-lg"
+                >
+                  <span className="min-w-0 truncate text-ink">
+                    A new version is available
+                  </span>
+                  <button
+                    type="button"
+                    onClick={buildCheck.reloadNow}
+                    className="shrink-0 rounded-full bg-accent-strong px-3 py-1 text-xs font-medium text-white transition-all duration-ts hover:brightness-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg"
+                  >
+                    Reload
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
 
           <div
             ref={scrollRef}
@@ -3859,6 +4013,13 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
                     // never held it: decided here because only the thread can
                     // see the answer that follows the turn.
                     legacyPhoto={m.id === legacyPhotoTurn}
+                    // A turn from a page too old to write `meta.images`: its
+                    // photos as the server stored them (STORE-ALWAYS §2).
+                    serverImages={
+                      m.role === 'user' && needsServerPhotoLookup(m)
+                        ? photoLookup(m) ?? null
+                        : null
+                    }
                     uploadStatus={
                       datasetUpload?.messageId === m.id
                         ? datasetUpload.status

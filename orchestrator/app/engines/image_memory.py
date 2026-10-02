@@ -495,9 +495,11 @@ async def hydrate(
     the turn routed as though no picture had ever been sent — while the chat's
     pictures were now stored for the life of the chat (app/chat_media.py).
     When neither half has a live entry, the newest user message whose
-    `meta.images` names stored pictures supplies them, with that turn's
-    question and answer as the context and the user turns since as the
-    counter; the word test then runs unchanged. A chat with no stored picture
+    `meta.images` names stored pictures supplies them (or, for a photo from
+    a page that wrote no `meta.images`, the `ix-` pictures the server stored
+    under the message's send intent, docs/chat-media/STORE-ALWAYS.md), with
+    that turn's question and answer as the context and the user turns since
+    as the counter; the word test then runs unchanged. A chat with no stored picture
     costs one statement that finds nothing and behaves exactly as before.
     The entry is NOT written back to the V41 row: the store already holds the
     bytes, and a second copy in the database would buy nothing.

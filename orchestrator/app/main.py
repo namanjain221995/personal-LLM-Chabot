@@ -2661,7 +2661,9 @@ class ChatRequest(BaseModel):
     # composer's attachment ids of the inline images, index i <-> images[i]
     # (or [0] <-> the single spelling): the server stores every inline picture
     # under its id behind the turn (app/chat_media.py), so the chat shows it on
-    # any device. A count that does not match stores nothing and is never a 4xx.
+    # any device. Absent, or a count that does not match: the server names the
+    # pictures from `intent_id` (`ix-<intent>-<index>`), or stores nothing
+    # without one. Never a 4xx.
     image_ids: Optional[List[str]] = Field(default=None, fail_fast=True)
     # Ids of pictures ALREADY stored for this viewer and chat, sent INSTEAD of
     # bytes: a regenerate, edit or retry on a device that never held them. The
@@ -4385,9 +4387,13 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     # 2. This turn's inline pictures are stored BEHIND the turn: a background
     #    task, all file work in a worker thread, nothing awaited here, so the
     #    first token waits on none of it. A failure is logged and counted
-    #    (chat_media_writes_total), never a chat error.
+    #    (chat_media_writes_total), never a chat error. Pictures sent with no
+    #    ids that fit them (a page loaded before V44) are named after the
+    #    browser's send intent: `request.intent_id`, never the one minted
+    #    above for a client that sent none (docs/chat-media/STORE-ALWAYS.md).
     _chat_media.schedule_inline_store(
-        viewer, request.conversation_id, inline_images, request.image_ids
+        viewer, request.conversation_id, inline_images, request.image_ids,
+        intent_id=request.intent_id, by_reference=bool(request.image_refs),
     )
 
     # DURABLE INTENT (V29). Record the send before anything runs, so the
