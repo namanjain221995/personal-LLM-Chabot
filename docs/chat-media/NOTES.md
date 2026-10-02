@@ -698,3 +698,38 @@ Not fixed, with reasons:
   Starlette's behaviour; no per-member quota on the lasting store is an owner decision). Do not chase
   their failures and do not commit them; the coordinator removes them before the push. Judge the gates
   on tracked files only (e.g. `git stash` is forbidden, so exclude them by path when you run suites).
+
+## e2e (real-browser two-device run, 2026-10-02 22:55 IST)
+
+Stack (b) on the head, briefly, all on 127.0.0.1 and removed afterwards: the orchestrator from a
+`git archive` of 1348a56d (venv uvicorn :18961, V44 migrated at boot, private DB
+chatmedia_e2e_test on pg-test-hand, now dropped), the Next build of the same snapshot (:3961),
+and a copy of e2e/ci/engine.js (:18960) that also logs the number of image parts per completion.
+Worker (a) was skipped: no orchestrator image or python:3.11 base cached there, and Docker Hub
+pulls were failing today. ASR_BASE_URL must be overridden in any such stack: its default is the
+production whisper on the worker.
+
+Held (Playwright Chromium, A = 390x844 phone, B = 1440x900 fresh storage, same account):
+- A sends a photo: the bubble shows it at once (data URL, 1200x900). /chat carries `image_ids`,
+  the row and full.jpg + thumb.webp land, meta.images is pushed.
+- B opens the chat: the thumb (512x384 webp, immutable, nosniff, sandbox CSP) sits in a
+  213x160 box reserved before load; nothing moved after load. Click opens size=full (1200x900).
+- B "Try again": the body has `image_refs` and no inline image; the engine got 1 image part.
+- Backfill: a legacy turn (no meta.images, an IndexedDB record without `fp`, vision answer) was
+  posted as `bf-<32 hex>`, meta.images reached the server, B showed the photo, the legacy line went.
+- Delete: every media URL answers 404 to B (request context and fetch no-store); the chat's
+  chat-media directory is gone. B's page fetch with the default cache still gets 200 for photos
+  it had seen (immutable cache; Clear-Site-Data on logout is the only purge, by design).
+
+Failed (3 of 3 runs), for whoever owns history sync:
+- RC-3c is not closed for this sequence: image + PDF in turn 2, the upload answered 200 before
+  the answer (uploads row exists), A's two PUTs carrying `attachments[0].id` were both 409
+  (the first with an `expected_updated_at` older than A's own POST /messages append), A
+  reconciled to the server copy and never pushed again. The stored attachment keeps
+  `upload_state: "selected"` and no `id`, so no other device can open the PDF.
+- B, which had the chat open earlier (and regenerated in it), navigated back to it after A's
+  second turn: it fetched the conversation list but not the conversation, and kept showing its
+  cached thread without A's turn (second photo and PDF missing). Root cause not isolated; it
+  may predate this branch.
+- Not run: video/audio playback (step 7). The stub stack has VIDEO_ANALYSIS_ENABLED=false and no
+  ffmpeg on the head, and audio/video travel on the video rail.
