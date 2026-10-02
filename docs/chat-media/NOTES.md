@@ -384,3 +384,58 @@ frontend/tests/attack-be-store-failure-never-repaired.test.ts); none is a cross-
   row, one directory), crash between files and row (no files left), CMYK / animated GIF / animated
   WebP / palette+transparency / LA / EXIF 6 / 1x1 / 20000^2 bomb, RTL/unicode/traversal ids, 10k-row
   list (1.8 MB, 0.11 s), five ~10 MiB pictures in one POST (49 MiB, 200 in 0.6 s).
+
+## be-files (orchestrator: lasting originals, download fallback, reaper, My files)
+
+As built (commit fa6d3277):
+
+- `uploads.lasting_path(conv, upload_id)` = `<CHAT_FILES_DIR>/<conv>/<upload_id>/original`
+  (None unless conv matches `^[A-Za-z0-9_-]{1,64}$` and the id is 32 hex).
+  `uploads.keep_lasting_copy` makes it for purposes `document` and `dataset`
+  only (hard link, fsynced copy on EXDEV), from both finalisers, so single-shot
+  and chunked alike. Never raises; never refuses the upload.
+- `uploads.lasting_has_room()` probes CHAT_FILES_DIR (not CHAT_MEDIA_DIR)
+  against `settings.chat_media_min_free_gib`. A test of the floor sets the
+  setting high (`1e9`); conftest's 0.0 default means every other test gets
+  copies.
+- `uploads.kept_original(conv, upload_id, notes)` is the shared fallback:
+  lasting copy, then the video store for `notes == 'video'`. The member route
+  ends in 410, the admin route keeps its 404 "The file has expired.".
+- Range: Starlette 1.6 `FileResponse` already answers 206/416/If-Range on
+  both routes; nothing was written for it, `tests/test_chat_files.py` pins it.
+- `uploads.erase_conversation_files` now ALSO removes
+  `<WORKSPACE_DIR>/uploads/<conv>` (the hard link's other name). Still one
+  `chat_media_erase_total{store="files"}` count per call.
+- Lasting-copy reaper: `uploads.reap_lasting_files()` /
+  `maybe_reap_lasting_files()`. It is called at the end of
+  `uploads.sweep_expired_upload_sessions()`, which main.py's
+  `_upload_session_sweep_loop` already runs every 600 s, and throttles itself
+  to `CHAT_MEDIA_REAP_INTERVAL_S` with a module global `_LASTING_REAP_DUE`
+  (tests reset it with monkeypatch). Reaped directories are counted as
+  `chat_media_reaped_total{kind="dir"}` (the closed label set has no
+  `files` value).
+- My files: `KINDS` gains `image`, `SOURCES` gains `media`. Picture row =
+  the fe-files shape exactly: `id "media:<media_id>"`, `source "media"`,
+  `kind "image"`, `name "Picture.<ext>"` (from the mime, so name sort, name
+  search and cursors stay non-null), `media {width, height, mime}`,
+  `attachment_id`, `can {download, preview "image"|null, delete false}`,
+  `availability` from the full file on disk. Scoped by `m.user_id = viewer`
+  AND `conversations.user_id = m.user_id`, F034 excluded. Retention:
+  `files_kept_with_chat: true`, `pictures: "kept_with_chat"`. The summary's
+  `kinds` always carries `image`.
+
+be-files needs (not done, files I may not edit):
+
+- main.py could start the lasting-copy reaper beside `chat_media.reap_loop()`
+  instead of it riding the upload-session sweep; behaviour would not change.
+- `tests/test_document_uploads.py::test_a_swept_document_is_still_an_honest_410`
+  pinned "swept means 410" and failed once documents kept a lasting copy. I
+  changed that one test (one line: it also removes the lasting copy) and
+  committed it with this track, since the change is this track's behaviour.
+- `GET /uploads/{conv}` (`list_uploads`, `bytes_available`) still says
+  `expired` from the workspace copy alone. Left as is: the dataset engine
+  reads `extracted/`, which the lasting copy does not restore.
+- Test runs on pg-test-hand currently need
+  `TEST_DATABASE_ALLOW_SHARED_SERVER=chatmedia_qa_be_fresh,chatmedia_qa_be_v43`:
+  another track created those two databases without the `_test` suffix, and
+  conftest refuses a server holding non-test databases.

@@ -292,3 +292,49 @@ Signals worth watching:
   `meta.images`; the vision answer after it is still `route=vision`, which the
   policy allows. This gap is the same one `meta.attachments` has. The photo
   itself can never leak, because the snapshot is an allowlist.
+
+---
+
+## Lasting originals for every other upload (be-files, CONTRACT §9)
+
+- **What is kept.** When a document or dataset upload finishes (single-shot
+  `POST /uploads` or chunked `complete`; zip and tar travel as `document`),
+  `uploads.keep_lasting_copy` hard-links the workspace original to
+  `<CHAT_FILES_DIR>/<conversation>/<upload>/original` (default
+  `/data/chat-files`, outside `WORKSPACE_DIR`). On one filesystem that writes
+  no bytes; across filesystems it falls back to a fsynced copy. A dataset's
+  copy is made before extraction drops the workspace original, so an uploaded
+  archive is downloadable now. Videos and audio get no copy: the video store
+  already keeps them while a chat links them.
+- **The floor.** Below `CHAT_MEDIA_MIN_FREE_GIB` free on CHAT_FILES_DIR's own
+  filesystem (`uploads.lasting_has_room`, nearest existing ancestor) no copy
+  is made, the upload is never refused for it, and the file ages out with the
+  workspace sweep as before. Outcomes:
+  `chat_files_lasting_total{purpose=document|dataset, result=stored|no_space|error}`.
+- **Reads.** `GET /uploads/{conv}/{id}/file` and the admin download share
+  `uploads.kept_original`: workspace, lasting copy, video store (video rail
+  rows only), then 410 (the admin route keeps its 404 "The file has
+  expired."). Byte ranges (206/416) are Starlette's own `FileResponse`.
+  My files counts a lasting copy as `available`.
+- **Deletion.** `uploads.erase_conversation_files` removes
+  `<CHAT_FILES_DIR>/<conv>` AND `<WORKSPACE_DIR>/uploads/<conv>`: the lasting
+  copy is a hard link to the workspace file, so removing only one name would
+  leave the bytes on disk until the sweep.
+- **Reaper.** `uploads.reap_lasting_files` rides main.py's ten-minute
+  upload-session sweep (`sweep_expired_upload_sessions`), at most one pass per
+  `CHAT_MEDIA_REAP_INTERVAL_S` per process. It removes a
+  `<conversation>/<upload>` directory past `CHAT_MEDIA_ORPHAN_GRACE_H` whose
+  chat (deleted, or its account deleted) or uploads row is gone. It never
+  follows a symbolic link and never judges a name it did not make. Counted as
+  `chat_media_reaped_total{kind="dir"}`.
+- **Operating it.** Disk use: hard links share the workspace's bytes for the
+  first 24 h, then the lasting copy holds them alone. `du -sh /data/chat-files`
+  inside the orchestrator container is the store's size. The same floor
+  switch as pictures (`CHAT_MEDIA_MIN_FREE_GIB` set far above the disk) stops
+  new copies with no deploy.
+- **Honest limits.** An upload made before this change, or below the floor,
+  has no lasting copy and still expires after the sweep. `GET /uploads/{conv}`
+  (the per-chat list) still reports `expired` from the workspace copy alone;
+  the file route and My files are the ones that know about the lasting copy.
+  `/data/chat-files` is not in `scripts/backup-knowledge.sh` (nor are
+  `/data/chat-media`, `/data/video` or `/data/voice`).
