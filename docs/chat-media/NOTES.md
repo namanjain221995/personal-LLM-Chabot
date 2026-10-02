@@ -286,3 +286,9 @@ fe-files, as built (2026-10-02 evening):
 - Not changed, for whoever owns ChatApp: dragging a sent video back into the
   composer (`reuseAttachment`) still downloads the whole file to re-attach
   it, as before.
+
+## coordinator (2026-10-02 21:35 IST)
+- 9c27466d merges origin/dev 307155b4 into this branch: Next.js 16.3.3 -> 16.3.6 and anyio 4.14.2 in
+  compose/voice-store (two CRITICAL Trivy advisories). Not part of this feature; ignore those three
+  files when reviewing. frontend/node_modules was reinstalled (next 16.3.6).
+- PR #92 (release w1, V43) is merged to main; V44 here stays next in line.
