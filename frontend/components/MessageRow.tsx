@@ -30,6 +30,7 @@ import {
 import { keepsCitations, linkCitations, stripCitations } from '@/lib/citations';
 import {
   attachmentFile,
+  mediaKindFor,
   previewKindFor,
   resolveAttachmentAsync,
   streamedPlayerFor,
@@ -264,6 +265,15 @@ function OpenableAttachment({
     const local = resolveAttachment(messageId, index, { name, dataUrl, space });
     // A stored photo is drawable whatever it is called ("Attached image 1").
     const drawable = Boolean(media) || previewKindFor(name) !== 'none';
+    if (!drawable && local.kind === 'unavailable' && !mediaKindFor(name)) {
+      // No bytes here, and none would help: what the dialog can say about a
+      // .zip is the same on every device, so it is not blamed on this one.
+      // (A video with no upload id yet keeps `unavailable`: it may play once
+      // its upload lands.) A .xlsx or .docx still gets its server preview —
+      // the dialog asks for it on `none` exactly as on `unavailable`.
+      setSource({ ...local, kind: 'none' });
+      return;
+    }
     if (!drawable || local.kind !== 'unavailable' || (!upload && !media)) {
       setSource(local);
       return;
