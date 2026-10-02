@@ -691,3 +691,10 @@ Not fixed, with reasons:
   `tests/test_chat_files.py::test_a_resent_document_reads_its_lasting_copy`
   is the real proof. `test_attack_lasting_files_sec.py::test_trailing_newline_conversation_id`
   now skips ("refused upstream").
+
+## coordinator (2026-10-02 22:35 IST) — for the Verify phase
+- The UNTRACKED files `frontend/tests/attack-*.test.ts(x)` and `orchestrator/tests/test_attack_*.py` are
+  QA proofs, not part of the branch. Some fail on purpose (deferred items: malformed Range -> 400 is
+  Starlette's behaviour; no per-member quota on the lasting store is an owner decision). Do not chase
+  their failures and do not commit them; the coordinator removes them before the push. Judge the gates
+  on tracked files only (e.g. `git stash` is forbidden, so exclude them by path when you run suites).
