@@ -832,3 +832,68 @@ What changed that other tracks may rely on:
   two in a row, 2 per save against a server that moves after every read, and
   0 for a settled thread re-saved. Not re-run in a real browser.
 - The README deviation row for RC-3c is removed.
+
+## fix-stale-second-device (2026-10-02 23:55 IST)
+
+The e2e failure "B fetched the list but not the conversation and kept its
+cached thread" PREDATES this branch:
+
+- origin/dev 3fead415 (detached scratch worktree, since removed), vitest
+  through the real ChatApp and store: after phone A's turn, B's reload plus
+  one poll tick made 1 list GET, 0 conversation GETs, and showed B's cached 4
+  messages without A's 2.
+- Real Chromium against a fake orchestrator, HEAD 16dcae1d without the fix:
+  same result (list 2 = active + archived, conversation 0, no photo, no PDF
+  chip). Bringing the tab back into view did nothing either.
+
+Cause: `loadConversation` served the cache whenever its ids matched what this
+browser last pushed, and `mergeServerRows` folded the list's newer
+`updated_at` into the cached `updatedAt` without remembering that the cached
+thread was older.
+
+Fix (frontend/lib/history.ts, frontend/components/ChatApp.tsx):
+- SyncState `seen[conv]` is the server's `updated_at` (epoch ms) at the last
+  GET of the messages. `stale[]` lists chats whose list `updated_at` is newer
+  than `seen`. A chat never read here (started in this browser, or cached by
+  an older build) compares with the cached `updatedAt` instead. The cached
+  `updatedAt` alone is not enough: a thumb, a rename or a title stamps it with
+  the browser's clock, which would hide the other device's turn.
+- `loadConversation` skips the cache shortcut for a stale chat. It clears the
+  flag before the GET, so a second load at the same time serves the cache. It
+  sets the flag again if the GET fails, except on a 404. A non-forced read
+  keeps the cached id, `imageDataUrl(s)` and `pdfName` on every turn that is
+  unchanged (threadReconcile's per-turn rule), so the next save is still an
+  append.
+- New optional store methods: `refreshActive()` (one GET of the active list,
+  no writes) and `isStale(id)`. `mergeServerRows` skips ids whose delete is
+  still pending.
+- ChatApp `checkForUpdates` runs on a sidebar open and on window focus or
+  visibilitychange (visible). It waits for the mount's refresh, runs one at a
+  time, and at most once per 5 s. It reads the list once, and re-reconciles
+  the open chat only when `isStale`. No timer; the 8 s poll still never reads
+  the list.
+- Cost: one list GET per sidebar open or tab return. One conversation GET
+  when the list is newer than `seen`, never when it is equal. After this
+  browser's own writes that is also one GET, because it cannot know the
+  server's new stamp.
+
+Limits: a tab that stays focused and visible does not pick up the other
+device's turn on the open chat until a reopen, a focus or a reload (no
+polling, by design). Archived chats are re-listed only by the mount's
+refresh.
+
+Proof: frontend/tests/second-device-stale-open.test.tsx (7 tests: reload
+fetches once and shows A's turn with its `meta.images` thumb and PDF chip;
+equal `updated_at` makes no GET; a tab coming back into view; a sidebar open
+fetches only the chat that moved; the open chat streams normally and keeps
+its ids; `seen` beats a rename's local stamp; a failed read stays stale but a
+404 does not). Real Chromium against the fake orchestrator, fixed build: the
+same reopen made 1 conversation GET and showed the phone photo (thumb
+512x384) and the PDF chip. An unchanged reopen made 0 GETs. Focus made 1 list
+and 1 conversation GET. Code block, table, mermaid diagram and the artifact
+panel all rendered on the refreshed thread, and B's own send streamed.
+
+Seen, not changed (the same on both builds): the first two opens of a chat in
+a fresh browser both GET it. With the fake orchestrator, an answer whose
+stream carried a `generation_id` was not pushed by the browser. I did not
+look into why; the real orchestrator has stored the answer itself since V29.

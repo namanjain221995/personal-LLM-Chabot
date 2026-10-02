@@ -124,6 +124,20 @@ export interface ServerHistoryStore extends HistoryStore {
    */
   refreshArchived(): Promise<boolean>;
   /**
+   * 2026-10-02 (second device): pull the ACTIVE list only — titles, order and
+   * which cached threads the server has written since this browser read them
+   * (see isStale). One request and no writes, unlike refresh(): the chat view
+   * calls it when a chat is opened and when the tab comes back into view.
+   * false = offline. Optional so a partial test double need not provide it.
+   */
+  refreshActive?(): Promise<boolean>;
+  /**
+   * true when the latest list says the server wrote `id` after this browser
+   * last read its messages; the next load() fetches it instead of serving
+   * the cache, and that read clears it. Optional, like refreshActive.
+   */
+  isStale?(id: string): boolean;
+  /**
    * Ensure a conversation's messages are loaded (server fetch if stale).
    * `force` always refetches server truth — used when a detached generation
    * may have appended an assistant answer server-side (see lib/streams.ts).
@@ -651,6 +665,22 @@ interface SyncState {
    * unconditional exactly as it was before.
    */
   stamps?: Record<string, string>;
+  /**
+   * 2026-10-02 (second device): per conversation, the server's `updated_at`
+   * (epoch ms) the last time this browser READ its messages — what the cached
+   * thread is known to include. Absent = never read here (a chat this browser
+   * started, or a cache from before the field); the cached `updatedAt` stands
+   * in. Not the cached `updatedAt` itself: a thumb, a rename or a title
+   * stamps that with this browser's clock, which would hide a turn another
+   * device sent a moment earlier.
+   */
+  seen?: Record<string, number>;
+  /**
+   * Conversations the list says the server wrote after `seen`: another
+   * device sent a turn, or the server stored an answer. The cached thread may
+   * be missing it, so the next load fetches instead of serving the cache.
+   */
+  stale?: string[];
 }
 
 /* --------------------------------------------------- what the server has
@@ -850,6 +880,11 @@ export function createServerHistoryStore(
           parsed.stamps && typeof parsed.stamps === 'object'
             ? (parsed.stamps as Record<string, string>)
             : {},
+        seen:
+          parsed.seen && typeof parsed.seen === 'object'
+            ? (parsed.seen as Record<string, number>)
+            : {},
+        stale: Array.isArray(parsed.stale) ? parsed.stale : [],
       };
     } catch {
       return { pushed: {}, dirty: [], deleted: [], stamps: {} };
@@ -912,7 +947,12 @@ export function createServerHistoryStore(
   function mergeServerRows(rows: ServerConversationSummary[]): void {
     const all = cache.readAll();
     const changed: string[] = [];
+    const staled: string[] = [];
+    const { deleted, seen } = readSync();
     for (const sc of rows) {
+      // A delete still on its way to the server: a list read before it landed
+      // must not bring the chat back (refreshActive reads the list mid-session).
+      if (deleted.includes(sc.id)) continue;
       const idx = all.findIndex((c) => c.id === sc.id);
       if (idx === -1) {
         const updatedAt = toEpoch(sc.updated_at, Date.now());
@@ -937,6 +977,12 @@ export function createServerHistoryStore(
           touched = true;
         }
         const serverUpdated = toEpoch(sc.updated_at, conv.updatedAt);
+        // Compared BEFORE updatedAt adopts the list's value below: after that
+        // nothing would remember that the cached thread is older than the
+        // server's (the stale second device, 2026-10-02).
+        if (serverUpdated > (seen?.[sc.id] ?? conv.updatedAt)) {
+          staled.push(sc.id);
+        }
         if (serverUpdated > conv.updatedAt) {
           conv.updatedAt = serverUpdated;
           touched = true;
@@ -954,6 +1000,11 @@ export function createServerHistoryStore(
       }
     }
     if (changed.length > 0) cache.writeAll(all, changed);
+    if (staled.length > 0) {
+      mutateSync((s) => {
+        s.stale = [...new Set([...(s.stale ?? []), ...staled])];
+      });
+    }
   }
 
   /**
@@ -1189,8 +1240,13 @@ export function createServerHistoryStore(
     const cached = local.get(id);
     const s = readSync();
     const pushed = s.pushed[id];
+    // The list said the server wrote this chat after we last read it — a turn
+    // sent from another device. Same ids as what we pushed proves nothing
+    // then (2026-10-02: the second device kept its cached thread for good).
+    const stale = s.stale?.includes(id) === true;
     if (
       !force &&
+      !stale &&
       cached &&
       Array.isArray(pushed) &&
       sameIds(pushed, cached.messages)
@@ -1199,6 +1255,13 @@ export function createServerHistoryStore(
     }
     if (!force && cached && (pushed === undefined || s.dirty.includes(id))) {
       return cached; // local copy is ahead; background sync will push it
+    }
+    // Claimed before the request, so a second load meanwhile (the poll, a
+    // focus) serves the cache instead of fetching the same thing again.
+    if (stale) {
+      mutateSync((st) => {
+        st.stale = (st.stale ?? []).filter((x) => x !== id);
+      });
     }
     try {
       const server = await api.get(id);
@@ -1212,7 +1275,25 @@ export function createServerHistoryStore(
         return cached; // server is behind the local copy — keep local truth
       }
       const now = Date.now();
-      const messages: ChatMessage[] = server.messages.map((m, i) => ({
+      // 2026-10-02 (second device): a non-forced read — the list said
+      // another device wrote — keeps, on every turn the cache already holds
+      // unchanged, the client id and the browser-only fields (threadReconcile's
+      // per-turn rule). The open view keeps them too, so the next save is
+      // still an append rather than a whole-thread PUT, and a photo only this
+      // browser holds stays on screen after switching chats.
+      const held = force ? [] : (cached?.messages ?? []);
+      const keepHeld = (m: ChatMessage, i: number): ChatMessage => {
+        const l = held[i];
+        if (!l || l.role !== m.role || l.content !== m.content) return m;
+        return {
+          ...m,
+          id: l.id,
+          ...(l.imageDataUrl !== undefined ? { imageDataUrl: l.imageDataUrl } : {}),
+          ...(l.imageDataUrls !== undefined ? { imageDataUrls: l.imageDataUrls } : {}),
+          ...(l.pdfName !== undefined ? { pdfName: l.pdfName } : {}),
+        };
+      };
+      const messages: ChatMessage[] = server.messages.map((m, i) => keepHeld({
         id: `srv-${id}-${i}`,
         // The server row id, so a thumb given now survives the next reload.
         ...(typeof m.id === 'number' ? { serverId: m.id } : {}),
@@ -1230,7 +1311,7 @@ export function createServerHistoryStore(
           : {}),
         ...(m.role === 'user' ? {} : { status: 'done' as const }),
         createdAt: now - (server.messages.length - i),
-      }));
+      }, i));
       // A conversation this browser never cached takes the SERVER's
       // updated_at, not "now": stamping the load time moved every deep-linked
       // chat to the top of Recents, where it stayed after a reload even
@@ -1253,6 +1334,10 @@ export function createServerHistoryStore(
         if (!st.stamps) st.stamps = {};
         if (server.updatedAt !== undefined) st.stamps[id] = server.updatedAt;
         else delete st.stamps[id];
+        // What the cache now holds, for the next list to be compared with.
+        if (!st.seen) st.seen = {};
+        if (server.updatedAt !== undefined) st.seen[id] = serverUpdatedAt;
+        else delete st.seen[id];
       });
       return conv;
     } catch (err) {
@@ -1260,6 +1345,13 @@ export function createServerHistoryStore(
       // exactly as before, and a network failure is not a verdict.
       if (!cached && isNotFound(err)) notFound.add(id);
       else notFound.delete(id);
+      // Not read after all: the next load tries again (a 404 is a verdict —
+      // the next refresh drops the chat — and must not be retried each poll).
+      if (stale && !isNotFound(err)) {
+        mutateSync((st) => {
+          if (!st.stale?.includes(id)) st.stale = [...(st.stale ?? []), id];
+        });
+      }
       return cached; // offline — serve the cached copy (may be stale)
     }
   }
@@ -1624,9 +1716,20 @@ export function createServerHistoryStore(
       }
     },
 
+    async refreshActive() {
+      try {
+        mergeServerRows(await api.list());
+        return true;
+      } catch {
+        return false;
+      }
+    },
+
     load: (id, opts) => loadConversation(id, opts?.force === true),
 
     wasNotFound: (id) => notFound.has(id),
+
+    isStale: (id) => readSync().stale?.includes(id) === true,
 
     subscribe(listener) {
       adopted.add(listener);

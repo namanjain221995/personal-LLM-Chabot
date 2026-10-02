@@ -219,6 +219,14 @@ import { ShareDialog } from './ShareDialog';
  */
 type EarlyUpload = Attachment & { uploadConversationId?: string | null };
 
+/**
+ * 2026-10-02 (second device): the least time between two "did another device
+ * write?" list reads — opening chats from the sidebar, the tab coming back
+ * into view. A focus and a visibilitychange arrive together; one read covers
+ * both.
+ */
+const UPDATE_CHECK_MIN_MS = 5_000;
+
 /** The row callbacks ChatApp caches per message id — see `rowHandlers`. */
 interface RowHandlers {
   onRegenerate: () => void;
@@ -496,6 +504,13 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
    * 2026-09-13). The poll leaves that id to the mount effect until it is done.
    */
   const bootReconcileRef = useRef<string | null>(null);
+  /**
+   * 2026-10-02 (second device): `ready` once the mount has bound the store to
+   * the signed-in account and refreshed it — a list read before that could
+   * land in the previous account's cache; `at`/`running` space the reads
+   * (checkForUpdates).
+   */
+  const updateCheckRef = useRef({ ready: false, at: 0, running: false });
   /**
    * A ?c= deep link named a conversation the server does not have (deleted, or
    * another account's — the same 404). Shown over the new chat that replaced
@@ -1244,6 +1259,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       await store.refresh();
       if (cancelled) return;
       refreshList();
+      updateCheckRef.current.ready = true;
 
       try {
         // After an account switch `wanted` names the PREVIOUS account's
@@ -1413,6 +1429,47 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       window.clearInterval(timer);
     };
   }, [reconcileConversation]);
+
+  /**
+   * 2026-10-02 (second device): did another device write to the open chat?
+   *
+   * The poll above never asks: a non-forced load serves the cache, and only
+   * the list says a chat moved on. So a desktop that had the chat open showed
+   * its cached thread without the photo and PDF a phone had just sent, for
+   * good. One list read here; the conversation itself is fetched only when
+   * the list says the server wrote it after this browser last read it.
+   * Called when a chat is opened from the sidebar and when the tab comes back
+   * into view — never on a timer.
+   */
+  const checkForUpdates = useCallback(async () => {
+    const check = updateCheckRef.current;
+    const now = Date.now();
+    if (!check.ready || check.running || now - check.at < UPDATE_CHECK_MIN_MS) return;
+    check.running = true;
+    check.at = now;
+    try {
+      const store = getHistoryStore();
+      if (!(await store.refreshActive?.())) return;
+      refreshList();
+      const id = activeIdRef.current;
+      if (!id || bootReconcileRef.current === id || isStreaming(id)) return;
+      if (store.isStale?.(id)) await reconcileConversation(id);
+    } finally {
+      check.running = false;
+    }
+  }, [reconcileConversation, refreshList]);
+
+  useEffect(() => {
+    const onReturn = () => {
+      if (!document.hidden) void checkForUpdates();
+    };
+    document.addEventListener('visibilitychange', onReturn);
+    window.addEventListener('focus', onReturn);
+    return () => {
+      document.removeEventListener('visibilitychange', onReturn);
+      window.removeEventListener('focus', onReturn);
+    };
+  }, [checkForUpdates]);
 
   // H-01: an upload indicator belongs to the chat it was started in; leaving
   // it on screen in another conversation would describe nothing.
@@ -3015,13 +3072,22 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
           // harmless: click A then B, and A's response finds activeIdRef
           // pointing at B and does nothing at all.
           void reconcileConversation(id).finally(() => settleLoading(id));
+          // The cache's own verdict above is only as fresh as the last list:
+          // ask whether another device wrote to it since (2026-10-02).
+          void checkForUpdates();
         }
       }
       if (window.matchMedia('(max-width: 767px)').matches) {
         setSidebarOpen(false);
       }
     },
-    [attachOrExplain, reconcileConversation, setUrlConversation, settleLoading],
+    [
+      attachOrExplain,
+      checkForUpdates,
+      reconcileConversation,
+      setUrlConversation,
+      settleLoading,
+    ],
   );
 
   const renameConversation = useCallback(
