@@ -350,8 +350,17 @@ MYFILES_RESULTS = frozenset({"ok", "bad_request", "error"})
 
 _ROUTE_EFFORT = {"route": set(CHAT_ROUTES), "effort": set(CHAT_EFFORTS)}
 
+#: The speech router's two tiers (app/asr.RoutedProvider): the GPU replicas in ASR_BASE_URLS and
+#: the CPU overflow replica in ASR_CPU_BASE_URLS (2026-09-30).
+ASR_TIERS = frozenset({"gpu", "cpu"})
+#: What the CPU replica did with a clip that found every GPU replica busy: took it, or could not
+#: (busy with another clip, standing down after a failure, or the clip would miss its deadline).
+ASR_CPU_OVERFLOW_OUTCOMES = frozenset({"sent", "cpu_busy", "cpu_down", "too_long"})
+
 #: metric -> {label name: closed value set}. Only these label NAMES survive.
 _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
+    "asr_route_total": {"tier": set(ASR_TIERS)},
+    "asr_cpu_overflow_total": {"outcome": set(ASR_CPU_OVERFLOW_OUTCOMES)},
     "chat_first_visible_seconds": {**_ROUTE_EFFORT, "kind": set(FIRST_VISIBLE_KINDS)},
     "knowledge_prepare_seconds": {
         "effort": set(CHAT_EFFORTS),

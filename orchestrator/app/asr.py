@@ -67,6 +67,7 @@ PCM it cut itself — see `transcribe_segments` and the BATCH pool.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import dataclasses
 import logging
 import re
@@ -307,11 +308,28 @@ class VLLMAudioProvider:
         model: str,
         name: str = "whisper",
         timeout_s: float = 60.0,
+        tier: str = "gpu",
+        fixed_s: float = 0.0,
+        s_per_audio_s: float = 0.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.name = name
         self.timeout_s = timeout_s
+        #: "gpu" for the replicas in ASR_BASE_URLS, "cpu" for the overflow replica in
+        #: ASR_CPU_BASE_URLS (compose/whisper-cpu/server.py): same contract, slower.
+        self.tier = tier
+        #: How long a clip takes on THIS engine, as fixed + seconds x rate. Zero (a GPU replica)
+        #: keeps the loaded GPU rate `_retry_affordable` has always used; the CPU replica carries
+        #: its own measured numbers (ASR_CPU_FIXED_S, ASR_CPU_S_PER_AUDIO_S).
+        self.fixed_s = fixed_s
+        self.s_per_audio_s = s_per_audio_s
+
+    def decode_cost_s(self, seconds: float) -> float:
+        """Estimated seconds for this engine to decode `seconds` of audio, when it is free."""
+        if self.s_per_audio_s <= 0.0:
+            return seconds * LOADED_DECODE_S_PER_AUDIO_S
+        return self.fixed_s + seconds * self.s_per_audio_s
 
     # -- transport ---------------------------------------------------------
 
@@ -537,7 +555,9 @@ class VLLMAudioProvider:
                 first, confidence=_silence_confidence(first, heard)
             )
         remaining = deadline - time.monotonic()
-        if not _retry_affordable(heard.duration_s or 0.0, remaining):
+        if not _retry_affordable(
+            heard.duration_s or 0.0, remaining, cost_s=self.decode_cost_s(heard.duration_s or 0.0)
+        ):
             # The first pass used the dictation's wall clock up. Starting a
             # decode that cannot finish inside it would take a GPU for a
             # transcript nobody will ever receive.
@@ -574,6 +594,7 @@ class VLLMAudioProvider:
             heard_again.duration_s or heard.duration_s or 0.0,
             second.segments,
             engine_heard_speech=False,
+            tier=self.tier,
         ):
             metrics.inc("asr_gated_retry_total", "silence-gated dictations decoded again", result="accepted")
             # A plain Transcript, the shape dictation always returns: the
@@ -659,6 +680,38 @@ def _number(value: Any) -> Optional[float]:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def clip_seconds(audio: Any) -> Optional[float]:
+    """The length of a RIFF/WAVE clip read from its header, or None when it is not one.
+
+    Recording-session windows and video windows are WAV built in memory, so their length is exact
+    and free to read, and the CPU replica's deadline check (`RoutedProvider._cpu_fits`) uses it.
+    Anything else — the legacy path's WebM/Opus — is None: its length is not known without
+    decoding it, and the check then assumes the longest clip an engine accepts.
+
+    Walks the chunks rather than assuming a 44-byte header (ffmpeg writes a LIST chunk first), and
+    trusts the bytes actually present over a data size that claims more (a streamed header)."""
+    try:
+        head = bytes(audio[:65536])
+    except Exception:  # noqa: BLE001
+        return None
+    if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        return None
+    offset, byte_rate = 12, 0
+    while offset + 8 <= len(head):
+        chunk, size = head[offset:offset + 4], int.from_bytes(head[offset + 4:offset + 8], "little")
+        body = offset + 8
+        if chunk == b"fmt " and body + 12 <= len(head):
+            byte_rate = int.from_bytes(head[body + 8:body + 12], "little")
+        elif chunk == b"data":
+            if byte_rate <= 0:
+                return None
+            present = max(0, len(audio) - body)
+            data = present if size in (0, 0xFFFFFFFF) else min(size, present)
+            return data / byte_rate
+        offset = body + size + (size & 1)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -873,6 +926,7 @@ def speech_is_plausible(
     *,
     engine_heard_speech: bool,
     no_speech_prob: Optional[float] = None,
+    tier: str = "gpu",
 ) -> bool:
     """Whether a dictation transcript is speech rather than Whisper's invention.
 
@@ -882,7 +936,8 @@ def speech_is_plausible(
     was not sure was speech (`no_speech_prob`). False: the gate called the
     clip silent and the text comes from the ungated retry, so the words must
     be as dense as speech — measured over the audio the segments cover, or
-    the whole clip when the reply carries no segments.
+    the whole clip when the reply carries no segments. `tier` is the replica
+    that decoded it ("gpu" or "cpu", `VLLMAudioProvider.tier`).
     """
     units = _speech_units(text)
     if units == 0:
@@ -891,6 +946,18 @@ def speech_is_plausible(
         if no_speech_prob is not None and no_speech_prob < _CONFIDENT_SPEECH_NSP:
             return True
         return not (seconds >= _STOCK_PHRASE_MIN_SECONDS and _only_stock_phrases(text))
+    # ON THE CPU REPLICA ONLY: nothing but stock phrases, from a clip the gate
+    # called silent, is an invention however the engine times it. The density
+    # below catches it while the engine times such a phrase to the end of its
+    # window, as the GPU pipeline does ("Thank you." at 0-29.98 s over 10 s of
+    # digital silence, 0.2 words/s). whisper.cpp, the CPU replica, times it to
+    # the word: "you" at 0.00-0.62 s over the same clip is 1.0 words/s, and it
+    # was kept (measured end to end on the worker, 2026-09-30). Not on a GPU
+    # replica (verifier, 2026-09-30): there the density already drops the
+    # invention, and the rule would drop a real quiet "Okay." or "Thank you."
+    # that the retry recovered, a change nobody asked for on the GPU path.
+    if tier == "cpu" and _only_stock_phrases(text):
+        return False
     # A stock phrase that is not all of the text is the decoder filling a
     # quiet stretch: live, a 60 s dictation (32 s quiet, then 52 words of real
     # speech) came back with "Thank you." spanning 0-29.98 s, which made it
@@ -929,16 +996,19 @@ def _gated(result: Transcript, heard: _Heard) -> bool:
     )
 
 
-def _retry_affordable(duration_s: float, remaining_s: float) -> bool:
+def _retry_affordable(duration_s: float, remaining_s: float, *, cost_s: Optional[float] = None) -> bool:
     """Whether the second decode can finish in what is left of the dictation's
     one wall clock.
 
     Estimated at the LOADED rate: a replica that is already decoding somebody
     else's clip is exactly when this optional decode is most expensive, and
     guessing the quiet rate would start decodes that end as a 504 having spent
-    the GPU anyway.
+    the GPU anyway. `cost_s` is the engine's own estimate when it has one (the
+    CPU replica, `VLLMAudioProvider.decode_cost_s`).
     """
-    return remaining_s > 0.0 and duration_s * LOADED_DECODE_S_PER_AUDIO_S <= remaining_s
+    if cost_s is None:
+        cost_s = duration_s * LOADED_DECODE_S_PER_AUDIO_S
+    return remaining_s > 0.0 and cost_s <= remaining_s
 
 
 def _silence_confidence(result: Transcript, heard: _Heard) -> str:
@@ -1052,33 +1122,116 @@ class RoutedProvider:
     #: The ceiling on the doubling below. An engine that has been broken for
     #: ten minutes is checked every ten minutes, not every twenty seconds.
     _COOLDOWN_MAX_S = 600.0
+    #: Clips a CPU replica is given at once. compose/whisper-cpu/server.py decodes one at a time,
+    #: as the GPU replica does, and a second would only wait behind the first on the same cores.
+    _CPU_MAX_ACTIVE = 1
 
-    def __init__(self, engines: Sequence[ASRProvider]) -> None:
+    def __init__(
+        self,
+        engines: Sequence[ASRProvider],
+        overflow: Sequence[ASRProvider] = (),
+        *,
+        cpu_margin: float = 1.5,
+        longest_clip_s: float = 600.0,
+    ) -> None:
+        """`engines` are the GPU replicas, always preferred. `overflow` are CPU replicas: a clip
+        goes to one only when every GPU replica is already decoding (or standing down) and the
+        clip fits its deadline at the CPU's measured speed. See THE CPU REPLICA below."""
         if not engines:
             raise ValueError("RoutedProvider needs at least one engine")
-        self._engines = list(engines)
+        # GPU replicas FIRST, so their indices are the ones ASR_BASE_URLS gives them: /v1's
+        # `counted_in_dictation_routing` finds a replica's index through stats() by its URL.
+        self._engines = list(engines) + list(overflow)
+        self._tier: List[str] = ["gpu"] * len(engines) + ["cpu"] * len(overflow)
         self._active: Dict[int, int] = {i: 0 for i in range(len(self._engines))}
         self._down_until: Dict[int, float] = {i: 0.0 for i in range(len(self._engines))}
         #: Consecutive failures per engine, reset by the first success. It
         #: lengthens the stand-down and — just as importantly — is REPORTED,
         #: because the failure this exists for is invisible otherwise.
         self._failures: Dict[int, int] = {i: 0 for i in range(len(self._engines))}
+        self._cpu_margin = max(1.0, float(cpu_margin))
+        self._longest_clip_s = float(longest_clip_s)
         self.name = self._engines[0].name
         self.model = self._engines[0].model
 
-    def _order(self) -> List[int]:
+    # -- THE CPU REPLICA (2026-09-30) ------------------------------------------------------------
+    #
+    # A third copy of the same model on the worker's CPU cores (compose/whisper-cpu/server.py).
+    # PREFER THE GPUS: a clip is sent to it only when every GPU replica has a clip in flight from
+    # this process (or is standing down after a failure) — "busy", because each GPU replica decodes
+    # one clip at a time and the next one waits inside it. Then the CPU replica goes FIRST if it
+    # is free and the clip can finish in time: its measured decode estimate (ASR_CPU_FIXED_S +
+    # seconds x ASR_CPU_S_PER_AUDIO_S), times ASR_CPU_DEADLINE_MARGIN, must fit the call's
+    # deadline — the window timeout for a session window, the engine timeout otherwise. A clip whose
+    # length is unknown (WebM on the legacy path) is costed at the longest clip an engine accepts.
+    # A clip that does not fit is NEVER sent: it queues on a GPU replica as it always did.
+    #
+    # And while a GPU replica is free, a free CPU replica is still the LAST resort after every GPU
+    # replica (healthy or cooling) has failed this call, under the same deadline rule: a node
+    # rebooting should cost dictation speed, not dictation.
+
+    def _cpu_fits(self, index: int, seconds: Optional[float], deadline_s: Optional[float]) -> bool:
+        engine = self._engines[index]
+        estimate = getattr(engine, "decode_cost_s", None)
+        if deadline_s is None or not callable(estimate):
+            return False
+        clip = self._longest_clip_s if seconds is None else float(seconds)
+        return float(estimate(clip)) * self._cpu_margin <= float(deadline_s)
+
+    def _order(
+        self, seconds: Optional[float] = None, deadline_s: Optional[float] = None, *, count: bool = True
+    ) -> List[int]:
         """Healthy engines first, freest first; then the ones standing down.
 
         The stood-down engines stay on the end rather than being dropped, so a
         fleet where every engine is cooling off still tries one instead of
-        failing a request nobody had to lose.
+        failing a request nobody had to lose. CPU replicas are placed by the
+        rule above; with none configured this is exactly the order it always was.
+        `count=False` asks without counting an overflow (`cpu_takes_next`).
         """
         now = time.monotonic()
-        healthy = [i for i in range(len(self._engines)) if self._down_until[i] <= now]
-        cooling = [i for i in range(len(self._engines)) if self._down_until[i] > now]
+        gpu = [i for i in range(len(self._engines)) if self._tier[i] == "gpu"]
+        healthy = [i for i in gpu if self._down_until[i] <= now]
+        cooling = [i for i in gpu if self._down_until[i] > now]
         healthy.sort(key=lambda i: self._active[i])
         cooling.sort(key=lambda i: self._down_until[i])
-        return healthy + cooling
+        order = healthy + cooling
+        cpus = [i for i in range(len(self._engines)) if self._tier[i] == "cpu"]
+        if not cpus:
+            return order
+        usable = [
+            i for i in cpus
+            if self._down_until[i] <= now
+            and self._active[i] < self._CPU_MAX_ACTIVE
+            and self._cpu_fits(i, seconds, deadline_s)
+        ]
+        if any(self._active[i] == 0 for i in healthy):
+            # A GPU replica is free: it takes the clip. The CPU only backs the GPUs up.
+            return order + usable
+        if not count:
+            return usable + order
+        if usable:
+            outcome = "sent"
+        elif not any(self._down_until[i] <= now for i in cpus):
+            outcome = "cpu_down"
+        elif not any(self._active[i] < self._CPU_MAX_ACTIVE for i in cpus):
+            outcome = "cpu_busy"
+        else:
+            outcome = "too_long"
+        metrics.inc(
+            "asr_cpu_overflow_total",
+            "clips that found every GPU speech replica busy, by what the CPU replica did",
+            outcome=outcome,
+        )
+        return usable + order
+
+    def cpu_takes_next(self) -> bool:
+        """Whether a clip of unknown length routed NOW goes to a CPU replica first: every GPU
+        replica is busy or standing down, and a CPU replica is up, free and fast enough for the
+        engine timeout. `_order`'s own rule, uncounted. The dictation pool asks it before lending
+        a CPU replica's slot (`_Pool`)."""
+        order = self._order(None, self._deadline_s({}), count=False)
+        return bool(order) and self._tier[order[0]] == "cpu"
 
     async def transcribe(
         self, audio: bytes, *, filename: str, content_type: str, language: str = ""
@@ -1126,9 +1279,17 @@ class RoutedProvider:
         that is unavailable and trying the next — the same loop for every
         method an engine exposes."""
         last: Optional[Exception] = None
-        for index in self._order():
+        order = self._order(clip_seconds(audio), self._deadline_s(kwargs))
+        for index in order:
             engine = self._engines[index]
             self._active[index] += 1
+            metrics.inc("asr_route_total", "clips sent to a speech replica, by its tier", tier=self._tier[index])
+            if self._tier[index] == "cpu":
+                log.info(
+                    "ASR clip (%s) sent to the CPU replica %s: %s",
+                    method, getattr(engine, "base_url", index),
+                    "every GPU replica is busy" if index == order[0] else "every GPU replica failed",
+                )
             try:
                 result = await getattr(engine, method)(audio, **kwargs)
                 if self._failures[index]:
@@ -1184,6 +1345,17 @@ class RoutedProvider:
                 self._active[index] -= 1
         raise ASRUnavailable(str(last) if last else "no speech engine answered")
 
+    def _deadline_s(self, kwargs: Dict[str, Any]) -> Optional[float]:
+        """How long this call may take: a session window's own timeout, otherwise the
+        engine timeout the CPU replica would be held to (ASR_TIMEOUT_S)."""
+        explicit = kwargs.get("timeout_s")
+        if explicit:
+            return float(explicit)
+        for engine, tier in zip(self._engines, self._tier):
+            if tier == "cpu":
+                return float(getattr(engine, "timeout_s", 0.0) or 0.0) or None
+        return None
+
     async def health(self) -> bool:
         """True when ANY engine answers — the feature works on one node."""
         for engine in self._engines:
@@ -1197,6 +1369,8 @@ class RoutedProvider:
         return [
             {
                 "endpoint": getattr(engine, "base_url", ""),
+                # "gpu" (ASR_BASE_URLS) or "cpu" (ASR_CPU_BASE_URLS, the overflow replica).
+                "tier": self._tier[i],
                 "active": self._active[i],
                 "available": self._down_until[i] <= now,
                 # An engine that answers /health and fails every transcription
@@ -1227,13 +1401,34 @@ class RoutedProvider:
 
 
 class _Pool:
-    """A semaphore that reports its own depth, and refuses rather than hangs."""
+    """A semaphore that reports its own depth, and refuses rather than hangs.
+
+    A CPU REPLICA'S SLOT IS LENT, NOT ADDED TO THE SEMAPHORE (2026-10-01).
+    The permits are the GPU replicas' alone (`_size`), as before the CPU
+    replica existed. A clip is admitted WITHOUT a permit only when the router
+    would send it to a CPU replica first at that moment (`_lend`), and it
+    gives that slot back when it leaves. The router places the clip in the
+    same synchronous run, so the lent slot is the one the clip uses. Adding
+    the CPU's slot to the semaphore instead (the first version) admitted it
+    while the CPU could not take a clip (standing down, busy with a video or
+    session window, or too slow for the deadline), and that clip went to a
+    GPU replica as the third in flight, past ASR_MAX_CONCURRENT's "one
+    decoding, one ready" (verifier, 2026-09-30). A lent clip whose CPU call
+    fails still falls back to the GPU queue, like any failed engine.
+    """
 
     def __init__(self) -> None:
         self._sem: Optional[asyncio.Semaphore] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.waiting = 0
         self.active = 0
+        #: Clips in flight on a lent CPU slot rather than a permit.
+        self.lent = 0
+        #: Per task, innermost last: whether each admission was lent a slot,
+        #: so `__aexit__` gives back the kind it took.
+        self._held: contextvars.ContextVar[Tuple[bool, ...]] = contextvars.ContextVar(
+            f"asr_pool_held_{id(self)}", default=()
+        )
 
     #: How many may be in flight at once. Dictation's pool scales with the
     #: fleet (see below); the batch pool does NOT — see `BATCH_POOL`.
@@ -1242,6 +1437,15 @@ class _Pool:
         # the same pressure each. `settings.asr_base_urls` is never empty
         # (config falls back to the single URL), so this is at least one.
         return max(1, settings.asr_max_concurrent) * max(1, len(settings.asr_base_urls))
+
+    def _lend(self) -> bool:
+        """Whether this admission takes a CPU replica's slot instead of a
+        permit: one is configured and the router would send a clip arriving
+        now to it first (`RoutedProvider.cpu_takes_next`)."""
+        if not getattr(settings, "asr_cpu_base_urls", ()):
+            return False
+        router = _provider
+        return isinstance(router, RoutedProvider) and router.cpu_takes_next()
 
     def _semaphore(self) -> asyncio.Semaphore:
         loop = asyncio.get_running_loop()
@@ -1254,19 +1458,29 @@ class _Pool:
 
     async def __aenter__(self) -> "_Pool":
         sem = self._semaphore()
-        self.waiting += 1
-        metrics.set_gauge("asr_queue_depth", self.waiting, "requests waiting for a slot")
-        try:
-            # asyncio.timeout, not asyncio.wait_for: on Python 3.11 (CI's
-            # interpreter) wait_for can swallow a cancellation that arrives in
-            # the same pass as the timeout, which hung a CI run once.
-            async with asyncio.timeout(settings.asr_queue_wait_s):
-                await sem.acquire()
-        except TimeoutError as exc:
-            raise ASRBusy("every transcription slot is busy") from exc
-        finally:
-            self.waiting -= 1
+        lent = self._lend()
+        if not lent:
+            self.waiting += 1
             metrics.set_gauge("asr_queue_depth", self.waiting, "requests waiting for a slot")
+            try:
+                # asyncio.timeout, not asyncio.wait_for: on Python 3.11 (CI's
+                # interpreter) wait_for can swallow a cancellation that arrives in
+                # the same pass as the timeout, which hung a CI run once.
+                async with asyncio.timeout(settings.asr_queue_wait_s):
+                    await sem.acquire()
+            except TimeoutError as exc:
+                raise ASRBusy("every transcription slot is busy") from exc
+            finally:
+                self.waiting -= 1
+                metrics.set_gauge("asr_queue_depth", self.waiting, "requests waiting for a slot")
+            # Admitted after a wait, into a fleet whose next clip goes to a
+            # CPU replica: this one does, so its permit goes to the next caller.
+            lent = self._lend()
+            if lent:
+                sem.release()
+        if lent:
+            self.lent += 1
+        self._held.set(self._held.get() + (lent,))
         self.active += 1
         metrics.set_gauge("asr_active_requests", self.active, "transcriptions in flight")
         return self
@@ -1274,7 +1488,11 @@ class _Pool:
     async def __aexit__(self, *_exc: Any) -> None:
         self.active -= 1
         metrics.set_gauge("asr_active_requests", self.active, "transcriptions in flight")
-        if self._sem is not None:
+        held = self._held.get()
+        self._held.set(held[:-1])
+        if held and held[-1]:
+            self.lent -= 1
+        elif self._sem is not None:
             self._sem.release()
 
     def reset_for_tests(self) -> None:
@@ -1282,6 +1500,7 @@ class _Pool:
         self._loop = None
         self.waiting = 0
         self.active = 0
+        self.lent = 0
 
 
 POOL = _Pool()
@@ -1303,6 +1522,11 @@ class _BatchPool(_Pool):
 
     def _size(self) -> int:
         return max(1, settings.video_asr_concurrency)
+
+    def _lend(self) -> bool:
+        # Video's windows reach a CPU replica through the router as before;
+        # this pool's size is VIDEO_ASR_CONCURRENCY and nothing else.
+        return False
 
 
 BATCH_POOL = _BatchPool()
@@ -1335,10 +1559,31 @@ def provider() -> ASRProvider:
             )
             for url in urls
         ]
+        # The CPU overflow replica(s), ASR_CPU_BASE_URLS: the same model and contract, used only
+        # when every GPU replica above is busy (RoutedProvider, THE CPU REPLICA). Empty by default,
+        # and then routing is exactly what it was.
+        overflow = [
+            VLLMAudioProvider(
+                base_url=url,
+                model=settings.asr_model,
+                name=settings.asr_backend,
+                timeout_s=settings.asr_timeout_s,
+                tier="cpu",
+                fixed_s=settings.asr_cpu_fixed_s,
+                s_per_audio_s=settings.asr_cpu_s_per_audio_s,
+            )
+            for url in (getattr(settings, "asr_cpu_base_urls", ()) or ())
+            if url and url.strip() and url.strip().rstrip("/") not in {u.rstrip("/") for u in urls}
+        ]
         # One engine still goes through the router: the code path a workspace
         # runs every day should be the one the tests exercise, not a special
         # case that only appears on smaller deployments.
-        _provider = RoutedProvider(engines)
+        _provider = RoutedProvider(
+            engines,
+            overflow,
+            cpu_margin=settings.asr_cpu_deadline_margin,
+            longest_clip_s=float(settings.asr_max_audio_seconds),
+        )
     return _provider
 
 

@@ -687,7 +687,7 @@ never touches Docker's chains.
 | node | guarded tcp ports | accepted from | dropped |
 |---|---|---|---|
 | head | 8000-8005, 9100, 9835, 9838 | lo; docker0 and br-* from 172.16.0.0/12; enp1s0f1np1 from 10.100.184.0/24; enP2p1s0f1np1 from 10.100.185.0/24 | enP7s7, tailscale0, any other ingress (IPv4 and IPv6) |
-| worker | 9100, 9835, 9839, 30004, 30007, 30011 (the voice archive store, [`voice-archive.md`](../voice-archive.md)) | lo; both rails; enP7s7 from the head 192.168.9.54 (not 9839); local Docker bridges | enP7s7 from anyone else, tailscale0, any other ingress |
+| worker | 9100, 9835, 9839, 30004, 30007, 30008 (the CPU speech replica, `scripts/whisper-cpu.sh`, whose `up` refuses to start while the loaded table or the boot copy leaves it out), 30011 (the voice archive store, [`voice-archive.md`](../voice-archive.md)) | lo; both rails; enP7s7 from the head 192.168.9.54 (not 9839); local Docker bridges | enP7s7 from anyone else, tailscale0, any other ingress |
 
 `apply` refuses, before calling nft, if the rules would drop a consumer in its
 built-in consumer table, if an interface it names is missing, or if a peer
@@ -941,6 +941,7 @@ last:
 | adj | who | what killing it frees |
 | --- | --- | --- |
 | 900 | OCR engine (`ocr`, worker; compose.ocr.yaml) | ~15.2 GiB GPU |
+| 850 | CPU speech replica (`whisper-cpu`, worker, when deployed; compose.whisper-cpu.yaml): overflow capacity, so it goes before the GPU replica that serves speech normally | ~2.3 GiB host RSS, no GPU |
 | 800 | speech (`whisper`, both nodes; compose.whisper.yaml) | 3.3 GiB (head) / 4.9 GiB (worker) GPU |
 | 700 | vllm-router, vllm-embed, vllm-reranker (head), `AUX_ENGINE_OOM_SCORE_ADJ=700` | 16.5 + 4.0 + 4.0 GiB GPU |
 | 600 | grafana, cadvisor, postgres-exporter, data-stores-exporter, blackbox-exporter | little (host RSS) |
@@ -985,6 +986,15 @@ not charged to their cgroup, so a limit would only bound their small host RSS
 and add a second way to be killed, at a size nobody has measured. The test
 `test_no_compose_file_gives_any_service_a_hard_memory_limit` makes adding one
 a deliberate decision.
+
+One has been decided (2026-09-30): the CPU speech replica (`whisper-cpu`,
+compose.whisper-cpu.yaml) has `mem_limit` and `memswap_limit` 4g. It runs no
+GPU code, so all of its memory is host RSS that the cgroup does charge, and the
+limit is twice its measured 2.0 GiB peak. A leak there is killed inside its own
+cgroup and the router falls back to the GPU replicas. Without the limit it
+would reach the global killer, which takes the OCR engine (900) first. The
+test's `DECIDED_MEMORY_LIMITS` lists it with that basis
+(docs/voice/CPU-REPLICA.md).
 
 ### Right now, as root, without restarting anything (the bridge)
 
@@ -1281,6 +1291,7 @@ docker inspect "sf-local-ai-$s-1" --format '{{index .Config.Labels "com.docker.c
 | head `vllm`, worker `vllm-worker` | compose.dgx-spark.yaml, compose.cluster-worker.yaml | `${ENGINE_OOM_SCORE_ADJ:-0}` | **-450** | only at a recreate that happens anyway (`--full`, incident); the bridge until then |
 | vllm-router, vllm-embed, vllm-reranker | compose.dgx-spark.yaml | `${AUX_ENGINE_OOM_SCORE_ADJ:-0}` | **700** | the next deploy after the key is set (aux models reload, not the main engine) |
 | `ocr` | compose.ocr.yaml | 900 | — | `scripts/ocr.sh up` |
+| `whisper-cpu` (worker, when deployed) | compose.whisper-cpu.yaml | 850 | — | `scripts/whisper-cpu.sh up` |
 | `whisper` (both nodes) | compose.whisper.yaml | 800 | — | `scripts/whisper.sh up` |
 | grafana, cadvisor, postgres-exporter, data-stores-exporter, blackbox-exporter | compose.monitoring.yaml | 600 | — | `scripts/monitoring.sh up` |
 | prometheus, node-exporter, dgx-gpu-exporter (head and worker) | compose.monitoring.yaml, compose.monitoring-worker.yaml | 500 | — | `scripts/monitoring.sh up` |
