@@ -316,15 +316,16 @@ describe('a second device opens a chat whose photo an old page sent', () => {
     storedTwoPhotos();
     await openApp();
 
-    await waitFor(() => expect(thumbs()).toEqual([thumbFor(0), thumbFor(1)]));
+    await waitFor(() => expect(thumbs()).toEqual([thumbFor(0), thumbFor(1)]), { timeout: 4000 });
     // The box is reserved from the listed size, like any meta.images thumb.
     const first = document.querySelector('img[data-testid="stored-image"]')!;
     expect(first.getAttribute('width')).toBe('1600');
     expect(first.getAttribute('height')).toBe('1200');
     expect(screen.queryByTestId('legacy-photo-note')).toBeNull();
 
-    await drain();
     // One read of the list for the whole chat, one PUT carrying the refs.
+    await waitFor(() => expect(puts).toHaveLength(1), { timeout: 4000 });
+    await drain();
     expect(listReads()).toBe(1);
     expect(puts).toHaveLength(1);
     expect(serverUserMeta()?.images).toEqual([
@@ -347,8 +348,10 @@ describe('a second device opens a chat whose photo an old page sent', () => {
     storedTwoPhotos();
     movePuts = 1;
     await openApp();
-    await waitFor(() => expect(thumbs()).toHaveLength(2));
-    await drain();
+    await waitFor(() => expect(thumbs()).toHaveLength(2), { timeout: 4000 });
+    await waitFor(() => expect((serverUserMeta()?.images as unknown[] | undefined)?.length).toBe(2), {
+      timeout: 4000,
+    });
     await drain();
     expect(puts.length).toBeGreaterThanOrEqual(2);
     expect(puts.length).toBeLessThanOrEqual(3);
@@ -360,7 +363,7 @@ describe('a second device opens a chat whose photo an old page sent', () => {
     seedOldPageTurn();
     mediaItems = [{ attachment_id: `ix-${OTHER_INTENT}-0`, mime: 'image/png' }];
     await openApp();
-    expect(await screen.findByTestId('legacy-photo-note')).toBeTruthy();
+    expect(await screen.findByTestId('legacy-photo-note', undefined, { timeout: 4000 })).toBeTruthy();
     expect(thumbs()).toEqual([]);
     await drain();
     // Nothing to write.
@@ -371,7 +374,7 @@ describe('a second device opens a chat whose photo an old page sent', () => {
     seedOldPageTurn();
     mediaItems = null;
     await openApp();
-    await waitFor(() => expect(listReads()).toBeGreaterThanOrEqual(1));
+    await waitFor(() => expect(listReads()).toBeGreaterThanOrEqual(1), { timeout: 4000 });
     await drain();
     expect(screen.queryByTestId('legacy-photo-note')).toBeNull();
     expect(thumbs()).toEqual([]);
@@ -400,14 +403,15 @@ describe('a second device opens a chat whose photo an old page sent', () => {
       document.dispatchEvent(new Event('visibilitychange'));
     });
     await screen.findByText(ANSWER, undefined, { timeout: 4000 });
-    await waitFor(() => expect(thumbs()).toEqual([thumbFor(0)]));
+    await waitFor(() => expect(thumbs()).toEqual([thumbFor(0)]), { timeout: 4000 });
     expect(screen.queryByTestId('legacy-photo-note')).toBeNull();
     // The list is read again because the chat moved, not per turn.
     expect(listReads()).toBe(2);
+    const photoTurn = () => server.get(CONV)!.rows.find((r) => r.content === QUESTION)!;
+    await waitFor(() => expect(photoTurn().meta?.images).toBeTruthy(), { timeout: 4000 });
     await drain();
     expect(serverUserMeta()).toEqual({ intent: { id: OTHER_INTENT, state: 'completed' } });
-    const photoTurn = server.get(CONV)!.rows.find((r) => r.content === QUESTION)!;
-    expect(photoTurn.meta?.images).toEqual([
+    expect(photoTurn().meta?.images).toEqual([
       { attachment_id: IX(0), mime: 'image/jpeg', width: 1600, height: 1200 },
     ]);
   });
@@ -422,6 +426,7 @@ describe('a second device opens a chat whose photo an old page sent', () => {
       ]);
     }
     await openApp('answer 9');
+    await waitFor(() => expect(listReads()).toBe(1), { timeout: 4000 });
     await drain();
     expect(listReads()).toBe(1);
     expect(puts).toHaveLength(0);

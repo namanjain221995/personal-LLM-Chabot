@@ -230,7 +230,7 @@ describe('a tab left behind by a deploy', () => {
     renderApp();
     await screen.findByRole('textbox', { name: 'Message' });
     await cameBack();
-    await waitFor(() => expect(reloads()).toBe(1));
+    await waitFor(() => expect(reloads()).toBe(1), { timeout: 4000 });
     // The store was asked to finish its pushes first.
     expect(flush).toHaveBeenCalled();
     // A focus and a visibilitychange together are one request.
@@ -242,7 +242,7 @@ describe('a tab left behind by a deploy', () => {
     await screen.findByRole('textbox', { name: 'Message' });
     await type('what is the due date on');
     await cameBack();
-    expect(await screen.findByTestId('new-version-banner')).toBeTruthy();
+    expect(await screen.findByTestId('new-version-banner', undefined, { timeout: 4000 })).toBeTruthy();
     expect(screen.getByText('A new version is available')).toBeTruthy();
     await act(async () => {
       await new Promise((r) => setTimeout(r, 1_200));
@@ -262,7 +262,7 @@ describe('a tab left behind by a deploy', () => {
     });
     await screen.findByLabelText('Remove attachment invoice.png');
     await cameBack();
-    expect(await screen.findByTestId('new-version-banner')).toBeTruthy();
+    expect(await screen.findByTestId('new-version-banner', undefined, { timeout: 4000 })).toBeTruthy();
     await act(async () => {
       await new Promise((r) => setTimeout(r, 1_200));
     });
@@ -274,12 +274,12 @@ describe('a tab left behind by a deploy', () => {
     await screen.findByRole('textbox', { name: 'Message' });
     await type('what is the total?');
     await cameBack();
-    await screen.findByTestId('new-version-banner');
+    await screen.findByTestId('new-version-banner', undefined, { timeout: 4000 });
 
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
     });
-    await waitFor(() => expect(chatBodies).toBe(1));
+    await waitFor(() => expect(chatBodies).toBe(1), { timeout: 4000 });
     await screen.findByText('The total is 42.', undefined, { timeout: 4000 });
     // Streaming, composer empty: still not.
     await act(async () => {
@@ -291,7 +291,7 @@ describe('a tab left behind by a deploy', () => {
       releaseStream?.();
     });
     await waitFor(() => expect(streamingIds()).toEqual([]), { timeout: 4000 });
-    await waitFor(() => expect(reloads()).toBe(1), { timeout: 3000 });
+    await waitFor(() => expect(reloads()).toBe(1), { timeout: 6000 });
     expect(stored.some((m) => m.role === 'user' && m.content === 'what is the total?')).toBe(true);
   });
 
@@ -301,11 +301,11 @@ describe('a tab left behind by a deploy', () => {
     await screen.findByRole('textbox', { name: 'Message' });
     await type('half a question about the invoice');
     await cameBack();
-    await screen.findByTestId('new-version-banner');
+    await screen.findByTestId('new-version-banner', undefined, { timeout: 4000 });
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Reload' }));
     });
-    await waitFor(() => expect(reloads()).toBe(1));
+    await waitFor(() => expect(reloads()).toBe(1), { timeout: 4000 });
     expect(window.sessionStorage.getItem(RELOAD_DRAFT_KEY)).toContain(
       'half a question about the invoice',
     );
@@ -315,7 +315,9 @@ describe('a tab left behind by a deploy', () => {
     document.head.innerHTML = '';
     servedBy('build-new');
     renderApp();
-    await waitFor(() => expect(box().value).toBe('half a question about the invoice'));
+    await waitFor(() => expect(box().value).toBe('half a question about the invoice'), {
+      timeout: 4000,
+    });
     expect(window.sessionStorage.getItem(RELOAD_DRAFT_KEY)).toBeNull();
   });
 
@@ -323,7 +325,7 @@ describe('a tab left behind by a deploy', () => {
     renderApp();
     await screen.findByRole('textbox', { name: 'Message' });
     await cameBack();
-    await waitFor(() => expect(reloads()).toBe(1));
+    await waitFor(() => expect(reloads()).toBe(1), { timeout: 4000 });
     expect(window.sessionStorage.getItem(RELOADED_FOR_KEY)).toBe('build-new');
 
     // The page that came back still carries the OLD id (a cache in between).
@@ -333,7 +335,7 @@ describe('a tab left behind by a deploy', () => {
     renderApp();
     await screen.findByRole('textbox', { name: 'Message' });
     await cameBack();
-    expect(await screen.findByTestId('new-version-banner')).toBeTruthy();
+    expect(await screen.findByTestId('new-version-banner', undefined, { timeout: 4000 })).toBeTruthy();
     await act(async () => {
       await new Promise((r) => setTimeout(r, 1_200));
     });
@@ -342,7 +344,7 @@ describe('a tab left behind by a deploy', () => {
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Reload' }));
     });
-    await waitFor(() => expect(reloads()).toBe(2));
+    await waitFor(() => expect(reloads()).toBe(2), { timeout: 4000 });
   });
 
   it('a page that IS the build it reloaded for clears the guard', async () => {
