@@ -109,6 +109,10 @@ _APP_TABLES = (
     # test a photo it never sent — and the tests of the word test are
     # precisely about which turns do and do not reach one.
     "conversation_images",
+    # V44 (2026-10-02): the pictures sent in a chat. It cascades from users
+    # too, but a row that survived would make the next test's idempotent
+    # store answer `created: false` for a picture it never sent.
+    "chat_media",
     "video_analyses",
     # V8 web-search memory: web_results cascades from web_searches, but the
     # explicit order keeps TRUNCATE happy either way; web_pages is global.
@@ -401,6 +405,11 @@ def isolated_app_db(app_database, tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "lancedb_web_dir", str(tmp_path / "lancedb-web"))
     monkeypatch.setattr(settings, "lancedb_video_dir", str(tmp_path / "lancedb-video"))
     monkeypatch.setattr(settings, "video_data_dir", str(tmp_path / "video"))
+    # The lasting chat stores (V44, docs/chat-media/CONTRACT.md) default to
+    # /data/chat-media and /data/chat-files, which is production's volume on
+    # the head: a test that stores a picture or erases a chat writes there.
+    monkeypatch.setattr(settings, "chat_media_dir", str(tmp_path / "chat-media"))
+    monkeypatch.setattr(settings, "chat_files_dir", str(tmp_path / "chat-files"))
     with db.connection() as con:
         con.execute(
             f"TRUNCATE TABLE {', '.join(_APP_TABLES)} RESTART IDENTITY CASCADE"

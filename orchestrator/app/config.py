@@ -1686,6 +1686,34 @@ class Settings:
         self.workspace_quota_gb: int = _int("WORKSPACE_QUOTA_GB", 20)
         self.repo_final_chunks: int = _int("REPO_FINAL_CHUNKS", 12)
 
+        # --- Chat media (V44, 2026-10-02; docs/chat-media/CONTRACT.md) ---
+        # Every upload is kept for the life of its chat and shows on every
+        # device (owner, 2026-10-02). Pictures sent in a chat live under
+        # CHAT_MEDIA_DIR/<user>/<conversation>/<media_id>/ (app/chat_media.py);
+        # the lasting copy of a document or dataset original lives under
+        # CHAT_FILES_DIR/<conversation>/<upload_id>/ (app/uploads.py). Both on
+        # the /data volume beside /data/video and deliberately NOT under
+        # WORKSPACE_DIR: its 24 h sweep and 20 GB quota would delete them, and
+        # exempting them there would let them evict everything else early.
+        self.chat_media_dir: str = os.environ.get("CHAT_MEDIA_DIR", "/data/chat-media")
+        self.chat_files_dir: str = os.environ.get("CHAT_FILES_DIR", "/data/chat-files")
+        # New bytes are refused (507 on the upload route; skipped and counted
+        # on /chat, which never fails for it) when the filesystem holding them
+        # has less than this free. 250 GiB is the project's floor for the
+        # head's root NVMe (VOICE_MIN_FREE_BYTES, PUBLIC_API_FILES_MIN_FREE_GIB):
+        # the OS, /var/lib/docker and production Postgres share it. There is no
+        # per-person quota beyond this (owner default, 2026-10-02).
+        self.chat_media_min_free_gib: float = max(0.0, _float("CHAT_MEDIA_MIN_FREE_GIB", 250.0))
+        # The reaper (directories and rows whose chat or account is gone) runs
+        # at most this often per process. Hourly: a deleted chat's bytes are
+        # removed at once by the delete route; this is the backstop.
+        self.chat_media_reap_interval_s: float = max(60.0, _float("CHAT_MEDIA_REAP_INTERVAL_S", 3600.0))
+        # How old an orphan must be before the reaper removes it. /chat stores
+        # a picture BEFORE the browser's first history push creates the chat's
+        # row, so a picture with no chat row is normal for the first moments
+        # of a new chat; a day is far past any push.
+        self.chat_media_orphan_grace_h: float = max(1.0, _float("CHAT_MEDIA_ORPHAN_GRACE_H", 24.0))
+
         # --- Charts (§8) ---
         # explicit — a chart appears only when the user asked for one, in
         #            words. This is the historical behaviour and the default.
