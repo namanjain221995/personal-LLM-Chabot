@@ -634,3 +634,60 @@ Commit 32e3d9d5. What changed that other tracks may rely on:
 - PR #92 is deployed: production is at V43 on main 4df0e3d6. V44 here is the next migration.
 - Known CI flakes seen on #92's main run, not ours: the arm64 gate's `auth.docker.io` connection reset
   (Container images) and a timing flake in `test_health_dependency_cache`. Rerun alone before chasing.
+
+## fix-files (backend fixes from the attacks on the lasting copies, 2026-10-02 23:10 IST)
+
+Commit 509a473c. What changed that other tracks may rely on:
+
+- `uploads.sweep_expired_upload_sessions()` no longer runs the lasting-copy
+  reaper; it still runs inside POST /uploads and chunked init
+  (`_sweep_quietly`). main.py's `_upload_session_sweep_loop` calls
+  `uploads.maybe_reap_lasting_files` after each sweep (first pass ten minutes
+  after start-up, then at most once per CHAT_MEDIA_REAP_INTERVAL_S). No
+  request path reaps.
+- `_resolve_document_refs` (main.py): when the workspace `_original` is gone,
+  a `pdf_uploads` ref resolves to the lasting copy if THIS conversation's
+  uploads row names it (`_kept_document`). The row's filename is the name and
+  decides the type. An archive re-extracts into the workspace
+  `<upload>/extracted/`, which the TTL sweeps again later. With no lasting
+  copy the old "no longer available" sentence stands. A dataset id sent as a
+  document ref now also resolves (direct API only; the browser never sends
+  one).
+- `GET /uploads/{conv}`: `expired` only when neither the workspace copy nor
+  the lasting copy is on disk. A dataset listed `ready` after the sweep has
+  no `extracted/`; the dataset engine's behaviour for it is unchanged.
+- The member file route serves a kept file whose name the resolver refuses
+  (leading dot, backslash) from the lasting copy. With no copy it is still
+  404. Content-Disposition uses `os.path.basename(filename)`.
+- Stored upload names: `uploads._upload_filename`. Empty, "." and ".."
+  become `upload.bin`. Names over 240 bytes keep their extension (when it is
+  32 bytes or less) and lose the end of the stem. That is 255 less room for
+  the chunked rail's `<name>.assembling`, so a 245-255 byte name now gets
+  shortened. Before, single-shot kept it and chunked failed with a 500.
+- Conversation ids use `fullmatch` at every claim site: uploads `_own`,
+  `lasting_path`, `erase_conversation_files`, history POST
+  /history/conversations (400), and /chat's claim (422).
+- Admin `member_chat_media` answers `Cache-Control: private, no-store` on
+  200, 304 and 410. The Next admin proxy (`proxyToOrchestrator`) relays it.
+  `tests/test_chat_media_lifecycle.py` pins it, and a second view writes a
+  second audit row.
+
+Not fixed, with reasons:
+
+- Range with an unknown unit, malformed or reversed (`items=0-1`,
+  `bytes=abc`, `bytes=10-5`) still answers 400. This is Starlette 1.6
+  FileResponse behaviour and was the same before this branch. RFC 9110
+  allows rejecting a malformed range. Only the unknown-unit case should be
+  200, and no player sends it. The three
+  `test_attack_ranges_on_a_lasting_file` proofs still fail.
+- Per-member cap on the lasting store: not added. CONTRACT §2 records the
+  owner default "no per-user quota beyond the disk free-space floor". The
+  existing `DiskFillingUp` alert (root over 85% full) fires before the
+  250 GiB floor (about 93% of 3.7 TiB). Raise this with the owner before
+  release.
+- The uncommitted `test_attack_chat_files_qa.py::test_attack_a_resent_document_ref_...`
+  now gets past the "gone" error. It still fails, but only because its fake
+  request has no `pdf_data` attribute.
+  `tests/test_chat_files.py::test_a_resent_document_reads_its_lasting_copy`
+  is the real proof. `test_attack_lasting_files_sec.py::test_trailing_newline_conversation_id`
+  now skips ("refused upstream").
