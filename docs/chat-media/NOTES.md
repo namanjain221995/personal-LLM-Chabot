@@ -1094,3 +1094,91 @@ release may rely on:
   rewrites the intent of a turn that has neither. The browser closed that gap
   in e1967cfc: regenerate, retry and edit write the `ix-` photos into
   `meta.images` first.
+
+## store-always (frontend fixes from the QA attack, 2026-10-03)
+
+Commits 1daab005, e1967cfc and 79df761a, frontend only. What the other side
+and the release may rely on:
+
+- **Regenerate, retry and edit of an `ix-` turn (e1967cfc).** A user turn
+  that needs the photo lookup (no `meta.images`, no bytes here, a 32-hex
+  intent) waits for the page's one list read (`mediaListRef`, normally
+  answered already), then gets its `ix-<intent>-<n>` photos written onto it
+  as `meta.images` before anything reads it. The request carries them as
+  `image_refs` (no inline bytes), and the turn keeps them when the
+  regenerate's new intent replaces `meta.intent.id`. So the server sees a
+  ref turn with a new `intent_id` and never mints for it, and the fallback
+  then finds the photo through `meta.images`. This closes the residual "A
+  regenerate or edit before the backfill has written the refs…" of the
+  frontend note above.
+  - The list cannot be read: a regenerate or retry of a turn whose answer
+    is `route: 'vision'` is refused with the toast "The server could not be
+    reached. Check the connection and retry." and nothing changes (no
+    request, the intent stays). Any other turn is re-asked as before, so
+    text regenerates never depend on the photo list. An edit goes ahead as
+    before: the original keeps its intent and its photos.
+  - While the list is read, the chat counts as mid-send
+    (`pendingSendRef`), so a second click, a send, the backfill and an
+    automatic reload wait.
+- **The sender completes a partly stored `ix-` turn (79df761a).** When the
+  list holds `ix-<intent>-0` but not `-1` and this browser holds both
+  photos, the backfill POSTs the missing ones to `/chat-media/{conv}` with
+  `attachment_id` = `ix-<intent>-<i>` and `source=backfill`, then writes the
+  whole set in send order in its one save. Two things the server must keep
+  for that:
+  - the upload route accepts a client-sent `ix-` id (the attachment id
+    pattern admits it). A 400 there is handled as a refusal: the turn gets
+    the photos the server listed, as before;
+  - the list's `bytes` is the stored full file's size, equal to the decoded
+    bytes as sent (`decode_inline` then `_commit(len(data))`). The browser
+    reads it now (`ListedMediaItem.bytes`). An older IndexedDB record that
+    names no turn (every record a pre-V44 page wrote) is used only when each
+    listed photo has the same type and the same size at the same index. If
+    the server ever trimmed or re-encoded, the completion would simply not
+    happen.
+  - A stop (offline, 5xx, 507) writes nothing for that turn, so a later
+    open can still complete it; `meta.images` is written once.
+- **Build check (1daab005).** An automatic reload asks "would this lose
+  anything?" again after its wait for the history store (up to 3 s), and
+  lets the 1 s quiet poll retry when the person typed, attached or sent in
+  that wait. The banner's Reload saves the draft after the wait, so text
+  typed during it is kept; a failed flush still keeps it.
+
+Proof in a real Chromium (Playwright 1.63, scratch venv) against the
+production layout of this branch (`.next/standalone` + static + public,
+`node --require ./server-preload.cjs server.js`) and a fake orchestrator,
+torn down after:
+- "Try again" on the old-page photo turn with idle callbacks held back (the
+  backfill never ran first): the orchestrator's `/chat` body had
+  `image_refs` = [ix-0, ix-1] and no inline image; both thumbs stayed; the
+  stored question had both refs and the new intent; a second device at
+  390 px showed both photos, with no horizontal scroll.
+- List down (502): the toast showed, no `/chat`, intent unchanged. List
+  back: the next click sent both refs and the thumbs showed.
+- Reload while a PUT took 2.5 s: text typed in the wait was not reloaded
+  away (banner up, text in the composer); emptied, the page reloaded
+  0.21 s later.
+- Code block, table, mermaid diagram and the artifact panel (page 1 drawn)
+  all rendered. No page errors.
+
+Tests: `tests/store-always-ix-photos.test.tsx` (11),
+`tests/chat-media.test.ts` (56), `tests/build-check-reload.test.tsx` (13).
+Every new case for a fixed behavior failed on the code before its fix; the
+guards (a text turn, unpaired photos, a refusal, a failed flush) pass on
+both. Full suite: 212 files,
+4093 passed, 11 skipped. `tsc --noEmit` clean, `eslint .` 0 errors (the
+34 warnings are in files these commits do not touch).
+
+Residuals:
+- A list read that fails when a chat opens is retried only at the next ask:
+  a "Try again", the next open, or a focus when the chat is stale. Until
+  then that chat's `ix-` photos stay hidden and nothing is said.
+- A regenerate of an old-page photo turn whose answer is not `vision`
+  (a photo with a document, an artifact) while the list cannot be read is
+  re-asked without the photos, and its new intent cuts the turn off from
+  them.
+- A device without the bytes can adopt a partial `ix-` set before the sender
+  completes it; `meta.images` is then written once, with part of the photos.
+- `listChatMedia` never reads the body of a failed response. People see no
+  effect, but Playwright keeps that request pending, so a browser test
+  must not wait for network idle while the list is down.
