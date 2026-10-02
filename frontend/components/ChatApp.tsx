@@ -1931,7 +1931,6 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
         // into a chip; turns already stored with it still render and still
         // fold — this is only the write side.)
         meta: metaWithBranch(
-          withImagesMeta(
           isPdf || isDataset || quoted || videoAttachments.length > 0
             ? {
                 route: 'chat',
@@ -1989,12 +1988,14 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
                   : {}),
               }
             : undefined,
-          imagesMeta,
-          ),
           userBranch,
         ),
         createdAt: Date.now(),
       };
+      // Chat media (2026-10-02): the photos' references, written HERE by the
+      // browser so they ride this turn's first history push. Nothing else is
+      // added to a turn without photos, so its meta keeps its exact key set.
+      userMessage.meta = withImagesMeta(userMessage.meta, imagesMeta);
       // NEW-09: keep the original Files for this tab so the cards below can be
       // OPENED. Positional and keyed by message id, because two turns are
       // allowed to attach two different files both called `invoice.pdf`, and
