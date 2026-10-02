@@ -310,6 +310,8 @@ export interface ListedMediaItem {
   mime?: string;
   width?: number | null;
   height?: number | null;
+  /** The stored file's size: the bytes as sent (the store never re-encodes). */
+  bytes?: number;
 }
 
 /**
@@ -338,6 +340,7 @@ export async function listChatMedia(
         ...(typeof item.mime === 'string' ? { mime: item.mime } : {}),
         ...(positiveInt(item.width) ? { width: item.width as number } : {}),
         ...(positiveInt(item.height) ? { height: item.height as number } : {}),
+        ...(positiveInt(item.bytes) ? { bytes: item.bytes as number } : {}),
       });
     }
     return items;
@@ -716,11 +719,82 @@ interface BackfillTarget {
   index: number;
   content: string;
   dataUrls: string[];
+  /** The bytes are known to be this turn's (not an older, unnamed record). */
+  own: boolean;
   /**
    * A REPAIR: the turn's own `meta.images` ids, index for index with
    * `dataUrls`. Absent for a turn with no references yet.
    */
   ids?: string[];
+  /**
+   * A COMPLETION (QA 2026-10-03): the turn's `ix-` photos the server listed
+   * when it kept only some of them; `ids` are then the ids it minted for
+   * every photo this browser holds.
+   */
+  listed?: MessageImage[];
+}
+
+/**
+ * The ids to store the rest of a turn's photos under when the server kept
+ * only some of them (QA 2026-10-03): `ix-<intent>-<index>` for every photo
+ * this browser holds, or null when nothing is missing or the held photos are
+ * not provably that send's.
+ *
+ * The ids are positional and first write wins, so a wrong photo would stay
+ * on the turn for good. Every listed photo must sit at an index held here
+ * with the same type, and, unless the bytes are known to be this turn's, the
+ * same size: the store keeps a photo's bytes exactly as sent, so a size match
+ * at the same place is the same send.
+ */
+function idsToComplete(
+  turn: ChatMessage,
+  target: BackfillTarget,
+  listed: readonly MessageImage[],
+  sizes: ReadonlyMap<string, number>,
+): string[] | null {
+  const intent = serverPhotoIntentOf(turn);
+  if (!intent || listed.length >= target.dataUrls.length) return null;
+  const ids = target.dataUrls.map((_, i) => `ix-${intent}-${i}`);
+  for (const image of listed) {
+    const at = ids.indexOf(image.attachment_id);
+    if (at === -1) return null;
+    const url = target.dataUrls[at];
+    if (image.mime && image.mime !== mimeFromDataUrl(url)) return null;
+    if (!target.own && sizes.get(image.attachment_id) !== dataUrlToBlob(url)?.size) return null;
+  }
+  return ids;
+}
+
+/** The reference a stored photo becomes: its id, type and pixel size. */
+function storedImage(id: string, item: StoredMediaItem): MessageImage {
+  const width = positiveInt(item.width);
+  const height = positiveInt(item.height);
+  return {
+    attachment_id: id,
+    ...(item.mime ? { mime: item.mime } : {}),
+    ...(width && height ? { width, height } : {}),
+  };
+}
+
+/**
+ * A completed turn's references, in send order: the photos the server listed
+ * and the ones just stored. null when any is missing from both.
+ */
+function completedImages(
+  ids: string[],
+  listed: readonly MessageImage[],
+  stored: readonly StoredMediaItem[],
+): MessageImage[] | null {
+  const byId = new Map<string, MessageImage>();
+  for (const item of stored) byId.set(item.attachment_id, storedImage(item.attachment_id, item));
+  for (const image of listed) byId.set(image.attachment_id, image);
+  const images: MessageImage[] = [];
+  for (const id of ids) {
+    const image = byId.get(id);
+    if (!image) return null;
+    images.push(image);
+  }
+  return images;
 }
 
 /** The held bytes for a turn, and whether they are known to be that turn's. */
@@ -891,7 +965,7 @@ export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
           const next = messages[index + 1];
           if (next?.role !== 'assistant' || next.meta?.route !== 'vision') return;
         }
-        out.push({ index, content: m.content, dataUrls });
+        out.push({ index, content: m.content, dataUrls, own: bound === 'own' });
         return;
       }
       // A repair writes these bytes under the turn's OWN ids, for good (first
@@ -899,20 +973,21 @@ export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
       // and not while the turn's own /chat store may still be landing.
       if (bound !== 'own' || !pairsWithRefs(m, dataUrls)) return;
       if (typeof m.createdAt === 'number' && now() - m.createdAt < REPAIR_GRACE_MS) return;
-      out.push({ index, content: m.content, dataUrls, ids: refs.map((r) => r.attachment_id) });
+      out.push({ index, content: m.content, dataUrls, own: true, ids: refs.map((r) => r.attachment_id) });
     });
     return out;
   }
 
   /**
    * Upload the photos of a turn whose references the server does not hold,
-   * under those same ids. Nothing to write back: the reference is the id.
+   * under those same ids. A repair writes nothing back: the reference is the
+   * id. A completion writes the whole set from what was stored.
    */
   async function repairTurn(
     conversationId: string,
     target: BackfillTarget & { ids: string[] },
     held: Set<string>,
-  ): Promise<{ done: true } | { stop: BackfillChatOutcome } | { refused: true }> {
+  ): Promise<{ stored: StoredMediaItem[] } | { stop: BackfillChatOutcome } | { refused: true }> {
     const parts: MediaUploadPart[] = [];
     const seen = new Set<string>();
     target.ids.forEach((id, i) => {
@@ -923,11 +998,11 @@ export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
       const ext = EXTENSION_BY_MIME[blob.type] ?? 'img';
       parts.push({ attachmentId: id, blob, name: `image-${i + 1}.${ext}` });
     });
-    if (parts.length === 0) return { done: true };
+    if (parts.length === 0) return { stored: [] };
     const outcome = await upload(conversationId, parts, 'backfill');
     switch (outcome.kind) {
       case 'stored':
-        return { done: true };
+        return { stored: outcome.items };
       case 'refused':
         return { refused: true };
       case 'no_space':
@@ -972,13 +1047,7 @@ export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
         for (const id of ids) {
           const item = byId.get(id);
           if (!item) return { refused: true };
-          const width = positiveInt(item.width);
-          const height = positiveInt(item.height);
-          images.push({
-            attachment_id: id,
-            ...(item.mime ? { mime: item.mime } : {}),
-            ...(width && height ? { width, height } : {}),
-          });
+          images.push(storedImage(id, item));
         }
         return { images };
       }
@@ -997,24 +1066,30 @@ export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
 
   /**
    * The turns whose photos the server stored by itself (`ix-` ids), as the
-   * references to write. null when the list could not be read and some turn
-   * might have such photos: nothing is known about those turns this time.
+   * references to write, and the listed size of each stored photo. null when
+   * the list could not be read and some turn might have such photos: nothing
+   * is known about those turns this time.
    */
   async function adoptable(
     conversationId: string,
     messages: ChatMessage[],
-  ): Promise<Map<number, { content: string; images: MessageImage[] }> | null> {
+  ): Promise<{
+    found: Map<number, { content: string; images: MessageImage[] }>;
+    sizes: Map<string, number>;
+  } | null> {
     const found = new Map<number, { content: string; images: MessageImage[] }>();
-    if (!messages.some((m) => serverPhotoIntentOf(m) !== null)) return found;
+    const sizes = new Map<string, number>();
+    if (!messages.some((m) => serverPhotoIntentOf(m) !== null)) return { found, sizes };
     const items = await media(conversationId);
     if (!items) return null;
+    for (const item of items) if (item.bytes) sizes.set(item.attachment_id, item.bytes);
     const byIntent = serverPhotosByIntent(items);
     messages.forEach((m, index) => {
       const intent = serverPhotoIntentOf(m);
       const images = intent ? byIntent.get(intent) : undefined;
       if (images?.length) found.set(index, { content: m.content, images });
     });
-    return found;
+    return { found, sizes };
   }
 
   async function runChat(conversationId: string): Promise<BackfillChatOutcome> {
@@ -1022,19 +1097,59 @@ export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
     const messages = host.messages(conversationId);
     if (!messages?.length) return 'done';
     const adopted = await adoptable(conversationId, messages);
-    const found = new Map(adopted ?? []);
-    const targets = (await targetsOf(conversationId, messages)).filter((target) => {
-      if (target.ids) return true;
+    const found = new Map(adopted?.found ?? []);
+    const targets: BackfillTarget[] = [];
+    for (const target of await targetsOf(conversationId, messages)) {
+      if (target.ids) {
+        targets.push(target);
+        continue;
+      }
       // The server holds this turn's photos already: a `bf-` copy would be a
-      // duplicate. And while the list is unknown, a turn the server may have
-      // stored by itself waits for the next open rather than risk one.
-      if (found.has(target.index)) return false;
-      return adopted !== null || serverPhotoIntentOf(messages[target.index]) === null;
-    });
+      // duplicate. Unless it kept only some of them (QA 2026-10-03): this
+      // browser then stores the rest under the ids it minted for the others,
+      // and the turn is written once, whole.
+      const listed = found.get(target.index)?.images;
+      if (listed) {
+        const ids = idsToComplete(messages[target.index], target, listed, adopted?.sizes ?? new Map());
+        if (ids) targets.push({ ...target, ids, listed });
+        continue;
+      }
+      // While the list is unknown, a turn the server may have stored by
+      // itself waits for the next open rather than risk a duplicate.
+      if (adopted !== null || serverPhotoIntentOf(messages[target.index]) === null) {
+        targets.push(target);
+      }
+    }
     let stop: BackfillChatOutcome = 'done';
+    // A turn whose photos could not all be stored is not written with part
+    // of them (meta.images is written once): a later open completes it.
+    const unfinished = new Set(targets.filter((t) => t.listed).map((t) => t.index));
     // Asked once per chat, and only when there is something to repair.
     let held: Set<string> | null | undefined;
     for (const target of targets) {
+      if (target.listed && target.ids) {
+        const completed = await repairTurn(
+          conversationId,
+          { ...target, ids: target.ids },
+          new Set(target.listed.map((image) => image.attachment_id)),
+        );
+        if ('stop' in completed) {
+          stop = completed.stop;
+          break;
+        }
+        unfinished.delete(target.index);
+        if ('refused' in completed) {
+          // Those bytes will never be kept: the turn gets the photos the
+          // server has.
+          refused.add(`${conversationId}#${target.index}`);
+          continue;
+        }
+        // Every photo stored: the turn gets them all, in send order; if the
+        // answer left one out, the photos the server listed.
+        const images = completedImages(target.ids, target.listed, completed.stored);
+        if (images) found.set(target.index, { content: target.content, images });
+        continue;
+      }
       if (target.ids) {
         if (held === undefined) held = await list(conversationId);
         // Unknown is not "missing": try again at the next open.
@@ -1059,6 +1174,7 @@ export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
       stop = result.stop;
       break;
     }
+    for (const index of unfinished) found.delete(index);
     // Whatever landed before a stop is written all the same: the bytes are on
     // the server now, and the reference is what makes them reachable.
     if (found.size > 0) await apply(conversationId, found);
