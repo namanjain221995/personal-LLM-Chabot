@@ -1112,3 +1112,44 @@ Replaces the "Counts on the server" list above (20 everywhere). For the frontend
   reads `GET /chat-media/{conv}` once before its POSTs and sends only the ids the server does not list;
   an unknown answer (any failure) sends them all. For the backend: every by-reference send now costs
   one list read, and that list is unpaginated (about 200 bytes per picture in the chat).
+
+## limits: backend fixes after the NO-limit QA attack (orchestrator, 2026-10-03 04:15 IST)
+
+For the frontend track and the release:
+
+- **Documents never read on the event loop.** Every PDFium call (text layer, page renders, OCR
+  renders), the DOCX reader and the base64 round trips run in worker threads, from
+  `_resolve_document_refs` through the engine and the upload prewarm (`core.pdf.PDFIUM_LOCK` still
+  serialises PDFium). QA's 50 x 40-page PDFs: longest loop stall 6.01 s -> 0.02 s. Only the first
+  document that renders is rendered now; the others' renders were ~80% of reading a PDF and were
+  thrown away.
+- **A follow-up on many photos says how many it sees.** image_memory remembers the turn's total. The
+  V41 row's `images` holds one slot per picture of the turn, `''` for one past the durable budget,
+  so the total survives a restart with no new column; the store fallback reports `total` from
+  `meta.images`. The model is told, and the answer ends with a counted sentence: "_I could see 13 of
+  the 100 pictures from that message here; send the others again to ask about them._"
+- **`image_refs`:** each distinct id is read once however often it is named (the backfill names one
+  picture twice when a turn carried it twice; 999 copies of one id were 999 reads and 990 decodes,
+  ~135 s before /chat answered). Past `REFS_FULL_CHARS` a ref is its stored thumbnail (512 px
+  WebP, `data:image/webp`), read and never decoded.
+- **Zips are never listed whole.** `core.archive.open_zip` parses at most `ARCHIVE_MAX_FILES`
+  central-directory entries and 16 MiB of directory; past either it opens a view of the file whose
+  new zip64 end records name only those first entries. QA's 300,000-entry zip: listing peak 170 MiB
+  -> 6 MiB. Same results on Python 3.11.16 and 3.12.3 (it uses zipfile's `_EndRecData` and
+  `_ECD_*`, so a Python upgrade must keep `test_listing_a_huge_archive_parses_only_the_entries_it_unpacks`
+  green). The .docx readers (`core.docx`, the on-disk document sniff) use it too: a crafted .docx
+  listing 70,000 parts held 78 MB, now under 16 MiB.
+- **Datasets past a reading cap are kept.** An .xlsx past the caps (entries, expanded bytes, a sheet
+  past the expansion ratio) or a dataset archive with a bomb-shaped member is kept whole and
+  downloadable and answered **200** with `files: 0`, `profile: []` and one note
+  `stored whole but not profiled: <reason>` (it was deleted with a 400 stating a limit). Hostile
+  structure (sizes that lie, an unreadable zip) is still refused. The frontend may show a dataset
+  chip with no tables and that note.
+- **`POST /chat-media`:** a request whose pictures' headers claim more than `MAX_REQUEST_PIXELS`
+  (4,000 MP, each picture counted at most 16 MP) is refused before any decode:
+  413 `{"detail": "Send these pictures in smaller batches."}`. The browser's fullest batch (999 x
+  1600 x 1600 = 2,558 MP) never reaches it, so the frontend needs no change.
+- **Open (not changed here):** `core.docx.extract_docx_text` (whole-read path, at most 256 MiB of
+  documents a turn) still inflates `word/document.xml` whole, so a .docx bomb is a memory risk there;
+  `artifacts/material_in._kind_of` still parses the directory of bytes it already holds. The
+  follow-up re-sends the pictures image_memory kept, not the turn's stored copies by reference.

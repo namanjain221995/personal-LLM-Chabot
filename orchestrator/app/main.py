@@ -2975,6 +2975,15 @@ async def _kept_document(conversation_id: str, upload_id: str) -> Optional[tuple
     return os.path.basename(str(row.get("filename") or "")) or "document", str(kept)
 
 
+def _file_base64(path: str) -> str:
+    """A document read whole, as base64: up to DOC_WHOLE_READ_BYTES a turn,
+    so in a worker thread, never on the loop every stream shares."""
+    import base64 as _b64
+
+    with open(path, "rb") as fh:
+        return _b64.b64encode(fh.read()).decode("ascii")
+
+
 async def _resolve_document_refs(
     request: "ChatRequest", conversation_id: Optional[str]
 ) -> tuple[list, list, Optional[str]]:
@@ -3086,9 +3095,7 @@ async def _resolve_document_refs(
                 docs.append(DocFile(entry_name, entry_path))
                 continue
             whole_budget[0] -= size
-            with open(entry_path, "rb") as fh:
-                raw = fh.read()
-            docs.append((entry_name, _b64.b64encode(raw).decode("ascii")))
+            docs.append((entry_name, await asyncio.to_thread(_file_base64, entry_path)))
     if request.pdf_data:
         docs.append((request.pdf_filename, request.pdf_data))
     return docs, images, None
@@ -6695,6 +6702,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     emit,
                     effort=request.effort,
                     conversation_id=conv_key,
+                    # The memory keeps a turn's first pictures that fit its
+                    # budget: the answer says how many of how many it saw.
+                    total_pictures=image_followup.total,
                 )
             elif image_followup.unavailable:
                 # This turn IS about the picture, and the picture is not

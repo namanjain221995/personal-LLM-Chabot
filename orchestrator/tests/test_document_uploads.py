@@ -747,3 +747,72 @@ def test_a_pdf_on_disk_is_opened_by_path_and_page_bounded(tmp_path, monkeypatch)
     # A scan has no text to reach the character budget with: the page
     # budget bounds it, and the note says how many pages were looked at.
     assert doc.note == "only the first 2 of its 5 pages were read (" + f"{os.path.getsize(path):,} bytes file)"
+
+
+def test_many_documents_are_read_off_the_event_loop_and_rendered_once(monkeypatch):
+    """QA 2026-10-03: a turn's documents were extracted ON the event loop
+    (PDFium, the DOCX reader, the base64 round trips), so 50 PDFs stalled
+    every other person's stream for 6 s at once and 999 for about two
+    minutes, past the SSE heartbeat and Cloudflare's cut. Every such step now
+    runs in a worker thread, from the resolver through the engine. And only
+    the first PDF is rendered: the others' renders were ~80% of reading a
+    PDF and were thrown away (page images come from the first PDF only)."""
+    import asyncio
+    import io
+    import threading
+
+    from docx import Document
+    from weasyprint import HTML
+
+    from app.core import docx as docx_module
+    from app.engines import document as eng
+    from app.main import _resolve_document_refs
+
+    body = "".join(
+        f"<h2>Section {p}</h2><p>{'Quarterly revenue grew in every region. ' * 20}</p>"
+        "<p style='page-break-after: always'></p>"
+        for p in range(3)
+    )
+    pdf = HTML(string=f"<html><body>{body}</body></html>").write_pdf()
+    word = Document()
+    word.add_paragraph("The board approved the budget.")
+    buf = io.BytesIO()
+    word.save(buf)
+    ids = [_stored_document("conv-loop", pdf, f"report-{i:02d}.pdf") for i in range(12)]
+    ids.append(_stored_document("conv-loop", buf.getvalue(), "minutes.docx"))
+    refs = [{"upload_id": u, "name": "x"} for u in ids]
+
+    calls: list = []
+
+    def watched(fn, name):
+        def run(*args, **kwargs):
+            calls.append((name, threading.current_thread() is threading.main_thread()))
+            return fn(*args, **kwargs)
+        return run
+
+    for name in ("extract_pdf_pages", "render_pdf", "render_pdf_pages"):
+        monkeypatch.setattr(eng, name, watched(getattr(eng, name), name))
+    for name in ("is_docx", "extract_docx_text"):
+        monkeypatch.setattr(docx_module, name, watched(getattr(docx_module, name), name))
+    for name in ("b64encode", "b64decode"):
+        monkeypatch.setattr(base64, name, watched(getattr(base64, name), name))
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    seen = _capture_engine(monkeypatch)
+
+    async def emit(kind, payload):
+        pass
+
+    async def turn():
+        docs, _images, err = await _resolve_document_refs(_Req(pdf_uploads=refs), "conv-loop")
+        assert err is None and len(docs) == 13
+        return await eng.run_pdf_engine_multi("summarise", docs, [], emit, effort="think")
+
+    assert asyncio.run(turn()).startswith("ok")
+    on_the_loop = sorted({name for name, main in calls if main})
+    assert on_the_loop == [], f"run on the event loop: {on_the_loop}"
+    names = [name for name, _ in calls]
+    assert names.count("extract_pdf_pages") == 12 and names.count("extract_docx_text") == 1
+    assert names.count("render_pdf") == 1  # the first PDF only
+    assert "13 documents were uploaded and ALL were read" in _prompt_text(seen)
+    pictures = [p for p in seen["messages"][-1]["content"] if p.get("type") == "image_url"]
+    assert len(pictures) == eng.LAYOUT_PAGES

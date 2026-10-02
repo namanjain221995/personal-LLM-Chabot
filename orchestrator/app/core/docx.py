@@ -9,12 +9,20 @@ out of scope — this feeds a language model, not a renderer.
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import re
 import zipfile
 from xml.etree import ElementTree
 
+from .archive import open_zip
+
 _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+#: Parts of a .docx whose directory entries are parsed (a real one lists tens):
+#: a crafted one listing millions was parsed whole, ~500 B of memory each
+#: (archive.open_zip, 2026-10-03).
+_MAX_PARTS = 10_000
 
 
 class DocxError(RuntimeError):
@@ -26,7 +34,16 @@ def is_docx(data: bytes) -> bool:
     if not data.startswith(b"PK"):
         return False
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        with open_zip(io.BytesIO(data), _MAX_PARTS) as zf:
+            return "word/document.xml" in zf.namelist()
+    except Exception:
+        return False
+
+
+def is_docx_file(path: str) -> bool:
+    """`is_docx` for a file on disk, never read whole."""
+    try:
+        with open(path, "rb") as fh, open_zip(fh, _MAX_PARTS) as zf:
             return "word/document.xml" in zf.namelist()
     except Exception:
         return False
@@ -41,7 +58,7 @@ def _cell_text(cell) -> str:
 def extract_docx_text(data: bytes, max_chars: int = 400_000) -> str:
     """Paragraphs in order; tables as one tab-separated line per row."""
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        with open_zip(io.BytesIO(data), _MAX_PARTS) as zf:
             xml = zf.read("word/document.xml")
     except (zipfile.BadZipFile, KeyError) as exc:
         raise DocxError("not a readable .docx file") from exc
@@ -96,14 +113,16 @@ def extract_docx_file(path: str, max_chars: int = 400_000) -> tuple[str, bool]:
     parser and parsing STOPS once `max_chars` of text is in hand. Memory is
     one paragraph or table at a time, whatever the file's size (2026-10-03,
     docs/chat-media/LIMITS.md). -> (text, whether the whole body was read)."""
+    opened = contextlib.ExitStack()
     try:
-        zf = zipfile.ZipFile(path)
+        zf = open_zip(opened.enter_context(open(path, "rb")), _MAX_PARTS)
     except (zipfile.BadZipFile, OSError) as exc:
+        opened.close()
         raise DocxError("not a readable .docx file") from exc
     blocks: list[str] = []
     used = 0
     skipped = False
-    with zf:
+    with opened, zf:
         try:
             src = zf.open("word/document.xml")
         except KeyError as exc:

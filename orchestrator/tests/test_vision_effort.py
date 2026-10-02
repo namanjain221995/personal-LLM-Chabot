@@ -262,6 +262,7 @@ def _fake_engine(recorder):
         effort="think",
         max_tokens=None,
         conversation_id=None,
+        total_pictures=0,
     ):
         recorder["effort"] = effort
         recorder["conversation_id"] = conversation_id
