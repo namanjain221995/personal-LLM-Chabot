@@ -61,9 +61,11 @@ picture, `size=thumb` serves the full file.
 four of these agree:
 
 1. the file's magic bytes;
-2. the file ends the way a whole file of that format ends: a JPEG EOI after
-   its last scan, the PNG `IEND` chunk with its CRC, a GIF whose blocks walk to
-   the trailer, a WebP as long as its RIFF size. A truncated file fails here;
+2. the file ends the way a whole file of that format ends: a JPEG whose
+   marker segments walk to the primary picture's EOI (bytes after it, such as
+   an MPO's further pictures or a motion photo's video, are ignored), the PNG
+   `IEND` chunk with its CRC, a GIF whose blocks walk to the trailer, a WebP as
+   long as its RIFF size. A truncated file fails here;
 3. Pillow, opened for that one format only, and its `verify()`;
 4. a full decode.
 
@@ -76,8 +78,15 @@ Everything else is refused: SVG, HTML renamed `.png`, HEIC, BMP, TIFF, and
 truncated files. Further limits:
 
 - Pillow's decompression-bomb guard stays on.
-- A decode is capped at 40 MP, or 89 MP for a JPEG. This is the same bound
-  `image_memory` uses.
+- A picture over 16 MP (`chat_media.MAX_STORE_PIXELS`, every format, read from
+  the header before any decode) is refused as unsupported. The composer never
+  sends more than 1600 px on the long edge. `image_memory` keeps its own,
+  higher bound for inline pictures.
+- Every decode (the upload route's check, the `/chat` background store, a heal
+  and the follow-up fallback's read) runs on a 2-thread pool
+  (`chat_media.DECODE_WORKERS`), so a burst queues instead of filling the
+  default executor with ~0.5 GiB decodes.
+- A multi-picture JPEG (Pillow's `MPO`) is stored as `image/jpeg`, `full.jpg`.
 - At most 10 MiB per picture and 5 per request. These are the composer's own
   `MAX_IMAGE_BYTES` and `MAX_IMAGES`.
 
@@ -92,6 +101,14 @@ truncated files. Further limits:
 `UNIQUE (user_id, conversation_id, attachment_id)` decides a race. The first
 write wins, and the loser removes its own files. So the bytes behind a URL never
 change, which is why `Cache-Control: immutable` is safe.
+
+**Heal.** When a row exists but its full file is gone, a retry of the SAME
+bytes (equal sha256) under the same attachment id rewrites `full.<ext>` (and
+`thumb.webp` when the row has one) into the row's own directory. The route
+answers `created:false` with the unchanged row, and the metric counts
+`result="stored"`. Different bytes never replace a row; it stays 410. Nothing
+re-sends such bytes on its own today: the browser's repair re-sends only ids
+the list lacks.
 
 **The reference lives on the message, and the browser writes it.** The user
 message's `meta.images` is `[{attachment_id, name?, mime?, width?, height?}]`.
@@ -116,7 +133,7 @@ Every other case gets **the same 404 body**:
 
 | Route | What it does |
 |---|---|
-| `POST /chat-media/{conv}` | Multipart. Up to 5 `file` parts, then `attachment_id` text parts in the same order. `source` is `upload` (default) or `backfill`. Every picture is checked before any is stored. An `attachment_id` that already has a row answers that row with `created:false`, and its bytes are not read again. **400** bad shape (count mismatch, a bad or duplicate id, more than 5 files, a bad `source`); **403** the account may not attach; **404** not yours; **413** over 10 MiB; **415** not a verified raster; **507** below the free-space floor. Body cap: **64 MiB** (`main.body_cap_for`). |
+| `POST /chat-media/{conv}` | Multipart. Up to 5 `file` parts, then `attachment_id` text parts in the same order. `source` is `upload` (default) or `backfill`. Every picture is checked before any is stored. An `attachment_id` that already has a row answers that row with `created:false`; its bytes are compared only when the row's file is gone (the heal above). **400** bad shape (count mismatch, a bad or duplicate id, more than 5 files, a bad `source`); **403** the account may not attach; **404** not yours; **408** the body was cut off; **413** over 10 MiB; **415** not a verified raster; **507** below the free-space floor; **500** `store_failed`. Every refusal is `{"code","detail"}` except 403 and 408, which keep the upload rail's `{"detail"}`. Body cap: **64 MiB** (`main.body_cap_for`). |
 | `GET /chat-media/{conv}` | The viewer's pictures in that chat, oldest first. |
 | `GET /chat-media/{conv}/{attachment_id}?size=thumb\|full` | The bytes, streamed with `FileResponse`. |
 | `GET /admin/api/members/{user_id}/chat-media/{conv}/{attachment_id}?size=` | The same response, for the audited conversation viewer. See below. |
@@ -135,7 +152,9 @@ The byte route behaves like this:
 - **`If-None-Match`.** A matching tag (`W/` and `*` included) answers 304 with
   no body.
 - **A row whose file is gone** answers 410 `{"code":"media_missing"}`. This
-  happens only for your own row; anyone else gets the 404.
+  happens only for your own row; anyone else gets the 404. A matching
+  `If-None-Match` still answers 304 for such a row: the tag is the sha256, so
+  the browser's cached copy is exactly right.
 
 The admin route:
 
@@ -145,6 +164,9 @@ The admin route:
 - Each 200 and each 304 writes an `admin_viewed_chat_media` audit event. The
   resource is `chat_media`/`media_id`, and the meta is
   `{conversation_id, size}`.
+- It answers `Cache-Control: private, no-store` on 200, 304 and 410 (the
+  recordings rail's rule), not the member route's year-long `immutable`. So an
+  admin's second view reaches the server and writes a second audit event.
 
 **`/chat`** gained two fields:
 
@@ -167,17 +189,32 @@ The admin route:
     a `chat_requests` row exists.
   - The request snapshot keeps both lists of ids and never the bytes. A turn
     that sent only refs stays resumable.
+  - A turn with refs and no words gets "Analyze the attached image." as its
+    question, like an inline picture.
+- An account without the ATTACHMENTS feature has both lists cleared with the
+  rest of its attachments (the usual "Photos and files" notice), never a 422.
+- Each list holds at most 5 ids matching `^[A-Za-z0-9_-]{8,64}$`; anything else
+  is pydantic's 422 (a malformed body), which the Next proxy never forwards.
 
 **Follow-up questions.** `image_memory.hydrate` falls back to the store when
-neither the process nor the V41 row has a live picture. It takes the newest
-user message whose `meta.images` names stored pictures, together with that
-turn's question and answer. A chat with no stored picture pays one index probe
-(the plan gates on it) and behaves as before. Turn the fallback off with
-`IMAGE_MEMORY_STORE_FALLBACK=0`.
+neither the process nor the V41 row has a live picture. It follows the branch
+the person sees: `/chat`'s `messages` are passed as `visible`, and
+`chat_media.latest_turn_images` takes the newest picture turn ON that path
+(matched by its words, or, for a photo with no words, by the assistant message
+stored under it), with that turn's question and answer. A picture on an
+edited-away branch is never read into a later turn. `turns_after` counts user
+turns on the path after it, not the question being asked now. Only the 20
+newest picture turns are compared, and nothing is written back to the V41 row.
+A request with no `messages` keeps the stored-order behaviour. A chat with no
+stored picture pays one index probe (the plan gates on it) and behaves as
+before. Turn the fallback off with `IMAGE_MEMORY_STORE_FALLBACK=0`.
 
 **Sharing.** `sharing.PRIVATE_META_KEYS` has `images`, so a chat with stored
-photos cannot get a public link. The snapshot never carried pictures in any
-case: it is an allowlist.
+photos cannot get a public link. `sharing.evaluate` reads that provenance
+(private meta keys, private routes, attachments) from EVERY user and assistant
+message, empty ones included, so a chat whose only turn is a photo with no
+words answers 422 "uploaded photos" too. The snapshot never carried pictures in
+any case: it is an allowlist.
 
 ---
 
@@ -287,11 +324,9 @@ Signals worth watching:
   drop another account's rows early: only an account that stored pictures under
   an id nobody owned yet, which the deleter then claimed. Their pictures are
   dropped early, never disclosed.
-- **The share policy reads only non-empty messages** (`_is_shareable_message`).
-  A user message with no text, only a picture, is not inspected for
-  `meta.images`; the vision answer after it is still `route=vision`, which the
-  policy allows. This gap is the same one `meta.attachments` has. The photo
-  itself can never leak, because the snapshot is an allowlist.
+- **`/chat` accepts only `data:<type>;base64,` data URLs for storage.** A data
+  URL with parameters (`data:image/png;name=x.png;base64,...`) is counted
+  `unsupported` and not stored. The composer never sends one.
 
 ---
 
@@ -315,14 +350,32 @@ Signals worth watching:
   `uploads.kept_original`: workspace, lasting copy, video store (video rail
   rows only), then 410 (the admin route keeps its 404 "The file has
   expired."). Byte ranges (206/416) are Starlette's own `FileResponse`.
-  My files counts a lasting copy as `available`.
+  My files and `GET /uploads/{conv}` count a lasting copy as `available`
+  (`expired` only when neither copy is on disk). The member route also serves
+  a kept file whose name the path resolver refuses (a leading dot, a
+  backslash) from the lasting copy, with `os.path.basename` of the name.
+- **Regenerate, edit and retry.** main.py `_resolve_document_refs` falls back
+  to the lasting copy (`_kept_document`) when the workspace `_original` is
+  gone, if THIS conversation's uploads row names it. An archive re-extracts
+  into the workspace, which the TTL sweeps again later. With no lasting copy
+  the old "no longer available on the server" sentence stands.
+- **Stored names.** `uploads._upload_filename`: an empty name, `.` and `..`
+  become `upload.bin`; a name over 240 bytes keeps its extension (up to 32
+  bytes) and loses the end of its stem. Before, single-shot kept a 245-255
+  byte name and the chunked rail failed with a 500.
+- **Conversation ids** are matched with `fullmatch` at every claim site
+  (uploads `_own`, `lasting_path`, `erase_conversation_files`, history POST
+  /history/conversations with a 400, and `/chat`'s claim with a 422), so a
+  trailing newline is refused.
 - **Deletion.** `uploads.erase_conversation_files` removes
   `<CHAT_FILES_DIR>/<conv>` AND `<WORKSPACE_DIR>/uploads/<conv>`: the lasting
   copy is a hard link to the workspace file, so removing only one name would
   leave the bytes on disk until the sweep.
-- **Reaper.** `uploads.reap_lasting_files` rides main.py's ten-minute
-  upload-session sweep (`sweep_expired_upload_sessions`), at most one pass per
-  `CHAT_MEDIA_REAP_INTERVAL_S` per process. It removes a
+- **Reaper.** main.py's `_upload_session_sweep_loop` calls
+  `uploads.maybe_reap_lasting_files` after each ten-minute upload-session
+  sweep (first pass ten minutes after start), at most one pass per
+  `CHAT_MEDIA_REAP_INTERVAL_S` per process. No request path reaps:
+  `sweep_expired_upload_sessions`, which POST /uploads also runs, does not. It removes a
   `<conversation>/<upload>` directory past `CHAT_MEDIA_ORPHAN_GRACE_H` whose
   chat (deleted, or its account deleted) or uploads row is gone. It never
   follows a symbolic link and never judges a name it did not make. Counted as
@@ -333,8 +386,51 @@ Signals worth watching:
   switch as pictures (`CHAT_MEDIA_MIN_FREE_GIB` set far above the disk) stops
   new copies with no deploy.
 - **Honest limits.** An upload made before this change, or below the floor,
-  has no lasting copy and still expires after the sweep. `GET /uploads/{conv}`
-  (the per-chat list) still reports `expired` from the workspace copy alone;
-  the file route and My files are the ones that know about the lasting copy.
+  has no lasting copy and still expires after the sweep. A dataset listed
+  `ready` after the sweep has no `extracted/` (the lasting copy restores only
+  the original); the dataset engine behaves for it as before.
   `/data/chat-files` is not in `scripts/backup-knowledge.sh` (nor are
   `/data/chat-media`, `/data/video` or `/data/voice`).
+- **Disk is not bounded per member.** The lasting copy is a hard link, so the
+  workspace quota (`WORKSPACE_QUOTA_GB`) and the 24 h TTL free nothing for
+  documents and datasets any more. The only guard is the global free-space
+  floor, shared with every member's new pictures and copies. This is the
+  owner's "no per-user quota" default (CONTRACT §2); the `DiskFillingUp`
+  alert (root over 85% full) fires before the 250 GiB floor. Raise it with the
+  owner before release.
+- **Malformed byte ranges answer 400.** Starlette 1.6 `FileResponse` refuses
+  an unknown unit (`items=0-1`), a malformed or a reversed range. RFC 9110
+  says an unknown unit should be ignored (200). No browser player sends one;
+  this was true before this branch.
+
+---
+
+## Where the build differs from CONTRACT.md
+
+Each is deliberate and recorded in NOTES.md under the named track.
+
+| CONTRACT | As built | Track |
+|---|---|---|
+| §3 "Pillow's decompression-bomb guard stays on" and nothing more | Also a 16 MP store ceiling for every format and a 2-thread decode pool | fix-be |
+| §3 "On a UNIQUE conflict the existing row wins ... new files are removed" | Still true, except that the SAME bytes rewrite a row's missing file (heal) | fix-be |
+| §3 accepted types jpeg/png/webp/gif | An MPO JPEG is accepted and stored as `image/jpeg`; bytes after the primary picture's EOI are ignored | fix-be |
+| §4.1 errors 400/404/413/415/507 | Flat `{"code","detail"}` bodies, plus 403 (attachments gate) and 408 (cut body) with `{"detail"}`, plus 500 `store_failed` | be-media |
+| §4.3 `size=thumb` answers `image/webp` with ETag `"<sha256>-t"` | For a picture with no thumbnail, `size=thumb` serves the full file with its own mime and ETag `"<sha256>"` | be-media |
+| §4.3 410 when the row exists and the file does not | A matching `If-None-Match` still answers 304 first | fix-be |
+| §4.4 `/admin/members/...`, "same headers as (3)" | `/admin/api/members/...`, with `Cache-Control: private, no-store` instead of `immutable` | be-media, fix-files |
+| §5 `image_refs` "same order" as inline images | Refs come first, then inline pictures; the frontend never sends both in one request | be-media |
+| §5 (not covered) | ATTACHMENTS feature off clears `image_ids`/`image_refs` (no 422); a ref-only turn with no words gets "Analyze the attached image." | be-media, fix-be |
+| §6 "the newest USER message ... whose `meta.images` is non-empty" | The newest picture turn on the branch the person sees (`visible`), at most 20 compared; `turns_after` excludes the question being asked | fix-be |
+| §7 `PRIVATE_META_KEYS` gains `images` | Also: `sharing.evaluate` reads provenance from empty messages, so a photo-only chat cannot be shared | fix-be |
+| §8 reapers "started like the other background sweeps" | Media: `chat_media.reap_loop`, first pass 5 min after start. Lasting files: after main.py's upload-session sweep, first pass 10 min after start | be-media, fix-files |
+| §9 `erase_conversation_files` removes `<CHAT_FILES_DIR>/<conv>` | Also removes `<WORKSPACE_DIR>/uploads/<conv>`, the hard link's other name | be-files |
+| §9 admin download "gets the same fallback" | Same fallback, but its last answer stays 404 "The file has expired." (not 410) | be-files |
+| §9 (not covered) | Regenerate/edit/retry of a document reads the lasting copy; upload names are shortened or replaced; conversation ids use `fullmatch` everywhere | fix-files |
+| §9 My files picture rows | `name` is `Picture.<ext>` (chat_media has no file name); retention flags `files_kept_with_chat: true`, `pictures: "kept_with_chat"` | be-files, fe-files |
+| §10 legacy line under any imageless turn followed by a vision answer | At most one line per thread: the first photo-less user turn under a vision answer, only when no earlier turn has a photo or a vision answer | fix-fe |
+| §10 backfill only for turns without `meta.images` | Also a repair: a turn WITH `meta.images` whose ids the list lacks is re-sent under the same ids (2 min grace) | fix-fe |
+| §10 "404/410 -> an Image unavailable tile" | A thumbnail retries 3 times (2 s, 6 s, 15 s) before the tile | fix-fe |
+| §10 edit by reference | `runEdit` asks the list once before it writes the new version; a missing ref shows the re-attach toast and writes nothing | fix-fe |
+| §10 CSP "`media-src 'self'` if `default-src` would block it" | Not needed: `default-src 'self'` admits the route; a test pins that `blob:` stays out | fe-files |
+| §10 admin inspection uses the admin route "if that view renders MessageRow" | It does not, so no frontend calls the admin route yet | fe-images |
+| (not in CONTRACT) | Logout answers `Clear-Site-Data: "cache"`, so a year-long cached photo is not served to the next person at the keyboard | fix-fe |
