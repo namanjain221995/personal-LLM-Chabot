@@ -183,3 +183,39 @@ Not done here, for whoever owns them:
   on the server.") for a stored photo whose full size answers 404/410. The
   video/audio player and the expired-document wording (CONTRACT §10 "Other
   kinds") are not in this track.
+
+## fe-files (frontend: players, uploads file proxy, expired documents, My files pictures)
+
+What the My files page reads for a stored chat picture (CONTRACT §9), so the
+backend files track can match it. Written before the backend rows landed;
+the parser accepts the variants marked "or".
+
+- One row per `chat_media` row, in the same `items` list as every other kind:
+  `{"id": "media:<media_id>", "source": "media", "kind": "image",
+    "name": "<shown name>", "bytes": <int>, "created_at": "<iso>",
+    "conversation": {"id": "<conv>", "title": "<title>"},
+    "availability": "available" | "expired",
+    "attachment_id": "<the chat_media.attachment_id>",
+    "media": {"width": <int|null>, "height": <int|null>, "mime": "<mime>"} | null,
+    "can": {"download": true|false, "preview": "image" | null, "delete": false}}`.
+- `source` may also be `image` or `chat_media`; the id prefix must equal it,
+  as for every other source.
+- The page BUILDS every picture URL itself, from `conversation.id` and the
+  attachment id: `/api/chat-media/<conv>/<attachment_id>?size=thumb` for the
+  row's thumbnail, `?size=full` for Preview and Download. It never puts a
+  server-sent URL in an `<img src>`. So the row MUST carry the attachment id:
+  `attachment_id` (or `media.attachment_id`), or a `thumb_url` /
+  `thumbnail_url` of the form `.../chat-media/<conv>/<attachment_id>?...`
+  from which it is read. A picture row with none of these is dropped (the
+  page cannot show it), like any other row it cannot act on.
+- `name` may be null or empty for a picture (chat_media has no file name):
+  the page then shows "Picture" plus the extension of `media.mime`.
+- `kind=image` must be accepted by the `kind` filter (comma list) and the
+  summary's `kinds` must carry `image: {count, bytes}`. The type chip
+  "Pictures" is shown only when the summary reports an `image` count, so an
+  orchestrator without picture rows never gets a `?kind=image` it would 400.
+- `retention.pictures`: `"browser_only"` keeps today's sentence ("Pictures
+  stay only in the browser you sent them from"). Any other value (suggested:
+  `"kept_with_chat"`) makes the page say pictures stay while their chat
+  exists, and that an older picture appears once the browser that sent it
+  opens its chat again (the backfill).
