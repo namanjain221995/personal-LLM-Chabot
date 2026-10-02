@@ -1088,8 +1088,9 @@ release may rely on:
     release and d5239301, resolved as above in a scratch copy, then
     `tests/test_chat_media_chat.py` gave 42 passed. That includes the
     release's twelve `ix-` pictures in index order and its 101-picture turn.
-- Seen and not changed (not a backend finding): if a regenerate rewrites an
-  un-adopted turn's `meta.intent.id` (QA's
-  `test_qa_regenerate_rekeys_the_turn_and_the_fallback_loses_the_photo`), the
-  fallback can no longer reach that turn's `ix-` photo until a device writes
-  `meta.images` for it.
+- Left unchanged on the server: the fallback finds an `ix-` photo through
+  the turn's `meta.intent.id` or its `meta.images`. QA's
+  `test_qa_regenerate_rekeys_the_turn_and_the_fallback_loses_the_photo`
+  rewrites the intent of a turn that has neither. The browser closed that gap
+  in e1967cfc: regenerate, retry and edit write the `ix-` photos into
+  `meta.images` first.
