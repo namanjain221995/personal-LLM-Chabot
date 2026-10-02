@@ -328,6 +328,13 @@ function PreviewBody({
     );
   }
 
+  if (kind === 'missing') {
+    // 2026-10-02: a stored photo whose route answered 404/410. Not "expired"
+    // (photos are kept for the life of the chat) and not "this browser
+    // session" (the server is where it was looked for).
+    return <p className={NOTE}>This photo is no longer stored on the server.</p>;
+  }
+
   if (kind === 'image') {
     return objectUrl ? (
       // eslint-disable-next-line @next/next/no-img-element

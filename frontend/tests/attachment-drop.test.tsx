@@ -899,7 +899,8 @@ describe('the shared pipeline and application state', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
 
     await waitFor(() => expect(stored.length).toBeGreaterThan(0));
-    expect(attachmentFile(stored[0].id, 0)?.name).toBe('drop.png');
+    // A photo is held in the photos' own index space (RC-3a, 2026-10-02).
+    expect(attachmentFile(stored[0].id, 0, 'image')?.name).toBe('drop.png');
   });
 
   it('is the only drop region, and never the sidebar', () => {

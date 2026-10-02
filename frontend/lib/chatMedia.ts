@@ -25,7 +25,7 @@
  * meta.
  */
 
-import type { ChatMessage, MessageImage } from './types';
+import type { ChatMessage, MessageImage, Meta } from './types';
 import { dataUrlToBlob, mimeFromDataUrl } from './attachments';
 
 /** An attachment id as the server accepts it (CONTRACT §3, client-minted). */
@@ -112,6 +112,19 @@ export function imagesMetaFor(images: SentImage[]): MessageImage[] | undefined {
 }
 
 /**
+ * A user turn's meta with its photo references added — `meta` untouched when
+ * there are none, so a turn without photos keeps exactly the meta (and the
+ * sync key) it always had.
+ */
+export function withImagesMeta(
+  meta: Meta | undefined,
+  images: MessageImage[] | undefined,
+): Meta | undefined {
+  if (!images?.length) return meta;
+  return { ...(meta ?? {}), images };
+}
+
+/**
  * The well-formed stored-photo references on a turn, in order. Structural, so
  * the resend path (and tests) need no full ChatMessage.
  */
@@ -152,6 +165,40 @@ export function showsLegacyPhotoNote(
   if (localImagesOf(message).length > 0) return false;
   if (storedImagesOf(message).length > 0) return false;
   return next?.role === 'assistant' && next.meta?.route === 'vision';
+}
+
+/**
+ * An image's pixel size as the browser draws it (EXIF orientation applied),
+ * or null when it cannot be decoded here — no DOM (tests, SSR), an
+ * undecodable file, or a decode slower than `timeoutMs`. Never throws, never
+ * waits long: the size is a nicety for other devices, not a gate on sending.
+ */
+export function measureDataUrl(
+  dataUrl: string,
+  timeoutMs = 3_000,
+): Promise<{ width: number; height: number } | null> {
+  if (typeof Image === 'undefined' || !dataUrl.startsWith('data:image/')) {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    const img = new Image();
+    let settled = false;
+    const finish = (size: { width: number; height: number } | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(size);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    img.onload = () => {
+      const width = positiveInt(img.naturalWidth);
+      const height = positiveInt(img.naturalHeight);
+      finish(width && height ? { width, height } : null);
+    };
+    img.onerror = () => finish(null);
+    img.decoding = 'async';
+    img.src = dataUrl;
+  });
 }
 
 /* ------------------------------------------------------- the thumbnail box */

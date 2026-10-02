@@ -153,12 +153,25 @@ function withFile(name: string, mime: string, body: BlobPart = 'x') {
   ]);
 }
 
+/**
+ * The same for a PHOTO card. Since RC-3a (2026-10-02) a turn's photos and its
+ * documents count in separate index spaces, so photo 0 is held apart from
+ * document 0 — the two used to share a slot, and a photo opened the PDF.
+ */
+function withImageFile(name: string, mime: string, body: BlobPart = 'x') {
+  rememberAttachmentFiles(
+    'u1',
+    [{ name, mime, blob: new Blob([body], { type: mime }) }],
+    'image',
+  );
+}
+
 /* ================================================ 1. every type PREVIEWS */
 
 describe('clicking an attachment opens an in-app preview', () => {
   it('shows an image inside the dialog', async () => {
     // NEW09A-01
-    withFile('shot.png', 'image/png');
+    withImageFile('shot.png', 'image/png');
     renderRow(userMessage({ imageDataUrl: PNG_DATA_URL }));
 
     fireEvent.click(card(/shot\.png/));
@@ -400,7 +413,7 @@ describe('attachment cards never download — the invariant', () => {
 describe('object URL lifecycle', () => {
   it('mints nothing until a card is clicked', () => {
     // NEW09A-23
-    withFile('shot.png', 'image/png');
+    withImageFile('shot.png', 'image/png');
     renderRow(userMessage({ imageDataUrl: PNG_DATA_URL }));
 
     expect(created).toEqual([]);
@@ -408,7 +421,7 @@ describe('object URL lifecycle', () => {
 
   it('keeps the URL alive for as long as the preview is open', async () => {
     // NEW09A-24 — revoking early is what produced blank previews before.
-    withFile('shot.png', 'image/png');
+    withImageFile('shot.png', 'image/png');
     renderRow(userMessage({ imageDataUrl: PNG_DATA_URL }));
 
     fireEvent.click(card(/shot\.png/));
@@ -420,7 +433,7 @@ describe('object URL lifecycle', () => {
 
   it('revokes the URL when the preview closes', async () => {
     // NEW09A-25 — tied to the dialog's life, not to a 60-second timer.
-    withFile('shot.png', 'image/png');
+    withImageFile('shot.png', 'image/png');
     renderRow(userMessage({ imageDataUrl: PNG_DATA_URL }));
 
     fireEvent.click(card(/shot\.png/));
@@ -444,7 +457,7 @@ describe('object URL lifecycle', () => {
 
   it('closes on Escape and still revokes', async () => {
     // NEW09A-27
-    withFile('shot.png', 'image/png');
+    withImageFile('shot.png', 'image/png');
     renderRow(userMessage({ imageDataUrl: PNG_DATA_URL }));
 
     fireEvent.click(card(/shot\.png/));
@@ -565,10 +578,14 @@ describe('the card itself is unchanged apart from what it does', () => {
 describe('attachment identity', () => {
   it('previews the second image of a turn, not the first', async () => {
     // NEW09A-38
-    rememberAttachmentFiles('u1', [
-      { name: 'one.png', mime: 'image/png', blob: new Blob(['1'], { type: 'image/png' }) },
-      { name: 'two.png', mime: 'image/png', blob: new Blob(['2'], { type: 'image/png' }) },
-    ]);
+    rememberAttachmentFiles(
+      'u1',
+      [
+        { name: 'one.png', mime: 'image/png', blob: new Blob(['1'], { type: 'image/png' }) },
+        { name: 'two.png', mime: 'image/png', blob: new Blob(['2'], { type: 'image/png' }) },
+      ],
+      'image',
+    );
     renderRow(userMessage({ imageDataUrls: [PNG_DATA_URL, PNG_DATA_URL] }));
 
     fireEvent.click(card(/two\.png/));
