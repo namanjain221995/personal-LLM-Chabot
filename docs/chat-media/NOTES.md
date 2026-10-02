@@ -353,3 +353,34 @@ fe-files, as built (2026-10-02 evening):
   sandbox CSP on 200, and logs without names. gitleaks `dir` over every
   in-scope file: no leaks. Gitleaks `git` in this worktree scans nothing
   (the .git file points outside the mount).
+
+## qa-be (backend QA attack, 2026-10-02 22:00 IST)
+
+Confirmed by attack tests (uncommitted: orchestrator/tests/test_attack_chat_media_be.py,
+frontend/tests/attack-be-store-failure-never-repaired.test.ts); none is a cross-user leak.
+
+- The image_memory store fallback is BRANCH-BLIND: `latest_turn_images` takes the newest user
+  message with `meta.images` in the flat, append-only message list (lib/branching.ts), so a photo
+  turn on an edited-away branch is read into a later text turn ("what does the photo show?" ->
+  vision with that photo; IMAGE_MEMORY_STORE_FALLBACK=0 -> chat). `turns_after` counts other
+  branches' turns too.
+- A failed background store (/chat `image_ids`) is never repaired: the message already has
+  `meta.images`, and the backfill skips every turn that has it (lib/chatMedia.ts:571), so the
+  browser holding the bytes never re-sends them. POST /chat-media under the SAME attachment id
+  would heal it (idempotent).
+- The sharing gap is live over HTTP: a chat whose only user turn is a photo (empty content) gets a
+  public link (200) carrying the vision answer.
+- A row whose file is gone stays 410 forever: a re-POST of the identical bytes answers
+  `created:false` and writes nothing; If-None-Match still answers 304.
+- Thumbnails: a 16-bit greyscale PNG thumbnails as pure white. Refused as unsupported although
+  every browser shows them: MPO JPEGs (camera/phone multi-picture) and a JPEG with an appended
+  trailer containing FF DA (motion photos). The composer re-encodes anything over 1600 px, so these
+  reach the store only at 1600 px or less.
+- A ref-only /chat turn with no `message` hands the engine an empty question (the placeholder is
+  computed before refs load); the Next proxy fills IMAGE_ONLY_PROMPT, so only direct callers see it.
+- Held: V44 over a V43 database with data (schema_parity compare IDENTICAL, idempotent re-run,
+  user cascade, delete_conversation clears rows), F034 and IDOR on every route and on image_refs,
+  an unowned chat later claimed by another account, 8 concurrent stores of one attachment id (one
+  row, one directory), crash between files and row (no files left), CMYK / animated GIF / animated
+  WebP / palette+transparency / LA / EXIF 6 / 1x1 / 20000^2 bomb, RTL/unicode/traversal ids, 10k-row
+  list (1.8 MB, 0.11 s), five ~10 MiB pictures in one POST (49 MiB, 200 in 0.6 s).
