@@ -59,6 +59,7 @@ import {
   isPersistableMessage,
   localOnlyTail,
   withLocalBranches,
+  withStoredImages,
 } from './threadReconcile';
 
 const STORAGE_KEY = 'techsara.history.v1';
@@ -190,6 +191,26 @@ export interface ServerHistoryStore extends HistoryStore {
    * always does.
    */
   subscribe?(listener: (conversationId: string) => void): () => void;
+  /**
+   * 2026-10-02 (chat media backfill): replace a conversation's messages with
+   * an AMENDED copy of the same thread — the same turns, richer meta — and
+   * push it, WITHOUT moving the chat in Recents. `saveMessages` stamps
+   * `updatedAt`, which is right for a new turn and wrong for writing photo
+   * references onto turns sent months ago: every old chat the backfill
+   * touched would jump to the top of the sidebar. Resolves once the push has
+   * settled (a refused one included — the caller re-reads to find out).
+   *
+   * Optional so a partial test double need not provide it; the browser store
+   * always does.
+   */
+  amendMessages?(conversationId: string, messages: ChatMessage[]): Promise<void>;
+  /**
+   * 2026-10-02: the photo data URLs this browser still holds for a
+   * conversation, by message index — the in-memory copy, then IndexedDB's
+   * write-once image records, which outlive a hydrate that replaced the
+   * in-memory thread with the server's (see CachePersister.loadImages).
+   */
+  localImages?(conversationId: string): Promise<Map<number, string[]>>;
 }
 
 export function titleFromFirstMessage(text: string): string {
@@ -981,7 +1002,13 @@ export function createServerHistoryStore(
         // 2026-09-13: an answer the server stored WITHOUT the tree position
         // this tab gave it gets that position back (withLocalBranches) — the
         // dedupe above must not be what turns a version into a stacked copy.
-        const repaired = withLocalBranches(before, server.messages);
+        // 2026-10-02: likewise a turn's photo references (withStoredImages):
+        // the refused push may have been the one carrying them, and the
+        // server's copy would otherwise erase them here, for good.
+        const repaired = withStoredImages(
+          withLocalBranches(before, server.messages),
+          before,
+        );
         if (tail.length === 0 && repaired === server.messages) {
           mutateSync((s) => {
             s.dirty = s.dirty.filter((d) => d !== conv.id);
@@ -1006,8 +1033,12 @@ export function createServerHistoryStore(
         });
         if (!pulled) return;
         // The same repair as the conversation-changed path: a server copy of
-        // an answer that lacks the branch this tab gave it takes it back.
-        const repaired = withLocalBranches(conv.messages, pulled.messages);
+        // an answer that lacks the branch this tab gave it takes it back, and
+        // a turn whose photo references only this tab has keeps them.
+        const repaired = withStoredImages(
+          withLocalBranches(conv.messages, pulled.messages),
+          conv.messages,
+        );
         if (repaired !== pulled.messages && !reconciled) {
           local.saveMessages(conv.id, repaired);
           publishAdopted(conv.id);
@@ -1285,8 +1316,38 @@ export function createServerHistoryStore(
       const kept = messages.filter(
         (m, i) => i < from || isPersistableMessage(m),
       );
-      local.saveMessages(id, kept);
+      // 2026-10-02: a copy taken before a turn's photos were referenced (the
+      // view a render behind, a stream that captured the thread at send)
+      // must not erase the reference — see withStoredImages.
+      local.saveMessages(id, withStoredImages(kept, local.get(id)?.messages ?? []));
       enqueue(id, () => syncConversation(id));
+    },
+
+    amendMessages(id, messages) {
+      const all = cache.readAll();
+      const target = all.find((c) => c.id === id);
+      if (!target) return Promise.resolve();
+      target.messages = withStoredImages(messages, target.messages);
+      cache.writeAll(all, id);
+      return enqueue(id, () => syncConversation(id));
+    },
+
+    async localImages(id) {
+      const out = new Map<number, string[]>();
+      if (persister.loadImages) {
+        for (const [i, urls] of await persister.loadImages(id)) out.set(i, urls);
+      }
+      // The in-memory copy wins where it has the photo: it is what is on
+      // screen, and it is newer than any write-behind record.
+      local.get(id)?.messages.forEach((m, i) => {
+        const urls = m.imageDataUrls?.length
+          ? m.imageDataUrls
+          : m.imageDataUrl
+            ? [m.imageDataUrl]
+            : [];
+        if (urls.length) out.set(i, urls);
+      });
+      return out;
     },
 
     /* ------------------------------------------------ v3 additions */

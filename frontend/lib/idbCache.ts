@@ -42,6 +42,17 @@ export interface CachePersister {
   put(conversations: Conversation[]): void | Promise<void>;
   remove(ids: string[]): void | Promise<void>;
   clear(): void | Promise<void>;
+  /**
+   * 2026-10-02 (chat media backfill): the photo data URLs this persister
+   * holds for ONE conversation, by message index. Read straight from the
+   * `images` store, because the in-memory copy loses them whenever a server
+   * read replaces the thread (a hydrate carries no browser-only fields) while
+   * the write-once records stay on disk — and "this browser still holds the
+   * photo" is exactly the question the backfill asks. Optional: a persister
+   * that keeps no separate image records (the legacy blob) has nothing to add
+   * to what the cache already shows.
+   */
+  loadImages?(convId: string): Promise<Map<number, string[]>>;
 }
 
 interface ImageRecord {
@@ -243,6 +254,28 @@ export function createIdbPersister(
         fail(err);
         return fallback.put(conversations);
       }
+    },
+
+    async loadImages(convId) {
+      const out = new Map<number, string[]>();
+      if (broken) return out;
+      try {
+        const db = await openDb();
+        const tx = db.transaction(IMAGE_STORE, 'readonly');
+        const records = (await requestDone(
+          tx.objectStore(IMAGE_STORE).getAll(imageRange(convId)) as IDBRequest<ImageRecord[]>,
+        )) as ImageRecord[];
+        for (const rec of records) {
+          const idx = Number(rec.key.slice(convId.length + 1));
+          if (!Number.isInteger(idx) || rec.convId !== convId) continue;
+          const urls = rec.multi?.length ? rec.multi : rec.single ? [rec.single] : [];
+          if (urls.length) out.set(idx, urls);
+        }
+      } catch {
+        // Best-effort, like every read here: no photos found is the answer
+        // that changes nothing.
+      }
+      return out;
     },
 
     async remove(ids) {

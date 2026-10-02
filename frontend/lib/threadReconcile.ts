@@ -126,6 +126,39 @@ export function withLocalBranches(
 }
 
 /**
+ * `next`, with the photo references (`meta.images`) that only `kept` still
+ * carries put back — 2026-10-02 (chat media).
+ *
+ * History stores `meta` verbatim and the last writer wins, so any copy of a
+ * thread written before a turn's photos were referenced — a view a render
+ * behind the store, a stream that captured the thread when the send began, a
+ * server copy adopted after a refused push — would erase the reference the
+ * moment it was saved, and the photo would vanish from every other device.
+ * A turn's photos never change once sent (an edit is a new message), so the
+ * reference is only ever carried forward, never taken away.
+ *
+ * Matched by POSITION and checked by identity of the turn: the same place in
+ * the flat, append-only thread, a user turn on both sides, the same words.
+ * Rows that need nothing keep their exact object, and the array itself is
+ * returned unchanged when no row did (M-08: the poll's no-op stays a no-op).
+ */
+export function withStoredImages(
+  next: ChatMessage[],
+  kept: ChatMessage[],
+): ChatMessage[] {
+  let changed = false;
+  const out = next.map((m, i) => {
+    if (m.role !== 'user' || m.meta?.images?.length) return m;
+    const k = kept[i];
+    if (!k || k === m || k.role !== 'user' || k.content !== m.content) return m;
+    if (!k.meta?.images?.length) return m;
+    changed = true;
+    return { ...m, meta: { ...(m.meta ?? {}), images: k.meta.images } };
+  });
+  return changed ? out : next;
+}
+
+/**
  * Server truth WITHOUT throwing away what only this tab knows — the reload
  * and poll path (fe-chat F1).
  *
@@ -184,6 +217,11 @@ export function reconcileThread(
   });
   // The tree positions this tab gave answers the server stored without one
   // (withLocalBranches) — so the poll never flips a version back into a
-  // stacked copy while the repaired thread is on its way to the server.
-  return [...withLocalBranches(local, merged), ...localOnlyTail(local, server)];
+  // stacked copy while the repaired thread is on its way to the server. And
+  // the photo references a server copy does not carry yet (withStoredImages),
+  // so the view never drops one the next save would then push away.
+  return [
+    ...withLocalBranches(local, withStoredImages(merged, local)),
+    ...localOnlyTail(local, server),
+  ];
 }
