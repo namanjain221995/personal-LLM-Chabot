@@ -434,4 +434,3 @@ Each is deliberate and recorded in NOTES.md under the named track.
 | §10 CSP "`media-src 'self'` if `default-src` would block it" | Not needed: `default-src 'self'` admits the route; a test pins that `blob:` stays out | fe-files |
 | §10 admin inspection uses the admin route "if that view renders MessageRow" | It does not, so no frontend calls the admin route yet | fe-images |
 | (not in CONTRACT) | Logout answers `Clear-Site-Data: "cache"`, so a year-long cached photo is not served to the next person at the keyboard | fix-fe |
-| §10 RC-3c "the background document upload patches the LATEST stored copy" | OPEN at 1348a56d: for an image + PDF turn whose two history PUTs both answer 409, the browser reconciles to the server copy and never pushes the `id` again, so the PDF stays `upload_state: "selected"` with no id and no other device can open it (3 of 3 real-browser runs). Remove this row when fixed | e2e |

@@ -799,3 +799,36 @@ four conflicts were resolved under the dev owner's rules:
   were sent." The video sentence now shows whenever `video_kept_with_chat`
   is set. Pinned in my-files-lib.test.ts ("a lasting copy gets its own
   sentence ...").
+
+## fix-pdf-id (RC-3c: the document id lost to two 409s, 2026-10-02)
+
+What changed that other tracks may rely on:
+
+- `threadReconcile.withStoredUploadIds(next, kept)` puts an upload id that
+  only `kept` knows back onto the same file: same position, a user turn on
+  both sides, the same words, then entry by entry on `attachment_id`. Only an
+  entry with no id takes one (and `upload_state: 'uploaded'` with it); an id
+  is never replaced or removed. `withStoredRefs` = `withStoredImages` + this,
+  and it now runs everywhere `withStoredImages` did: the store's
+  `saveMessages` and `amendMessages`, both 409 recoveries in `pushAll`, and
+  the view's `reconcileThread`.
+- `pushAll`, conversation changed: the carried id makes the repaired copy
+  differ from the server's, so the recovery re-pushes once with the fresh
+  stamp (it used to adopt the server copy and stop). A second refusal in a
+  row still writes nothing more, but the repaired copy (ids, photo refs,
+  branches) now stays in the cache, marked dirty, so the next push (the next
+  save or the mount refresh) carries it. Before, the second refusal left the
+  server's copy in the cache. The shrink 409 path does the same.
+- Not done, on purpose: `expected_updated_at` is not refreshed from the
+  client's own POST /messages. The append answers `created_at`, not
+  `updated_at`, and quoting it would be wrong anyway: it would let the next
+  PUT overwrite a server write made between this tab's last GET and its
+  append (RC-4). So the first PUT after an append is still refused once, and
+  the carry plus the re-push recover it. No backend change.
+- Proof: `frontend/tests/upload-id-409-carry.test.ts` uses a server that
+  keeps the real V29 rule (every write moves `updated_at`; a stale stamp is
+  refused). On the old code it reproduces the e2e result: one refused PUT and
+  no re-push. With the fix: 2 PUTs for one refusal, 2 + 1 (next refresh) for
+  two in a row, 2 per save against a server that moves after every read, and
+  0 for a settled thread re-saved. Not re-run in a real browser.
+- The README deviation row for RC-3c is removed.

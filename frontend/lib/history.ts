@@ -60,7 +60,7 @@ import {
   isPersistableMessage,
   localOnlyTail,
   withLocalBranches,
-  withStoredImages,
+  withStoredRefs,
 } from './threadReconcile';
 
 const STORAGE_KEY = 'techsara.history.v1';
@@ -996,22 +996,32 @@ export function createServerHistoryStore(
         // than to a loop.
         const before = conv.messages;
         const server = await loadConversation(conv.id, true, true);
-        if (!server || reconciled) {
+        if (!server) {
           markDirty(conv.id);
-          if (server) publishAdopted(conv.id);
           return;
         }
-        const tail = localOnlyTail(before, server.messages);
         // 2026-09-13: an answer the server stored WITHOUT the tree position
         // this tab gave it gets that position back (withLocalBranches) — the
-        // dedupe above must not be what turns a version into a stacked copy.
-        // 2026-10-02: likewise a turn's photo references (withStoredImages):
-        // the refused push may have been the one carrying them, and the
-        // server's copy would otherwise erase them here, for good.
-        const repaired = withStoredImages(
+        // dedupe below must not be what turns a version into a stacked copy.
+        // 2026-10-02: likewise a turn's photo references and its files'
+        // upload ids (withStoredRefs): the refused push may have been the one
+        // carrying them, and the server's copy would otherwise erase them
+        // here, for good (RC-3c: a document's id written after its turn was
+        // appended always meets this refusal first).
+        const repaired = withStoredRefs(
           withLocalBranches(before, server.messages),
           before,
         );
+        if (reconciled) {
+          // The second refusal in a row: no third write now. But the cache
+          // keeps what only this tab knows about the turns the server holds,
+          // so the dirty retry pushes THAT, not the server's copy.
+          if (repaired !== server.messages) local.saveMessages(conv.id, repaired);
+          markDirty(conv.id);
+          publishAdopted(conv.id);
+          return;
+        }
+        const tail = localOnlyTail(before, server.messages);
         if (tail.length === 0 && repaired === server.messages) {
           mutateSync((s) => {
             s.dirty = s.dirty.filter((d) => d !== conv.id);
@@ -1037,14 +1047,19 @@ export function createServerHistoryStore(
         if (!pulled) return;
         // The same repair as the conversation-changed path: a server copy of
         // an answer that lacks the branch this tab gave it takes it back, and
-        // a turn whose photo references only this tab has keeps them.
-        const repaired = withStoredImages(
+        // a turn whose photo references or upload ids only this tab has
+        // keeps them.
+        const repaired = withStoredRefs(
           withLocalBranches(conv.messages, pulled.messages),
           conv.messages,
         );
-        if (repaired !== pulled.messages && !reconciled) {
+        if (repaired !== pulled.messages) {
           local.saveMessages(conv.id, repaired);
           publishAdopted(conv.id);
+          if (reconciled) {
+            markDirty(conv.id); // as above: kept for the next retry
+            return;
+          }
           const fresh = local.get(conv.id);
           if (fresh) await pushAll(fresh, true);
           return;
@@ -1319,10 +1334,10 @@ export function createServerHistoryStore(
       const kept = messages.filter(
         (m, i) => i < from || isPersistableMessage(m),
       );
-      // 2026-10-02: a copy taken before a turn's photos were referenced (the
-      // view a render behind, a stream that captured the thread at send)
-      // must not erase the reference — see withStoredImages.
-      local.saveMessages(id, withStoredImages(kept, local.get(id)?.messages ?? []));
+      // 2026-10-02: a copy taken before a turn's photos were referenced or
+      // its files' upload ids landed (the view a render behind, a stream that
+      // captured the thread at send) must not erase them — see withStoredRefs.
+      local.saveMessages(id, withStoredRefs(kept, local.get(id)?.messages ?? []));
       enqueue(id, () => syncConversation(id));
     },
 
@@ -1330,7 +1345,7 @@ export function createServerHistoryStore(
       const all = cache.readAll();
       const target = all.find((c) => c.id === id);
       if (!target) return Promise.resolve();
-      target.messages = withStoredImages(messages, target.messages);
+      target.messages = withStoredRefs(messages, target.messages);
       cache.writeAll(all, id);
       return enqueue(id, () => syncConversation(id));
     },
