@@ -262,3 +262,19 @@ worker's disk; transcripts and the list stay on the head. Off unless
 | `VOICE_ARCHIVE_RATE_BYTES_PER_S` | `20971520` | Copy and read-back pace: 20 MiB/s is 17% of the 1 GbE management LAN (average ping +0.05–0.2 ms at it). |
 | `VOICE_ARCHIVE_HOLD_S` | `21600` | A recording brought back for a retranscription or a continuation stays on the head at least this long. |
 | `VOICE_ARCHIVE_RESTORE_WAIT_S` | `86400` | How long a continuation waits for a store that is down before it decodes alone. |
+
+## Chat media: stored pictures and lasting files (2026-10-02)
+
+Every picture sent in a chat is kept on the server for the life of the chat
+and shows on every device (schema V44, `orchestrator/app/chat_media.py`).
+Layout, routes, metrics, rollback and limits:
+[`chat-media/README.md`](chat-media/README.md).
+
+| Variable | Default | What it does |
+|---|---|---|
+| `CHAT_MEDIA_DIR` | `/data/chat-media` | Pictures: `<dir>/<user>/<conversation>/<media_id>/full.<ext>` and `thumb.webp`. On the `/data` volume and outside `WORKSPACE_DIR`, whose 24 h sweep and 20 GB quota would delete them. |
+| `CHAT_FILES_DIR` | `/data/chat-files` | Lasting copies of document and dataset originals: `<dir>/<conversation>/<upload_id>/original`. Same volume, same reason. |
+| `CHAT_MEDIA_MIN_FREE_GIB` | `250` | Below this much free space on that filesystem, new bytes are refused (507 on `POST /chat-media/{conv}`; skipped and counted on `/chat`, which never fails for it). The project's floor for the head's root NVMe. A value far above the disk size stops new writes without a deploy. |
+| `CHAT_MEDIA_REAP_INTERVAL_S` | `3600` | The orphan reaper runs at most this often per process (minimum 60). A deleted chat's bytes are removed at once by the delete route; this is the backstop. |
+| `CHAT_MEDIA_ORPHAN_GRACE_H` | `24` | How old a row or directory with no owning chat must be before the reaper removes it (minimum 1). `/chat` stores a picture before the browser's first history push creates the chat's row. |
+| `IMAGE_MEMORY_STORE_FALLBACK` | on | Follow-up questions read the chat's stored picture when the 2 h V41 row is gone (expired, or a restart). `0` restores the behaviour before V44. |
