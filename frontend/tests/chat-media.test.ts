@@ -22,7 +22,10 @@ import {
   createBackfill,
   fetchChatMediaBlob,
   imagesMetaFor,
+  legacyPhotoNoteId,
+  REPAIR_GRACE_MS,
   showsLegacyPhotoNote,
+  storedAttachmentIds,
   storedImagesOf,
   thumbBox,
   uploadChatMedia,
@@ -31,6 +34,7 @@ import {
   type BackfillHost,
   type MediaUploadOutcome,
 } from '@/lib/chatMedia';
+import { turnFingerprint } from '@/lib/idbCache';
 import type { ChatMessage } from '@/lib/types';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -152,6 +156,50 @@ describe('the legacy photo note', () => {
     expect(showsLegacyPhotoNote(user('q'), answer('a'))).toBe(false);
     expect(showsLegacyPhotoNote(user('q'), undefined)).toBe(false);
     expect(showsLegacyPhotoNote(answer('a', 'vision'), answer('b', 'vision'))).toBe(false);
+  });
+
+  // QA 2026-10-02: a text follow-up about a photo is answered by the vision
+  // engine too (image memory), so "a vision answer under a photo-less turn"
+  // used to put the line under every follow-up, on every device.
+  it('stays silent on a text follow-up once the thread above holds a photo or a vision answer', () => {
+    const followup = user('what colour is the stem?');
+    const stemAnswer = answer('green', 'vision');
+    const stored = user('is this leaf healthy?', {
+      meta: { images: [{ attachment_id: 'img-aaaa-0001' }] },
+    });
+    expect(showsLegacyPhotoNote(followup, stemAnswer, [stored, answer('healthy', 'vision')])).toBe(
+      false,
+    );
+    expect(
+      showsLegacyPhotoNote(followup, stemAnswer, [user('q', { imageDataUrl: PNG }), answer('a')]),
+    ).toBe(false);
+    // A legacy photo turn above (no bytes here, but its vision answer).
+    expect(showsLegacyPhotoNote(followup, stemAnswer, [user('q'), answer('a', 'vision')])).toBe(
+      false,
+    );
+    // Nothing about a picture above: still the legacy line.
+    expect(showsLegacyPhotoNote(followup, stemAnswer, [user('hi'), answer('hello')])).toBe(true);
+  });
+
+  it('legacyPhotoNoteId names at most one turn: the first photo-less turn under a vision answer', () => {
+    const legacy = user('is this leaf healthy?');
+    const thread = [
+      user('hi'),
+      answer('hello'),
+      legacy,
+      answer('healthy', 'vision'),
+      user('and the stem?'),
+      answer('green', 'vision'),
+    ];
+    expect(legacyPhotoNoteId(thread)).toBe(legacy.id);
+    const withStoredPhoto = [
+      user('leaf', { meta: { images: [{ attachment_id: 'img-aaaa-0001' }] } }),
+      answer('healthy', 'vision'),
+      user('and the stem?'),
+      answer('green', 'vision'),
+    ];
+    expect(legacyPhotoNoteId(withStoredPhoto)).toBeNull();
+    expect(legacyPhotoNoteId([user('hi'), answer('hello')])).toBeNull();
   });
 });
 
@@ -300,11 +348,19 @@ describe('the backfill', () => {
     };
     const { host, saves } = fakeHost(threads, photos);
     const upload = storingUpload();
-    const backfill = createBackfill(host, { upload, schedule: now, locks: null, online: () => true });
+    const list = vi.fn(async () => new Set(['img-aaaa-0009']));
+    const backfill = createBackfill(host, {
+      upload,
+      list,
+      schedule: now,
+      locks: null,
+      online: () => true,
+    });
 
     expect(await backfill.runNow(CONV)).toBe('done');
 
-    // One request per turn that needs it; never for the turn that has refs.
+    // One request per turn that needs it; never for the turn whose reference
+    // the server holds.
     expect(upload).toHaveBeenCalledTimes(2);
     for (const call of upload.mock.calls) {
       expect(call[0]).toBe(CONV);
@@ -502,6 +558,47 @@ describe('the backfill', () => {
     expect(schedule).not.toHaveBeenCalled();
   });
 
+  it('takes no photo from a record written for ANOTHER turn that once sat at that index', async () => {
+    // QA 2026-10-02 (security): records are keyed by index, and a thread
+    // replaced under them left an old photo under an unrelated text turn,
+    // which the backfill uploaded and wrote into that turn on every device.
+    const threads = {
+      [CONV]: [user('hello again'), answer('hi'), user('draft my resignation letter'), answer('Dear')],
+    };
+    const { host, saves } = fakeHost(threads, {});
+    host.localImages = async () =>
+      new Map([[2, { urls: [PNG], boundTo: turnFingerprint(user('what is this rash?')) }]]);
+    const upload = storingUpload();
+    await createBackfill(host, { upload, schedule: now, locks: null }).runNow(CONV);
+    expect(upload).not.toHaveBeenCalled();
+    expect(saves).toHaveLength(0);
+  });
+
+  it('uses a record that names its turn, and an older unnamed one only under a vision answer', async () => {
+    const threads = {
+      [CONV]: [user('leaf?'), answer('healthy', 'vision'), user('letter please'), answer('Dear')],
+    };
+    const { host, saves } = fakeHost(threads, {});
+    host.localImages = async () =>
+      new Map([
+        [0, { urls: [PNG] }],
+        [2, { urls: [JPEG] }],
+      ]);
+    const upload = storingUpload();
+    await createBackfill(host, { upload, schedule: now, locks: null }).runNow(CONV);
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(saves[0].messages[0].meta?.images).toHaveLength(1);
+    expect(saves[0].messages[2].meta).toBeUndefined();
+
+    const bound = { [CONV]: [user('letter please'), answer('Dear')] };
+    const second = fakeHost(bound, {});
+    second.host.localImages = async () =>
+      new Map([[0, { urls: [JPEG], boundTo: turnFingerprint(user('letter please')) }]]);
+    const upload2 = storingUpload();
+    await createBackfill(second.host, { upload: upload2, schedule: now, locks: null }).runNow(CONV);
+    expect(upload2).toHaveBeenCalledTimes(1);
+  });
+
   it('withBackfilledImages only writes onto the same turn, and keeps identity otherwise', () => {
     const msgs = [user('photo'), answer('a')];
     const found = new Map([[0, { content: 'photo', images: [{ attachment_id: 'bf-aaaaaaaa' }] }]]);
@@ -514,5 +611,146 @@ describe('the backfill', () => {
     // Already referenced: untouched, same array.
     const done = [user('photo', { meta: { images: [{ attachment_id: 'img-aaaa-0001' }] } })];
     expect(withBackfilledImages(done, found)).toBe(done);
+  });
+});
+
+/* ======================================================= the repair */
+
+describe('the repair: a referenced photo the server never stored', () => {
+  // QA 2026-10-02: the browser writes meta.images at send and the server
+  // stores the bytes later, from the /chat body. When that store is lost the
+  // reference names nothing, and the backfill skipped every turn that had
+  // one, although this browser still held the bytes.
+  const sent = (extra: Partial<ChatMessage> = {}) =>
+    user('what is this?', {
+      imageDataUrl: PNG,
+      meta: { images: [{ attachment_id: 'att-00000001', mime: 'image/png' }] },
+      ...extra,
+    });
+
+  it('re-uploads the bytes under the SAME id, and writes nothing', async () => {
+    const threads = { [CONV]: [sent(), answer('a cat', 'vision')] };
+    const { host, saves } = fakeHost(threads, { [CONV]: new Map([[0, [PNG]]]) });
+    const upload = storingUpload();
+    const list = vi.fn(async () => new Set<string>());
+    expect(
+      await createBackfill(host, { upload, list, schedule: now, locks: null }).runNow(CONV),
+    ).toBe('done');
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(upload).toHaveBeenCalledTimes(1);
+    const [conv, parts, source] = upload.mock.calls[0];
+    expect(conv).toBe(CONV);
+    expect(source).toBe('backfill');
+    expect(parts.map((p) => p.attachmentId)).toEqual(['att-00000001']);
+    expect(parts[0].blob.type).toBe('image/png');
+    expect(saves).toHaveLength(0);
+    expect(threads[CONV][0].meta?.images).toEqual([
+      { attachment_id: 'att-00000001', mime: 'image/png' },
+    ]);
+  });
+
+  it('asks once per chat and uploads only the ids the server lacks', async () => {
+    const two = user('two', {
+      imageDataUrls: [PNG, JPEG],
+      meta: {
+        images: [
+          { attachment_id: 'att-00000002', mime: 'image/png' },
+          { attachment_id: 'att-00000003', mime: 'image/jpeg' },
+        ],
+      },
+    });
+    const threads = { [CONV]: [sent(), answer('a'), two, answer('b')] };
+    const photos = { [CONV]: new Map([[0, [PNG]], [2, [PNG, JPEG]]]) };
+    const { host } = fakeHost(threads, photos);
+    const upload = storingUpload();
+    const list = vi.fn(async () => new Set(['att-00000001', 'att-00000002']));
+    await createBackfill(host, { upload, list, schedule: now, locks: null }).runNow(CONV);
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(upload.mock.calls[0][1].map((p) => p.attachmentId)).toEqual(['att-00000003']);
+    expect(upload.mock.calls[0][1][0].blob.type).toBe('image/jpeg');
+  });
+
+  it('does nothing when the server holds them, or when it could not say', async () => {
+    const threads = { [CONV]: [sent(), answer('a')] };
+    const { host } = fakeHost(threads, { [CONV]: new Map([[0, [PNG]]]) });
+    const upload = storingUpload();
+    await createBackfill(host, {
+      upload,
+      list: async () => new Set(['att-00000001']),
+      schedule: now,
+      locks: null,
+    }).runNow(CONV);
+    await createBackfill(host, { upload, list: async () => null, schedule: now, locks: null }).runNow(
+      CONV,
+    );
+    expect(upload).not.toHaveBeenCalled();
+  });
+
+  it('never repairs with bytes that are not provably that turn’s, or too soon after the send', async () => {
+    const list = vi.fn(async () => new Set<string>());
+    const cases: Array<{ turn: ChatMessage; held: unknown }> = [
+      // Unnamed (older) record: could be another turn's photo.
+      { turn: sent(), held: { urls: [PNG] } },
+      // Named for another turn.
+      { turn: sent(), held: { urls: [PNG], boundTo: turnFingerprint(user('other words')) } },
+      // The recorded type disagrees with the bytes.
+      { turn: sent(), held: [JPEG] },
+      // Counts disagree.
+      { turn: sent(), held: [PNG, PNG] },
+      // The /chat store may still be landing.
+      { turn: sent({ createdAt: 1_000_000 }), held: [PNG] },
+    ];
+    for (const { turn, held } of cases) {
+      const { host } = fakeHost({ [CONV]: [turn, answer('a', 'vision')] }, {});
+      host.localImages = async () => new Map([[0, held as string[]]]);
+      const upload = storingUpload();
+      await createBackfill(host, {
+        upload,
+        list,
+        now: () => 1_000_000 + REPAIR_GRACE_MS - 1,
+        schedule: now,
+        locks: null,
+      }).runNow(CONV);
+      expect(upload).not.toHaveBeenCalled();
+    }
+  });
+
+  it('stops on 507 like the backfill', async () => {
+    const threads = { [CONV]: [sent(), answer('a')] };
+    const { host } = fakeHost(threads, { [CONV]: new Map([[0, [PNG]]]) });
+    const upload = vi.fn(async () => ({ kind: 'no_space' }) as MediaUploadOutcome);
+    const backfill = createBackfill(host, {
+      upload,
+      list: async () => new Set<string>(),
+      schedule: now,
+      locks: null,
+    });
+    // 'halt' is what makes the queue stop for the page's life (tick).
+    expect(await backfill.runNow(CONV)).toBe('halt');
+  });
+});
+
+describe('storedAttachmentIds', () => {
+  it('reads the ids of the list, and null for anything that is not a list', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        Response.json({ items: [{ attachment_id: 'att-00000001' }, { attachment_id: '../x' }, null] }),
+      ),
+    );
+    expect(await storedAttachmentIds(CONV)).toEqual(new Set(['att-00000001']));
+    expect(vi.mocked(fetch).mock.calls[0][0]).toBe(`/api/chat-media/${CONV}`);
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({})));
+    expect(await storedAttachmentIds(CONV)).toBeNull();
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 502 })));
+    expect(await storedAttachmentIds(CONV)).toBeNull();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new TypeError('Failed to fetch');
+      }),
+    );
+    expect(await storedAttachmentIds(CONV)).toBeNull();
   });
 });

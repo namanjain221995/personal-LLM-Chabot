@@ -116,7 +116,11 @@ describe('another device', () => {
     );
   });
 
-  it('turns a thumbnail that cannot load into an "Image unavailable" tile — after one retry', () => {
+  // QA 2026-10-02: the server stores a sent photo BEHIND the turn, and a
+  // second device can see the reference first. One retry after 2 s left a
+  // photo that took longer "unavailable" until a reload; now three retries,
+  // 2, 6 and 15 s apart, each under its own URL.
+  it('turns a thumbnail that cannot load into an "Image unavailable" tile — after three retries', () => {
     vi.useFakeTimers();
     const { container } = renderRow(turn({ meta: stored }));
     const first = container.querySelector('img') as HTMLImageElement;
@@ -125,20 +129,50 @@ describe('another device', () => {
     fireEvent.error(first);
     // Hidden while it waits, never a broken-image icon; the box stays.
     expect(first.className).toContain('opacity-0');
-    act(() => {
-      vi.advanceTimersByTime(2_000);
-    });
-    const second = container.querySelector('img') as HTMLImageElement;
-    expect(second.getAttribute('src')).toBe(
-      `/api/chat-media/${CONV}/img-aaaa-0001?size=thumb&retry=1`,
-    );
-    fireEvent.error(second);
+    for (const [n, delay] of [
+      [1, 2_000],
+      [2, 6_000],
+      [3, 15_000],
+    ] as const) {
+      act(() => {
+        vi.advanceTimersByTime(delay - 1);
+      });
+      // Not before its time.
+      expect(container.querySelector('img')?.getAttribute('src')).not.toContain(`retry=${n}`);
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+      const retry = container.querySelector('img') as HTMLImageElement;
+      expect(retry.getAttribute('src')).toBe(
+        `/api/chat-media/${CONV}/img-aaaa-0001?size=thumb&retry=${n}`,
+      );
+      expect(screen.queryByTestId('stored-image-unavailable')).toBeNull();
+      fireEvent.error(retry);
+    }
 
     const tile = screen.getByTestId('stored-image-unavailable');
     expect(tile.textContent).toContain('Image unavailable');
     expect(tile.style.width).toBe('213px');
     expect(tile.style.aspectRatio).toBe('800 / 600');
     expect(container.querySelector('img')).toBeNull();
+  });
+
+  it('a photo that lands while it retries is shown, and no later retry undoes it', () => {
+    vi.useFakeTimers();
+    const { container } = renderRow(turn({ meta: stored }));
+    fireEvent.error(container.querySelector('img') as HTMLImageElement);
+    act(() => {
+      vi.advanceTimersByTime(2_000);
+    });
+    const retry = container.querySelector('img') as HTMLImageElement;
+    fireEvent.load(retry);
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    const img = container.querySelector('img') as HTMLImageElement;
+    expect(img.getAttribute('src')).toContain('retry=1');
+    expect(img.className).not.toContain('opacity-0');
+    expect(screen.queryByTestId('stored-image-unavailable')).toBeNull();
   });
 
   it('a thumbnail that loads stays as it is', () => {

@@ -59,7 +59,8 @@ import {
 import {
   createBackfill,
   imagesMetaFor,
-  showsLegacyPhotoNote,
+  legacyPhotoNoteId,
+  storedAttachmentIds,
   storedImagesOf,
   withImagesMeta,
   type Backfill,
@@ -786,6 +787,13 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
     () => threadPath.map((i) => messages[i]),
     [threadPath, messages],
   );
+  /**
+   * The turn that says its photo was sent before photos were stored — at
+   * most one, decided from the whole thread as read: a photo-less turn under a
+   * vision answer is otherwise a text follow-up about an EARLIER photo, which
+   * the orchestrator answers through the same vision route.
+   */
+  const legacyPhotoTurn = useMemo(() => legacyPhotoNoteId(thread), [thread]);
   const threadRef = useRef<ChatMessage[]>([]);
   threadRef.current = thread;
   const activeIdRef = useRef<string | null>(null);
@@ -2668,9 +2676,9 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
   const runEdit = useCallback(
     async (messageId: string, text: string) => {
       const id = activeIdRef.current;
-      if (!id || isStreaming(id)) return;
-      const all = messagesRef.current;
-      const original = all.find((m) => m.id === messageId);
+      if (!id || isStreaming(id) || pendingSendRef.current.has(id)) return;
+      let all = messagesRef.current;
+      let original = all.find((m) => m.id === messageId);
       if (!original || original.role !== 'user') return;
 
       // Re-ask the question WITH whatever was attached to it. Images survive
@@ -2678,12 +2686,36 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       // dataset only ever lived server-side, so both report `missing` and the
       // edit stops rather than silently re-asking with nothing attached.
       const resend = resendOptionsFor(original);
-      if (resend.missing) {
+      const reattach = () =>
         toast(
           'Re-attach the file to edit this message — its contents are no longer in memory.',
           'error',
         );
+      if (resend.missing) {
+        reattach();
         return;
+      }
+      // Photos sent by reference must still be on the server BEFORE the
+      // version is written: an edit is stored (and pushed) before its stream
+      // starts, so a 422 `image_ref_missing` would come too late to take it
+      // back — an unanswered `2 / 2` the server will not let a push remove.
+      // One list read; an unknown answer lets the server decide, as before.
+      if (resend.imageRefs?.length) {
+        pendingSendRef.current.add(id);
+        let held: Set<string> | null;
+        try {
+          held = await storedAttachmentIds(id);
+        } finally {
+          pendingSendRef.current.delete(id);
+        }
+        if (held && resend.imageRefs.some((ref) => !held.has(ref))) {
+          reattach();
+          return;
+        }
+        if (activeIdRef.current !== id || isStreaming(id)) return;
+        all = messagesRef.current;
+        original = all.find((m) => m.id === messageId);
+        if (!original || original.role !== 'user') return;
       }
 
       const version = branchForVersion(all, original);
@@ -3754,7 +3786,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
                     // A photo sent before photos were stored, on a device that
                     // never held it: decided here because only the thread can
                     // see the answer that follows the turn.
-                    legacyPhoto={showsLegacyPhotoNote(m, thread[i + 1])}
+                    legacyPhoto={m.id === legacyPhotoTurn}
                     uploadStatus={
                       datasetUpload?.messageId === m.id
                         ? datasetUpload.status

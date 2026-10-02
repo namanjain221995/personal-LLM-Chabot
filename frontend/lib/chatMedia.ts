@@ -27,6 +27,7 @@
 
 import type { ChatMessage, MessageImage, Meta } from './types';
 import { dataUrlToBlob, mimeFromDataUrl } from './attachments';
+import { turnFingerprint, type HeldImageRecord } from './idbCache';
 
 /** An attachment id as the server accepts it (CONTRACT §3, client-minted). */
 export const ATTACHMENT_ID = /^[A-Za-z0-9_-]{8,64}$/;
@@ -146,6 +147,10 @@ export function localImagesOf(
   return message.imageDataUrl ? [message.imageDataUrl] : [];
 }
 
+function hasPhotos(message: ChatMessage): boolean {
+  return localImagesOf(message).length > 0 || storedImagesOf(message).length > 0;
+}
+
 /**
  * Should this turn say that its photo was never stored?
  *
@@ -156,15 +161,39 @@ export function localImagesOf(
  * carries), one muted line says what happened instead of nothing. An image
  * sent with a document routes to the document engine, so this stays silent
  * there rather than guess.
+ *
+ * A vision answer is not proof of a photo, though: a text follow-up ABOUT an
+ * earlier photo ("what colour is the stem?") is answered by the vision engine
+ * too (orchestrator image memory, main.py `image_followup_images`), with the
+ * same `route: 'vision'`. So once the thread before this turn (`earlier`, in
+ * reading order) holds a photo or a vision answer, a photo-less turn under a
+ * vision answer is taken for such a follow-up and gets no line.
  */
 export function showsLegacyPhotoNote(
   message: ChatMessage,
   next: ChatMessage | undefined,
+  earlier: readonly ChatMessage[] = [],
 ): boolean {
   if (message.role !== 'user') return false;
-  if (localImagesOf(message).length > 0) return false;
-  if (storedImagesOf(message).length > 0) return false;
-  return next?.role === 'assistant' && next.meta?.route === 'vision';
+  if (hasPhotos(message)) return false;
+  if (next?.role !== 'assistant' || next.meta?.route !== 'vision') return false;
+  return !earlier.some((m) =>
+    m.role === 'user' ? hasPhotos(m) : m.meta?.route === 'vision',
+  );
+}
+
+/**
+ * The one turn of a thread (as read, in order) that gets the legacy line, or
+ * null — `showsLegacyPhotoNote` for every turn in a single pass.
+ */
+export function legacyPhotoNoteId(thread: readonly ChatMessage[]): string | null {
+  for (let i = 0; i < thread.length; i += 1) {
+    const m = thread[i];
+    if (m.role === 'user' && hasPhotos(m)) return null;
+    if (m.role === 'assistant' && m.meta?.route === 'vision') return null;
+    if (showsLegacyPhotoNote(m, thread[i + 1])) return m.id;
+  }
+  return null;
 }
 
 /**
@@ -262,6 +291,34 @@ export async function fetchChatMediaBlob(
     return { status: 'ok', blob: await res.blob() };
   } catch {
     return { status: 'unavailable' };
+  }
+}
+
+/**
+ * The attachment ids the server holds for this viewer's conversation
+ * (GET /api/chat-media/{conversation}), or null when that could not be
+ * learned — offline, a failing service, an answer of the wrong shape. null
+ * never means "none": callers that act on a missing id act only on a list.
+ */
+export async function storedAttachmentIds(
+  conversationId: string,
+  signal?: AbortSignal,
+): Promise<Set<string> | null> {
+  try {
+    const res = await fetch(`/api/chat-media/${encodeURIComponent(conversationId)}`, {
+      signal,
+      cache: 'no-store',
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { items?: unknown };
+    if (!Array.isArray(body.items)) return null;
+    const ids = new Set<string>();
+    for (const item of body.items as Array<{ attachment_id?: unknown } | null>) {
+      if (isAttachmentId(item?.attachment_id)) ids.add(item.attachment_id);
+    }
+    return ids;
+  } catch {
+    return null;
   }
 }
 
@@ -379,7 +436,32 @@ export async function uploadChatMedia(
    · ONE push per chat, re-applied once if a 409 adopted the server's copy
      over it (history stores meta verbatim; the server copy lacks the field);
    · only the viewer's own chats in the normal view. ChatApp is the only
-     host, so a shared page or the admin transcript never runs it. */
+     host, so a shared page or the admin transcript never runs it;
+   · photos are taken only from a record written for THAT turn (same role,
+     same words — idbCache's turnFingerprint). Records are keyed by index,
+     and a thread replaced under them leaves one under an unrelated turn; a
+     record older than the fingerprint is used only under a vision answer.
+
+   It also REPAIRS (2026-10-02, QA): a turn sent with this build carries
+   `meta.images` from the moment it is sent, but the server stores the bytes
+   later, from the /chat body, and that store can be lost (a restart or a
+   deploy mid-store, a failed /chat, a full disk). The reference then names
+   nothing, and every other device shows "Image unavailable" for good. So when
+   this browser holds the bytes for such a turn, it asks the server once per
+   chat which ids it holds, and uploads the missing ones under the SAME ids
+   (source=backfill; first write wins, so a store that did land is never
+   overwritten). The reference is already right, so nothing is saved. */
+
+/**
+ * Photos this browser holds for one turn. A bare list is the host vouching
+ * that the bytes ride on that very message; a record read back from
+ * IndexedDB names the turn it was written for (`boundTo`), or nothing when it
+ * predates that.
+ */
+export type HeldPhotos = string[] | HeldImageRecord;
+
+/** A turn younger than this is not repaired: its /chat store may still be landing. */
+export const REPAIR_GRACE_MS = 2 * 60_000;
 
 /** The id a backfilled photo is stored under: `bf-<32 hex of sha256>`. */
 export async function backfillAttachmentId(dataUrl: string): Promise<string | null> {
@@ -414,7 +496,7 @@ export interface BackfillHost {
    * The photos this browser still holds for the conversation, by message
    * index — the in-memory copy first, then IndexedDB (history.localImages).
    */
-  localImages(conversationId: string): Promise<Map<number, string[]>>;
+  localImages(conversationId: string): Promise<Map<number, HeldPhotos>>;
   /**
    * Persist an amended copy of the same thread through the normal store path
    * (one push), WITHOUT moving the chat in Recents, and fold it into the view.
@@ -427,6 +509,9 @@ export interface BackfillHost {
 
 export interface BackfillDeps {
   upload?: typeof uploadChatMedia;
+  /** Which ids the server holds for a chat (the repair asks once per chat). */
+  list?: typeof storedAttachmentIds;
+  now?: () => number;
   attachmentId?: (dataUrl: string) => Promise<string | null>;
   /** Run `task` when the browser is idle. Tests run it at once. */
   schedule?: (task: () => void) => void;
@@ -443,6 +528,35 @@ interface BackfillTarget {
   index: number;
   content: string;
   dataUrls: string[];
+  /**
+   * A REPAIR: the turn's own `meta.images` ids, index for index with
+   * `dataUrls`. Absent for a turn with no references yet.
+   */
+  ids?: string[];
+}
+
+/** The held bytes for a turn, and whether they are known to be that turn's. */
+function heldFor(
+  held: HeldPhotos,
+  turn: ChatMessage,
+): { urls: string[]; bound: 'own' | 'unknown' | 'other' } {
+  if (Array.isArray(held)) return { urls: held, bound: 'own' };
+  if (held.boundTo === undefined) return { urls: held.urls, bound: 'unknown' };
+  return { urls: held.urls, bound: held.boundTo === turnFingerprint(turn) ? 'own' : 'other' };
+}
+
+/**
+ * Do these bytes pair index for index with the turn's references? Only when
+ * every entry is well formed (`imagesMetaFor` skipped none) and the counts and
+ * every recorded type agree.
+ */
+function pairsWithRefs(turn: ChatMessage, urls: string[]): boolean {
+  const raw = turn.meta?.images;
+  const refs = storedImagesOf(turn);
+  if (!Array.isArray(raw) || raw.length !== urls.length || refs.length !== urls.length) {
+    return false;
+  }
+  return refs.every((ref, i) => !ref.mime || ref.mime === mimeFromDataUrl(urls[i]));
 }
 
 export type BackfillChatOutcome =
@@ -500,6 +614,8 @@ export function withBackfilledImages(
  */
 export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
   const upload = deps.upload ?? uploadChatMedia;
+  const list = deps.list ?? storedAttachmentIds;
+  const now = deps.now ?? Date.now;
   const mintId = deps.attachmentId ?? backfillAttachmentId;
   const schedule = deps.schedule ?? idleScheduler;
   const locks = deps.locks === undefined ? browserLocks() : deps.locks;
@@ -568,14 +684,71 @@ export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
     const local = await host.localImages(conversationId);
     const out: BackfillTarget[] = [];
     messages.forEach((m, index) => {
-      if (m.role !== 'user' || storedImagesOf(m).length > 0) return;
+      if (m.role !== 'user') return;
       if (refused.has(`${conversationId}#${index}`)) return;
-      const dataUrls = local.get(index) ?? [];
+      const held = local.get(index);
+      if (!held) return;
+      const { urls: dataUrls, bound } = heldFor(held, m);
       if (dataUrls.length === 0 || dataUrls.length > MAX_MEDIA_PER_REQUEST) return;
       if (!dataUrls.every((url) => typeof url === 'string' && url.startsWith('data:'))) return;
-      out.push({ index, content: m.content, dataUrls });
+      // Written for another turn that once sat at this index: never this one's.
+      if (bound === 'other') return;
+      const refs = storedImagesOf(m);
+      if (refs.length === 0) {
+        // A record from before records named their turn: trusted only where
+        // the answer below it is about a picture.
+        if (bound === 'unknown') {
+          const next = messages[index + 1];
+          if (next?.role !== 'assistant' || next.meta?.route !== 'vision') return;
+        }
+        out.push({ index, content: m.content, dataUrls });
+        return;
+      }
+      // A repair writes these bytes under the turn's OWN ids, for good (first
+      // write wins): only bytes known to be this turn's, paired one to one,
+      // and not while the turn's own /chat store may still be landing.
+      if (bound !== 'own' || !pairsWithRefs(m, dataUrls)) return;
+      if (typeof m.createdAt === 'number' && now() - m.createdAt < REPAIR_GRACE_MS) return;
+      out.push({ index, content: m.content, dataUrls, ids: refs.map((r) => r.attachment_id) });
     });
     return out;
+  }
+
+  /**
+   * Upload the photos of a turn whose references the server does not hold,
+   * under those same ids. Nothing to write back: the reference is the id.
+   */
+  async function repairTurn(
+    conversationId: string,
+    target: BackfillTarget & { ids: string[] },
+    held: Set<string>,
+  ): Promise<{ done: true } | { stop: BackfillChatOutcome } | { refused: true }> {
+    const parts: MediaUploadPart[] = [];
+    const seen = new Set<string>();
+    target.ids.forEach((id, i) => {
+      if (held.has(id) || seen.has(id)) return;
+      seen.add(id);
+      const blob = dataUrlToBlob(target.dataUrls[i]);
+      if (!blob) return;
+      const ext = EXTENSION_BY_MIME[blob.type] ?? 'img';
+      parts.push({ attachmentId: id, blob, name: `image-${i + 1}.${ext}` });
+    });
+    if (parts.length === 0) return { done: true };
+    const outcome = await upload(conversationId, parts, 'backfill');
+    switch (outcome.kind) {
+      case 'stored':
+        return { done: true };
+      case 'refused':
+        return { refused: true };
+      case 'no_space':
+      case 'unauthenticated':
+        return { stop: 'halt' };
+      case 'offline':
+        return { stop: 'offline' };
+      case 'not_found':
+      case 'failed':
+        return { stop: 'later' };
+    }
   }
 
   /** Upload one turn's photos. The images for meta, or what stopped it. */
@@ -638,7 +811,21 @@ export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
     if (targets.length === 0) return 'done';
     const found = new Map<number, { content: string; images: MessageImage[] }>();
     let stop: BackfillChatOutcome = 'done';
+    // Asked once per chat, and only when there is something to repair.
+    let held: Set<string> | null | undefined;
     for (const target of targets) {
+      if (target.ids) {
+        if (held === undefined) held = await list(conversationId);
+        // Unknown is not "missing": try again at the next open.
+        if (held === null) continue;
+        const repaired = await repairTurn(conversationId, { ...target, ids: target.ids }, held);
+        if ('refused' in repaired) refused.add(`${conversationId}#${target.index}`);
+        if ('stop' in repaired) {
+          stop = repaired.stop;
+          break;
+        }
+        continue;
+      }
       const result = await uploadTurn(conversationId, target);
       if ('images' in result) {
         found.set(target.index, { content: target.content, images: result.images });

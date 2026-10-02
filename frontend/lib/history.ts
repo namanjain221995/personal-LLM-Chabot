@@ -36,6 +36,7 @@ import {
   isIdbAvailable,
   userDbName,
   type CachePersister,
+  type HeldImageRecord,
 } from './idbCache';
 import { PREFS_STORAGE_KEY } from './prefs';
 import { FEEDBACK_STORAGE_KEY } from './feedback';
@@ -209,8 +210,10 @@ export interface ServerHistoryStore extends HistoryStore {
    * conversation, by message index — the in-memory copy, then IndexedDB's
    * write-once image records, which outlive a hydrate that replaced the
    * in-memory thread with the server's (see CachePersister.loadImages).
+   * A bare list is bytes carried by the message itself; a record says which
+   * turn it was written for (`boundTo`), absent when it predates that.
    */
-  localImages?(conversationId: string): Promise<Map<number, string[]>>;
+  localImages?(conversationId: string): Promise<Map<number, string[] | HeldImageRecord>>;
 }
 
 export function titleFromFirstMessage(text: string): string {
@@ -1333,19 +1336,28 @@ export function createServerHistoryStore(
     },
 
     async localImages(id) {
-      const out = new Map<number, string[]>();
-      if (persister.loadImages) {
-        for (const [i, urls] of await persister.loadImages(id)) out.set(i, urls);
-      }
+      const out = new Map<number, string[] | HeldImageRecord>();
+      const records = persister.loadImages
+        ? await persister.loadImages(id)
+        : new Map<number, HeldImageRecord>();
+      for (const [i, rec] of records) out.set(i, rec);
       // The in-memory copy wins where it has the photo: it is what is on
-      // screen, and it is newer than any write-behind record.
+      // screen, and it is newer than any write-behind record. Except over a
+      // record that names no turn: the boot read lays such a record over
+      // whatever turn sits at its index, so the copy on the message may be
+      // that very record and is no better bound than it. (A record bound to
+      // ANOTHER turn is never laid over this one, so bytes found here then
+      // are this tab's own send, not yet written behind.)
       local.get(id)?.messages.forEach((m, i) => {
         const urls = m.imageDataUrls?.length
           ? m.imageDataUrls
           : m.imageDataUrl
             ? [m.imageDataUrl]
             : [];
-        if (urls.length) out.set(i, urls);
+        if (!urls.length) return;
+        const rec = records.get(i);
+        if (rec && rec.boundTo === undefined) return;
+        out.set(i, urls);
       });
       return out;
     },

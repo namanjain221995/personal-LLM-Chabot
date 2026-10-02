@@ -33,6 +33,9 @@ let seeded: ChatMessage[] | null = null;
 let chatBodies: ChatRequestBody[] = [];
 let chatAnswer: () => Response | { ok: boolean; status: number; body: ReadableStream<Uint8Array> };
 let mediaPosts: FormData[] = [];
+/** What GET /api/chat-media/{conv} lists; null answers `{}` (no list). */
+let mediaList: string[] | null = null;
+let mediaListReads = 0;
 let releaseUpload: ((value: { upload_id: string; name: string }) => void) | null = null;
 const uploadDocumentFile = vi.fn(
   () =>
@@ -142,6 +145,12 @@ function stubBrowser() {
         chatBodies.push(JSON.parse(String(init?.body)) as ChatRequestBody);
         return chatAnswer();
       }
+      if (u === `/api/chat-media/${CONV}` && (init?.method ?? 'GET') === 'GET') {
+        mediaListReads += 1;
+        return Response.json(
+          mediaList === null ? {} : { items: mediaList.map((attachment_id) => ({ attachment_id })) },
+        );
+      }
       if (u === `/api/chat-media/${CONV}` && init?.method === 'POST') {
         const form = init.body as FormData;
         mediaPosts.push(form);
@@ -207,6 +216,8 @@ beforeEach(() => {
   seeded = null;
   chatBodies = [];
   mediaPosts = [];
+  mediaList = null;
+  mediaListReads = 0;
   releaseUpload = null;
   uploadDocumentFile.mockClear();
   chatAnswer = () => ({ ok: true, status: 200, body: sse('Here is the answer.') });
@@ -356,6 +367,84 @@ describe('a device that never held the photo', () => {
     expect(screen.getByText('It looks healthy.')).toBeTruthy();
   });
 
+  // QA 2026-10-02: the orchestrator answers a text follow-up about a photo
+  // through the vision engine too, so the line used to appear under every
+  // follow-up — on every device, in chats whose photo IS stored.
+  it('a text follow-up about a stored photo gets no "not stored" line', async () => {
+    seedThread([
+      askedWithPhoto,
+      visionAnswer,
+      { id: 'srv-conv-1-2', role: 'user', content: 'what colour is the stem?', createdAt: 3 },
+      { ...visionAnswer, id: 'srv-conv-1-3', content: 'The stem is green.' },
+    ]);
+    renderApp();
+    await screen.findByText('The stem is green.');
+    expect(screen.queryAllByTestId('legacy-photo-note')).toHaveLength(0);
+  });
+
+  it('a follow-up under a legacy photo turn: the line once, on the photo turn only', async () => {
+    seedThread([
+      { id: 'srv-conv-1-0', role: 'user', content: 'is this leaf healthy?', createdAt: 1 },
+      visionAnswer,
+      { id: 'srv-conv-1-2', role: 'user', content: 'what colour is the stem?', createdAt: 3 },
+      { ...visionAnswer, id: 'srv-conv-1-3', content: 'The stem is green.' },
+    ]);
+    renderApp();
+    await screen.findByText('The stem is green.');
+    const notes = screen.getAllByTestId('legacy-photo-note');
+    expect(notes).toHaveLength(1);
+    // On the photo turn: before the first answer, not under the follow-up.
+    const position = (text: string) =>
+      notes[0].compareDocumentPosition(screen.getByText(text));
+    expect(position('It looks healthy.') & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(position('what colour is the stem?') & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  async function editTo(text: string) {
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('button', { name: 'Edit message' }));
+    });
+    const editor = screen.getByRole('textbox', { name: 'Edit your message' });
+    await act(async () => {
+      fireEvent.change(editor, { target: { value: text } });
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    });
+  }
+
+  // QA 2026-10-02: an edit is stored (and pushed) BEFORE its stream starts,
+  // so a 422 image_ref_missing left an unanswered `2 / 2` behind that no
+  // push may remove. The photo is now checked before anything is written.
+  it('an edit by reference whose photo the server no longer holds writes nothing', async () => {
+    mediaList = [];
+    seedThread([askedWithPhoto, visionAnswer]);
+    renderApp();
+    await screen.findByText('It looks healthy.');
+    await editTo('is this leaf dying?');
+    expect(
+      await screen.findByText(
+        'Re-attach the file to edit this message — its contents are no longer in memory.',
+      ),
+    ).toBeTruthy();
+    expect(chatBodies).toHaveLength(0);
+    expect(
+      (stored.length ? stored : seeded!).filter((m) => m.role === 'user').map((m) => m.content),
+    ).toEqual(['is this leaf healthy?']);
+  });
+
+  it('an edit by reference whose photo is stored goes out with image_refs', async () => {
+    mediaList = ['img-aaaa-0001'];
+    seedThread([askedWithPhoto, visionAnswer]);
+    renderApp();
+    await screen.findByText('It looks healthy.');
+    await editTo('is this leaf dying?');
+    await waitFor(() => expect(chatBodies).toHaveLength(1));
+    expect(lastBody().image_refs).toEqual(['img-aaaa-0001']);
+    expect(stored.filter((m) => m.role === 'user').map((m) => m.content)).toEqual([
+      'is this leaf healthy?',
+      'is this leaf dying?',
+    ]);
+  });
+
   it('a photo sent before photos were stored says so — once, under a vision answer', async () => {
     seedThread([
       { id: 'srv-conv-1-0', role: 'user', content: 'is this leaf healthy?', createdAt: 1 },
@@ -391,5 +480,44 @@ describe('the browser that still holds an old photo', () => {
     expect(document.querySelector(`img[src="${PNG}"]`)).toBeTruthy();
     // No legacy note: this device has the photo.
     expect(screen.queryByTestId('legacy-photo-note')).toBeNull();
+  });
+});
+
+describe('the browser that holds a photo whose store was lost', () => {
+  // QA 2026-10-02: the turn already carries meta.images, so the backfill
+  // skipped it, and every other device showed "Image unavailable" for good.
+  it('re-uploads it on open under the SAME id, and changes nothing in the thread', async () => {
+    const PNG = 'data:image/png;base64,iVBORw0KGgo=';
+    mediaList = [];
+    seedThread([
+      {
+        ...askedWithPhoto,
+        imageDataUrl: PNG,
+        meta: { images: [{ attachment_id: 'img-aaaa-0001', mime: 'image/png' }] },
+      },
+      visionAnswer,
+    ]);
+    renderApp();
+    await waitFor(() => expect(mediaPosts).toHaveLength(1), { timeout: 4000 });
+    expect(mediaPosts[0].getAll('attachment_id')).toEqual(['img-aaaa-0001']);
+    expect(mediaPosts[0].get('source')).toBe('backfill');
+    expect(stored).toEqual([]);
+  });
+
+  it('uploads nothing when the server lists it', async () => {
+    const PNG = 'data:image/png;base64,iVBORw0KGgo=';
+    mediaList = ['img-aaaa-0001'];
+    seedThread([
+      {
+        ...askedWithPhoto,
+        imageDataUrl: PNG,
+        meta: { images: [{ attachment_id: 'img-aaaa-0001', mime: 'image/png' }] },
+      },
+      visionAnswer,
+    ]);
+    renderApp();
+    await waitFor(() => expect(mediaListReads).toBe(1), { timeout: 4000 });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(mediaPosts).toHaveLength(0);
   });
 });

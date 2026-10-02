@@ -348,11 +348,16 @@ const SQUARE_BOX = { width: '160px', height: '160px', maxWidth: '100%' } as cons
  *   · the URL is stable and immutable, so the browser's cache serves every
  *     later view without a request.
  *
- * A 404 or 410 becomes an "Image unavailable" tile of the same size. One
- * retry first, two seconds later: the orchestrator stores a sent photo in
- * the background, and a device that loads the chat in that instant can ask
- * a moment too early.
+ * A 404 or 410 becomes an "Image unavailable" tile of the same size — after
+ * three retries, 2, 6 and 15 seconds apart: the orchestrator stores a sent
+ * photo in the background, behind the turn, and a second device polling the
+ * chat can see the reference before the row lands. Five large photos on a
+ * busy server take longer than one two-second retry covered. Each retry has
+ * its own URL (`&retry=N`, dropped by the proxy), so no cached failure
+ * answers it.
  */
+const STORED_IMAGE_RETRY_MS = [2_000, 6_000, 15_000] as const;
+
 function StoredImage({
   messageId,
   index,
@@ -371,11 +376,11 @@ function StoredImage({
   useEffect(() => {
     if (state !== 'retrying') return;
     const timer = window.setTimeout(() => {
-      setAttempt(1);
+      setAttempt((n) => n + 1);
       setState('loading');
-    }, 2_000);
+    }, STORED_IMAGE_RETRY_MS[attempt] ?? 0);
     return () => window.clearTimeout(timer);
-  }, [state]);
+  }, [state, attempt]);
 
   const alt = `Attached image ${index + 1}`;
   const box = thumbBox(image) ?? SQUARE_BOX;
@@ -408,7 +413,7 @@ function StoredImage({
           only add a second, server-side copy of a private photo. */}
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img
-        src={attempt === 0 ? src : `${src}&retry=1`}
+        src={attempt === 0 ? src : `${src}&retry=${attempt}`}
         alt={alt}
         width={image.width}
         height={image.height}
@@ -417,7 +422,9 @@ function StoredImage({
         data-testid="stored-image"
         style={box}
         onLoad={() => setState('shown')}
-        onError={() => setState(attempt === 0 ? 'retrying' : 'failed')}
+        onError={() =>
+          setState(attempt < STORED_IMAGE_RETRY_MS.length ? 'retrying' : 'failed')
+        }
         className={`rounded-ts border border-border bg-surface-2 object-cover ${
           state === 'retrying' ? 'opacity-0' : ''
         }`}
