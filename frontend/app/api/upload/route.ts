@@ -25,13 +25,14 @@ export const dynamic = 'force-dynamic';
  * two places that decide it — a smaller cap would break uploads that work
  * today, which is the one outcome worse than no cap:
  *
- *   · datasets never chunk. ChatApp.tsx posts the whole file here as one
- *     multipart body, up to MAX_DATASET_BYTES (Composer.tsx) = 512 MiB.
- *   · documents and videos chunk past CHUNK_THRESHOLD_BYTES = 90 MiB
- *     (lib/uploadDocument.ts), and every part of a chunked session goes to
- *     /api/upload/chunked/… — a different route — at CHUNK_PART_BYTES = 64 MiB
- *     each, so the largest body that can reach THIS handler is the 512 MiB
- *     dataset, not the 4 GiB video.
+ *   · documents, videos and (since 2026-10-03, when the app dropped its size
+ *     limits, docs/chat-media/LIMITS.md) datasets chunk past
+ *     CHUNK_THRESHOLD_BYTES = 90 MiB (lib/uploadDocument.ts), and every part
+ *     of a chunked session goes to /api/upload/chunked/… — a different route —
+ *     at CHUNK_PART_BYTES = 64 MiB each. So no file of any size needs a bigger
+ *     body here than 90 MiB.
+ *   · a tab loaded before 2026-10-03 still posts a dataset whole, up to the
+ *     512 MiB it allowed then; this cap keeps admitting it.
  *
  * Plus 1 MiB for multipart framing: the boundary, the filename, and the
  * conversation_id and purpose fields that travel beside the file.

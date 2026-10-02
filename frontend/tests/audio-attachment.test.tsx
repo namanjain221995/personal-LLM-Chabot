@@ -36,6 +36,7 @@ const { ChatApp } = await import('@/components/ChatApp');
 const { Composer } = await import('@/components/Composer');
 const { Providers } = await import('@/components/Providers');
 const { clearAttachments, mediaKindFor } = await import('@/lib/attachments');
+const { MAX_DOCUMENTS } = await import('@/lib/orchestrator');
 
 const media = (name: string, type: string) =>
   new File(['\x00\x00\x00\x20ftypM4A '], name, { type });
@@ -181,7 +182,9 @@ describe('an audio attachment', () => {
     }
   });
 
-  it('takes the video cap, not the 512 MB document cap', async () => {
+  it('has no size limit in the app: 600 MB and over 4 GB both attach', async () => {
+    // Was 4 GB (2026-10-03, LIMITS.md): the server's own upload ceiling is
+    // the only size rule now, and the chunked rail carries any size.
     const input = renderComposer();
     await act(async () => {
       fireEvent.change(input, { target: { files: [sized(media('long-call.m4a', 'audio/mp4'), 600 * MB)] } });
@@ -191,8 +194,8 @@ describe('an audio attachment', () => {
     await act(async () => {
       fireEvent.change(input, { target: { files: [sized(media('huge.wav', 'audio/wav'), 4 * GB + 1)] } });
     });
-    await waitFor(() => expect(screen.getByText(/huge\.wav is .* the limit is 4 GB/)).toBeTruthy());
-    expect(screen.queryByLabelText('Remove attachment huge.wav')).toBeNull();
+    expect(chipOf('huge.wav').textContent).toContain('AUDIO');
+    expect(screen.queryByText(/the limit is|4 GB|512 MB/)).toBeNull();
   });
 
   it('is refused with the video toast when the account may not use video understanding', async () => {
@@ -289,33 +292,35 @@ describe('a file typed audio/* that is not a recording stays a document', () => 
   });
 });
 
-describe('the five-document cap says so', () => {
+describe('no document cap; only the technical ceiling speaks, and only past it', () => {
   // appendDocument used to set `refused` inside the setAttachments updater,
   // which React runs AFTER the `if (refused) toast(...)` check for every
   // file but the first of a batch: the sixth streamed file (video, audio,
-  // big PDF, archive) vanished with no message (QA, 2026-09-18).
+  // big PDF, archive) vanished with no message (QA, 2026-09-18). Since
+  // 2026-10-03 there is no product limit (LIMITS.md); 999 (MAX_DOCUMENTS) is
+  // the technical ceiling the server validates, and the only number said.
   it.each([
     ['audio', (i: number) => media(`part-${i}.mp3`, 'audio/mpeg')],
     ['video', (i: number) => media(`clip-${i}.mp4`, 'video/mp4')],
-  ])('six %s files in one pick: five chips and the toast', async (_kind, make) => {
+  ])('30 %s files in one pick: 30 chips and no word about a limit', async (_kind, make) => {
     const input = renderComposer();
-    const files = Array.from({ length: 6 }, (_, i) => make(i));
+    const files = Array.from({ length: 30 }, (_, i) => make(i));
     await act(async () => {
       fireEvent.change(input, { target: { files } });
     });
-    expect(screen.getAllByLabelText(/Remove attachment (part|clip)-/)).toHaveLength(5);
-    expect(screen.queryByLabelText(/Remove attachment (part|clip)-5\./)).toBeNull();
-    await waitFor(() => expect(screen.getByText('You can attach up to 5 documents.')).toBeTruthy());
+    expect(screen.getAllByLabelText(/Remove attachment (part|clip)-/)).toHaveLength(30);
+    expect(screen.queryByText(/can carry|up to \d+|left out/)).toBeNull();
   });
 
-  it('the cap counts across picks, and a removed chip frees its place', async () => {
+  it('past the 999 ceiling: counted across picks, said once, and a removed chip frees its place', async () => {
+    expect(MAX_DOCUMENTS).toBe(999);
     const input = renderComposer();
     await act(async () => {
       fireEvent.change(input, {
-        target: { files: Array.from({ length: 5 }, (_, i) => media(`a-${i}.m4a`, 'audio/mp4')) },
+        target: { files: Array.from({ length: 999 }, (_, i) => media(`a-${i}.m4a`, 'audio/mp4')) },
       });
     });
-    expect(screen.queryByText('You can attach up to 5 documents.')).toBeNull();
+    expect(screen.queryByText(/can carry/)).toBeNull();
     await act(async () => {
       fireEvent.click(screen.getByLabelText('Remove attachment a-0.m4a'));
     });
@@ -326,7 +331,12 @@ describe('the five-document cap says so', () => {
     });
     expect(chipOf('b-0.m4a').textContent).toContain('AUDIO');
     expect(screen.queryByLabelText('Remove attachment b-1.m4a')).toBeNull();
-    await waitFor(() => expect(screen.getByText('You can attach up to 5 documents.')).toBeTruthy());
-    expect(screen.getAllByLabelText(/Remove attachment [ab]-/)).toHaveLength(5);
-  });
+    await waitFor(() =>
+      expect(
+        screen.getByText('One message can carry 999 files — send the rest in the next message.'),
+      ).toBeTruthy(),
+    );
+    expect(screen.getAllByLabelText(/Remove attachment [ab]-/)).toHaveLength(999);
+  }, 60_000);
 });
+

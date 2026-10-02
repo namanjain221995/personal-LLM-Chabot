@@ -63,6 +63,31 @@ export interface DownscaledImage {
 }
 
 /**
+ * How many photos are decoded at once (2026-10-03). A message may carry any
+ * number of photos now (LIMITS.md), and a decoded 48 MP phone photo is about
+ * 190 MB of pixels: a hundred picked together and decoded in parallel would
+ * take the tab down. The rest wait their turn; each chip still lands as soon
+ * as its own photo is done.
+ */
+export const MAX_PARALLEL_DECODES = 3;
+let decoding = 0;
+const decodeQueue: Array<() => void> = [];
+
+async function withDecodeSlot<T>(run: () => Promise<T>): Promise<T> {
+  // A freed slot is handed straight to the next in line, so a newcomer can
+  // never slip in between and make it MAX_PARALLEL_DECODES + 1.
+  if (decoding < MAX_PARALLEL_DECODES) decoding += 1;
+  else await new Promise<void>((resolve) => decodeQueue.push(resolve));
+  try {
+    return await run();
+  } finally {
+    const next = decodeQueue.shift();
+    if (next) next();
+    else decoding -= 1;
+  }
+}
+
+/**
  * Downscale `file` so its long edge is <= maxEdge. Resolves to `null` when the
  * image already fits, when the browser lacks the APIs, or on any error — the
  * caller then sends the original bytes exactly as before.
@@ -74,6 +99,10 @@ export async function downscaleImageFile(
   if (typeof createImageBitmap !== 'function' || typeof document === 'undefined') {
     return null;
   }
+  return withDecodeSlot(() => downscaleNow(file, maxEdge));
+}
+
+async function downscaleNow(file: File, maxEdge: number): Promise<DownscaledImage | null> {
   let bitmap: ImageBitmap | null = null;
   try {
     bitmap = await createImageBitmap(file);
@@ -96,4 +125,15 @@ export async function downscaleImageFile(
   } finally {
     bitmap?.close?.();
   }
+}
+
+/**
+ * How many bytes a base64 data URL decodes to, without decoding it. The
+ * composer's photo size rule is measured on this (2026-10-03): what is sent,
+ * not what was picked.
+ */
+export function dataUrlByteLength(dataUrl: string): number {
+  const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+  const padding = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor((b64.length * 3) / 4) - padding);
 }

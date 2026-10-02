@@ -65,7 +65,7 @@ import {
   withImagesMeta,
   type Backfill,
 } from '@/lib/chatMedia';
-import { uploadDocumentFile } from '@/lib/uploadDocument';
+import { CHUNK_THRESHOLD_BYTES, uploadDocumentFile } from '@/lib/uploadDocument';
 import type { SendOptions as ComposerSendOptions } from './Composer';
 import {
   ARTIFACT_EDIT_EVENT,
@@ -1887,8 +1887,9 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
       setSelectedContext(null);
       // What names a brand-new chat when the message has no words.
       const first = attachments[0] ?? null;
-      // 2026-09-02: documents stack (up to five). ONE small document still
-      // rides inline — byte-identical wire to every conversation before it.
+      // 2026-09-02: documents stack (any number since 2026-10-03). ONE small
+      // document still rides inline — byte-identical wire to every
+      // conversation before it.
       // Several documents, or any that skipped base64 for size, upload first
       // (chunked past the Cloudflare 100 MB edge cap) and the request sends
       // REFERENCES instead.
@@ -2283,16 +2284,21 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
             }
           } else {
             try {
-              const form = new FormData();
-              form.append('file', dataset?.file as File);
-              form.append('conversation_id', conversationId);
-              const res = await fetch('/api/upload', { method: 'POST', body: form });
-              const body = (await res.json()) as {
-                detail?: string;
-                files?: number;
-                upload_id?: string;
-              };
-              if (!res.ok) throw new Error(body.detail ?? 'upload failed');
+              const file = dataset?.file as File;
+              let body: { detail?: string; files?: number; upload_id?: string };
+              if (file.size > CHUNK_THRESHOLD_BYTES) {
+                // 2026-10-03 (LIMITS.md): a dataset has no size limit in the
+                // app, so a big one takes the chunked rail like a big
+                // document: no single request past Cloudflare's 100 MB.
+                body = await uploadDocumentFile(file, conversationId, 'dataset');
+              } else {
+                const form = new FormData();
+                form.append('file', file);
+                form.append('conversation_id', conversationId);
+                const res = await fetch('/api/upload', { method: 'POST', body: form });
+                body = (await res.json()) as typeof body;
+                if (!res.ok) throw new Error(body.detail ?? 'upload failed');
+              }
               // Link the turn to the server's durable uploads row, so the
               // persisted message names the exact attachment it was asked
               // about.
@@ -3288,7 +3294,7 @@ export function ChatApp({ appName = DEFAULT_APP_NAME }: { appName?: string } = {
    * It resolves bytes down the full ladder (this tab's File, the persisted
    * image payload, then the orchestrator by upload_id), rebuilds a real `File`
    * and hands it to the composer. It does NOT bypass validation: the caps, the
-   * five-image ceiling, the PDF/dataset exclusivity and the refusals while
+   * image ceiling, the PDF/dataset exclusivity and the refusals while
    * streaming or uploading all still apply, because this goes in through the
    * same front door a picked file does.
    */

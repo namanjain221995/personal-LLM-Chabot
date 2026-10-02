@@ -989,3 +989,45 @@ Backend as built (limits, 2026-10-03):
   connection), and a follow-up that re-sends the remembered pictures pays most of it again: the
   engine runs `--no-enable-prefix-caching` (`prefix_cache_queries_total` 0); only vLLM's
   multimodal processor cache can be hit.
+
+## limits: frontend, NO limit (2026-10-03)
+
+What the browser does now (replaces the 20-per-message version of this section):
+
+- **No count limit.** `frontend/lib/orchestrator.ts` `MAX_IMAGES = MAX_DOCUMENTS = 999`, the
+  technical ceiling only (the backend's `main.MAX_IMAGES`, `chat_media.MAX_FILES`). The proxy's
+  id-list filter (`forwardableAttachmentIds`) passes 1..999 ids. The composer says nothing about
+  a number below it; only a pick past 999 is told "One message can carry 999 photos — send the
+  rest in the next message." (or "999 files"). The "You can attach up to N" toasts are gone.
+- **No size limit on what streams.** The composer's 512 MB (documents, datasets, archives) and
+  4 GB (video, audio) checks and their toasts are gone; the server's `UPLOAD_MAX_MB` is the only
+  size rule and its refusal reaches the chip in its words. Datasets used to post whole to
+  `/api/upload` (dead past Cloudflare's 100 MB): over `CHUNK_THRESHOLD_BYTES` (90 MiB) they now
+  take the chunked rail with `purpose=dataset` (`uploadDocumentFile`, `DocumentRef.files` carries
+  the profiled-table count); smaller ones post once, as before. `/api/upload`'s 513 MiB cap stays
+  for tabs loaded before this change.
+- **Photo size:** unchanged from the 20-step: measured on what is sent. A shrunk photo is accepted
+  whatever the original weighed; one the browser cannot shrink keeps the server's 10 MiB
+  stored-file rule ("<name> is 11.0 MB and this browser couldn’t make it smaller. A photo sent as
+  it is can be at most 10 MB.").
+- **Many photos, many big files, one tab:** at most 3 photos decode at once
+  (`images.MAX_PARALLEL_DECODES`: a decoded 48 MP photo is ~190 MB of pixels) and at most 2
+  chunked parts are read for their SHA-256 at once across all uploads
+  (`uploadDocument.MAX_PARALLEL_HASHES`: 64 MiB each). The composer's chip row scrolls past three
+  rows (`max-h-48`), so the box and Send stay on screen with 100 chips, phone included.
+- **By reference over the budget:** as in the 20-step (inline at or under 48 MiB of base64,
+  otherwise `POST /api/chat-media` first, then `image_refs`), but a batch is now cut by its BYTES
+  only (`MAX_MEDIA_BYTES_PER_REQUEST` = 48 MiB; `MAX_MEDIA_PER_REQUEST` = the 999 ceiling).
+- **Real browser (Chromium, built app + fake orchestrator, 2026-10-03 ~02:40 IST):** 100 photos
+  (95 noisy 2400x1800 JPEGs + five 40 MB 8000x6000 originals, 411 MB picked) became 100 chips in
+  about 11 s, no toast, chip row 192 px, box and Send in view at 1280x900 and at 390x844, no
+  horizontal scroll. The send stored them by reference and posted one ~4 KB `/chat` with 100
+  `image_refs`; the bubble showed 100 photos and the answer's code block, table and mermaid
+  diagram rendered. 50 documents (a 600 MB PDF + 49 small) and a 5 GB video attached with no
+  toast; the PDF went chunked (`init` purpose=document, 629,145,600 bytes, 10 parts, complete) and
+  `/chat` carried 50 `pdf_uploads`. A 600 MB CSV went chunked with purpose=dataset and no
+  single-shot `/api/upload`. The 100 photos (shrunk in the browser) went as two
+  `POST /chat-media`, 61 files in a 47.9 MiB body and 39 in 31.6 MiB.
+- **Not done here:** the 100-photo bubble is 160 px thumbnails, about 50 rows tall on a desktop; a
+  compact grid for many photos is a design follow-up. The model-context fit of 100 photos is the
+  backend's (smaller sizes); not exercised against the real model from the browser.

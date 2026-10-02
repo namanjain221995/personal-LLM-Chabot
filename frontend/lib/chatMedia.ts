@@ -22,11 +22,14 @@
  * Nothing here runs on the send's critical path. The bytes of a new photo
  * still travel inline in the /chat body (and the server stores them from
  * there, `image_ids`); the only thing a send gains is a few short strings in
- * meta.
+ * meta. The one exception (2026-10-03, LIMITS.md): a send whose inline photos
+ * would exceed INLINE_IMAGE_BUDGET_BYTES stores them here first and names
+ * them in `image_refs` (`storeImagesForSend`, called by startStream).
  */
 
 import type { ChatMessage, MessageImage, Meta } from './types';
 import { dataUrlToBlob, mimeFromDataUrl } from './attachments';
+import { INLINE_IMAGE_BUDGET_BYTES, MAX_IMAGES } from './orchestrator';
 import { turnFingerprint, type HeldImageRecord } from './idbCache';
 
 /** An attachment id as the server accepts it (CONTRACT §3, client-minted). */
@@ -345,8 +348,8 @@ export type MediaUploadOutcome =
   | { kind: 'refused'; status: number }
   /** 404: not this person's conversation (or not one at all). */
   | { kind: 'not_found' }
-  /** 401 / 403: the session is gone; nothing more can be done here. */
-  | { kind: 'unauthenticated' }
+  /** 401 / 403: the session is gone, or the account may not attach. */
+  | { kind: 'unauthenticated'; status: number }
   /** 507: the server is below its free-space floor. */
   | { kind: 'no_space' }
   /** Anything else the server said — try another time. */
@@ -354,11 +357,23 @@ export type MediaUploadOutcome =
   /** The request never got an answer. */
   | { kind: 'offline' };
 
-/** At most this many photos per request, the composer's and the server's cap. */
-export const MAX_MEDIA_PER_REQUEST = 5;
+/**
+ * At most this many photos per request: the 999 technical ceiling, the
+ * server's `chat_media.MAX_FILES` (2026-10-03, LIMITS.md: no limit in the
+ * app). What really cuts a batch is its bytes, MAX_MEDIA_BYTES_PER_REQUEST.
+ */
+export const MAX_MEDIA_PER_REQUEST = MAX_IMAGES;
 
 /**
- * Upload up to five photos to the conversation's media store.
+ * At most this many file bytes per request (2026-10-03): the inline budget,
+ * so one batch is never a bigger body than the /chat it replaces, and stays
+ * under the proxy's MAX_MEDIA_BODY_BYTES with its multipart framing.
+ */
+export const MAX_MEDIA_BYTES_PER_REQUEST = INLINE_IMAGE_BUDGET_BYTES;
+
+/**
+ * Upload up to MAX_MEDIA_PER_REQUEST photos to the conversation's media store
+ * in ONE request (`uploadChatMediaInBatches` splits a longer list).
  *
  * Multipart, one `file` part and one `attachment_id` part per photo in the
  * same order (the server pairs them by position and refuses a count
@@ -405,11 +420,109 @@ export async function uploadChatMedia(
     return { kind: 'refused', status: res.status };
   }
   if (res.status === 404) return { kind: 'not_found' };
-  if (res.status === 401 || res.status === 403) return { kind: 'unauthenticated' };
+  if (res.status === 401 || res.status === 403) {
+    return { kind: 'unauthenticated', status: res.status };
+  }
   if (res.status === 507) return { kind: 'no_space' };
   // The proxy answers 502 for "the orchestrator could not be reached", which
   // is the server's side, not this browser being offline.
   return { kind: 'failed', status: res.status };
+}
+
+/**
+ * `parts` in as many requests as it takes, in order: each holds at most
+ * MAX_MEDIA_PER_REQUEST photos and MAX_MEDIA_BYTES_PER_REQUEST file bytes (a
+ * single photo larger than that still goes, alone). Stops at the first
+ * request that is not stored and answers with it; otherwise every item the
+ * server returned, in order. Retrying the whole list is safe: an id the
+ * server already holds comes back unchanged.
+ */
+export async function uploadChatMediaInBatches(
+  conversationId: string,
+  parts: MediaUploadPart[],
+  source: 'upload' | 'backfill',
+  signal?: AbortSignal,
+): Promise<MediaUploadOutcome> {
+  const batches: MediaUploadPart[][] = [];
+  let batch: MediaUploadPart[] = [];
+  let bytes = 0;
+  for (const part of parts) {
+    if (
+      batch.length > 0 &&
+      (batch.length >= MAX_MEDIA_PER_REQUEST ||
+        bytes + part.blob.size > MAX_MEDIA_BYTES_PER_REQUEST)
+    ) {
+      batches.push(batch);
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(part);
+    bytes += part.blob.size;
+  }
+  if (batch.length > 0) batches.push(batch);
+  const items: StoredMediaItem[] = [];
+  for (const one of batches) {
+    const outcome = await uploadChatMedia(conversationId, one, source, signal);
+    if (outcome.kind !== 'stored') return outcome;
+    items.push(...outcome.items);
+  }
+  return { kind: 'stored', items };
+}
+
+/** The image type of raw base64, from its first bytes; '' when unknown. */
+function mimeOfBase64(base64: string): string {
+  if (base64.startsWith('/9j/')) return 'image/jpeg';
+  if (base64.startsWith('iVBORw0KGgo')) return 'image/png';
+  if (base64.startsWith('R0lGOD')) return 'image/gif';
+  if (base64.startsWith('UklGR')) return 'image/webp';
+  return '';
+}
+
+/**
+ * Should this send's photos go by reference? True when the base64 it would
+ * carry inline (`inlineBytes`: the photos plus an inline document) is over
+ * INLINE_IMAGE_BUDGET_BYTES and every photo has a well-formed id to be
+ * stored under. A conversation id the media routes refuse keeps it inline.
+ */
+export function imagesGoByReference(
+  conversationId: string,
+  images: readonly string[] | null | undefined,
+  imageIds: readonly string[] | null | undefined,
+  inlineBytes: number,
+): boolean {
+  if (!images?.length || inlineBytes <= INLINE_IMAGE_BUDGET_BYTES) return false;
+  if (imageIds?.length !== images.length || !imageIds.every(isAttachmentId)) return false;
+  return CONVERSATION_ID.test(conversationId) && !RESERVED_CONVERSATION.test(conversationId);
+}
+
+/**
+ * Store a send's inline photos BEFORE the /chat request, so it can name them
+ * in `image_refs` instead of carrying them (2026-10-03, LIMITS.md "No
+ * request-size wall"). `images` is raw base64 and `imageIds`, index for
+ * index, the ids `meta.images` already names, so the turn's references are
+ * the same whichever way the bytes travel. The same photo twice is stored
+ * once. source=upload; idempotent like every upload here.
+ */
+export async function storeImagesForSend(
+  conversationId: string,
+  images: readonly string[],
+  imageIds: readonly string[],
+  signal?: AbortSignal,
+): Promise<MediaUploadOutcome> {
+  const parts: MediaUploadPart[] = [];
+  const seen = new Set<string>();
+  images.forEach((base64, i) => {
+    const attachmentId = imageIds[i];
+    if (seen.has(attachmentId)) return;
+    seen.add(attachmentId);
+    const mime = mimeOfBase64(base64);
+    const blob = dataUrlToBlob(`data:${mime || 'application/octet-stream'};base64,${base64}`);
+    if (!blob) return;
+    const ext = EXTENSION_BY_MIME[mime] ?? 'img';
+    parts.push({ attachmentId, blob, name: `image-${i + 1}.${ext}` });
+  });
+  if (parts.length !== seen.size) return { kind: 'refused', status: 400 };
+  return uploadChatMediaInBatches(conversationId, parts, 'upload', signal);
 }
 
 /* ------------------------------------------------------------ the backfill
@@ -613,7 +726,7 @@ export function withBackfilledImages(
  * `request` is cheap and idempotent; call it whenever a chat is opened.
  */
 export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
-  const upload = deps.upload ?? uploadChatMedia;
+  const upload = deps.upload ?? uploadChatMediaInBatches;
   const list = deps.list ?? storedAttachmentIds;
   const now = deps.now ?? Date.now;
   const mintId = deps.attachmentId ?? backfillAttachmentId;
@@ -689,7 +802,7 @@ export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
       const held = local.get(index);
       if (!held) return;
       const { urls: dataUrls, bound } = heldFor(held, m);
-      if (dataUrls.length === 0 || dataUrls.length > MAX_MEDIA_PER_REQUEST) return;
+      if (dataUrls.length === 0 || dataUrls.length > MAX_IMAGES) return;
       if (!dataUrls.every((url) => typeof url === 'string' && url.startsWith('data:'))) return;
       // Written for another turn that once sat at this index: never this one's.
       if (bound === 'other') return;

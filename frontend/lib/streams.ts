@@ -28,6 +28,7 @@ import type { ChatPrefs } from './prefs';
 import { copyForCategory, toClientError } from './errorTypes';
 import { withoutFailedAttempt } from './regenerate';
 import { foldStreamState, mergeStep, readChatStream } from './sse';
+import { imagesGoByReference, storeImagesForSend } from './chatMedia';
 import type {
   BranchMeta,
   ChatMessage,
@@ -1117,7 +1118,11 @@ export interface StartStreamOptions {
    */
   announceBranch?: boolean;
   prefs: ChatPrefs;
-  /** 2026-08-05: up to 5 attached images (base64, no data: prefix). */
+  /**
+   * 2026-08-05: the attached images (base64, no data: prefix), any number
+   * since 2026-10-03. Over INLINE_IMAGE_BUDGET_BYTES they are stored first
+   * and sent as `image_refs` — see startStream.
+   */
   images?: string[] | null;
   /**
    * 2026-10-02 (chat media): the attachment ids of `images`, index for
@@ -1146,7 +1151,7 @@ export interface StartStreamOptions {
    * 2026-09-02: documents that STREAMED to /api/upload (purpose=document)
    * instead of riding inline — 512 MB of base64 through this JSON body would
    * kill the tab and both servers. The orchestrator reads the stored bytes
-   * by reference; up to five per message.
+   * by reference; any number per message (2026-10-03).
    */
   pdfUploads?: { upload_id: string; name: string }[] | null;
   /**
@@ -1253,7 +1258,42 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
   // Did the orchestrator accept the request? Decides whether a failure below
   // is "unreachable" (retry) or "interrupted" (re-join) — see markInterrupted.
   let connected = false;
+  // What this send carries for its photos. Inline bytes as a rule; refs when
+  // the caller names stored photos, or when the bytes would push the body
+  // past INLINE_IMAGE_BUDGET_BYTES (2026-10-03, docs/chat-media/LIMITS.md):
+  // Cloudflare refuses a body over 100 MB, and a message may carry any
+  // number of photos. Then the photos are stored first, under
+  // the ids `meta.images` already names, and the request names them instead.
+  // `meta.images` is the caller's and is not touched here.
+  let images = opts.images ?? null;
+  let imageIds = opts.imageIds ?? null;
+  let imageRefs = opts.imageRefs ?? null;
   try {
+    const inlineBytes =
+      (images ?? []).reduce((n, b64) => n + b64.length, 0) + (opts.pdf?.length ?? 0);
+    if (!imageRefs?.length && imagesGoByReference(conversationId, images, imageIds, inlineBytes)) {
+      const stored = await storeImagesForSend(
+        conversationId,
+        images as string[],
+        imageIds as string[],
+        s.controller.signal,
+      );
+      // Stop pressed while the photos were going up: the same as a stop
+      // before the first byte of an answer.
+      if (s.controller.signal.aborted) {
+        throw new DOMException('The send was stopped.', 'AbortError');
+      }
+      if (stored.kind !== 'stored') {
+        if (stored.kind === 'offline') markUnreachable(s, null, 'NETWORK_ERROR');
+        else if (stored.kind === 'no_space') markUnreachable(s, 507);
+        else if (stored.kind === 'not_found') markUnreachable(s, 404);
+        else markUnreachable(s, stored.status);
+        return;
+      }
+      imageRefs = imageIds;
+      images = null;
+      imageIds = null;
+    }
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1282,17 +1322,16 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
         deep_research: prefs.deepResearch,
         // The single-image spelling stays for the proxy's v1 contract; the
         // full list rides alongside when more than one image is attached.
-        ...(opts.images?.length ? { image: opts.images[0] } : {}),
-        ...(opts.images && opts.images.length > 1
-          ? { images: opts.images }
-          : {}),
+        ...(images?.length ? { image: images[0] } : {}),
+        ...(images && images.length > 1 ? { images } : {}),
         // Chat media: which stored id each inline photo is kept under, and
-        // the stored photos a resend names instead of sending bytes. Both
-        // only when present, so every other send keeps its exact key set.
-        ...(opts.images?.length && opts.imageIds?.length === opts.images.length
-          ? { image_ids: opts.imageIds }
+        // the stored photos a resend (or an over-budget send) names instead
+        // of sending bytes. Both only when present, so every other send keeps
+        // its exact key set.
+        ...(images?.length && imageIds?.length === images.length
+          ? { image_ids: imageIds }
           : {}),
-        ...(opts.imageRefs?.length ? { image_refs: opts.imageRefs } : {}),
+        ...(imageRefs?.length ? { image_refs: imageRefs } : {}),
         ...(opts.pdf
           ? { pdf: opts.pdf, pdf_filename: opts.pdfName ?? undefined }
           : {}),
@@ -1315,7 +1354,7 @@ export async function startStream(opts: StartStreamOptions): Promise<void> {
       signal: s.controller.signal,
     });
     if (!res.ok || !res.body) {
-      if (res.status === 422 && opts.imageRefs?.length) {
+      if (res.status === 422 && imageRefs?.length) {
         const refusal = await readRefusal(res);
         if (refusal.code === 'image_ref_missing') {
           withdrawSend(s, conversationId);

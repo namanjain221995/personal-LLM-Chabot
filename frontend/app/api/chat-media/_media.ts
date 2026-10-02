@@ -23,9 +23,14 @@ export const SAFE_ATTACHMENT = /^[A-Za-z0-9_-]{8,64}$/;
 
 /**
  * The largest upload body this proxy carries, 64 MiB (CONTRACT §4.1 — the
- * orchestrator's `body_cap_for` entry is the same number). Five photos at the
- * composer's 10 MiB each is 50 MiB of bytes; the rest is multipart framing
- * with room to spare. Counted as the bytes pass, never by holding them.
+ * orchestrator's `body_cap_for` entry is the same number). Since 2026-10-03
+ * (LIMITS.md) the browser splits an upload into requests of at most
+ * MAX_MEDIA_BYTES_PER_REQUEST (= INLINE_IMAGE_BUDGET_BYTES, 48 MiB) of file
+ * bytes (lib/chatMedia.ts uploadChatMediaInBatches), however many photos
+ * the message carries, and the framing of up to 999 parts; the rest
+ * is multipart framing with room to spare. A single photo larger than a batch
+ * cannot exist: the server stores at most 10 MiB each. Counted as the bytes
+ * pass, never by holding them.
  */
 export const MAX_MEDIA_BODY_BYTES = 64 * 1024 * 1024;
 

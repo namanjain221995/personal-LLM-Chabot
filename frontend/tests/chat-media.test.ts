@@ -21,20 +21,27 @@ import {
   chatMediaUrl,
   createBackfill,
   fetchChatMediaBlob,
+  imagesGoByReference,
   imagesMetaFor,
+  MAX_MEDIA_BYTES_PER_REQUEST,
+  MAX_MEDIA_PER_REQUEST,
   legacyPhotoNoteId,
   REPAIR_GRACE_MS,
   showsLegacyPhotoNote,
   storedAttachmentIds,
   storedImagesOf,
   thumbBox,
+  storeImagesForSend,
   uploadChatMedia,
+  uploadChatMediaInBatches,
   withBackfilledImages,
   withImagesMeta,
   type BackfillHost,
   type MediaUploadOutcome,
 } from '@/lib/chatMedia';
 import { turnFingerprint } from '@/lib/idbCache';
+import { INLINE_IMAGE_BUDGET_BYTES, MAX_IMAGES } from '@/lib/orchestrator';
+import { MAX_MEDIA_BODY_BYTES } from '@/app/api/chat-media/_media';
 import type { ChatMessage } from '@/lib/types';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -277,6 +284,104 @@ describe('uploadChatMedia', () => {
       }),
     );
     expect((await uploadChatMedia(CONV, [], 'backfill')).kind).toBe('offline');
+  });
+});
+
+describe('uploads in batches under the budget (2026-10-03, LIMITS.md)', () => {
+  /** A blob that claims `size` bytes without allocating them. */
+  const sized = (size: number) => {
+    const blob = new Blob(['x'], { type: 'image/png' });
+    Object.defineProperty(blob, 'size', { value: size });
+    return blob;
+  };
+  const part = (i: number, size: number) => ({
+    attachmentId: `img-limit-${String(i).padStart(4, '0')}`,
+    blob: sized(size),
+    name: `image-${i}.png`,
+  });
+  function stubStore() {
+    const forms: FormData[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        const form = init?.body as FormData;
+        forms.push(form);
+        return Response.json({
+          items: (form.getAll('attachment_id') as string[]).map((attachment_id) => ({ attachment_id })),
+        });
+      }),
+    );
+    return forms;
+  }
+
+  it('a batch is cut by its bytes, and by the 999 ceiling only past that', async () => {
+    // No count limit in the app: 999 is the technical ceiling, the server's
+    // chat_media.MAX_FILES too. Bytes are what bound one request.
+    expect(MAX_MEDIA_PER_REQUEST).toBe(MAX_IMAGES);
+    expect(MAX_IMAGES).toBe(999);
+    expect(MAX_MEDIA_BYTES_PER_REQUEST).toBe(INLINE_IMAGE_BUDGET_BYTES);
+    const forms = stubStore();
+    const small = Array.from({ length: 1001 }, (_, i) => part(i, 1024));
+    const out = await uploadChatMediaInBatches(CONV, small, 'upload');
+    expect(out.kind).toBe('stored');
+    expect(forms.map((f) => f.getAll('file').length)).toEqual([999, 2]);
+    expect(out.kind === 'stored' && out.items.map((i) => i.attachment_id)).toEqual(
+      small.map((p) => p.attachmentId),
+    );
+
+    forms.length = 0;
+    const tenMiB = 10 * 1024 * 1024;
+    // 4 × 10 MiB = 40 MiB fits; the fifth would make 50 MiB > 48 MiB.
+    await uploadChatMediaInBatches(CONV, Array.from({ length: 7 }, (_, i) => part(i, tenMiB)), 'upload');
+    expect(forms.map((f) => f.getAll('file').length)).toEqual([4, 3]);
+  });
+
+  it('stops at the first request that is not stored and answers with it', async () => {
+    let calls = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        calls += 1;
+        return calls === 1 ? Response.json({ items: [] }) : Response.json({}, { status: 507 });
+      }),
+    );
+    const parts = Array.from({ length: 11 }, (_, i) => part(i, 10 * 1024 * 1024));
+    expect((await uploadChatMediaInBatches(CONV, parts, 'upload')).kind).toBe('no_space');
+    expect(calls).toBe(2);
+  });
+
+  it('every batch fits the proxy (and the orchestrator) body cap with its framing', () => {
+    expect(MAX_MEDIA_BYTES_PER_REQUEST + 1024 * 1024).toBeLessThanOrEqual(MAX_MEDIA_BODY_BYTES);
+  });
+
+  it('decides by the inline bytes, and only for photos with ids in a real chat', () => {
+    const ids = ['img-limit-0001', 'img-limit-0002'];
+    const over = INLINE_IMAGE_BUDGET_BYTES + 1;
+    expect(imagesGoByReference(CONV, ['AAAA', 'BBBB'], ids, INLINE_IMAGE_BUDGET_BYTES)).toBe(false);
+    expect(imagesGoByReference(CONV, ['AAAA', 'BBBB'], ids, over)).toBe(true);
+    // No ids that pair with the bytes: nothing to name them by, so inline.
+    expect(imagesGoByReference(CONV, ['AAAA', 'BBBB'], ids.slice(0, 1), over)).toBe(false);
+    expect(imagesGoByReference(CONV, ['AAAA'], ['short'], over)).toBe(false);
+    // A bare /chat session key is never a media conversation (F034).
+    expect(imagesGoByReference('u7-abc', ['AAAA', 'BBBB'], ids, over)).toBe(false);
+    expect(imagesGoByReference(CONV, [], [], over)).toBe(false);
+  });
+
+  it('stores a send\'s base64 under its ids, with the real type, the same photo once', async () => {
+    const forms = stubStore();
+    const png = 'iVBORw0KGgoAAAANSUhEUg==';
+    const jpeg = '/9j/4AAQSkZJRgABAQ==';
+    const out = await storeImagesForSend(
+      CONV,
+      [png, jpeg, png],
+      ['img-limit-0001', 'img-limit-0002', 'img-limit-0001'],
+    );
+    expect(out.kind).toBe('stored');
+    const files = forms[0].getAll('file') as File[];
+    expect(forms[0].getAll('attachment_id')).toEqual(['img-limit-0001', 'img-limit-0002']);
+    expect(files.map((f) => f.type)).toEqual(['image/png', 'image/jpeg']);
+    expect(files.map((f) => f.name)).toEqual(['image-1.png', 'image-2.jpg']);
+    expect(forms[0].get('source')).toBe('upload');
   });
 });
 

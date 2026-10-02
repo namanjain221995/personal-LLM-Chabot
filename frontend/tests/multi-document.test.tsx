@@ -330,16 +330,15 @@ describe('documents stack', () => {
     expect(labels.join(' ')).toContain('b.pdf');
   });
 
-  it('a burst of six caps silently at five; the NEXT attempt gets the message', async () => {
+  it('a burst of 25 is kept whole, and a later one joins it, with no word of a limit', async () => {
     renderApp();
-    // One drop of six: FileReader resolves them concurrently, so the cap is
-    // applied inside the state update (silently, like images always have).
-    dropFiles(...[1, 2, 3, 4, 5, 6].map((i) => pdf(`d${i}.pdf`)));
-    await waitFor(() => expect(chips().length).toBe(5));
-    // A deliberate seventh, attached once the five are settled, is told why.
-    dropFiles(pdf('d7.pdf'));
-    expect(await screen.findByText(/up to 5 documents/i)).toBeTruthy();
-    expect(chips().length).toBe(5);
+    // No limit since 2026-10-03 (LIMITS.md, was 5). One drop of 25:
+    // FileReader resolves them concurrently, and every one lands.
+    dropFiles(...Array.from({ length: 25 }, (_, i) => pdf(`d${i + 1}.pdf`)));
+    await waitFor(() => expect(chips().length).toBe(25));
+    dropFiles(pdf('d26.pdf'));
+    await waitFor(() => expect(chips().length).toBe(26));
+    expect(screen.queryByText(/up to \d+ documents|can carry/i)).toBeNull();
   });
 });
 

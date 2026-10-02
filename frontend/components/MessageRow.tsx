@@ -868,7 +868,7 @@ function MessageRowImpl({
         <div className={editing ? 'w-full' : 'max-w-[85%] sm:max-w-[70%]'}>
           {localUrls.length > 0 ? (
             <div className="mb-1.5 flex flex-wrap justify-end gap-1.5">
-              {/* 2026-08-05: up to 5 images per turn — `imageDataUrls` when
+              {/* 2026-08-05: several images per turn (any number since 2026-10-03) — `imageDataUrls` when
                   several, the legacy single `imageDataUrl` otherwise.
                   data: URL previews — next/image can't optimize these. */}
               {localUrls.map((url, i) => {

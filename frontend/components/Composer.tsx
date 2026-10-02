@@ -25,7 +25,8 @@ import {
   type ReactNode,
 } from 'react';
 import type { ChatPrefs } from '@/lib/prefs';
-import { downscaleImageFile } from '@/lib/images';
+import { dataUrlByteLength, downscaleImageFile } from '@/lib/images';
+import { MAX_DOCUMENTS, MAX_IMAGES } from '@/lib/orchestrator';
 import { measureDataUrl } from '@/lib/chatMedia';
 import {
   applySlashCommand,
@@ -70,12 +71,22 @@ import {
   IconPlay,
 } from './icons';
 
+/**
+ * The size rule for a photo, on the bytes that are SENT (2026-10-03,
+ * docs/chat-media/LIMITS.md). A photo the browser shrinks to MAX_IMAGE_EDGE
+ * is accepted whatever its original size; only one it cannot shrink (a HEIC
+ * in desktop Chrome, a huge GIF that already fits) is held to this, the
+ * server's chat_media.MAX_IMAGE_BYTES.
+ */
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-/** Up to 5 images per message (owner request 2026-08-05); the orchestrator
-    enforces the same ceiling (MAX_IMAGES in main.py). */
-const MAX_IMAGES = 5;
-//: Documents per message (2026-09-02) — matches the server's reference cap.
-const MAX_DOCS = 5;
+/** Photos and documents per message: no limit (owner, 2026-10-03, LIMITS.md;
+    was 5). MAX_IMAGES and MAX_DOCUMENTS (lib/orchestrator.ts) are only the
+    999 technical ceiling the server validates against; nobody is told of it
+    until a pick goes past it. */
+const MAX_DOCS = MAX_DOCUMENTS;
+/** The only words about a count, said only past the ceiling. */
+const CEILING_PHOTOS = `One message can carry ${MAX_IMAGES} photos — send the rest in the next message.`;
+const CEILING_FILES = `One message can carry ${MAX_DOCS} files — send the rest in the next message.`;
 const LINE_HEIGHT = 24;
 const MAX_ROWS = 10;
 /**
@@ -168,7 +179,7 @@ export interface ComposerHandle {
    *
    * This is deliberately the WHOLE entry point, not a "validate these for me"
    * helper: it runs the same type and extension checks, the same size caps,
-   * the same five-image ceiling, the same PDF/dataset exclusivity and the same
+   * the same MAX_IMAGES ceiling, the same PDF/dataset exclusivity and the same
    * toasts as the "+" menu, because it IS the code the "+" menu runs. A second
    * upload route may not come with a second rulebook — that is how the two
    * paths drift until one of them accepts a file the other refuses.
@@ -268,21 +279,19 @@ export interface SendOptions {
   prefs?: ChatPrefs;
 }
 
-// 2026-09-02: 512 MB, ChatGPT-class. Small documents still ride inline as
-// base64 (one FileReader pass, zero extra round trips); anything above
-// INLINE_DOC_BYTES keeps its File handle and STREAMS to /api/upload on send,
-// exactly like a dataset — reading half a gigabyte with readAsDataURL would
-// hold ~700 MB of string in the tab before the first byte left it.
-const MAX_PDF_BYTES = 512 * 1024 * 1024;
+// 2026-09-02: small documents still ride inline as base64 (one FileReader
+// pass, zero extra round trips); anything above INLINE_DOC_BYTES keeps its
+// File handle and STREAMS to /api/upload on send, exactly like a dataset —
+// reading half a gigabyte with readAsDataURL would hold ~700 MB of string in
+// the tab before the first byte left it.
+//
+// 2026-10-03 (docs/chat-media/LIMITS.md, owner: "no limit"): the composer has
+// NO size rule for a document, dataset, archive, video or audio file (they
+// were 512 MB and 4 GB). The server's own UPLOAD_MAX_MB is the only one, and
+// its refusal reaches the chip in its own words. Big files take the chunked
+// rail (lib/uploadDocument.ts), so no single request crosses Cloudflare's
+// 100 MB edge cap.
 const INLINE_DOC_BYTES = 25 * 1024 * 1024;
-// Datasets are streamed to their own endpoint, not base64'd into the chat
-// body, so they can be far larger than an image or PDF.
-const MAX_DATASET_BYTES = 512 * 1024 * 1024;
-// 2026-09-09: a video streams by reference like a big document (chunked past
-// 90 MB); the server's own cap is VIDEO_MAX_UPLOAD_MB. Four hours of 1080p
-// screen recording is well under this. Audio shares it (B12): it is the same
-// upload to the same job.
-const MAX_VIDEO_BYTES = 4 * 1024 * 1024 * 1024;
 const DATASET_SUFFIXES = [
   '.zip', '.tar', '.tar.gz', '.tgz', '.csv', '.tsv', '.parquet',
   '.xlsx', '.json', '.jsonl', '.ndjson',
@@ -830,7 +839,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         list.filter((a) => a.kind === 'pdf' || a.kind === 'video').length;
       const accepted = acceptedRef.current.filter((a) => a.kind !== 'dataset');
       if (streamed(accepted) >= MAX_DOCS) {
-        toast(`You can attach up to ${MAX_DOCS} documents.`, 'error');
+        toast(CEILING_FILES, 'error');
         return;
       }
       acceptedRef.current = [...accepted, att];
@@ -880,22 +889,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       // is ALSO a document now ("upload anything"): the server reads text
       // honestly and names binaries instead of rejecting them at the door.
       const isOtherDoc = !isImage && !isPdf && !isVideo && !isArchive && !isDataset;
-      const limit = isImage
-        ? MAX_IMAGE_BYTES
-        : isVideo
-          ? MAX_VIDEO_BYTES
-          : isDataset
-            ? MAX_DATASET_BYTES
-            : MAX_PDF_BYTES;
-      if (file.size > limit) {
-        const mb = (file.size / (1024 * 1024)).toFixed(1);
-        const cap = isImage ? '10 MB' : isVideo ? '4 GB' : '512 MB';
-        toast(
-          `${file.name || 'That file'} is ${mb} MB — the limit is ${cap}.`,
-          'error',
-        );
-        return;
-      }
+      // No size check here (2026-10-03, LIMITS.md). A photo is measured
+      // AFTER the browser shrinks it (below), on the bytes actually sent: a
+      // 30 MB phone photo is a few hundred KB at MAX_IMAGE_EDGE. Everything
+      // else streams, and only the server's own size rule applies to it.
+      const isPhoto = isImage && !isPdf;
       if (isVideo) {
         // File handle only; streamed (chunked) on attach or on send. Never
         // read into memory — a two-hour recording is gigabytes.
@@ -926,9 +924,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         return;
       }
       if (isDataset) {
-        // Never read a 512 MB archive into memory: keep the File handle and
-        // stream it to /api/upload when the message is sent. A dataset (like
-        // a PDF) stands alone — it replaces whatever was attached.
+        // Never read a dataset into memory, whatever its size: keep the File
+        // handle and stream it to /api/upload when the message is sent. A
+        // dataset (like a PDF) stands alone — it replaces whatever was
+        // attached.
         const dataset: Attachment = {
           clientId: newClientId(),
           attachment_id: newAttachmentId(),
@@ -962,14 +961,14 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         !isPdf &&
         attachments.filter((a) => a.kind === 'image').length >= MAX_IMAGES
       ) {
-        toast(`You can attach up to ${MAX_IMAGES} images.`, 'error');
+        toast(CEILING_PHOTOS, 'error');
         return;
       }
       if (
         isPdf &&
         attachments.filter((a) => a.kind === 'pdf').length >= MAX_DOCS
       ) {
-        toast(`You can attach up to ${MAX_DOCS} documents.`, 'error');
+        toast(CEILING_FILES, 'error');
         return;
       }
       const name =
@@ -1027,17 +1026,44 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       // the attachment is counted as pending until it lands: `submit()` and
       // the Send button wait for it instead of posting the message without
       // the image (the classic Ctrl+V-then-Enter race).
+      //
+      // 2026-10-03: the photo size rule applies HERE, to what would be sent.
+      // A shrunk photo is accepted whatever the original weighed; one the
+      // browser cannot shrink (it cannot decode it, or it already fits in
+      // MAX_IMAGE_EDGE) is sent as it is, so it keeps MAX_IMAGE_BYTES, and is
+      // refused before a byte of it is read.
+      const tooBig = (bytes: number, shrunk: boolean) => {
+        const mb = (bytes / (1024 * 1024)).toFixed(1);
+        const label = file.name || 'That photo';
+        toast(
+          shrunk
+            ? `${label} is still ${mb} MB after shrinking, and a photo can be at most 10 MB.`
+            : `${label} is ${mb} MB and this browser couldn’t make it smaller. A photo sent as it is can be at most 10 MB.`,
+          'error',
+        );
+      };
       setPendingAttach((n) => n + 1);
       void (async () => {
         try {
           const scaled = isPdf ? null : await downscaleImageFile(file);
           if (scaled) {
+            const sent = dataUrlByteLength(scaled.dataUrl);
+            if (sent > MAX_IMAGE_BYTES) {
+              tooBig(sent, true);
+              return;
+            }
             attach(scaled.dataUrl, { width: scaled.width, height: scaled.height });
+          } else if (isPhoto && file.size > MAX_IMAGE_BYTES) {
+            tooBig(file.size, false);
           } else {
             attach(await readOriginal());
           }
         } catch {
           try {
+            if (isPhoto && file.size > MAX_IMAGE_BYTES) {
+              tooBig(file.size, false);
+              return;
+            }
             attach(await readOriginal());
           } catch {
             /* unreadable file: nothing to attach, exactly as before */
@@ -1059,7 +1085,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
      * The image room is counted HERE, synchronously, rather than inside
      * `handleFile`: that function's own cap check reads `attachments`, which
      * does not update until the whole batch has been dispatched, so a
-     * six-image drop would otherwise sail past a five-image limit.
+     * drop past the MAX_IMAGES ceiling would otherwise sail through it.
      */
     function acceptFiles(incoming: File[]) {
       if (!incoming.length) return;
@@ -1097,7 +1123,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
       }
       if (dropped > 0) {
         toast(
-          `You can attach up to ${MAX_IMAGES} images — ${dropped} ${dropped === 1 ? 'file was' : 'files were'} left out.`,
+          `${dropped} ${dropped === 1 ? 'photo was' : 'photos were'} left out. ${CEILING_PHOTOS}`,
           'error',
         );
       }
@@ -1152,7 +1178,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
             </div>
           )}
           {attachments.length > 0 && (
-            <div className="mb-2 flex flex-wrap items-start gap-2">
+            // Any number of files may be attached (2026-10-03): past three
+            // rows the chips scroll in place, so the box and Send stay on
+            // screen even on a phone.
+            <div className="mb-2 flex max-h-48 flex-wrap items-start gap-2 overflow-y-auto">
               {attachments.map((attachment) => (
                 <div
                   key={attachment.clientId}

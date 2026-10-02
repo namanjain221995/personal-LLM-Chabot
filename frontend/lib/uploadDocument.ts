@@ -9,8 +9,9 @@
  *
  * Cloudflare's edge caps a single request body at 100 MB on this plan, so a
  * file bigger than CHUNK_THRESHOLD_BYTES is sliced into CHUNK_PART_BYTES
- * pieces and reassembled server-side — that is what makes a 512 MB upload
- * work on ai.techsarasolutions.com and not just on the LAN.
+ * pieces and reassembled server-side — that is what makes a file of any size
+ * (no app limit since 2026-10-03, only the server's UPLOAD_MAX_MB) work on
+ * ai.techsarasolutions.com and not just on the LAN.
  *
  * WHAT 2026-09-10 ADDED, AND WHY.
  *
@@ -51,7 +52,9 @@ const RETRY_CAP_MS = 8000;
  */
 const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 
-export type UploadPurpose = 'document' | 'video';
+/** `dataset` since 2026-10-03: a dataset over CHUNK_THRESHOLD_BYTES takes
+    this rail too (it has no size limit any more, LIMITS.md). */
+export type UploadPurpose = 'document' | 'video' | 'dataset';
 
 /**
  * The three upload states this client can OBSERVE. They are the same words
@@ -88,6 +91,8 @@ export interface DocumentRef {
   /** What the server stored, when it says so; the file's own size otherwise.
       A re-selected file is checked against this before a resume sends a byte. */
   bytes: number;
+  /** A dataset only: how many tables the server profiled. */
+  files?: number;
 }
 
 export interface UploadOptions {
@@ -140,6 +145,7 @@ interface UploadBody {
   upload_id?: unknown;
   filename?: unknown;
   bytes?: unknown;
+  files?: unknown;
 }
 
 /** `GET /uploads/chunked/{conv}/{id}` — what the server already has. */
@@ -340,11 +346,17 @@ function refFrom(body: UploadBody, file: { name: string; size: number }): Docume
     upload_id: asString(body.upload_id),
     name: asString(body.filename, file.name) || file.name,
     bytes: asNumber(body.bytes, file.size),
+    ...(typeof body.files === 'number' ? { files: body.files } : {}),
   };
 }
 
 const chunkedBase = (conversationId: string, uploadId: string) =>
   `/api/upload/chunked/${encodeURIComponent(conversationId)}/${encodeURIComponent(uploadId)}`;
+
+/** Parts being read for their hash right now, in this tab (see partHash). */
+export const MAX_PARALLEL_HASHES = 2;
+let hashing = 0;
+const hashQueue: Array<() => void> = [];
 
 /**
  * The SHA-256 of one part, as the server will recompute it.
@@ -353,11 +365,28 @@ const chunkedBase = (conversationId: string, uploadId: string) =>
  * address that is not localhost — so the header is OMITTED there rather than
  * failing the upload: the server treats `X-Part-SHA256` as optional and only
  * checks what it is given. The part is read into memory to hash it, which is
- * why parts are hashed one at a time and never the whole file.
+ * why parts are hashed one at a time and never the whole file — and, since a
+ * message may carry any number of big files (2026-10-03, LIMITS.md), at most
+ * MAX_PARALLEL_HASHES parts across ALL uploads in this tab: fifty 64 MiB
+ * parts read at once would be 3 GB of memory.
  */
 async function partHash(part: Blob): Promise<string | null> {
   const subtle = globalThis.crypto?.subtle;
   if (!subtle || typeof part.arrayBuffer !== 'function') return null;
+  if (hashing < MAX_PARALLEL_HASHES) hashing += 1;
+  else await new Promise<void>((resolve) => hashQueue.push(resolve));
+  try {
+    return await hashNow(subtle, part);
+  } finally {
+    // The slot goes straight to the next in line, never back to the pool
+    // first, so nothing can slip in between.
+    const next = hashQueue.shift();
+    if (next) next();
+    else hashing -= 1;
+  }
+}
+
+async function hashNow(subtle: SubtleCrypto, part: Blob): Promise<string | null> {
   try {
     const digest = await subtle.digest('SHA-256', await part.arrayBuffer());
     return Array.from(new Uint8Array(digest))
