@@ -533,22 +533,31 @@ async def _finalise_dataset(
         # run on the event loop, a legitimate 100k-row .xlsx held every user's
         # stream for ~8.5 s (dataset review, 2026-09-19). They run in a thread.
         lower = filename.lower()
-        if archive.is_zip_container(raw_path) and not lower.endswith(".xlsx"):
-            plan = archive.extract(raw_path, extract_dir)
-        elif lower.endswith((".tar", ".tar.gz", ".tgz")) or (
-            archive.sniff_format(raw_path) == "gzip"
-        ):
-            plan = archive.extract(raw_path, extract_dir)
-        else:
-            # A single data file. An .xlsx IS a zip container, so it faces the
-            # same bomb/member caps HERE — before it is stored or read — and a
-            # hostile one is rejected outright rather than quietly skipped
-            # during profiling.
-            if archive.is_zip_container(raw_path):
-                archive.check_zip_container(raw_path, label="spreadsheet")
-            os.makedirs(extract_dir, exist_ok=True)
-            shutil.copy2(raw_path, os.path.join(extract_dir, filename))
-            plan = None
+        try:
+            if archive.is_zip_container(raw_path) and not lower.endswith(".xlsx"):
+                plan = archive.extract(raw_path, extract_dir)
+            elif lower.endswith((".tar", ".tar.gz", ".tgz")) or (
+                archive.sniff_format(raw_path) == "gzip"
+            ):
+                plan = archive.extract(raw_path, extract_dir)
+            else:
+                # A single data file. An .xlsx IS a zip container, so it faces
+                # the same bomb/member caps HERE — before it is read — and a
+                # hostile one is rejected outright rather than quietly skipped
+                # during profiling.
+                if archive.is_zip_container(raw_path):
+                    archive.check_zip_container(raw_path, label="spreadsheet")
+                os.makedirs(extract_dir, exist_ok=True)
+                shutil.copy2(raw_path, os.path.join(extract_dir, filename))
+                plan = None
+        except archive.ArchiveTooLarge as exc:
+            # Past a READING cap (parts, expanded bytes, one part's
+            # expansion), not hostile: the file is kept whole and
+            # downloadable and only profiling is skipped. It was deleted
+            # with a 400 that stated a limit (QA 2026-10-03, LIMITS.md).
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            notes.append(f"stored whole but not profiled: {exc.reason}")
+            return None, [], 0
 
         files = sum(len(names) for _dir, _sub, names in os.walk(extract_dir))
         return plan, profiler.profile_directory(extract_dir), files

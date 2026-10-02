@@ -111,6 +111,38 @@ def test_one_post_of_999_pictures_is_bounded_by_bytes_not_count():
     assert chat_media._FORM_MAX_FIELDS > chat_media.MAX_FILES
 
 
+def test_one_post_is_bounded_by_the_pixels_it_makes_the_server_decode(login_client, monkeypatch, tmp_path):
+    """QA 2026-10-03: 999 small-on-the-wire 16 MP PNGs fit one POST's bytes
+    and took 175-231 s to verify, past Cloudflare's 125 s. A POST's pictures
+    are now also bounded by the pixels their headers claim, refused before
+    any is decoded, at a budget the browser's fullest batch never reaches."""
+    assert chat_media.MAX_FILES * 1600 * 1600 < chat_media.MAX_REQUEST_PIXELS
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    monkeypatch.setattr(chat_media, "MAX_REQUEST_PIXELS", 3 * 4000 * 4000)
+    alice = login_client("alice")
+    assert alice.post("/history/conversations", json={"id": "conv-px", "title": "x"}).status_code == 200
+    out = io.BytesIO()
+    Image.new("RGB", (4000, 4000), (40, 90, 160)).save(out, format="PNG")
+    flat = out.getvalue()  # 16 MP, a few KB on the wire
+    decoded = []
+    real_inspect = chat_media.inspect
+    monkeypatch.setattr(chat_media, "inspect", lambda data: decoded.append(1) or real_inspect(data))
+
+    def post(count: int, first: int):
+        return alice.post(
+            "/chat-media/conv-px",
+            data={"attachment_id": [f"att-px-{first + i:06d}" for i in range(count)], "source": "upload"},
+            files=[("file", (f"p{i}.png", flat, "image/png")) for i in range(count)],
+        )
+
+    over = post(4, 0)
+    assert over.status_code == 413 and decoded == []
+    assert over.json()["detail"] == "Send these pictures in smaller batches."
+    within = post(3, 100)
+    assert within.status_code == 200, within.text
+    assert len(within.json()["items"]) == 3 and len(decoded) == 3
+
+
 def test_a_chunked_upload_is_not_capped_at_8_gib_by_its_part_count(login_client, monkeypatch, tmp_path):
     """128 parts of the browser's 64 MiB was a hidden 8 GiB limit."""
     monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
@@ -319,12 +351,89 @@ def test_many_photos_keep_what_fits_and_never_fail_the_turn(monkeypatch):
         assert 8 <= len(kept) < 40
         assert kept[:8] == pictures[:8]
         assert sum(map(len, kept)) <= image_memory.max_chars()
-        # The durable row keeps fewer, within ITS budget, and is still written.
+        # The durable row keeps fewer, within ITS budget, and is still written:
+        # one slot per picture of the turn, '' for one it could not hold.
         assert len(rows.saved) == 1
-        stored = rows.saved[0]
+        assert len(rows.saved[0]) == 40
+        stored = [image for image in rows.saved[0] if image]
         assert 4 <= len(stored) < len(kept)
-        assert stored[:4] == pictures[:4]
+        assert stored[:4] == pictures[:4] and rows.saved[0][: len(stored)] == stored
         assert sum(map(len, stored)) <= image_memory.max_db_chars()
+    finally:
+        image_memory.clear()
+
+
+def _follow_up(monkeypatch, conversation: str, question: str = "what is in the photos?"):
+    """main.py's follow-up branch: the word test, then the vision engine with
+    the remembered pictures and their turn's total."""
+    monkeypatch.setitem(context._window_cache, settings.openai_base_url, 1_000_000)
+    monkeypatch.delenv("VISION_IMAGE_TOKEN_BUDGET", raising=False)
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    found = image_memory.followup(conversation, question, 7)
+    assert found.images
+    seen: dict = {}
+
+    async def fake_stream(messages, **kw):
+        seen["messages"] = messages
+        yield ("token", "ok")
+
+    monkeypatch.setattr(llm, "stream_chat_events", fake_stream)
+
+    async def emit(kind, payload):
+        pass
+
+    answer = asyncio.run(
+        vision.run_vision_engine(
+            question, found.images, [], emit, effort="fast", total_pictures=found.total
+        )
+    )
+    words = " ".join(p["text"] for p in seen["messages"][-1]["content"] if p.get("type") == "text")
+    return found, answer, words
+
+
+def test_a_follow_up_on_many_photos_says_how_many_it_can_see(monkeypatch):
+    """QA 2026-10-03: a follow-up about a 100-photo turn answered from the
+    13 photos image_memory kept, as if they were all, with no note. LIMITS.md:
+    where reading is partial the answer says exactly what was read."""
+    pictures = [_noise_jpeg(i) for i in range(30)]
+    one = max(map(len, pictures))
+    monkeypatch.setenv("IMAGE_MEMORY_MAX_CHARS", str(8 * one))
+    monkeypatch.setattr(image_memory, "_db", lambda: _Rows())
+    image_memory.clear()
+    try:
+        image_memory.remember("conv-follow", pictures, question="compare these photos", answer="ok", user_id=7)
+        found, answer, words = _follow_up(monkeypatch, "conv-follow")
+        kept = len(found.images)
+        assert 8 <= kept < 30 and found.total == 30
+        assert f"This question is about the 30 pictures of an earlier message. The app sent {kept} of them" in words
+        assert answer == f"ok\n\n_I could see {kept} of the 30 pictures from that message here; send the others again to ask about them._"
+    finally:
+        image_memory.clear()
+
+
+def test_the_total_survives_a_restart_in_the_row(monkeypatch):
+    """The V41 row holds fewer pictures than the process (IMAGE_MEMORY_DB_CHARS),
+    and a deploy restarts the process: the follow-up after it still counts
+    against the turn's total, from the row's empty slots."""
+    pictures = [_noise_jpeg(i) for i in range(30)]
+    one = max(map(len, pictures))
+    monkeypatch.setenv("IMAGE_MEMORY_MAX_CHARS", str(8 * one))
+    monkeypatch.setenv("IMAGE_MEMORY_DB_CHARS", str(4 * one))
+    monkeypatch.delenv("IMAGE_MEMORY_DURABLE", raising=False)
+    rows = _Rows()
+    monkeypatch.setattr(image_memory, "_db", lambda: rows)
+    image_memory.clear()
+    try:
+        image_memory.remember("conv-restart", pictures, question="compare these photos", answer="ok", user_id=7)
+        saved = rows.saved[-1]
+        image_memory._remembered_images.clear()  # the restart: the process half is gone
+        rows.get_conversation_image = lambda user_id, conversation_id: {
+            "images": saved, "context": "compare these photos\nok", "turns_after": 0, "age_s": 1.0,
+        }
+        asyncio.run(image_memory.hydrate("conv-restart", 7))
+        found, answer, words = _follow_up(monkeypatch, "conv-restart")
+        assert found.images == [image for image in saved if image] and found.total == 30
+        assert f"_I could see {len(found.images)} of the 30 pictures from that message here" in answer
     finally:
         image_memory.clear()
 
@@ -437,7 +546,125 @@ def test_an_archive_past_the_byte_cap_is_unpacked_up_to_it_not_refused(tmp_path,
         archive.extract(bomb, str(tmp_path / "out2"))
 
 
+def test_listing_a_huge_archive_parses_only_the_entries_it_unpacks(tmp_path, monkeypatch):
+    """QA 2026-10-03: listing a zip built a ZipInfo for EVERY entry (~500 B
+    of heap each, beside the whole directory read in), so with no upload
+    limit a 2 GB zip of small files was ~10 GB of the head's memory for the
+    ARCHIVE_MAX_FILES entries ever used. Only those are parsed now; this zip
+    has 70,000 entries, so it also carries zip64 end records."""
+    import tracemalloc
+
+    from app.core import archive
+
+    monkeypatch.setattr(settings, "archive_max_files", 100)
+    src = tmp_path / "rows.zip"
+    with zipfile.ZipFile(src, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i in range(70_000):
+            zf.writestr(f"rows/part-{i:06d}.csv", f"id,value\n{i},{i * 3}\n")
+    tracemalloc.start()
+    try:
+        plan = archive.check_zip_container(str(src), partial=True)
+        _now, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 2 * 1024 * 1024, f"listing held {peak:,} bytes"
+    assert len(plan.members) == 100
+    assert plan.skipped == [
+        ("69,900 more file(s)", "not unpacked: only the first 100 entries are (the archive itself is kept whole)")
+    ]
+    plan = archive.extract(str(src), str(tmp_path / "out"))
+    assert len(plan.members) == 100
+    assert (tmp_path / "out" / "rows" / "part-000099.csv").read_text() == "id,value\n99,297\n"
+    # An .xlsx is opened whole by its reader: past the cap it is not opened.
+    with pytest.raises(archive.ArchiveTooLarge, match="contains 70,000 entries"):
+        archive.check_zip_container(str(src), label="spreadsheet")
+
+
+def test_a_partial_listing_reads_a_zip_behind_a_stub(tmp_path, monkeypatch):
+    """Bytes before the zip proper (a self-extractor's stub) shift every
+    offset the directory records; the first entries are still found and
+    unpacked whole (`extract` itself only takes a file that starts as a zip)."""
+    from app.core import archive
+
+    monkeypatch.setattr(settings, "archive_max_files", 3)
+    plain = _zip(tmp_path / "plain.zip", [(f"f{i}.txt", f"text {i}".encode() * 50) for i in range(8)])
+    stubbed = tmp_path / "sfx.zip"
+    stubbed.write_bytes(b"MZ" + b"\0" * 4094 + open(plain, "rb").read())
+    plan = archive.extract_zip(str(stubbed), str(tmp_path / "out"), partial=True)
+    assert [m.name for m in plan.members] == ["f0.txt", "f1.txt", "f2.txt"]
+    assert plan.skipped[-1][0] == "5 more file(s)"
+    assert (tmp_path / "out" / "f2.txt").read_bytes() == b"text 2" * 50
+
+
+def test_a_docx_with_a_huge_directory_is_read_without_parsing_it_whole(tmp_path):
+    """The same whole-directory parse sat in the .docx readers, on the path a
+    document of any size takes past the whole-read budget: a crafted file
+    listing millions of parts was ~500 B of the head's memory a part."""
+    import tracemalloc
+
+    from app.engines import document as eng
+
+    path = tmp_path / "minutes.docx"
+    w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "word/document.xml",
+            f"<w:document {w}><w:body><w:p><w:r><w:t>Budget approved</w:t></w:r></w:p></w:body></w:document>",
+        )
+        for i in range(70_000):
+            zf.writestr(f"word/media/pad-{i:06d}.bin", b"")
+    tracemalloc.start()
+    try:
+        doc, err = asyncio.run(eng.extract_document_file("minutes.docx", str(path)))
+        _now, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert err is None and "Budget approved" in doc.full_text
+    assert peak < 16 * 1024 * 1024, f"reading held {peak:,} bytes"
+
+
 # --------------------------------------------------------------- datasets --
+
+
+def _workbook(path, sheet: bytes) -> bytes:
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr("xl/workbook.xml", "<workbook/>")
+        zf.writestr("xl/worksheets/sheet1.xml", sheet)
+    return path.read_bytes()
+
+
+def test_a_spreadsheet_past_a_reading_cap_is_kept_whole_not_refused(login_client, monkeypatch, tmp_path):
+    """QA 2026-10-03: an .xlsx dataset past the unpack caps (2,048 MB expanded
+    in production) or with one sheet past the expansion ratio was deleted and
+    refused with a stated limit, after its whole upload. LIMITS.md: the
+    stored file is always kept whole and downloadable; reading bounds degrade
+    and never refuse the upload. Hostile structure is still refused."""
+    monkeypatch.setattr(settings, "workspace_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "archive_max_uncompressed_mb", 1)  # 2048 in production, scaled
+    monkeypatch.setattr(settings, "archive_max_ratio", 200)
+    alice = login_client("alice")
+    assert alice.post("/history/conversations", json={"id": "conv-xlsx", "title": "x"}).status_code == 200
+    books = [
+        ("sales.xlsx", _workbook(tmp_path / "sales.xlsx", random.Random(1).randbytes(2 * 1024 * 1024)),
+         "stored whole but not profiled: it expands to more than 1 MB"),
+        ("flat.xlsx", _workbook(tmp_path / "flat.xlsx", b"<row>0</row>" * 300_000),
+         "stored whole but not profiled: 'xl/worksheets/sheet1.xml' expands"),
+        ("rows.zip", open(_zip(tmp_path / "rows.zip", [("rows.csv", b"0,0\n" * 900_000)]), "rb").read(),
+         "stored whole but not profiled: 'rows.csv' expands"),
+    ]
+    for name, payload, note in books:
+        resp = alice.post(
+            "/uploads",
+            data={"conversation_id": "conv-xlsx", "purpose": "dataset"},
+            files={"file": (name, payload, "application/octet-stream")},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["files"] == 0 and body["profile"] == []
+        assert len(body["notes"]) == 1 and body["notes"][0].startswith(note), body["notes"]
+        got = alice.get(f"/uploads/conv-xlsx/{body['upload_id']}/file")
+        assert got.status_code == 200 and got.content == payload
 
 
 def test_the_dataset_profiler_cannot_take_the_heads_memory():

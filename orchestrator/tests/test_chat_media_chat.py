@@ -62,8 +62,10 @@ def engines(monkeypatch):
     """Every engine these turns can reach, faked to record what it was handed."""
     seen: dict = {"vision": [], "document": [], "chat": []}
 
-    async def fake_vision(message, images, history, emit, *, effort="think", max_tokens=None, conversation_id=None):
-        seen["vision"].append({"message": message, "images": list(images)})
+    async def fake_vision(
+        message, images, history, emit, *, effort="think", max_tokens=None, conversation_id=None, total_pictures=0
+    ):
+        seen["vision"].append({"message": message, "images": list(images), "total_pictures": total_pictures})
         text = ANSWER1 if message == TURN1 else "vision answer"
         await emit("token", {"text": text})
         await emit("meta", {"route": "vision"})
@@ -678,20 +680,49 @@ def test_a_hundred_stored_pictures_go_by_reference_in_one_turn(engines, as_user)
 
 def test_many_large_refs_are_read_as_model_sized_copies_past_the_memory_budget(engines, as_user, monkeypatch):
     """Head memory: past REFS_FULL_CHARS of originals a /chat turn reads each
-    further stored picture as a small copy, never all originals at once."""
+    further stored picture as a small copy, never all originals at once: the
+    thumbnail the store wrote beside it, read and never decoded (QA
+    2026-10-03: decoding a 16 MP original cost ~0.14 s each, 990 of them
+    before /chat's stream existed)."""
     alice = as_user("alice")
     monkeypatch.setattr(chat_media, "REFS_FULL_CHARS", 1)
     with TestClient(app) as client:
         pictures = [(f"att-big-{i:03d}", _png(colour=(i, 9, 9), size=(1200, 900))) for i in range(4)]
         _upload_many(client, "conv-big", pictures)
+        decoded: list = []
+        monkeypatch.setattr(vision, "shrink_picture", lambda payload, edge: decoded.append(edge))
         loaded, missing = chat_media._load_refs(
             int(alice["id"]), "conv-big", [a for a, _p in pictures], None, chat_media.REFS_FULL_CHARS
         )
     assert missing == [] and len(loaded) == 4
     assert _decoded(loaded[0]) == pictures[0][1]  # the first, as stored
+    assert decoded == []
     for url in loaded[1:]:
-        assert url.startswith("data:image/jpeg;base64,")
-        assert max(Image.open(io.BytesIO(_decoded(url))).size) <= vision.FIT_EDGES[-1]
+        assert url.startswith("data:image/webp;base64,")
+        assert max(Image.open(io.BytesIO(_decoded(url))).size) <= chat_media.THUMB_EDGE
+
+
+def test_a_picture_named_many_times_is_read_once(engines, as_user, monkeypatch):
+    """QA 2026-10-03: image_refs naming one stored picture 999 times read its
+    original 999 times and decoded it ~990 times (135 s for an 8 MiB PNG)
+    before /chat sent a byte. The backfill names one picture twice when a
+    turn carried it twice, so names are not refused: each distinct picture
+    is read once as stored and once as its thumbnail past REFS_FULL_CHARS,
+    and every name still gets its copy, in order."""
+    alice = as_user("alice")
+    monkeypatch.setattr(chat_media, "REFS_FULL_CHARS", 1)
+    with TestClient(app) as client:
+        _upload_many(client, "conv-dup", [("att-dup-0001", _png(size=(1200, 900)))])
+    reads, decodes = [], []
+    real_read = chat_media.read_full
+    monkeypatch.setattr(chat_media, "read_full", lambda row: reads.append(1) or real_read(row))
+    monkeypatch.setattr(vision, "shrink_picture", lambda payload, edge: decodes.append(edge))
+    ids = ["att-dup-0001"] * 999 + ["att-gone-0001"] * 5
+    loaded, missing = chat_media._load_refs(int(alice["id"]), "conv-dup", ids, None, chat_media.REFS_FULL_CHARS)
+    assert (len(reads), len(decodes)) == (1, 0)
+    assert len(loaded) == 999 and missing == ["att-gone-0001"]
+    assert loaded[0].startswith("data:image/png;base64,")
+    assert all(url is loaded[1] for url in loaded[1:]) and loaded[1].startswith("data:image/webp;base64,")
 
 
 def test_an_account_without_attachments_cannot_read_a_ref_into_a_turn(engines, as_user, monkeypatch):
@@ -795,6 +826,27 @@ def test_the_follow_up_reads_the_stored_picture_after_a_restart(engines, as_user
         _chat(client, message="Is the date in the photo legible?", conversation_id="conv-restart")
         assert len(engines["vision"]) == 2
         assert [_decoded(i) for i in engines["vision"][-1]["images"]] == [payload]
+
+
+def test_a_follow_up_is_told_how_many_pictures_its_turn_carried(engines, as_user, monkeypatch):
+    """QA 2026-10-03: image_memory keeps a turn's first pictures that fit its
+    budget, and a follow-up read them as if they were all. /chat now hands
+    the vision engine the turn's total, which its notes count against."""
+    as_user("alice")
+    pictures = [_png(colour=(i * 40, 9, 9)) for i in range(3)]
+    monkeypatch.setenv("IMAGE_MEMORY_MAX_CHARS", str(len(_data_url(pictures[0]))))
+    with TestClient(app) as client:
+        assert client.post("/history/conversations", json={"id": "conv-three", "title": "t"}).status_code == 200
+        _upload_many(client, "conv-three", [(f"att-three-{i:03d}", p) for i, p in enumerate(pictures)])
+        _say("conv-three", "user", TURN1, {"images": [{"attachment_id": f"att-three-{i:03d}"} for i in range(3)]})
+        _say("conv-three", "assistant", ANSWER1, {"route": "vision"})
+        _restart()
+        resp = _chat(client, message=FOLLOW, conversation_id="conv-three")
+        assert resp.status_code == 200, resp.text
+        assert _route(resp) == "vision"
+    last = engines["vision"][-1]
+    assert [_decoded(i) for i in last["images"]] == pictures[:1]
+    assert last["total_pictures"] == 3
 
 
 def test_the_fallback_switch_restores_the_old_behaviour(engines, as_user, monkeypatch):
@@ -1088,3 +1140,57 @@ def test_the_fallback_reads_every_picture_the_server_named_in_index_order_within
     for visible in (None, path):
         bounded = chat_media.latest_turn_images(uid, "conv-ix-many", visible, max_chars=budget)
         assert [_decoded(i) for i in bounded["images"]] == pictures[:3]
+
+
+def test_a_follow_up_on_photos_the_server_named_counts_the_stored_pictures(engines, as_user, monkeypatch):
+    """No limits x store-always: an `ix-` turn's candidates are every index
+    up to MAX_FILES, and the follow-up's "N of M" note counts against the
+    turn's total. The total is the pictures stored under the intent (three
+    here), never the 999 candidates: counting those told the model it saw
+    "1 of the 999 pictures" of a three-photo message."""
+    alice = as_user("alice")
+    uid = int(alice["id"])
+    pictures = [_png(colour=(i * 40, 90, 9)) for i in range(3)]
+    monkeypatch.setenv("IMAGE_MEMORY_MAX_CHARS", str(len(_data_url(pictures[0]))))
+    with TestClient(app) as client:
+        resp = _chat(
+            client,
+            message=TURN1,
+            conversation_id="conv-ix-total",
+            intent_id=INTENT,
+            images=[_data_url(p) for p in pictures],
+        )
+        assert resp.status_code == 200, resp.text
+        assert [r["attachment_id"] for r in _wait_rows("conv-ix-total", 3)] == [
+            f"ix-{INTENT}-{i}" for i in range(3)
+        ]
+        _wait_settled()
+        pushed = client.put(
+            "/history/conversations/conv-ix-total/messages",
+            json={
+                "messages": [
+                    {"role": "user", "content": TURN1, "meta": {"intent": {"id": INTENT, "state": "answered"}}},
+                    {"role": "assistant", "content": ANSWER1, "meta": {"route": "vision"}},
+                ]
+            },
+        )
+        assert pushed.status_code == 200, pushed.text
+        image_memory._writer_pool().submit(lambda: None).result(timeout=15)
+        with db.connection() as con:
+            con.execute("DELETE FROM conversation_images WHERE conversation_id = 'conv-ix-total'")
+        _restart()
+        path = [
+            {"role": "user", "content": TURN1},
+            {"role": "assistant", "content": ANSWER1},
+            {"role": "user", "content": FOLLOW},
+        ]
+        resp = _chat(client, message=FOLLOW, conversation_id="conv-ix-total", messages=path)
+        assert resp.status_code == 200, resp.text
+        assert _route(resp) == "vision"
+    last = engines["vision"][-1]
+    assert [_decoded(i) for i in last["images"]] == pictures[:1]
+    assert last["total_pictures"] == 3
+    visible = [("user", TURN1), ("assistant", ANSWER1), ("user", FOLLOW)]
+    for seen in (None, visible):
+        found = chat_media.latest_turn_images(uid, "conv-ix-total", seen, max_chars=1)
+        assert len(found["images"]) == 1 and found["total"] == 3

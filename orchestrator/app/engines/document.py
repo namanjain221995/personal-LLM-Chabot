@@ -642,11 +642,15 @@ async def _extract_pdf(
     """→ (page-marked text, first-page images, total pages, ocr'd pages, pages).
 
     `pdf_base64` may be a file PATH (PDFium then reads it on demand);
-    `pages_total` is a text layer the caller already extracted."""
-    pages, total = pages_total or extract_pdf_pages(pdf_base64, max_chars)
+    `pages_total` is a text layer the caller already extracted.
+
+    Every PDFium call runs in a worker thread (core.pdf.PDFIUM_LOCK keeps
+    them one at a time): on the loop, a turn of 50 documents stalled every
+    other stream for 6 s, and 999 for about two minutes (2026-10-03)."""
+    pages, total = pages_total or await asyncio.to_thread(extract_pdf_pages, pdf_base64, max_chars)
     images: List[str] = []
     if render_pages > 0:
-        images, _text, _total = render_pdf(pdf_base64, max_pages=render_pages)
+        images, _text, _total = await asyncio.to_thread(render_pdf, pdf_base64, max_pages=render_pages)
 
     ocred = 0
     if settings.ocr_enabled:
@@ -661,7 +665,7 @@ async def _extract_pdf(
                 )
             from .ocr import ocr_images
 
-            page_images = render_pdf_pages(pdf_base64, thin)
+            page_images = await asyncio.to_thread(render_pdf_pages, pdf_base64, thin)
             transcripts = await ocr_images(page_images)
             for idx, transcript in zip(thin, transcripts):
                 if transcript.strip():
@@ -763,28 +767,31 @@ async def extract_document(
     effort: str = "think",
     question: str = "",
     emit: Optional[Emit] = None,
+    renders: bool = True,
 ) -> Tuple[Optional[_Doc], Optional[str]]:
     """Sniff and extract ONE document from its bytes. → (doc, error note).
 
     Exactly one of the pair is set. `effort` and `question` drive the page
     render policy; the upload-time prewarm passes Think and an empty
     question, which yields the superset a later Fast answer trims from.
+    `renders` False renders no page: a turn of many documents keeps the
+    first one's renders only. The reading itself runs in worker threads.
     """
     label = name or "document"
 
     if raw.startswith(b"%PDF"):
         if emit is not None:
             await emit("status", {"text": f"Reading {label}…"})
-        pdf_base64 = base64.b64encode(raw).decode("ascii")
+        pdf_base64 = await asyncio.to_thread(lambda: base64.b64encode(raw).decode("ascii"))
         try:
-            pages, total = extract_pdf_pages(pdf_base64)
+            pages, total = await asyncio.to_thread(extract_pdf_pages, pdf_base64)
         except Exception:  # noqa: BLE001 — a broken PDF is a note, not a 500
             # The library's own words ("Failed to load document (PDFium:
             # Data format error).") went to the person verbatim until
             # 2026-09-19. What they can act on is what the file IS.
             log.info("unreadable PDF %s", label, exc_info=True)
             return None, f"Could not read {label}: the file is damaged or is not a PDF."
-        wanted = page_images_wanted(pages, total, effort, question)
+        wanted = page_images_wanted(pages, total, effort, question) if renders else 0
         full_text, images, total, ocred, raw_pages = await _extract_pdf(
             pdf_base64, emit, render_pages=wanted, pages_total=(pages, total)
         )
@@ -797,9 +804,9 @@ async def extract_document(
 
     from ..core.docx import DocxError, extract_docx_text, is_docx
 
-    if is_docx(raw):
+    if await asyncio.to_thread(is_docx, raw):
         try:
-            full_text = extract_docx_text(raw)
+            full_text = await asyncio.to_thread(extract_docx_text, raw)
         except DocxError as exc:
             return None, f"Could not read {label} ({exc})."
     else:
@@ -814,7 +821,9 @@ async def extract_document(
             )
         else:
             try:
-                full_text = raw.decode("utf-8", errors="replace")[:DOC_MAX_CHARS]
+                # UTF-8 spends at most four bytes a character, so this prefix
+                # holds the first DOC_MAX_CHARS; the rest is never decoded.
+                full_text = raw[: DOC_MAX_CHARS * 4].decode("utf-8", errors="replace")[:DOC_MAX_CHARS]
             except Exception:
                 full_text = ""
     note = _part_note(0, [], DOC_MAX_CHARS) if len(full_text) >= DOC_MAX_CHARS else ""
@@ -829,6 +838,7 @@ async def extract_document_file(
     question: str = "",
     emit: Optional[Emit] = None,
     max_chars: int = DOC_MAX_CHARS,
+    renders: bool = True,
 ) -> Tuple[Optional[_Doc], Optional[str]]:
     """`extract_document` for a document ON DISK, never read into memory
     whole (2026-10-03, docs/chat-media/LIMITS.md: no size limit, and head
@@ -836,9 +846,9 @@ async def extract_document_file(
     demand) and read up to DOC_MAX_PAGES pages and `max_chars` characters; a
     .docx is streamed (core.docx.extract_docx_file); text is read up to
     `max_chars` characters' worth of bytes. The `_Doc.note` says what part
-    was read; the stored file stays whole and downloadable."""
+    was read; the stored file stays whole and downloadable. `renders` as in
+    `extract_document`."""
     import pathlib
-    import zipfile
 
     label = name or "document"
     try:
@@ -857,7 +867,7 @@ async def extract_document_file(
         except Exception:  # noqa: BLE001 — a broken PDF is a note, not a 500
             log.info("unreadable PDF %s", label, exc_info=True)
             return None, f"Could not read {label}: the file is damaged or is not a PDF."
-        wanted = page_images_wanted(pages, total, effort, question)
+        wanted = page_images_wanted(pages, total, effort, question) if renders else 0
         full_text, images, total, ocred, raw_pages = await _extract_pdf(
             source, emit, render_pages=wanted, max_chars=max_chars, pages_total=(pages, total)
         )
@@ -873,14 +883,9 @@ async def extract_document_file(
         return _Doc(name, full_text, images, total, ocred, raw_pages, note), None
 
     if head.startswith(b"PK"):
-        try:
-            with zipfile.ZipFile(path) as zf:
-                is_docx = "word/document.xml" in zf.namelist()
-        except (zipfile.BadZipFile, OSError):
-            is_docx = False
-        if is_docx:
-            from ..core.docx import DocxError, extract_docx_file
+        from ..core.docx import DocxError, extract_docx_file, is_docx_file
 
+        if await asyncio.to_thread(is_docx_file, path):
             try:
                 text, whole = await asyncio.to_thread(extract_docx_file, path, max_chars)
             except DocxError as exc:
@@ -921,10 +926,13 @@ async def _read_one(
     *,
     effort: str = "think",
     question: str = "",
+    renders: bool = True,
 ) -> Tuple[Optional[_Doc], Optional[str]]:
     """Sniff and extract ONE base64 document. → (doc, error note)."""
-    raw = base64.b64decode(_strip_data_url(pdf_base64))
-    return await extract_document(name, raw, effort=effort, question=question, emit=emit)
+    raw = await asyncio.to_thread(lambda: base64.b64decode(_strip_data_url(pdf_base64)))
+    return await extract_document(
+        name, raw, effort=effort, question=question, emit=emit, renders=renders
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1053,20 +1061,25 @@ async def run_pdf_engine_multi(
     read: List[_Doc] = []
     # One text budget for the whole turn (DOC_TURN_TEXT_CHARS): with many
     # documents each keeps its share, and page renders only for the first
-    # PDF, which is the only one whose pages the answer shows.
+    # PDF, which is the only one whose pages the answer shows. The others are
+    # not rendered at all: renders were ~80% of reading a PDF, thrown away.
     share = doc_text_budget(len(docs))
     for item in docs:
+        renders = not any(d.images for d in read)
         if isinstance(item, _Doc):
             doc, err = item, None
         elif isinstance(item, DocFile):
             doc, err = await extract_document_file(
-                item.name, item.path, effort=effort, question=message, emit=emit, max_chars=share
+                item.name, item.path, effort=effort, question=message, emit=emit,
+                max_chars=share, renders=renders,
             )
         else:
             name, b64 = item
-            doc, err = await _read_one(name, b64, emit, effort=effort, question=message)
+            doc, err = await _read_one(
+                name, b64, emit, effort=effort, question=message, renders=renders
+            )
         if doc is not None:
-            doc = doc.trimmed(share, keep_images=not any(d.images for d in read))
+            doc = doc.trimmed(share, keep_images=renders)
         if doc is not None and (doc.full_text.strip() or doc.images):
             read.append(doc)
         elif err:

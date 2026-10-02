@@ -48,6 +48,7 @@ import {
 } from '@/lib/chatMedia';
 import { turnFingerprint } from '@/lib/idbCache';
 import { INLINE_IMAGE_BUDGET_BYTES, MAX_IMAGES } from '@/lib/orchestrator';
+import { MAX_ATTEMPTS } from '@/lib/uploadDocument';
 import { MAX_MEDIA_BODY_BYTES } from '@/app/api/chat-media/_media';
 import type { ChatMessage } from '@/lib/types';
 
@@ -306,11 +307,17 @@ describe('uploads in batches under the budget (2026-10-03, LIMITS.md)', () => {
     blob: sized(size),
     name: `image-${i}.png`,
   });
-  function stubStore() {
+  /** Stores every POST; the list (GET) names `held`, or fails when null. */
+  function stubStore(held: string[] | null = []) {
     const forms: FormData[] = [];
     vi.stubGlobal(
       'fetch',
       vi.fn(async (_url: string, init?: RequestInit) => {
+        if ((init?.method ?? 'GET') === 'GET') {
+          return held
+            ? Response.json({ items: held.map((attachment_id) => ({ attachment_id })) })
+            : Response.json({}, { status: 503 });
+        }
         const form = init?.body as FormData;
         forms.push(form);
         return Response.json({
@@ -319,6 +326,27 @@ describe('uploads in batches under the budget (2026-10-03, LIMITS.md)', () => {
       }),
     );
     return forms;
+  }
+  /** Yield (setImmediate is never faked here) until `ready`, or 2 s of real time. */
+  async function until(ready: () => boolean): Promise<void> {
+    const deadline = Date.now() + 2000;
+    while (!ready() && Date.now() < deadline) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+  /** Run a pending upload to its end under fake timers, a backoff at a time. */
+  async function drain<T>(pending: Promise<T>): Promise<T> {
+    let settled = false;
+    void pending.then(
+      () => (settled = true),
+      () => (settled = true),
+    );
+    const deadline = Date.now() + 4000;
+    while (!settled && Date.now() < deadline) {
+      await vi.advanceTimersByTimeAsync(8_001);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    return pending;
   }
 
   it('a batch is cut by its bytes, and by the 999 ceiling only past that', async () => {
@@ -357,6 +385,104 @@ describe('uploads in batches under the budget (2026-10-03, LIMITS.md)', () => {
     expect(calls).toBe(2);
   });
 
+  it('a batch that fails for a passing reason goes again, alone, after a wait (QA 2026-10-03)', async () => {
+    // 40 photos the browser could not shrink, 10 MiB each: ten requests of
+    // four. Before, the 503 on the fifth failed the whole send, and the
+    // person's retry sent all 400 MiB again.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const tenMiB = 10 * 1024 * 1024;
+      const parts = Array.from({ length: 40 }, (_, i) => part(i, tenMiB));
+      const posted: string[][] = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (_url: string, init?: RequestInit) => {
+          const ids = (init?.body as FormData).getAll('attachment_id') as string[];
+          posted.push(ids);
+          if (posted.length === 5) return new Response('upstream', { status: 503 });
+          if (posted.length === 8) throw new TypeError('Failed to fetch');
+          return Response.json({ items: ids.map((attachment_id) => ({ attachment_id })) });
+        }),
+      );
+      const pending = uploadChatMediaInBatches(CONV, parts, 'upload');
+      await until(() => posted.length === 5 && vi.getTimerCount() === 1);
+      // Not at once: the chunked rail's backoff first.
+      expect(posted).toHaveLength(5);
+      expect(vi.getTimerCount()).toBe(1);
+
+      const out = await drain(pending);
+      expect(out.kind).toBe('stored');
+      expect(out.kind === 'stored' && out.items.map((i) => i.attachment_id)).toEqual(
+        parts.map((p) => p.attachmentId),
+      );
+      // Ten batches and the two that failed, each sent again on its own:
+      // 480 MiB in all, not 400 + 400.
+      expect(posted).toHaveLength(12);
+      expect(posted[5]).toEqual(posted[4]);
+      expect(posted[8]).toEqual(posted[7]);
+      expect(new Set(posted.flat()).size).toBe(40);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a passing failure is tried MAX_ATTEMPTS times; an answer is never asked again', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let calls = 0;
+      let status = 503;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => {
+          calls += 1;
+          return Response.json({}, { status });
+        }),
+      );
+      for (const passing of [429, 502, 503, 504]) {
+        calls = 0;
+        status = passing;
+        const out = await drain(uploadChatMediaInBatches(CONV, [part(0, 1024)], 'upload'));
+        expect(out).toEqual({ kind: 'failed', status: passing });
+        expect(calls).toBe(MAX_ATTEMPTS);
+      }
+      // A refusal, a missing chat, a dead session, a server error and a full
+      // disk say something about the request: one request, no wait.
+      for (const answer of [400, 413, 415, 404, 401, 403, 500, 507]) {
+        calls = 0;
+        status = answer;
+        await uploadChatMediaInBatches(CONV, [part(0, 1024)], 'upload');
+        expect(calls).toBe(1);
+        expect(vi.getTimerCount()).toBe(0);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('Stop during the wait ends it at once, and nothing goes again', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let calls = 0;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => {
+          calls += 1;
+          return Response.json({}, { status: 503 });
+        }),
+      );
+      const stop = new AbortController();
+      const pending = uploadChatMediaInBatches(CONV, [part(0, 1024)], 'upload', stop.signal);
+      await until(() => calls === 1 && vi.getTimerCount() === 1);
+      expect(vi.getTimerCount()).toBe(1); // waiting to try again
+      stop.abort();
+      // Settles with no timer advanced: the backoff did not run out.
+      expect((await pending).kind).toBe('failed');
+      expect(calls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('every batch fits the proxy (and the orchestrator) body cap with its framing', () => {
     expect(MAX_MEDIA_BYTES_PER_REQUEST + 1024 * 1024).toBeLessThanOrEqual(MAX_MEDIA_BODY_BYTES);
   });
@@ -389,6 +515,36 @@ describe('uploads in batches under the budget (2026-10-03, LIMITS.md)', () => {
     expect(files.map((f) => f.type)).toEqual(['image/png', 'image/jpeg']);
     expect(files.map((f) => f.name)).toEqual(['image-1.png', 'image-2.jpg']);
     expect(forms[0].get('source')).toBe('upload');
+  });
+
+  it('a retried send sends only the photos the server does not hold yet (QA 2026-10-03)', async () => {
+    const png = 'iVBORw0KGgoAAAANSUhEUg==';
+    const jpeg = '/9j/4AAQSkZJRgABAQ==';
+    const images = [png, jpeg, png.replace('Ug', 'Ag'), jpeg.replace('AQ', 'AA')];
+    const ids = ['img-limit-0001', 'img-limit-0002', 'img-limit-0003', 'img-limit-0004'];
+
+    // An earlier attempt stored the first and third before it failed.
+    const forms = stubStore(['img-limit-0001', 'img-limit-0003']);
+    const out = await storeImagesForSend(CONV, images, ids);
+    expect(out.kind).toBe('stored');
+    expect(forms).toHaveLength(1);
+    expect(forms[0].getAll('attachment_id')).toEqual(['img-limit-0002', 'img-limit-0004']);
+    // A part keeps the name of its place in the message.
+    expect((forms[0].getAll('file') as File[]).map((f) => f.name)).toEqual([
+      'image-2.jpg',
+      'image-4.jpg',
+    ]);
+
+    // All of them landed (the answer was lost): nothing is sent again.
+    const none = stubStore(ids);
+    expect((await storeImagesForSend(CONV, images, ids)).kind).toBe('stored');
+    expect(none).toHaveLength(0);
+
+    // The server could not say: every photo goes, as before (an id it
+    // already holds comes back unchanged).
+    const all = stubStore(null);
+    expect((await storeImagesForSend(CONV, images, ids)).kind).toBe('stored');
+    expect(all.flatMap((f) => f.getAll('attachment_id'))).toEqual(ids);
   });
 });
 

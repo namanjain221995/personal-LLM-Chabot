@@ -17,6 +17,8 @@
  *     stores them first (POST /api/chat-media, batches under the budget) and
  *     names them in `image_refs`: no inline bytes, `meta.images` unchanged.
  *     Under the budget nothing changes: inline, and no extra round trip.
+ *     A request that fails for a passing reason (503) goes again, alone; a
+ *     send retried after a failure sends only the photos the server lacks.
  *   · No string in the app still states an old limit.
  */
 
@@ -43,6 +45,10 @@ let uploads: { name: string; size: number; purpose: string }[] = [];
 let datasetPosts = 0;
 /** The status POST /api/chat-media answers; 200 stores. */
 let mediaStatus = 200;
+/** Statuses for the next POSTs, first to last, before `mediaStatus` applies. */
+let mediaQueue: number[] = [];
+/** The ids the server holds: what its list (GET /api/chat-media) names. */
+let mediaHeld = new Set<string>();
 /** The browser's shrink. jsdom has no canvas, so `null` ("send as is") by default. */
 const downscale = vi.fn<(file: File) => Promise<DownscaledImage | null>>(async () => null);
 
@@ -154,16 +160,21 @@ function stubBrowser() {
       if (u === `/api/chat-media/${CONV}` && init?.method === 'POST') {
         const form = init.body as FormData;
         mediaPosts.push(form);
-        if (mediaStatus !== 200) return Response.json({}, { status: mediaStatus });
+        const status = mediaQueue.shift() ?? mediaStatus;
+        if (status !== 200) return Response.json({}, { status });
+        const ids = form.getAll('attachment_id') as string[];
+        ids.forEach((id) => mediaHeld.add(id));
         return Response.json({
-          items: (form.getAll('attachment_id') as string[]).map((id) => ({
+          items: ids.map((id) => ({
             attachment_id: id,
             mime: 'image/png',
             created: true,
           })),
         });
       }
-      if (u === `/api/chat-media/${CONV}`) return Response.json({ items: [] });
+      if (u === `/api/chat-media/${CONV}`) {
+        return Response.json({ items: [...mediaHeld].map((attachment_id) => ({ attachment_id })) });
+      }
       if (u === '/api/chat/active') return Response.json({ active: [] });
       if (u === '/api/upload') {
         datasetPosts += 1;
@@ -232,6 +243,8 @@ beforeEach(() => {
   uploads = [];
   datasetPosts = 0;
   mediaStatus = 200;
+  mediaQueue = [];
+  mediaHeld = new Set();
   downscale.mockReset();
   downscale.mockImplementation(async () => null);
   clearAttachments();
@@ -460,6 +473,51 @@ describe('the inline payload budget', () => {
     expect(chatBodies).toHaveLength(0);
     // The references stay: a retry stores the same ids and sends them.
     expect(userTurn().meta?.images).toHaveLength(6);
+  }, 30_000);
+
+  it('over the budget, a request that fails for a passing reason goes again and the send goes through', async () => {
+    // Five 9 MiB photos fill the first request, the sixth rides alone; the
+    // proxy answers that one 503 once (QA 2026-10-03: it failed the send).
+    mediaQueue = [200, 503];
+    const photos = Array.from({ length: 6 }, (_, i) => png(`big${i}.png`, 9 * 1024 * 1024));
+    renderApp();
+    await attach(photos);
+    await send('which of these is sharpest?');
+
+    const ids = userTurn().meta!.images!.map((i) => i.attachment_id);
+    const posted = mediaPosts.map((f) => f.getAll('attachment_id') as string[]);
+    expect(posted.map((p) => p.length)).toEqual([5, 1, 1]);
+    expect(posted[2]).toEqual(posted[1]);
+    expect(lastBody().image_refs).toEqual(ids);
+    expect(userTurn().meta?.intent?.state).not.toBe('unsent');
+  }, 30_000);
+
+  it('over the budget, a send that failed part-way sends only the photos the server lacks', async () => {
+    // The first request stores five photos, the second is refused for want
+    // of disk (507, never asked again) and the turn stays unsent.
+    mediaQueue = [200, 507];
+    const photos = Array.from({ length: 6 }, (_, i) => png(`big${i}.png`, 9 * 1024 * 1024));
+    renderApp();
+    await attach(photos);
+    await act(async () => {
+      fireEvent.change(box(), { target: { value: 'which is sharpest?' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
+    });
+    await waitFor(() => expect(userTurn().meta?.intent?.state).toBe('unsent'), { timeout: 10_000 });
+    const ids = userTurn().meta!.images!.map((i) => i.attachment_id);
+    expect(mediaHeld.size).toBe(5);
+    expect(chatBodies).toHaveLength(0);
+
+    // The person presses Retry: only the sixth photo travels this time.
+    const before = mediaPosts.length;
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('button', { name: 'Retry' }));
+    });
+    await waitFor(() => expect(chatBodies).toHaveLength(1), { timeout: 10_000 });
+    const resent = mediaPosts.slice(before).flatMap((f) => f.getAll('attachment_id') as string[]);
+    expect(resent).toEqual([ids[5]]);
+    expect(lastBody().image_refs).toEqual(ids);
+    expect(lastBody().images).toBeUndefined();
   }, 30_000);
 });
 

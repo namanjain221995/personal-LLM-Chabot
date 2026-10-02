@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -292,6 +293,9 @@ class FittedImages:
     total: int
     edge: Optional[int] = None  # the long edge they were sent at, when shrunk
     unreadable: int = 0  # pictures that needed shrinking and would not decode
+    #: The pictures are an EARLIER message's (a follow-up), and `total`
+    #: counts that message: image_memory keeps only its first ones that fit.
+    earlier: bool = False
 
     @property
     def dropped(self) -> int:
@@ -303,6 +307,14 @@ class FittedImages:
 
     def model_note(self) -> str:
         """A line for the model: what it is looking at."""
+        if self.dropped and self.earlier:
+            return (
+                f"\n\n(This question is about the {self.total} pictures of an earlier message. The app "
+                f"sent {len(self.images)} of them"
+                + (f" at {self.edge} px on the long edge" if self.edge else "")
+                + ": the others are not attached to this question. Answer only about the pictures "
+                "you can see and do not guess about the others.)"
+            )
         if self.dropped:
             return (
                 f"\n\n(The app sent {len(self.images)} of the {self.total} attached pictures"
@@ -324,6 +336,11 @@ class FittedImages:
         if not self.dropped:
             return ""
         read = len(self.images)
+        if self.earlier:
+            return (
+                f"\n\n_I could see {read} of the {self.total} pictures from that message here; "
+                "send the others again to ask about them._"
+            )
         if not self.unreadable:
             return (
                 f"\n\n_I read the first {read} of the {self.total} pictures in this message; the "
@@ -1054,6 +1071,7 @@ async def run_vision_engine(
     effort: str = DEFAULT_EFFORT,
     max_tokens: Optional[int] = None,
     conversation_id: Optional[str] = None,
+    total_pictures: int = 0,
 ) -> str:
     """Answer about attached image(s) at the effort the caller asked for.
 
@@ -1068,6 +1086,10 @@ async def run_vision_engine(
     whose images the sidecar cannot read inside its deadline stops paying
     that deadline on every later turn. Nothing else reads it, and a caller
     that has no conversation (the bare API, graph.py) may leave it None.
+
+    `total_pictures` is a follow-up's: how many pictures the remembered
+    message carried, when image_memory kept only its first ones. The notes
+    then say how many of THAT message's pictures the model saw.
     """
     imgs = [images] if isinstance(images, str) else list(images or [])
     if not imgs:
@@ -1076,6 +1098,8 @@ async def run_vision_engine(
     level = llm.normalize_effort(effort)
     # Any number of pictures, fitted to what one call can read (above).
     fitted = await fit_for_model(imgs)
+    if total_pictures > fitted.total:
+        fitted = dataclasses.replace(fitted, total=total_pictures, earlier=True)
     imgs = fitted.images
     user_content = build_user_content(message + extraction_hint(message), imgs)
     if fitted.model_note():

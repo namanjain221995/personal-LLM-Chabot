@@ -31,6 +31,7 @@ import type { ChatMessage, MessageImage, Meta } from './types';
 import { dataUrlToBlob, mimeFromDataUrl } from './attachments';
 import { INLINE_IMAGE_BUDGET_BYTES, MAX_IMAGES } from './orchestrator';
 import { turnFingerprint, type HeldImageRecord } from './idbCache';
+import { backoffMs, MAX_ATTEMPTS, RETRYABLE_STATUS, sleep } from './uploadDocument';
 
 /** An attachment id as the server accepts it (CONTRACT §3, client-minted). */
 export const ATTACHMENT_ID = /^[A-Za-z0-9_-]{8,64}$/;
@@ -584,12 +585,28 @@ export async function uploadChatMedia(
 }
 
 /**
+ * A failure that says nothing about the photos: a dropped connection, 429,
+ * 502, 503 or 504 — the chunked rail's rule (lib/uploadDocument.ts). Any
+ * other status (a refusal, 404, 401/403, 500, 507) is an answer about the
+ * request, and is not asked again.
+ */
+function isTransient(outcome: MediaUploadOutcome): boolean {
+  return (
+    outcome.kind === 'offline' ||
+    (outcome.kind === 'failed' && RETRYABLE_STATUS.has(outcome.status))
+  );
+}
+
+/**
  * `parts` in as many requests as it takes, in order: each holds at most
  * MAX_MEDIA_PER_REQUEST photos and MAX_MEDIA_BYTES_PER_REQUEST file bytes (a
- * single photo larger than that still goes, alone). Stops at the first
- * request that is not stored and answers with it; otherwise every item the
- * server returned, in order. Retrying the whole list is safe: an id the
- * server already holds comes back unchanged.
+ * single photo larger than that still goes, alone). A request that fails for
+ * a passing reason (`isTransient`) is sent again, up to MAX_ATTEMPTS times
+ * with the chunked rail's backoff: a message may carry any number of photos
+ * (2026-10-03), and 125 requests must not fail whole on one 503. Otherwise
+ * stops at the first request that is not stored and answers with it; when
+ * all are, every item the server returned, in order. Retrying the whole list
+ * is safe: an id the server already holds comes back unchanged.
  */
 export async function uploadChatMediaInBatches(
   conversationId: string,
@@ -616,7 +633,17 @@ export async function uploadChatMediaInBatches(
   if (batch.length > 0) batches.push(batch);
   const items: StoredMediaItem[] = [];
   for (const one of batches) {
-    const outcome = await uploadChatMedia(conversationId, one, source, signal);
+    let outcome = await uploadChatMedia(conversationId, one, source, signal);
+    // Only THIS batch goes again; the ones before it are stored.
+    for (let attempt = 1; attempt < MAX_ATTEMPTS && isTransient(outcome); attempt += 1) {
+      if (signal?.aborted) break;
+      try {
+        await sleep(backoffMs(attempt), signal);
+      } catch {
+        break; // stopped during the wait
+      }
+      outcome = await uploadChatMedia(conversationId, one, source, signal);
+    }
     if (outcome.kind !== 'stored') return outcome;
     items.push(...outcome.items);
   }
@@ -656,6 +683,12 @@ export function imagesGoByReference(
  * index, the ids `meta.images` already names, so the turn's references are
  * the same whichever way the bytes travel. The same photo twice is stored
  * once. source=upload; idempotent like every upload here.
+ *
+ * A RETRIED send does not start again from the first byte (2026-10-03, QA):
+ * the server is asked once which ids it holds, and the photos an earlier
+ * attempt stored are not sent again (`items` names only what this call
+ * sent). An unknown answer sends them all, which is safe for the same
+ * reason a retry is.
  */
 export async function storeImagesForSend(
   conversationId: string,
@@ -663,19 +696,23 @@ export async function storeImagesForSend(
   imageIds: readonly string[],
   signal?: AbortSignal,
 ): Promise<MediaUploadOutcome> {
+  const held = await storedAttachmentIds(conversationId, signal);
+  // Stop pressed while asking: no photo is converted, none is sent.
+  if (signal?.aborted) return { kind: 'offline' };
   const parts: MediaUploadPart[] = [];
   const seen = new Set<string>();
-  images.forEach((base64, i) => {
+  for (let i = 0; i < images.length; i += 1) {
     const attachmentId = imageIds[i];
-    if (seen.has(attachmentId)) return;
+    if (seen.has(attachmentId)) continue;
     seen.add(attachmentId);
-    const mime = mimeOfBase64(base64);
-    const blob = dataUrlToBlob(`data:${mime || 'application/octet-stream'};base64,${base64}`);
-    if (!blob) return;
+    if (held?.has(attachmentId)) continue;
+    const mime = mimeOfBase64(images[i]);
+    const blob = dataUrlToBlob(`data:${mime || 'application/octet-stream'};base64,${images[i]}`);
+    if (!blob) return { kind: 'refused', status: 400 };
     const ext = EXTENSION_BY_MIME[mime] ?? 'img';
     parts.push({ attachmentId, blob, name: `image-${i + 1}.${ext}` });
-  });
-  if (parts.length !== seen.size) return { kind: 'refused', status: 400 };
+  }
+  if (parts.length === 0) return { kind: 'stored', items: [] };
   return uploadChatMediaInBatches(conversationId, parts, 'upload', signal);
 }
 

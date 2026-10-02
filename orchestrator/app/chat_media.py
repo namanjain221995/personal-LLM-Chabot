@@ -180,6 +180,13 @@ _EXT_BY_MIME = {mime: ext for mime, ext in _FORMATS.values()}
 #: +9.5 GiB for 16 at once. The composer sends at most 1600 px on the long
 #: edge (2.6 MP); 16 MP still takes a 12 MP phone photo whose downscale failed.
 MAX_STORE_PIXELS = 16_000_000
+#: Decoded pixels one POST here may carry (2026-10-03). Each picture is
+#: decoded to be verified, one after another before the answer, ~11-14 ms a
+#: megapixel for a PNG: 999 small-on-the-wire 16 MP PNGs fit the byte cap and
+#: ran 175-231 s, past Cloudflare's 125 s, while the server went on storing
+#: them (QA). This is ~45-60 s of that work. The browser's fullest batch is
+#: MAX_FILES pictures of at most 1600 x 1600, 2,558 MP: never refused.
+MAX_REQUEST_PIXELS = 4_000_000_000
 
 #: Decodes (verification, thumbnail, image_memory's fit of a stored original)
 #: run on their own small pool, so a burst of pictures queues instead of
@@ -1024,29 +1031,61 @@ def _load_refs(
     reach that many characters: the caller keeps only what fits its budget,
     so many 10 MiB originals are never all in memory at once. With
     `full_chars` (/chat) it reads on past that point, each further picture as
-    a model-sized copy (`REFS_FULL_CHARS`); one that will not shrink is read
-    as it is."""
+    a model-sized copy (`REFS_FULL_CHARS`, `_model_copy`).
+
+    Each DISTINCT picture is read once, however often it is named: the
+    backfill references one stored picture twice when a turn carried it
+    twice, and a request may name one id 999 times (QA 2026-10-03: 999 reads
+    of an 8 MiB original and 990 decodes, 135 s before /chat answered)."""
     rows = rows_by_attachment(user_id, conversation_id, attachment_ids)
     loaded: List[str] = []
     missing: List[str] = []
+    read: Dict[Tuple[str, bool], str] = {}
     held = 0
     for attachment_id in attachment_ids:
         if max_chars is not None and held >= max_chars:
             break
-        row = rows.get(attachment_id)
-        data = read_full(row) if row is not None else None
-        if data is None:
-            if attachment_id not in missing:
-                missing.append(attachment_id)
+        if attachment_id in missing:
             continue
-        small = None
-        if full_chars is not None and held >= full_chars:
-            from .engines.vision import FIT_EDGES, shrink_picture
-
-            small = shrink_picture(data, FIT_EDGES[-1])
-        loaded.append(small or _data_url(row, data))
-        held += len(loaded[-1])
+        small = full_chars is not None and held >= full_chars
+        url = read.get((attachment_id, small))
+        if url is None:
+            row = rows.get(attachment_id)
+            url = None if row is None else _model_copy(row) if small else _full_copy(row)
+            if url is None:
+                missing.append(attachment_id)
+                continue
+            read[(attachment_id, small)] = url
+        loaded.append(url)
+        held += len(url)
     return loaded, missing
+
+
+def _full_copy(row: Dict[str, Any]) -> Optional[str]:
+    data = read_full(row)
+    return None if data is None else _data_url(row, data)
+
+
+def _model_copy(row: Dict[str, Any]) -> Optional[str]:
+    """A stored picture past REFS_FULL_CHARS: its thumbnail (THUMB_EDGE px
+    WebP, written beside it when it was stored), read and never decoded, so
+    the per-turn work is a small file read whatever the originals are; the
+    original was decoded and shrunk here before, ~0.14 s for a 16 MP PNG, all
+    before /chat's stream exists. A picture with no thumbnail is shrunk from
+    its original as before: it is small (CONTRACT §3), or, rarely, one whose
+    thumbnail could not be made. A missing original is missing either way."""
+    if row.get("has_thumb") and _file_present(row):
+        try:
+            with open(file_path(row, "thumb"), "rb") as fh:
+                return "data:image/webp;base64," + base64.b64encode(fh.read()).decode("ascii")
+        except OSError:
+            pass  # the thumbnail is gone: from the original, below
+    data = read_full(row)
+    if data is None:
+        return None
+    from .engines.vision import FIT_EDGES, shrink_picture
+
+    return shrink_picture(data, FIT_EDGES[-1]) or _data_url(row, data)
 
 
 async def load_refs(
@@ -1096,6 +1135,20 @@ def _turn_attachment_ids(images: Any, intent_id: Any) -> List[str]:
     if ids or not (isinstance(intent_id, str) and _MINT_INTENT_RE.fullmatch(intent_id)):
         return ids
     return [minted_attachment_id(intent_id, i) for i in range(MAX_FILES)]
+
+
+def _turn_picture_count(
+    user_id: int, conversation_id: str, images: Any, ids: Sequence[str]
+) -> int:
+    """How many pictures a turn carried, the `total` image_memory's follow-up
+    note counts against ("I could see 3 of the 100 pictures"): the ones its
+    `meta.images` names, or, for an `ix-` turn, the rows the server stored
+    under its intent. `_turn_attachment_ids` names all MAX_FILES candidate
+    indexes for such a turn, and counting those told a three-photo follow-up
+    it could see 3 of 999 pictures (the no-limits x store-always merge)."""
+    if _meta_attachment_ids(images):
+        return len(ids)
+    return len(rows_by_attachment(user_id, conversation_id, ids))
 
 
 #: A user message `m` (of conversation `c`) that names stored pictures: by
@@ -1202,18 +1255,15 @@ def _latest_visible_turn_images(
         index, answer = placed
         # The newest picture on the path is the one "the photo" means; if its
         # files are gone, an older one would be the wrong picture.
-        loaded, _missing = _load_refs(
-            user_id,
-            conversation_id,
-            _turn_attachment_ids(row["images"], row["intent_id"]),
-            max_chars,
-        )
+        ids = _turn_attachment_ids(row["images"], row["intent_id"])
+        loaded, _missing = _load_refs(user_id, conversation_id, ids, max_chars)
         if not loaded:
             return None
         return {
             "images": loaded,
             "context": f"{row['content'] or ''}\n{answer}".lower(),
             "turns_after": sum(1 for role, _ in path[index + 1:] if role == "user"),
+            "total": _turn_picture_count(user_id, conversation_id, row["images"], ids),
         }
     return None
 
@@ -1231,9 +1281,10 @@ def latest_turn_images(
 
     {"images": [data URL, ...], "context": question + "\\n" + answer
     (lowercased, as image_memory.remember stores it), "turns_after": user
-    messages after it}, or None. One statement that finds nothing at once for
-    a chat with no stored picture: the EXISTS is evaluated once, before any
-    message is read.
+    messages after it, "total": pictures the turn carried,
+    `_turn_picture_count`}, or None. One
+    statement that finds nothing at once for a chat with no stored picture:
+    the EXISTS is evaluated once, before any message is read.
 
     `visible` is the path the browser sent with the turn (/chat `messages`,
     as (role, content)). When given, only a picture turn ON that path counts,
@@ -1288,6 +1339,7 @@ def latest_turn_images(
         "images": loaded,
         "context": f"{row['content'] or ''}\n{answer or ''}".lower(),
         "turns_after": users_after,
+        "total": _turn_picture_count(int(user_id), conversation_id, row["images"], ids),
     }
 
 
@@ -1473,6 +1525,9 @@ async def _upload(viewer: int, conversation_id: str, form) -> Any:
             _count_write(source, "too_large")
             return _error(413, "too_large", "A picture may be at most 10 MiB.")
         pending[attachment_id] = data
+    if await asyncio.to_thread(_request_pixels, list(pending.values())) > MAX_REQUEST_PIXELS:
+        _count_write(source, "too_large")
+        return _error(413, "too_large", "Send these pictures in smaller batches.")
 
     started = time.monotonic()
     checked: Dict[str, Picture] = {}
@@ -1519,6 +1574,19 @@ async def _upload(viewer: int, conversation_id: str, form) -> Any:
             source=source,
         )
     return {"items": items}
+
+
+def _request_pixels(pictures: List[bytes]) -> int:
+    """The pixels these pictures' headers claim, read before any is decoded:
+    each at most MAX_STORE_PIXELS (`inspect` refuses one over it without
+    decoding it), and that much for a header that names no size."""
+    from .context import _image_dimensions
+
+    total = 0
+    for data in pictures:
+        dims = _image_dimensions(data)
+        total += min(dims[0] * dims[1], MAX_STORE_PIXELS) if dims else MAX_STORE_PIXELS
+    return total
 
 
 def _list_for(viewer: int, conversation_id: str) -> Optional[List[Dict[str, Any]]]:
