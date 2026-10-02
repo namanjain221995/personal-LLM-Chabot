@@ -2932,6 +2932,21 @@ def _expand_archive(root: str, path: str, name: str) -> tuple[list, list, str]:
     return docs, images, "\n".join(lines)
 
 
+async def _kept_document(conversation_id: str, upload_id: str) -> Optional[tuple[str, str]]:
+    """(name, path) of an upload's lasting copy when THIS conversation's
+    uploads row names it and the copy is on disk, else None."""
+    from . import uploads
+
+    rows = await db.run_in_thread(db.get_uploads, conversation_id)
+    row = next((u for u in rows if u["id"] == upload_id), None)
+    if row is None:
+        return None
+    kept = await asyncio.to_thread(uploads.lasting_file, conversation_id, upload_id)
+    if kept is None:
+        return None
+    return os.path.basename(str(row.get("filename") or "")) or "document", str(kept)
+
+
 async def _resolve_document_refs(
     request: "ChatRequest", conversation_id: Optional[str]
 ) -> tuple[list, list, Optional[str]]:
@@ -2965,28 +2980,38 @@ async def _resolve_document_refs(
             files = [e for e in os.scandir(original) if e.is_file()]
         except OSError:
             files = []
-        if len(files) != 1:
-            name = str((ref or {}).get("name") or "an attached document")
-            return [], [], (
-                f"{name} is no longer available on the server "
-                "(uploads are swept after their TTL) — please re-attach it."
-            )
-        entry = files[0]
-        lower = entry.name.lower()
+        if len(files) == 1:
+            entry_name, entry_path = files[0].name, files[0].path
+        else:
+            # The workspace TTL swept `_original`. A document's LASTING copy
+            # (CHAT_FILES_DIR, docs/chat-media/CONTRACT.md §9) is kept for the
+            # life of the chat and the file route serves it, so a regenerate,
+            # edit or retry of an older turn reads it too. Scoped by this
+            # conversation's uploads row; the row's name decides the type,
+            # since the copy itself is named `original`.
+            kept = await _kept_document(conversation_id, upload_id)
+            if kept is None:
+                name = str((ref or {}).get("name") or "an attached document")
+                return [], [], (
+                    f"{name} is no longer available on the server "
+                    "(uploads are swept after their TTL) — please re-attach it."
+                )
+            entry_name, entry_path = kept
+        lower = entry_name.lower()
         is_archive = lower.endswith((".zip", ".tar", ".tar.gz", ".tgz")) or \
-            archive.is_zip_container(entry.path)
+            archive.is_zip_container(entry_path)
         if is_archive and not lower.endswith((".docx", ".xlsx")):
             # .docx/.xlsx ARE zip containers; sniffing alone would unzip a
             # Word file into its XML skeleton. The extension decides those.
             try:
                 more_docs, more_images, manifest = await asyncio.to_thread(
-                    _expand_archive, root, entry.path, entry.name
+                    _expand_archive, root, entry_path, entry_name
                 )
             except archive.ArchiveError as exc:
-                return [], [], f"{entry.name} could not be opened: {exc}"
+                return [], [], f"{entry_name} could not be opened: {exc}"
             docs.append(
                 (
-                    f"{entry.name} (archive contents)",
+                    f"{entry_name} (archive contents)",
                     _b64.b64encode(manifest.encode("utf-8")).decode("ascii"),
                 )
             )
@@ -3003,7 +3028,7 @@ async def _resolve_document_refs(
                 cached = await asyncio.to_thread(
                     load_document_cache,
                     root,
-                    entry.name,
+                    entry_name,
                     effort=request.effort,
                     question=request.text or "",
                 )
@@ -3012,9 +3037,9 @@ async def _resolve_document_refs(
             if cached is not None:
                 docs.append(cached)
                 continue
-            with open(entry.path, "rb") as fh:
+            with open(entry_path, "rb") as fh:
                 raw = fh.read()
-            docs.append((entry.name, _b64.b64encode(raw).decode("ascii")))
+            docs.append((entry_name, _b64.b64encode(raw).decode("ascii")))
     if request.pdf_data:
         docs.append((request.pdf_filename, request.pdf_data))
     return docs, images, None
@@ -3951,6 +3976,10 @@ async def _upload_session_sweep_loop() -> None:
             swept = await asyncio.to_thread(uploads.sweep_expired_upload_sessions)
             if swept:
                 logging.getLogger(__name__).info("swept %d expired upload session(s)", swept)
+            # The lasting-copy reaper (docs/chat-media/CONTRACT.md §8-9) rides
+            # this timer and never an upload request; it throttles itself to
+            # CHAT_MEDIA_REAP_INTERVAL_S and never raises.
+            await asyncio.to_thread(uploads.maybe_reap_lasting_files)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -4259,7 +4288,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # First message of a NEW conversation: claim the id for this user
             # before any side-table row is written under it, closing the
             # pre-seeding hole (nobody else can later create-and-inherit it).
-            if not _CONVERSATION_ID_RE.match(request.conversation_id):
+            if not _CONVERSATION_ID_RE.fullmatch(request.conversation_id):
                 raise HTTPException(status_code=422, detail="invalid conversation id")
             title = (request.text or "New chat").strip()[:80] or "New chat"
             try:

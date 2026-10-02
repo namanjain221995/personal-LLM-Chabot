@@ -259,7 +259,7 @@ def create_conversation(
     body: ConversationIn, user: UserRow = Depends(require_user)
 ) -> dict:
     conversation_id = body.id or uuid.uuid4().hex
-    if not _CONVERSATION_ID_RE.match(conversation_id):
+    if not _CONVERSATION_ID_RE.fullmatch(conversation_id):
         raise HTTPException(
             status_code=400,
             detail="conversation id must be 1-64 characters from A-Z a-z 0-9 _ -",

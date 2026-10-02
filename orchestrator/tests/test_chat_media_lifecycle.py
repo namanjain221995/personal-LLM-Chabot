@@ -249,9 +249,14 @@ def test_an_admin_reads_a_members_picture_audited_and_never_a_super_admins(login
     owner = bob.get("/chat-media/conv-bob/att-00000001")
     for header in (
         "content-type", "x-content-type-options", "content-security-policy",
-        "content-disposition", "cache-control", "etag",
+        "content-disposition", "etag",
     ):
         assert resp.headers[header] == owner.headers[header], header
+    # Never the member's year-long immutable cache: a cached copy would be
+    # shown again with no request and so with no audit row (security
+    # 2026-10-02). The Next admin proxy relays this header.
+    assert owner.headers["cache-control"] == "private, max-age=31536000, immutable"
+    assert resp.headers["cache-control"] == "private, no-store"
     rows = _audit_rows()
     assert len(rows) == 1
     assert rows[0]["actor_user_id"] == _uid("adm")
@@ -265,15 +270,20 @@ def test_an_admin_reads_a_members_picture_audited_and_never_a_super_admins(login
         _admin_path(_uid("bob"), "conv-bob"), headers={"If-None-Match": f'"{item["sha256"]}"'}
     )
     assert again.status_code == 304
+    assert again.headers["cache-control"] == "private, no-store"
     assert len(_audit_rows()) == 2
+    # A second plain view is a second request and a second audit row.
+    third = admin.get(_admin_path(_uid("bob"), "conv-bob"))
+    assert third.status_code == 200 and third.headers["cache-control"] == "private, no-store"
+    assert len(_audit_rows()) == 3
     # Nothing there: a 404 and no event.
     assert admin.get(_admin_path(_uid("bob"), "conv-bob", "att-nothing-here")).status_code == 404
     assert admin.get(_admin_path(_uid("bob"), "conv-boss")).status_code == 404
-    assert len(_audit_rows()) == 2
+    assert len(_audit_rows()) == 3
 
     # Owner decision 2026-09-14: a super admin inspects every member.
     assert boss.get(_admin_path(_uid("bob"), "conv-bob", size="thumb")).status_code == 200
-    assert len(_audit_rows()) == 3
+    assert len(_audit_rows()) == 4
 
 
 # ----------------------------------------------------------------- sharing --

@@ -1270,6 +1270,10 @@ async def member_chat_media(
             resource_id=row["media_id"],
             meta={"conversation_id": conversation_id, "size": size},
         )
+    # Never the member route's year-long immutable caching: a picture the
+    # admin's browser kept would be shown again with no request, so with no
+    # audit row. The recordings rail's rule (audio_api.py).
+    response.headers["Cache-Control"] = "private, no-store"
     return response
 
 

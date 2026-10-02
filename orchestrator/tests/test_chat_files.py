@@ -472,19 +472,197 @@ def test_a_database_error_stops_the_pass_and_removes_nothing(monkeypatch):
     assert os.path.exists(orphan)
 
 
-def test_the_session_sweep_runs_the_reaper_at_most_once_per_interval(monkeypatch):
-    """main.py's ten-minute upload-session sweep is what runs the reaper;
-    it throttles itself to CHAT_MEDIA_REAP_INTERVAL_S."""
+def test_the_reaper_runs_at_most_once_per_interval(monkeypatch):
+    """It throttles itself to CHAT_MEDIA_REAP_INTERVAL_S."""
     grace = float(settings.chat_media_orphan_grace_h) * 3600.0 + 600
     monkeypatch.setattr(up, "_LASTING_REAP_DUE", 0.0)
     first = os.path.join(settings.chat_files_dir, "conv-gone", "e" * 32)
     os.makedirs(first)
     _age(settings.chat_files_dir, grace)
-    up.sweep_expired_upload_sessions()
+    up.maybe_reap_lasting_files()
     assert not os.path.exists(first)
 
     second = os.path.join(settings.chat_files_dir, "conv-gone-too", "f" * 32)
     os.makedirs(second)
     _age(settings.chat_files_dir, grace)
-    up.sweep_expired_upload_sessions()
+    up.maybe_reap_lasting_files()
     assert os.path.exists(second)  # inside the interval: no second pass
+
+
+def _aged_orphan() -> str:
+    orphan = os.path.join(settings.chat_files_dir, "conv-gone", "e" * 32)
+    os.makedirs(orphan)
+    _age(settings.chat_files_dir, float(settings.chat_media_orphan_grace_h) * 3600.0 + 600)
+    return orphan
+
+
+def test_an_upload_request_never_runs_the_reaper(alice, monkeypatch):
+    """QA 2026-10-02: the reaper rode sweep_expired_upload_sessions, which
+    POST /uploads and chunked init also await (_sweep_quietly), so one
+    person's upload paid for a pass over every chat with files (1.2 s at
+    3000 chats). A due pass must now wait for the background loop."""
+    monkeypatch.setattr(up, "_LASTING_REAP_DUE", 0.0)
+    orphan = _aged_orphan()
+    conv = _chat(alice, "conv-upload-no-reap")
+    monkeypatch.setattr(up, "_last_sweep_at", 0.0)
+    _upload(alice, conv, "contract.pdf", PDF, "document", "application/pdf")
+    monkeypatch.setattr(up, "_last_sweep_at", 0.0)
+    resp = alice.post(
+        "/uploads/chunked/init",
+        data={"conversation_id": conv, "filename": "big.pdf", "purpose": "document"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert os.path.exists(orphan)
+    assert up._LASTING_REAP_DUE == 0.0  # still due: no request took the pass
+
+
+def test_the_background_sweep_loop_runs_the_reaper(monkeypatch):
+    import asyncio
+    import contextlib
+
+    from app import main
+
+    monkeypatch.setattr(up, "_LASTING_REAP_DUE", 0.0)
+    monkeypatch.setattr(main, "_UPLOAD_SWEEP_INTERVAL_S", 0.0)
+    orphan = _aged_orphan()
+
+    async def one_pass():
+        task = asyncio.create_task(main._upload_session_sweep_loop())
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            if not os.path.exists(orphan):
+                break
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(one_pass())
+    assert not os.path.exists(orphan)
+
+
+# ------------------------------------------- everything else that reads a file --
+
+
+def test_the_upload_list_reports_a_kept_file_as_ready(alice):
+    """QA 2026-10-02: GET /uploads/{conv} said `expired` from the workspace
+    copy alone, and the workbook preview printed "no longer stored" over a
+    file the download route served."""
+    conv = _chat(alice, "conv-list")
+    table = _upload(alice, conv, "sales.csv", CSV, "dataset", "text/csv")
+    _sweep(conv, table)
+
+    def status() -> str:
+        rows = alice.get(f"/uploads/{conv}").json()["uploads"]
+        return next(u for u in rows if u["id"] == table)["status"]
+
+    assert status() == "ready"
+    shutil.rmtree(os.path.dirname(_lasting(conv, table)))
+    assert status() == "expired"
+
+
+def _resolve(conv: str, refs: list):
+    import asyncio
+    import types
+
+    from app import main
+
+    request = types.SimpleNamespace(
+        pdf_uploads=refs, pdf_data=None, pdf_filename=None, effort="think", text="what does it say?"
+    )
+    return asyncio.run(main._resolve_document_refs(request, conv))
+
+
+def test_a_resent_document_reads_its_lasting_copy(alice, login_client):
+    """QA 2026-10-02: a regenerate, edit or retry of a document turn older
+    than the workspace TTL resends the document by reference, and was told
+    "<name> is no longer available on the server" while the copy was kept."""
+    import base64
+
+    conv = _chat(alice, "conv-resend")
+    document = _upload(alice, conv, "contract.pdf", PDF, "document", "application/pdf")
+    bundle = _upload(
+        alice, conv, "bundle.zip", _zip({"notes.txt": b"hello from the archive"}),
+        "document", "application/zip",
+    )
+    _sweep(conv, document)
+    _sweep(conv, bundle)
+
+    docs, images, error = _resolve(conv, [{"upload_id": document, "name": "renamed.pdf"}])
+    assert error is None, error
+    assert docs == [("contract.pdf", base64.b64encode(PDF).decode("ascii"))]  # the row's name
+
+    docs, images, error = _resolve(conv, [{"upload_id": bundle, "name": "bundle.zip"}])
+    assert error is None, error
+    names = [d[0] for d in docs]
+    assert names[0] == "bundle.zip (archive contents)"
+    assert any("notes.txt" in n for n in names[1:])
+
+    # Scoped by THIS conversation's row: another chat's id names nothing,
+    # and with no lasting copy the old sentence stands.
+    bob = login_client("bob")
+    _chat(bob, "conv-bob")
+    _, _, error = _resolve("conv-bob", [{"upload_id": document, "name": "contract.pdf"}])
+    assert error and "no longer available" in error
+    shutil.rmtree(os.path.dirname(_lasting(conv, document)))
+    _, _, error = _resolve(conv, [{"upload_id": document, "name": "contract.pdf"}])
+    assert error and "no longer available" in error
+
+
+@pytest.mark.parametrize("name", [".env", "notes\\v2.txt"])
+def test_a_kept_file_whose_name_the_resolver_refuses_is_served(alice, name):
+    """QA 2026-10-02: a leading dot or a backslash is accepted at upload,
+    but the name-based path resolver refused it and the route answered 404
+    while My files offered the download. The lasting copy never needs the
+    name."""
+    conv = _chat(alice, "conv-odd-name")
+    payload = b"KEY=value\n"
+    upload_id = _upload(alice, conv, name, payload, "document", "text/plain")
+    got = alice.get(f"/uploads/{conv}/{upload_id}/file")
+    assert got.status_code == 200, got.text
+    assert got.content == payload
+    assert got.headers["content-disposition"].startswith("attachment")
+    # With no lasting copy it stays the 404 it always was.
+    shutil.rmtree(os.path.dirname(_lasting(conv, upload_id)))
+    assert alice.get(f"/uploads/{conv}/{upload_id}/file").status_code == 404
+
+
+@pytest.mark.parametrize(
+    "sent, stored",
+    [
+        ("..", "upload.bin"),
+        ("dir/", "upload.bin"),
+        ("x" * 300 + ".pdf", "x" * 236 + ".pdf"),
+        ("न" * 100 + ".pdf", "न" * 78 + ".pdf"),  # 3 bytes each: 234 + 4
+    ],
+)
+def test_odd_upload_names_are_stored_not_a_500(alice, sent, stored):
+    """QA 2026-10-02 (already true before the lasting copies): "..", "dir/"
+    and a name over 255 bytes raised inside _stream_to_disk (500); on the
+    chunked rail a name over 244 bytes failed at `<name>.assembling`."""
+    conv = _chat(alice, "conv-names")
+    upload_id = _upload(alice, conv, sent, PDF, "document", "application/pdf")
+    row = next(u for u in db.get_uploads(conv) if u["id"] == upload_id)
+    assert row["filename"] == stored
+    assert len(stored.encode("utf-8") + b".assembling") <= 255
+    chunked = _chunked(alice, conv, sent, PDF, "document")
+    row = next(u for u in db.get_uploads(conv) if u["id"] == chunked)
+    assert row["filename"] == stored
+    assert alice.get(f"/uploads/{conv}/{chunked}/file").content == PDF
+
+
+def test_a_conversation_id_with_a_trailing_newline_is_refused(alice):
+    """Security 2026-10-02: `^...$` with re.match admits "conv\n", so an id
+    could be claimed whose workspace copy (sanitised name) and lasting copy
+    (raw name) live under different names, and which the reaper
+    (fullmatch) never collects."""
+    resp = alice.post(
+        "/uploads",
+        files={"file": ("a.pdf", PDF, "application/pdf")},
+        data={"conversation_id": "conv-nl\n", "purpose": "document"},
+    )
+    assert resp.status_code == 422, resp.text
+    resp = alice.post("/history/conversations", json={"id": "conv-nl\n", "title": "x"})
+    assert resp.status_code == 400, resp.text
+    assert db.conversation_owner("conv-nl\n") is None
+    assert up.lasting_path("conv-nl\n", "a" * 32) is None
+    assert up.erase_conversation_files("conv-nl\n") is False

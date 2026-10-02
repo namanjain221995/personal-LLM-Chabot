@@ -58,7 +58,7 @@ def lasting_path(conversation_id: str, upload_id: str) -> Optional[str]:
     §9), or None for an id that cannot name one. Both ids are checked against
     their shapes before they become path components, so nothing outside
     CHAT_FILES_DIR can be named."""
-    if not _CONVERSATION_ID_RE.match(conversation_id or ""):
+    if not _CONVERSATION_ID_RE.fullmatch(conversation_id or ""):
         return None
     if not _HEX32.fullmatch(upload_id or ""):
         return None
@@ -189,7 +189,7 @@ def erase_conversation_files(conversation_id: str) -> bool:
     """
     from . import metrics
 
-    if not _CONVERSATION_ID_RE.match(conversation_id or ""):
+    if not _CONVERSATION_ID_RE.fullmatch(conversation_id or ""):
         return False
     paths = (
         os.path.join(settings.chat_files_dir, conversation_id),
@@ -223,6 +223,30 @@ def bytes_available(conversation_id: str, upload_id: str) -> bool:
     """True while the extracted files still exist (TTL has not swept them)."""
     root = upload_root(conversation_id, upload_id)
     return os.path.isdir(root) and any(os.scandir(root))
+
+
+#: The longest stored file name, in bytes: Linux's NAME_MAX (255) less room
+#: for the chunked rail's `<name>.assembling` temp file (_assemble).
+_NAME_MAX_BYTES = 240
+
+
+def _upload_filename(raw: Optional[str]) -> str:
+    """The name an upload is stored under: the basename of what the browser
+    sent, made safe for the filesystem. An empty name, "." or ".." (a
+    `dir/` or `..` upload landed on the directory itself) becomes
+    "upload.bin"; a name over _NAME_MAX_BYTES (ENAMETOOLONG) keeps its
+    extension and loses the end of its stem. Until this both answered 500."""
+    name = os.path.basename(raw or "")
+    if name in ("", ".", ".."):
+        return "upload.bin"
+    if len(name.encode("utf-8", "surrogateescape")) > _NAME_MAX_BYTES:
+        stem, ext = os.path.splitext(name)
+        if len(ext.encode("utf-8", "surrogateescape")) > 32:
+            stem, ext = name, ""
+        budget = _NAME_MAX_BYTES - len(ext.encode("utf-8", "surrogateescape"))
+        stem = stem.encode("utf-8", "surrogateescape")[:budget].decode("utf-8", "ignore")
+        name = (stem or "upload") + ext
+    return name
 
 
 async def _stream_to_disk(upload: UploadFile, dest: str) -> int:
@@ -376,7 +400,7 @@ async def _create_upload_from_form(request: Request, form, user: UserRow) -> dic
 
     upload_id = uuid.uuid4().hex
     root = upload_root(conversation_id, upload_id)
-    filename = os.path.basename(file.filename or "upload.bin")
+    filename = _upload_filename(file.filename)
     raw_path = os.path.join(root, "_original", filename)
 
     try:
@@ -623,9 +647,15 @@ async def download_upload(
             settings.workspace_dir, conversation_id, upload_id, filename
         )
     except UploadPathError:
-        # A malformed id cannot name a real row, so this is effectively
-        # unreachable — and it stays a 404 rather than leaking the distinction.
-        raise HTTPException(status_code=404, detail="upload not found")
+        # Both ids are a real row's, so only the NAME can be refused here: a
+        # leading dot (".env") or a backslash, which the upload itself
+        # accepts. The lasting copy is named `original` and never needs the
+        # name, so it serves such a file; without one this stays the 404 it
+        # always was.
+        stored = await kept_original(conversation_id, upload_id, row.get("notes"))
+        if stored is None:
+            raise HTTPException(status_code=404, detail="upload not found")
+        path = stored
 
     if not path.is_file():
         # DOCUMENTS keep their bytes in `_original`, not `extracted` — the
@@ -673,7 +703,9 @@ async def download_upload(
     # If-Range), which the <video>/<audio> players need to seek; pinned in
     # tests/test_chat_files.py.
     media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    return FileResponse(path, filename=filename, media_type=media_type)
+    return FileResponse(
+        path, filename=os.path.basename(filename) or "download", media_type=media_type
+    )
 
 
 async def _video_source(conversation_id: str, upload_id: str):
@@ -757,9 +789,15 @@ def list_uploads(
     if owner is None or owner != int(user["id"]):
         raise HTTPException(status_code=404, detail="conversation not found")
     uploads = db.get_uploads(conversation_id)
-    # Report expiry rather than pretending the bytes are still there.
+    # Report expiry rather than pretending the bytes are still there. A
+    # lasting copy (CONTRACT §9) is the bytes still being there: the file
+    # route serves it, so the workbook preview must not call it gone.
     for up in uploads:
-        if up["status"] == "ready" and not bytes_available(conversation_id, up["id"]):
+        if (
+            up["status"] == "ready"
+            and not bytes_available(conversation_id, up["id"])
+            and lasting_file(conversation_id, up["id"]) is None
+        ):
             up["status"] = "expired"
     return {"uploads": uploads}
 
@@ -854,7 +892,7 @@ async def _own(conversation_id: str, user: UserRow) -> None:
         raise HTTPException(status_code=422, detail="invalid conversation id")
     owner = await db.run_in_thread(db.conversation_owner, conversation_id)
     if owner is None:
-        if not _CONVERSATION_ID_RE.match(conversation_id or ""):
+        if not _CONVERSATION_ID_RE.fullmatch(conversation_id or ""):
             raise HTTPException(status_code=422, detail="invalid conversation id")
         try:
             await db.run_in_thread(
@@ -1184,7 +1222,7 @@ async def chunked_init(
     session = await db.run_in_thread(
         db.create_upload_session,
         upload_id, int(user["id"]), conversation_id,
-        os.path.basename(filename or "upload.bin"), purpose,
+        _upload_filename(filename), purpose,
         expected_bytes=size, expected_parts=parts, part_size=part_size,
         ttl_hours=settings.upload_session_ttl_hours,
     )
@@ -1438,7 +1476,7 @@ async def _finalise_session(conversation_id: str, upload_id: str, user: UserRow)
     if session is None:
         raise HTTPException(status_code=404, detail="upload not found")
     purpose = session["purpose"]
-    filename = os.path.basename(session["filename"] or "upload.bin")
+    filename = _upload_filename(session["filename"])
     root = upload_root(conversation_id, upload_id)
     present = await asyncio.to_thread(_present_parts, session, root)
 
@@ -1589,9 +1627,10 @@ def sweep_expired_upload_sessions(limit: int = 50) -> int:
         )
         _count_session(str(session["purpose"]), "expired")
         swept += 1
-    # The lasting-copy reaper rides this timer (main.py runs it every ten
-    # minutes from start-up) and throttles itself to its own interval.
-    maybe_reap_lasting_files()
+    # NOT the lasting-copy reaper: this function also runs inside upload
+    # requests (_sweep_quietly), and a reaper pass is one query per chat
+    # directory (1.2 s for 3000 chats, paid by one person's upload). main.py's
+    # _upload_session_sweep_loop runs maybe_reap_lasting_files after this.
     return swept
 
 
@@ -1604,7 +1643,8 @@ def sweep_expired_upload_sessions(limit: int = 50) -> int:
 # also covers the moment between a copy and its uploads row.
 
 #: time.monotonic() before which this process runs no further pass; 0 means
-#: the first session sweep (ten minutes after start-up) runs one.
+#: the first pass of main.py's upload-session sweep loop (ten minutes after
+#: start-up) runs one. Never called from a request.
 _LASTING_REAP_DUE = 0.0
 
 
