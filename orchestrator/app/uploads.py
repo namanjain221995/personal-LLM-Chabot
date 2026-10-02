@@ -456,6 +456,18 @@ async def download_upload(
         if original.is_file():
             path = original
 
+    if not path.is_file() and row.get("notes") == "video":
+        # A VIDEO (or an audio file on the video rail) is also hard-linked into
+        # the analysis store, where it stays while any chat links it
+        # (video/store.adopt_source). The workspace copy is swept after
+        # WORKSPACE_TTL_HOURS, and until 2026-09-30 this route then answered
+        # 410 for bytes that were still on disk. Ownership and the
+        # (conversation, upload) scoping were settled above; the link row is
+        # looked up by that same pair.
+        stored = await _video_source(conversation_id, upload_id)
+        if stored is not None:
+            path = stored
+
     if not path.is_file():
         # Two ways to get here, and the user can act on both the same way.
         # Either the workspace TTL swept the files, or this upload was a
@@ -475,6 +487,28 @@ async def download_upload(
     # frontend for every response it proxies).
     media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return FileResponse(path, filename=filename, media_type=media_type)
+
+
+async def _video_source(conversation_id: str, upload_id: str):
+    """The analysis store's copy of a video upload (a Path), or None.
+
+    Only ever called for a row the video rail wrote (`notes == 'video'`) and
+    only after the caller's ownership was checked, so this can trust the pair
+    it is given; the store resolves nothing outside VIDEO_DATA_DIR/<sha256>.
+    """
+    from pathlib import Path
+
+    from .video import store
+
+    link = await db.run_in_thread(db.get_video_by_upload, conversation_id, upload_id)
+    content_hash = (link or {}).get("content_hash")
+    if not content_hash:
+        return None
+    try:
+        found = await asyncio.to_thread(store.source_path, content_hash)
+    except (OSError, ValueError):
+        return None
+    return Path(found) if found else None
 
 
 #: How much extracted document text a preview may pull. A 300-page PDF's text

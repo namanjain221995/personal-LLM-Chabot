@@ -6,8 +6,10 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import {
+  PLAYBACK_MESSAGES,
   appendPage,
   deleteRecording,
+  diagnosePlayback,
   loadTranscript,
   parseRecordingPage,
   recordingsListUrl,
@@ -219,5 +221,36 @@ describe('loadTranscript', () => {
       kind: 'failed',
       message: 'This recording is no longer on the server. It was discarded or has expired.',
     });
+  });
+});
+
+describe('diagnosePlayback', () => {
+  it('asks for one byte and names the reason a player failed', async () => {
+    const cases: [Response | Error, string][] = [
+      [new Response(new Uint8Array([1]), { status: 206 }), 'format'],
+      [new Response(new Uint8Array([1, 2, 3]), { status: 200 }), 'format'],
+      [reply({ detail: 'x', reason: 'archive_unavailable', retry_after_s: 30 }, 503), 'archive_unavailable'],
+      [reply({ detail: 'x', reason: 'archive_busy', retry_after_s: 5 }, 503), 'archive_busy'],
+      [reply({ detail: 'x', reason: 'audio_missing' }, 410), 'audio_missing'],
+      [reply({ detail: 'x', reason: 'audio_deleted' }, 410), 'deleted'],
+      [reply({ detail: 'x', reason: 'not_found' }, 404), 'deleted'],
+      [reply({ detail: 'x', reason: 'storage_unavailable' }, 503), 'unknown'],
+      [new TypeError('Failed to fetch'), 'unknown'],
+    ];
+    for (const [answer, expected] of cases) {
+      const fetchImpl = fetchOnce(answer);
+      expect(await diagnosePlayback(fetchImpl, ID)).toBe(expected);
+      const [url, init] = (fetchImpl as unknown as { mock: { calls: [string, RequestInit][] } }).mock.calls[0]!;
+      expect(url).toBe(`/api/audio/sessions/${ID}/audio`);
+      expect(new Headers(init.headers).get('range')).toBe('bytes=0-0');
+    }
+  });
+
+  it('has a sentence for every reason, and the archive one says nothing is lost', () => {
+    for (const reason of ['format', 'archive_unavailable', 'archive_busy', 'audio_missing', 'deleted', 'unknown'] as const) {
+      expect(PLAYBACK_MESSAGES[reason].length).toBeGreaterThan(20);
+    }
+    expect(PLAYBACK_MESSAGES.archive_unavailable).toContain('Nothing is lost');
+    expect(PLAYBACK_MESSAGES.archive_busy).toContain('Nothing is lost');
   });
 });

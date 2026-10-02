@@ -343,6 +343,11 @@ SPECULATIVE_EMBED_WASTE_REASONS = frozenset(
     {"refetch_empty", "load_failed", "cancelled"}
 )
 
+#: app/myfiles.py: the two reads (GET /files/mine and /files/mine/summary)
+#: and how each ended. A malformed query is `bad_request`, not a failure.
+MYFILES_VIEWS = frozenset({"list", "summary"})
+MYFILES_RESULTS = frozenset({"ok", "bad_request", "error"})
+
 _ROUTE_EFFORT = {"route": set(CHAT_ROUTES), "effort": set(CHAT_EFFORTS)}
 
 #: metric -> {label name: closed value set}. Only these label NAMES survive.
@@ -379,6 +384,10 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
         "plan": set(DECIDE_PLANS),
         "outcome": set(STEP_OUTCOMES),
     },
+    # My files (app/myfiles.py, 2026-09-30): which read, and how it ended.
+    # Never a file name, a user or a query — those are the person's content.
+    "myfiles_list_seconds": {"view": set(MYFILES_VIEWS)},
+    "myfiles_list_total": {"view": set(MYFILES_VIEWS), "result": set(MYFILES_RESULTS)},
     # Engine first token to the SSE write that carries it — the part of the
     # 105 -> 88 tok/s relay loss that is time, not throughput.
     "relay_overhead_seconds": dict(_ROUTE_EFFORT),
@@ -393,6 +402,25 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
         "category": set(FAST_LANE_CATEGORIES),
         "veto": set(FAST_LANE_VETOES),
     },
+    # The voice archive (app/voice_archive.py, 2026-09-30). Literal here so
+    # this module imports nothing; tests/test_voice_archive.py pins these to
+    # voice_archive.ERROR_REASONS / PROXY_RESULTS / RESTORE_RESULTS /
+    # RECONCILE_RESULTS. No id, user or path is ever a label.
+    "voice_archive_errors_total": {"reason": {
+        "unreachable", "timeout", "tls", "auth", "storage_full", "busy", "conflict",
+        "remote_sha_mismatch", "missing", "http_4xx", "http_5xx",
+        "local_missing", "local_size_mismatch", "local_sha_mismatch", "local_unreadable", "remote_missing",
+    }},
+    "voice_archive_proxy_total": {"result": {
+        "ok", "partial", "not_satisfiable", "bad_request", "busy", "unavailable", "missing",
+    }},
+    "voice_archive_restored_total": {"result": {
+        "restored", "held", "unavailable", "missing", "mismatch", "no_space", "deleted",
+    }},
+    "voice_archive_reconcile_total": {"result": {
+        "orphan_quarantined", "orphan_waiting", "other_owner", "unowned",
+        "deleted_row_purged", "repaired", "remote_missing", "foreign",
+    }},
 }
 _ALLOWED_BY_METRIC.update(_LABELS_BY_METRIC)
 

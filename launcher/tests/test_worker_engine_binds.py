@@ -121,6 +121,104 @@ class WorkerEngineBindTests(unittest.TestCase):
                     self.assertEqual(result.stdout, "", "nothing may be printed as a bind address")
                     self.assertIn("enP7s7", result.stderr)
 
+    def test_the_voice_archive_store_binds_the_management_address_the_orchestrator_dials(self) -> None:
+        # The head orchestrator dials https://192.168.9.68:30011 (VOICE_ARCHIVE_URL,
+        # written by the same script) and the certificate's IP SAN is this
+        # address. Worker only: nothing new runs on the head.
+        result = self._bind_address(
+            "voice-store.sh", "voice_store_bind_address", "worker",
+            VOICE_STORE_MANAGEMENT_IFNAME="enP7s7", CLUSTER_WORKER_IP=RAIL_ADDRESS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, MANAGEMENT_LAN_ADDRESS)
+        self.assertIn("enP7s7", self.ssh_log.read_text(encoding="utf-8"), "the address is read from the management interface")
+
+    def test_the_voice_archive_store_never_binds_nothing_everything_or_the_fabric(self) -> None:
+        for answer in ("", "0.0.0.0", "::", "[::]", RAIL_ADDRESS, "10.100.185.2"):
+            with self.subTest(ssh_answer=answer):
+                result = self._bind_address(
+                    "voice-store.sh", "voice_store_bind_address", "worker",
+                    VOICE_STORE_MANAGEMENT_IFNAME="enP7s7", FAKE_SSH_ANSWER=answer,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout, "", "nothing may be printed as a bind address")
+                self.assertIn("enP7s7", result.stderr)
+
+    def test_a_candidate_voice_store_never_rewrites_the_production_stores_compose_file(self) -> None:
+        # lib/cluster-common.sh sets WORKER_REMOTE_DIR itself, so a candidate
+        # that took its directory from it ran `docker compose` out of, and
+        # copied its compose file over, the production store's
+        # ~/.techsara-cluster/compose.voice-store.yaml (candidate run,
+        # 2026-09-30). The whole script runs here, every ssh call recorded.
+        def compose_dirs(*args: str, **env: str) -> list[str]:
+            if self.ssh_log.exists():
+                self.ssh_log.unlink()
+            result = subprocess.run(
+                ["bash", str(SCRIPTS / "voice-store.sh"), "down", *args],
+                env={
+                    "PATH": self.path,
+                    "HOME": str(self.root),
+                    "CLUSTER_MODE": "dual",
+                    "CLUSTER_WORKER_SSH": f"techsphere@{MANAGEMENT_LAN_ADDRESS}",
+                    **env,
+                },
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            log = self.ssh_log.read_text(encoding="utf-8")
+            return re.findall(r"-- cd (\S+) && .*docker compose", log)
+
+        self.assertEqual(compose_dirs(), ["$HOME/.techsara-cluster"])
+        self.assertEqual(
+            compose_dirs("--candidate", VOICE_STORE_PORT="30195"),
+            ["$HOME/.techsara-cluster/candidates/voice-store-candidate"],
+        )
+        self.assertEqual(
+            compose_dirs("--candidate", VOICE_STORE_PORT="30195", VOICE_STORE_PROJECT="trackb-voice-store"),
+            ["$HOME/.techsara-cluster/candidates/trackb-voice-store"],
+        )
+
+    def test_a_rotated_voice_archive_token_never_appears_on_a_command_line(self) -> None:
+        # /proc/<pid>/cmdline is readable by every user of the head (no
+        # hidepid), and rotate-token put the new token there: `sed -i
+        # "s|...|VOICE_ARCHIVE_TOKEN=${new}|"` (review 2026-09-30). It goes
+        # through stdin now, like the worker's copy. The function runs here
+        # with a python3 on PATH that records its own arguments.
+        script = SCRIPTS / "voice-store.sh"
+        self.assertNotRegex(script.read_text(encoding="utf-8"), r"sed -i[^\n]*\$\{?new")
+        real_python = shutil.which("python3")
+        self.assertIsNotNone(real_python)
+        argv_log = self.root / "argv.log"
+        shim = self.root / "bin" / "python3"
+        shim.write_text(
+            f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{argv_log}"\nexec "{real_python}" "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        secrets_env = self.root / "secrets.env"
+        secrets_env.write_text("# kept\nOTHER=1\nVOICE_ARCHIVE_TOKEN=old-token-" + "c" * 40 + "\n", encoding="utf-8")
+        secrets_env.chmod(0o600)
+        token = "new-token-" + "d" * 40  # low entropy: secret scanners flag random-looking literals
+        program = "\n".join([
+            "set -euo pipefail",
+            _function_source(script, "set_secret"),
+            'printf "%s" "$TOKEN_UNDER_TEST" | set_secret "$1" VOICE_ARCHIVE_TOKEN',
+        ])
+        result = subprocess.run(
+            ["bash", "-c", program, "set-secret-test", str(secrets_env)],
+            env={"PATH": self.path, "HOME": str(self.root), "TOKEN_UNDER_TEST": token},
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(secrets_env.read_text(encoding="utf-8"), f"# kept\nOTHER=1\nVOICE_ARCHIVE_TOKEN={token}\n")
+        self.assertEqual(secrets_env.stat().st_mode & 0o777, 0o600)
+        arguments = argv_log.read_text(encoding="utf-8")
+        self.assertIn("VOICE_ARCHIVE_TOKEN", arguments, "python3 did the replacement")
+        self.assertNotIn(token, arguments)
+        self.assertEqual([p.name for p in self.root.iterdir() if p.name.startswith(".secrets.")], [])
+
     def test_the_head_engines_still_bind_the_docker_bridge_gateway(self) -> None:
         for script, function in (("ocr.sh", "ocr_bind_address"), ("whisper.sh", "whisper_bind_address")):
             with self.subTest(script=script):

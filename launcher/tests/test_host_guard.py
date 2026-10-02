@@ -318,7 +318,9 @@ class HostGuardTests(unittest.TestCase):
     # -- the worker's ruleset --------------------------------------------------
     def test_only_the_head_reaches_the_worker_ocr_and_speech_engines_over_the_lan(self) -> None:
         ruleset = self.plan("worker")
-        for port in (30004, 30007, 9100, 9835):
+        # 30011: the voice archive store (scripts/voice-store.sh refuses to
+        # start until the live ruleset lists it in both sets).
+        for port in (30004, 30007, 30011, 9100, 9835):
             self.assertEqual(python_verdict(ruleset, port, "enP7s7", "192.168.9.54"), "accept")
             self.assertEqual(python_verdict(ruleset, port, "enP7s7", "192.168.9.20"), "drop")
             self.assertEqual(python_verdict(ruleset, port, "tailscale0", "100.64.0.9"), "drop")
@@ -683,7 +685,7 @@ class HostGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         ruleset = result.stdout
         self.assertIn("DEGRADED fallback", ruleset)
-        for port in (30004, 30007, 9100, 9835):
+        for port in (30004, 30007, 30011, 9100, 9835):
             self.assertEqual(python_verdict(ruleset, port, "enP7s7", "192.168.9.20"), "drop")
             self.assertEqual(python_verdict(ruleset, port, "tailscale0", "100.64.0.9"), "drop")
             self.assertEqual(python_verdict(ruleset, port, "enP7s7", "192.168.9.54"), "accept")

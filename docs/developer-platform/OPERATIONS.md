@@ -687,7 +687,7 @@ never touches Docker's chains.
 | node | guarded tcp ports | accepted from | dropped |
 |---|---|---|---|
 | head | 8000-8005, 9100, 9835, 9838 | lo; docker0 and br-* from 172.16.0.0/12; enp1s0f1np1 from 10.100.184.0/24; enP2p1s0f1np1 from 10.100.185.0/24 | enP7s7, tailscale0, any other ingress (IPv4 and IPv6) |
-| worker | 9100, 9835, 9839, 30004, 30007 | lo; both rails; enP7s7 from the head 192.168.9.54 (not 9839); local Docker bridges | enP7s7 from anyone else, tailscale0, any other ingress |
+| worker | 9100, 9835, 9839, 30004, 30007, 30011 (the voice archive store, [`voice-archive.md`](../voice-archive.md)) | lo; both rails; enP7s7 from the head 192.168.9.54 (not 9839); local Docker bridges | enP7s7 from anyone else, tailscale0, any other ingress |
 
 `apply` refuses, before calling nft, if the rules would drop a consumer in its
 built-in consumer table, if an interface it names is missing, or if a peer
@@ -944,7 +944,7 @@ last:
 | 800 | speech (`whisper`, both nodes; compose.whisper.yaml) | 3.3 GiB (head) / 4.9 GiB (worker) GPU |
 | 700 | vllm-router, vllm-embed, vllm-reranker (head), `AUX_ENGINE_OOM_SCORE_ADJ=700` | 16.5 + 4.0 + 4.0 GiB GPU |
 | 600 | grafana, cadvisor, postgres-exporter, data-stores-exporter, blackbox-exporter | little (host RSS) |
-| 500 | prometheus, node-exporter, dgx-gpu-exporter (both nodes) — after the dashboards, they hold the incident's evidence | little |
+| 500 | prometheus, node-exporter, dgx-gpu-exporter (both nodes) — after the dashboards, they hold the incident's evidence; the voice archive store (`voice-store`, worker; compose.voice-store.yaml) — about 40 MB, so killing it first gains nothing | little |
 | 300 / 200 / 100 | user-slice processes set by systemd, not this repository: `code`, `chrome` (+300; the worker's 2026-07-16/22/28 kills), the GitHub `Runner.Listener` (+200), `systemd --user`, gnome-shell, Xwayland (+100) | little |
 | 0 | every application service: postgres, orchestrator, frontend, sync-worker, searxng, pgadmin, engine-controller, sentinel, cloudflared; `pg-test`, `litellm-dgx`, `ir-team-automation-postgres` | host RSS; among these the largest goes first |
 | -250 | systemd-journald | little |

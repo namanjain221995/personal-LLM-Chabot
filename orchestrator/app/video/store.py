@@ -72,11 +72,17 @@ def artifacts_dir(content_hash: str) -> str:
 
 
 def source_path(content_hash: str) -> Optional[str]:
-    """The stored source file, whatever its extension, or None."""
+    """The stored source file, whatever its extension, or None.
+
+    Never `source.<ext>.part`: adopt_source copies into that name and renames
+    it, so one left behind is a copy a crash cut short. Matching it served a
+    third of a video as the whole file, and made adopt_source hand the
+    pipeline that third as "already stored" (QA, 2026-09-30).
+    """
     root = analysis_dir(content_hash)
     try:
         for entry in os.scandir(root):
-            if entry.is_file() and entry.name.startswith("source."):
+            if entry.is_file() and entry.name.startswith("source.") and not entry.name.endswith(".part"):
                 return entry.path
     except OSError:
         return None
