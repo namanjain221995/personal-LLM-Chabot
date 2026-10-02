@@ -28,6 +28,7 @@ import type { ChatPrefs } from '@/lib/prefs';
 import { dataUrlByteLength, downscaleImageFile } from '@/lib/images';
 import { MAX_DOCUMENTS, MAX_IMAGES } from '@/lib/orchestrator';
 import { measureDataUrl } from '@/lib/chatMedia';
+import { inPickOrder } from '@/lib/pickOrder';
 import {
   applySlashCommand,
   completeCommand,
@@ -277,6 +278,9 @@ export interface Attachment {
   /** Chunked uploads only: the server's session id, so an interrupted upload
       can be resumed instead of restarted from byte 0. */
   sessionId?: string;
+  /** When the file was picked (C6, lib/pickOrder): its chip's place, however
+      long its shrink or read takes. */
+  pickOrder?: number;
 }
 
 /** 2026-09-03: what a slash command decided about THIS send. */
@@ -472,6 +476,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
     }, [attachments]);
     /** Files still being read/downscaled; a send must wait for them. */
     const [pendingAttach, setPendingAttach] = useState(0);
+    /** Files picked so far, every entry point counted: the next `pickOrder`. */
+    const pickCountRef = useRef(0);
     /**
      * What each chip's bytes are doing, keyed by clientId (2026-09-10).
      *
@@ -850,15 +856,18 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
         toast(CEILING_FILES, 'error');
         return;
       }
-      acceptedRef.current = [...accepted, att];
+      acceptedRef.current = inPickOrder(accepted, att);
       setAttachments((prev) => {
         const kept = prev.filter((a) => a.kind !== 'dataset');
         if (streamed(kept) >= MAX_DOCS) return prev; // raced past the cap
-        return [...kept, att];
+        return inPickOrder(kept, att);
       });
     }
 
     function handleFile(file: File) {
+      // Taken before anything is read: the chip's place is where it was
+      // picked, not when its shrink or read finishes (C6, lib/pickOrder).
+      const pickOrder = (pickCountRef.current += 1);
       const isImage = file.type.startsWith('image/');
       const lower = file.name.toLowerCase();
       // 2026-08-07: .docx/.txt/.md ride the document path too — the server
@@ -914,6 +923,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           dataUrl: '',
           base64: '',
           file,
+          pickOrder,
         });
         return;
       }
@@ -928,6 +938,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           dataUrl: '',
           base64: '',
           file,
+          pickOrder,
         });
         return;
       }
@@ -962,6 +973,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           dataUrl: '',
           base64: '',
           file,
+          pickOrder,
         });
         return;
       }
@@ -996,6 +1008,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           // request payload above is unchanged.
           file,
           ...(size ?? {}),
+          pickOrder,
         };
         setAttachments((prev) => {
           // Documents stack to MAX_DOCS, images to MAX_IMAGES, and since
@@ -1007,7 +1020,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
           const same = kept.filter((a) => a.kind === att.kind);
           const cap = att.kind === 'pdf' ? MAX_DOCS : MAX_IMAGES;
           if (same.length >= cap) return prev; // raced past the cap
-          return [...kept, att];
+          return inPickOrder(kept, att);
         });
         if (!isPdf && !size) {
           // Measured AFTER the chip exists, so a send is never held up by it:

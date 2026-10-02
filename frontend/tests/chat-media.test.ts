@@ -215,6 +215,68 @@ describe('the legacy photo note', () => {
     expect(legacyPhotoNoteId(withStoredPhoto)).toBeNull();
     expect(legacyPhotoNoteId([user('hi'), answer('hello')])).toBeNull();
   });
+
+  // S7 (real browser, 2026-10-03): the document engine answers under route
+  // 'vision' too, and turns of 5 and 50 documents with no photo carried the
+  // line on both devices.
+  const docs = (...kinds: Array<'pdf' | 'dataset' | 'video'>) => ({
+    attachments: kinds.map((kind, i) => ({ name: `file-${i}`, kind })),
+  });
+  const documentAnswer = (content: string): ChatMessage => ({
+    ...answer(content, 'vision'),
+    meta: {
+      route: 'vision',
+      document: { filename: 'file-0 (+4 more)', total_pages: 5, ocr_pages: 0, pages: [] },
+    },
+  });
+
+  it('a turn of documents never gets the line, whatever the document engine answered', () => {
+    const fiveDocs = user('compare these', { meta: docs('pdf', 'pdf', 'pdf', 'pdf', 'pdf') });
+    expect(showsLegacyPhotoNote(fiveDocs, documentAnswer('they agree'))).toBe(false);
+    // The engine's refusal carries the route and nothing else.
+    expect(showsLegacyPhotoNote(fiveDocs, answer('no readable content', 'vision'))).toBe(false);
+    // A document answer is not a photo answer even where the turn's own
+    // record of its files is gone (another device, a turn older than
+    // meta.attachments).
+    expect(showsLegacyPhotoNote(user('summarise this'), documentAnswer('a summary'))).toBe(false);
+    // A V8 turn on the device that sent it: the PDF's chip name, no meta.
+    expect(
+      showsLegacyPhotoNote(user('summarise', { pdfName: 'scan.pdf' }), answer('a', 'vision')),
+    ).toBe(false);
+    expect(legacyPhotoNoteId([fiveDocs, documentAnswer('they agree')])).toBeNull();
+  });
+
+  it('a dataset turn under the vision engine still had a photo with it', () => {
+    // A dataset never answers through 'vision' by itself: a photo sent with
+    // it took the turn there (main.py's dataset path stands down for one).
+    expect(showsLegacyPhotoNote(user('q', { meta: docs('dataset') }), answer('a', 'vision'))).toBe(
+      true,
+    );
+    expect(
+      showsLegacyPhotoNote(user('q', { pdfName: 'sales.csv', meta: docs('dataset') }), answer('a', 'vision')),
+    ).toBe(true);
+  });
+
+  it('a document exchange above does not hide the old photo turn under it', () => {
+    const legacy = user('is this leaf healthy?');
+    const thread = [
+      user('compare these', { meta: docs('pdf', 'pdf') }),
+      documentAnswer('they agree'),
+      legacy,
+      answer('healthy', 'vision'),
+    ];
+    expect(legacyPhotoNoteId(thread)).toBe(legacy.id);
+    expect(showsLegacyPhotoNote(legacy, thread[3], thread.slice(0, 2))).toBe(true);
+    // A photo answer above still marks a follow-up, as before.
+    const photoAbove = [user('leaf'), answer('healthy', 'vision'), ...thread.slice(0, 2)];
+    expect(showsLegacyPhotoNote(legacy, thread[3], photoAbove)).toBe(false);
+    const storedAbove = [
+      user('leaf', { meta: { images: [{ attachment_id: 'img-aaaa-0001' }] } }),
+      answer('healthy', 'vision'),
+      ...thread,
+    ];
+    expect(legacyPhotoNoteId(storedAbove)).toBeNull();
+  });
 });
 
 /* ======================================================= reading the bytes */
