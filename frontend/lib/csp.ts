@@ -18,6 +18,14 @@
  * (every call goes through this origin's /api BFF). The overrides below exist
  * because something in this app needs each one:
  *
+ * - NO media-src, on purpose (2026-10-02, chat media). The chat's <video> and
+ *   <audio> players stream a sent file from /api/uploads/{conv}/{upload}/file
+ *   and the recordings play from /api/audio/sessions/{id}/audio: same-origin
+ *   URLs, which the fallback to default-src 'self' already admits. It also
+ *   REFUSES a blob: media URL, which is why no player is ever handed one
+ *   (lib/attachments `streamedPlayerFor`): a 4 GB video must stream by range,
+ *   not be fetched whole into an object URL. Adding `media-src 'self'` would
+ *   change nothing; adding `blob:` would invite exactly that.
  * - style-src 'unsafe-inline': React server-renders `style={{…}}` as style
  *   ATTRIBUTES, which no nonce can cover, and mermaid and echarts write
  *   <style> elements and style attributes at runtime. Style injection cannot
