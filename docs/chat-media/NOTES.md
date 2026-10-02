@@ -926,3 +926,120 @@ Not tested: a sidebar click inside the 5 s `UPDATE_CHECK_MIN_MS` window after an
 skips the list read (ChatApp checkForUpdates), so a turn sent in that window would show only
 after the next focus or reopen. The orchestrator log's Files API PermissionError was the
 harness (no PUBLIC_API_FILES root set), not this branch.
+
+## store-always (backend, STORE-ALWAYS.md §1, 2026-10-03)
+
+What the orchestrator does now, for the frontend side to rely on:
+
+- `/chat` with inline pictures and no usable `image_ids` (absent, or a count
+  that does not match the inline pictures) stores them under
+  `ix-<intent_id>-<index>`, index 0..N-1 in the order of `images` (the single
+  `image`/`image_base64` spelling is index 0). Only when the request's OWN
+  `intent_id` fullmatches `^[0-9a-f]{32}$` (newIntentId(): randomUUID without
+  dashes). The base36 fallback newIntentId() makes without `crypto.randomUUID`
+  is not that shape and is not minted.
+- Same background store as `image_ids` (behind the turn, `source` `chat`,
+  same checks, same metrics). A retry of the same send names the same ids
+  and counts `duplicate`; no second copy.
+- Never minted on a turn that sends `image_refs`. With no usable intent (none
+  sent, or not 32 hex), nothing is stored and each picture is counted
+  `chat_media_writes_total{source="chat",result="unlinked"}` (a new closed
+  value; metrics.py, chat_media.WRITE_RESULTS and the pin in
+  test_chat_media_api.py changed together). A bare call (no conversation)
+  still stores nothing and counts nothing. Ownership and F034 unchanged: the
+  hook still runs after the feature gate and the ownership check.
+- The server still never writes `meta.images`. The rows are in
+  `GET /chat-media/{conv}` (`attachment_id`, `mime`, `width`, `height`),
+  listed oldest first: sort the `ix-<intent>-` items by the number after the
+  last `-`, not by list order. They land milliseconds to seconds after the
+  send, like every /chat store; a second device that looks too early sees
+  none yet.
+- image_memory's store fallback (`chat_media.latest_turn_images`, both the
+  visible-path and the stored-order queries) treats a user message with no
+  `meta.images` as a picture turn when its `meta.intent.id` is 32 hex and the
+  viewer has `ix-<that intent>-*` rows in that chat; it loads indexes 0..4 in
+  order. A message WITH `meta.images` uses those ids as before, so once the
+  frontend writes `meta.images` (ix- ids) nothing changes for the model.
+- Not changed, known: `sharing.evaluate` blocks a public link by
+  `meta.images`, so a chat whose only photo is an `ix-` row with no
+  `meta.images` yet is shareable exactly as an old-tab photo chat was before
+  this change (the snapshot is an allowlist: no picture leaks, the vision
+  answer's text can). It closes when the frontend writes `meta.images`.
+
+## store-always (frontend, STORE-ALWAYS.md §2 and §3, 2026-10-03)
+
+What the browser does now, for the other side to rely on:
+
+- A user turn is looked up when it has no `meta.images`, no bytes in this
+  browser, and a `meta.intent.id` that fullmatches `^[0-9a-f]{32}$` (the same
+  rule the server mints by). Its photos are the list's
+  `ix-<that intent>-<n>` items, ordered by `n`, shown exactly like
+  `meta.images` (thumb URL, the listed width/height reserve the box, click
+  opens `size=full`). MessageRow takes them as `serverImages`.
+- The list (`GET /api/chat-media/{conv}`) is read ONCE per conversation per
+  page load: `lib/chatMedia.createMediaListCache`, shared by the view and the
+  backfill. A read that fails is dropped and tried at the next ask. ChatApp's
+  `checkForUpdates` forgets a chat's entry when the chat is stale (another
+  device wrote to it), so an old-page photo turn sent from a phone shows on a
+  desktop that had the chat open, after one more read, on return.
+  Cost: nearly every turn sent since V29 carries an intent, so opening any
+  chat with text turns costs one list read per page load (ten text turns:
+  one read, test-pinned). Never one per turn.
+- "Photo not stored on the server…" is said only once the list has been read
+  and holds no `ix-` row for that turn (or the turn has no 32-hex intent).
+  Never while the read is pending, never when it failed.
+- The backfill then writes `meta.images` = `[{attachment_id, mime?, width?,
+  height?}]` (no `name`; the server does not know it) through
+  `amendMessages`: one save per chat, re-applied once after a 409, no move in
+  Recents. So the backend's sharing gap above closes once a device has opened
+  the chat. On the sending browser a turn with `ix-` rows is adopted, never
+  uploaded as `bf-`; while the list is unreadable, turns with a usable intent
+  wait for the next open (no `bf-` duplicate), turns without one upload `bf-`
+  as before.
+- Build id: `lib/buildId.ts` reads `.next/BUILD_ID` from the working
+  directory once per process, in production only (null otherwise). Next lists
+  BUILD_ID among the standalone server's required files, so the image has it
+  at `/app/.next/BUILD_ID` (checked: `.next/standalone/.next/BUILD_ID` after
+  `npm run build`); no Dockerfile change. The root layout renders
+  `<meta name="techsara-build">`; `GET /api/version` answers
+  `{"build": "<id>" | null}`, `cache-control: no-store`, no session read, no
+  orchestrator call (the middleware already skips `/api/`).
+- Client (`components/useBuildCheck.ts`, hosted by ChatApp only): checks on
+  focus, on visibilitychange to visible and every 5 min while visible; one
+  request in flight, none within 15 s of the last, none while hidden,
+  failures silent; a page without the meta never checks. On a different id:
+  if nothing streams in this tab, no send is pending, no dataset uploads, no
+  message is open for editing and the composer has nothing typed, attached,
+  being read or dictated (`ComposerHandle.hasDraft()`, the only Composer.tsx
+  change), it lets the history store flush (3 s at most) and reloads.
+  Otherwise the banner "A new version is available" + Reload; the page
+  reloads by itself the first second it is quiet (polled locally). Reload
+  keeps typed text in sessionStorage `techsara.reloadDraft` (keyed to path +
+  query, read once). Loop guard: sessionStorage `techsara.reloadedFor`, at
+  most one automatic reload per server build per tab.
+- Only pages loaded from this build on have the check; tabs open before it
+  ship are not reloaded by it (the server's store-always covers them).
+
+Proof in a real Chromium (Playwright 1.63, scratch venv), the production
+layout (`.next/standalone` + static + public, `node --require
+./server-preload.cjs server.js`) against a fake orchestrator, torn down after:
+- Fresh device, old-page turn with `ix-…-1` listed before `ix-…-0`: both thumbs
+  in send order (512 px thumbs, 1600x1200 and 800x800 boxes), no legacy note,
+  1 list read, 1 PUT whose user turn carries both refs with type and size and
+  keeps its intent; reload: thumbs from `meta.images`, 0 PUTs. A click opened
+  the full 1600x1200 image. Code block, table, mermaid diagram and the
+  artifact panel (page 1 rendered) all drew. 390 px: no horizontal scroll.
+- A real deploy: tab open on build A, server swapped to build B on the same
+  port. Empty composer: reloaded 0.31 s after focus, now on B, 1 version
+  request. With a draft: banner, no reload for 2.5 s, draft intact; Reload ->
+  B with the draft back in the composer and the session key gone.
+- B against a simulated build C: draft, banner, Send: no reload mid-stream,
+  reload after the answer finished and was pushed (append + PUT before the
+  reload's first request); the page that came back (still B) showed the
+  banner and did not reload again.
+
+Residuals: an `ix-` photo has no `name`, so the full-size preview's badge
+says "FILE" (`fileBadgeFor(name)`), as for `bf-` backfills. A regenerate or
+edit before the backfill has written the refs (its idle tick, under 10 s)
+takes the old "missing" path. A turn with only some of its `ix-` rows shows
+those.

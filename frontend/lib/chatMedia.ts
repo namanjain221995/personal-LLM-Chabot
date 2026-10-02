@@ -185,13 +185,23 @@ export function showsLegacyPhotoNote(
 /**
  * The one turn of a thread (as read, in order) that gets the legacy line, or
  * null — `showsLegacyPhotoNote` for every turn in a single pass.
+ *
+ * STORE-ALWAYS (2026-10-03): with a `lookup`, a photo the server stored by
+ * itself (`ix-` ids) counts as a photo, and the line is said only once the
+ * list has been read and holds none for that turn — never while it is still
+ * being asked, so it does not flash up over a photo about to appear.
  */
-export function legacyPhotoNoteId(thread: readonly ChatMessage[]): string | null {
+export function legacyPhotoNoteId(
+  thread: readonly ChatMessage[],
+  lookup?: ServerPhotoLookup,
+): string | null {
   for (let i = 0; i < thread.length; i += 1) {
     const m = thread[i];
-    if (m.role === 'user' && hasPhotos(m)) return null;
+    if (m.role === 'user' && (hasPhotos(m) || (lookup?.(m)?.length ?? 0) > 0)) return null;
     if (m.role === 'assistant' && m.meta?.route === 'vision') return null;
-    if (showsLegacyPhotoNote(m, thread[i + 1])) return m.id;
+    if (showsLegacyPhotoNote(m, thread[i + 1])) {
+      return lookup && lookup(m) === undefined ? null : m.id;
+    }
   }
   return null;
 }
@@ -294,16 +304,24 @@ export async function fetchChatMediaBlob(
   }
 }
 
+/** One photo of GET /api/chat-media/{conversation} (CONTRACT §4.2). */
+export interface ListedMediaItem {
+  attachment_id: string;
+  mime?: string;
+  width?: number | null;
+  height?: number | null;
+}
+
 /**
- * The attachment ids the server holds for this viewer's conversation
+ * The photos the server holds for this viewer's conversation
  * (GET /api/chat-media/{conversation}), or null when that could not be
  * learned — offline, a failing service, an answer of the wrong shape. null
  * never means "none": callers that act on a missing id act only on a list.
  */
-export async function storedAttachmentIds(
+export async function listChatMedia(
   conversationId: string,
   signal?: AbortSignal,
-): Promise<Set<string> | null> {
+): Promise<ListedMediaItem[] | null> {
   try {
     const res = await fetch(`/api/chat-media/${encodeURIComponent(conversationId)}`, {
       signal,
@@ -312,14 +330,150 @@ export async function storedAttachmentIds(
     if (!res.ok) return null;
     const body = (await res.json()) as { items?: unknown };
     if (!Array.isArray(body.items)) return null;
-    const ids = new Set<string>();
-    for (const item of body.items as Array<{ attachment_id?: unknown } | null>) {
-      if (isAttachmentId(item?.attachment_id)) ids.add(item.attachment_id);
+    const items: ListedMediaItem[] = [];
+    for (const item of body.items as Array<Record<string, unknown> | null>) {
+      if (!isAttachmentId(item?.attachment_id)) continue;
+      items.push({
+        attachment_id: item.attachment_id,
+        ...(typeof item.mime === 'string' ? { mime: item.mime } : {}),
+        ...(positiveInt(item.width) ? { width: item.width as number } : {}),
+        ...(positiveInt(item.height) ? { height: item.height as number } : {}),
+      });
     }
-    return ids;
+    return items;
   } catch {
     return null;
   }
+}
+
+/** The attachment ids of `listChatMedia`, or null when it could not say. */
+export async function storedAttachmentIds(
+  conversationId: string,
+  signal?: AbortSignal,
+): Promise<Set<string> | null> {
+  const items = await listChatMedia(conversationId, signal);
+  return items ? new Set(items.map((item) => item.attachment_id)) : null;
+}
+
+/**
+ * The conversation's list, read ONCE per conversation per page load
+ * (STORE-ALWAYS §2): the view and the backfill ask the same promise, and a
+ * thread of a hundred turns costs one request, never one per turn. A list
+ * that could not be read is dropped, so the next ask tries again; `forget`
+ * is for a chat another device has just written to.
+ */
+export function createMediaListCache(list: typeof listChatMedia = listChatMedia) {
+  const entries = new Map<string, Promise<ListedMediaItem[] | null>>();
+  return {
+    get(conversationId: string): Promise<ListedMediaItem[] | null> {
+      const cached = entries.get(conversationId);
+      if (cached) return cached;
+      const pending: Promise<ListedMediaItem[] | null> = list(conversationId).then((items) => {
+        if (items === null && entries.get(conversationId) === pending) {
+          entries.delete(conversationId);
+        }
+        return items;
+      });
+      entries.set(conversationId, pending);
+      return pending;
+    },
+    forget(conversationId: string): void {
+      entries.delete(conversationId);
+    },
+  };
+}
+
+/* ------------------------------------- photos the server stored by itself
+
+   STORE-ALWAYS (2026-10-03). A page loaded before a deploy runs the old
+   JavaScript: it sends a photo inline with no `image_ids` and never writes
+   `meta.images`. The server now stores such a photo anyway, under an id it
+   mints from the send's intent: `ix-<intent_id>-<index>`, index in send
+   order. The turn carries that intent (`meta.intent.id`), so any device can
+   find its photos in the conversation's list — and, once found, writes the
+   reference the old page never did. */
+
+/**
+ * The send intents the server mints photo ids from: newIntentId's randomUUID
+ * without dashes, exactly the shape the orchestrator fullmatches. Its base36
+ * fallback (no `crypto.randomUUID`) is not minted from, so it is not looked up.
+ */
+const MINTING_INTENT = /^[0-9a-f]{32}$/;
+/** An id the server minted: `ix-<intent>-<index>`, index in send order. */
+const SERVER_MINTED_ID = /^ix-([0-9a-f]{32})-(\d{1,3})$/;
+/** "Looked, and the server holds none for this turn." One object, so it is stable. */
+const NO_SERVER_PHOTOS: MessageImage[] = [];
+
+/**
+ * The intent whose `ix-` photos would be this turn's, or null: a user turn
+ * with no references of its own whose intent id the server could mint from.
+ */
+export function serverPhotoIntentOf(message: ChatMessage): string | null {
+  if (message.role !== 'user' || storedImagesOf(message).length > 0) return null;
+  const id = message.meta?.intent?.id;
+  return typeof id === 'string' && MINTING_INTENT.test(id) ? id : null;
+}
+
+/**
+ * Does showing this turn depend on the list? Only when it has no reference,
+ * no bytes in this browser, and an intent the server could have stored its
+ * photos under. Nearly every text turn qualifies — which is why the list is
+ * read once per conversation and never per turn.
+ */
+export function needsServerPhotoLookup(message: ChatMessage): boolean {
+  return localImagesOf(message).length === 0 && serverPhotoIntentOf(message) !== null;
+}
+
+/**
+ * The server-minted photos of a list, by intent, each in send order, as the
+ * `meta.images` entries they become (id, type and size from the list).
+ */
+export function serverPhotosByIntent(
+  items: readonly ListedMediaItem[],
+): Map<string, MessageImage[]> {
+  const indexed = new Map<string, Array<{ index: number; image: MessageImage }>>();
+  for (const item of items) {
+    const match = SERVER_MINTED_ID.exec(item.attachment_id);
+    if (!match) continue;
+    const intent = match[1];
+    const width = positiveInt(item.width);
+    const height = positiveInt(item.height);
+    const image: MessageImage = {
+      attachment_id: item.attachment_id,
+      ...(item.mime ? { mime: item.mime } : {}),
+      ...(width && height ? { width, height } : {}),
+    };
+    const list = indexed.get(intent) ?? [];
+    list.push({ index: Number(match[2]), image });
+    indexed.set(intent, list);
+  }
+  const out = new Map<string, MessageImage[]>();
+  for (const [intent, list] of indexed) {
+    out.set(
+      intent,
+      list.sort((a, b) => a.index - b.index).map((entry) => entry.image),
+    );
+  }
+  return out;
+}
+
+/**
+ * What the list says about a turn: its server-stored photos, `[]` when there
+ * are none to find (also for a turn with no usable intent), or undefined
+ * while that is not known — the list not read yet, or unreadable.
+ */
+export type ServerPhotoLookup = (message: ChatMessage) => MessageImage[] | undefined;
+
+/** A lookup over `byIntent`; undefined `byIntent` means "not known yet". */
+export function serverPhotoLookup(
+  byIntent: ReadonlyMap<string, MessageImage[]> | undefined,
+): ServerPhotoLookup {
+  return (message) => {
+    const intent = serverPhotoIntentOf(message);
+    if (!intent) return NO_SERVER_PHOTOS;
+    if (!byIntent) return undefined;
+    return byIntent.get(intent) ?? NO_SERVER_PHOTOS;
+  };
 }
 
 /* ------------------------------------------------------- uploading photos */
@@ -450,7 +604,15 @@ export async function uploadChatMedia(
    this browser holds the bytes for such a turn, it asks the server once per
    chat which ids it holds, and uploads the missing ones under the SAME ids
    (source=backfill; first write wins, so a store that did land is never
-   overwritten). The reference is already right, so nothing is saved. */
+   overwritten). The reference is already right, so nothing is saved.
+
+   And it ADOPTS (2026-10-03, STORE-ALWAYS §2): a turn sent by a page that
+   predates `meta.images` has its photos on the server already, under
+   `ix-<intent>-<index>`. Before any `bf-` copy is uploaded, the chat's list
+   is read (once per page load, shared with the view); a turn whose intent
+   has `ix-` items gets them as its `meta.images` — on the sending browser
+   instead of a duplicate upload, and on every other device so the photo
+   needs no lookup the next time. Same single save, same 409 re-apply. */
 
 /**
  * Photos this browser holds for one turn. A bare list is the host vouching
@@ -511,6 +673,11 @@ export interface BackfillDeps {
   upload?: typeof uploadChatMedia;
   /** Which ids the server holds for a chat (the repair asks once per chat). */
   list?: typeof storedAttachmentIds;
+  /**
+   * The chat's stored photos, for adopting `ix-` items. The host passes the
+   * page's shared cache (`createMediaListCache`) so the view's read is reused.
+   */
+  media?: (conversationId: string) => Promise<ListedMediaItem[] | null>;
   now?: () => number;
   attachmentId?: (dataUrl: string) => Promise<string | null>;
   /** Run `task` when the browser is idle. Tests run it at once. */
@@ -615,6 +782,7 @@ export function withBackfilledImages(
 export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
   const upload = deps.upload ?? uploadChatMedia;
   const list = deps.list ?? storedAttachmentIds;
+  const media = deps.media ?? createMediaListCache().get;
   const now = deps.now ?? Date.now;
   const mintId = deps.attachmentId ?? backfillAttachmentId;
   const schedule = deps.schedule ?? idleScheduler;
@@ -678,9 +846,10 @@ export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
     }
   }
 
-  async function targetsOf(conversationId: string): Promise<BackfillTarget[]> {
-    const messages = host.messages(conversationId);
-    if (!messages?.length) return [];
+  async function targetsOf(
+    conversationId: string,
+    messages: ChatMessage[],
+  ): Promise<BackfillTarget[]> {
     const local = await host.localImages(conversationId);
     const out: BackfillTarget[] = [];
     messages.forEach((m, index) => {
@@ -805,11 +974,42 @@ export function createBackfill(host: BackfillHost, deps: BackfillDeps = {}) {
     }
   }
 
+  /**
+   * The turns whose photos the server stored by itself (`ix-` ids), as the
+   * references to write. null when the list could not be read and some turn
+   * might have such photos: nothing is known about those turns this time.
+   */
+  async function adoptable(
+    conversationId: string,
+    messages: ChatMessage[],
+  ): Promise<Map<number, { content: string; images: MessageImage[] }> | null> {
+    const found = new Map<number, { content: string; images: MessageImage[] }>();
+    if (!messages.some((m) => serverPhotoIntentOf(m) !== null)) return found;
+    const items = await media(conversationId);
+    if (!items) return null;
+    const byIntent = serverPhotosByIntent(items);
+    messages.forEach((m, index) => {
+      const intent = serverPhotoIntentOf(m);
+      const images = intent ? byIntent.get(intent) : undefined;
+      if (images?.length) found.set(index, { content: m.content, images });
+    });
+    return found;
+  }
+
   async function runChat(conversationId: string): Promise<BackfillChatOutcome> {
     if (!host.idle(conversationId)) return 'busy';
-    const targets = await targetsOf(conversationId);
-    if (targets.length === 0) return 'done';
-    const found = new Map<number, { content: string; images: MessageImage[] }>();
+    const messages = host.messages(conversationId);
+    if (!messages?.length) return 'done';
+    const adopted = await adoptable(conversationId, messages);
+    const found = new Map(adopted ?? []);
+    const targets = (await targetsOf(conversationId, messages)).filter((target) => {
+      if (target.ids) return true;
+      // The server holds this turn's photos already: a `bf-` copy would be a
+      // duplicate. And while the list is unknown, a turn the server may have
+      // stored by itself waits for the next open rather than risk one.
+      if (found.has(target.index)) return false;
+      return adopted !== null || serverPhotoIntentOf(messages[target.index]) === null;
+    });
     let stop: BackfillChatOutcome = 'done';
     // Asked once per chat, and only when there is something to repair.
     let held: Set<string> | null | undefined;

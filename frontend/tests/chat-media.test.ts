@@ -20,10 +20,16 @@ import {
   BACKFILL_CHATS_PER_TICK,
   chatMediaUrl,
   createBackfill,
+  createMediaListCache,
   fetchChatMediaBlob,
   imagesMetaFor,
   legacyPhotoNoteId,
+  listChatMedia,
+  needsServerPhotoLookup,
   REPAIR_GRACE_MS,
+  serverPhotoIntentOf,
+  serverPhotoLookup,
+  serverPhotosByIntent,
   showsLegacyPhotoNote,
   storedAttachmentIds,
   storedImagesOf,
@@ -32,6 +38,7 @@ import {
   withBackfilledImages,
   withImagesMeta,
   type BackfillHost,
+  type ListedMediaItem,
   type MediaUploadOutcome,
 } from '@/lib/chatMedia';
 import { turnFingerprint } from '@/lib/idbCache';
@@ -752,5 +759,222 @@ describe('storedAttachmentIds', () => {
       }),
     );
     expect(await storedAttachmentIds(CONV)).toBeNull();
+  });
+});
+
+/* ============================================ STORE-ALWAYS: ix- photos */
+
+describe('photos the server stored by itself (STORE-ALWAYS §2)', () => {
+  // newIntentId's shape, low-entropy for the secret scanner.
+  const INTENT = 'ab12'.repeat(8);
+  const OTHER = 'cd34'.repeat(8);
+  const ix = (i: number, intent = INTENT) => `ix-${intent}-${i}`;
+  const oldPageTurn = (extra: Partial<ChatMessage> = {}) =>
+    user('what is on this invoice?', {
+      meta: { intent: { id: INTENT, state: 'completed' } },
+      ...extra,
+    });
+  const listed = (...items: ListedMediaItem[]) => vi.fn(async () => items);
+
+  it('a turn is looked up only without references, without local bytes, with a 32-hex intent', () => {
+    expect(serverPhotoIntentOf(oldPageTurn())).toBe(INTENT);
+    expect(needsServerPhotoLookup(oldPageTurn())).toBe(true);
+    // Its own references win; local bytes show at once; no lookup either way.
+    expect(
+      needsServerPhotoLookup(oldPageTurn({ meta: { intent: { id: INTENT, state: 'completed' }, images: [{ attachment_id: 'img-aaaa-0001' }] } })),
+    ).toBe(false);
+    expect(needsServerPhotoLookup(oldPageTurn({ imageDataUrl: PNG }))).toBe(false);
+    // The base36 fallback intent is never minted from, nor an upper-case one.
+    expect(serverPhotoIntentOf(user('q', { meta: { intent: { id: 'kx9abc12de34fg', state: 'completed' } } }))).toBeNull();
+    expect(serverPhotoIntentOf(user('q', { meta: { intent: { id: INTENT.toUpperCase(), state: 'completed' } } }))).toBeNull();
+    expect(serverPhotoIntentOf(user('q'))).toBeNull();
+    expect(serverPhotoIntentOf({ ...answer('a'), meta: { intent: { id: INTENT, state: 'completed' } } } as ChatMessage)).toBeNull();
+  });
+
+  it('groups a list by intent, in SEND order (index), with the listed type and size', () => {
+    const byIntent = serverPhotosByIntent([
+      { attachment_id: ix(2), mime: 'image/png', width: 10, height: 20 },
+      { attachment_id: ix(0), mime: 'image/jpeg' },
+      { attachment_id: 'bf-' + '0'.repeat(32) },
+      { attachment_id: ix(0, OTHER), mime: 'image/webp', width: 5, height: 5 },
+      { attachment_id: ix(1), width: 0, height: 9 },
+      { attachment_id: `ix-${INTENT}-x` },
+    ]);
+    expect(byIntent.get(INTENT)).toEqual([
+      { attachment_id: ix(0), mime: 'image/jpeg' },
+      { attachment_id: ix(1) },
+      { attachment_id: ix(2), mime: 'image/png', width: 10, height: 20 },
+    ]);
+    expect(byIntent.get(OTHER)).toEqual([
+      { attachment_id: ix(0, OTHER), mime: 'image/webp', width: 5, height: 5 },
+    ]);
+    expect(byIntent.size).toBe(2);
+  });
+
+  it('the lookup tells found, none and not-known-yet apart', () => {
+    const known = serverPhotoLookup(serverPhotosByIntent([{ attachment_id: ix(0) }]));
+    expect(known(oldPageTurn())).toEqual([{ attachment_id: ix(0) }]);
+    expect(known(user('q', { meta: { intent: { id: OTHER, state: 'completed' } } }))).toEqual([]);
+    expect(known(user('no intent'))).toEqual([]);
+    const pending = serverPhotoLookup(undefined);
+    expect(pending(oldPageTurn())).toBeUndefined();
+    // A turn the list can say nothing about is "none" even while pending.
+    expect(pending(user('no intent'))).toEqual([]);
+  });
+
+  it('the legacy line waits for the list, and is said only when it holds nothing', () => {
+    const thread = [oldPageTurn(), answer('a total of 42', 'vision')];
+    const found = serverPhotoLookup(serverPhotosByIntent([{ attachment_id: ix(0) }]));
+    const none = serverPhotoLookup(serverPhotosByIntent([{ attachment_id: ix(0, OTHER) }]));
+    expect(legacyPhotoNoteId(thread, found)).toBeNull();
+    expect(legacyPhotoNoteId(thread, none)).toBe(thread[0].id);
+    expect(legacyPhotoNoteId(thread, serverPhotoLookup(undefined))).toBeNull();
+    // Without a lookup, exactly as before.
+    expect(legacyPhotoNoteId(thread)).toBe(thread[0].id);
+    // A follow-up under a found photo is a follow-up, not a legacy turn.
+    const followUp = [
+      ...thread,
+      user('and the due date?', { meta: { intent: { id: OTHER, state: 'completed' } } }),
+      answer('Friday', 'vision'),
+    ];
+    expect(legacyPhotoNoteId(followUp, found)).toBeNull();
+  });
+
+  it('the list is read once per chat however often it is asked, and again after a failure or forget', async () => {
+    let fail = true;
+    const list = vi.fn(async () => (fail ? null : [{ attachment_id: ix(0) }]));
+    const cache = createMediaListCache(list);
+    const [a, b] = await Promise.all([cache.get(CONV), cache.get(CONV)]);
+    expect(a).toBeNull();
+    expect(b).toBeNull();
+    expect(list).toHaveBeenCalledTimes(1);
+    fail = false;
+    expect(await cache.get(CONV)).toEqual([{ attachment_id: ix(0) }]);
+    expect(await cache.get(CONV)).toEqual([{ attachment_id: ix(0) }]);
+    expect(list).toHaveBeenCalledTimes(2);
+    cache.forget(CONV);
+    await cache.get(CONV);
+    expect(list).toHaveBeenCalledTimes(3);
+    await cache.get('another-chat');
+    expect(list).toHaveBeenCalledTimes(4);
+  });
+
+  it('listChatMedia keeps id, type and a real size, and nothing malformed', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        Response.json({
+          items: [
+            { attachment_id: ix(0), mime: 'image/png', width: 640, height: 480, bytes: 9, media_id: 'm' },
+            { attachment_id: ix(1), width: null, height: -1 },
+            { attachment_id: '../x' },
+            null,
+          ],
+        }),
+      ),
+    );
+    expect(await listChatMedia(CONV)).toEqual([
+      { attachment_id: ix(0), mime: 'image/png', width: 640, height: 480 },
+      { attachment_id: ix(1) },
+    ]);
+  });
+
+  it('the sending browser adopts ix- rows instead of uploading a bf- duplicate', async () => {
+    const threads = { [CONV]: [oldPageTurn({ imageDataUrl: PNG }), answer('42', 'vision')] };
+    const { host, saves } = fakeHost(threads, { [CONV]: new Map([[0, [PNG]]]) });
+    const upload = storingUpload();
+    const media = listed({ attachment_id: ix(0), mime: 'image/png', width: 640, height: 480 });
+    expect(
+      await createBackfill(host, { upload, media, schedule: now, locks: null }).runNow(CONV),
+    ).toBe('done');
+    expect(upload).not.toHaveBeenCalled();
+    expect(media).toHaveBeenCalledTimes(1);
+    expect(saves).toHaveLength(1);
+    expect(saves[0].messages[0].meta?.images).toEqual([
+      { attachment_id: ix(0), mime: 'image/png', width: 640, height: 480 },
+    ]);
+    // The intent is untouched.
+    expect(saves[0].messages[0].meta?.intent?.id).toBe(INTENT);
+  });
+
+  it('a device without the bytes writes the references too — one save for the chat', async () => {
+    const threads = {
+      [CONV]: [
+        oldPageTurn(),
+        answer('42', 'vision'),
+        user('second', { meta: { intent: { id: OTHER, state: 'completed' } } }),
+        answer('ok', 'vision'),
+      ],
+    };
+    const { host, saves } = fakeHost(threads, {});
+    const media = listed({ attachment_id: ix(1) }, { attachment_id: ix(0) }, { attachment_id: ix(0, OTHER) });
+    await createBackfill(host, { upload: storingUpload(), media, schedule: now, locks: null }).runNow(CONV);
+    expect(saves).toHaveLength(1);
+    expect(saves[0].messages[0].meta?.images?.map((i) => i.attachment_id)).toEqual([ix(0), ix(1)]);
+    expect(saves[0].messages[2].meta?.images?.map((i) => i.attachment_id)).toEqual([ix(0, OTHER)]);
+  });
+
+  it('re-applies the adoption once after a 409, like the backfill', async () => {
+    const original = [oldPageTurn(), answer('42', 'vision')];
+    const threads: Record<string, ChatMessage[]> = { [CONV]: original };
+    let refusals = 1;
+    const { host, saves } = fakeHost(threads, {}, {
+      onSave: (id) => {
+        if (refusals-- > 0) threads[id] = original.map((m) => ({ ...m }));
+      },
+    });
+    await createBackfill(host, {
+      upload: storingUpload(),
+      media: listed({ attachment_id: ix(0) }),
+      schedule: now,
+      locks: null,
+    }).runNow(CONV);
+    expect(saves).toHaveLength(2);
+    expect(threads[CONV][0].meta?.images).toEqual([{ attachment_id: ix(0) }]);
+  });
+
+  it('uploads bf- copies as before when the list holds nothing for the turn', async () => {
+    const threads = { [CONV]: [oldPageTurn({ imageDataUrl: PNG }), answer('42', 'vision')] };
+    const { host, saves } = fakeHost(threads, { [CONV]: new Map([[0, [PNG]]]) });
+    const upload = storingUpload();
+    await createBackfill(host, {
+      upload,
+      media: listed({ attachment_id: ix(0, OTHER) }),
+      schedule: now,
+      locks: null,
+    }).runNow(CONV);
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(saves[0].messages[0].meta?.images?.[0].attachment_id).toBe(await backfillAttachmentId(PNG));
+  });
+
+  it('an unreadable list holds back only the turns the server may have stored itself', async () => {
+    const threads = {
+      [CONV]: [
+        oldPageTurn({ imageDataUrl: PNG }),
+        answer('42', 'vision'),
+        user('older photo, no intent', { imageDataUrl: JPEG }),
+        answer('ok', 'vision'),
+      ],
+    };
+    const { host, saves } = fakeHost(threads, { [CONV]: new Map([[0, [PNG]], [2, [JPEG]]]) });
+    const upload = storingUpload();
+    await createBackfill(host, {
+      upload,
+      media: vi.fn(async () => null),
+      schedule: now,
+      locks: null,
+    }).runNow(CONV);
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(upload.mock.calls[0][1][0].blob.type).toBe('image/jpeg');
+    expect(saves[0].messages[0].meta?.images).toBeUndefined();
+    expect(saves[0].messages[2].meta?.images).toHaveLength(1);
+  });
+
+  it('never reads the list for a chat whose turns carry no usable intent', async () => {
+    const threads = { [CONV]: [user('photo'), answer('a', 'vision')] };
+    const { host } = fakeHost(threads, { [CONV]: new Map([[0, [PNG]]]) });
+    const media = vi.fn(async () => [] as ListedMediaItem[]);
+    await createBackfill(host, { upload: storingUpload(), media, schedule: now, locks: null }).runNow(CONV);
+    expect(media).not.toHaveBeenCalled();
   });
 });
