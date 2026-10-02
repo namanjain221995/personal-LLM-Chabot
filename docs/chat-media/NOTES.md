@@ -234,3 +234,55 @@ the parser accepts the variants marked "or".
   `"kept_with_chat"`) makes the page say pictures stay while their chat
   exists, and that an older picture appears once the browser that sent it
   opens its chat again (the backfill).
+
+fe-files, as built (2026-10-02 evening):
+
+- Retention: the page also reads `retention.files_kept_with_chat` (boolean).
+  `true` once documents and datasets get their lasting copy (CONTRACT §9):
+  the first sentence becomes "Files you attach to a chat stay while the chat
+  exists. One that could not be kept was removed after up to 24 hours; ..."
+  and a swept row's note speaks about that file ("it was kept for up to 24
+  hours") instead of stating a rule every file obeys. Absent or false keeps
+  today's sentences. The backend files track should send it when the lasting
+  copy ships; nothing else on the page depends on it.
+- Players: a chip whose name is video or audio (`mediaKindFor`), or any chip
+  on the `video` rail, opens `<video>`/`<audio controls preload="metadata"
+  controlsList="nodownload">` with `src` = `/api/uploads/{conv}/{id}/file`.
+  Opening fetches nothing. No upload id = no player (the dialog keeps its
+  `unavailable` sentence). On a media `error` the dialog asks the same URL
+  once for `Range: bytes=0-0`: 410 -> expired, 404 -> "no longer on the
+  server", other non-2xx or offline -> "couldn't be loaded", 2xx -> "This
+  browser can't play <EXT> files." (e.g. an .mkv or .avi codec).
+- The uploads file proxy forwards `Range` and `If-Range` (plus the cookie,
+  plus `accept-encoding: identity`; fetch() adds a second `identity` to a
+  ranged request, so the orchestrator sees "identity, identity") and relays
+  200/206 with content-type, content-disposition, content-length,
+  content-range and accept-ranges, and 416 with its `bytes */<size>`.
+  Checked in bundled Chromium and Google Chrome against a fake orchestrator
+  serving Starlette 1.6 FileResponse: the WebM player's first request is
+  `bytes=0-` -> 206; Chrome's seeks asked `bytes=393216-` and `bytes=65536-`,
+  the WAV's seek `bytes=229376-`, all 206 through the proxy; a past-the-end
+  range -> 416 `bytes */412440`. No CSP violation: the page policy needed
+  no `media-src` (the fallback to `default-src 'self'` admits the route);
+  `edge-csp.test.ts` now pins that blob: stays out.
+- Opening never downloads a file the dialog cannot draw from bytes
+  (`previewKindFor(name) === 'none'`: .zip, .pptx, .html, .parquet, .mkv
+  with no id ...). On a device without the bytes such a chip now says
+  "Preview is not available for this file type", the same everywhere,
+  instead of "no longer available in this browser session".
+- Kept previews: a PDF or text document (document rail) whose bytes answer
+  410, or that has no upload id at all (a small inline document whose
+  background upload never landed), shows `GET /uploads/{conv}/document?name=`
+  under "The file itself has expired and is no longer stored." (410 only) or
+  "The file itself can't be opened here." A CSV/TSV/JSON dataset whose bytes
+  answer 410 shows its stored profile's table. A workbook listed `expired`
+  shows its summary under the expired line, and with no usable summary says
+  "This upload has expired..." (it used to say "this browser session").
+  `ServerPreviewLoaders` now return `{value, expired?}` (`Kept<T>` in
+  AttachmentPreview.tsx); MessageRow and MyFileRow are the only callers.
+- My files: picture rows as written above; a 404/410 on the full picture
+  turns the row into Removed. Video and audio UPLOAD rows on My files still
+  have Download only (no player): not in this track's brief.
+- Not changed, for whoever owns ChatApp: dragging a sent video back into the
+  composer (`reuseAttachment`) still downloads the whole file to re-attach
+  it, as before.
