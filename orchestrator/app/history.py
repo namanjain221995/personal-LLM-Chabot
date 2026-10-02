@@ -22,7 +22,7 @@ import uuid
 from typing import List, Literal, Optional, Sequence, Type, TypeVar
 
 from fastapi.responses import JSONResponse
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -636,7 +636,9 @@ def get_summary(
 
 @router.delete("/conversations/{conversation_id}")
 def delete_conversation(
-    conversation_id: str, user: UserRow = Depends(require_user)
+    conversation_id: str,
+    background: BackgroundTasks,
+    user: UserRow = Depends(require_user),
 ) -> dict:
     if not db.delete_conversation(int(user["id"]), conversation_id):
         raise _not_found()
@@ -649,7 +651,33 @@ def delete_conversation(
     from .engines import image_memory
 
     image_memory.forget(conversation_id, int(user["id"]))
+    # V44: the chat's stored pictures and lasting file copies. Their ROWS went
+    # with the delete above (db._SIDE_TABLES); the bytes are files, removed
+    # after the response so the person does not wait on a directory walk.
+    background.add_task(_erase_stored_bytes, conversation_id, int(user["id"]))
     return {"ok": True}
+
+
+def _erase_stored_bytes(conversation_id: str, user_id: int) -> None:
+    """Remove a deleted chat's bytes from the two lasting stores, now, in a
+    worker thread (docs/chat-media/CONTRACT.md §8). Best effort and never
+    raises: each store logs and counts its own failure, and the reapers
+    remove what is left, because no row names it any more. Nothing promises
+    the person a time by which it is gone."""
+    import logging
+
+    from . import chat_media, uploads
+
+    for store, erase in (
+        ("chat media", lambda: chat_media.erase_conversation(conversation_id, user_id)),
+        ("chat files", lambda: uploads.erase_conversation_files(conversation_id)),
+    ):
+        try:
+            erase()
+        except Exception:  # noqa: BLE001 — the chat is already deleted; this is cleanup
+            logging.getLogger(__name__).warning(
+                "erasing a deleted chat's %s failed", store, exc_info=True
+            )
 
 
 @router.get("/search")

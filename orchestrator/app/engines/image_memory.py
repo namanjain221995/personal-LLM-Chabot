@@ -177,6 +177,15 @@ def durable_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def store_fallback_enabled() -> bool:
+    """Does `hydrate` fall back to the chat's STORED pictures (V44,
+    app/chat_media.py) when neither this process nor the V41 row has a live
+    picture? On unless IMAGE_MEMORY_STORE_FALLBACK says otherwise; off is the
+    behaviour this module had before V44, exactly."""
+    raw = (os.environ.get("IMAGE_MEMORY_STORE_FALLBACK") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def prune_interval_s() -> float:
     """How often ONE process will sweep expired rows. The sweep is a range
     delete on an index; running it on every turn would still be a statement
@@ -474,8 +483,22 @@ async def hydrate(
     Deliberately NOT folded into `recall`: `recall` is called from inside the
     word test and from `images_for_followup`, both synchronous and both on
     the event loop, and a database read belongs on neither.
+
+    THE STORE FALLBACK (V44, 2026-10-02). The V41 row lives two hours, so a
+    follow-up the next morning, or after the row was swept, found nothing and
+    the turn routed as though no picture had ever been sent — while the chat's
+    pictures were now stored for the life of the chat (app/chat_media.py).
+    When neither half has a live entry, the newest user message whose
+    `meta.images` names stored pictures supplies them, with that turn's
+    question and answer as the context and the user turns since as the
+    counter; the word test then runs unchanged. A chat with no stored picture
+    costs one statement that finds nothing and behaves exactly as before.
+    The entry is NOT written back to the V41 row: the store already holds the
+    bytes, and a second copy in the database would buy nothing.
     """
-    if not durable_enabled():
+    durable = durable_enabled()
+    fallback = store_fallback_enabled()
+    if not durable and not fallback:
         return
     _sweep_expired()
     key = scope(conversation_id, user_id)
@@ -484,10 +507,14 @@ async def hydrate(
     ident = _durable_identity(conversation_id, user_id)
     if ident is None:
         return
-    row = await asyncio.to_thread(_hydrate_read, ident)
-    if row is None or key in _remembered_images:
-        # `key in ...` again: an image turn for this conversation may have
-        # landed while the read was in flight, and it is the newer picture.
+    row = await asyncio.to_thread(_hydrate_read, ident) if durable else None
+    if key in _remembered_images:
+        # An image turn for this conversation may have landed while the read
+        # was in flight, and it is the newer picture.
+        return
+    if row is None:
+        if fallback:
+            await _hydrate_from_store(key, ident)
         return
     _remembered_images[key] = _Remembered(
         images=list(row["images"]),
@@ -497,6 +524,42 @@ async def hydrate(
         # a hydrated entry exactly as on a local one.
         at=time.monotonic() - row["age_s"],
         turns_after=row["turns_after"],
+    )
+    _remembered_images.move_to_end(key)
+    _evict()
+
+
+def _stored_read(ident: tuple) -> "Optional[dict]":
+    """The chat's newest stored pictures, fitted to this process's budget, or
+    None — the STORE half of `hydrate`, in a worker thread. Same rule as
+    `_hydrate_read`: it reads, and never touches `_remembered_images`."""
+    try:
+        from .. import chat_media
+
+        found = chat_media.latest_turn_images(ident[0], ident[1])
+    except Exception as exc:  # noqa: BLE001 — never a failed turn
+        log.debug("image memory: could not read the stored pictures: %s", type(exc).__name__)
+        return None
+    if not found:
+        return None
+    # The stored originals may be up to 10 MiB each; the process budget is
+    # the same one `remember` applies, downscaling here, off the loop.
+    images = _fit(found["images"])
+    if not images:
+        return None
+    return {**found, "images": images}
+
+
+async def _hydrate_from_store(key: str, ident: tuple) -> None:
+    found = await asyncio.to_thread(_stored_read, ident)
+    if found is None or key in _remembered_images:
+        return
+    _remembered_images[key] = _Remembered(
+        images=list(found["images"]),
+        context=found["context"],
+        # Fresh in this process: the TTL bounds how long this process holds
+        # the bytes, and the store will hand them back after it if asked.
+        turns_after=int(found["turns_after"]),
     )
     _remembered_images.move_to_end(key)
     _evict()

@@ -47,6 +47,44 @@ def upload_root(conversation_id: str, upload_id: str) -> str:
     return os.path.join(settings.workspace_dir, "uploads", safe_conv, upload_id)
 
 
+def erase_conversation_files(conversation_id: str) -> bool:
+    """Remove <CHAT_FILES_DIR>/<conversation_id> now: the lasting copies of a
+    deleted chat's document and dataset originals (docs/chat-media/CONTRACT.md
+    §8-9; the copies themselves are made by the upload finalisers).
+
+    Called by history.py after the chat's rows are gone, in a worker thread.
+    Best effort: a failure is logged and counted (chat_media_erase_total
+    {store="files"}), returns False, and a reaper removes the directory later.
+    The id is checked against the conversation-id shape before it becomes a
+    path, so nothing outside CHAT_FILES_DIR can be named.
+    """
+    from . import metrics
+
+    if not _CONVERSATION_ID_RE.match(conversation_id or ""):
+        return False
+    path = os.path.join(settings.chat_files_dir, conversation_id)
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        log.warning("could not erase a deleted chat's lasting files", exc_info=True)
+        metrics.inc(
+            "chat_media_erase_total",
+            "chat deletion: stored bytes removed at once, by store",
+            store="files",
+            result="error",
+        )
+        return False
+    metrics.inc(
+        "chat_media_erase_total",
+        "chat deletion: stored bytes removed at once, by store",
+        store="files",
+        result="ok",
+    )
+    return True
+
+
 def bytes_available(conversation_id: str, upload_id: str) -> bool:
     """True while the extracted files still exist (TTL has not swept them)."""
     root = upload_root(conversation_id, upload_id)

@@ -156,6 +156,11 @@ PRIVATE_META_KEYS: Dict[str, str] = {
     "report_files": "generated files held in this workspace",
     "code_sources": "a private repository",
     "attachments": "uploaded files",
+    # V44 (2026-10-02): the browser writes `meta.images` on a user message that
+    # sent pictures, which the server now stores (app/chat_media.py). A chat
+    # with someone's photos is private like one with uploaded files; the
+    # snapshot never carries the pictures either way (it is an allowlist).
+    "images": "uploaded photos",
     "video": "an uploaded video",
 }
 

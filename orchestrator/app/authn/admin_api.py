@@ -1221,6 +1221,51 @@ async def download_member_upload(
     return FileResponse(path, filename=upload["filename"], media_type=media_type)
 
 
+@router.get("/members/{user_id}/chat-media/{conversation_id}/{attachment_id}")
+async def member_chat_media(
+    user_id: int,
+    conversation_id: str,
+    attachment_id: str,
+    request: Request,
+    size: str = Query("full", pattern="^(thumb|full)$"),
+    principal: Principal = Depends(require_capability(Cap.WORKSPACE_CONTENT_READ)),
+):
+    """A picture a member sent in a chat (V44, app/chat_media.py), for the
+    audited conversation viewer. Audited per picture, like the upload
+    download above.
+
+    Served INLINE, unlike that download, and on purpose: the upload rail keeps
+    whatever was sent (an SVG or an HTML file served inline would attack the
+    admin reading it), while this store holds only rasters verified by magic
+    bytes and a decode, served with nosniff and a sandbox CSP — the same
+    response as the member's own route. Ownership is the member's own rule
+    (chat_media.lookup): the row is theirs, and the chat is theirs or has no
+    row yet; anything else is 404, as is a member this admin may not inspect.
+    """
+    from .. import chat_media
+
+    await _inspectable_member(principal, user_id)
+    row = await db.run_in_thread(chat_media.lookup, user_id, conversation_id, attachment_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such picture.")
+    response = await chat_media.media_response(row, size, request.headers.get("if-none-match"))
+    # Audited when the picture was actually shown: its bytes, or the 304 that
+    # confirms the copy the admin's browser already holds. A 410 shows
+    # nothing, as the upload download's "expired" 404 shows nothing.
+    if response.status_code in (200, 304):
+        await db.run_in_thread(
+            audit,
+            principal,
+            request,
+            "admin_viewed_chat_media",
+            target_user_id=user_id,
+            resource_type="chat_media",
+            resource_id=row["media_id"],
+            meta={"conversation_id": conversation_id, "size": size},
+        )
+    return response
+
+
 @router.get("/members/{user_id}/reports/{filename}")
 async def download_member_report(
     user_id: int,
