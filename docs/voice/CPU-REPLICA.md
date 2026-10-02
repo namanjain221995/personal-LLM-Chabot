@@ -575,9 +575,9 @@ or fail it (503). Every call went through the product's own entry points (`asr.t
    `up` refuses until it is done.
 2. `scripts/whisper-cpu.sh up` on the head (it builds and runs on the worker), then `verify`.
 3. **Decide on the chat cost.** It was about 5 % on the 27B while the replica decoded (above), but
-   the 27B is no longer the main model. On the running Qwen3.6-35B-A3B the one measurement is
-   −3.6 % (CI −11.6 % to +5.3 %, 26 pairs, the upstream decoder). A quiet-hours re-run on it with
-   more pairs would narrow that. Fewer threads (`WHISPER_CPU_THREADS` and `cpus` in
+   the 27B is no longer the main model. On the running Qwen3.6-35B-A3B the worker's copy costs
+   about 0-5 % of decode, inside the noise (−3.6 %, CI −11.6 % to +5.3 %, 26 pairs, the upstream
+   decoder). The head copy's gate on the same model is in CPU-REPLICA-HEAD.md (4 threads PASS). Fewer threads (`WHISPER_CPU_THREADS` and `cpus` in
    compose/compose.whisper-cpu.yaml) would lower it and slow the replica, and the router's
    estimate would then have to be re-measured.
 4. **Pair json mode** (the legacy dictation's first pass) against the GPU replica, as described

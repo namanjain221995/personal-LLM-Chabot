@@ -28,8 +28,8 @@
 #     file the worker converted, both copied over ssh and checked against the worker's image ID and
 #     the q8_0 pin (a compile is minutes of four jobs, a conversion loads 3 GB of fp16 weights);
 #   - binds the Docker bridge gateway (172.17.0.1), like the head's GPU replica on 30007;
-#   - runs on its own cores (WHISPER_CPU_HEAD_CPUSET/_CPUS/_THREADS, from the environment or .env,
-#     where a cap decided at the chat gate is kept so the next `up` cannot undo it);
+#   - runs on its own cores (WHISPER_CPU_HEAD_CPUSET/_CPUS/_THREADS, from the environment or .env;
+#     the default is the 4-core cap that passed the chat gate, 16-19 / 4 / 4);
 #   - is listed LAST in ASR_CPU_BASE_URLS, so the worker's copy takes overflow first.
 # There is no single-node fallback: in single mode this script refuses.
 #
@@ -95,15 +95,16 @@ head_setting() {
   printf '%s' "${value:-$2}"
 }
 
-# The head copy's cores. Default: eight Cortex-X925 cores without 5-6, where the chat model's
-# rank-0 engine loop and worker thread ran during decode on 2026-09-30 (3 s per-thread sample),
-# with eight cores' worth of time. That is the configuration measured on the head that day: the
-# same transcripts as the worker's copy, 1.3-1.6 % slower (docs/voice/CPU-REPLICA-HEAD.md).
+# The head copy's cores. Default: four Cortex-X925 cores (16-19), four cores' worth of time,
+# four threads: the configuration that passed the owner's chat gate on Qwen/Qwen3.6-35B-A3B-NVFP4
+# (decode +0.07 %, TTFT +2.5 %). Eight threads on 7-9,15-19 failed it (TTFT +10.1 % against a
+# 10 % limit). Four threads decode about 1.8 times slower than eight, about 0.41 s per second of
+# audio (docs/voice/CPU-REPLICA-HEAD.md).
 head_placement() {
   local cpuset cpus threads
-  cpuset="$(head_setting WHISPER_CPU_HEAD_CPUSET 7-9,15-19)"
-  cpus="$(head_setting WHISPER_CPU_HEAD_CPUS 8)"
-  threads="$(head_setting WHISPER_CPU_HEAD_THREADS 8)"
+  cpuset="$(head_setting WHISPER_CPU_HEAD_CPUSET 16-19)"
+  cpus="$(head_setting WHISPER_CPU_HEAD_CPUS 4)"
+  threads="$(head_setting WHISPER_CPU_HEAD_THREADS 4)"
   [[ "$cpuset" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] \
     || die "WHISPER_CPU_HEAD_CPUSET '$cpuset' is not a cpuset (for example 7-9,15-19)"
   [[ "$cpus" =~ ^[1-9][0-9]?$ ]] && [ "$cpus" -le 20 ] \

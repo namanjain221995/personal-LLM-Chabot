@@ -196,15 +196,17 @@ class HeadPlacementTests(_BashCase):
         ]
         return self._run(program, **env)
 
-    def test_the_default_is_eight_x925_cores_without_5_and_6(self) -> None:
+    def test_the_default_is_the_four_core_cap_that_passed_the_chat_gate(self) -> None:
+        # 8 threads on 7-9,15-19 failed the gate on Qwen3.6-35B-A3B (TTFT +10.1 % against 10 %);
+        # 4 threads on 16-19 passed it (decode +0.07 %, TTFT +2.5 %). docs/voice/CPU-REPLICA-HEAD.md.
         result = self._placement()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "WHISPER_CPU_CPUSET=7-9,15-19 WHISPER_CPU_CPUS=8 WHISPER_CPU_THREADS=8")
-
-    def test_a_cap_kept_in_env_survives_the_next_up(self) -> None:
-        result = self._placement("WHISPER_CPU_HEAD_CPUSET=16-19\nWHISPER_CPU_HEAD_CPUS=4\nWHISPER_CPU_HEAD_THREADS=4\n")
-        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "WHISPER_CPU_CPUSET=16-19 WHISPER_CPU_CPUS=4 WHISPER_CPU_THREADS=4")
+
+    def test_a_setting_kept_in_env_survives_the_next_up(self) -> None:
+        result = self._placement("WHISPER_CPU_HEAD_CPUSET=12-13\nWHISPER_CPU_HEAD_CPUS=2\nWHISPER_CPU_HEAD_THREADS=2\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "WHISPER_CPU_CPUSET=12-13 WHISPER_CPU_CPUS=2 WHISPER_CPU_THREADS=2")
 
     def test_the_environment_wins_over_env(self) -> None:
         result = self._placement("WHISPER_CPU_HEAD_CPUSET=16-19\n", WHISPER_CPU_HEAD_CPUSET="0-4,10-14")

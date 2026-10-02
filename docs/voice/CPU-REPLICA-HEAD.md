@@ -1,13 +1,16 @@
 # The CPU speech replica on the head
 
 A second CPU copy of `openai/whisper-large-v3` (whisper.cpp q8_0, the same image, model file and
-contract as the worker's copy in [CPU-REPLICA.md](CPU-REPLICA.md)), on eight cores of the head
+contract as the worker's copy in [CPU-REPLICA.md](CPU-REPLICA.md)), on four cores of the head
 Spark (spark-0e68). Like the worker's copy, it takes a clip only when every GPU replica is already
 decoding one.
 
-**Status, 2026-09-30 18:10 IST:** the code is ready (`WHISPER_CPU_NODE=head scripts/whisper-cpu.sh`).
-The copy is **not deployed**. The owner's chat gate has **not been measured** on the model now
-serving (`nvidia/Qwen3.8-27B-NVFP4`).
+**Status, 2026-10-02:** the code is ready (`WHISPER_CPU_NODE=head scripts/whisper-cpu.sh`) and the
+copy is **not deployed**. The owner's chat gate **has been measured** on the model now serving,
+`Qwen/Qwen3.6-35B-A3B-NVFP4`: eight threads FAILED it and four threads PASSED it (see
+"The gate, measured" below). The defaults are the
+4-thread cap: `WHISPER_CPU_HEAD_CPUSET=16-19`, `WHISPER_CPU_HEAD_CPUS=4`,
+`WHISPER_CPU_HEAD_THREADS=4`.
 
 ---
 
@@ -25,7 +28,7 @@ Nothing else about the head changes. Every other new or scaled service still goe
 
 | | head copy | worker copy |
 |---|---|---|
-| cores | `7-9,15-19` (eight Cortex-X925), `cpus: 8`, 8 threads | `5-9,15-19` (ten X925), `cpus: 8`, 8 threads |
+| cores | `16-19` (four Cortex-X925), `cpus: 4`, 4 threads (the cap that passed the chat gate) | `5-9,15-19` (ten X925), `cpus: 8`, 8 threads |
 | bind | `172.17.0.1:30008` (Docker bridge gateway), host networking | management address `:30008`, host networking |
 | image, model | loaded from the worker: same image ID, same q8_0 SHA-256 | built and converted on the worker |
 | memory | peak 2.010 GiB measured on the head, 4 GiB cap, no swap | 2.0 GiB, 4 GiB cap |
@@ -42,9 +45,10 @@ Nothing else about the head changes. Every other new or scaled service still goe
   - No production container is pinned, so the scheduler moves those threads: at 17:35 they ran on
     cpus 4, 10 and 11.
 
-  The default leaves cpus 5-6 and the whole A725 cluster free. It is also the one configuration
-  measured on the head. It keeps the router's speed estimate true, because that estimate was measured
-  with eight X925 threads.
+  The default, `16-19` with four threads, leaves cpus 5-15 and the whole A725 cluster free. It is
+  the configuration that passed the chat gate. The first one tried, eight threads on `7-9,15-19`,
+  failed it on time to first token. Four threads decode about 1.8 times slower than eight, about
+  0.41 s per second of audio; see Known limits for what that means for the router's estimate.
 - **The bind.** The head's GPU replica listens on `172.17.0.1:30007`. The orchestrator reaches the
   gateway from its compose bridge, and the office LAN does not. The head's host guard does not judge
   30007 or 30008 (`scripts/host-guard.sh explain 30008 enP7s7 192.168.9.20 --role head` says
@@ -97,38 +101,36 @@ slower. Per clip, 3.9-11.6 s for 2.5-31 s of audio.
 
 **Memory.** cgroup `memory.peak` was 2.010 GiB (anon 1.990 GiB) over 436 s of back-to-back decoding.
 
-**Chat cost: measured against the PREVIOUS model only.** Against `Qwen/Qwen3.6-35B-A3B-NVFP4` (MoE),
-with 3 probes that ran alone per phase (18 attempts), median decode was:
+**Chat cost, first measured 2026-09-30 morning against `Qwen/Qwen3.6-35B-A3B-NVFP4`** (MoE), with
+3 probes that ran alone per phase (18 attempts), median decode was:
 
 | before | during | after |
 |---:|---:|---:|
 | 102.3 tok/s | 101.7 tok/s | 100.3 tok/s |
 
-That model is no longer served, so this does not answer the condition.
+Three probes per phase decide nothing; the paired gate below does.
 
-## Why the 27B needs its own measurement
+## The gate, measured on Qwen/Qwen3.6-35B-A3B-NVFP4
 
-These are estimates, not measurements. The gate decides.
+The main model is `Qwen/Qwen3.6-35B-A3B-NVFP4` again (since 22:38 IST on 2026-09-30). The gate was
+run on it with the copy on the head decoding back to back against it idle, and judged against two
+limits: chat decode may drop by no more than 5 %, and time to first token (TTFT) may rise by no
+more than 10 %.
 
-- **The 27B leaves less bandwidth spare.** The dense 27B in NVFP4 reads about 8 GB of weights per
-  rank for every token. At its ~22 tok/s that is about 180 GB/s on each node, most of what GB10's
-  LPDDR5X delivers (273 GB/s peak).
-- **The old model left more.** The MoE read about 1 GB per rank per token, about 100 GB/s at 100 tok/s.
-- **What whisper takes.** whisper.cpp's decoder streams about 0.85 GB of q8_0 weights per token, at
-  15-28 ms per token: 30-55 GB/s while it decodes.
+| head copy | decode cost | TTFT rise | verdict |
+|---|---:|---:|---|
+| 8 threads, `7-9,15-19`, `cpus: 8` | +1.28 % | **+10.1 %** | **FAIL** (TTFT over the 10 % limit) |
+| 4 threads, `16-19`, `cpus: 4` | +0.07 % | +2.5 % | **PASS** |
 
-So a CPU decode takes a larger share of a bus the 27B already uses more fully, and the MoE result
-above does not carry over. The CPU-time share matters less than it did: a 27B decode step lasts about
-45 ms, not 10 ms, so the engine loop's CPU work is a smaller part of it.
+So the head copy runs capped at four threads, and those are the defaults in `scripts/whisper-cpu.sh`
+and `.env.example`. Decode barely moved at either size; at eight threads the cost showed in TTFT.
 
-**A clean measurement needs a quiet engine.** From 17:58 to 18:05, none of 21 probes ran alone:
+**The worker's copy on the same model** costs chat about 0-5 % of decode speed while it decodes,
+inside the noise of the measurement (earlier: −3.6 %, 95 % CI −11.6 % to +5.3 %, 26 pairs;
+[CPU-REPLICA.md](CPU-REPLICA.md)).
 
-- 2-4 other requests were running during every probe, with 600-850 other tokens generated per probe.
-- Decode was 11.9-20.0 tok/s (median 15.8) and TTFT 183-365 ms.
-- The load came from benchmark jobs on the head: `chat_ab27.py`, `acc_step.py`, and a script from
-  another agent's venv. In ten minutes, 111 chat requests came from 127.0.0.1, 21 of them the probes.
-
-The gate tool reports nothing from probes that shared the engine.
+**The 4-thread copy's speed:** about 0.41 s of decoding per second of audio, about 1.8 times slower
+than the 8-thread copy on the same clips.
 
 ## The gate
 
@@ -164,19 +166,19 @@ docker run -d --name whisper-cpu-head-test --network host \
   whisper-cpu-head-test:a08a1066
 until curl -fsS http://127.0.0.1:30208/health | grep -q '"ready":true'; do sleep 2; done
 python3 scripts/whisper-cpu-chat-gate.py --replica http://127.0.0.1:30208 --clips "$C" \
-  --pairs 12 --model nvidia/Qwen3.8-27B-NVFP4 --out gate-c8.jsonl
+  --pairs 12 --model Qwen/Qwen3.6-35B-A3B-NVFP4 --out gate-c8.jsonl
 docker rm -f whisper-cpu-head-test
 ```
 
 **If that FAILs,** rerun the same `docker run` with `--cpuset-cpus 16-19 --cpus 4` and
 `-e WHISPER_CPU_THREADS=4`, then write the gate to `--out gate-c4.jsonl`.
 
-**Decision:**
-- **PASS at 8 cores:** deploy with the defaults.
-- **FAIL at 8, PASS at 4:** deploy capped (below). The router's speed estimate was measured with
-  eight threads, so first check that a 4-thread copy still finishes the clips the router would send
-  it inside their deadlines (see Known limits).
-- **FAIL at 4:** do not deploy. The worker's copy is unaffected.
+`scripts/whisper-cpu-chat-gate.py` judges decode only; it records each probe's `ttft_ms`, and the
+TTFT limit of 10 % was applied to those medians.
+
+**Decision (taken):** FAIL at 8, PASS at 4, so the copy deploys capped at four threads, and that cap
+is now the default. Had both failed, the head would get no copy and the worker's would be
+unaffected.
 
 ## Deploy (after a PASS)
 
@@ -186,12 +188,13 @@ because the head's image and model come from it.
 ```bash
 cd /home/techsphere/Documents/project/personal-LLM-Chabot
 scripts/whisper-cpu.sh up                          # worker: build, convert, start, list first
-WHISPER_CPU_NODE=head scripts/whisper-cpu.sh up    # head: load, copy, start on 7-9,15-19, list last
+WHISPER_CPU_NODE=head scripts/whisper-cpu.sh up    # head: load, copy, start on 16-19 (4 threads), list last
 WHISPER_CPU_NODE=head scripts/whisper-cpu.sh verify
 ./techsara up                                      # orchestrator recreate; the main model is not restarted
 ```
 
-To deploy capped, put the cap in `.env` before the head's `up`. The next `up` then keeps it.
+The defaults are the 4-thread cap. A different placement goes in `.env` before the head's `up`,
+and the next `up` keeps it; any change needs the gate run again first.
 
 ```
 WHISPER_CPU_HEAD_CPUSET=16-19
@@ -204,12 +207,17 @@ worker's entry stays in `ASR_CPU_BASE_URLS`.
 
 ## Known limits
 
-- **One speed estimate for every CPU copy.** `ASR_CPU_FIXED_S` and `ASR_CPU_S_PER_AUDIO_S` were
-  measured with eight X925 threads. The default head copy matches it, 1.3-1.6 % slower. A 4-core
-  copy would decode long clips more slowly than the estimate says, and the 1.5 margin is then all
-  the headroom it has. Session windows (120 s timeout) and ASR_TIMEOUT_S (600 s) are generous, but
-  a capped copy should be re-timed on the long-form sets before it is enabled, or given its own
-  estimate.
+- **One speed estimate for every CPU copy.** The router has no per-copy estimate:
+  `ASR_CPU_FIXED_S` (8.5) and `ASR_CPU_S_PER_AUDIO_S` (0.45) apply to every URL in
+  `ASR_CPU_BASE_URLS`, and they were measured with eight X925 threads. The head's 4-thread copy
+  measured **about 0.41 s per second of audio, about 1.8 times slower than the 8-thread copy** on
+  the same clips. On the slowest long-form material (Hindi-English, where eight threads needed up
+  to 0.45 s/s), 1.8 times slower is about 0.8 s/s, past the shared estimate and past what the 1.5
+  margin absorbs. Session windows (120 s timeout) and ASR_TIMEOUT_S (600 s) are generous, so the
+  failure mode is a late transcript, not a lost one. The router has no setting for the head copy
+  alone, so its value is recorded here: **0.41 s per audio second** at four threads. A per-copy
+  estimate, or re-timing the 4-thread copy on the long-form sets, is open work before the head copy
+  is listed.
 - **The head's guard leaves 30007 and 30008 unjudged.** Both engines bind 172.17.0.1, which the LAN
   has no route to. Linux accepts a packet for any local address on any interface, though, so a LAN
   host that adds a route to 172.17.0.0/16 via 192.168.9.54 would reach both unauthenticated engines.

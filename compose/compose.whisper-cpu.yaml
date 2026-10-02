@@ -47,8 +47,8 @@ services:
     # cpuset), so its threads may run on these ten too; the measured chat cost includes that.
     # The quota leaves two X925 cores' worth of time free inside the set as well. These are the
     # WORKER's values and the defaults. The head's copy is given its own
-    # (WHISPER_CPU_CPUSET/_CPUS/_THREADS, set by scripts/whisper-cpu.sh): eight X925 cores without
-    # 5-6, where the chat model's rank-0 engine loop ran on 2026-09-30.
+    # (WHISPER_CPU_CPUSET/_CPUS/_THREADS, set by scripts/whisper-cpu.sh): four X925 cores, 16-19,
+    # four threads, the cap that passed the owner's chat gate (docs/voice/CPU-REPLICA-HEAD.md).
     cpuset: "${WHISPER_CPU_CPUSET:-5-9,15-19}"
     cpus: ${WHISPER_CPU_CPUS:-8}
     # A MEMORY CEILING, AND NO SWAP: the one service with a hard limit, decided on purpose
