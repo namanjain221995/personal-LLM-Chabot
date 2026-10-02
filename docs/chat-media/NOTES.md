@@ -297,3 +297,27 @@ fe-files, as built (2026-10-02 evening):
   compose/voice-store (two CRITICAL Trivy advisories). Not part of this feature; ignore those three
   files when reviewing. frontend/node_modules was reinstalled (next 16.3.6).
 - PR #92 (release w1, V43) is merged to main; V44 here stays next in line.
+
+## qa-frontend (attack on be-media / fe-images / fe-files frontend, 2026-10-02 21:50 IST)
+
+- A text-only follow-up about a picture is answered by `run_vision_engine`
+  (main.py `elif image_followup_images`, and the `image_followup.unavailable`
+  branch), which emits `meta.route = "vision"`. `showsLegacyPhotoNote` reads
+  any imageless user turn followed by a vision answer as a pre-storage photo,
+  so the "Photo not stored on the server" line shows under every such
+  follow-up, on every device, in new chats too. Whoever fixes it: the
+  orchestrator could tag follow-up answers (e.g. `meta.image_followup: true`)
+  and the predicate skip them; legacy rows have no tag, so the predicate also
+  needs a thread-level rule (no earlier user turn with photos or a note).
+- `runEdit` persists the new version BEFORE `startStream`. A 422
+  `image_ref_missing` then withdraws the stream but the unanswered edit stays
+  stored (and pushed). The regenerate and retry paths persist nothing first.
+- The backfill only looks at turns WITHOUT `meta.images`. A turn whose
+  browser-written `meta.images` never got stored (the /chat never reached
+  intake, a feature-gated account, a skipped store) shows "Image unavailable"
+  everywhere else for good, even while the sending browser still holds the
+  bytes.
+- Proxies held against encoded traversal (%2e%2e, %2F, %252F, NUL, RTL
+  override, >64 chars, bad `size`): 400 before any fetch, all three routes.
+- `npm run build` rewrites `frontend/next-env.d.ts` (`.next/dev/types` ->
+  `.next/types`); put the committed copy back after a build.
