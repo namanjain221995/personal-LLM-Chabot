@@ -926,3 +926,42 @@ Not tested: a sidebar click inside the 5 s `UPDATE_CHECK_MIN_MS` window after an
 skips the list read (ChatApp checkForUpdates), so a turn sent in that window would show only
 after the next focus or reopen. The orchestrator log's Files API PermissionError was the
 harness (no PUBLIC_API_FILES root set), not this branch.
+
+## store-always (backend, STORE-ALWAYS.md §1, 2026-10-03)
+
+What the orchestrator does now, for the frontend side to rely on:
+
+- `/chat` with inline pictures and no usable `image_ids` (absent, or a count
+  that does not match the inline pictures) stores them under
+  `ix-<intent_id>-<index>`, index 0..N-1 in the order of `images` (the single
+  `image`/`image_base64` spelling is index 0). Only when the request's OWN
+  `intent_id` fullmatches `^[0-9a-f]{32}$` (newIntentId(): randomUUID without
+  dashes). The base36 fallback newIntentId() makes without `crypto.randomUUID`
+  is not that shape and is not minted.
+- Same background store as `image_ids` (behind the turn, `source` `chat`,
+  same checks, same metrics). A retry of the same send names the same ids
+  and counts `duplicate`; no second copy.
+- Never minted on a turn that sends `image_refs`. With no usable intent (none
+  sent, or not 32 hex), nothing is stored and each picture is counted
+  `chat_media_writes_total{source="chat",result="unlinked"}` (a new closed
+  value; metrics.py, chat_media.WRITE_RESULTS and the pin in
+  test_chat_media_api.py changed together). A bare call (no conversation)
+  still stores nothing and counts nothing. Ownership and F034 unchanged: the
+  hook still runs after the feature gate and the ownership check.
+- The server still never writes `meta.images`. The rows are in
+  `GET /chat-media/{conv}` (`attachment_id`, `mime`, `width`, `height`),
+  listed oldest first: sort the `ix-<intent>-` items by the number after the
+  last `-`, not by list order. They land milliseconds to seconds after the
+  send, like every /chat store; a second device that looks too early sees
+  none yet.
+- image_memory's store fallback (`chat_media.latest_turn_images`, both the
+  visible-path and the stored-order queries) treats a user message with no
+  `meta.images` as a picture turn when its `meta.intent.id` is 32 hex and the
+  viewer has `ix-<that intent>-*` rows in that chat; it loads indexes 0..4 in
+  order. A message WITH `meta.images` uses those ids as before, so once the
+  frontend writes `meta.images` (ix- ids) nothing changes for the model.
+- Not changed, known: `sharing.evaluate` blocks a public link by
+  `meta.images`, so a chat whose only photo is an `ix-` row with no
+  `meta.images` yet is shareable exactly as an old-tab photo chat was before
+  this change (the snapshot is an allowlist: no picture leaks, the vision
+  answer's text can). It closes when the frontend writes `meta.images`.

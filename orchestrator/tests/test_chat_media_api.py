@@ -635,7 +635,7 @@ def test_the_metric_registry_holds_every_contract_entry_and_the_module_agrees():
     labels = metrics._LABELS_BY_METRIC
     assert labels["chat_media_writes_total"] == {
         "source": {"chat", "upload", "backfill"},
-        "result": {"stored", "duplicate", "unsupported", "too_large", "no_space", "error"},
+        "result": {"stored", "duplicate", "unsupported", "too_large", "no_space", "error", "unlinked"},
     }
     assert labels["chat_media_reads_total"] == {
         "size": {"thumb", "full"},

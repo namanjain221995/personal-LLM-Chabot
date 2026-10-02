@@ -323,6 +323,8 @@ def test_a_picture_the_store_refuses_is_counted_and_the_chat_goes_on(engines, as
 
 
 def test_mismatched_image_ids_store_nothing_and_are_never_a_4xx(engines, as_user):
+    # No send intent either, so the server has nothing to name them by
+    # (STORE-ALWAYS.md §1): skipped, and counted.
     as_user("alice")
     with TestClient(app) as client:
         resp = _chat(
@@ -333,6 +335,7 @@ def test_mismatched_image_ids_store_nothing_and_are_never_a_4xx(engines, as_user
         assert _route(resp) == "vision"
         _wait_settled()
     assert _rows("conv-mismatch") == []
+    assert _counter("chat_media_writes_total", source="chat", result="unlinked") == 2
 
 
 def test_a_malformed_image_id_is_a_422(engines, as_user):
@@ -354,6 +357,143 @@ def test_a_bare_call_with_no_conversation_stores_nothing(engines, as_user):
         assert resp.status_code == 200
         _wait_settled()
     assert _rows(f"u{alice['id']}-default") == []
+
+
+# ------------------------- pictures from a page that sends no ids (store always) --
+#
+# docs/chat-media/STORE-ALWAYS.md §1. Production, 2026-10-03 01:59 IST: a tab
+# opened before the V44 deploy still ran the old JavaScript, which sends the
+# bytes and no `image_ids`, so the photo was not stored and the chat said
+# "Photo not stored on the server". The server now names such pictures itself,
+# from the send intent the browser keeps on the message (`meta.intent.id`).
+
+#: The composer's newIntentId() shape (32 hex), kept low-entropy for gitleaks.
+INTENT = "ab" * 16
+
+
+def test_a_turn_without_image_ids_is_stored_under_ids_minted_from_its_intent(engines, as_user):
+    alice = as_user("alice")
+    png, jpeg = _png(), _jpeg()
+    minted = [f"ix-{INTENT}-0", f"ix-{INTENT}-1"]
+    with TestClient(app) as client:
+        body = dict(
+            message="what is on this invoice?", conversation_id="conv-old-tab", intent_id=INTENT,
+            images=[_data_url(png), _data_url(jpeg, "image/jpeg")],
+        )
+        resp = _chat(client, **body)
+        assert resp.status_code == 200, resp.text
+        assert _route(resp) == "vision"
+        rows = _wait_rows("conv-old-tab", 2)
+        assert [(r["attachment_id"], r["mime"], r["source"]) for r in rows] == [
+            (minted[0], "image/png", "chat"),
+            (minted[1], "image/jpeg", "chat"),
+        ]
+        assert all(r["user_id"] == int(alice["id"]) for r in rows)
+        # Any device finds them in the list by the message's intent, in send
+        # order, and reads the bytes that were sent.
+        listed = client.get("/chat-media/conv-old-tab").json()["items"]
+        assert sorted(i["attachment_id"] for i in listed) == minted
+        assert client.get(f"/chat-media/conv-old-tab/{minted[0]}").content == png
+        assert client.get(f"/chat-media/conv-old-tab/{minted[1]}").content == jpeg
+        # A retry of the same send names the same pictures: no second copy.
+        assert _chat(client, **body).status_code == 200
+        _wait_settled()
+    assert [r["attachment_id"] for r in _rows("conv-old-tab")] == minted
+    assert _counter("chat_media_writes_total", source="chat", result="stored") == 2
+    assert _counter("chat_media_writes_total", source="chat", result="duplicate") == 2
+
+
+def test_the_single_image_spelling_without_ids_is_minted_as_index_0(engines, as_user):
+    as_user("alice")
+    with TestClient(app) as client:
+        resp = _chat(
+            client, message="what is it", conversation_id="conv-old-single",
+            intent_id=INTENT, image_base64=base64.b64encode(_jpeg()).decode("ascii"),
+        )
+        assert resp.status_code == 200, resp.text
+        assert [r["attachment_id"] for r in _wait_rows("conv-old-single", 1)] == [f"ix-{INTENT}-0"]
+
+
+def test_mismatched_image_ids_with_an_intent_are_minted_instead(engines, as_user):
+    as_user("alice")
+    with TestClient(app) as client:
+        resp = _chat(
+            client, message="compare", conversation_id="conv-mismatch-intent", intent_id=INTENT,
+            images=[_data_url(_png()), _data_url(_jpeg(), "image/jpeg")], image_ids=["att-only-one"],
+        )
+        assert resp.status_code == 200
+        rows = _wait_rows("conv-mismatch-intent", 2)
+    assert [r["attachment_id"] for r in rows] == [f"ix-{INTENT}-0", f"ix-{INTENT}-1"]
+
+
+def test_a_turn_with_image_ids_is_stored_exactly_as_before(engines, as_user):
+    as_user("alice")
+    with TestClient(app) as client:
+        resp = _chat(
+            client, message="what is it", conversation_id="conv-with-ids", intent_id=INTENT,
+            images=[_data_url(_png())], image_ids=["att-with-id-1"],
+        )
+        assert resp.status_code == 200
+        _wait_rows("conv-with-ids", 1)
+        _wait_settled()
+    assert [r["attachment_id"] for r in _rows("conv-with-ids")] == ["att-with-id-1"]
+    assert _counter("chat_media_writes_total", source="chat", result="stored") == 1
+
+
+def test_without_a_usable_intent_nothing_is_stored_and_it_is_counted(engines, as_user):
+    as_user("alice")
+    with TestClient(app) as client:
+        # No intent at all (the one the server mints is never the browser's),
+        # and an intent that is not the composer's 32-hex shape.
+        for conv, extra in (("conv-no-intent", {}), ("conv-odd-intent", {"intent_id": "intent-old-1"})):
+            resp = _chat(
+                client, message="what is it", conversation_id=conv,
+                images=[_data_url(_png()), _data_url(_jpeg(), "image/jpeg")], **extra,
+            )
+            assert resp.status_code == 200, resp.text
+            assert _route(resp) == "vision"
+        _wait_settled()
+    assert _rows("conv-no-intent") == [] and _rows("conv-odd-intent") == []
+    assert _counter("chat_media_writes_total", source="chat", result="unlinked") == 4
+    assert _counter("chat_media_writes_total", source="chat", result="stored") == 0
+
+
+def test_a_ref_turn_never_mints(engines, as_user):
+    as_user("alice")
+    with TestClient(app) as client:
+        _upload(client, "conv-ref-mint", "att-stored-1", _png(colour=(5, 5, 5)))
+        resp = _chat(
+            client, message="again", conversation_id="conv-ref-mint", intent_id=INTENT,
+            image_refs=["att-stored-1"],
+        )
+        assert resp.status_code == 200, resp.text
+        resp = _chat(
+            client, message="and this", conversation_id="conv-ref-mint", intent_id="cd" * 16,
+            image_refs=["att-stored-1"], images=[_data_url(_jpeg(), "image/jpeg")],
+        )
+        assert resp.status_code == 200, resp.text
+        assert len(engines["vision"][-1]["images"]) == 2
+        _wait_settled()
+    assert [r["attachment_id"] for r in _rows("conv-ref-mint")] == ["att-stored-1"]
+    assert _counter("chat_media_writes_total", source="chat", result="unlinked") == 1
+
+
+def test_minting_keeps_ownership_and_the_reserved_key_refusal(engines, as_user):
+    as_user("bob")
+    with TestClient(app) as client:
+        assert client.post("/history/conversations", json={"id": "conv-bobs", "title": "t"}).status_code == 200
+        alice = as_user("alice")
+        image = [_data_url(_png())]
+        resp = _chat(client, message="x", conversation_id="conv-bobs", intent_id=INTENT, images=image)
+        assert resp.status_code == 404
+        resp = _chat(client, message="x", conversation_id=f"u{alice['id']}-default", intent_id=INTENT, images=image)
+        assert resp.status_code == 422
+        # A bare call has no chat to show it in.
+        assert _chat(client, message="x", intent_id=INTENT, images=image).status_code == 200
+        _wait_settled()
+    with db.connection() as con:
+        assert con.execute("SELECT count(*) AS n FROM chat_media").fetchone()["n"] == 0
+    assert not metrics._counters.get("chat_media_writes_total")
 
 
 # ----------------------------------------------------------- stored by ref --
@@ -737,3 +877,87 @@ def test_a_wordless_photo_is_found_by_a_regenerated_answer_stored_later(as_user)
     assert found["turns_after"] == 0
     # An answer that is not stored under the photo does not place it.
     assert chat_media.latest_turn_images(uid, "conv-regen", [("assistant", "more answer"), ("user", "q")]) is None
+
+
+# ------------------------------ the store fallback reads a photo the server named --
+
+
+def _old_tab_photo_turn(client, conv: str, payload: bytes) -> None:
+    """An old page's photo turn as the database ends up holding it: the
+    server stored the picture under `ix-<intent>-0`, and the browser's history
+    push wrote the user message with its `meta.intent` and NO `meta.images`."""
+    resp = _chat(client, message=TURN1, conversation_id=conv, intent_id=INTENT, images=[_data_url(payload)])
+    assert resp.status_code == 200, resp.text
+    assert [r["attachment_id"] for r in _wait_rows(conv, 1)] == [f"ix-{INTENT}-0"]
+    _wait_settled()
+    pushed = client.put(
+        f"/history/conversations/{conv}/messages",
+        json={
+            "messages": [
+                {"role": "user", "content": TURN1, "meta": {"intent": {"id": INTENT, "state": "answered"}}},
+                {"role": "assistant", "content": ANSWER1, "meta": {"route": "vision"}},
+            ]
+        },
+    )
+    assert pushed.status_code == 200, pushed.text
+
+
+def test_the_follow_up_reads_a_photo_the_server_named_after_the_v41_row_is_gone(engines, as_user):
+    as_user("alice")
+    payload = _png(colour=(120, 60, 30))
+    with TestClient(app) as client:
+        _old_tab_photo_turn(client, "conv-ix-follow", payload)
+        # The V41 row (written behind the turn, on its single writer) and this
+        # process's copy are gone: the TTL sweep, then a restart.
+        image_memory._writer_pool().submit(lambda: None).result(timeout=15)
+        with db.connection() as con:
+            con.execute("DELETE FROM conversation_images WHERE conversation_id = 'conv-ix-follow'")
+        _restart()
+        path = [
+            {"role": "user", "content": TURN1},
+            {"role": "assistant", "content": ANSWER1},
+            {"role": "user", "content": FOLLOW},
+        ]
+        resp = _chat(client, message=FOLLOW, conversation_id="conv-ix-follow", messages=path)
+        assert resp.status_code == 200, resp.text
+        assert _route(resp) == "vision"
+        assert [_decoded(i) for i in engines["vision"][-1]["images"]] == [payload]
+
+
+def test_latest_turn_images_takes_a_photo_the_server_named_by_the_message_intent(as_user):
+    bob = as_user("bob")
+    alice = as_user("alice")
+    uid = int(alice["id"])
+    photo, second = _png(colour=(7, 77, 7)), _png(colour=(70, 7, 7))
+    later_intent = "cd" * 16
+    with TestClient(app) as client:
+        assert client.post("/history/conversations", json={"id": "conv-ix", "title": "t"}).status_code == 200
+        _upload(client, "conv-ix", f"ix-{INTENT}-1", second)
+        _upload(client, "conv-ix", f"ix-{INTENT}-0", photo)
+    # A row under the later turn's intent that is BOB's (stored while the id
+    # was nobody's): never Alice's picture.
+    with db.connection() as con:
+        con.execute(
+            "INSERT INTO chat_media (media_id, user_id, conversation_id, attachment_id, sha256, mime, bytes, source) "
+            "VALUES (%s, %s, 'conv-ix', %s, %s, 'image/png', 1, 'chat')",
+            ("e" * 32, int(bob["id"]), f"ix-{later_intent}-0", "f" * 64),
+        )
+    _say("conv-ix", "user", "Read this", {"intent": {"id": INTENT, "state": "answered"}})
+    _say("conv-ix", "assistant", "It says hello")
+    _say("conv-ix", "user", "thanks", {"intent": {"id": later_intent, "state": "answered"}})
+    _say("conv-ix", "assistant", "you are welcome")
+    found = chat_media.latest_turn_images(uid, "conv-ix")
+    assert [_decoded(i) for i in found["images"]] == [photo, second]  # by index, not by upload order
+    assert found["context"] == "read this\nit says hello"
+    assert found["turns_after"] == 1
+    path = [
+        ("user", "Read this"),
+        ("assistant", "It says hello"),
+        ("user", "thanks"),
+        ("assistant", "you are welcome"),
+        ("user", "what did it say?"),
+    ]
+    found = chat_media.latest_turn_images(uid, "conv-ix", path)
+    assert [_decoded(i) for i in found["images"]] == [photo, second]
+    assert found["turns_after"] == 1
+    assert chat_media.latest_turn_images(int(bob["id"]), "conv-ix") is None

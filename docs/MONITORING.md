@@ -911,7 +911,7 @@ attachment id or a file name.
 
 | metric | labels | what it answers |
 |---|---|---|
-| `chat_media_writes_total` | source = chat / upload / backfill, result = stored / duplicate / unsupported / too_large / no_space / error | pictures written, and why some were not (`chat` is `/chat`'s background store, which never fails a turn) |
+| `chat_media_writes_total` | source = chat / upload / backfill, result = stored / duplicate / unsupported / too_large / no_space / error / unlinked | pictures written, and why some were not (`chat` is `/chat`'s background store, which never fails a turn; `unlinked` is a `/chat` picture with no ids and no send intent to name it by, so not stored) |
 | `chat_media_write_seconds` | source | verify + durable write of one picture |
 | `chat_media_reads_total` | size = thumb / full, result = ok / not_modified / not_found / missing | byte reads, the admin route included; `missing` is a 410, a row whose file is gone |
 | `chat_media_erase_total` | store = media / files, result = ok / error | bytes removed at once when a chat is deleted; an error is finished by the reaper |

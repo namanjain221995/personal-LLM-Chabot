@@ -123,7 +123,7 @@ THUMB_QUALITY = 80
 #: The closed vocabularies of the V44 CHECK and of app/metrics.py, which
 #: tests/test_chat_media_api.py pins to these.
 SOURCES = ("chat", "upload", "backfill")
-WRITE_RESULTS = ("stored", "duplicate", "unsupported", "too_large", "no_space", "error")
+WRITE_RESULTS = ("stored", "duplicate", "unsupported", "too_large", "no_space", "error", "unlinked")
 SIZES = ("thumb", "full")
 READ_RESULTS = ("ok", "not_modified", "not_found", "missing")
 
@@ -134,9 +134,13 @@ READ_RESULTS = ("ok", "not_modified", "not_found", "missing")
 CACHE_CONTROL = "private, max-age=31536000, immutable"
 CONTENT_SECURITY_POLICY = "default-src 'none'; sandbox"
 
-#: The composer's id for an attachment: crypto.randomUUID(), or the backfill's
-#: `bf-<32 hex>`.
+#: The composer's id for an attachment: crypto.randomUUID(), the backfill's
+#: `bf-<32 hex>`, or the server's own `ix-<intent>-<index>` (below).
 ATTACHMENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+#: A send intent the server names pictures by: the composer's newIntentId(),
+#: crypto.randomUUID() without its dashes. `ix-<intent>-<index>` is then 37
+#: characters, inside ATTACHMENT_ID_RE.
+_MINT_INTENT_RE = re.compile(r"^[0-9a-f]{32}$")
 _CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 #: F034's reserved bare-call key, `u<user id>-<session id>`. The same
 #: expression lives in main.py, uploads.py and history.py; spelled out again
@@ -887,31 +891,71 @@ async def _store_inline(user_id: int, conversation_id: str, pairs: List[Tuple[st
         log.warning("chat media: the background store stopped early", exc_info=True)
 
 
+def minted_attachment_id(intent_id: str, index: int) -> str:
+    """The id the server gives the `index`-th inline picture of a send that
+    came with no usable `image_ids` (docs/chat-media/STORE-ALWAYS.md §1)."""
+    return f"ix-{intent_id}-{index}"
+
+
+def _minted_ids(
+    images: Sequence[str], intent_id: Optional[str], by_reference: bool
+) -> Optional[List[str]]:
+    """Ids for a turn whose pictures came without ids that fit them: one per
+    picture, from the send intent and the picture's place in the send, or
+    None when there is nothing to name them by (counted `unlinked`).
+
+    A page loaded before V44 sends the bytes and no ids, and never stores them
+    itself (production, 2026-10-03: a tab opened before the deploy). The
+    browser keeps the intent on the user message (`meta.intent.id`), so every
+    device can find these pictures from the message alone. Without the
+    browser's own intent there is no such link: the one /chat mints when none
+    is sent is never the browser's. A turn that sends `image_refs` is a
+    regenerate, edit or retry of pictures already stored under the ids its
+    message names; it is never given a second set.
+    """
+    if not by_reference and intent_id and _MINT_INTENT_RE.fullmatch(intent_id):
+        return [minted_attachment_id(intent_id, i) for i in range(len(images))]
+    unlinked = sum(1 for value in images if value and value.strip())
+    for _ in range(unlinked):
+        _count_write("chat", "unlinked")
+    if unlinked:
+        log.info("chat media: %d inline picture(s) with no ids to store them under", unlinked)
+    return None
+
+
 def schedule_inline_store(
     user_id: int,
     conversation_id: Optional[str],
     images: Sequence[str],
     attachment_ids: Optional[Sequence[str]],
+    *,
+    intent_id: Optional[str] = None,
+    by_reference: bool = False,
 ) -> Optional["asyncio.Task"]:
     """/chat's hook (CONTRACT §5): store this turn's inline pictures BEHIND
     the turn. Returns at once; the task never raises and nothing waits on it.
 
-    `images[i]` is the picture `attachment_ids[i]` names. Counts that do not
-    match store nothing: which id belongs to which picture is then unknown,
-    and a picture filed under the wrong id would show on the wrong message of
-    every other device, forever (the first write wins). Logged, never a 4xx.
+    `images[i]` is the picture `attachment_ids[i]` names. When the ids are
+    absent or their count does not match, which id belongs to which picture
+    is unknown, and a picture filed under the wrong id would show on the
+    wrong message of every other device, forever (the first write wins); so
+    the server names them itself from the browser's send intent
+    (`_minted_ids`), or, with none, stores nothing and counts it. Never a 4xx.
     A bare call (no conversation id) stores nothing: its key is the account's
     shared `u<id>-<session>`, which is not a chat anybody can open.
     """
-    if not attachment_ids or not images or not _valid_conversation(conversation_id):
+    if not images or not _valid_conversation(conversation_id):
         return None
-    if len(images) != len(attachment_ids):
-        log.info(
-            "chat media: %d inline picture(s) but %d image_ids; nothing stored for this turn",
-            len(images),
-            len(attachment_ids),
-        )
-        return None
+    if not attachment_ids or len(images) != len(attachment_ids):
+        if attachment_ids:
+            log.info(
+                "chat media: %d inline picture(s) but %d image_ids",
+                len(images),
+                len(attachment_ids),
+            )
+        attachment_ids = _minted_ids(images, intent_id, by_reference)
+        if attachment_ids is None:
+            return None
     pairs = [
         (str(aid), value)
         for aid, value in zip(attachment_ids, images)
@@ -989,6 +1033,29 @@ def _meta_attachment_ids(images: Any) -> List[str]:
     return out
 
 
+def _turn_attachment_ids(images: Any, intent_id: Any) -> List[str]:
+    """The pictures a stored user message names: its `meta.images`, or, for
+    a message without them, the ones the server stored under its send intent
+    (`ix-<intent>-<index>`, STORE-ALWAYS.md §1), in send order. An index with
+    no row is simply missing when they are loaded."""
+    ids = _meta_attachment_ids(images)
+    if ids or not (isinstance(intent_id, str) and _MINT_INTENT_RE.fullmatch(intent_id)):
+        return ids
+    return [minted_attachment_id(intent_id, i) for i in range(MAX_FILES)]
+
+
+#: A user message `m` (of conversation `c`) that names stored pictures: by
+#: its `meta.images`, or, with none, by the viewer's `ix-` rows under its
+#: send intent: a photo from a page that wrote no `meta.images` (a tab loaded
+#: before V44), which the server stored under ids it named itself.
+_PICTURE_TURN_SQL = (
+    "((jsonb_typeof(m.meta -> 'images') = 'array' AND (m.meta -> 'images') -> 0 IS NOT NULL) "
+    " OR ((m.meta -> 'intent' ->> 'id') ~ '^[0-9a-f]{32}$' "
+    "     AND EXISTS (SELECT 1 FROM chat_media x "
+    "                  WHERE x.user_id = c.user_id AND x.conversation_id = m.conversation_id "
+    "                    AND starts_with(x.attachment_id, 'ix-' || (m.meta -> 'intent' ->> 'id') || '-'))))"
+)
+
 #: Picture turns compared with the path the browser sent, newest first.
 _VISIBLE_CANDIDATES = 20
 
@@ -1051,7 +1118,7 @@ def _latest_visible_turn_images(
         return None
     with db.read_connection() as con:
         rows = con.execute(
-            "SELECT m.content, m.meta -> 'images' AS images, "
+            "SELECT m.content, m.meta -> 'images' AS images, m.meta -> 'intent' ->> 'id' AS intent_id, "
             "(SELECT coalesce(jsonb_agg(a.content), '[]'::jsonb) FROM messages a "
             "  WHERE btrim(coalesce(m.content, '')) = '' "
             "    AND a.conversation_id = m.conversation_id AND a.id > m.id "
@@ -1064,8 +1131,7 @@ def _latest_visible_turn_images(
             ") AS answers "
             "FROM messages m JOIN conversations c ON c.id = m.conversation_id "
             "WHERE m.conversation_id = %s AND c.user_id = %s AND m.role = 'user' "
-            "  AND jsonb_typeof(m.meta -> 'images') = 'array' "
-            "  AND (m.meta -> 'images') -> 0 IS NOT NULL "
+            f"  AND {_PICTURE_TURN_SQL} "
             "  AND EXISTS (SELECT 1 FROM chat_media s "
             "               WHERE s.conversation_id = %s AND s.user_id = %s) "
             "ORDER BY m.id DESC LIMIT %s",
@@ -1079,7 +1145,9 @@ def _latest_visible_turn_images(
         index, answer = placed
         # The newest picture on the path is the one "the photo" means; if its
         # files are gone, an older one would be the wrong picture.
-        loaded, _missing = _load_refs(user_id, conversation_id, _meta_attachment_ids(row["images"]))
+        loaded, _missing = _load_refs(
+            user_id, conversation_id, _turn_attachment_ids(row["images"], row["intent_id"])
+        )
         if not loaded:
             return None
         return {
@@ -1096,7 +1164,9 @@ def latest_turn_images(
     visible: Optional[Sequence[Tuple[str, str]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """image_memory's store fallback (CONTRACT §6): the newest USER message
-    of this chat whose `meta.images` is non-empty, with its stored pictures.
+    of this chat whose `meta.images` is non-empty, or, with none, whose send
+    intent names the viewer's `ix-` rows (`_PICTURE_TURN_SQL`), with its
+    stored pictures.
 
     {"images": [data URL, ...], "context": question + "\\n" + answer
     (lowercased, as image_memory.remember stores it), "turns_after": user
@@ -1121,7 +1191,7 @@ def latest_turn_images(
         return _latest_visible_turn_images(int(user_id), conversation_id, visible)
     with db.read_connection() as con:
         row = con.execute(
-            "SELECT t.content, t.images, "
+            "SELECT t.content, t.images, t.intent_id, "
             "(SELECT jsonb_build_object('role', n.role, 'content', n.content) "
             "   FROM messages n WHERE n.conversation_id = t.conversation_id AND n.id > t.id "
             "  ORDER BY n.id LIMIT 1) AS next_message, "
@@ -1129,11 +1199,11 @@ def latest_turn_images(
             "   AND u.id > t.id AND u.role = 'user') AS users_after, "
             "(SELECT l.role FROM messages l WHERE l.conversation_id = t.conversation_id "
             "  ORDER BY l.id DESC LIMIT 1) AS last_role "
-            "FROM (SELECT m.id, m.conversation_id, m.content, m.meta -> 'images' AS images "
+            "FROM (SELECT m.id, m.conversation_id, m.content, m.meta -> 'images' AS images, "
+            "             m.meta -> 'intent' ->> 'id' AS intent_id "
             "        FROM messages m JOIN conversations c ON c.id = m.conversation_id "
             "       WHERE m.conversation_id = %s AND c.user_id = %s AND m.role = 'user' "
-            "         AND jsonb_typeof(m.meta -> 'images') = 'array' "
-            "         AND (m.meta -> 'images') -> 0 IS NOT NULL "
+            f"        AND {_PICTURE_TURN_SQL} "
             "         AND EXISTS (SELECT 1 FROM chat_media s "
             "                      WHERE s.conversation_id = %s AND s.user_id = %s) "
             "       ORDER BY m.id DESC LIMIT 1) t",
@@ -1141,7 +1211,7 @@ def latest_turn_images(
         ).fetchone()
     if row is None:
         return None
-    ids = _meta_attachment_ids(row["images"])
+    ids = _turn_attachment_ids(row["images"], row["intent_id"])
     loaded, _missing = _load_refs(int(user_id), conversation_id, ids)
     if not loaded:
         return None

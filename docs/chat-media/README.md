@@ -176,8 +176,18 @@ The admin route:
   - This applies on every route: vision, document plus picture, and artifact.
   - The first token waits on none of it. A failure is logged and counted, and
     never surfaces as a chat error.
-  - If the counts do not match, nothing is stored. This is logged and is never
-    a 4xx.
+  - **No usable ids** (absent, or a count that does not match): the server
+    names the pictures itself, `ix-<intent_id>-<index>` (index 0..N-1 in send
+    order), when the request's own `intent_id` is the composer's shape (32
+    lowercase hex). That is what a page loaded before V44 sends: the bytes,
+    the intent, and no ids ([`STORE-ALWAYS.md`](STORE-ALWAYS.md)). The
+    browser keeps the intent on the user message (`meta.intent.id`), so any
+    device finds the pictures in `GET /chat-media/{conv}` by that prefix. A
+    retry of the same send names the same ids (`duplicate`). Same background
+    store, same checks, `source` `chat`.
+  - With no such intent (none sent; the one /chat mints for an old client is
+    never the browser's), or on a turn that also sends `image_refs`, nothing
+    is stored: counted `result="unlinked"`, never a 4xx.
   - A bare call (no `conversation_id`) stores nothing.
 - **`image_refs`.** These are pictures that are already stored, sent instead of
   bytes.
@@ -201,7 +211,10 @@ neither the process nor the V41 row has a live picture. It follows the branch
 the person sees: `/chat`'s `messages` are passed as `visible`, and
 `chat_media.latest_turn_images` takes the newest picture turn ON that path
 (matched by its words, or, for a photo with no words, by the assistant message
-stored under it), with that turn's question and answer. A picture on an
+stored under it), with that turn's question and answer. A picture turn is a
+user message with `meta.images`, or, with none, one whose `meta.intent.id`
+has the viewer's `ix-<intent>-*` rows (a photo from a page that wrote no
+`meta.images`); its pictures are then read in index order. A picture on an
 edited-away branch is never read into a later turn. `turns_after` counts user
 turns on the path after it, not the question being asked now. Only the 20
 newest picture turns are compared, and nothing is written back to the V41 row.
@@ -267,7 +280,7 @@ No label ever carries a user, a chat, an attachment id or a file name.
 
 | Metric | Labels | What it answers |
 |---|---|---|
-| `chat_media_writes_total` | `source` = chat / upload / backfill; `result` = stored / duplicate / unsupported / too_large / no_space / error | Pictures written, and why some were not. |
+| `chat_media_writes_total` | `source` = chat / upload / backfill; `result` = stored / duplicate / unsupported / too_large / no_space / error / unlinked | Pictures written, and why some were not. `unlinked`: a `/chat` picture with no ids and no send intent to name it by. |
 | `chat_media_write_seconds` | `source` | Time to verify and durably store one picture. |
 | `chat_media_reads_total` | `size` = thumb / full; `result` = ok / not_modified / not_found / missing | Byte reads, including the admin route. `missing` is a 410. |
 | `chat_media_erase_total` | `store` = media / files; `result` = ok / error | Bytes removed at chat deletion. |
@@ -307,6 +320,9 @@ Signals worth watching:
 
 ## Honest limits
 
+- **A page with no send intent.** A `/chat` picture that carries neither
+  `image_ids` nor the browser's 32-hex `intent_id` is not stored
+  (`unlinked`). Every composer since V29 sends an intent.
 - **Pictures sent before V44 are on the server only if a browser backfills
   them.** The browser that sent a photo, and still holds it in IndexedDB, uploads
   it the next time it opens that chat. A photo whose only browser has logged out,
@@ -420,6 +436,8 @@ Each is deliberate and recorded in NOTES.md under the named track.
 | §4.4 `/admin/members/...`, "same headers as (3)" | `/admin/api/members/...`, with `Cache-Control: private, no-store` instead of `immutable` | be-media, fix-files |
 | §5 `image_refs` "same order" as inline images | Refs come first, then inline pictures; the frontend never sends both in one request | be-media |
 | §5 (not covered) | ATTACHMENTS feature off clears `image_ids`/`image_refs` (no 422); a ref-only turn with no words gets "Analyze the attached image." | be-media, fix-be |
+| §5 "a length mismatch is ignored for storage" | Absent or mismatched `image_ids` with the browser's 32-hex `intent_id` store under `ix-<intent>-<index>`; otherwise counted `unlinked`; never on a ref turn | store-always |
+| §6 "the newest USER message ... whose `meta.images` is non-empty" | Also a user message with no `meta.images` whose `meta.intent.id` has the viewer's `ix-` rows | store-always |
 | §6 "the newest USER message ... whose `meta.images` is non-empty" | The newest picture turn on the branch the person sees (`visible`), at most 20 compared; `turns_after` excludes the question being asked | fix-be |
 | §7 `PRIVATE_META_KEYS` gains `images` | Also: `sharing.evaluate` reads provenance from empty messages, so a photo-only chat cannot be shared | fix-be |
 | §8 reapers "started like the other background sweeps" | Media: `chat_media.reap_loop`, first pass 5 min after start. Lasting files: after main.py's upload-session sweep, first pass 10 min after start | be-media, fix-files |
