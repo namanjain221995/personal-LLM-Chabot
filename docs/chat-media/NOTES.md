@@ -897,3 +897,32 @@ Seen, not changed (the same on both builds): the first two opens of a chat in
 a fresh browser both GET it. With the fake orchestrator, an answer whose
 stream carried a `generation_id` was not pushed by the browser. I did not
 look into why; the real orchestrator has stored the answer itself since V29.
+
+## e2e2 (re-run of the parts that failed, HEAD 4436a3d7, 2026-10-03 00:05 IST)
+
+Same stack (b) on the head, all on 127.0.0.1, torn down afterwards: a `git archive` of 4436a3d7,
+venv uvicorn :18971 (V44 migrated at boot, private DB chatmedia_e2e2_test, now dropped), the Next
+build of the same snapshot (:3971), the image-counting stub engine (:18970), a throwaway member.
+Use full Chromium (`channel="chromium"`): the default headless shell has no PDF viewer, so the
+PDF dialog shows "Preview could not be displayed." even though the file arrived (200, 7125 bytes).
+
+All four held, in 3 full runs (run 1 headless shell, runs 2-3 full Chromium):
+- Baseline: A's photo shows on B (fresh storage) as the 512x384 webp thumb, immutable cache.
+- Image + PDF in one turn: the stored user message carries `attachments[0].id` with
+  `upload_state: "uploaded"`; B shows both photos and the PDF chip; the chip fetches
+  /api/uploads/{conv}/{id}/file (200, application/pdf, 7125 bytes) and the PDF renders.
+  A's first PUT after its POST /messages append is still 409 (expected, fix-pdf-id); the re-push
+  with the fresh stamp is 200. Also held with A's /api/upload held 6 s so it lands after the
+  answer, on a first turn and on a second turn (409, re-push without the id, then the late
+  upload's PUT carries it, n=4, 200); B opened that PDF.
+- Stale second device: B had the chat open, A sent image + PDF, B went to / and back: exactly 1
+  conversation GET (200) and 2 list GETs; A's turn, its photo and the PDF chip showed. In-app
+  (New chat, then the sidebar row, 6 s later) after A's third photo turn: 1 conversation GET,
+  1 list GET, the third photo showed.
+- Regenerate on B: /chat body has `image_refs` = [the photo's attachment id], no inline image,
+  200; the engine got 1 image part.
+
+Not tested: a sidebar click inside the 5 s `UPDATE_CHECK_MIN_MS` window after an earlier check
+skips the list read (ChatApp checkForUpdates), so a turn sent in that window would show only
+after the next focus or reopen. The orchestrator log's Files API PermissionError was the
+harness (no PUBLIC_API_FILES root set), not this branch.
