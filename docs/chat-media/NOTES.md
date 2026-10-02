@@ -100,3 +100,86 @@ Operational switch: `CHAT_MEDIA_MIN_FREE_GIB` set far above the disk size
 stops all new writes (507 / skipped) with no deploy; reads, deletion and the
 reaper keep working. `IMAGE_MEMORY_STORE_FALLBACK=0` turns off the follow-up
 fallback.
+
+## fe-images (frontend: meta.images, render, resend, backfill, proxies, RC-3a, RC-3c)
+
+What the browser sends and stores, as built:
+
+- `meta.images` entries are `{attachment_id, name?, mime?, width?, height?}`
+  and nothing else. `mime` is the type of the data URL actually sent (the
+  composer re-encodes large photos to JPEG or PNG), `width`/`height` the
+  pixels as sent and drawn (EXIF applied), measured by the composer at attach
+  time and simply absent when a send beats the measurement. A backfilled entry
+  has no `name`; its `mime`/`width`/`height` come from the POST response.
+  Built by `lib/chatMedia.ts imagesMetaFor`; never rewritten afterwards.
+- `image_ids` goes on the /chat body only when it pairs index for index with
+  the INLINE images (`image` alone for one photo, `image` + `images` for
+  several). It is never sent next to `image_refs`, and the frontend never
+  sends inline images and refs in one request: a resend uses this tab's bytes
+  when it has them (with their ids), otherwise refs for every photo.
+- The Next chat proxy forwards `image_ids` / `image_refs` only when every id
+  matches `^[A-Za-z0-9_-]{8,64}$` and there are 1..5 of them (all or nothing),
+  so the orchestrator's pydantic 422 for a malformed id is never reached from
+  this app. A wordless resend with only `image_refs` gets the image-only
+  prompt. The proxy relays exactly one refusal beyond a category: a 422 whose
+  `detail.code` is `image_ref_missing` becomes `{"code":"image_ref_missing",
+  "missing":[ids]}` (ids filtered to the id shape). The browser then withdraws
+  the send (no error row, nothing persisted) and shows the existing
+  "Re-attach the file to regenerate/edit/retry ..." toast.
+- `/api/chat-media/[conversation]` (GET list, POST multipart) and
+  `/api/chat-media/[conversation]/[attachment]?size=` (GET bytes) are the only
+  browser paths. The bytes route forwards the cookie, `If-None-Match` and
+  `accept-encoding: identity`, forwards ONLY `size` upstream (the bubble's one
+  retry adds `&retry=1`, which never reaches the orchestrator), relays
+  200/304/404/410 and the §4.3 headers, and always sets nosniff and
+  `default-src 'none'; sandbox` on a 200 even if upstream omits them. Checked
+  in a real Chromium against a fake orchestrator: Next passes the
+  `private, max-age=31536000, immutable` Cache-Control through unchanged, and
+  after a reload no thumbnail request reaches the orchestrator.
+- POST refuses a `Sec-Fetch-Site` other than same-origin/none (403) before any
+  fetch, like the recording proxy: a multipart form post is a simple request.
+
+Backfill (lib/chatMedia.ts createBackfill, hosted only by ChatApp):
+
+- One POST per user turn (<= 5 photos), parts interleaved `file`,
+  `attachment_id`, ..., then `source=backfill`; the same picture twice in one
+  turn is sent once (the server refuses a repeated id) and referenced twice.
+- Outcomes: 400/413/415 = refused for the rest of the page session (not
+  retried until a reload); 404/5xx = try at the next open; 401/403/507 or no
+  WebCrypto (plain-http LAN) = stop the backfill for the page's life;
+  a network failure = drop the queue until a chat is opened again.
+- It reads the photos from IndexedDB's write-once `images` store through the
+  new `history.localImages` (the in-memory thread loses them whenever a
+  hydrate replaces it) and writes through the new `history.amendMessages`,
+  which does not touch `updatedAt`, so an old chat does not jump to the top of
+  Recents.
+
+History invariants other tracks may rely on:
+
+- `meta.images` is carried FORWARD and never erased by the browser: the
+  store's `saveMessages`, its 409 recoveries (conversation changed and
+  shrink) and the reload reconcile all put back a reference that only the
+  older copy is missing (`threadReconcile.withStoredImages`, matched by
+  position + user role + identical content). A server-written `meta.images`
+  would still be overwritten by a client push; nothing server-side should
+  write it.
+- Photos and documents are held in separate index spaces in the tab
+  (`rememberAttachmentFiles(..., 'image')`), and an internal drag of a photo
+  carries `space: 'image'`. `uploadRefFor(index)` counts among
+  `meta.attachments` only.
+
+Not done here, for whoever owns them:
+
+- The admin transcript viewer (`app/admin/members/[id]/conversations/[cid]`)
+  does not render MessageRow or any attachment, so nothing in the frontend
+  calls the admin chat-media route yet. A viewer that wants photos needs its
+  own STREAMING proxy for `/admin/api/members/{uid}/chat-media/...`: the
+  generic `/api/admin/[...path]` rides `proxyToOrchestrator`, which buffers and
+  caps at 32 MiB.
+- be-media's sharing gap stands: a photo-only turn is still sent with empty
+  `content` (the bubble shows no text and the model gets the image-only
+  prompt). Closing it belongs in `sharing.evaluate`, not in invented content.
+- `AttachmentPreview` gained a `missing` kind ("This photo is no longer stored
+  on the server.") for a stored photo whose full size answers 404/410. The
+  video/audio player and the expired-document wording (CONTRACT §10 "Other
+  kinds") are not in this track.
