@@ -30,7 +30,6 @@ import {
   withImagesMeta,
   type BackfillHost,
   type MediaUploadOutcome,
-  type MediaUploadPart,
 } from '@/lib/chatMedia';
 import type { ChatMessage } from '@/lib/types';
 
@@ -169,9 +168,8 @@ describe('fetchChatMediaBlob', () => {
   });
 
   it('uses the HTTP cache (no cache: no-store) and returns the bytes', async () => {
-    const fetchMock = vi.fn(
-      async (_url: string, _init?: RequestInit) =>
-        new Response(new Blob(['png'], { type: 'image/png' }), { status: 200 }),
+    const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(
+      async () => new Response(new Blob(['png'], { type: 'image/png' }), { status: 200 }),
     );
     vi.stubGlobal('fetch', fetchMock);
     const out = await fetchChatMediaBlob(
@@ -188,7 +186,7 @@ describe('fetchChatMediaBlob', () => {
 
 describe('uploadChatMedia', () => {
   it('posts file and attachment_id parts in the same order, plus the source', async () => {
-    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+    const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(async () =>
       Response.json({ items: [{ attachment_id: 'bf-one-aaaaaaaa' }, { attachment_id: 'bf-two-aaaaaaaa' }] }),
     );
     vi.stubGlobal('fetch', fetchMock);
@@ -268,11 +266,7 @@ function fakeHost(
 
 /** An upload that stores everything and echoes a size back. */
 function storingUpload() {
-  return vi.fn(async (
-    _conv: string,
-    parts: MediaUploadPart[],
-    _source?: 'upload' | 'backfill',
-  ): Promise<MediaUploadOutcome> => ({
+  return vi.fn<typeof uploadChatMedia>(async (...[, parts]) => ({
     kind: 'stored',
     items: parts.map((p) => ({
       attachment_id: p.attachmentId,
@@ -372,10 +366,10 @@ describe('the backfill', () => {
     const photos = { [CONV]: new Map([[0, [PNG]], [1, [JPEG]], [2, ['data:image/gif;base64,R0lG']]]) };
     const { host, saves } = fakeHost(threads, photos);
     let calls = 0;
-    const upload = vi.fn(async (conv: string, parts: MediaUploadPart[]) => {
+    const upload = vi.fn<typeof uploadChatMedia>(async (...args) => {
       calls += 1;
-      if (calls === 2) return { kind: 'no_space' } as MediaUploadOutcome;
-      return storingUpload()(conv, parts);
+      if (calls === 2) return { kind: 'no_space' };
+      return storingUpload()(...args);
     });
     const backfill = createBackfill(host, { upload, schedule: now, locks: null });
     expect(await backfill.runNow(CONV)).toBe('halt');

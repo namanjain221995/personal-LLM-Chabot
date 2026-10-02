@@ -88,8 +88,8 @@ describe('the device that sent it', () => {
 
 describe('another device', () => {
   it('opens the FULL photo in the existing preview', async () => {
-    const fetchMock = vi.fn(
-      async (_url: string) =>
+    const fetchMock = vi.fn<(url: string) => Promise<Response>>(
+      async () =>
         new Response(new Uint8Array([0xff, 0xd8, 0xff]), {
           status: 200,
           headers: { 'content-type': 'image/jpeg' },

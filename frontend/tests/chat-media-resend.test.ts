@@ -123,7 +123,9 @@ describe('resendOptionsFor — photos', () => {
 /* ===================================================== the request body */
 
 async function bodyOf(opts: Partial<Parameters<typeof startStream>[0]>): Promise<Record<string, unknown>> {
-  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(null, { status: 503 }));
+  const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<Response>>(
+    async () => new Response(null, { status: 503 }),
+  );
   vi.stubGlobal('fetch', fetchMock);
   await startStream({ conversationId: 'conv-wire-1', turns: [user()], prefs: PREFS, ...opts });
   return JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
