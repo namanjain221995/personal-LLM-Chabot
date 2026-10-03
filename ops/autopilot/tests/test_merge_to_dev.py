@@ -107,12 +107,13 @@ class MergeToDev(unittest.TestCase):
         with open(os.path.join(self.bin, "scenario.json"), "w") as fh:
             json.dump(scenario, fh)
 
-    def make_gate(self):
+    def make_gate(self, repo=None, name="gate"):
         with open(SCRIPT, encoding="utf-8") as fh:
             text = fh.read()
         subs = {
             "GH=/usr/bin/gh": f"GH={self.gh}",
-            "REPO=$HOME/work/llm-dev": f"REPO={self.wt}",
+            "REPO=$HOME/work/llm-dev": f"REPO={repo or self.wt}",
+            "EXPECTED_COMMON_DIR=$HOME/Documents/project/personal-LLM-Chabot/.git": f"EXPECTED_COMMON_DIR={self.wt}/.git",
             "ORIGIN_URL=https://github.com/namanjain221995/personal-LLM-Chabot.git": f"ORIGIN_URL={self.origin}",
             "LOG=$HOME/.llm-autopilot/logs/merge_to_dev.log": f"LOG={self.log}",
             "CI_APPROVALS=$HOME/.llm-autopilot/approved-ci-trees": f"CI_APPROVALS={self.approvals}",
@@ -120,7 +121,7 @@ class MergeToDev(unittest.TestCase):
         for old, new in subs.items():
             self.assertEqual(text.count("\n" + old + "\n"), 1, old)
             text = text.replace("\n" + old + "\n", "\n" + new + "\n")
-        path = os.path.join(self.tmp, "gate", "merge_to_dev.sh")
+        path = os.path.join(self.tmp, name, "merge_to_dev.sh")
         os.makedirs(os.path.dirname(path))
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -138,10 +139,10 @@ class MergeToDev(unittest.TestCase):
     def push_tip(self):
         git(self.wt, "push", "-q", "origin", "HEAD:refs/heads/autopilot/dev")
 
-    def run_gate(self, *args, env=None):
+    def run_gate(self, *args, env=None, gate=None):
         e = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/tmp")}
         e.update(env or {})
-        return subprocess.run([self.gate, *args], env=e, capture_output=True, text=True, timeout=60)
+        return subprocess.run([gate or self.gate, *args], env=e, capture_output=True, text=True, timeout=60)
 
     def origin_ref(self, ref):
         return git(self.origin, "rev-parse", ref)
@@ -375,6 +376,103 @@ class MergeToDev(unittest.TestCase):
         self.assertTrue(text.startswith("#!/bin/bash -p\n"), "bash -p ignores BASH_ENV, ENV and exported functions")
         self.assertNotIn("MERGE_TO_DEV_", text)
         self.assertNotIn("${GH:-", text)
+
+    # ---- P0-17: the repository's hooks, replace refs and identity
+    def install_hooks(self, hooks_dir, marker):
+        os.makedirs(hooks_dir, exist_ok=True)
+        for name in ("pre-push", "reference-transaction", "pre-auto-gc", "post-checkout"):
+            path = os.path.join(hooks_dir, name)
+            with open(path, "w") as fh:
+                fh.write(f"#!/bin/sh\necho {name} >> '{marker}'\nexit 1\n")
+            os.chmod(path, 0o755)
+
+    def test_repository_hooks_never_run(self):
+        marker = os.path.join(self.tmp, "hook-ran")
+        self.install_hooks(os.path.join(self.wt, ".git", "hooks"), marker)
+        r = self.run_gate()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.origin_ref("dev"), self.origin_ref("autopilot/dev"))
+        self.assertFalse(os.path.exists(marker), "a hook in .git/hooks ran inside the gate")
+
+    def test_a_configured_hooks_path_is_ignored_too(self):
+        marker = os.path.join(self.tmp, "hook-ran")
+        custom = os.path.join(self.tmp, "custom-hooks")
+        self.install_hooks(custom, marker)
+        git(self.wt, "config", "core.hooksPath", custom)
+        r = self.run_gate()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.origin_ref("dev"), self.origin_ref("autopilot/dev"))
+        self.assertFalse(os.path.exists(marker), "a hook from core.hooksPath ran inside the gate")
+
+    def test_replace_refs_cannot_supply_a_missing_report(self):
+        dev_before = self.origin_ref("dev")
+        git(self.wt, "rm", "-q", "docs/ai-platform-upgrade/FINAL_REPORT.md")
+        git(self.wt, "commit", "-q", "-m", "drop report")
+        self.push_tip()
+        git(self.wt, "replace", "HEAD", "HEAD~1")  # the tip now reads as its parent, which has a report
+        self.assert_refused(self.run_gate(), "FINAL_REPORT.md does not exist", dev_before)
+
+    def test_replace_refs_cannot_hide_a_ci_change(self):
+        dev_before = self.origin_ref("dev")
+        self.commit(".github/workflows/scripts/ci_gate.py", "import sys; sys.exit(0)")
+        self.push_tip()
+        git(self.wt, "replace", "HEAD", "HEAD~1")  # the tip now reads as its parent, with dev's .github
+        self.assert_refused(self.run_gate(), "CI definition", dev_before)
+
+    def test_refuses_a_checkout_of_another_repository(self):
+        # Another clone of the same origin passes the origin URL check; only
+        # its git common directory tells it apart from the expected repository.
+        dev_before = self.origin_ref("dev")
+        decoy = os.path.join(self.tmp, "decoy")
+        subprocess.run(["git", "clone", "-q", self.origin, decoy], check=True, capture_output=True)
+        pointer = os.path.join(self.tmp, "pointer")  # a .git file that points into the decoy
+        os.makedirs(pointer)
+        with open(os.path.join(pointer, ".git"), "w") as fh:
+            fh.write(f"gitdir: {decoy}/.git\n")
+        for name, repo in (("clone", decoy), ("gitfile", pointer)):
+            with self.subTest(name):
+                gate = self.make_gate(repo=repo, name=f"gate-{name}")
+                r = self.run_gate(gate=gate)
+                self.assert_refused(r, f"the git common directory of {repo} is", dev_before)
+                self.assertIn(f"not the expected {os.path.realpath(self.wt)}/.git", r.stderr)
+                self.assertNotIn("OK:", r.stderr, "it refuses before any other check")
+
+    def test_refuses_a_directory_outside_any_repository(self):
+        dev_before = self.origin_ref("dev")
+        plain = os.path.join(self.tmp, "plain")
+        os.makedirs(plain)
+        gate = self.make_gate(repo=plain, name="gate-plain")
+        self.assert_refused(self.run_gate(gate=gate), f"cannot read the git common directory of {plain}", dev_before)
+
+    def test_refuses_when_the_expected_repository_is_missing(self):
+        dev_before = self.origin_ref("dev")
+        shutil.move(os.path.join(self.wt, ".git"), os.path.join(self.tmp, "moved.git"))
+        self.assert_refused(self.run_gate(), "the expected git common directory", dev_before)
+
+    def test_accepts_a_linked_worktree_of_the_expected_repository(self):
+        # The dev worktree is a linked worktree; its common dir is the main checkout's .git.
+        linked = os.path.join(self.tmp, "linked")
+        git(self.wt, "worktree", "add", "-q", "--detach", linked, "HEAD")
+        gate = self.make_gate(repo=linked, name="gate-linked")
+        r = self.run_gate(gate=gate)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.origin_ref("dev"), self.origin_ref("autopilot/dev"))
+
+    def test_every_git_call_is_hardened(self):
+        with open(SCRIPT, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertRegex(text, r"\nGIT_NO_REPLACE_OBJECTS=1\n")
+        self.assertRegex(text, r"\nexport [^\n]*\bGIT_NO_REPLACE_OBJECTS\b")
+        self.assertIn("-c core.hooksPath=/dev/null", text)
+        self.assertEqual(text.count('"$GIT"'), 1, "git runs only through the one hardened wrapper")
+
+
+class Syntax(unittest.TestCase):
+    def test_the_gate_parses(self):
+        # bash -n reads the script without running any of it
+        r = subprocess.run(["/bin/bash", "-n", SCRIPT], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr, "")
 
 
 if __name__ == "__main__":

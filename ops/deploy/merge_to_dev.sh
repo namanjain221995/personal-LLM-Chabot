@@ -19,10 +19,13 @@
 #
 # It trusts nothing from whoever runs it: bash -p ignores BASH_ENV, ENV and
 # exported functions, every other variable is cleared below, and the tools,
-# repository, branches, remote and log are fixed. The autopilot runs the
-# installed copy (~/.llm-autopilot/bin/merge_to_dev.sh), which it cannot edit;
-# this file is the source. Tests run a copy with the configuration block
-# replaced (ops/autopilot/tests/test_merge_to_dev.py).
+# repository, branches, remote and log are fixed. Every git call goes through
+# one wrapper that runs no repository hooks and reads no replace refs, and the
+# gate acts only when the repository's git common directory is the expected
+# one. The autopilot runs the installed copy
+# (~/.llm-autopilot/bin/merge_to_dev.sh), which it cannot edit; this file is
+# the source. Tests run a copy with the configuration block replaced
+# (ops/autopilot/tests/test_merge_to_dev.py).
 #
 # Usage: merge_to_dev.sh [--dry-run] [<40-hex commit> | origin/autopilot/dev]
 
@@ -35,13 +38,17 @@ done
 PATH=/usr/bin:/bin
 HOME=$(getent passwd "$(id -u)" | cut -d: -f6)
 LANG=C.UTF-8
-export PATH HOME LANG
+# git reads every object as stored, never through refs/replace, so the checks
+# below see the commit that is pushed and nothing standing in for it
+GIT_NO_REPLACE_OBJECTS=1
+export PATH HOME LANG GIT_NO_REPLACE_OBJECTS
 umask 022
 
 # --- configuration (constants; tests replace this block in a temporary copy) ---
 GIT=/usr/bin/git
 GH=/usr/bin/gh
 REPO=$HOME/work/llm-dev
+EXPECTED_COMMON_DIR=$HOME/Documents/project/personal-LLM-Chabot/.git
 ORIGIN_URL=https://github.com/namanjain221995/personal-LLM-Chabot.git
 LOG=$HOME/.llm-autopilot/logs/merge_to_dev.log
 CI_APPROVALS=$HOME/.llm-autopilot/approved-ci-trees
@@ -58,7 +65,7 @@ want=""
 for arg in "$@"; do
     case "$arg" in
         --dry-run) dry_run=1 ;;
-        -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *)
             if [ -z "$want" ] && { [[ "$arg" =~ ^[0-9a-f]{40}$ ]] || [ "$arg" = "origin/$SOURCE_BRANCH" ]; }; then
                 want=$arg
@@ -83,45 +90,63 @@ refuse() {
     exit 1
 }
 
+# The only way git runs here: in $REPO, without replace objects, and with the
+# hooks directory at /dev/null, so no hook from the repository or from a
+# configured core.hooksPath runs (a command-line -c wins over every config file,
+# and git hands it on to the git processes it starts).
+g() {
+    "$GIT" --no-replace-objects -c core.hooksPath=/dev/null -C "$REPO" "$@"
+}
+
 slug=${ORIGIN_URL#https://github.com/}
 slug=${slug%.git}
 
-# 0. origin is the repository, for fetches and pushes alike (insteadOf and pushurl are expanded here)
+# 0. $REPO belongs to the expected repository: its git common directory (the
+#    main checkout's .git, which every linked worktree shares) is the expected one
+want_common=$(cd "$EXPECTED_COMMON_DIR" 2>/dev/null && pwd -P) \
+    || refuse "the expected git common directory $EXPECTED_COMMON_DIR does not exist"
+common=$(g rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -n "$common" ] \
+    || refuse "cannot read the git common directory of $REPO (not a git repository?)"
+common=$(cd "$common" 2>/dev/null && pwd -P) || refuse "cannot resolve the git common directory $common of $REPO"
+[ "$common" = "$want_common" ] \
+    || refuse "the git common directory of $REPO is $common, not the expected $want_common"
+
+# 0b. origin is the repository, for fetches and pushes alike (insteadOf and pushurl are expanded here)
 for kind in fetch push; do
-    if [ "$kind" = push ]; then url=$("$GIT" -C "$REPO" remote get-url --push origin) || refuse "cannot read the push URL of origin in $REPO"
-    else url=$("$GIT" -C "$REPO" remote get-url origin) || refuse "cannot read the URL of origin in $REPO"; fi
+    if [ "$kind" = push ]; then url=$(g remote get-url --push origin) || refuse "cannot read the push URL of origin in $REPO"
+    else url=$(g remote get-url origin) || refuse "cannot read the URL of origin in $REPO"; fi
     [ "${url%.git}" = "${ORIGIN_URL%.git}" ] || refuse "the $kind URL of origin in $REPO is not $ORIGIN_URL"
 done
 
-"$GIT" -C "$REPO" fetch --quiet "$ORIGIN_URL" \
+g fetch --quiet "$ORIGIN_URL" \
     "+refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH" \
     "+refs/heads/$SOURCE_BRANCH:refs/remotes/origin/$SOURCE_BRANCH" \
     || refuse "git fetch of $TARGET_BRANCH and $SOURCE_BRANCH failed"
-tip=$("$GIT" -C "$REPO" rev-parse --verify "refs/remotes/origin/$SOURCE_BRANCH^{commit}") \
+tip=$(g rev-parse --verify "refs/remotes/origin/$SOURCE_BRANCH^{commit}") \
     || refuse "origin/$SOURCE_BRANCH does not exist"
-sha=$("$GIT" -C "$REPO" rev-parse --verify "${want:-$tip}^{commit}") \
+sha=$(g rev-parse --verify "${want:-$tip}^{commit}") \
     || refuse "cannot resolve ${want:-$tip}"
 
 # 1. exactly the pushed tip of the source branch
 [ "$sha" = "$tip" ] || refuse "$sha is not the pushed tip of origin/$SOURCE_BRANCH ($tip)"
 
 # 2. fast-forward only
-"$GIT" -C "$REPO" merge-base --is-ancestor "refs/remotes/origin/$TARGET_BRANCH" "$sha" \
+g merge-base --is-ancestor "refs/remotes/origin/$TARGET_BRANCH" "$sha" \
     || refuse "origin/$TARGET_BRANCH is not an ancestor of $sha; merge the latest $TARGET_BRANCH into $SOURCE_BRANCH, re-run everything, push, and try again"
 
 # 3. the final report is a non-empty regular file in the commit
-entry=$("$GIT" -C "$REPO" ls-tree "$sha" -- "$REPORT" | cut -f1)
+entry=$(g ls-tree "$sha" -- "$REPORT" | cut -f1)
 case "$entry" in
     "100644 blob "*|"100755 blob "*) ;;
     "") refuse "$REPORT does not exist in $sha" ;;
     *) refuse "$REPORT in $sha is not a regular file" ;;
 esac
-size=$("$GIT" -C "$REPO" cat-file -s "$sha:$REPORT") || refuse "cannot read $REPORT in $sha"
+size=$(g cat-file -s "$sha:$REPORT") || refuse "cannot read $REPORT in $sha"
 [ "$size" -gt 0 ] || refuse "$REPORT in $sha is empty"
 
 # 4. the CI definition is the one dev already has, or one the operator approved
-dev_ci=$("$GIT" -C "$REPO" rev-parse -q --verify "refs/remotes/origin/$TARGET_BRANCH:.github" || echo none)
-new_ci=$("$GIT" -C "$REPO" rev-parse -q --verify "$sha:.github" || echo none)
+dev_ci=$(g rev-parse -q --verify "refs/remotes/origin/$TARGET_BRANCH:.github" || echo none)
+new_ci=$(g rev-parse -q --verify "$sha:.github" || echo none)
 if [ "$dev_ci" != "$new_ci" ] && ! grep -qxF "$new_ci" "$CI_APPROVALS" 2>/dev/null; then
     refuse "the CI definition (.github/) in $sha differs from origin/$TARGET_BRANCH, so its checks could have been graded by edited CI; the operator reviews git diff origin/$TARGET_BRANCH $sha -- .github/ and approves it by adding the tree $new_ci as a line of $CI_APPROVALS"
 fi
@@ -161,8 +186,8 @@ if [ "$dry_run" = 1 ]; then
     exit 0
 fi
 
-"$GIT" -C "$REPO" push "$ORIGIN_URL" "$sha:refs/heads/$TARGET_BRANCH" \
+g push "$ORIGIN_URL" "$sha:refs/heads/$TARGET_BRANCH" \
     || refuse "push to origin/$TARGET_BRANCH failed (not a fast-forward any more?)"
-now=$("$GIT" -C "$REPO" ls-remote "$ORIGIN_URL" "refs/heads/$TARGET_BRANCH" | cut -f1)
+now=$(g ls-remote "$ORIGIN_URL" "refs/heads/$TARGET_BRANCH" | cut -f1)
 [ "$now" = "$sha" ] || refuse "origin/$TARGET_BRANCH is $now after the push, expected $sha"
 log "MERGED: origin/$TARGET_BRANCH is now $sha"
