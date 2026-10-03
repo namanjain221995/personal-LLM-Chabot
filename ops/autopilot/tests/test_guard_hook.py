@@ -1,6 +1,6 @@
 """Unit tests for the autopilot PreToolUse guard (ops/autopilot/guard/guard_hook.py).
 
-Run: python3 -m unittest discover -s ops/autopilot/tests -v
+Run: python3 -m pytest ops/autopilot/tests -q -p no:cacheprovider (or python3 -m unittest discover -s ops/autopilot/tests)
 They exercise the guard's decisions only; nothing here runs the commands.
 """
 
@@ -201,8 +201,8 @@ ALLOW_BASH = [
     "docker ps --format '{{.Names}}'",
     "docker inspect --format '{{.State.Status}}' sf-local-ai-vllm-1",
     "docker logs --tail 50 sf-local-ai-orchestrator-1",
-    "docker run --rm alpine echo hi",
-    "docker build -t llmdev-orch:test .",
+    "docker run --rm -m 256m --cpus 1 alpine echo hi",
+    "DOCKER_HOST=ssh://192.0.2.20 docker build -t llmdev-orch:test .",
     'docker exec sf-local-ai-postgres-1 psql -U postgres -c "select count(*) from pg_stat_activity"',
     "curl -s 'http://127.0.0.1:9090/api/v1/query?query=up'",
     "curl -s http://127.0.0.1:8000/v1/models",
@@ -278,7 +278,7 @@ class GuardBash(unittest.TestCase):
 
     def test_disk_floor(self):
         with mock.patch.object(guard, "free_fraction", return_value=0.10):
-            self.assertFalse(bash("docker build -t llmdev-x:1 .")[0])
+            self.assertFalse(bash("DOCKER_HOST=ssh://192.0.2.20 docker build -t llmdev-x:1 .")[0])
             self.assertFalse(bash("npm ci")[0])
             self.assertTrue(bash("git status")[0])
 
@@ -317,7 +317,7 @@ class GuardBash(unittest.TestCase):
         self.assertFalse(bash("docker run -d --name llmdev-x alpine sleep 1")[0])
         self.assertFalse(bash("docker run --rm -e A=1 -e B=2 -e C=3 -e D=4 -e E=5 -e F=6 -d alpine sleep 1")[0])
         self.assertTrue(bash("DOCKER_HOST=ssh://192.0.2.20 docker run -d --name llmdev-x alpine sleep 1")[0])
-        self.assertTrue(bash("docker run --rm alpine sh -c 'tar -xd'")[0])
+        self.assertTrue(bash("docker run --rm -m 128m --cpus 1 alpine sh -c 'tar -xd'")[0])
         self.assertFalse(bash("DOCKER_HOST=tcp://198.51.100.9:2375 docker ps")[0])
         self.assertFalse(bash("docker --context other ps")[0])
 
@@ -433,6 +433,513 @@ class GuardProcess(unittest.TestCase):
     def test_other_tools_pass(self):
         r = self.run_hook(json.dumps({"tool_name": "WebSearch", "tool_input": {"query": "x"}, "cwd": DEV}))
         self.assertEqual(r.returncode, 0)
+
+
+GATE = f"{HOME}/.llm-autopilot/bin/merge_to_dev.sh"
+SLUG = "namanjain221995/personal-LLM-Chabot"
+
+
+class Lists(unittest.TestCase):
+    """Allow and deny lists; every relaxation is paired with its dangerous look-alikes."""
+
+    def check(self, allow, deny, cwd=DEV):
+        for cmd in allow:
+            with self.subTest(allow=cmd):
+                ok, why = bash(cmd, cwd)
+                self.assertTrue(ok, f"should pass: {cmd!r} -> {why}")
+        for cmd in deny:
+            with self.subTest(deny=cmd):
+                ok, why = bash(cmd, cwd)
+                self.assertFalse(ok, f"should be blocked: {cmd!r}")
+                self.assertIn("[autopilot-guard]", why)
+
+
+PS_ALLOW = [
+    "ps -eo pid,ppid,etime,cmd",
+    "ps -o pid,user,cmd",
+    "ps -p 123 -o rss,etime",
+    "ps -u techsphere",
+    "ps -u root",
+    "ps -U root -o pid,etime",
+    "ps --format pid,etime",
+    "ps --format=pid,etime",
+    "ps -o user= -p 1",
+    "ps -C python3 -o pid,etime",
+    "ps -ef",
+    "ps aux",
+    "ps -eo pid,comm",
+    "ps -eLf",
+    "ps -ejH",
+    "ps -ef --forest",
+    "ps -e --sort=-etime -o pid,etime,args",
+    "ps -o etime= -p $pid",
+    "ps -o pid=,etime= -p $(pgrep -f uvicorn)",
+    "ps axo pid,etime",
+    "ps U root",
+    "ps -fp 123",
+    "ps -eo pid,args 1",
+]
+PS_DENY = [
+    "ps e",
+    "ps eww",
+    "ps auxe",
+    "ps axe",
+    "ps ewwaux",
+    "ps -ef e",
+    "ps -o pid,cmd e",
+    "ps -u root e",
+    "ps --pid 1 e",
+    "ps o pid e",
+    # procps re-reads a dash command line that fails to parse as BSD options
+    "ps -auxe",
+    "ps -aue",
+    "ps -ex",
+    "ps -ev",
+    "ps -eX",
+    "ps -eu exx",
+    "ps -ef -o pid,args",
+    "ps -ef -O pid",
+    "ps -eo args -M",
+    "ps -eo args -c",
+    "ps -eo args -k pid",
+    "ps -eo args -x",
+    "ps -eo pid,args -ef",
+    "ps -eo pid,bogus,args",
+    "ps $x",
+    "ps -$x",
+    "ps $(echo e)",
+    "cat /proc/1/environ",
+    "cat /proc/self/environ",
+]
+
+
+class GuardPs(Lists):
+    def test_ps_lists(self):
+        self.check(PS_ALLOW, PS_DENY)
+
+    @unittest.skipUnless(os.path.exists("/usr/bin/ps") and sys.platform.startswith("linux"), "needs procps")
+    def test_allowed_ps_never_prints_environments(self):
+        """Run every ps argument list the guard allows (the fixed list and a seeded
+        fuzz) under a controlling terminal with a marker variable, and check the
+        marker never appears. Only the boolean is kept; the output is discarded."""
+        import fcntl
+        import pty
+        import random
+        import termios
+        version = subprocess.run(["/usr/bin/ps", "--version"], capture_output=True, text=True).stdout
+        if "procps" not in version:
+            self.skipTest("not procps")
+        pool = ["-e", "-f", "-ef", "-x", "-a", "-u", "-o", "-O", "-p", "-L", "-H", "-M", "-c", "-k", "--forest", "--sort",
+                "e", "x", "a", "u", "aux", "o", "pid,args", "args", "etime", "1", "root", "exx", "-eo", "-eu", "-ex",
+                "-Ce", "-auxe", "-ww", "--format", "U", "p", "-j", "-l", "-F", "pid", "-T"]
+        rng = random.Random(15)
+        cases = [c.split(" ")[1:] for c in PS_ALLOW if "$" not in c]
+        for _ in range(400):
+            cases.append([rng.choice(pool) for _ in range(rng.randint(1, 4))])
+        allowed = []
+        for args in cases:
+            ok, _ = bash("ps " + " ".join(args))
+            if ok:
+                allowed.append(args)
+        self.assertGreater(len(allowed), 40)
+        env = {"PATH": "/usr/bin:/bin", "LANG": "C", "P015PSMARK": "zz"}
+        for args in allowed:
+            master, slave = pty.openpty()
+
+            def pre():
+                os.setsid()
+                fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+            try:
+                r = subprocess.run(["/usr/bin/ps", *args], env=env, stdin=slave, capture_output=True, text=True,
+                                   preexec_fn=pre, timeout=20)
+            finally:
+                os.close(master)
+                os.close(slave)
+            with self.subTest(args=args):
+                self.assertNotIn("P015PSMARK=zz", r.stdout, f"allowed ps {args} printed an environment")
+
+
+PROD_READ_ALLOW = [
+    "grep -n foo scripts/deploy.sh",
+    "grep -n foo scripts/deploy.sh | head -5",
+    "cat scripts/ocr.sh",
+    "cat scripts/deploy.sh | grep -n docker | wc -l",
+    "head -40 scripts/cluster-up.sh",
+    "tail -n 20 scripts/whisper-stack.sh",
+    "wc -l scripts/deploy.sh",
+    "git log -- scripts/cluster-up.sh",
+    "git log --oneline -5 -- scripts/deploy.sh",
+    "git diff origin/dev -- scripts/deploy.sh",
+    "git show HEAD:scripts/deploy.sh",
+    "git --no-pager blame scripts/deploy.sh",
+    "ls ops/deploy/deploy.sh",
+    "ls -la scripts/deploy.sh scripts/ocr.sh",
+    "stat scripts/deploy.sh",
+    "file scripts/deploy.sh",
+    "diff a/deploy.sh b/deploy.sh",
+    "cmp a/deploy.sh b/deploy.sh",
+    "sha256sum scripts/deploy.sh",
+    "sed -n 1,20p scripts/deploy.sh",
+    "sed -n '1,20p;40q' scripts/deploy.sh",
+    "rg -n docker scripts/deploy.sh",
+    "grep -n x orchestrator/scripts/validate_long_context.py",
+    "cat evaluation/runners/evaluation_runner.py",
+]
+PROD_READ_DENY = [
+    "bash scripts/deploy.sh",
+    "sh scripts/deploy.sh",
+    "zsh scripts/deploy.sh",
+    "dash scripts/deploy.sh",
+    "./scripts/deploy.sh",
+    "scripts/deploy.sh",
+    "source scripts/deploy.sh",
+    ". scripts/deploy.sh",
+    "env X=1 scripts/deploy.sh",
+    "nohup scripts/deploy.sh",
+    "timeout 60 scripts/deploy.sh",
+    "nice -n 10 scripts/deploy.sh",
+    "setsid scripts/deploy.sh",
+    "stdbuf -oL scripts/deploy.sh",
+    "echo x | xargs scripts/deploy.sh",
+    "echo x | xargs bash scripts/deploy.sh",
+    "watch scripts/deploy.sh",
+    "flock /tmp/llmdev.lock scripts/deploy.sh",
+    "find . -name x -exec scripts/deploy.sh {} \\;",
+    "sed -i s/a/b/ scripts/deploy.sh",
+    "sed -n '1w /tmp/x' scripts/deploy.sh",
+    "sed -n 1e scripts/deploy.sh",
+    "tee scripts/deploy.sh",
+    "cp /tmp/x scripts/deploy.sh",
+    "mv /tmp/x scripts/deploy.sh",
+    "ln -sf /tmp/x scripts/deploy.sh",
+    "chmod +x scripts/deploy.sh",
+    "git checkout -- scripts/deploy.sh",
+    "git restore scripts/deploy.sh",
+    f"git log --output={HOME}/.bashrc",
+    "git grep --open-files-in-pager=scripts/deploy.sh x",
+    "docker exec llmdev-x scripts/deploy.sh",
+    "awk 'BEGIN{system(\"scripts/deploy.sh\")}'",
+    "rg --pre scripts/deploy.sh x .",
+    "less scripts/deploy.sh",
+    # a reader whose output is captured, written or piped on can feed a runner
+    "cat scripts/deploy.sh > /tmp/llmdev-x.sh",
+    "cat scripts/deploy.sh | tee /tmp/llmdev-x.sh",
+    "cat scripts/deploy.sh | bash",
+    "cat scripts/deploy.sh | sort > /tmp/llmdev-x.sh",
+    "x=$(cat scripts/deploy.sh); echo ok",
+    "bash -c 'cat scripts/deploy.sh' > /tmp/llmdev-x.sh",
+    "diff <(cat scripts/deploy.sh) /tmp/x",
+    "python3 orchestrator/scripts/validate_long_context.py",
+    "python3 -m evaluation.runners.evaluation_runner",
+    "make -C /tmp/x deploy.sh",
+]
+
+
+class GuardProductionReads(Lists):
+    def test_reading_production_scripts(self):
+        with mock.patch.object(guard, "in_quiet_window", return_value=False):
+            self.check(PROD_READ_ALLOW, PROD_READ_DENY)
+
+
+PUSH_ALLOW = [
+    "git push origin upgrade/a/x",
+    "git push -u origin upgrade/a/x",
+    "git push origin HEAD:autopilot/dev",
+    "git push origin HEAD:refs/heads/upgrade/a/b",
+    "git push origin HEAD:refs/tags/rc/1",
+    "git push origin refs/tags/release/x",
+    "git push origin tag baseline/x",
+]
+PUSH_DENY = [
+    "git push origin HEAD:heads/dev",
+    "git push origin HEAD:heads/main",
+    "git push origin HEAD:Dev",
+    "git push origin HEAD:refs/heads/main",
+    "git push origin autopilot/dev:refs/heads/dev",
+    "git push origin 'refs/heads/autopilot/*:refs/heads/*'",
+    "git push origin 'refs/heads/*:refs/heads/*'",
+    "git push origin 'HEAD:refs/heads/*'",
+    "git push origin dev",
+    "git push origin main",
+    "git push origin heads/dev",
+    "git push origin refs/heads/dev",
+    "git push origin HEAD",
+    "git push origin @",
+    "git push origin HEAD:HEAD",
+    "git push origin HEAD:refs/remotes/origin/dev",
+    "git push origin HEAD:refs/pull/1/head",
+    "git push origin '@{u}'",
+    "git push origin tag v1",
+    "git push origin :",
+    "git push origin --recurse-submodules=on-demand upgrade/a/x",
+    "git -c remote.origin.push=refs/heads/autopilot/dev:refs/heads/dev push origin autopilot/dev",
+    "git -c remote.origin.url=https://example.com/x.git push origin upgrade/a/x",
+    "git -c remote.origin.pushurl=https://example.com/x.git push origin upgrade/a/x",
+    "git -c push.default=upstream push origin autopilot/dev",
+    "git -c branch.autopilot/dev.merge=refs/heads/dev push origin autopilot/dev",
+    "git --config-env=remote.origin.push=X push origin autopilot/dev",
+    "git --config-env remote.origin.push=X push origin autopilot/dev",
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=x git push origin autopilot/dev",
+    "export GIT_CONFIG_PARAMETERS=x; git push origin autopilot/dev",
+    "git send-pack https://github.com/x/y.git HEAD:refs/heads/dev",
+    "git http-push https://github.com/x/y.git HEAD:refs/heads/dev",
+    "git receive-pack /tmp/x",
+    "git remote-https origin https://github.com/x/y.git",
+    "git subtree push --prefix=x origin dev",
+    "git push https://github.com/namanjain221995/personal-LLM-Chabot.git HEAD:autopilot/dev",
+]
+
+
+class GuardPush(Lists):
+    def test_push_lists(self):
+        self.check(PUSH_ALLOW, PUSH_DENY)
+
+    def test_push_mapping_config_is_resolved(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as d:
+            def git(*a):
+                subprocess.run(["git", "-C", d, *a], check=True, capture_output=True)
+            git("init", "-q", "-b", "autopilot/dev")
+            git("-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "x")
+            git("remote", "add", "origin", "https://example.invalid/x.git")
+            self.assertTrue(bash("git push origin autopilot/dev", cwd=d)[0])
+            git("config", "branch.autopilot/dev.merge", "refs/heads/dev")
+            self.assertTrue(bash("git push origin autopilot/dev", cwd=d)[0], "push.default simple ignores the upstream")
+            git("config", "push.default", "upstream")
+            self.assertFalse(bash("git push origin autopilot/dev", cwd=d)[0], "push.default=upstream maps it to dev")
+            self.assertTrue(bash("git push origin autopilot/dev:autopilot/dev", cwd=d)[0])
+            git("config", "--unset", "push.default")
+            git("config", "remote.origin.push", "refs/heads/autopilot/dev:refs/heads/dev")
+            self.assertFalse(bash("git push origin autopilot/dev", cwd=d)[0], "remote.origin.push remaps it")
+            self.assertFalse(bash(f"git -C {d} push origin autopilot/dev")[0])
+
+
+GH_ALLOW = [
+    "gh pr view 98",
+    "gh pr checks 98",
+    f"gh -R {SLUG} pr view 98",
+    f"gh pr view 98 --repo={SLUG}",
+    "gh pr ready 98",
+    "gh run view 123",
+    "gh run list -L 5",
+    "gh workflow list",
+    f"gh api repos/{SLUG}/commits/abc/check-runs",
+    f"gh api repos/{SLUG}/branches/main/protection",
+    "gh api graphql -f query='query { viewer { login } }'",
+    "gh pr create --draft --title t --body b --base dev --head autopilot/dev",
+    "gh pr edit 98 --body x",
+    "gh pr comment 98 --body x",
+    "gh issue list",
+    "gh auth status",
+    f"GH_REPO={SLUG} gh pr view 1",
+    "gh repo view",
+    "gh release list",
+]
+GH_DENY = [
+    f"gh -R {SLUG} pr merge 98",
+    f"gh --repo={SLUG} pr merge 98",
+    f"gh --repo {SLUG} pr merge 98",
+    f"gh pr -R {SLUG} merge 98",
+    "gh pr --body x merge 98",
+    f"gh -R {SLUG} workflow run deploy.yml",
+    f"gh -R {SLUG} workflow enable x",
+    "gh workflow disable x",
+    f"gh -R {SLUG} api -X PUT repos/{SLUG}/x",
+    f"gh api -XPUT repos/{SLUG}/x",
+    f"gh api --method=patch repos/{SLUG}/x",
+    f"gh api repos/{SLUG}/merges -fbase=dev -fhead=autopilot/dev",
+    f"gh api repos/{SLUG}/merges --field=base=dev",
+    f"gh api repos/{SLUG}/merges --input /tmp/x.json",
+    "gh api graphql -F query=@/tmp/q.graphql",
+    "gh api graphql -f query=@/tmp/q.graphql",
+    "gh api graphql --input /tmp/q.json",
+    "gh api graphql -f query='mutation { x }'",
+    f"gh -R {SLUG} api graphql -f query='mutation {{ x }}'",
+    "gh api /graphql -f query='mutation { x }'",
+    "gh api -H 'X-HTTP-Method-Override: PUT' repos/x/y",
+    "gh repo new x",
+    "gh repo create x",
+    "gh repo edit --default-branch dev",
+    "gh release delete v1",
+    "gh release rm v1",
+    "gh co 98",
+    "gh extension install x/y",
+    "gh pr review 98 -a",
+    "gh pr review 98 --approve=true",
+    "gh auth status --show-token",
+    "gh auth status -t",
+    "gh auth token",
+    "gh -R other/repo pr view 1",
+    "gh -Rother/repo pr view 1",
+    "GH_REPO=other/repo gh pr view 1",
+    "GH_TOKEN=x gh pr view 1",
+    "GH_CONFIG_DIR=/tmp/x gh pr view 1",
+    "gh run cancel 1",
+    f"gh -R {SLUG} run delete 1",
+    "gh issue delete 1",
+    "gh cache delete x",
+    "gh ruleset list",
+    "gh secret list",
+]
+
+
+class GuardGh(Lists):
+    def test_gh_lists(self):
+        self.check(GH_ALLOW, GH_DENY)
+
+
+GATE_ALLOW = [
+    GATE,
+    f"{GATE} --dry-run",
+    f"{GATE} --dry-run 0123456789abcdef0123456789abcdef01234567",
+    f"cd {DEV} && {GATE} --dry-run",
+    f"{GATE} --dry-run 2>&1 | tail -20",
+]
+GATE_DENY = [
+    f"PATH=/tmp/fakebin:$PATH {GATE}",
+    f"BASH_ENV=/tmp/env.sh {GATE}",
+    f"ENV=/tmp/env.sh {GATE}",
+    f"LD_PRELOAD=/tmp/x.so {GATE}",
+    f"MERGE_TO_DEV_LOG={HOME}/.bashrc {GATE} 'x; touch /tmp/p'",
+    f"MERGE_TO_DEV_LOG={HOME}/.llm-autopilot/MASTER_PROMPT.md {GATE}",
+    f"MERGE_TO_DEV_SOURCE=upgrade/x/y {GATE}",
+    f"MERGE_TO_DEV_REPO={HOME}/work/other-clone {GATE}",
+    f"GIT_DIR=/tmp/x {GATE}",
+    f"GH_TOKEN=x {GATE}",
+    f"HOME=/tmp/x {GATE}",
+    f"env X=1 {GATE}",
+    f"export X=1; {GATE}",
+    f"bash -c 'X=1 {GATE}'",
+    f"bash -c 'export X=1; {GATE}'",
+    f"bash {GATE}",
+    f"sh {GATE} --dry-run",
+    f"source {GATE}",
+    f". {GATE}",
+    f"nohup {GATE}",
+    f"timeout 600 {GATE}",
+    f"nice {GATE}",
+    f"echo x | xargs {GATE}",
+    f"find . -maxdepth 0 -exec {GATE} \\;",
+    "bash ops/deploy/merge_to_dev.sh",
+    "./ops/deploy/merge_to_dev.sh --dry-run",
+    "cp ops/deploy/merge_to_dev.sh /tmp/merge_to_dev.sh && /tmp/merge_to_dev.sh",
+]
+
+
+class GuardGate(Lists):
+    def test_gate_runs_only_as_a_plain_command(self):
+        self.check(GATE_ALLOW, GATE_DENY)
+
+
+EXEC_ENV_ALLOW = [
+    "GIT_EDITOR=true git commit --amend --no-edit",
+    "PAGER=cat git log -1",
+    "GIT_PAGER=cat git log -1",
+    "GIT_CONFIG_GLOBAL=/dev/null git status",
+    "PYTHONPATH=launcher python3 -m pytest launcher/tests -q",
+    "DOCKER_HOST=ssh://192.0.2.20 docker ps",
+]
+EXEC_ENV_DENY = [
+    "BASH_ENV=/tmp/x.sh bash -c true",
+    "GIT_PAGER=scripts/deploy.sh git log",
+    "PAGER=/tmp/x git -p log",
+    "GIT_EXTERNAL_DIFF=/tmp/x git diff",
+    "GIT_SSH_COMMAND='ssh -o ProxyCommand=x' git fetch",
+    "LD_PRELOAD=/tmp/x.so ls",
+    "export BASH_ENV=/tmp/x.sh",
+    "declare -x LD_PRELOAD=/tmp/x.so",
+    "env GIT_CONFIG_PARAMETERS=x git status",
+    "echo x | xargs env BASH_ENV=/tmp/x.sh bash -c true",
+    "LESSOPEN='|scripts/deploy.sh %s' less README.md",
+]
+
+
+class GuardExecEnv(Lists):
+    def test_exec_env(self):
+        self.check(EXEC_ENV_ALLOW, EXEC_ENV_DENY)
+
+
+DOCKER_ALLOW = [
+    "docker run --rm -m 256m --cpus 1 alpine echo hi",
+    "docker run --rm --memory=1g --cpus=2 alpine true",
+    "docker run --rm -m2g --cpus 4 alpine true",
+    "docker container run --rm -m 512m --cpus 0.5 alpine true",
+    "DOCKER_HOST=ssh://192.0.2.20 docker build -t llmdev-x .",
+    "DOCKER_HOST=ssh://192.0.2.20 docker buildx build -t llmdev-x .",
+    "DOCKER_HOST=ssh://192.0.2.20 docker run --rm alpine true",
+    "docker -H ssh://192.0.2.20 run --rm alpine true",
+    "docker ps",
+    "docker images",
+    "docker info",
+    "docker version",
+    "docker logs --tail 50 llmdev-x",
+    "docker inspect --format '{{.State.Status}}' llmdev-x",
+    "docker stop llmdev-x",
+    "docker rm llmdev-x",
+]
+DOCKER_DENY = [
+    "docker run --rm alpine true",
+    "docker run --rm -m 8g --cpus 1 alpine true",
+    "docker run --rm -m 64g --cpus 1 alpine sleep 3600",
+    "docker run --rm -m 256m alpine true",
+    "docker run --rm --cpus 1 alpine true",
+    "docker run --rm -m 256m --cpus 32 alpine true",
+    "docker run -m 256m --cpus 1 alpine true",
+    "docker run --rm -m lots --cpus 1 alpine true",
+    "docker create --rm alpine true",
+    "docker container run --rm alpine true",
+    "docker build -t llmdev-probe -f orchestrator/Dockerfile orchestrator",
+    "docker buildx build -t llmdev-x .",
+    "docker builder build -t llmdev-x .",
+    "docker image build -t llmdev-x .",
+    "docker run --rm -m 256m --cpus 1 --privileged alpine true",
+    "docker run --rm -m 256m --cpus 1 --pid=host alpine true",
+    "docker run --rm -m 256m --cpus 1 --gpus all alpine true",
+    "docker run --rm -m 256m --cpus 1 --restart always alpine true",
+    "docker run --rm -m 256m --cpus 1 -v /var/run/docker.sock:/var/run/docker.sock alpine true",
+    "docker run --rm -m 256m --cpus 1 -v sf-local-ai_pgdata:/data alpine true",
+    "DOCKER_HOST=ssh://192.0.2.20 docker run --rm --privileged alpine true",
+    "DOCKER_HOST=ssh://192.0.2.20 docker build -t sf-local-ai-orchestrator:cuda .",
+    "docker pull alpine",
+    "docker image prune -f",
+]
+
+
+class GuardDocker(Lists):
+    def test_docker_lists(self):
+        self.check(DOCKER_ALLOW, DOCKER_DENY)
+
+
+RUNNER_ALLOW = [
+    "python3 -m pytest ops/autopilot/tests -q -p no:cacheprovider",
+    "git add ops/autopilot/autopilot.py",
+    "python3 -m py_compile ops/autopilot/autopilot.py",
+    "cat ops/autopilot/autopilot.py",
+    os.path.join(os.path.dirname(HERE), "status.sh"),
+]
+RUNNER_DENY = [
+    f"python3 {HOME}/.llm-autopilot/bin/autopilot.py",
+    f"/usr/bin/python3 -I {HOME}/.llm-autopilot/bin/autopilot.py",
+    f"{HOME}/.llm-autopilot/bin/autopilot.py",
+    "python3 -I ops/autopilot/autopilot.py",
+    "AP_SETTINGS=/tmp/x.json AP_HOME=/tmp/ap python3 ops/autopilot/autopilot.py",
+    f"echo 'NODE_OPTIONS=--require=/tmp/x.js' >> {HOME}/.llm-autopilot/agent/test-db.vars",
+    f"printf 'PATH=/tmp/x' > {HOME}/.llm-autopilot/agent/test-db.vars",
+    f"echo 0123 >> {HOME}/.llm-autopilot/approved-ci-trees",
+]
+
+
+class GuardRunnerFiles(Lists):
+    def test_runner_and_its_inputs(self):
+        self.check(RUNNER_ALLOW, RUNNER_DENY)
+
+    def test_runner_inputs_are_not_writable(self):
+        for p in (f"{HOME}/.llm-autopilot/agent/test-db.vars", f"{HOME}/.llm-autopilot/approved-ci-trees"):
+            for tool in ("Write", "Edit"):
+                with self.subTest(p=p, tool=tool):
+                    ti = {"file_path": p, "content": "PATH=/tmp/x"} if tool == "Write" else {"file_path": p, "old_string": "a", "new_string": "b"}
+                    self.assertFalse(decide(tool, ti)[0])
+        self.assertTrue(decide("Write", {"file_path": f"{HOME}/.llm-autopilot/agent/notes.md", "content": "x"})[0])
 
 
 if __name__ == "__main__":

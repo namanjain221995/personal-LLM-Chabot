@@ -18,6 +18,7 @@ Stays fast (a hook that times out does not block): the only slow path is the
 secret scan of outgoing commits on `git push`.
 """
 
+import grp
 import json
 import os
 import pwd
@@ -35,6 +36,10 @@ DEV_COMPOSE_DIR = os.path.join(DEV_WORKTREE, "ops/dev")
 # The installed release gate: the only way the agent may move `dev`. The copy in
 # the repository is its source; the agent cannot edit the installed one.
 MERGE_TO_DEV = os.path.join(AUTOPILOT_HOME, "bin", "merge_to_dev.sh")
+# Operator-approved tree hashes of .github/ that the gate may release to dev.
+CI_APPROVALS = os.path.join(AUTOPILOT_HOME, "approved-ci-trees")
+# The runner merges these test-database variables into every cycle's environment.
+TEST_DB_VARS = os.path.join(AUTOPILOT_HOME, "agent", "test-db.vars")
 
 # Host details (addresses, ports, names) live in a host-only file so the public
 # repository carries none of them (operator decision 6, 2026-10-03). Template:
@@ -125,6 +130,8 @@ GUARD_FILES = [
     _real(HOST_CONFIG_PATH),
     _real(os.path.join(AUTOPILOT_HOME, "state.json")),
     _real(os.path.join(AUTOPILOT_HOME, "lock")),
+    _real(CI_APPROVALS),
+    _real(TEST_DB_VARS),
 ]
 
 SECRET_BASENAME = re.compile(
@@ -276,7 +283,7 @@ def block(msg):
 
 
 class Ctx:
-    def __init__(self, raw, cwd, depth=0, env=None, piped_in=False, redirs=None, top=True):
+    def __init__(self, raw, cwd, depth=0, env=None, piped_in=False, redirs=None, top=True, captured=False):
         self.raw = raw
         self.cwd = cwd
         self.depth = depth
@@ -284,11 +291,19 @@ class Ctx:
         self.piped_in = piped_in
         self.redirs = list(redirs or [])
         self.top = top
+        # captured: this command's output does not reach the transcript (it is
+        # captured by $(...), written to a file or piped into a non-reader).
+        self.captured = captured
+        self.out_ok = True
 
     def child(self, **kw):
         c = Ctx(self.raw, kw.get("cwd", self.cwd), self.depth + 1, kw.get("env", self.env),
-                kw.get("piped_in", False), kw.get("redirs", []), top=False)
+                kw.get("piped_in", False), kw.get("redirs", []), top=False,
+                captured=kw.get("captured", self.output_captured()))
         return c
+
+    def output_captured(self):
+        return self.captured or not self.out_ok
 
     def deny(self, why):
         block(f"{TAG} {self.raw} -> blocked: {why}")
@@ -334,7 +349,7 @@ def write_allowed(path):
 
 def write_why(path):
     if path and is_guard_path(path):
-        return "the autopilot may never modify its own guardrails (guard hook, runner, settings, master prompt) (§3.3)"
+        return "the autopilot may never modify its own guardrails (guard hook, runner, settings, master prompt, test-db.vars, CI approvals) (§3.3); ask the operator in NEEDS_HUMAN.md"
     if path and under(path, R_PROD):
         return f"the production checkout is read-only; work in {DEV_WORKTREE}"
     if path and under(path, R_DOCUMENTS):
@@ -548,6 +563,17 @@ def tokenize(text):
     return list(lex)
 
 
+def writes_output_file(redirs):
+    """True when a redirection sends output to a file (not a descriptor or /dev/null)."""
+    for op, target in redirs:
+        if ">" not in op:
+            continue
+        if target.startswith("&") or re.fullmatch(r"\d+|-", target or "") or target in ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"):
+            continue
+        return True
+    return False
+
+
 def segments(tokens):
     """Split tokens into simple commands: [(words, redirections, piped_in)]."""
     segs, words, redirs, piped_in, i = [], [], [], False, 0
@@ -661,19 +687,22 @@ def analyze(cmd, ctx):
         check_heredoc(consumer, body, ctx)
     text, inners = extract_substitutions(text)
     for inner in inners:
-        analyze(inner, ctx.child())
+        analyze(inner, ctx.child(captured=True))  # its output feeds the outer command, not the transcript
     try:
         tokens = tokenize(prepare(text))
     except ValueError as exc:
         ctx.deny(f"could not parse the command ({exc}); simplify quoting (fail-closed)")
     cwd = ctx.cwd
     env = dict(ctx.env)
-    for words, redirs, piped_in in segments(tokens):
-        sctx = Ctx(ctx.raw, cwd, ctx.depth, env, piped_in, redirs, top=ctx.top)
+    segs = segments(tokens)
+    for idx, (words, redirs, piped_in) in enumerate(segs):
+        sctx = Ctx(ctx.raw, cwd, ctx.depth, env, piped_in, redirs, top=ctx.top, captured=ctx.captured)
+        sctx.out_ok = not writes_output_file(redirs) and pipeline_tail_is_safe(segs, idx)
         check_redirects(sctx)
         senv, w, bare_env = strip_prefix(words)
         if bare_env:
             sctx.deny("printing the environment exposes secrets")
+        check_exec_env(senv, sctx)
         if not w:
             continue
         sctx.env = {**env, **senv}
@@ -683,20 +712,75 @@ def analyze(cmd, ctx):
             nxt = expand_path(target[0], cwd) if target else HOME
             cwd = nxt or cwd
             continue
-        if name == "export":
+        if name in ("export", "declare", "typeset", "readonly", "local"):
+            assigned = {}
             for a in w[1:]:
                 if "=" in a and not a.startswith("-"):
                     k, v = a.split("=", 1)
-                    env[k] = v
+                    assigned[k] = v
+            check_exec_env(assigned, sctx)
+            if name == "export":
+                env.update(assigned)
         if ("$" in w[0] or "__SUBST__" in w[0]) and ctx.top:
             sctx.deny("the command name is computed at run time and cannot be reviewed; write it literally")
         if cwd and not write_allowed(_real(cwd)) and name not in READONLY_CMDS and name not in SYSTEM_DENY:
             sctx.deny(f"the working directory {cwd} is read-only to the autopilot; cd to {DEV_WORKTREE} first")
-        if name == "merge_to_dev.sh" and expand_path(w[0], cwd) != _real(MERGE_TO_DEV):
-            sctx.deny(f"run the installed gate {MERGE_TO_DEV}, not a repository copy (the agent cannot weaken the installed one)")
+        if name == "merge_to_dev.sh":
+            check_gate_invocation(words, w, sctx)
         if ("/" in w[0] or w[0].endswith(".sh")) and name not in SHELLS and name not in INTERPRETERS:
             analyze_script_file(w[0], sctx)
         check_command(name, w[1:], sctx)
+
+
+# Pipe sinks that only print what they read: a pure reader piped into them still
+# shows its output in the transcript and writes nothing.
+SAFE_SINKS = {"head", "tail", "wc", "grep", "egrep", "fgrep", "cut", "tr", "nl", "cat", "column"}
+
+
+def pipeline_tail_is_safe(segs, idx):
+    """True when segment idx is not piped, or every later stage of its pipeline is a safe sink."""
+    j = idx + 1
+    while j < len(segs) and segs[j][2]:  # piped_in
+        words, redirs, _ = segs[j]
+        _env, w, _bare = strip_prefix(words)
+        if not w or os.path.basename(w[0]) not in SAFE_SINKS or writes_output_file(redirs):
+            return False
+        if any("__SUBST__" in x for x in w):
+            return False
+        j += 1
+    return True
+
+
+# Variables that make a program run another command (or load code) chosen by
+# their value; set inline they hide that command from review.
+EXEC_ENV = re.compile(
+    r"^(BASH_ENV|ENV|LD_PRELOAD|LD_AUDIT|PROMPT_COMMAND|PERL5OPT|LESSOPEN|LESSCLOSE|PAGER|GIT_PAGER|GIT_EXTERNAL_DIFF|"
+    r"GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|SSH_ASKPASS|EDITOR|VISUAL|GIT_EDITOR|GIT_SEQUENCE_EDITOR|GIT_PROXY_COMMAND|"
+    r"GIT_EXEC_PATH|GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_CONFIG|GIT_CONFIG_GLOBAL|GIT_CONFIG_SYSTEM|GIT_CONFIG_PARAMETERS|"
+    r"GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+|GIT_TEMPLATE_DIR|GH_CONFIG_DIR|GH_HOST|GH_TOKEN|GITHUB_TOKEN|"
+    r"GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|DOCKER_CONFIG)$"
+)
+EXEC_ENV_SAFE_VALUES = {"", "true", ":", "cat", "less", "/bin/true", "/usr/bin/true"}
+
+
+def check_exec_env(assignments, ctx):
+    for k, v in assignments.items():
+        if k == "GIT_CONFIG_GLOBAL" and v == "/dev/null":
+            continue
+        if k == "GH_REPO":
+            if v.lower() != REPO_SLUG.lower():
+                ctx.deny(f"gh may only act on {REPO_SLUG}")
+            continue
+        if EXEC_ENV.match(k) and v not in EXEC_ENV_SAFE_VALUES:
+            ctx.deny(f"setting {k} makes programs run code or use configuration the guard cannot review; leave it unset")
+
+
+def check_gate_invocation(words, w, ctx):
+    """The installed gate runs only as its own command: no assignments, wrappers or exported variables."""
+    if expand_path(w[0], ctx.cwd) != _real(MERGE_TO_DEV):
+        ctx.deny(f"run the installed gate {MERGE_TO_DEV}, not a repository copy (the agent cannot weaken the installed one)")
+    if words[0] != w[0] or ctx.env:
+        ctx.deny(f"run the installed gate {MERGE_TO_DEV} as a plain command: no variable assignments, exports or wrappers in front of it (they would change what it checks)")
 
 
 def check_heredoc(consumer, body, ctx):
@@ -737,6 +821,184 @@ def in_quiet_window():
     return QUIET_WINDOW_IST[0] <= now.hour < QUIET_WINDOW_IST[1]
 
 
+PURE_READERS = {"cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "ag", "diff", "cmp", "stat", "file", "ls",
+                "md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "b2sum", "cksum"}
+GIT_READERS = {"log", "diff", "show", "blame", "annotate"}
+
+
+def is_pure_read(cmd, args):
+    """Commands that only print files: they cannot run, write or replace what they read."""
+    if cmd in PURE_READERS:
+        return not (cmd == "rg" and any(a.startswith("--pre") for a in args))  # rg --pre runs a program per file
+    if cmd == "sed":
+        scripts, rest, i = [], [], 0
+        while i < len(args):
+            a = args[i]
+            if a in ("-e", "--expression") and i + 1 < len(args):
+                scripts.append(args[i + 1])
+                i += 2
+                continue
+            if a.startswith("--expression="):
+                scripts.append(a.split("=", 1)[1])
+            elif a.startswith("-") and a != "-":
+                if a.startswith(("-i", "--in-place", "-f", "--file", "-s", "--separate")) or (not a.startswith("--") and re.search(r"[ifs]", a[1:])):
+                    return False
+                if a not in ("-n", "--quiet", "--silent", "-E", "-r", "--regexp-extended", "-u", "--unbuffered", "-z", "--null-data", "--debug"):
+                    return False
+            else:
+                rest.append(a)
+            i += 1
+        if not scripts and rest:
+            scripts.append(rest.pop(0))
+        # line ranges and p/q/= only: no w (write), e (execute), r/R (read), s///e
+        return bool(scripts) and all(re.fullmatch(r"[0-9,$;pqn=\s]+", s) for s in scripts)
+    if cmd == "git":
+        a = list(args)
+        while a and a[0].startswith("-"):
+            opt = a.pop(0)
+            if opt in ("-C", "-c") and a:
+                a.pop(0)
+            elif opt not in ("--no-pager", "-P", "--no-replace-objects", "--literal-pathspecs"):
+                return False
+        if not a or a[0] not in GIT_READERS:
+            return False
+        return not any(x.startswith(("--output", "--ext-diff", "--textconv", "-O", "--open-files-in-pager")) for x in a[1:])
+    return False
+
+
+# procps-ng ps. A BSD-syntax 'e' (no dash) appends each process's environment.
+# When a dash-syntax command line fails to parse, procps parses it again as BSD
+# syntax with the dashes dropped, so 'ps -ex' or 'ps -ef -o pid,args' print
+# environments as well. The guard therefore checks both readings.
+PS_KEYWORDS = frozenset(
+    "%cpu %mem _left _left2 _right _right2 _unlimited _unlimited2 ag_id ag_nice args atime blocked bsdstart bsdtime c caught "
+    "cgname cgroup cgroupns class cls cmd comm command context cp cpuid cputime cputimes cuc cuu drs dsiz egid egroup eip esp "
+    "etime etimes euid euser exe f fgid fgroup flag flags fname fsgid fsgroup fsuid fsuser fuid fuser gid group ignored intpri "
+    "ipcns label lastcpu lim longtname lsession lstart luid lwp lxc m_drs m_size m_trs machine maj_flt majflt min_flt minflt "
+    "mntns netns ni nice nlwp numa oom oomadj opri ouid pagein pcpu pending pgid pgrp pid pidns pmem policy ppid pri pri_api "
+    "pri_bar pri_baz pri_foo priority psr pss rbytes rchars rgid rgroup rops rss rssize rsz rtprio ruid ruser s sched seat sess "
+    "session sgi_p sgi_rss sgid sgroup sid sig sig_block sig_catch sig_ignore sig_pend sigcatch sigignore sigmask size slice "
+    "spid stackp start start_stack start_time stat state stime suid supgid supgrp suser svgid svgroup svuid svuser sz tgid "
+    "thcount tid time timens times tname tpgid trs trss tsig tsiz tt tty tty4 tty8 ucmd ucomm uid uid_hack uname unit user "
+    "userns uss util utsns uunit vsize vsz wbytes wcbytes wchan wchars wname wops zone".split()
+)
+PS_UNIX_VALUE = {"C": "any", "D": "any", "G": "groups", "g": "groups", "O": "format", "o": "format", "p": "numbers",
+                 "q": "numbers", "s": "numbers", "U": "users", "u": "users", "t": "unknown", "k": "unknown", "n": "unknown"}
+PS_SAFE_FLAGS = set("eAadHwLTm")  # never fail to parse, never conflict with a format
+PS_FORMAT_FLAGS = set("fFjl")  # predefined formats: fine together, conflict with -o/-O
+PS_BSD_VALUE = set("oOpUtkq")  # BSD options that take the rest of the word or the next word
+PS_LONG = {"forest": None, "headers": None, "no-headers": None, "cumulative": None, "format": "format", "sort": "sort",
+           "pid": "numbers", "ppid": "numbers", "quick-pid": "numbers", "sid": "numbers", "user": "users", "User": "users",
+           "group": "groups", "Group": "groups", "cols": "numbers", "columns": "numbers", "width": "numbers",
+           "rows": "numbers", "lines": "numbers", "tty": "unknown"}
+
+
+def _ps_value_ok(kind, val):
+    if val is None or "$" in val or "__SUBST__" in val or "`" in val:
+        return False
+    items = [x for x in re.split(r"[,\s]+", val) if x]
+    if kind == "any":
+        return bool(val)
+    if kind == "numbers":
+        return bool(items) and all(x.isdigit() for x in items)
+    if kind == "format":
+        names = val.split("=", 1)[0]
+        cols = [x for x in re.split(r"[,\s]+", names) if x]
+        return bool(cols) and all(re.sub(r":\d+$", "", c) in PS_KEYWORDS for c in cols)
+    if kind == "sort":
+        return bool(items) and all(x.lstrip("+-") in PS_KEYWORDS for x in items)
+    if kind in ("users", "groups"):
+        def known(x):
+            if x.isdigit():
+                return True
+            try:
+                (pwd.getpwnam if kind == "users" else grp.getgrnam)(x)
+                return True
+            except KeyError:
+                return False
+        return bool(items) and all(known(x) for x in items)
+    return False
+
+
+def _ps_bsd_word(word):
+    """Read one BSD-syntax word. Returns (shows_environment, takes_next_word)."""
+    word = word.replace("__SUBST__", "$")
+    if re.match(r"^\d", word):
+        return False, False  # a process ID list
+    for i, c in enumerate(word):
+        if c == "e" or c in "$`*?[":  # computed text could expand to 'e'
+            return True, False
+        if c in PS_BSD_VALUE:
+            return False, i == len(word) - 1
+    return False, False
+
+
+def ps_env_risk(args):
+    """Why this ps command line could print process environments, or None."""
+    # 1. How procps reads it: dash words as UNIX options, bare words as BSD options.
+    provable, fmt_opts, flags, i, n = True, [], set(), 0, len(args)
+    while i < n:
+        a = args[i]
+        if a == "--":
+            provable = False
+        elif a.startswith("--"):
+            name, eq, val = a[2:].partition("=")
+            if name not in PS_LONG:
+                provable = False
+            elif PS_LONG[name]:
+                if not eq:
+                    val = args[i + 1] if i + 1 < n else None
+                    i += 1
+                provable = provable and _ps_value_ok(PS_LONG[name], val)
+                if name == "format":
+                    fmt_opts.append("o")
+        elif a.startswith("-") and len(a) > 1:
+            body = a[1:]
+            for j, c in enumerate(body):
+                if c in PS_UNIX_VALUE:
+                    val = body[j + 1 :]
+                    if not val:
+                        val = args[i + 1] if i + 1 < n else None
+                        i += 1
+                    provable = provable and _ps_value_ok(PS_UNIX_VALUE[c], val)
+                    if c in "oO":
+                        fmt_opts.append(c)
+                    break
+                if c not in PS_SAFE_FLAGS | PS_FORMAT_FLAGS:
+                    provable = False
+                flags.add(c)
+        else:
+            if not re.fullmatch(r"\d+(,\d+)*", a):
+                provable = False
+            env, takes_next = _ps_bsd_word(a)
+            if env:
+                return f"'{a}' is BSD-syntax ps with 'e', which prints process environments (secrets); use ps -ef or ps -o <columns> -p <pid>"
+            if takes_next:
+                i += 1
+        i += 1
+    if fmt_opts and flags & PS_FORMAT_FLAGS or "O" in fmt_opts and len(fmt_opts) > 1:
+        provable = False
+    # 2. The BSD re-read procps falls back to when step 1 fails to parse.
+    i, retry_env = 0, False
+    while i < n:
+        a = args[i]
+        if a.startswith("--"):
+            name, eq, _val = a[2:].partition("=")
+            if PS_LONG.get(name) and not eq:
+                i += 1
+        else:
+            env, takes_next = _ps_bsd_word(a[1:] if a.startswith("-") and a != "-" else a)
+            retry_env = retry_env or env
+            if takes_next:
+                i += 1
+        i += 1
+    if retry_env and not provable:
+        return ("this ps command line may fail to parse as dash options, and procps then re-reads it as BSD options "
+                "where 'e' prints process environments (secrets); use a plain form such as ps -ef, ps -eo pid,etime,args "
+                "or ps -o pid,etime -p <pid> (known columns, existing users, numeric IDs)")
+    return None
+
+
 def check_production_reach(cmd, args, ctx):
     """Rules about what a command can reach in production, whatever the command is."""
     text = " ".join([f"{k}={v}" for k, v in ctx.env.items()] + list(args))
@@ -744,7 +1006,13 @@ def check_production_reach(cmd, args, ctx):
         ctx.deny("load generators are not run on these hosts: the main model is shared TP=2 across both DGX nodes (§3.3: no disruptive load against production)")
     if any("@anthropic-ai/claude-code" in a for a in args):
         ctx.deny("the autopilot may not launch or modify Claude Code itself")
-    for a in [cmd] + list(args):
+    interp = cmd in INTERPRETERS or re.fullmatch(r"python3\.\d+", cmd)
+    if cmd == "autopilot.py" or (interp and not {"-m", "-c"} & set(args) and any(os.path.basename(a) == "autopilot.py" for a in nonopt(args))):
+        ctx.deny("the autopilot runner belongs to the operator; starting another runner would launch Claude sessions outside these guardrails (run its tests with pytest instead)")
+    # Reading a production script or harness (cat, grep, git log, ...) is fine when
+    # the output only reaches the transcript; running, copying or editing it is not.
+    reading = is_pure_read(cmd, args) and not ctx.output_captured()
+    for a in [cmd] + ([] if reading else list(args)):
         if PROD_SCRIPTS.search(a) and not a.startswith("-"):
             ctx.deny(f"{a} acts on PRODUCTION (deploys, cluster, backups, host guard, reconciler, shared e2e stack); the programme never changes production (operator decision 3: prepare it and list it in NEEDS_HUMAN.md)")
         if HEAVY_HARNESS.search(a) and not in_quiet_window():
@@ -799,8 +1067,10 @@ def check_command(cmd, args, ctx):
         ctx.deny("printing shell variables exposes secrets")
     if cmd in ("echo", "printf", "cat", "tee") and SECRET_VAR.search(" ".join(args)):
         ctx.deny("prints a secret-looking variable")
-    if cmd == "ps" and any((not a.startswith("-")) and "e" in a for a in args):
-        ctx.deny("'ps e' prints process environments (secrets)")
+    if cmd == "ps":
+        why = ps_env_risk(list(args))
+        if why:
+            ctx.deny(why)
     if any("/proc/" in a and "environ" in a for a in args):
         ctx.deny("process environments hold secrets")
     if cmd in SHELLS:
@@ -808,6 +1078,8 @@ def check_command(cmd, args, ctx):
     if cmd in ("source", "."):
         if args and (args[0] == "__SUBST__" or args[0].startswith("/dev/fd")):
             ctx.deny("sourcing generated input hides the commands")
+        if args and (os.path.basename(args[0]) == "merge_to_dev.sh" or expand_path(args[0], ctx.cwd) == _real(MERGE_TO_DEV)):
+            ctx.deny(f"run the installed gate {MERGE_TO_DEV} directly; sourcing it runs it with the caller's functions and variables")
         if args:
             analyze_script_file(args[0], ctx, force=True)
         return
@@ -921,12 +1193,15 @@ def analyze_words(words, ctx):
     env, w, bare = strip_prefix(words)
     if bare:
         ctx.deny("printing the environment exposes secrets")
+    check_exec_env(env, ctx)
     if not w:
         return
     c = ctx.child(env={**ctx.env, **env})
     name = os.path.basename(w[0])
     if name in ("techsara",) or w[0].endswith("/techsara"):
         name = "techsara"
+    if name == "merge_to_dev.sh":
+        ctx.deny(f"run the installed gate {MERGE_TO_DEV} as a plain command of its own, not through xargs, find, watch or another wrapper")
     check_command(name, w[1:], c)
 
 
@@ -939,8 +1214,8 @@ def check_shell(args, ctx):
             return
     scripts = nonopt(args)
     if scripts:
-        if os.path.basename(scripts[0]) == "merge_to_dev.sh" and expand_path(scripts[0], ctx.cwd) != _real(MERGE_TO_DEV):
-            ctx.deny(f"run the installed gate {MERGE_TO_DEV}, not a repository copy (the agent cannot weaken the installed one)")
+        if os.path.basename(scripts[0]) == "merge_to_dev.sh" or expand_path(scripts[0], ctx.cwd) == _real(MERGE_TO_DEV):
+            ctx.deny(f"run the installed gate {MERGE_TO_DEV} directly, not through a shell (a shell would load BASH_ENV and the caller's functions)")
         return analyze_script_file(scripts[0], ctx, force=True)
     src = [t for op, t in ctx.redirs if op == "<"]
     if src:
@@ -1115,7 +1390,15 @@ def check_disk(cmd, args, ctx):
 # git / gh
 # --------------------------------------------------------------------------
 
-GIT_DANGEROUS_C = re.compile(r"^(core\.(sshCommand|hooksPath|fsmonitor|pager|editor|askpass|gitProxy)|alias\.|url\.|credential|http\.|protocol\.|include\.|includeIf\.|filter\.|diff\.\w+\.textconv|uploadpack|receive\.)", re.I)
+GIT_DANGEROUS_C = re.compile(
+    r"^(core\.(sshCommand|hooksPath|fsmonitor|pager|editor|askpass|gitProxy|alternateRefsCommand|worktree|bare)|alias\.|url\.|credential|"
+    r"http\.|protocol\.|include\.|includeIf\.|filter\.|diff\.external|diff\.\w+\.(textconv|command)|merge\.\w+\.driver|pager\.|"
+    r"sequence\.editor|gpg\.|interactive\.diffFilter|uploadpack|receive\.|remote\.|push\.|branch\.|transfer\.|submodule\.)",
+    re.I,
+)
+# Plumbing that can update remote refs without `git push`'s refspec checks.
+GIT_TRANSPORT_SUBCOMMANDS = {"send-pack", "http-push", "receive-pack", "upload-pack", "upload-archive", "http-fetch",
+                             "remote-http", "remote-https", "remote-ext", "remote-fd", "remote-ftp", "remote-ftps", "subtree"}
 
 
 def check_git(args, ctx):
@@ -1128,7 +1411,11 @@ def check_git(args, ctx):
         elif opt == "-c" and a:
             kv = a.pop(0)
             if GIT_DANGEROUS_C.match(kv):
-                ctx.deny("git -c overrides of hooks, transports, credentials, aliases or filters can run hidden commands")
+                ctx.deny("git -c overrides of hooks, transports, remotes, push mappings, credentials, aliases or filters can run hidden commands or move other branches")
+        elif opt == "--config-env" or opt.startswith("--config-env="):
+            kv = opt.split("=", 1)[1] if "=" in opt else (a.pop(0) if a else "")
+            if GIT_DANGEROUS_C.match(kv):
+                ctx.deny("git --config-env overrides of hooks, transports, remotes, push mappings, credentials, aliases or filters can run hidden commands or move other branches")
         elif opt in ("--git-dir", "--work-tree", "--namespace", "--exec-path") and a:
             a.pop(0)
             ctx.deny("redirecting git to another repository or tree is not allowed")
@@ -1137,6 +1424,16 @@ def check_git(args, ctx):
     if not a:
         return
     sub, rest = a[0], a[1:]
+    if sub in GIT_TRANSPORT_SUBCOMMANDS or sub.startswith("remote-"):
+        ctx.deny(f"'git {sub}' talks to remotes without git push's checks; push one named branch with git push origin <branch>")
+    if sub == "grep" and any(x.startswith(("-O", "--open-files-in-pager")) for x in rest):
+        ctx.deny("git grep -O runs a program on the matches; print them instead")
+    for j, x in enumerate(rest):
+        out = x.split("=", 1)[1] if x.startswith("--output=") else (rest[j + 1] if x == "--output" and j + 1 < len(rest) else None)
+        if out is not None:
+            p = expand_path(out, ctx.cwd)
+            if not write_allowed(p):
+                ctx.deny(write_why(p))
     gdir_real = _real(gdir) if gdir else None
     protected_tree = gdir_real is not None and not write_allowed(gdir_real)
     readonly = sub in GIT_READONLY
@@ -1219,6 +1516,7 @@ def check_git_push(rest, gdir, ctx):
     for x in rest:
         if x in ("-f", "--force", "--mirror", "--all", "--prune", "--delete", "-d", "--tags", "--follow-tags") \
                 or x.startswith(("--force", "--mirror", "--receive-pack", "--exec", "--repo")) \
+                or (x.startswith("--recurse-submodules") and x.split("=", 1)[-1] in ("on-demand", "only", "--recurse-submodules")) \
                 or (re.fullmatch(r"-[a-zA-Z]+", x) and re.search(r"[fd]", x[1:])):
             ctx.deny("force/mirror/all/tags pushes, remote deletes and transport overrides are not allowed (§3.3); push one named branch or tag")
     opts_with_value = {"-o", "--push-option", "--signed"}
@@ -1239,24 +1537,101 @@ def check_git_push(rest, gdir, ctx):
     refspecs = pos[1:]
     if not refspecs:
         ctx.deny("name the refspec explicitly (git push origin upgrade/<ws>/<slug>, or git push origin HEAD:autopilot/dev)")
-    sources = []
-    for rs in refspecs:
+    sources, i = [], 0
+    while i < len(refspecs):
+        rs = refspecs[i]
+        i += 1
+        if "__SUBST__" in rs or "$" in rs or "`" in rs:
+            ctx.deny("refspecs must be literal")
+        if rs == "tag":  # `git push origin tag <name>` = refs/tags/<name>:refs/tags/<name>
+            name = refspecs[i] if i < len(refspecs) else ""
+            i += 1
+            check_push_destination(f"refs/tags/{name}", ctx)
+            sources.append(f"refs/tags/{name}")
+            continue
         if rs.startswith("+"):
             ctx.deny("'+' refspecs force-update; not allowed (§3.3)")
+        if any(c in rs for c in "*?[\\") or "@{" in rs:
+            ctx.deny("glob, pattern and @{...} refspecs can update branches the command does not name; push one named branch (git push origin <branch> or git push origin HEAD:<branch>)")
         src, colon, dst = rs.partition(":")
         if colon and not src:
-            ctx.deny("an empty source deletes the remote ref; not allowed (§3.3)")
-        target = re.sub(r"^refs/heads/", "", dst or src)
-        if target in ("main", "master") or re.fullmatch(r"(refs/)?(remotes/origin/)?main", target):
-            ctx.deny("the agent never pushes to main; the operator releases dev -> main (operator decisions 2 and 5)")
-        if target == "dev" or re.fullmatch(r"(refs/)?(remotes/origin/)?dev", target):
-            ctx.deny(f"dev moves only through the installed gate {MERGE_TO_DEV}, which refuses unless every check passed for that exact commit and FINAL_REPORT.md exists (operator decision 5)")
-        if (dst or src).startswith("refs/tags/") and not re.match(r"^refs/tags/(baseline|release|rc)/", dst or src):
-            ctx.deny("push only baseline/*, release/* or rc/* tags")
-        if "__SUBST__" in rs or "$" in rs:
-            ctx.deny("refspecs must be literal")
+            ctx.deny("an empty source deletes the remote ref (or pushes every matching branch); not allowed (§3.3)")
+        if colon:
+            check_push_destination(remote_destination(dst, ctx), ctx)
+        else:
+            check_push_destination(resolve_push_source(src, gdir, ctx), ctx)
         sources.append(src)
     scan_outgoing(sources, gdir, ctx)
+
+
+def remote_destination(dst, ctx):
+    """The remote ref a push destination names, the way git expands it."""
+    if dst in ("HEAD", "@") or dst.startswith(("remotes/", "refs/remotes/")):
+        ctx.deny(f"push to an explicit branch (HEAD:<branch>); '{dst}' is not a branch on the remote")
+    if dst.startswith("refs/"):
+        if not dst.startswith(("refs/heads/", "refs/tags/")):
+            ctx.deny("push only branches (refs/heads/...) and tags (refs/tags/...)")
+        return dst
+    if dst.startswith(("heads/", "tags/")):
+        return "refs/" + dst
+    return "refs/heads/" + dst
+
+
+def resolve_push_source(src, gdir, ctx):
+    """Where `git push origin <src>` (no destination) lands: the source's full name,
+    unless remote.origin.push or push.default=upstream maps it elsewhere."""
+    if src in ("HEAD", "@"):
+        ctx.deny("name the destination when pushing HEAD (git push origin HEAD:<branch>); the current branch can change before the push runs")
+    full = None
+    if src.startswith(("refs/heads/", "refs/tags/")):
+        full = src
+    else:
+        try:
+            r = subprocess.run(["git", "-C", gdir or DEV_WORKTREE, "rev-parse", "--symbolic-full-name", src],
+                               capture_output=True, text=True, timeout=10)
+            out = r.stdout.strip().splitlines()
+            if r.returncode == 0 and len(out) == 1 and out[0].startswith(("refs/heads/", "refs/tags/")):
+                full = out[0]
+            elif r.returncode == 0 and out:
+                ctx.deny(f"'{src}' is not a local branch or tag; push with an explicit destination (git push origin {src}:<branch>)")
+        except Exception:
+            ctx.deny("could not resolve the push source (fail-closed)")
+        if full is None:  # not created yet: git will name it the way it is written
+            full = remote_destination(src, ctx)
+    try:
+        r = subprocess.run(["git", "-C", gdir or DEV_WORKTREE, "config", "--get-regexp", r"^(remote\.origin\.push|push\.default|branch\..*\.merge)$"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        ctx.deny("could not read the push configuration (fail-closed)")
+    # rc 1: none of the keys is set; rc 128: not a repository or unreadable
+    # config, where the push itself fails the same way.
+    conf = {}
+    for line in r.stdout.splitlines():
+        k, _, v = line.partition(" ")
+        conf.setdefault(k.lower(), []).append(v.strip())
+    if conf.get("remote.origin.push"):
+        ctx.deny("remote.origin.push is configured and remaps pushes; push with an explicit destination (git push origin <src>:refs/heads/<branch>)")
+    if (conf.get("push.default") or [""])[-1].lower() in ("upstream", "tracking") and full.startswith("refs/heads/"):
+        merge = conf.get(f"branch.{full[len('refs/heads/'):]}.merge".lower())
+        if merge:
+            return merge[-1]
+    return full
+
+
+def check_push_destination(ref, ctx):
+    if ref.startswith("refs/heads/"):
+        name = ref[len("refs/heads/"):]
+        if name.lower() in ("main", "master"):
+            ctx.deny("the agent never pushes to main; the operator releases dev -> main (operator decisions 2 and 5)")
+        if name.lower() == "dev":
+            ctx.deny(f"dev moves only through the installed gate {MERGE_TO_DEV}, which refuses unless every check passed for that exact commit and FINAL_REPORT.md exists (operator decision 5)")
+        if name.lower() == "head" or not name:
+            ctx.deny("push to a named branch")
+    elif ref.startswith("refs/tags/"):
+        if not re.match(r"^refs/tags/(baseline|release|rc)/[\w./-]+$", ref):
+            ctx.deny("push only baseline/*, release/* or rc/* tags")
+    else:
+        ctx.deny("push only branches (refs/heads/...) and tags (refs/tags/...)")
 
 
 def load_secret_values():
@@ -1316,44 +1691,125 @@ def scan_outgoing(sources, gdir, ctx):
         scan_text_for_secrets(added, "an outgoing commit", ctx, values)
 
 
-GH_DENY = [
-    (r"^pr\s+merge\b", "merges happen only inside the installed gate ~/.llm-autopilot/bin/merge_to_dev.sh (dev) or by the operator (main)"),
-    (r"^pr\s+review\b.*--approve", "self-approval is not a review"),
-    (r"^workflow\s+(run|enable|disable)\b", "workflow_dispatch can deploy production; the agent never triggers it"),
-    (r"^run\s+(cancel|delete)\b", "cancelling or deleting runs can cancel a production deploy or erase evidence"),
-    (r"^(secret|variable|ruleset|ssh-key|gpg-key|codespace|extension|alias|config|cache)\b", "repository, account and CLI configuration belong to the operator"),
-    (r"^repo\s+(edit|delete|rename|archive|unarchive|sync|set-default|deploy-key|fork|create)\b", "repository settings belong to the operator"),
-    (r"^release\s+(delete|delete-asset|edit|upload)\b", "existing releases are rollback records"),
-    (r"^auth\b(?!\s+status\b(?!.*(\s-t\b|--show-token)))", "never print or change GitHub credentials"),
-    (r"^gist\b", "gists publish data outside the repository"),
-    (r"(?i)^api\b.*(-X|--method)\s*=?\s*(PUT|PATCH|DELETE|POST)", "mutating REST calls are not allowed; use the typed gh commands"),
-    (r"^api\b(?!\s+graphql\b).*\s(-f|-F|--field|--raw-field|--input)\b", "gh api with fields sends a POST; use the typed gh commands"),
-    (r"^api\s+graphql\b.*\bmutation\b", "GraphQL mutations are not allowed; use the typed gh commands"),
-]
+GH_CONFIG_WHY = "repository, account and CLI configuration belong to the operator"
+# Top-level gh commands. None = every subcommand is allowed (subject to the
+# checks below); a set = only those subcommands; missing = denied, which also
+# covers aliases and extensions the guard cannot see into.
+GH_ALLOWED = {
+    "pr": None, "issue": None, "label": None, "project": None, "org": None, "search": None, "status": None,
+    "browse": None, "completion": None, "help": None, "version": None, "api": None,
+    "repo": {"view", "list", "ls", "clone"},
+    "release": {"view", "list", "ls", "download", "create", "new"},
+    "run": {"list", "ls", "view", "watch", "download", "rerun"},
+    "workflow": {"list", "ls", "view"},
+    "auth": {"status"},
+}
+GH_DENIED_WHY = {
+    "workflow": "workflow_dispatch can deploy production; the agent never triggers, enables or disables workflows",
+    "run": "cancelling or deleting runs can cancel a production deploy or erase evidence",
+    "repo": "repository settings belong to the operator",
+    "release": "existing releases are rollback records",
+    "auth": "never print or change GitHub credentials",
+    "gist": "gists publish data outside the repository",
+}
+GH_ROOT_BOOL = {"-h", "--help", "--version"}
+
+
+def gh_command_words(args):
+    """The command path cobra resolves: a flag without '=' takes the next word
+    unless it is a known boolean flag ('gh -R x pr merge' is 'pr merge')."""
+    words, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            break
+        if a.startswith("-"):
+            if "=" not in a and a not in GH_ROOT_BOOL and (a.startswith("--") or len(a) == 2):
+                i += 2
+            else:
+                i += 1
+            continue
+        words.append(a)
+        i += 1
+    return words
+
+
+def gh_flag_values(args, shorts, longs):
+    """Values of the given flags in every spelling: -X v, -Xv, --flag v, --flag=v."""
+    vals, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in shorts or a in longs:
+            vals.append(args[i + 1] if i + 1 < len(args) else "")
+            i += 2
+            continue
+        for s in shorts:
+            if a.startswith(s) and len(a) > len(s) and not a.startswith("--"):
+                vals.append(a[len(s):].lstrip("="))
+        for lg in longs:
+            if a.startswith(lg + "="):
+                vals.append(a.split("=", 1)[1])
+        i += 1
+    return vals
 
 
 def check_gh(args, ctx):
-    joined = " ".join(args)
-    for i, x in enumerate(args):
-        val = args[i + 1] if x in ("-R", "--repo") and i + 1 < len(args) else (x.split("=", 1)[1] if x.startswith("--repo=") else None)
-        if val is not None and val.lower() != REPO_SLUG.lower():
+    for val in gh_flag_values(args, ("-R",), ("--repo",)):
+        if val.lower() != REPO_SLUG.lower():
             ctx.deny(f"gh may only act on {REPO_SLUG}")
-    for pat, why in GH_DENY:
-        if re.search(pat, joined):
-            ctx.deny(why)
-    if re.match(r"^run\s+rerun\b", joined):
+    words = gh_command_words(args)
+    if not words:
+        return
+    top, sub = words[0], (words[1] if len(words) > 1 else "")
+    if top not in GH_ALLOWED:
+        ctx.deny(GH_DENIED_WHY.get(top, f"'gh {top}' is not on the guard's allow list ({GH_CONFIG_WHY}; aliases and extensions cannot be reviewed)"))
+    allowed = GH_ALLOWED[top]
+    if allowed is not None and sub not in allowed:
+        ctx.deny(GH_DENIED_WHY.get(top, GH_CONFIG_WHY))
+    if top == "auth" and any(a in ("-t", "--show-token") or a.startswith("--show-token=") for a in args):
+        ctx.deny(GH_DENIED_WHY["auth"])
+    if top == "pr" and sub == "merge":
+        ctx.deny("merges happen only inside the installed gate ~/.llm-autopilot/bin/merge_to_dev.sh (dev) or by the operator (main)")
+    if top == "pr" and sub == "review" and any(a in ("-a", "--approve") or a.startswith("--approve=") for a in args):
+        ctx.deny("self-approval is not a review")
+    if top == "issue" and sub in ("delete", "transfer"):
+        ctx.deny("issues are records; the agent does not delete or move them")
+    if top == "api":
+        check_gh_api(args, words, ctx)
+    if top == "run" and sub == "rerun":
         check_rerun(args, ctx)
     # PR/issue text is public: scan bodies for secrets.
-    if re.match(r"^(pr|issue|release)\s+(create|edit|comment)\b", joined):
+    if top in ("pr", "issue", "release") and sub in ("create", "new", "edit", "comment"):
         values = load_secret_values()
-        for i, x in enumerate(args):
-            if x in ("-b", "--body", "-t", "--title", "--notes") and i + 1 < len(args):
-                scan_text_for_secrets(args[i + 1], "the PR/issue text", ctx, values)
-            if x in ("-F", "--body-file", "--notes-file") and i + 1 < len(args):
-                p = expand_path(args[i + 1], ctx.cwd)
-                if p and os.path.isfile(p):
-                    with open(p, "r", encoding="utf-8", errors="replace") as fh:
-                        scan_text_for_secrets(fh.read(2_000_000), "the PR/issue body file", ctx, values)
+        for text in gh_flag_values(args, ("-b", "-t", "-n"), ("--body", "--title", "--notes")):
+            scan_text_for_secrets(text, "the PR/issue text", ctx, values)
+        for f in gh_flag_values(args, ("-F",), ("--body-file", "--notes-file")):
+            p = expand_path(f, ctx.cwd)
+            if p and os.path.isfile(p):
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    scan_text_for_secrets(fh.read(2_000_000), "the PR/issue body file", ctx, values)
+
+
+def check_gh_api(args, words, ctx):
+    endpoint = words[1] if len(words) > 1 else ""
+    for m in gh_flag_values(args, ("-X",), ("--method",)):
+        if m.upper() not in ("GET", "HEAD"):
+            ctx.deny("mutating REST calls are not allowed; use the typed gh commands")
+    for h in gh_flag_values(args, ("-H",), ("--header",)):
+        if re.search(r"method-override", h, re.I):
+            ctx.deny("method-override headers turn reads into writes; not allowed")
+    if any(h != "github.com" for h in gh_flag_values(args, (), ("--hostname",))):
+        ctx.deny(f"gh may only act on github.com/{REPO_SLUG}")
+    fields = gh_flag_values(args, ("-f", "-F"), ("--field", "--raw-field"))
+    inputs = gh_flag_values(args, (), ("--input",))
+    if endpoint != "graphql":
+        if fields or inputs:
+            ctx.deny("gh api with fields or --input sends a POST; use the typed gh commands")
+        return
+    if inputs or any("=@" in f or f.startswith("@") for f in fields):
+        ctx.deny("GraphQL documents read from files or stdin cannot be checked; pass the query inline with -f query='query {...}'")
+    if any(re.search(r"mutation|subscription", f, re.I) for f in fields):
+        ctx.deny("GraphQL mutations are not allowed; use the typed gh commands")
 
 
 # --------------------------------------------------------------------------
@@ -1436,11 +1892,11 @@ def check_docker(args, ctx):
         if op == "prune" or (sub == "volume" and op in ("rm", "remove")) or (sub == "network" and op in ("rm", "remove", "disconnect", "connect")):
             ctx.deny("prunes and volume/network removal can destroy production data or shared caches (§3.3)")
         if sub == "container":
-            return check_docker([op] + rest[1:], ctx)
+            return check_docker((["--host", docker_host] if docker_host else []) + [op] + rest[1:], ctx)
         if sub == "image" and op in ("rm", "tag", "pull", "load", "import", "build", "push", "save"):
-            return check_docker([{"rm": "rmi"}.get(op, op)] + rest[1:], ctx)
-        if sub == "buildx" and op in ("build", "bake"):
-            return check_docker(["build"] + rest[1:], ctx)
+            return check_docker((["--host", docker_host] if docker_host else []) + [{"rm": "rmi"}.get(op, op)] + rest[1:], ctx)
+        if sub in ("buildx", "builder") and op in ("build", "bake"):
+            return check_docker((["--host", docker_host] if docker_host else []) + ["build"] + rest[1:], ctx)
         if sub == "context" and op not in ("ls", "list", "inspect", "show"):
             ctx.deny("docker contexts belong to the operator")
         if sub == "image" and op == "inspect":
@@ -1483,8 +1939,12 @@ def check_docker(args, ctx):
                 ctx.deny("build outputs stay local")
         if not tags or not all(is_dev(t) for t in tags):
             ctx.deny(f"tag dev builds {DEV}-<name>; never build onto a production image tag")
+        if not remote:
+            ctx.deny("image builds run under the Docker daemon, outside the autopilot's memory cap; build on the worker node (DOCKER_HOST=ssh://<worker>, address in the host config)")
         return
     if sub in ("run", "create"):
+        if not remote:
+            check_head_container_caps(rest, ctx)
         return check_docker_run(rest, ctx)
     if sub == "exec":
         return check_docker_exec(rest, ctx)
@@ -1575,6 +2035,50 @@ def check_compose(rest, ctx, remote=False):
         ctx.deny("long-lived dev services and builds run on the worker node (owner rule: nothing new on head memory); set DOCKER_HOST=ssh://<worker> (address in the host config); down/stop/rm/kill are fine here")
     if sub == "exec" and not remote:
         ctx.deny("compose exec runs against the worker's dev stack only")
+
+
+HEAD_CONTAINER_MAX_MEM = 2 * 1024 ** 3
+HEAD_CONTAINER_MAX_CPUS = 4.0
+
+
+def _docker_bytes(v):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([bkmg]?)b?", (v or "").strip().lower())
+    if not m:
+        return None
+    return float(m.group(1)) * {"": 1, "b": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}[m.group(2)]
+
+
+def check_head_container_caps(rest, ctx):
+    """Containers run under the Docker daemon, outside the autopilot's memory cap.
+    On the head only short --rm tool containers with small explicit caps are allowed."""
+    opts, i = {}, 0
+    while i < len(rest):
+        x = rest[i]
+        if not x.startswith("-"):
+            break  # the image; the rest is the container's command
+        if "=" in x and x.startswith("--"):
+            k, v = x.split("=", 1)
+            opts.setdefault(k, []).append(v)
+        elif re.fullmatch(r"-m\S+", x):
+            opts.setdefault("-m", []).append(x[2:])
+        elif x in RUN_VALUE_OPTS:
+            opts.setdefault(x, []).append(rest[i + 1] if i + 1 < len(rest) else "")
+            i += 1
+        else:
+            opts.setdefault(x, []).append("")
+        i += 1
+    mem = [_docker_bytes(v) for v in opts.get("-m", []) + opts.get("--memory", [])]
+    cpus = []
+    for v in opts.get("--cpus", []):
+        try:
+            cpus.append(float(v))
+        except ValueError:
+            cpus.append(None)
+    if "--rm" not in opts or not mem or not cpus or any(m is None or m <= 0 or m > HEAD_CONTAINER_MAX_MEM for m in mem) \
+            or any(c is None or c <= 0 or c > HEAD_CONTAINER_MAX_CPUS for c in cpus):
+        ctx.deny("containers run under the Docker daemon, outside the autopilot's memory cap; on the head use only "
+                 f"'docker run --rm -m <=2g --cpus <={HEAD_CONTAINER_MAX_CPUS:g} ...' tool containers, and run anything bigger on the worker "
+                 "(DOCKER_HOST=ssh://<worker>, address in the host config)")
 
 
 def check_docker_run(rest, ctx):
