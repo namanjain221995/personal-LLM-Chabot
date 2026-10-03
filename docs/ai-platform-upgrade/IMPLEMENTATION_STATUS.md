@@ -19,7 +19,7 @@ History of the programme, newest first. Designed ≠ Implemented ≠ Tested ≠ 
 | Last review of fb29fb03..4ff6bbac | Reviewed: fix_first, fixed | 141 new cases plus the earlier 383, malformed `find` inputs: no fail-open; 1 regression (an argument-joining tool's operands skipped the secret-file check; the tool is not installed here), fixed in e969264c, merged b21088b3 → `152 passed, 859 subtests passed` |
 | P0-17 (11550954) | TEST_PASSED, not installed | Suite on 11550954 → `116 passed, 859 subtests passed` |
 | P0-17 re-QA | Reviewed: fix_first | The first QA's blocking item is fixed. 3 new blocking items → P0-18 (host-only `p0-17-reqa-2026-10-03.md`) |
-| P0-18 (c23b17e2..ea25fba1) | Implemented, TEST_PASSED by the builder, review pending | Builder's suite → `130 passed, 893 subtests passed`; each new test fails on the previous code (builder's check) |
+| P0-18 (c23b17e2..ea25fba1) | Implemented, TEST_PASSED; reviewed: fix_first (all 5 items closed; 1 older gate item, host-only) | Builder's suite → `130 passed, 893 subtests passed`; each new test fails on the previous code (builder's check) |
 
 ## 2026-10-03 — Autopilot cycle 2 (07:30–about 10:00 UTC)
 
