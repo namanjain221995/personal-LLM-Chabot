@@ -2392,10 +2392,16 @@ class _QueuedTraceRecorder(TraceRecorder):
     # CONTEXT_ASSEMBLED that waits for its count, for one — and a time read
     # there would be the write's, not the stage's.
     def event_nowait(self, stage: str, **kwargs) -> None:  # type: ignore[override]
-        kwargs.setdefault("at", time.perf_counter())
-        if "details" in kwargs:
-            kwargs["details"] = _trace_snapshot(kwargs["details"])
-        self.writer.submit(lambda: TraceRecorder.event(self, stage, **kwargs))
+        # Called from the answer path (FIRST_ANSWER_TOKEN on the per-token
+        # emit, KNOWLEDGE_PREPARED): tracing must never break a chat, so any
+        # failure to queue the event is logged and dropped (B-03 QA).
+        try:
+            kwargs.setdefault("at", time.perf_counter())
+            if "details" in kwargs:
+                kwargs["details"] = _trace_snapshot(kwargs["details"])
+            self.writer.submit(lambda: TraceRecorder.event(self, stage, **kwargs))
+        except Exception:
+            logging.getLogger(__name__).debug("query trace event %s dropped", stage, exc_info=True)
 
     async def event(self, stage: str, **kwargs) -> None:  # type: ignore[override]
         self.event_nowait(stage, **kwargs)

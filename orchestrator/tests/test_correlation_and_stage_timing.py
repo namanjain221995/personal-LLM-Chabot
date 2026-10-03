@@ -577,3 +577,18 @@ def test_a_full_turn_records_retrieval_and_routing_with_their_durations(wired): 
     root = _ts(trace["started_at"])
     offsets = [_ts(by_stage[s]["completed_at"]) - root for s in order]
     assert offsets == sorted(offsets), offsets
+
+
+def test_queued_event_nowait_swallows_a_failing_writer():
+    """B-03 QA: the per-token FIRST_ANSWER_TOKEN hook goes through the queued
+    recorder's event_nowait; a failure there must never break the chat."""
+    from app import main as m
+
+    class Boom:
+        def submit(self, job):
+            raise RuntimeError("trace writer down")
+
+    rec = m._QueuedTraceRecorder.__new__(m._QueuedTraceRecorder)
+    rec.writer = Boom()
+    rec.event_nowait("FIRST_ANSWER_TOKEN", component="t", duration_ms=1)  # must not raise
+    rec.event_nowait("KNOWLEDGE_PREPARED", details={"a": 1})  # must not raise
