@@ -389,6 +389,50 @@ MATCHER_ALLOW = [
 ]
 
 
+# ===========================================================================
+# 6. Variable certainty (round 3). The guard resolves $VAR only from a single
+#    unconditional literal assignment; a value that may be reassigned, read,
+#    looped, declared, appended, printf-v'd or unset at run time, or an
+#    unsupported ${...} operator, stays unresolved so the computed-command /
+#    literal-refspec / literal-path denials fire (fail-closed).
+# ===========================================================================
+VAR_CERTAINTY_DENY = [
+    "[ -n \"$CI\" ] && BR=upgrade/i/x; git push origin HEAD:${BR:-main}",  # conditional assignment
+    "if false; then BR=upgrade/i/x; fi; git push origin HEAD:${BR:-main}",  # compound body
+    "BR=upgrade/i/x; unset BR; git push origin HEAD:${BR:-main}",
+    "BR=upgrade/i/x; read BR < /tmp/llmdev/br.txt; git push origin HEAD:$BR",
+    "BR=upgrade/i/x; for BR in main; do git push origin HEAD:$BR; done",
+    "BR=upgrade/i/x; declare BR=main; git push origin HEAD:$BR",
+    "BR=ma; BR+=in; git push origin HEAD:$BR",             # append
+    "BR=xmain; git push origin HEAD:${BR:1}",              # substring offset
+    "BR=xmain; git push origin HEAD:${BR#x}",              # prefix strip
+    "BR=; git push origin HEAD:main${BR-x}",               # set-but-empty: '-' keeps the empty value
+    "BR=upgrade/i/x; printf -v BR main; git push origin HEAD:$BR",
+    "U=xsudo; ${U:1} reboot",
+    "U=echo; unset U; ${U:-sudo} reboot",
+    "false && U=echo; ${U:-sudo} reboot",
+    "P=x$HOME/.llm-autopilot/guard; rm -rf ${P:1}",
+    "D=/tmp/llmdev/x; [ -d $D ] || unset D; rm -rf ${D:-$HOME/.llm-autopilot}",
+]
+VAR_CERTAINTY_ALLOW = [
+    "D=/tmp/llmdev/x; rm -rf $D",                          # one unconditional assignment: resolves
+    "U=echo; $U hi",                                       # resolves to a benign command
+    "BR=upgrade/i/x; git push origin HEAD:$BR",            # resolves to an allowed upgrade branch
+    "command -v gh",
+    "command -v claude",
+    "command -V git",
+    "command -v gh jq git python3",
+    "readlink -f \"$(command -v claude)\"",
+    "LLM_MAX_TOKENS=4096 python3 -c 'import os; print(os.environ[\"LLM_MAX_TOKENS\"])'",
+    "python3 -c 'import os; print(os.environ.get(\"TOKENIZERS_PARALLELISM\"))'",
+    "python3 -c 'import os; print(os.environ.get(\"GIT_AUTHOR_NAME\"))'",
+]
+# Inline code that builds a forbidden path by concatenation must still be caught.
+CODE_CONCAT_DENY = [
+    "python3 -c \"import shutil, os; shutil.rmtree(os.path.expanduser('~/.llm-' + 'autopilot/guard'))\"",
+]
+
+
 # ---------------------------------------------------------------------------
 # Plumbing: keep compose rendering and gh/docker off the daemon and network.
 # ---------------------------------------------------------------------------
@@ -473,6 +517,15 @@ class Sweep(unittest.TestCase):
 
     def test_filesystem_allow(self):
         self._run(FS_ALLOW, True)
+
+    def test_var_certainty_deny(self):
+        self._run(VAR_CERTAINTY_DENY, False)
+
+    def test_var_certainty_allow(self):
+        self._run(VAR_CERTAINTY_ALLOW, True)
+
+    def test_code_concat_deny(self):
+        self._run(CODE_CONCAT_DENY, False)
 
     def test_git_gh_docker_deny(self):
         with _patched()[0], _patched()[1], _patched()[2]:

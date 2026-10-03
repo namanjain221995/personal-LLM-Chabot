@@ -590,6 +590,13 @@ def prepare(text):
 
 SEPARATORS = {";", "&", "&&", "|", "||", "|&", "(", ")", ";;", "&;", ";&", ";;&"}
 REDIRECT_RE = re.compile(r"^\d*(>>?|>\||&>>?|<>?|<<<|<<-?|>&|<&)$")
+# Separators that start a segment whose assignments run unconditionally. A
+# segment reached only through '&&'/'||'/'|' (or inside a subshell / if-for-
+# while-case body) may or may not run, so a bare assignment there is NOT a
+# value the guard can trust later (it leaves the variable unresolved instead).
+UNCONDITIONAL_SEPARATORS = {None, ";", "&", "(", ")", ";;", "&;", ";&", ";;&"}
+COMPOUND_OPEN = {"if", "for", "while", "until", "case", "select"}
+COMPOUND_CLOSE = {"fi", "done", "esac"}
 
 
 def tokenize(text):
@@ -611,15 +618,33 @@ def writes_output_file(redirs):
 
 
 def segments(tokens):
-    """Split tokens into simple commands: [(words, redirections, piped_in)]."""
+    """Split tokens into simple commands: [(words, redirs, piped_in, unconditional)].
+
+    `unconditional` is True when a bare `V=value` assignment in the segment is
+    certain to run: at the top level (not inside a subshell '(...)' nor an
+    if/for/while/until/case body) and reached by ';'/'&'/newline/start, never
+    through '&&'/'||'/'|'. The guard trusts a variable's value only from such a
+    segment; everywhere else it leaves `$VAR` unresolved (fail-closed)."""
     segs, words, redirs, piped_in, i = [], [], [], False, 0
+    sep, paren, compound, pending_open, seg_flag = None, 0, 0, 0, None
+
+    def start_flag():
+        return paren == 0 and compound == 0 and sep in UNCONDITIONAL_SEPARATORS
+
     while i < len(tokens):
         t = tokens[i]
         if t in SEPARATORS:
             if words or redirs:
-                segs.append((words, redirs, piped_in))
-            words, redirs = [], []
+                segs.append((words, redirs, piped_in, seg_flag if seg_flag is not None else start_flag()))
+                compound += pending_open
+                pending_open = 0
+            words, redirs, seg_flag = [], [], None
             piped_in = t in ("|", "|&")
+            sep = t
+            if t == "(":
+                paren += 1
+            elif t == ")":
+                paren = max(0, paren - 1)
             i += 1
             continue
         if REDIRECT_RE.match(t):
@@ -627,12 +652,20 @@ def segments(tokens):
                 words.pop()  # file-descriptor number, e.g. 2>
             target = tokens[i + 1] if i + 1 < len(tokens) else ""
             redirs.append((t, target))
+            if seg_flag is None:
+                seg_flag = start_flag()
             i += 2
             continue
+        if not words and seg_flag is None:
+            if t in COMPOUND_CLOSE:
+                compound = max(0, compound - 1)
+            seg_flag = start_flag()
+            if t in COMPOUND_OPEN:
+                pending_open = 1
         words.append(t)
         i += 1
     if words or redirs:
-        segs.append((words, redirs, piped_in))
+        segs.append((words, redirs, piped_in, seg_flag if seg_flag is not None else start_flag()))
     return segs
 
 
@@ -656,6 +689,10 @@ def strip_prefix(words):
             continue
         if base in WRAPPERS_NO_ARG:
             w.pop(0)
+            # `command -v/-V NAME` only LOOKS a name up; it never runs it, so it
+            # is not the start of that command (command -v sudo is a lookup).
+            if base == "command" and w and (w[0] in ("-v", "-V") or re.fullmatch(r"-[a-zA-Z]*[vV][a-zA-Z]*", w[0])):
+                return env, [], False
             # Consume this wrapper's own options so '-p'/'-a name'/'--' are not
             # mistaken for the real command (command -p sudo, exec -a x sudo).
             while w and w[0].startswith("-") and w[0] != "-":
@@ -737,12 +774,38 @@ def _usable(val):
     return val is not None and "`" not in val and "$(" not in val
 
 
+def _resolve_braced(body, env):
+    """Resolve a ${...} expansion ONLY for the forms whose value is certain:
+    ${V}, ${V:-w}, ${V-w}, ${V:=w}, ${V=w} with exact bash set/null semantics,
+    where V is a variable the command assigned a trustworthy literal value.
+    Every other operator (':offset', '#', '##', '%', '%%', '/', '//', '^', '^^',
+    ',', ',,', '@', ':+', '+', '!' indirection, array '[...]') returns None, so
+    the caller leaves the '$' in place and the computed-at-run-time deny fires."""
+    m = re.match(r"^([A-Za-z_]\w*)(:-|:=|-|=)?(.*)$", body, re.S)
+    if not m:
+        return None  # ${!x}, ${#x}, ${1}, ... : not a plain name
+    name, op, arg = m.group(1), m.group(2), m.group(3)
+    if op is None and arg:
+        return None  # ${V<op>...} with an unsupported operator or an array index
+    if name not in env:
+        return None  # V is uncertain or inherited from the environment: leave it
+    val = env[name]
+    if op in (None, ""):
+        return val
+    if op in (":-", ":="):
+        return val if val != "" else arg  # set-and-non-empty keeps the value
+    # '-' / '=' use the default only when V is UNSET; V is set here, so keep val
+    return val
+
+
 def subst_env(word, env):
-    """Resolve $VAR / ${VAR} / ${VAR:-WORD} using the literal values the command
-    set, and the benign shell specials ($$, $RANDOM, ...), so later checks see the
-    real path or command name instead of giving up at the '$'. A ${VAR:-WORD}
-    default is used only when VAR is unset, matching bash (so `U=sudo; ${U:-x}`
-    resolves to sudo, not x)."""
+    """Resolve $VAR / ${VAR} / ${VAR:-WORD} using the values the command set
+    UNCONDITIONALLY (see track_var_mutations / segments), plus the benign shell
+    specials ($$, $RANDOM, ...), so later checks see the real path or command
+    name. A variable that may be reassigned, read, looped, declared or unset at
+    run time, or an unsupported ${...} operator, is left unresolved on purpose:
+    the '$' then trips the computed-command / literal-path / literal-refspec
+    denials (fail-closed)."""
     if "$" not in word:
         return word
     word = SHELL_SPECIAL.sub("0", word)
@@ -751,23 +814,11 @@ def subst_env(word, env):
         c = word[i]
         if c == "$" and i + 1 < n and word[i + 1] == "{":
             j = _brace_close(word, i + 2)
-            if j is not None:
-                m = re.match(r"^(!?)([A-Za-z_]\w*)(:?[-=+?])?(.*)$", word[i + 2 : j], re.S)
-                if m and not m.group(1):  # ${!x} indirection is left unresolved (stays '$', gets refused)
-                    name, op, arg = m.group(2), m.group(3), m.group(4)
-                    val = env.get(name)
-                    set_ = val is not None and val != ""
-                    rep = None
-                    if op in (":-", "-", ":=", "="):
-                        rep = val if set_ else arg
-                    elif op in (":+", "+"):
-                        rep = arg if set_ else ""
-                    elif op in (None,):
-                        rep = val
-                    if _usable(rep):
-                        out.append(rep)
-                        i = j + 1
-                        continue
+            rep = _resolve_braced(word[i + 2 : j], env) if j is not None else None
+            if rep is not None and _usable(rep):
+                out.append(rep)
+                i = j + 1
+                continue
             out.append(c)
             i += 1
             continue
@@ -873,7 +924,7 @@ def analyze(cmd, ctx):
     cwd = ctx.cwd
     env = dict(ctx.env)
     segs = segments(tokens)
-    for idx, (words, redirs, piped_in) in enumerate(segs):
+    for idx, (words, redirs, piped_in, unconditional) in enumerate(segs):
         sctx = Ctx(ctx.raw, cwd, ctx.depth, env, piped_in, redirs, top=ctx.top, captured=ctx.captured)
         sctx.out_ok = not writes_output_file(redirs) and pipeline_tail_is_safe(segs, idx)
         check_redirects(sctx)
@@ -882,25 +933,31 @@ def analyze(cmd, ctx):
             sctx.deny("printing the environment exposes secrets")
         check_exec_env(senv, sctx)
         if not w:
-            env.update(senv)  # a bare `FOO=bar` persists to later commands in this shell
+            # A bare `FOO=bar` persists only when it is certain to run. When it is
+            # guarded by &&/||, or inside a subshell or compound body, the guard
+            # drops the variable so later `$FOO` stays unresolved (fail-closed).
+            for k, v in senv.items():
+                if unconditional and _usable(v):
+                    env[k] = v
+                else:
+                    env.pop(k, None)
             continue
         sctx.env = {**env, **senv}
         w = [subst_env(x, sctx.env) for x in w]
+        # `VAR+=suffix` (append) and other appends make the value uncertain: drop
+        # the variable so later references are not resolved to a stale value.
+        while w and re.fullmatch(r"[A-Za-z_]\w*\+=.*", w[0]):
+            env.pop(w[0].split("+=", 1)[0], None)
+            w.pop(0)
+        if not w:
+            continue
         name = os.path.basename(w[0])
         if w[0] in ("cd", "pushd"):
             target = nonopt(w[1:])
             nxt = expand_path(target[0], cwd) if target else HOME
             cwd = nxt or cwd
             continue
-        if name in ("export", "declare", "typeset", "readonly", "local"):
-            assigned = {}
-            for a in w[1:]:
-                if "=" in a and not a.startswith("-"):
-                    k, v = a.split("=", 1)
-                    assigned[k] = v
-            check_exec_env(assigned, sctx)
-            if name == "export":
-                env.update(assigned)
+        track_var_mutations(name, w, unconditional, env, sctx)
         if re.search(r"\{[^{}]*,[^{}]*\}", w[0]):
             sctx.deny("brace expansion builds the command name; write the command literally so the guard can read it")
         if "$" in w[0] or "__SUBST__" in w[0]:
@@ -914,6 +971,57 @@ def analyze(cmd, ctx):
         check_command(name, w[1:], sctx)
 
 
+_VARNAME = re.compile(r"[A-Za-z_]\w*")
+
+
+def track_var_mutations(name, w, unconditional, env, ctx):
+    """Keep the certain-value map `env` in step with a command that sets, appends,
+    reads, loops over, declares or unsets shell variables, so later `$VAR`
+    references resolve to a trustworthy value or stay unresolved (fail-closed).
+    A variable is trusted only after a single unconditional literal assignment;
+    read/for/declare/printf -v/unset/let/mapfile all drop it instead."""
+    if name in ("export", "declare", "typeset", "readonly", "local"):
+        nameref = any(a == "-n" or (a.startswith("-") and not a.startswith("--") and "n" in a[1:]) for a in w[1:])
+        assigned = {}
+        bare = []
+        for a in w[1:]:
+            if a.startswith("-"):
+                continue
+            if "=" in a:
+                k, v = a.split("=", 1)
+                assigned[k] = v
+            elif _VARNAME.fullmatch(a):
+                bare.append(a)
+        check_exec_env(assigned, ctx)
+        for k, v in assigned.items():
+            if unconditional and not nameref and _usable(v):
+                env[k] = v  # e.g. `declare BR=main` sets BR=main, so a later push to it is seen
+            else:
+                env.pop(k, None)
+        for k in bare:
+            env.pop(k, None)  # declared without a value: uncertain
+        return
+    if name in ("unset", "read", "mapfile", "readarray", "getopts"):
+        for a in w[1:]:
+            if _VARNAME.fullmatch(a):
+                env.pop(a, None)
+        return
+    if name == "for" and len(w) >= 2 and _VARNAME.fullmatch(w[1]):
+        env.pop(w[1], None)  # the loop variable is reassigned each iteration
+        return
+    if name == "printf":
+        for i in range(1, len(w)):
+            if w[i] == "-v" and i + 1 < len(w) and _VARNAME.fullmatch(w[i + 1]):
+                env.pop(w[i + 1], None)
+        return
+    if name == "let":
+        for a in w[1:]:
+            m = re.match(r"^([A-Za-z_]\w*)\s*(?:[-+*/%&|^]|<<|>>)?=", a)
+            if m:
+                env.pop(m.group(1), None)
+        return
+
+
 # Pipe sinks that only print what they read: a pure reader piped into them still
 # shows its output in the transcript and writes nothing.
 SAFE_SINKS = {"head", "tail", "wc", "grep", "egrep", "fgrep", "cut", "tr", "nl", "cat", "column"}
@@ -923,7 +1031,7 @@ def pipeline_tail_is_safe(segs, idx):
     """True when segment idx is not piped, or every later stage of its pipeline is a safe sink."""
     j = idx + 1
     while j < len(segs) and segs[j][2]:  # piped_in
-        words, redirs, _ = segs[j]
+        words, redirs = segs[j][0], segs[j][1]
         _env, w, _bare = strip_prefix(words)
         if not w or os.path.basename(w[0]) not in SAFE_SINKS or writes_output_file(redirs):
             return False
@@ -1492,10 +1600,12 @@ _CODE_WRITE_OP = re.compile(
     r"os\.(remove|unlink|rename|replace|rmdir|makedirs|mkdir)|writeFileSync|rmSync|unlinkSync|renameSync|"
     r"pathlib\.Path\([^)]*\)[^\n]*\.(write_|unlink|rename|replace|rmdir|mkdir)"
 )
-# A secret-shaped environment variable read from inline code.
+# A secret-shaped environment variable read from inline code. TOKEN(?!S|IZER)
+# and AUTH(?!OR) keep MAX_TOKENS / TOKENIZERS_PARALLELISM / GIT_AUTHOR_NAME (all
+# benign in this LLM codebase) from being read as secrets.
 _CODE_SECRET_ENV = re.compile(
     r"(?:os\.environ(?:\.get)?\s*[\[(]\s*|getenv\s*\(\s*|\bgetenv\s+|process\.env[.\[])\s*['\"]?"
-    r"[A-Za-z_]*(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|_KEY|PRIVATE|CREDENTIAL|COOKIE|AUTH)",
+    r"[A-Za-z_]*(TOKEN(?!S|IZER)|SECRET|PASSWORD|PASSWD|API_?KEY|_KEY|PRIVATE|CREDENTIAL|COOKIE|AUTH(?!OR))",
     re.I,
 )
 
@@ -1528,7 +1638,7 @@ def check_code_text(code, ctx):
             analyze(" ".join(items), ctx.child())
     for root in (PROD_CHECKOUT, R_PROD, os.path.join(HOME, "Documents"), "~/Documents",
                  AUTOPILOT_HOME, "~/.llm-autopilot", "/.llm-autopilot/"):
-        if root in code and _CODE_WRITE_OP.search(code):
+        if root in joined and _CODE_WRITE_OP.search(joined):  # joined so 'a'+'b' concatenation is seen
             ctx.deny(f"inline code writes or deletes under {root}, which is read-only to the autopilot (guard files and production/model trees)")
 
 
@@ -1873,8 +1983,14 @@ def check_git_push(rest, gdir, ctx):
     # carry remote.origin.push or url.*.pushInsteadOf and remap the push. (The
     # GIT_CONFIG* variables are refused for every command by EXEC_ENV.)
     for k in ("HOME", "XDG_CONFIG_HOME"):
-        if ctx.env.get(k):
-            ctx.deny(f"{k} set in front of git push relocates git's global config, which can remap the push to another branch (remote.origin.push, url.*.pushInsteadOf); push with the normal environment")
+        v = ctx.env.get(k)
+        if not v:
+            continue
+        # Setting HOME to its own value (env -i HOME="$HOME" ...) does not relocate
+        # anything; only a DIFFERENT home redirects git's global config.
+        if k == "HOME" and (v in ("$HOME", "${HOME}") or expand_path(v, ctx.cwd) == _real(HOME)):
+            continue
+        ctx.deny(f"{k} set in front of git push relocates git's global config, which can remap the push to another branch (remote.origin.push, url.*.pushInsteadOf); push with the normal environment")
     for x in rest:
         # git accepts any unambiguous prefix of a long option (--dele -> --delete,
         # --tag -> --tags), so match prefixes of the dangerous ones too.
@@ -2604,8 +2720,8 @@ def check_docker_exec(rest, ctx):
                     toks = tokenize(prepare(w[i + 1]))
                 except ValueError:
                     ctx.deny("unparseable nested command (fail-closed)")
-                for words, _r, _p in segments(toks):
-                    check_docker_exec([container] + words, ctx)
+                for seg in segments(toks):
+                    check_docker_exec([container] + seg[0], ctx)
                 return
         ctx.deny("shells in production containers are not allowed; run one read-only command")
     if base in ("env", "printenv", "set", "export", "declare"):
