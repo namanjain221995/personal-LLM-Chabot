@@ -168,6 +168,12 @@ SECRET_DIRS = [
     _real(os.path.join(HOME, ".docker")),
     _real(os.path.join(HOME, ".claude/.credentials.json")),
     _real(os.path.join(AUTOPILOT_HOME, "secrets")),
+    # The test database's connection variables and URL carry its password; the
+    # runner exports them into each cycle, so no tool call needs to print them.
+    _real(TEST_DB_VARS),
+    _real(_hp(TEST_DB.get("url_file") or os.path.join(AUTOPILOT_HOME, "agent", "test-db.url"))),
+    _real(os.path.join(HOME, ".cache/huggingface/token")),
+    _real(os.path.join(HOME, ".cache/huggingface/stored_tokens")),
     "/run/secrets",
     "/etc/shadow",
     "/etc/gshadow",
@@ -873,7 +879,12 @@ def strip_prefix(words):
                 if not rest[0].startswith("-"):
                     k, v = rest[0].split("=", 1)
                     env[k] = v
-                elif rest[0] in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string") and len(rest) > 1:
+                elif re.fullmatch(r"-[^-]*[SC].*|--(split-string|chdir)(=.*)?|--s(p(l(i(t(-(s(t(r(i(ng?)?)?)?)?)?)?)?)?)?)?|--ch(d(ir?)?)?", rest[0]):
+                    # -S/--split-string makes its value the command that runs and
+                    # -C/--chdir moves where relative paths land; neither can be
+                    # reviewed from these words (fail-closed).
+                    block(f"{TAG} env {rest[0]} -> blocked: env -S/--split-string and -C/--chdir hide the command or its directory from review; write the command and its paths directly")
+                elif rest[0] in ("-u", "--unset") and len(rest) > 1:
                     rest = rest[1:]
                 rest = rest[1:]
             if not rest:
@@ -1598,6 +1609,122 @@ def ps_env_risk(args):
     return None
 
 
+_CURL_MUTATING_METHOD = re.compile(r"(^|\s)(-X|--request|--method)\s*=?\s*(POST|PUT|PATCH|DELETE)", re.I)
+
+
+# curl short options that take a value: in a cluster such as `-sGo out` the
+# first of these takes the rest of the word (or the next word) as its value, so
+# the `G` in `-oG` is a file name, not --get.
+_CURL_SHORT_WITH_VALUE = set("AbcCdDeEFHKmoPQrtTuUwxXyYz")
+# Long options known to take no value. Any other long option written without
+# `=` is assumed to consume the next word, so a `-G` right after it may be that
+# option's value and does not count as --get.
+_CURL_LONG_NO_VALUE = {"--get", "--silent", "--show-error", "--fail", "--fail-with-body", "--fail-early", "--location",
+                       "--location-trusted", "--insecure", "--compressed", "--verbose", "--include", "--head",
+                       "--globoff", "--no-progress-meter", "--no-buffer", "--no-keepalive", "--progress-bar",
+                       "--http1.0", "--http1.1", "--http2", "--ipv4", "--ipv6", "--raw", "--path-as-is"}
+_CURL_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+_CURL_BODY_LONG = ("--data", "--data-ascii", "--data-binary", "--data-raw", "--data-urlencode")
+_CURL_UPLOAD_LONG = ("--json", "--form", "--form-string", "--upload-file", "--config")
+
+
+def _curl_long_kind(name):
+    """'body', 'upload' or 'method' for a long option, or None. curl accepts any
+    unambiguous prefix (--upload-fi, --jso, --dat), so a prefix of a mutating
+    option counts as that option (fail-closed)."""
+    if len(name) < 3:
+        return None
+    if name.startswith("--data") or any(full.startswith(name) for full in _CURL_BODY_LONG):
+        return "body"
+    if name.startswith("--form") or any(full.startswith(name) for full in _CURL_UPLOAD_LONG):
+        return "upload"
+    if len(name) >= 4 and "--request".startswith(name):
+        return "method"
+    return None
+
+
+def _curl_requests(args):
+    """Split curl's words into its requests (--next, -: and a ':' inside a short
+    cluster start a new one with fresh options) and return, per request, a dict:
+    get (-G/--get definitely given), body (-d/--data*), upload (-T, -F/--form*,
+    --json, a -K/--config file the guard cannot read) and methods (-X/--request
+    values). Mutations are read from EVERY word, even one that may be another
+    option's value, so a misjudged value never hides a -d, -T, -F or -X
+    (fail-closed); only -G needs the value-aware reading, and a -G that may be a
+    value, or that follows a ':' in its cluster (curl ignores the rest of such a
+    cluster), never counts."""
+    def fresh():
+        return {"get": False, "body": False, "upload": False, "methods": []}
+
+    reqs, n, consumed, after_dashdash = [fresh()], len(args), False, False
+    for i, a in enumerate(args):
+        maybe_value, consumed = consumed, False
+        cur = reqs[-1]
+        if after_dashdash:
+            continue  # only URLs follow `--`
+        if a == "--" and not maybe_value:
+            after_dashdash = True
+        elif a in ("--next", "-:"):
+            reqs.append(fresh())
+        elif a.startswith("--"):
+            name, eq, val = a.partition("=")
+            kind = _curl_long_kind(name)
+            if kind == "body":
+                cur["body"] = True
+            elif kind == "upload":
+                cur["upload"] = True
+            elif kind == "method":
+                cur["methods"].append(val if eq else (args[i + 1] if i + 1 < n else ""))
+            if name == "--get" and not maybe_value:
+                cur["get"] = True
+            if not eq and name not in _CURL_LONG_NO_VALUE and not name.startswith("--no-"):
+                consumed = True
+        elif a.startswith("-") and len(a) > 1:
+            no_get = maybe_value
+            for j in range(1, len(a)):
+                c = a[j]
+                if c == ":":
+                    reqs.append(fresh())
+                    cur, no_get = reqs[-1], True
+                    continue
+                if c == "G" and not no_get:
+                    cur["get"] = True
+                elif c == "d":
+                    cur["body"] = True
+                elif c in "TFK":
+                    cur["upload"] = True
+                if c in _CURL_SHORT_WITH_VALUE:
+                    val = a[j + 1:]
+                    if c == "X":
+                        cur["methods"].append(val or (args[i + 1] if i + 1 < n else ""))
+                    consumed = not val
+                    break
+    return reqs
+
+
+def curl_request_mutates(cmd, args):
+    """True when an HTTP request changes server state. `curl -G`/`--get` sends
+    its -d/--data* payload as the URL query string of a GET (the Prometheus
+    /api/v1/query read), so that request is NOT a mutation. Each request of the
+    command line (--next / -: start a new one with fresh options) is judged on
+    its own, and any mutating one counts: an explicit method other than
+    GET/HEAD/OPTIONS, an upload (-T, -F/--form, --json), a -K/--config file the
+    guard cannot read, or -d/--data* without a definite -G. Secret files named
+    by -d @file, --data-urlencode name@file, -F name=@file/<file, -T file or a
+    file:// URL are refused separately by check_secret_args."""
+    text = " " + " ".join(args)
+    if _CURL_MUTATING_METHOD.search(text):
+        return True
+    if cmd != "curl":
+        return bool(NET_UPLOAD.search(text))
+    for r in _curl_requests(args):
+        if r["upload"] or (r["body"] and not r["get"]):
+            return True
+        if any(m.strip("'\"").upper() not in _CURL_SAFE_METHODS for m in r["methods"]):
+            return True
+    return False
+
+
 def check_production_reach(cmd, args, ctx):
     """Rules about what a command can reach in production, whatever the command is."""
     text = " ".join([f"{k}={v}" for k, v in ctx.env.items()] + list(args))
@@ -1636,7 +1763,7 @@ def check_production_reach(cmd, args, ctx):
             if url == UNCERTAIN:
                 ctx.deny("TEST_DATABASE_URL is set conditionally or computed earlier in this command, so the guard cannot tell which database the tests would truncate; set it unconditionally (export TEST_DATABASE_URL=...; ...), in the same && chain, or inline in front of pytest")
             if not url:
-                ctx.deny(f"orchestrator tests TRUNCATE every table; pass TEST_DATABASE_URL (and TEST_DATABASE_ALLOWED_HOSTS) for the autopilot's dedicated test database inline; the URL is in {TEST_DB.get('url_file', '~/.llm-autopilot/agent/test-db.url')}")
+                ctx.deny(f"orchestrator tests TRUNCATE every table; pass TEST_DATABASE_URL (and TEST_DATABASE_ALLOWED_HOSTS) for the autopilot's dedicated test database inline; the runner exports both into every cycle (the file that holds them is secret)")
             m = re.match(r"^postgres(?:ql)?(?:\+\w+)?://(?:[^@/]*@)?(\[[^\]]+\]|[^:/?]+)(?::(\d+))?/([^?\s]+)", url)
             host, port, dbname = (m.group(1).lower(), m.group(2) or "5432", m.group(3)) if m else (None, None, "")
             want = (str(TEST_DB.get("host", "")).lower(), str(TEST_DB.get("port", "")))
@@ -1651,7 +1778,7 @@ def check_production_reach(cmd, args, ctx):
             port, path = m.group(2) or "80", m.group(3) or "/"
             if path.startswith("/-/"):
                 ctx.deny("lifecycle endpoints such as /-/reload or /-/quit change production monitoring")
-            if port in PROD_CONTROL_PORTS and NET_UPLOAD.search(" " + " ".join(args)):
+            if port in PROD_CONTROL_PORTS and curl_request_mutates(cmd, args):
                 ctx.deny(f"mutating requests to production service port {port} change production state; read-only GETs only")
 
 
@@ -1903,11 +2030,180 @@ _CODE_SHELL_STR = re.compile(
 # before the quote is required, so "system's" (apostrophe, no space) is prose.
 _CODE_SYSTEM_BARE = re.compile(r"\bsystem\s+(['\"])(.*?)\1", re.S)
 _CODE_SHELL_LIST = re.compile(r"subprocess\.\w+\(\s*\[([^\]]*)\]", re.S)
-_CODE_WRITE_OP = re.compile(
-    r"open\([^)]*['\"]\s*,\s*['\"][wax+]|\.write_(text|bytes)|shutil\.(rmtree|move|copy\w*)|"
-    r"os\.(remove|unlink|rename|replace|rmdir|makedirs|mkdir)|writeFileSync|rmSync|unlinkSync|renameSync|"
-    r"pathlib\.Path\([^)]*\)[^\n]*\.(write_|unlink|rename|replace|rmdir|mkdir)"
+# The call head of a write/delete operation. _inline_write_hits_protected()
+# then reads the operation's OWN argument(s), so merely NAMING a protected path
+# in an unrelated string (e.g. writing a note to /tmp whose text mentions
+# ~/.llm-autopilot/guard) is not refused — only writing or deleting AT a
+# protected path is (P0-19 false positive).
+_CODE_WRITE_CALL = re.compile(
+    r"\bopen\s*\(|"
+    r"(?:shutil\.(?:rmtree|move|copy\w*)|os\.(?:remove|unlink|rename|renames|replace|rmdir|removedirs|makedirs|mkdir|truncate)|"
+    r"\bwriteFileSync|\bappendFileSync|\bcopyFileSync|\bcpSync|\brmSync|\bunlinkSync|\brenameSync|"
+    r"\bfs\.(?:promises\.)?(?:writeFile|appendFile|copyFile|cp|rm|unlink|rename))\s*\(|"
+    r"(?:pathlib\.)?Path\s*\("
 )
+# Operations whose destination follows the source: every argument is a target.
+_CODE_TWO_PATH_OP = re.compile(r"shutil\.(?:move|copy\w*)|os\.(?:rename|renames|replace)|renameSync|copyFileSync|cpSync|"
+                               r"fs\.(?:promises\.)?(?:copyFile|cp|rename)\b")
+# Code that changes which file a later path reaches, or calls a write/delete
+# function under another name: after a chdir a relative 'guard_hook.py' lands
+# inside the new directory, a symlink or hard link makes a harmless-looking
+# literal name a protected file, and `f = os.remove` / `from os import remove`
+# / `import shutil as sh` hide the call head. With a protected root anywhere in
+# the code, any of these is refused (fail-closed).
+_CODE_PATH_INDIRECTION = re.compile(
+    r"\bf?chdir\b|\b(?:os\.)?(?:sym)?link\s*\(|\b(?:sym)?linkSync\s*\(|"
+    r"\.\s*(?:symlink_to|hardlink_to|link_to)\s*\(|"
+    r"\b(?:os\.(?:remove|unlink|rename|renames|replace|rmdir|removedirs|makedirs|mkdir|truncate)|"
+    r"shutil\.(?:rmtree|move|copy\w*))\b(?!\s*\()|"
+    r"\bfrom\s+(?:os|shutil)\s+import\b|\bimport\s+(?:os|shutil)\s+as\b"
+)
+# A read-only open() mode: a literal made only of r, b and t.
+_OPEN_READ_MODE = re.compile(r"[rRbBuU]?(['\"])[rbt]*\1")
+# A target that is exactly one plain string literal: no f-string, no
+# concatenation, no format braces, no escapes, no variable.
+_LITERAL_TARGET = re.compile(r"\s*[rRbBuU]?(['\"])[^'\"{}\\]*\1\s*")
+# Methods that write or delete through a pathlib object; for the ones that
+# take a destination its first argument is a target too.
+_PATH_METHOD_CALL = re.compile(
+    r"\.\s*(write_text|write_bytes|unlink|rename|replace|rmdir|mkdir|touch|symlink_to|hardlink_to|"
+    r"copy|copy_into|move|move_into)\s*\(")
+_PATH_DEST_METHODS = {"rename", "replace", "symlink_to", "hardlink_to", "copy", "copy_into", "move", "move_into"}
+# A write method on a receiver the guard does not see built (p.write_text(...)
+# where p came from Path.home() / ...), unless the receiver is a Path(...) call.
+_BARE_WRITE_METHOD = re.compile(r"\.\s*write_(?:text|bytes)\s*\(")
+_PATH_CALL_RECEIVER = re.compile(r"(?:pathlib\.)?Path\s*\(\s*[rRbBuU]?(['\"])[^'\"]*\1\s*\)(?:\s*\.\s*\w+\s*\([^()]*\))*\s*$")
+
+
+def _call_parts(text, i, limit=4000):
+    """text[i] is just past a call's '('. Return (first_top_level_arg, full_inside,
+    index_just_past_the_matching_')'), quote-, escape- and nesting-aware (bounded)."""
+    depth, q, j, n, first_end = 1, None, i, min(len(text), i + limit), None
+    while j < n:
+        c = text[j]
+        if q:
+            if c == "\\":
+                j += 2
+                continue
+            if c == q:
+                q = None
+        elif c in "'\"":
+            q = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                break
+        elif c == "," and depth == 1 and first_end is None:
+            first_end = j
+        j += 1
+    j = min(j, n)
+    inside = text[i:j]
+    first = text[i:first_end] if first_end is not None else inside
+    return first, inside, j + 1  # j is the matching ')'; return the index past it
+
+
+def _top_args(inside):
+    """Split a call's argument text at its top-level commas (quote-, escape- and nesting-aware)."""
+    parts, depth, q, start, j, n = [], 0, None, 0, 0, len(inside)
+    while j < n:
+        c = inside[j]
+        if q:
+            if c == "\\":
+                j += 2
+                continue
+            if c == q:
+                q = None
+        elif c in "'\"":
+            q = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            parts.append(inside[start:j])
+            start = j + 1
+        j += 1
+    parts.append(inside[start:])
+    return [p for p in parts if p.strip()]
+
+
+def _kwarg(arg):
+    m = re.match(r"\s*(\w+)\s*=(?!=)", arg)
+    return (m.group(1), arg[m.end():].strip()) if m else (None, arg.strip())
+
+
+def _open_target_and_writes(inside):
+    """(target, writes) for open(...)/os.open(...): the target is the first
+    positional argument or file=/path=; it writes unless the mode (second
+    positional, mode= or flags=) is absent or a literal read-only mode ('r',
+    'rb', 'rt'). A computed mode or any flags count as a write (fail-closed)."""
+    positional, target, mode = [], None, None
+    for x in _top_args(inside):
+        k, v = _kwarg(x)
+        if k in ("mode", "flags"):
+            mode = v
+        elif k in ("file", "path"):
+            target = v
+        elif k is None:
+            positional.append(v)
+    if target is None and positional:
+        target = positional[0]
+    if mode is None and len(positional) > 1:
+        mode = positional[1]
+    writes = mode is not None and not _OPEN_READ_MODE.fullmatch(mode)
+    return (target if target is not None else ""), writes
+
+
+def _inline_write_hits_protected(joined, roots):
+    """True when an inline write/delete operation ACTS ON a protected root: the
+    root appears in that operation's own target argument(s) (a literal path;
+    every argument of a copy/move/rename; the destination of a pathlib
+    rename/replace/copy/move/link), or a target is anything but one plain
+    string literal (a variable, concatenation, f-string or call) while some
+    protected root is present in the code, or the code changes directory,
+    creates a link or aliases a write/delete function while a root is present
+    (fail-closed on indirection). A root named only in unrelated data next to
+    literal targets is ignored."""
+    import bisect
+    present = [r for r in roots if r in joined]
+    if present and _CODE_PATH_INDIRECTION.search(joined):
+        return True
+    if present:
+        for m in _BARE_WRITE_METHOD.finditer(joined):
+            if not _PATH_CALL_RECEIVER.search(joined[max(0, m.start() - 400):m.start()]):
+                return True  # the receiver was built elsewhere: a computed target
+    methods = [(m.start(), m.group(1), m.end()) for m in _PATH_METHOD_CALL.finditer(joined)]
+    starts = [mm[0] for mm in methods]
+    for name, end in ((mm[1], mm[2]) for mm in methods):
+        if name in _PATH_DEST_METHODS and name != "replace":
+            dst = _call_parts(joined, end)[0]
+            if dst.strip() and (any(r in dst for r in roots) or (present and not _LITERAL_TARGET.fullmatch(dst))):
+                return True  # p.rename(<protected>) whatever p is
+    for m in _CODE_WRITE_CALL.finditer(joined):
+        head = m.group()
+        first, inside, after = _call_parts(joined, m.end())
+        if head.lstrip().startswith("open"):
+            target, writes = _open_target_and_writes(inside)
+            if not writes:
+                continue  # open() without a write mode is a read
+            targets = [target]
+        elif "Path(" in head:
+            k = bisect.bisect_left(starts, after)
+            if k == len(methods):
+                continue  # Path(...) with no write/delete method after it
+            targets = [first]
+            if methods[k][1] in _PATH_DEST_METHODS:
+                targets.append(_call_parts(joined, methods[k][2])[0])
+        else:
+            targets = _top_args(inside) if _CODE_TWO_PATH_OP.search(head) else [first]
+        targets = [t for t in targets if t.strip()] or [""]
+        if any(r in t for t in targets for r in roots):
+            return True
+        if present and any(not _LITERAL_TARGET.fullmatch(t) for t in targets):
+            return True
+    return False
 # A secret-shaped environment variable read from inline code. TOKEN(?!S|IZER)
 # and AUTH(?!OR) keep MAX_TOKENS / TOKENIZERS_PARALLELISM / GIT_AUTHOR_NAME (all
 # benign in this LLM codebase) from being read as secrets.
@@ -1946,10 +2242,10 @@ def check_code_text(code, ctx):
         items = re.findall(r"['\"]([^'\"]*)['\"]", m.group(1))
         if items:
             analyze(" ".join(items), ctx.child())
-    for root in (PROD_CHECKOUT, R_PROD, os.path.join(HOME, "Documents"), "~/Documents",
-                 AUTOPILOT_HOME, "~/.llm-autopilot", "/.llm-autopilot/"):
-        if root in joined and _CODE_WRITE_OP.search(joined):  # joined so 'a'+'b' concatenation is seen
-            ctx.deny(f"inline code writes or deletes under {root}, which is read-only to the autopilot (guard files and production/model trees)")
+    roots = (PROD_CHECKOUT, R_PROD, os.path.join(HOME, "Documents"), "~/Documents",
+             AUTOPILOT_HOME, "~/.llm-autopilot", "/.llm-autopilot/", ".llm-autopilot")
+    if _inline_write_hits_protected(joined, roots):  # joined so 'a'+'b' concatenation is seen
+        ctx.deny("inline code writes or deletes under a read-only tree (the autopilot's guard files, ~/.llm-autopilot, or the production/model/Documents trees); operate only on paths the autopilot may write")
 
 
 # The exact header distlib / pip / uv write on a console-script entry point:
@@ -2308,6 +2604,13 @@ def check_secret_args(cmd, args, ctx):
             continue
         if _looks_secret(val, ctx.cwd):
             ctx.deny(f"reads a secret file ({val}); secrets must never enter the transcript, logs or commits (§3.3)")
+        if cmd in ("curl", "wget"):
+            # -d @file, --data-urlencode name@file, -F name=@file / name=<file, file:///path
+            m = re.match(r"^(?:[^\s@=<]*=)?[@<](.+)$", val) or re.match(r"^[\w.-]+@(.+)$", val) \
+                or re.match(r"^file://(?:localhost)?(/.*)$", val, re.I)
+            ref = m.group(1) if m else None
+            if ref and (_looks_secret(ref, ctx.cwd) or _names_existing_secret(ref, ctx.cwd)):
+                ctx.deny(f"sends or prints a secret file ({ref}); secrets must never leave the host or enter the transcript (§3.3)")
 
 
 def _dir_holds_secret(p):
@@ -2531,7 +2834,12 @@ def check_write_targets(cmd, args, ctx):
             targets.append(".")
     elif cmd == "find":
         f_starts, f_execs, f_values, f_flags = parse_find(args)
-        if f_execs or "-delete" in f_flags:
+        # A find is a delete/move only when it uses -delete or runs an -exec that
+        # is not a pure read. A reading -exec (find . -exec wc -l {} +) at the dev
+        # worktree root is not a broad delete (P0-19 false positive); its secret
+        # reaches are still checked by check_find.
+        deletes = "-delete" in f_flags or any(not _find_exec_reads_only(inner) for _a, inner in f_execs)
+        if deletes:
             find_roots = f_starts or ["."]
             targets = list(find_roots)
         # -fprint/-fprint0/-fprintf/-fls FILE create or truncate FILE
@@ -2582,6 +2890,30 @@ FIND_NAME_TESTS = ("-name", "-iname", "-path", "-ipath", "-wholename", "-iwholen
                    "-lname", "-ilname")
 FIND_EXEC = ("-exec", "-execdir", "-ok", "-okdir")
 FIND_OUTPUT_FILES = ("-fprint", "-fprint0", "-fprintf", "-fls")
+# Commands a find -exec may run that only READ what they find, so running them
+# at a broad root (the dev worktree, ~/work, /tmp, ~/.claude/projects, ...) is
+# not a delete. Anything not listed (rm, mv, cp, tee, sh -c, xargs, sed -i,
+# git clean, ...) is treated as mutating (fail-closed); its -exec command is
+# still analysed separately by check_find/analyze_words, but WITHOUT its `{}`
+# operands, so a command that can write one of its operands is not listed:
+# sort -o {} {}, uniq {} {} and xxd {} {} overwrite what they find, and rg/ag
+# run --pre/--hostname-bin programs.
+FIND_EXEC_READERS = {"cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "stat", "file", "ls",
+                     "md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "b2sum", "cksum",
+                     "cmp", "diff", "od", "hexdump", "strings", "nl", "cut", "tr", "column",
+                     "basename", "dirname", "realpath", "readlink", "echo", "printf", "true", "false", "test", "[", "du"}
+
+
+def _find_exec_reads_only(inner):
+    """True when a find -exec/-ok command only reads (so a find that runs it at a
+    broad root is not a delete). Wrappers (env/nice/timeout/stdbuf/setsid/...) are
+    stripped; a command word that is `{}`, computed, or not a known pure reader is
+    treated as mutating."""
+    words = [w for w in inner if w != "{}" and "{}" not in w]
+    _env, w, _bare = strip_prefix(words)
+    if not w:
+        return False
+    return os.path.basename(w[0]) in FIND_EXEC_READERS
 
 
 def parse_find(args):
@@ -2642,6 +2974,9 @@ def check_find(args, ctx):
         analyze_words([w for w in inner if w != "{}"], ctx)
     if not execs:
         return
+    for root in starts:
+        if _looks_secret(root, ctx.cwd) or _names_existing_secret(root, ctx.cwd):  # a secret FILE (or a glob matching one) as the starting path
+            ctx.deny(f"find -exec on {root} reads a secret file; secrets must never enter the transcript, logs or commits (§3.3)")
     names = [v for o, v in values if o in FIND_NAME_TESTS]
     if any(_glob_names_secret(v) for v in names):
         ctx.deny("find -exec on files named like secrets reads them; secrets must never enter the transcript, logs or commits (§3.3)")
@@ -2836,10 +3171,39 @@ def check_git(args, ctx):
         ctx.deny("force-adding ignored files risks committing secrets, data or weights; fix .gitignore or rename instead")
     if sub == "symbolic-ref" and len(nonopt(rest)) >= 2:
         readonly = False
-    if sub == "fetch" and any(":" in x and not x.startswith("-") for x in rest):
-        for x in rest:
-            if ":" in x and re.search(r":(refs/heads/)?(main|master|dev)$", x.lstrip("+")):
+    if sub in ("fetch", "pull"):
+        # A fetch/pull refspec SRC:DST writes DST. The destination may be a
+        # positional refspec or the value of --refmap. A plain fetch/pull (git
+        # fetch / origin / origin dev / --all) carries no ':' destination and git
+        # maps the remote-tracking refs itself, so it stays allowed.
+        dsts = []
+        j = 0
+        while j < len(rest):
+            x = rest[j]
+            if x == "--refmap" and j + 1 < len(rest):
+                rm = rest[j + 1]
+                j += 2
+                if ":" in rm:
+                    dsts.append(rm)
+                continue
+            if x.startswith("--refmap="):
+                rm = x.split("=", 1)[1]
+                if ":" in rm:
+                    dsts.append(rm)
+            elif not x.startswith("-") and ":" in x:
+                dsts.append(x)
+            j += 1
+        for spec in dsts:
+            dst = spec.lstrip("+").rsplit(":", 1)[1]
+            if re.fullmatch(r"(refs/heads/)?(main|master|dev)", dst):
                 ctx.deny("fetching into local main/dev changes refs the production checkout and the operator's worktree use")
+            # Defence in depth (P0-18): a plain fetch lets git maintain the
+            # origin/dev and origin/autopilot/dev remote-tracking refs; an explicit
+            # refspec that writes them (any spelling: refs/remotes/origin/dev,
+            # remotes/origin/dev, origin/dev) makes the local copy lie about origin
+            # and could feed a later merge/reset. Let a plain `git fetch` map them.
+            if re.fullmatch(r"(refs/remotes/|remotes/)?origin/(dev|autopilot/dev)", dst):
+                ctx.deny("do not fetch an explicit refspec into refs/remotes/origin/dev or refs/remotes/origin/autopilot/dev; a plain 'git fetch' (or 'git fetch origin') maps those remote-tracking refs itself")
     if sub == "push":
         readonly = False
         check_git_push(rest, gdir, ctx)
@@ -3274,7 +3638,12 @@ DOCKER_GLOBAL_BOOL = {"--tls", "--tlsverify", "-D", "--debug"}
 # Read-only subcommands the guard lets through after all the state-changing
 # branches; any other (unrecognised) subcommand fails closed.
 DOCKER_READONLY_SUBS = {"ps", "ls", "logs", "images", "version", "info", "events", "stats", "top",
-                        "port", "diff", "history", "search", "inspect", "df", "wait"}
+                        "port", "diff", "history", "search", "inspect", "df", "wait", "help"}
+# `docker scout` analyses images; these subcommands only read. config/push/
+# enroll/integration/cache/repo change Scout settings or publish data off-host.
+# `environment`/`env` with arguments records an image in a Scout environment
+# (state held off-host), so neither is listed.
+DOCKER_SCOUT_READONLY = {"cves", "quickview", "compare", "recommendations", "sbom", "version"}
 
 
 def check_docker(args, ctx):
@@ -3304,6 +3673,12 @@ def check_docker(args, ctx):
                 a.pop(0)  # consume the value (--tlscacert FILE, --log-level debug)
         elif opt in DOCKER_GLOBAL_BOOL:
             continue
+        elif opt in ("--version", "-v", "--help", "-h"):
+            if not a:
+                return  # prints the version or usage and exits; reaches nothing
+            # With more words the CLI may parse a subcommand after all (`docker -v
+            # run ...`); the guard cannot tell, so fail closed.
+            ctx.deny(f"'docker {opt}' is allowed only on its own; drop the words after it or run the subcommand without it")
         else:
             # An unknown global option could consume the next word, so the guard
             # cannot tell which word is the subcommand (a hidden value flag could
@@ -3403,6 +3778,18 @@ def check_docker(args, ctx):
         if fmt is None or re.search(r"\bEnv\b|\bjson\s+\.\s*\}\}|\{\{\s*\.\s*\}\}|\{\{\s*json\s+\.Config\s*\}\}|\.Config\s*\}\}", fmt):
             ctx.deny("docker inspect prints container environments (secrets); use --format with only the fields you need (never Env, never the whole .Config)")
         return
+    if sub == "manifest":
+        if rest[:1] == ["inspect"]:
+            return  # reads a remote manifest; prints it
+        ctx.deny("'docker manifest' can create, annotate, push or delete multi-arch manifests production pulls; only 'docker manifest inspect' is allowed")
+    if sub == "scout":
+        if any(w in ("-o", "--output") or w.startswith(("--output=", "-o=")) or re.fullmatch(r"-o\S+", w) for w in rest):
+            ctx.deny("'docker scout --output' writes a file the guard does not check; print the report to stdout instead")
+        if rest[:1] and rest[0] in DOCKER_SCOUT_READONLY:
+            return
+        ctx.deny("'docker scout' may only run its read-only analyses (cves, quickview, compare, recommendations, sbom); config/push/enroll/integration change Scout or publish data off-host (fail-closed)")
+    if sub == "help" and any(w.startswith("-") for w in rest):
+        ctx.deny("'docker help' takes only the names of the subcommands to explain; drop the options after it")
     if sub not in DOCKER_READONLY_SUBS:
         ctx.deny(f"'docker {sub}' is not on the guard's allow list; a subcommand that could change state goes through ops/deploy on production or runs against a {DEV}* dev target (fail-closed)")
 
