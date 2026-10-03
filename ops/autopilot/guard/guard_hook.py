@@ -3274,7 +3274,10 @@ DOCKER_GLOBAL_BOOL = {"--tls", "--tlsverify", "-D", "--debug"}
 # Read-only subcommands the guard lets through after all the state-changing
 # branches; any other (unrecognised) subcommand fails closed.
 DOCKER_READONLY_SUBS = {"ps", "ls", "logs", "images", "version", "info", "events", "stats", "top",
-                        "port", "diff", "history", "search", "inspect", "df", "wait"}
+                        "port", "diff", "history", "search", "inspect", "df", "wait", "help"}
+# `docker scout` analyses images; these subcommands only read. config/push/
+# enroll/integration/cache/repo change Scout settings or publish data off-host.
+DOCKER_SCOUT_READONLY = {"cves", "quickview", "compare", "recommendations", "sbom", "version", "environment", "env"}
 
 
 def check_docker(args, ctx):
@@ -3304,6 +3307,8 @@ def check_docker(args, ctx):
                 a.pop(0)  # consume the value (--tlscacert FILE, --log-level debug)
         elif opt in DOCKER_GLOBAL_BOOL:
             continue
+        elif opt in ("--version", "-v", "--help", "-h"):
+            return  # prints the version or usage and exits; reaches nothing
         else:
             # An unknown global option could consume the next word, so the guard
             # cannot tell which word is the subcommand (a hidden value flag could
@@ -3403,6 +3408,14 @@ def check_docker(args, ctx):
         if fmt is None or re.search(r"\bEnv\b|\bjson\s+\.\s*\}\}|\{\{\s*\.\s*\}\}|\{\{\s*json\s+\.Config\s*\}\}|\.Config\s*\}\}", fmt):
             ctx.deny("docker inspect prints container environments (secrets); use --format with only the fields you need (never Env, never the whole .Config)")
         return
+    if sub == "manifest":
+        if rest[:1] == ["inspect"]:
+            return  # reads a remote manifest; prints it
+        ctx.deny("'docker manifest' can create, annotate, push or delete multi-arch manifests production pulls; only 'docker manifest inspect' is allowed")
+    if sub == "scout":
+        if rest[:1] and rest[0] in DOCKER_SCOUT_READONLY:
+            return
+        ctx.deny("'docker scout' may only run its read-only analyses (cves, quickview, compare, recommendations, sbom); config/push/enroll/integration change Scout or publish data off-host (fail-closed)")
     if sub not in DOCKER_READONLY_SUBS:
         ctx.deny(f"'docker {sub}' is not on the guard's allow list; a subcommand that could change state goes through ops/deploy on production or runs against a {DEV}* dev target (fail-closed)")
 
