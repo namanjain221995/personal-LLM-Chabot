@@ -538,5 +538,5 @@ sentinel `9839` (worker, RoCE address only). Both are documented in
 - Compose files must pass `docker compose config` with the launcher's real
   file chain (`scripts/lib/deploy-common.sh: dr_compose_prefix`).
 - Shell: `shellcheck` clean.
-- Orchestrator tests: `TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/test_ha_<workstream>` — one database per workstream, never the shared one.
+- Orchestrator tests: `TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:<port>/ha_<workstream>_test` with `TEST_DATABASE_ALLOWED_HOSTS=127.0.0.1:<port>` — one database per workstream, never the shared one.
 - Python for tests: `/home/techsphere/Documents/project/personal-LLM-Chabot/orchestrator/.venv/bin/python -m pytest` run from the worktree.

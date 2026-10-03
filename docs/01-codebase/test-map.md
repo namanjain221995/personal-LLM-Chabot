@@ -23,7 +23,7 @@ PYTHONPATH=launcher python3 -m pytest launcher/tests -q
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s launcher/tests -v
 
 # a dedicated throwaway server: the suite refuses one that holds a non-test database
-cd orchestrator && TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/techsara_test \
+cd orchestrator && TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:<port>/techsara_test TEST_DATABASE_ALLOWED_HOSTS=127.0.0.1:<port> \
     python3 -m pytest tests -q
 cd sync-worker && python3 -m pytest tests -q
 cd frontend && npm test && npx tsc --noEmit && npm run lint

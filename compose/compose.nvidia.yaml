@@ -16,7 +16,7 @@ x-nvidia-devices: &nvidia-devices
 
 services:
   orchestrator:
-    image: sf-local-ai-orchestrator:cuda
+    image: ${TECHSARA_STACK:-sf-local-ai}-orchestrator:cuda
     build:
       context: ./orchestrator
       dockerfile: Dockerfile.cuda

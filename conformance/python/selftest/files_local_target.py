@@ -2,7 +2,8 @@
 real handlers (2026-09-13).
 
     cd orchestrator
-    TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/test_files_conformance \
+    TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:<port>/files_conformance_test \
+    TEST_DATABASE_ALLOWED_HOSTS=127.0.0.1:<port> \
       .venv/bin/python ../conformance/python/selftest/files_local_target.py \
         --port 18471 --data-dir /tmp/files-target \
         --keys-out /tmp/files-target/keys.json --env-out /tmp/files-target/node.env
@@ -110,7 +111,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if not args.dsn:
-        raise SystemExit("set TEST_DATABASE_URL (or --dsn) to a private test_* database")
+        raise SystemExit("set TEST_DATABASE_URL (or --dsn) to a private *_test database listed in TEST_DATABASE_ALLOWED_HOSTS")
     data = Path(args.data_dir).resolve()
     data.mkdir(parents=True, exist_ok=True)
     # Settings the handlers read at call time. The free-space floor defaults to

@@ -1,0 +1,50 @@
+{
+  "comment": "Copy to ~/.llm-autopilot/host.json (mode 600) and fill in this host's values. Never commit the filled copy: the repository is public.",
+  "prod_checkout": "~/Documents/project/personal-LLM-Chabot",
+  "repo_slug": "namanjain221995/personal-LLM-Chabot",
+  "prod_stack": "sf-local-ai",
+  "prod_db": {
+    "port": 5432,
+    "containers": [
+      "sf-local-ai-postgres-1"
+    ]
+  },
+  "shared_test_db_ports": [
+    0
+  ],
+  "prod_control_ports": [
+    3000,
+    8080
+  ],
+  "model_ports": [
+    8000
+  ],
+  "prod_hosts": [
+    "<head hostname>",
+    "<head addresses>",
+    "<worker hostname>",
+    "<worker addresses>"
+  ],
+  "trusted_hosts": [
+    "<head hostname>",
+    "<worker hostname>"
+  ],
+  "worker_ssh": "<worker address reachable with existing keys>",
+  "quiet_window_ist": [
+    5,
+    7
+  ],
+  "test_db": {
+    "host": "<worker address>",
+    "port": 15432,
+    "container": "llmdev-test-pg",
+    "url_file": "~/.llm-autopilot/agent/test-db.url"
+  },
+  "automode_environment_private": [
+    "**Host details (private)**: <hosts, endpoints and ports the classifier should know>"
+  ],
+  "worker_hosts": [
+    "<worker hostname>",
+    "<worker addresses>"
+  ]
+}

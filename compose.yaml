@@ -1,7 +1,13 @@
 # TechSara's platform-neutral application and data plane. The host launcher
 # selects one runtime overlay (plus a platform modifier where needed) and
 # passes generated.env both to interpolation and to application containers.
-name: sf-local-ai
+#
+# TECHSARA_STACK (default sf-local-ai) names the project, its volumes and its
+# image tags. Production never sets it, so its rendered configuration is
+# unchanged. A dev stack (ops/dev/stack.vars) sets it, so it can never mount
+# production's volumes or overwrite production's image tags; it runs on the
+# worker's Docker daemon, where the pinned v1relay subnet below is free.
+name: ${TECHSARA_STACK:-sf-local-ai}
 
 x-runtime-env: &runtime-env
   - path: .env
@@ -201,7 +207,7 @@ services:
     logging: *default-logging
 
   orchestrator:
-    image: sf-local-ai-orchestrator:cpu
+    image: ${TECHSARA_STACK:-sf-local-ai}-orchestrator:cpu
     build:
       context: ./orchestrator
       dockerfile: Dockerfile.cpu
@@ -400,7 +406,7 @@ services:
     logging: *default-logging
 
   sync-worker:
-    image: sf-local-ai-sync-worker:portable
+    image: ${TECHSARA_STACK:-sf-local-ai}-sync-worker:portable
     build:
       context: ./sync-worker
     environment:
@@ -435,7 +441,7 @@ services:
     logging: *default-logging
 
   frontend:
-    image: sf-local-ai-frontend:portable
+    image: ${TECHSARA_STACK:-sf-local-ai}-frontend:portable
     build:
       context: ./frontend
     env_file: *generated-env
@@ -565,7 +571,7 @@ services:
   # Cloudflare tunnel (gateway/README.md, "Operating it"). The launcher starts
   # it with `up -d --no-deps v1-gateway`, never --force-recreate.
   v1-gateway:
-    image: sf-local-ai-v1-gateway:${V1_GATEWAY_CODE_SHA:-unpinned}
+    image: ${TECHSARA_STACK:-sf-local-ai}-v1-gateway:${V1_GATEWAY_CODE_SHA:-unpinned}
     build:
       context: ./gateway
     environment:
@@ -673,14 +679,14 @@ networks:
 
 volumes:
   data:
-    name: sf-local-ai_data
+    name: ${TECHSARA_STACK:-sf-local-ai}_data
   reports:
-    name: sf-local-ai_reports
+    name: ${TECHSARA_STACK:-sf-local-ai}_reports
   pgdata:
-    name: sf-local-ai_pgdata
+    name: ${TECHSARA_STACK:-sf-local-ai}_pgdata
   pgadmin:
-    name: sf-local-ai_pgadmin
+    name: ${TECHSARA_STACK:-sf-local-ai}_pgadmin
   hf-cache:
-    name: sf-local-ai_hf-cache
+    name: ${TECHSARA_STACK:-sf-local-ai}_hf-cache
   v1gateway_spool:
-    name: sf-local-ai_v1gateway_spool
+    name: ${TECHSARA_STACK:-sf-local-ai}_v1gateway_spool

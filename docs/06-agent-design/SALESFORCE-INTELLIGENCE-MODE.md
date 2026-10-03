@@ -355,7 +355,7 @@ Deliberately **not** set, and why:
 ```bash
 # backend — needs a PostgreSQL server, nothing else
 cd orchestrator
-TEST_DATABASE_URL=postgresql://test:test@127.0.0.1:55432/techsara_test \
+TEST_DATABASE_URL=postgresql://test:test@127.0.0.1:<port>/techsara_test TEST_DATABASE_ALLOWED_HOSTS=127.0.0.1:<port> \
     .venv/bin/python -m pytest -q
 
 # just this feature

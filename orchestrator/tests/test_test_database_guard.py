@@ -17,10 +17,9 @@ _SPEC.loader.exec_module(suite_setup)
 @pytest.mark.parametrize(
     "dsn",
     [
-        "postgresql://user:secret@localhost/test",
         "postgresql://user:secret@localhost/techsara_test",
-        "postgres://user:secret@localhost/test_isolated",
-        "postgresql://user:secret@localhost/history-test?sslmode=disable",
+        "postgres://user:secret@localhost/isolated_test",
+        "postgresql://user:secret@localhost/history_test?sslmode=disable",
     ],
 )
 def test_unmistakable_test_database_names_are_accepted(dsn):
@@ -35,6 +34,11 @@ def test_unmistakable_test_database_names_are_accepted(dsn):
         "postgresql://user:secret@localhost/testimony",
         "mysql://user:secret@localhost/techsara_test",
         "postgresql://user:secret@localhost/",
+        # Accepted before 2026-10-03; the one accepted shape is now `*_test`.
+        "postgresql://user:secret@localhost/test",
+        "postgresql://user:secret@localhost/test_isolated",
+        "postgresql://user:secret@localhost/history-test",
+        "postgresql://user:secret@localhost/_test",
     ],
 )
 def test_ambiguous_or_non_postgres_database_names_are_rejected(dsn):
@@ -83,6 +87,8 @@ def test_a_server_is_a_test_server_only_if_every_database_on_it_is_a_test_databa
 
 def test_the_production_instance_is_refused_whatever_the_dsn_says(monkeypatch):
     monkeypatch.delenv("TEST_DATABASE_ALLOW_SHARED_SERVER", raising=False)
+    # Even listed as allowed, the production instance is refused by the server guard.
+    monkeypatch.setenv("TEST_DATABASE_ALLOWED_HOSTS", "127.0.0.1:5432")
     monkeypatch.setattr(
         suite_setup,
         "_server_databases",
@@ -117,14 +123,91 @@ def test_the_shared_server_escape_hatch_names_databases_and_never_the_app_databa
 )
 def test_the_app_environment_no_longer_steers_the_suite_onto_the_app_server(monkeypatch, env):
     """`set -a; . ./.env` (or pytest inside the production container) used to
-    turn into `<production server>/techsara_test`. Only TEST_DATABASE_URL, or
-    the throwaway default, choose the server now."""
+    turn into `<production server>/techsara_test`. Only TEST_DATABASE_URL
+    chooses the server now; without it the suite refuses to start."""
     for key in ("TEST_DATABASE_URL", "APP_DATABASE_URL", "POSTGRES_USER",
                 "POSTGRES_PASSWORD", "POSTGRES_DB", "POSTGRES_HOST", "POSTGRES_PORT"):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
-    assert suite_setup._test_dsn() == suite_setup._DEFAULT_TEST_DSN
+    with pytest.raises(pytest.UsageError, match="TEST_DATABASE_URL is not set"):
+        suite_setup._test_dsn()
+
+
+# ---------------------------------------------------------------------------
+# The ALLOWED-SERVER guard (2026-10-03). The old default server was a loopback
+# port on a shared host where another session's test server lived, so a run
+# with no TEST_DATABASE_URL truncated someone else's tables. There is no
+# default any more, and the host:port must be named in
+# TEST_DATABASE_ALLOWED_HOSTS (GitHub Actions jobs bring their own service
+# container and are exempt).
+# ---------------------------------------------------------------------------
+
+
+def test_there_is_no_default_server(monkeypatch):
+    monkeypatch.delenv("TEST_DATABASE_URL", raising=False)
+    with pytest.raises(pytest.UsageError, match="TEST_DATABASE_URL is not set"):
+        suite_setup._test_dsn()
+
+
+def test_the_server_must_be_listed(monkeypatch):
+    dsn = "postgresql://u:p@203.0.113.7:6543/x_test"
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.setenv("TEST_DATABASE_URL", dsn)
+    monkeypatch.delenv("TEST_DATABASE_ALLOWED_HOSTS", raising=False)
+    with pytest.raises(pytest.UsageError, match="TEST_DATABASE_ALLOWED_HOSTS"):
+        suite_setup._test_dsn()
+    monkeypatch.setenv("TEST_DATABASE_ALLOWED_HOSTS", "203.0.113.8:6543, 203.0.113.7:5432")
+    with pytest.raises(pytest.UsageError, match="203.0.113.7:6543"):
+        suite_setup._test_dsn()
+    monkeypatch.setenv("TEST_DATABASE_ALLOWED_HOSTS", "203.0.113.8:6543,203.0.113.7:6543")
+    assert suite_setup._test_dsn() == dsn
+
+
+def test_github_actions_jobs_are_exempt_only_without_an_allowlist(monkeypatch):
+    dsn = "postgresql://test:test@127.0.0.1:5432/shard1_test"
+    monkeypatch.setenv("TEST_DATABASE_URL", dsn)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.delenv("TEST_DATABASE_ALLOWED_HOSTS", raising=False)
+    assert suite_setup._test_dsn() == dsn
+    monkeypatch.setenv("TEST_DATABASE_ALLOWED_HOSTS", "203.0.113.7:6543")
+    with pytest.raises(pytest.UsageError):
+        suite_setup._test_dsn()
+
+
+def test_ensure_database_checks_the_allowlist_before_any_connection(monkeypatch):
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.setenv("TEST_DATABASE_ALLOWED_HOSTS", "203.0.113.8:5432")
+
+    def no_connection(dsn):
+        raise AssertionError("connected before the allowlist check")
+
+    monkeypatch.setattr(suite_setup, "_server_databases", no_connection)
+    with pytest.raises(pytest.UsageError, match="TEST_DATABASE_ALLOWED_HOSTS"):
+        suite_setup._ensure_database("postgresql://u:p@203.0.113.7:5432/x_test")
+
+
+class _Item:
+    def __init__(self, nodeid):
+        self.nodeid = nodeid
+        self.markers = []
+
+    def add_marker(self, marker):
+        self.markers.append(marker)
+
+
+def test_clock_skew_tests_are_expected_failures_only_against_a_remote_database(monkeypatch):
+    sensitive = sorted(suite_setup.CLOCK_SKEW_SENSITIVE)
+    assert sensitive, "the measured list must not be empty"
+    items = [_Item(f"tests/{sensitive[0]}"), _Item("tests/test_test_database_guard.py::test_there_is_no_default_server")]
+    monkeypatch.delenv("TEST_DATABASE_REMOTE", raising=False)
+    suite_setup.pytest_collection_modifyitems(None, items)
+    assert [len(i.markers) for i in items] == [0, 0]
+    monkeypatch.setenv("TEST_DATABASE_REMOTE", "1")
+    suite_setup.pytest_collection_modifyitems(None, items)
+    assert [len(i.markers) for i in items] == [1, 0]
+    mark = items[0].markers[0].mark
+    assert mark.name == "xfail" and mark.kwargs["strict"] is False
 
 
 def test_the_real_session_server_passes_and_a_foreign_database_on_it_is_refused(
