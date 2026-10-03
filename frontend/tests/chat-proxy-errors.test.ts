@@ -141,10 +141,25 @@ describe('chat proxy — server-side logging', () => {
     expect(line).toMatch(/timestamp="\d{4}-\d{2}-\d{2}T/);
   });
 
-  it('logs the correlation id when one was supplied', async () => {
+  it('logs its own minted id, not a well-formed one the browser supplied', async () => {
+    // B-03 QA: nothing upstream assigns ids here, so a supplied one is the browser's.
+    const id = `req_${'ab12'.repeat(8)}`;
     vi.stubGlobal('fetch', async () => new Response('x', { status: 500 }));
-    await POST(post({ headers: { 'x-request-id': 'req-42' } }));
-    expect(errors.join('\n')).toContain('request_id="req-42"');
+    const res = await POST(post({ headers: { 'x-request-id': id } }));
+    const minted = res.headers.get('x-request-id') ?? '';
+    expect(minted).toMatch(/^req_[0-9a-f]{32}$/);
+    expect(minted).not.toBe(id);
+    expect(errors.join('\n')).toContain(`request_id="${minted}"`);
+  });
+
+  it('logs a fresh id, not a malformed one, when the supplied one is not usable', async () => {
+    vi.stubGlobal('fetch', async () => new Response('x', { status: 500 }));
+    const res = await POST(post({ headers: { 'x-request-id': 'req-42' } }));
+    const line = errors.join('\n');
+    expect(line).not.toContain('req-42');
+    const minted = res.headers.get('x-request-id') ?? '';
+    expect(minted).toMatch(/^req_[0-9a-f]{32}$/);
+    expect(line).toContain(`request_id="${minted}"`);
   });
 
   it('logs the transport exception code', async () => {

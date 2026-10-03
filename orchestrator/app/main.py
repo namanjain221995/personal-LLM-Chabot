@@ -30,6 +30,7 @@ from .authn.analytics_api import router as analytics_router
 from .authn.shares_api import router as shares_admin_router
 from .config import settings
 from .core.tracing import TraceRecorder
+from .core.tracing import request_id_for as _tracing_request_id_for
 
 # App-module logging was silently dropped: uvicorn configures only its own
 # loggers, and with no root handler every app `log.info/warning/error` —
@@ -2386,14 +2387,30 @@ class _QueuedTraceRecorder(TraceRecorder):
     async def start(self, **kwargs) -> None:  # type: ignore[override]
         self.writer.submit(lambda: TraceRecorder.start(self, **kwargs))
 
+    # Every stage time is read HERE, at the call (B-03, 2026-10-03): the
+    # parent's methods run later on the writer's task — behind a queued
+    # CONTEXT_ASSEMBLED that waits for its count, for one — and a time read
+    # there would be the write's, not the stage's.
+    def event_nowait(self, stage: str, **kwargs) -> None:  # type: ignore[override]
+        # Called from the answer path (FIRST_ANSWER_TOKEN on the per-token
+        # emit, KNOWLEDGE_PREPARED): tracing must never break a chat, so any
+        # failure to queue the event is logged and dropped (B-03 QA).
+        try:
+            kwargs.setdefault("at", time.perf_counter())
+            if "details" in kwargs:
+                kwargs["details"] = _trace_snapshot(kwargs["details"])
+            self.writer.submit(lambda: TraceRecorder.event(self, stage, **kwargs))
+        except Exception:
+            logging.getLogger(__name__).debug("query trace event %s dropped", stage, exc_info=True)
+
     async def event(self, stage: str, **kwargs) -> None:  # type: ignore[override]
-        if "details" in kwargs:
-            kwargs["details"] = _trace_snapshot(kwargs["details"])
-        self.writer.submit(lambda: TraceRecorder.event(self, stage, **kwargs))
+        self.event_nowait(stage, **kwargs)
 
     def event_when_ready(self, stage: str, build, **kwargs) -> None:
         """Queue an event whose details are only complete later: `build` is
-        awaited on the writer's task, in this event's place in the order."""
+        awaited on the writer's task, in this event's place in the order.
+        Its stage time is the call's, not the moment `build` finished."""
+        kwargs.setdefault("at", time.perf_counter())
 
         async def job() -> None:
             await TraceRecorder.event(self, stage, details=_trace_snapshot(await build()), **kwargs)
@@ -2401,6 +2418,7 @@ class _QueuedTraceRecorder(TraceRecorder):
         self.writer.submit(job)
 
     async def finish(self, status: str, **kwargs) -> None:  # type: ignore[override]
+        kwargs.setdefault("at", time.perf_counter())
         if "meta" in kwargs:
             kwargs["meta"] = _trace_snapshot(kwargs["meta"])
         self.writer.submit(lambda: TraceRecorder.finish(self, status, **kwargs))
@@ -4152,12 +4170,23 @@ async def chat_route(http_request: Request) -> StreamingResponse:
     call it with a model they built themselves.
     """
     from .authn.principal import current_principal
+    from .core import tracing as _tracing
     from .history import read_validated_body
 
-    if await current_principal(http_request) is None:
-        raise HTTPException(status_code=401, detail="Sign in required.")
-    request = await read_validated_body(http_request, ChatRequest)
-    return await chat(request, http_request)
+    # B-03: the request's correlation id — the proxy's `X-Request-ID` when it
+    # is well formed, a new one otherwise — named on the response whatever
+    # it is. `chat` reads the same id off the request for the trace.
+    request_id = _tracing.request_id_for(http_request)
+    try:
+        if await current_principal(http_request) is None:
+            raise HTTPException(status_code=401, detail="Sign in required.")
+        request = await read_validated_body(http_request, ChatRequest)
+        response = await chat(request, http_request)
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), _tracing.REQUEST_ID_HEADER: request_id}
+        raise
+    response.headers[_tracing.REQUEST_ID_HEADER] = request_id
+    return response
 
 
 async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse:
@@ -4593,6 +4622,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     # join key; golden expectations remain in the offline evaluator.
     query_trace = _QueuedTraceRecorder(
         gen.generation_id,
+        # B-03: the correlation id the proxy sent (validated), or a new one —
+        # the same id chat_route returns in X-Request-ID.
+        request_id=_tracing_request_id_for(http_request),
         test_case_id=request.test_case_id,
         versions={
             "application": app.version,
@@ -4692,6 +4724,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         # chat_first_answer_seconds' `shape` (metrics.CHAT_ANSWER_SHAPES),
         # set by the worker once the history and the lane are known.
         "answer_shape": "plain",
+        # FIRST_ANSWER_TOKEN is in the trace (B-03).
+        "first_answer_traced": False,
     }
 
     def _observe_first_visible(route: str) -> None:
@@ -4905,6 +4939,19 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             if isinstance(piece, str) and piece.strip():
                 _timing["first_visible"] = _perf_counter() - _timing["started"]
                 _timing["first_visible_kind"] = "answer" if event == "token" else event
+        if event == "token" and not _timing["first_answer_traced"]:
+            # §11 "first meaningful answer token" (B-03): the first answer
+            # token with text in it, whichever engine produced it. A status
+            # line, a reasoning token or a heartbeat is not one. Its
+            # duration is the whole wait, request start to this token.
+            piece = data.get("text")
+            if isinstance(piece, str) and piece.strip():
+                _timing["first_answer_traced"] = True
+                query_trace.event_nowait(
+                    "FIRST_ANSWER_TOKEN",
+                    component="orchestrator.app.main.emit",
+                    duration_ms=max(0, round((_perf_counter() - _timing["started"]) * 1000)),
+                )
         await gen.publish(event, data)
 
     async def worker() -> None:
@@ -5334,6 +5381,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # cases?" came back with web articles about IT ticketing instead
             # of this org's cases.
             auto_plan = None
+            decide_started: Optional[float] = None
+            decide_s: Optional[float] = None
             if (
                 request.text
                 and not request.pdf_data
@@ -5345,9 +5394,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
 
                 decide_started = _perf_counter()
                 auto_plan = await decide(request.text, history, request.effort)
+                decide_s = _perf_counter() - decide_started
                 _allowed = _allowances(request.effort)
                 _latency_metrics.orchestrate_decide(
-                    _perf_counter() - decide_started,
+                    decide_s,
                     effort=str(request.effort or ""),
                     plan=_latency_metrics.plan_label(auto_plan.agent, auto_plan.search),
                     # decide() asks the router only when the effort permits
@@ -5458,11 +5508,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 await query_trace.event(
                     "MODE_RESOLVED",
                     component="orchestrator.app.engines.orchestrate",
+                    # §11 routing (B-03): decide() and the gates after it,
+                    # to this event; `decide_ms` is the router call alone.
+                    duration_ms=None
+                    if decide_started is None
+                    else max(0, round((_perf_counter() - decide_started) * 1000)),
                     details={
                         "requested_mode": request.mode,
                         "resolved_mode": query_trace.resolved_mode,
                         "agent": effective.agent,
                         "search": effective.search,
+                        "decide_ms": None if decide_s is None else max(0, round(decide_s * 1000)),
                     },
                 )
 
@@ -5947,10 +6003,15 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 await _settle_context()
                 return assembled_details
 
+            # §11 prompt preparation, orchestrator side (B-03): the same
+            # span context_assembly_seconds observes (facts, recall,
+            # documents, history, compaction), now on the trace too.
+            assembly_s = _perf_counter() - assembly_started
             query_trace.event_when_ready(
                 "CONTEXT_ASSEMBLED",
                 _assembled_details,
                 component="orchestrator.app.compaction",
+                duration_ms=max(0, round(assembly_s * 1000)),
             )
             # After CONTEXT_ASSEMBLED in the trace, so the stages every turn
             # has keep their order; the decision itself was made before the
@@ -5962,7 +6023,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 details=lane.as_details(),
             )
             _latency_metrics.context_assembly(
-                _perf_counter() - assembly_started,
+                assembly_s,
                 effort=str(request.effort or ""),
                 mode=str(request.mode or ""),
             )
@@ -6218,6 +6279,20 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     _knowledge_blocked_s,
                     effort=str(request.effort or ""),
                     decision=_knowledge_decision,
+                )
+                # §11 retrieval (B-03): the knowledge pre-pass, timed from its
+                # dispatch like knowledge_prepare_seconds; `blocked_ms` is the
+                # part the answer path waited for.
+                query_trace.event_nowait(
+                    "KNOWLEDGE_PREPARED",
+                    status="success" if knowledge_outcome == "ok" else "failed",
+                    component="orchestrator.app.living_knowledge",
+                    duration_ms=max(0, round((time.perf_counter() - knowledge_started_at) * 1000)),
+                    details={
+                        "decision": _knowledge_decision,
+                        "outcome": knowledge_outcome,
+                        "blocked_ms": max(0, round(_knowledge_blocked_s * 1000)),
+                    },
                 )
                 if (
                     knowledge_network_closed_by_rate
