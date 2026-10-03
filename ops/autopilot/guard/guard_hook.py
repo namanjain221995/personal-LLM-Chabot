@@ -1806,7 +1806,10 @@ def check_command(cmd, args, ctx):
                 analyze_words(inner, ctx)
             else:  # the words are joined and run by a shell
                 analyze(" ".join(inner), ctx.child())
-        return
+        if any(a in ("::::", "::::+") for a in args):
+            ctx.deny(f"{cmd} :::: reads its arguments from a file the guard cannot review; list them after :::")
+        # no return: the ':::' operands are what the command reads, so the
+        # secret-file checks below see them
     if cmd in ("tmux", "screen"):
         if re.search(r"\b(new-session|new|new-window|neww|send-keys|send|split-window|splitw|respawn-pane|respawn-window)\b|(^|\s)-(dm|dmS|S|d)\b", " ".join(args)):
             ctx.deny("detached sessions outlive the cycle and hide their commands; run work in the foreground")
@@ -2563,7 +2566,7 @@ def check_write_targets(cmd, args, ctx):
             gparent = expand_path(os.path.dirname(t.rstrip("/")) or ".", ctx.cwd)
             if gparent in BROAD_DELETE and not re.search(r"[A-Za-z0-9_]", os.path.basename(t.rstrip("/"))):
                 ctx.deny(f"refuses the broad delete of {t}; delete only paths the autopilot created")
-        if (cmd in ("rm", "rmdir", "shred") or (cmd == "find" and t in find_roots)) and (p in BROAD_DELETE or re.fullmatch(r"/(var/)?tmp/\*", t) or t.rstrip("/") in ("/tmp/*", "/tmp/.*", "~/*", "*", ".*", "/*")):
+        if (cmd in ("rm", "rmdir", "unlink", "shred", "srm") or (cmd == "find" and t in find_roots)) and (p in BROAD_DELETE or re.fullmatch(r"/(var/)?tmp/\*", t) or t.rstrip("/") in ("/tmp/*", "/tmp/.*", "~/*", "*", ".*", "/*")):
             ctx.deny(f"refuses the broad delete of {t}; delete only paths the autopilot created")
         if not write_allowed(p):
             ctx.deny(write_why(p))
