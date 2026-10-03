@@ -110,12 +110,17 @@ def _abs_text() -> str:
 
 
 METHOD = {
-    "runs": "The baseline is N run directories of run_evalset.py --repeats 1 --workers 1, each on its own fresh "
-            "account (no other conversations, no saved facts), so repeats never see each other; within a run the "
-            "case order is fixed. Every pooled run must have finished (not interrupted, no --deadline reached), "
-            "hold exactly conditions.repeats records of every case it ran (all of its --only, every case of the "
-            "pool when --only is empty), and share eval_set_sha256 and workers; a conversation id seen twice is "
-            f"refused (a copied run). Freeze needs at least {MIN_SAMPLES} records of every case.",
+    "runs": "Procedure: (1) for each run, seed a fresh account (ops/dev/devstack.sh seed <user>: no other "
+            "conversations, no saved facts); (2) run run_evalset.py --repeats 1 --workers 1 --label '<conditions>' "
+            "on that account, so no repeat can recall another and cases never contend; (3) repeat (1)-(2) for N "
+            f">= {MIN_SAMPLES} runs in the same window and freeze the N run directories together. Refused (exit 2): "
+            "a run that did not finish (finished null, interrupted, --deadline reached); a run without exactly "
+            "conditions.repeats records of every case it ran (all of its --only, every case of the pool when --only "
+            "is empty); runs that differ in eval_set_sha256 or workers; a record without a conversation id, or one "
+            f"seen twice (a copied run); fewer than {MIN_SAMPLES} records of any case. Recorded, not refused: a "
+            "run with --repeats above 1 or --workers above 1, an account that was not checked, one used with "
+            "--allow-used-account, or one that already held conversations or saved facts. Each is listed in "
+            "procedure_deviations, printed as a WARNING by freeze and shown at the top of the markdown.",
     "workload": "Each record's own `workload` field; when absent, the eval-set map in baseline.WORKLOAD "
                 "(MASTER_PROMPT §24 classes). A class without a defined tolerance is refused.",
     "case_score": "Score of one record (case x repeat) = checks passed / checks run, over all its turns, as an "
@@ -557,6 +562,37 @@ def _pool_conditions(public_sources: Sequence[dict]) -> dict:
             "harness_commits": _unique(s["harness_commit"] for s in public_sources)}
 
 
+def procedure_deviations(public_sources: Sequence[dict]) -> List[dict]:
+    """How each pooled run departed from the procedure in METHOD['runs'] (one entry per departure, in source
+    order). These are recorded and shown, not refused: the numbers stand, but under weaker conditions."""
+    out: List[dict] = []
+    for s in public_sources:
+        run = s.get("dir") or "<run>"
+
+        def add(kind: str, detail: str) -> None:
+            out.append({"run": run, "deviation": kind, "detail": detail})
+
+        if s["repeats"] > 1:
+            add("repeats", f"--repeats {s['repeats']}: the repeats of a case shared one account, so a later repeat "
+                           "could recall an earlier one (the procedure is --repeats 1 per run and account)")
+        if s["workers"] > 1:
+            add("workers", f"--workers {s['workers']}: cases ran concurrently and contended for the engine (the "
+                           "procedure is --workers 1)")
+        acct = s.get("account")
+        if not isinstance(acct, dict) or acct.get("checked") is not True:
+            add("account_unchecked", "the run did not count the account's conversations and saved facts, so "
+                                     "nothing shows the account was fresh")
+        elif acct.get("conversations") is None or acct.get("facts") is None:
+            add("account_counts_missing", "the account was marked checked but its counts are missing")
+        elif acct["conversations"] or acct["facts"]:
+            add("account_not_fresh", f"the account already held {acct['conversations']} conversation(s) and "
+                                     f"{acct['facts']} saved fact(s): cross-chat recall and saved facts could reach "
+                                     "the answers")
+        if isinstance(acct, dict) and acct.get("allowed_used") is True:
+            add("account_allowed_used", "the run was started with --allow-used-account")
+    return out
+
+
 def _check_public_source(s: dict, where: str) -> None:
     label = s.get("label")
     if not isinstance(label, str) or not label.strip():
@@ -900,6 +936,8 @@ def _verify_baseline(doc, where: str = "baseline") -> None:
         raise BaselineError(f"{where}: sources differ in eval_set_sha256 or workers")
     if not _same(doc.get("conditions"), _pool_conditions(sources)):
         raise BaselineError(f"{where}: `conditions` disagree with `sources`")
+    if not _same(doc.get("procedure_deviations"), procedure_deviations(sources)):
+        raise BaselineError(f"{where}: `procedure_deviations` disagree with `sources`")
 
     quality, latency = doc.get("quality"), doc.get("latency")
     if not isinstance(quality, dict) or not isinstance(quality.get("cases"), dict) or not quality["cases"] \
@@ -1030,6 +1068,7 @@ def freeze(records: Sequence[dict], *, frozen_at: Optional[str] = None) -> dict:
         "frozen_at": frozen_at or _now(),
         "sources": sources,
         "conditions": _pool_conditions(sources),
+        "procedure_deviations": procedure_deviations(sources),
         "repeats_per_case": {cid: c["repeats"] for cid, c in quality["cases"].items()},
         "quality": quality,
         "latency": latency_stats(records),
@@ -1248,8 +1287,9 @@ def compare(baseline: dict, candidate_records: Sequence[dict], *, allow_insuffic
         "passed": passed, "allow_insufficient": allow_insufficient,
         "fails": fails, "insufficient": insufficient,
         "baseline": {"frozen_at": baseline.get("frozen_at"), "sources": baseline["sources"],
-                     "conditions": base_cond},
-        "candidate": {"sources": cand_sources, "conditions": cand_cond, "records": len(records)},
+                     "conditions": base_cond, "procedure_deviations": baseline["procedure_deviations"]},
+        "candidate": {"sources": cand_sources, "conditions": cand_cond, "records": len(records),
+                      "procedure_deviations": procedure_deviations(cand_sources)},
         "condition_changes": _condition_changes(base_cond, cand_cond),
         "missing_cases": missing, "new_cases": new_cases, "new_units": new_units,
         "cases": cases, "overall": overall, "fast_thinking": thinking, "latency": latency,
@@ -1262,6 +1302,18 @@ def compare(baseline: dict, candidate_records: Sequence[dict], *, allow_insuffic
 
 def _cell(value) -> str:
     return str(value).replace("\r", " ").replace("\n", " ").replace("|", "\\|")
+
+
+def insufficient_gated(latency: dict) -> List[dict]:
+    """The gated class/metrics of a baseline's latency whose status is not ok (too few samples)."""
+    return [{"workload": w, "metric": m, "n": per[m]["n"], "noise_units": per[m]["noise_units"]}
+            for w, per in latency.items() for m in METRICS if per[m]["gated"] and per[m]["status"] != "ok"]
+
+
+def _insufficient_text(i: dict) -> str:
+    return (f"latency {i['workload']}/{i['metric']} is gated but has insufficient samples (n={i['n']}, "
+            f"{i['noise_units']} unit(s) with >= {MIN_UNIT_SAMPLES} samples; it needs {MIN_SAMPLES} samples and one "
+            "such unit): every compare fails on it unless --allow-insufficient. Pool more runs")
 
 
 def _row(cells: Iterable) -> str:
@@ -1298,11 +1350,26 @@ def render_markdown(baseline: dict) -> str:
     _verify_baseline(baseline)
     q, sources = baseline["quality"], baseline["sources"]
     cond = baseline["conditions"]
+    deviations, thin = baseline["procedure_deviations"], insufficient_gated(baseline["latency"])
     out = ["## Eval-set baseline", "",
            f"Frozen {baseline.get('frozen_at')} by `scripts/aiq/baseline.py` from {len(sources)} run(s). Every "
-           "number below holds only under the conditions listed here.", "", "### Conditions", "",
-           f"Eval set sha256 `{cond['eval_set_sha256']}`; workers {cond['workers']}; model ids "
-           f"{', '.join(f'`{m}`' for m in cond['model_ids']) or 'not reported'}.", ""]
+           "number below holds only under the conditions listed here.", "", "### Procedure deviations", ""]
+    if deviations:
+        out += [f"**{len(deviations)} deviation(s) from the procedure (method `runs`): the numbers below were "
+                "measured under weaker conditions than the procedure asks for.**", ""]
+        out += [f"- **run `{_cell(d['run'])}`: {_cell(d['deviation'])}**: {_cell(d['detail'])}" for d in deviations]
+    else:
+        out.append("None: every run followed the procedure (method `runs`).")
+    out += ["", "### Gated latency without enough samples", ""]
+    if thin:
+        out += [f"**{len(thin)} gated class/metric(s) have too few baseline samples: every compare fails on them "
+                "unless --allow-insufficient.**", ""]
+        out += [f"- **{_cell(_insufficient_text(i))}**" for i in thin]
+    else:
+        out.append("None: every gated class/metric has enough samples.")
+    out += ["", "### Conditions", "",
+            f"Eval set sha256 `{cond['eval_set_sha256']}`; workers {cond['workers']}; model ids "
+            f"{', '.join(f'`{m}`' for m in cond['model_ids']) or 'not reported'}.", ""]
     for s in sources:
         only, acct = s.get("only"), s.get("account")
         acct_text = ("not checked" if not acct or not acct.get("checked") else
@@ -1394,6 +1461,8 @@ def _summary(report: dict) -> str:
     lines.append("  candidate labels: " + "; ".join(repr(x) for x in report["candidate"]["conditions"]["labels"]))
     lines += [f"  CHANGED {c['field']}: baseline {c['baseline']} -> candidate {c['candidate']}"
               for c in report["condition_changes"]]
+    lines += [f"  PROCEDURE DEVIATION ({side}) run {d['run']}: {d['detail']}"
+              for side in ("baseline", "candidate") for d in report[side]["procedure_deviations"]]
     lines += [f"  FAIL {f}" for f in report["fails"]]
     lines += [f"  INSUFFICIENT latency {i['workload']}/{i['metric']}: baseline n={i['baseline_n']} with "
               f"{i['noise_units']} unit(s) of >= {MIN_UNIT_SAMPLES} samples (need {MIN_SAMPLES} samples and one "
@@ -1439,6 +1508,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _write_json(args.out, doc)
             if markdown is not None:
                 _write_text(args.markdown, markdown)
+            for i in insufficient_gated(doc["latency"]):
+                print(f"baseline.py: WARNING {_insufficient_text(i)}", file=sys.stderr)
+            for d in doc["procedure_deviations"]:
+                print(f"baseline.py: WARNING procedure deviation, run {d['run']}: {d['detail']}", file=sys.stderr)
             print(f"froze {len(records)} records of {len(doc['quality']['cases'])} cases from "
                   f"{len(doc['sources'])} run(s) -> {args.out}")
             return 0

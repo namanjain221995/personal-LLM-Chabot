@@ -59,6 +59,11 @@ def test_three_repeats_of_the_whole_set_freeze_and_compare(fake, tmp_path, pwfil
     # EV09 cannot pass: no endpoint exposes the passages a run read (source_passages_captured false)
     assert frozen["quality"]["cases"]["EV09"]["pass_rate"] == 0
     assert frozen["quality"]["checks"]["citation_passages"]["rate"] == 0
+    # the runner's account block reaches the procedure check: a fresh, counted account, but one run of --repeats 3
+    # instead of three runs of --repeats 1 (the procedure) is recorded as the only deviation
+    assert [(d["run"], d["deviation"]) for d in frozen["procedure_deviations"]] == [("base", "repeats")]
+    assert frozen["sources"][0]["account"] == {"conversations": 0, "facts": 0, "checked": True,
+                                               "allowed_used": False}
 
     path = tmp_path / "baseline.json"
     assert B.main(["freeze", run_dir, "--out", str(path), "--markdown", str(tmp_path / "b.md")]) == 0
@@ -67,6 +72,7 @@ def test_three_repeats_of_the_whole_set_freeze_and_compare(fake, tmp_path, pwfil
     assert same["passed"] is True and same["fails"] == [], same["fails"]
     md = (tmp_path / "b.md").read_text()
     assert "direct_fast" in md and "first_answer_s" in md
+    assert "- **run `base`: repeats**: --repeats 3" in md
     assert fake.base not in md and fake.base not in path.read_text(), "a baseline must not carry the endpoint"
 
     # a candidate whose RQ03 answer is now a sentence instead of names only

@@ -374,6 +374,7 @@ def test_freeze_pools_three_run_directories(tmp_path):
     assert len(records) == 9 and records[0]["_run"]["dir"] == dirs[0]
     doc = B.freeze(records, frozen_at=FROZEN_AT)
     assert doc["kind"] == "evalset-baseline" and doc["schema"] == 3 and doc["frozen_at"] == FROZEN_AT
+    assert doc["procedure_deviations"] == []
     assert doc["repeats_per_case"] == {"EV01": 3, "RQ01": 3, "EV08": 3}
     assert [s["dir"] for s in doc["sources"]] == ["run1", "run2", "run3"]           # basename only
     assert all(s["label"] == "synthetic stack, cap 2" and s["harness_commit"] == "0123abc"
@@ -384,6 +385,25 @@ def test_freeze_pools_three_run_directories(tmp_path):
     assert doc["quality"]["overall_mean_score_exact"] == "1"
     assert json.dumps(B.freeze(B.load_runs(dirs), frozen_at=FROZEN_AT)) == json.dumps(doc)   # deterministic
     assert B.compare(doc, B.load_runs(dirs))["passed"] is True                                # self-compare
+
+
+def test_freeze_warns_about_each_gated_class_without_enough_samples(tmp_path, capsys):
+    """Re-QA 3: a gated class that is insufficient at freeze made every later compare fail, and freeze was silent."""
+    recs = [record("EV09", r, effort="max") for r in (1, 2, 3)]
+    for rec in recs[1:]:
+        rec["turns"][0]["result"]["timing"]["first_answer_s"] = None
+    d = write_run(tmp_path, "thin", recs, repeats=3)
+    out, md = tmp_path / "thin.json", tmp_path / "thin.md"
+    assert B.main(["freeze", d, "--out", str(out), "--markdown", str(md)]) == 0
+    err = capsys.readouterr().err
+    assert ("baseline.py: WARNING latency max/first_answer_s is gated but has insufficient samples (n=1, 0 unit(s) "
+            "with >= 2 samples") in err
+    assert err.count("WARNING latency") == 1 and "unless --allow-insufficient" in err
+    text = md.read_text()
+    assert "**1 gated class/metric(s) have too few baseline samples: every compare fails on them" in text
+    assert "- **latency max/first_answer_s is gated but has insufficient samples (n=1" in text
+    assert B.insufficient_gated(json.loads(out.read_text())["latency"]) == [
+        {"workload": "max", "metric": "first_answer_s", "n": 1, "noise_units": 0}]
 
 
 def test_freeze_refuses_fewer_than_three_records_per_case():
@@ -443,6 +463,38 @@ def test_a_record_without_a_conversation_id_is_refused(tmp_path, conv):
     base = frozen(three_repeats())
     with pytest.raises(B.BaselineError, match="has no conversation_id"):
         B.compare(base, B.load_runs([a]))
+
+
+def test_freeze_records_each_deviation_from_the_procedure(tmp_path, capsys):
+    """Re-QA 6: one run of --repeats 3 on a used account froze silently although method.runs forbids it."""
+    used = write_run(tmp_path, "used", three_repeats(), repeats=3,
+                     cond={"workers": 2, "account": {"conversations": 40, "facts": 12, "checked": True,
+                                                     "allowed_used": True}})
+    unchecked = write_run(tmp_path, "unchecked", _ids(three_repeats(), "u"), repeats=3,
+                          cond={"workers": 2, "account": None})
+    out, md = tmp_path / "b.json", tmp_path / "b.md"
+    assert B.main(["freeze", used, unchecked, "--out", str(out), "--markdown", str(md)]) == 0
+    doc = json.loads(out.read_text())
+    assert [(d["run"], d["deviation"]) for d in doc["procedure_deviations"]] == [
+        ("used", "repeats"), ("used", "workers"), ("used", "account_not_fresh"), ("used", "account_allowed_used"),
+        ("unchecked", "repeats"), ("unchecked", "workers"), ("unchecked", "account_unchecked")]
+    assert "40 conversation(s) and 12 saved fact(s)" in doc["procedure_deviations"][2]["detail"]
+    err = capsys.readouterr().err
+    assert err.count("baseline.py: WARNING procedure deviation") == 7
+    assert "WARNING procedure deviation, run used: --repeats 3: the repeats of a case shared one account" in err
+    text = md.read_text()
+    assert text.index("### Procedure deviations") < text.index("### Conditions")
+    assert "**7 deviation(s) from the procedure (method `runs`)" in text
+    assert "- **run `unchecked`: account_unchecked**: the run did not count" in text
+    # checked but without counts; the procedure text says what freeze refuses and what it only records
+    doc = frozen(three_repeats(), account={"checked": True, "conversations": None, "facts": None})
+    assert [d["deviation"] for d in doc["procedure_deviations"]] == ["repeats", "account_counts_missing"]
+    assert "Procedure: (1)" in doc["method"]["runs"] and "Recorded, not refused" in doc["method"]["runs"]
+    # compare lists both sides' deviations; they never block
+    assert B.main(["compare", str(out), used, unchecked]) == 0
+    printed = capsys.readouterr().out
+    assert printed.count("PROCEDURE DEVIATION (baseline)") == 7
+    assert printed.count("PROCEDURE DEVIATION (candidate)") == 7
 
 
 def test_mixed_condition_labels_are_refused_without_the_flag(tmp_path):
@@ -909,6 +961,7 @@ def test_baseline_side_insufficiency_fails_unless_allowed():
     lambda d: d["quality"]["checks"]["c00"].update(passed=9),
     lambda d: d.update(schema=1),
     lambda d: d.update(schema=2),
+    lambda d: d.update(procedure_deviations=[]),
 ])
 def test_compare_refuses_a_baseline_whose_numbers_disagree(mutate):
     base = json.loads(json.dumps(frozen(three_repeats())))
@@ -933,6 +986,11 @@ def test_render_markdown_has_every_table_and_a_workload_row(tmp_path):
     assert "### Conditions" in md and 'label "synthetic stack, cap 2"' in md and "`0123abc`" in md
     assert f"Eval set sha256 `{SHA}`" in md and "account 0 other conversations, 0 saved facts" in md
     assert "run `run1`" in md and str(tmp_path) not in md                     # the run's name, not the path
+    # one run of --repeats 3: listed at the top as a deviation from the procedure
+    assert md.index("### Procedure deviations") < md.index("### Conditions")
+    assert "**1 deviation(s) from the procedure (method `runs`)" in md
+    assert "- **run `run1`: repeats**: --repeats 3: the repeats of a case shared one account" in md
+    assert "### Gated latency without enough samples\n\nNone: every gated class/metric has enough samples." in md
     assert ("| direct_fast | total_s | yes | 3 | 1 | 0 | 0 | 1.00 | 1.00 | 1.00 | 1.00 | 0.000 | class | 1.00 | "
             "1.700 | reported (n < 20) |") in md
     assert "| think | first_event_s | no | 3 |" in md and "| direct_fast | first_token_s | no | 3 |" in md
