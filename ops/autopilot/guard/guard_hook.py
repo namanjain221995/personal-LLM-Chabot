@@ -1908,6 +1908,68 @@ _CODE_WRITE_OP = re.compile(
     r"os\.(remove|unlink|rename|replace|rmdir|makedirs|mkdir)|writeFileSync|rmSync|unlinkSync|renameSync|"
     r"pathlib\.Path\([^)]*\)[^\n]*\.(write_|unlink|rename|replace|rmdir|mkdir)"
 )
+# The call head of a write/delete operation. _inline_write_hits_protected()
+# then reads the operation's OWN argument(s), so merely NAMING a protected path
+# in an unrelated string (e.g. writing a note to /tmp whose text mentions
+# ~/.llm-autopilot/guard) is not refused — only writing or deleting AT a
+# protected path is (P0-19 false positive).
+_CODE_WRITE_CALL = re.compile(
+    r"\bopen\s*\(|"
+    r"(?:shutil\.(?:rmtree|move|copy\w*)|os\.(?:remove|unlink|rename|replace|rmdir|makedirs|mkdir)|"
+    r"\bwriteFileSync|\brmSync|\bunlinkSync|\brenameSync)\s*\(|"
+    r"(?:pathlib\.)?Path\s*\("
+)
+_OPEN_WRITE_MODE = re.compile(r",\s*(?:mode\s*=\s*)?['\"][wax+]")
+# A write/delete method applied to a Path(...) object, possibly after chained
+# calls such as .expanduser() / .resolve().
+_PATH_WRITE_METHOD = re.compile(r"\s*(?:\.\s*\w+\s*\([^)]*\)\s*)*\.\s*(?:write_text|write_bytes|unlink|rename|replace|rmdir|mkdir)\b")
+
+
+def _call_parts(text, i, limit=4000):
+    """text[i] is just past a call's '('. Return (first_top_level_arg, full_inside,
+    index_just_past_the_matching_')'), quote- and nesting-aware (bounded)."""
+    depth, q, j, n, first_end = 1, None, i, min(len(text), i + limit), None
+    while j < n:
+        c = text[j]
+        if q:
+            if c == q and text[j - 1] != "\\":
+                q = None
+        elif c in "'\"":
+            q = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                break
+        elif c == "," and depth == 1 and first_end is None:
+            first_end = j
+        j += 1
+    inside = text[i:j]
+    first = text[i:first_end] if first_end is not None else inside
+    return first, inside, j + 1  # j is the matching ')'; return the index past it
+
+
+def _inline_write_hits_protected(joined, roots):
+    """True when an inline write/delete operation ACTS ON a protected root: the
+    root appears in that operation's own target argument (a literal path), or the
+    target is a computed expression (a variable/concat, no string literal of its
+    own) while some protected root is present in the code (fail-closed on
+    indirection). A root named in unrelated data is ignored."""
+    present = [r for r in roots if r in joined]
+    for m in _CODE_WRITE_CALL.finditer(joined):
+        head = m.group()
+        first, inside, after = _call_parts(joined, m.end())
+        if head.lstrip().startswith("open") and not _OPEN_WRITE_MODE.search(inside):
+            continue  # open() without a write mode is a read
+        if "Path(" in head and not _PATH_WRITE_METHOD.match(joined[after:after + 160]):
+            continue  # Path(...) not followed by a write/delete method
+        target = first
+        if any(r in target for r in roots):
+            return True
+        if present and "'" not in target and '"' not in target:
+            return True
+    return False
 # A secret-shaped environment variable read from inline code. TOKEN(?!S|IZER)
 # and AUTH(?!OR) keep MAX_TOKENS / TOKENIZERS_PARALLELISM / GIT_AUTHOR_NAME (all
 # benign in this LLM codebase) from being read as secrets.
@@ -1946,10 +2008,10 @@ def check_code_text(code, ctx):
         items = re.findall(r"['\"]([^'\"]*)['\"]", m.group(1))
         if items:
             analyze(" ".join(items), ctx.child())
-    for root in (PROD_CHECKOUT, R_PROD, os.path.join(HOME, "Documents"), "~/Documents",
-                 AUTOPILOT_HOME, "~/.llm-autopilot", "/.llm-autopilot/"):
-        if root in joined and _CODE_WRITE_OP.search(joined):  # joined so 'a'+'b' concatenation is seen
-            ctx.deny(f"inline code writes or deletes under {root}, which is read-only to the autopilot (guard files and production/model trees)")
+    roots = (PROD_CHECKOUT, R_PROD, os.path.join(HOME, "Documents"), "~/Documents",
+             AUTOPILOT_HOME, "~/.llm-autopilot", "/.llm-autopilot/")
+    if _inline_write_hits_protected(joined, roots):  # joined so 'a'+'b' concatenation is seen
+        ctx.deny("inline code writes or deletes under a read-only tree (the autopilot's guard files, ~/.llm-autopilot, or the production/model/Documents trees); operate only on paths the autopilot may write")
 
 
 # The exact header distlib / pip / uv write on a console-script entry point:
