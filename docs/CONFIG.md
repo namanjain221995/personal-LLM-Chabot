@@ -208,30 +208,6 @@ purge shared pages by domain, origin or introducer); on the host,
 |---|---|---|
 | `ASR_TIMEOUT_S` | `600` | How long the orchestrator waits for one engine to answer one clip. |
 | `ASR_MAX_AUDIO_SECONDS` | `600` | The longest recording accepted; the composer stops recording at it. |
-| `ASR_CPU_BASE_URLS` | empty | The CPU overflow replicas, tried in this order: the worker's, then the head's when it runs (`scripts/whisper-cpu.sh` merges it; `WHISPER_CPU_NODE=head` for the head's copy). Empty: no CPU replica. |
-| `ASR_CPU_FIXED_S` | `8.5` | The CPU replica's per-clip overhead in its decode estimate (pre-pass + one encoder window). |
-| `ASR_CPU_S_PER_AUDIO_S` | `0.45` | The CPU replica's seconds of decoding per second of audio in that estimate (the slowest measured: Hindi-English long form). |
-| `ASR_CPU_DEADLINE_MARGIN` | `1.5` | A clip goes to the CPU replica only when estimate x this fits its deadline. |
-
-**The CPU replica is overflow, never first choice** (docs/voice/CPU-REPLICA.md).
-A clip goes to it only when every GPU replica already has a clip in flight (or
-is standing down after a failure), and only when `(ASR_CPU_FIXED_S + seconds x
-ASR_CPU_S_PER_AUDIO_S) x ASR_CPU_DEADLINE_MARGIN` fits the clip's deadline: the
-session window timeout (`VOICE_SESSION_WINDOW_TIMEOUT_S`) for a recording
-window, `ASR_TIMEOUT_S` otherwise. A WAV clip's length is read from its header;
-a clip of unknown length (WebM on the legacy path) is costed at
-`ASR_MAX_AUDIO_SECONDS`. A clip that does not fit is not sent: it waits for a
-GPU replica exactly as before. That judgement assumes the replica is free when
-the router's own in-flight count says so, and the count forgets a decode whose
-caller let go of it (a cancelled call, a read timeout, an orchestrator
-restart). So the replica refuses any clip with a 503 while it is decoding,
-and the router takes that clip to the GPU queue in the same call: no clip
-waits behind a decode on the CPU. While a GPU replica is free the CPU replica is
-only the last resort after every GPU replica has failed the same call.
-`ASR_CPU_BASE_URLS` lists each replica once (a repeated URL, with or without
-a trailing slash, is dropped). The legacy dictation pool lends a CPU replica's
-slot only to a clip the router is about to send there, so `ASR_MAX_CONCURRENT`
-per GPU replica still holds when the CPU replica cannot take a clip.
 
 **Measured basis for `ASR_TIMEOUT_S` (2026-09-18, the worker Spark).**
 Whisper's sequential long-form pass took 0.45 s per second of audio on a

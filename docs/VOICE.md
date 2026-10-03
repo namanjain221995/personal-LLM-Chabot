@@ -207,34 +207,6 @@ and one ready to start, so the GPU never idles between clips and nobody queues
 behind more than one other person; past that a caller is told to try again
 rather than silently extending the window in which everyone's answers are slow.
 
-### A third copy on the worker's CPU (overflow only, 2026-09-30)
-
-`scripts/whisper-cpu.sh up` starts the same model (the same pinned weights,
-as whisper.cpp q8_0) on ten Cortex-X925 cores of the worker and no GPU. The
-orchestrator sends it a clip only when every GPU replica is already decoding
-one, and only if the clip can finish inside its deadline at the CPU's measured
-speed (`ASR_CPU_*`). Measured on the GPU baselines' own clips, utterance by
-utterance, it matches the GPU replicas within noise: LibriSpeech 3.89 % against
-4.21 %, FLEURS English 7.03 % against 6.81 %, FLEURS Hindi 39.11 % against
-39.42 % (200 utterances), MUCS Hindi-English 69.99 % against 65.40 % (one
-looping clip; 64.74 against 66.01 % without it). Every 95 % interval contains
-zero. Those pairs are verbose_json; the legacy dictation's first pass (json)
-is not paired yet. Its image lifts whisper.cpp's 220-token window limit to the
-pipeline's 443, without which dense Hindi repeated its tail. It holds 2.0 GiB
-and takes 0.2-1.0 s per second of audio. While it decoded, the 27B (the main
-model from 15:49 to 22:38 IST on 2026-09-30 only) lost about 5 % of its decode
-speed (a GPU replica cost it about 19 %); on Qwen3.6-35B-A3B, the main model
-again, the one measurement is −3.6 % (95 % CI −11.6 % to +5.3 %). It never
-queues: a clip that arrives while it decodes gets a 503 and goes to the GPU
-queue in the same call.
-It was proven end to end through the orchestrator's own router against a
-throwaway copy on the worker (13 scenarios, 2026-09-30). Its port, 30008, has no
-authentication, so `up` refuses to start it until the worker's packet filter
-closes that port to everything but the head, both in the table loaded now and in
-the copy that loads it at boot.
-Everything, including how it was measured, is in
-[voice/CPU-REPLICA.md](voice/CPU-REPLICA.md).
-
 ### Honest comparison with what this replaced
 
 The engine before this was `Qwen/Qwen3-ASR-1.7B` on vLLM, and swapping it in
@@ -342,8 +314,6 @@ scripts/whisper.sh verify          # transcribe a real clip and print what came 
 scripts/whisper.sh url             # the endpoint(s) the orchestrator should use
 scripts/whisper.sh logs
 scripts/whisper.sh down            # stops dictation; touches nothing else
-scripts/whisper-cpu.sh up          # the CPU overflow replica on the worker (voice/CPU-REPLICA.md)
-scripts/whisper-cpu.sh down        # ...and back to GPU replicas only
 ```
 
 `up` writes `ASR_ENABLED=true` and `ASR_BASE_URLS` into `.env`, then the
