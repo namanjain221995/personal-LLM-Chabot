@@ -123,11 +123,15 @@ graceful_restart() {
             return 1
         fi
     done
-    # STOP goes before the handlers do, so an interrupt at any point either
-    # finds STOP gone or removes it itself.
+    # From here until the runner is started, INT, TERM and HUP are ignored (by
+    # systemctl too, which inherits that), so an interrupt cannot leave STOP
+    # removed but the runner not started. One that came just before this line
+    # still finds the handler, which removes STOP itself and says the runner
+    # is down.
+    trap '' INT TERM HUP
     rm -f "$AP/STOP"
-    trap - INT TERM HUP PIPE
     systemctl --user start llm-autopilot.service
+    trap - INT TERM HUP PIPE
     echo "restarted on the new code; watch with: $AP/bin/status.sh"
 }
 

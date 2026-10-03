@@ -47,7 +47,7 @@ ops/autopilot/install.sh --restart-after-cycle    # install, then STOP, wait for
 
 Re-run `install.sh` after changing anything here. The guard hooks, settings and `CYCLE_PROMPT.md` are re-read on every call or cycle and pick up changes at once. **`autopilot.py` is the exception:** `systemctl start` on an active unit is a no-op, so the running process keeps the old runner code until it is restarted. Use `--restart-after-cycle`; a plain `systemctl --user restart` would SIGTERM the in-flight cycle. `install.sh` warns when `autopilot.py` changed while the runner was active.
 
-Ctrl-C during the `--restart-after-cycle` wait (or `TERM`, or the terminal closing) removes the `STOP` file that run created and leaves the old runner running its cycle on the old code; it says so, and whether the runner is still up. A `STOP` that was there before the run stays. Further signals are ignored while it cleans up, so pressing Ctrl-C twice cannot leave `STOP` behind. Re-run `--restart-after-cycle` to try again.
+Ctrl-C during the `--restart-after-cycle` wait (or `TERM`, or the terminal closing) removes the `STOP` file that run created and leaves the old runner running its cycle on the old code; it says so, and whether the runner is still up. A `STOP` that was there before the run stays. Further signals are ignored while it cleans up, so pressing Ctrl-C twice cannot leave `STOP` behind. Re-run `--restart-after-cycle` to try again. Once the old runner has exited, these signals are ignored until the new code is started, so an interrupt then cannot leave `STOP` removed and the runner down.
 
 Control the running runner through the host-only files:
 

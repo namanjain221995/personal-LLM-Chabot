@@ -668,10 +668,17 @@ class Units(unittest.TestCase):
 
 
 # is-active prints the word in ./state (a one-shot ./hang file makes that call
-# hang until it is signalled); every call is logged in ./calls.
+# hang until it is signalled); every call is logged in ./calls. With a
+# ./signal-on-start file naming a signal, start sends it to its whole process
+# group (the shell that called it included) and logs "start done" only if it
+# survives that.
 FAKE_SYSTEMCTL = """#!/bin/sh
 d=$(dirname "$0")
 echo "$*" >> "$d/calls"
+if [ "$2" = start ] && [ -e "$d/signal-on-start" ]; then
+    kill -s "$(cat "$d/signal-on-start")" 0
+    echo "start done" >> "$d/calls"
+fi
 if [ "$2" = is-active ]; then
     if [ -e "$d/hang" ]; then
         rm -f "$d/hang"
@@ -853,9 +860,37 @@ class InstallScript(unittest.TestCase):
         self.assertNotIn("--user start llm-autopilot.service", self.calls())
 
     def test_the_normal_path_removes_stop_before_dropping_its_handlers(self):
-        # An interrupt between the two still finds STOP gone or removes it.
+        # P0-18: the handlers give way to ignoring the signals, not to the
+        # defaults, before STOP is removed; the defaults come back only once
+        # the runner is started.
         body = re.search(r"^graceful_restart\(\) \{\n(.*?)^\}\n", read(INSTALL), re.M | re.S).group(1)
-        self.assertIn('    rm -f "$AP/STOP"\n    trap - INT TERM HUP PIPE\n    systemctl --user start', body)
+        self.assertIn("    trap '' INT TERM HUP\n    rm -f \"$AP/STOP\"\n    systemctl --user start llm-autopilot.service\n"
+                      "    trap - INT TERM HUP PIPE\n", body)
+
+    def test_an_interrupt_during_the_final_start_still_starts_the_runner(self):
+        # P0-18: STOP is gone and the runner has exited on it; a Ctrl-C, TERM
+        # or closing terminal now must not leave it down. The fake systemctl
+        # signals the whole process group from inside `start`, so the signal
+        # always lands in that window: with default handlers there the shell
+        # and systemctl die and "start done" is never logged.
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(sig=sig.name):
+                for f in ("calls", "hang"):
+                    if os.path.exists(os.path.join(self.bin, f)):
+                        os.remove(os.path.join(self.bin, f))
+                with open(os.path.join(self.bin, "signal-on-start"), "w") as fh:
+                    fh.write(sig.name[3:] + "\n")
+                proc = self.start_wait()
+                self.assertTrue(self.wait_for(lambda: os.path.exists(self.stop)))
+                self.set_state("inactive")
+                out, err = proc.communicate(timeout=20)
+                calls = self.calls()
+                self.assertEqual(proc.returncode, 0, err)
+                self.assertFalse(os.path.exists(self.stop))
+                self.assertIn("--user start llm-autopilot.service", calls)
+                self.assertEqual(calls[-1], "start done", "systemctl ignored the signal and finished the start")
+                self.assertIn("restarted on the new code", out)
+                self.assertNotIn("interrupted", err)
 
     def test_an_interrupted_restart_wait_keeps_an_operator_stop_file(self):
         open(self.stop, "w").close()
