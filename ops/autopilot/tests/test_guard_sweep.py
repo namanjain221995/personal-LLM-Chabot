@@ -408,6 +408,9 @@ MATCHER_DENY = [
     ("EnterWorktree", {"path": f"{HOME}/Documents/project/Model"}, None),
     ("mcp__slack__post_message", {"channel": "x", "text": f"token {FAKE_TOKEN}"}, None),
     ("mcp__slack__post_message", {"channel": "x", "text": "a deploy status"}, None),  # a write, no read-only verb
+    ("mcp__kubernetes__resources_delete", {"name": "x"}, None),  # read noun as a prefix: still a write
+    ("mcp__srv__update_status", {"id": 1}, None),                # read noun as a trailing object
+    ("mcp__srv__delete_resource", {"id": 1}, None),
     ("SomeFutureShellTool", {"command": "sudo true"}, None),                         # unknown tool, runs a shell cmd
     ("SomeFutureFileTool", {"file_path": f"{PROD}/.env"}, None),                      # unknown tool, reads a secret
 ]

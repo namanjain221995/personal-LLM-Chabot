@@ -3043,7 +3043,13 @@ FILE_READ_TOOLS = ("Read", "Grep", "NotebookRead", "Glob")
 # stay allowed; only a secret-carrying prompt or a request to run outside the
 # local guard (remote isolation) is refused.
 AGENT_TOOLS = ("Agent", "Task", "Workflow", "Skill")
-MCP_READONLY = re.compile(r"(^|_|__)(get|list|read|view|search|fetch|query|describe|show|status|lookup|inspect|resolve|resources?|retrieve|count|watch)(_|$|[A-Z])")
+# A read-only MCP leaf: the tool name AFTER the last '__' must START with a read
+# verb, so update_status / resources_delete / delete_resource (a read verb only
+# as a trailing noun) are refused, while get_/list_/read_/search_ pass.
+MCP_READONLY = re.compile(
+    r"^(get|list|read|view|search|fetch|query|describe|show|status|lookup|inspect|retrieve|count|watch|ping|head)s?(_|$|[A-Z0-9])",
+    re.I,
+)
 
 
 def _command_too_big(cmd):
@@ -3115,9 +3121,9 @@ def _refuse_secret_shape_in(tool, ti):
 # Hosts/addresses a WebFetch/WebSearch/WebSocket must never reach: production
 # control planes, and any private, link-local or loopback address.
 LINK_LOCAL_OR_PRIVATE = re.compile(
-    r"^(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[?::1\]?|169\.254\.\d+\.\d+|"
+    r"^(localhost|127(\.\d+){1,3}|0\.0\.0\.0|0x[0-9a-f]+|\d{8,10}|\[?::1\]?|169\.254\.\d+\.\d+|"
     r"192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|"
-    r"fe80:[0-9a-f:]*|fc[0-9a-f:]+|fd[0-9a-f:]+|[\w-]+\.internal|host\.docker\.internal)$",
+    r"::ffff:[0-9a-f.:]+|fe80:[0-9a-f:]*|fc[0-9a-f:]+|fd[0-9a-f:]+|[\w-]+\.internal|host\.docker\.internal)$",
     re.I,
 )
 
@@ -3181,13 +3187,22 @@ def check_enter_worktree(ti, cwd):
 
 def check_mcp_tool(tool, ti):
     _refuse_secret_shape_in(tool, ti)
-    leaf = tool[len("mcp__"):]
-    if not MCP_READONLY.search(leaf):
-        block(f"{TAG} {tool} -> blocked: MCP tools reach external services; only clearly read-only MCP calls (get/list/read/view/search/...) pass this guard (§3.3).")
+    leaf = tool.split("__")[-1]  # the tool name after the server segment(s)
+    if not MCP_READONLY.match(leaf):
+        block(f"{TAG} {tool} -> blocked: MCP tools reach external services; only clearly read-only MCP calls whose name begins with a read verb (get/list/read/view/search/...) pass this guard (§3.3).")
 
 
 def _deadline_reached(signum, frame):
-    raise Block(f"{TAG} the guard did not finish within its {GUARD_DEADLINE_S}s budget; blocking (fail-closed) so a slow check can never let a call through by timing out. Split or simplify the command.")
+    # Terminate hard with exit 2. Raising here could let the alarm fire inside an
+    # except/finally and escape main() as exit 1, which Claude Code treats as
+    # non-blocking (fail-open). os._exit guarantees a blocking exit code.
+    try:
+        sys.stderr.write(f"{TAG} the guard did not finish within its {GUARD_DEADLINE_S}s budget; "
+                         "blocking (fail-closed) so a slow check can never let a call through by timing out. "
+                         "Split or simplify the command.\n")
+        sys.stderr.flush()
+    finally:
+        os._exit(2)
 
 
 def main():
@@ -3207,9 +3222,15 @@ def main():
     try:
         evaluate(payload)
     except Block as b:
+        if armed:  # stop the clock before reporting so the alarm cannot interrupt the print
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, signal.SIG_IGN)
         print(str(b), file=sys.stderr)
         return 2
-    except BaseException as exc:  # fail closed on anything, including the deadline alarm
+    except BaseException as exc:  # fail closed on anything else
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, signal.SIG_IGN)
         print(f"{TAG} internal error ({type(exc).__name__}: {exc}); blocking (fail-closed). Simplify the command.", file=sys.stderr)
         return 2
     finally:

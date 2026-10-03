@@ -36,9 +36,14 @@ of them skips layer 3:
 | `EnterWorktree` | can move the session's write access | refuse pointing at the production checkout, `~/Documents`, a secret path or the guard files |
 | `mcp__.*` | MCP tools reach external services | refuse unless the tool name is clearly read-only (get/list/read/view/search/...) |
 
-Any other tool still reaches the hook: if its input has a `command` it is analysed
-like Bash, if it has a path the secret-file checks run, and a credential-shaped
-string anywhere in its input is refused; otherwise it is left to layers 1 and 2.
+The matcher is a fixed alternation, so only the tools above (and any `mcp__*`)
+reach layer 3; a tool not named here is left to layers 1 and 2 (`permissions.deny`
+and the auto-mode classifier). For a matched tool the guard does not specially
+model, the `evaluate()` fall-through still applies the shared safety net: a
+`command` field is analysed like Bash, a path field runs the secret-file checks,
+and a credential-shaped string anywhere in its input is refused.
+`test_guard_sweep.py` asserts the template JSON parses and that its matcher
+covers every tool in this table.
 
 The gate also refuses a commit whose `.github/` tree differs from `origin/dev`, because that commit's checks could have been graded by edited CI. When the programme changes `.github/`, the operator reviews `git diff origin/dev <commit> -- .github/` and approves it by adding the tree hash the gate prints as one line of `~/.llm-autopilot/approved-ci-trees` (operator-owned; the agent cannot write it). The agent raises a `NEEDS_HUMAN.md` item as soon as the trees first differ.
 
