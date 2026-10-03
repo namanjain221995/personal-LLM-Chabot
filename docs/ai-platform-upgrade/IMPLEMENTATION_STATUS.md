@@ -2,6 +2,23 @@
 
 History of the programme, newest first. Designed ≠ Implemented ≠ Tested ≠ Deployed; each entry says which.
 
+## 2026-10-03/04 — Autopilot cycle 9 (from about 19:20 UTC)
+
+B-04 split: B-04a (the runner, the statistics tool and the frozen tolerance method) done; B-04b (the baseline run itself) waits for the 05:00–07:00 IST window, which opens after this cycle's 4 h limit. Agents in parallel, each in its own worktree, against one written contract (results.json schema 1): a runner builder (`~/work/llm-b04-run`) and a statistics builder (`~/work/llm-b04-stats`); then two fresh QA reviewers (runner lens, statistics lens), two fixers, two fresh re-reviewers, two round-2 fixers. The main session integrated on `upgrade/b/baseline` (`~/work/llm-b04`), wrote the pipeline test, changed the noise estimate after its own Monte Carlo, ran the smoke against the dev stack and wrote the records.
+
+| Item | State | Evidence (command → result) |
+|---|---|---|
+| Runner `scripts/aiq/run_evalset.py`, harness client additions (977574cb, 00b43e03, b09605f5) | Implemented, TEST_PASSED | Builder against a loopback fake orchestrator: `pytest scripts/aiq/tests` → `124 passed`; run.py's request bytes unchanged (QA byte compare) |
+| Statistics `scripts/aiq/baseline.py` (95ba7509, 11e5915f) | Implemented, TEST_PASSED | Builder on synthetic schema-1 runs: `118 passed` |
+| Pipeline test (1860ae5b, main session) | TEST_PASSED | Three repeats of all 16 cases through the runner and the fake, frozen, compared with themselves (pass) and with an RQ03 names-only break (fails on exactly RQ03) |
+| QA round 1 (two fresh reviewers) | `fix_first` ×2 → fixed | Runner: 4 blocking (failed turns as latency samples; Ctrl-C kept sending; account recall contaminating repeats; SSE dropped lines on U+2028/2029/0085) + 11. Statistics: 5 blocking (class-spread noise passed 1.5× slowdowns and false-blocked on single samples; thin/unfinished baselines froze; non-comparable candidates passed; never-passing cases ungated; labels into the public baseline) + 12. Fixed 850d6027, 72e2e2e1 (runner `167 passed`; 43 new tests fail on the old code) and 20d27921 (statistics `184 passed`; 84 new tests fail on the old code) |
+| Noise estimate (9a427815, main session) | TEST_PASSED | Own Monte Carlo of freeze+compare (400 trials a row): per-class σ false-blocked unchanged builds 12.75 % (σ 0.15) and 32.75–41.75 % with load spikes; max(class, all-class pooled) gave 6.5 % / 15–19 % |
+| Re-QA (two fresh reviewers) | `fix_first` ×2 → fixed | Runner: a passed `--deadline` rolled over to tomorrow (a late start would run in business hours and freeze) + 10. Statistics: the all-class pooled σ let Think/Max noise loosen Fast (a Fast-only 1.3× slowdown caught in 34 %) + 10. Fixed 3a2e4589, d016d393 (runner `189 passed`; 25 new tests fail on 72e2e2e1) and 122050e1..fdd41a4f (statistics `334 passed`; 55 fail on 9a427815); family-pooled σ: Fast-only 1.3× caught in 87–99 % (heterogeneous noise), unchanged builds blocked 3–8.5 % (19–23.5 % with spikes) |
+| Smoke against the dev stack | TEST_PASSED (2 cases, not a benchmark) | Main engine 0 running / 0 waiting before each. Fresh accounts `aiq-smoke-20261004a`/`b`. EV01 and RQ03 passed every check twice; real trace stages, usage and model id captured; password absent from the run files. `--not-before 05:00` at 03:25 → exit 2; `freeze` of the two runs → exit 2 (fewer than 3 records) |
+| Merged into autopilot/dev c4fbcca6 | TEST_PASSED | `pytest scripts/aiq/tests` → `356 passed in 77.71s`; `orchestrator/tests/test_aiq_harness.py` (test database on the worker) → `59 passed, 5 skipped`; `eval_set.py` → `16 cases, valid`; regex scan of the merged diff: no hosts, addresses or secrets |
+| PR #98 CI | TEST_FAILED (pre-existing) | Every run since 64e4f699 fails `Security scanning` on one gitleaks finding inside the baseline file's own note (runs listed in NH-014); the classifier refused cycle 9's baseline edit, so it went to the operator (NH-014) |
+| B-04b baseline run | TEST_NOT_RUN | Belongs to the 05:00–07:00 IST window, after this cycle's 4 h limit |
+
 ## 2026-10-03/04 — Autopilot cycle 8 (from about 18:13 UTC)
 
 B-01, the dev stack on the worker. Two builders ran in parallel in their own worktrees (`~/work/llm-b01-cap`: the inference cap; `~/work/llm-b01`: overlay, scripts, README); one read-only investigator mapped the engine environment contract; the main session built the images, integrated, brought the stack up and ran the smoke tests; a fresh-context QA reviewer read the final diff.

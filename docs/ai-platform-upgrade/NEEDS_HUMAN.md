@@ -2,6 +2,19 @@
 
 Items only the operator can resolve. Each has the exact action, why, the risk, the command and the rollback. Open items first.
 
+## NH-014 — The status board's secret scan has failed on every run since cycle 3 (OPEN, action)
+
+- **What:** every CI run on PR #98 since 64e4f699 (cycle 3, 2026-10-03 09:57 UTC) failed `Security scanning`, so `CI passed` failed too: runs 37114769359, 37135812356, 37138911391, 37143364865, 37147459830. The cause is one new gitleaks finding, `generic-api-key` at `.github/workflows/gitleaks-baseline.json:126`: the explanatory note that 64e4f699 added to the baseline quotes, verbatim, one of the two fabricated runner-test values it baselines. Nothing else failed in those runs except one orchestrator shard in the first.
+- **Why you:** the fix is another reviewed entry in the secret-scan baseline (and rewording the note so it no longer quotes the value). Cycle 9 prepared that edit and the auto-mode classifier refused it as a change to a security control, so the autopilot leaves it to you. The finish-line gate (`merge_to_dev.sh`) needs `CI passed` green on the exact commit, so this blocks the final merge, not today's work.
+- **What to check:** `git -C ~/work/llm-dev show 64e4f699 -- .github/workflows/gitleaks-baseline.json` (the note at line 126 names a fabricated command-line token fed to the runner's log redactor in `ops/autopilot/tests/test_runner.py`; it was never minted).
+- **Command (if you agree):** add to `findings` in `.github/workflows/gitleaks-baseline.json`
+  ```json
+  {"fingerprint": "64e4f6995cdb7fddefc738cc623678bbf3230f7f:.github/workflows/gitleaks-baseline.json:generic-api-key:126", "rule": "generic-api-key", "file": ".github/workflows/gitleaks-baseline.json", "line": 126}
+  ```
+  reword line 126 so it describes the value instead of quoting it, commit on `autopilot/dev`, push, and approve the new `.github/` tree as NH-011 describes. The next PR #98 run should show `leaks found: 30` with no `NEW` line.
+- **Risk:** a baseline entry silences exactly one fingerprint (commit, file, rule, line); the gate fails if the entry ever stops matching.
+- **Rollback:** revert that commit.
+
 ## NH-013 — How the dev stack should reach the router, embedding and reranker engines (OPEN, decision)
 
 - **What:** the dev stack (B-01, `ops/dev/README.md`) runs on the worker. From there only the production main engine answers; the router, embedding and reranker engines listen on the head's loopback. So the dev stack runs with the main model serving router, agent and vision calls, and with embeddings and reranking off. Baselines measured on it (B-04) say so, and questions about uploaded documents lose semantic retrieval there.
