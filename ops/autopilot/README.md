@@ -1,20 +1,60 @@
 # ops/autopilot
 
-Guardrails for unattended Claude Code sessions that carry out `docs/ai-platform-upgrade/MASTER_PROMPT.md`.
+Guardrails and the unattended runner that carry out `docs/ai-platform-upgrade/MASTER_PROMPT.md` without an operator session. The operator approved the runner on 2026-10-03 (MASTER_PROMPT.md section 0, decision 9).
 
-Status (2026-10-03): the guard layers exist and the hook is unit-tested. The runner that would start the sessions is **not written**: Claude Code's auto-mode classifier refused to let an agent create it, and the operator decides how to proceed (`docs/ai-platform-upgrade/NEEDS_HUMAN.md`, NH-001).
+The runner starts fresh `claude -p` cycles in the dev worktree, one after another; each cycle reads the governing files, so nothing important lives only in chat history. Between cycles it waits for usage-limit resets, backs off on failures, honours `STOP`/`PAUSE`, and stops at the finish line or at `MAX_AUTONOMOUS_DAYS`.
+
+## Files
 
 | File | Purpose |
 |---|---|
-| `settings.autopilot.json` | Passed with `--settings`. Layer 1 `permissions.deny`, layer 2 `autoMode` (environment of this host, extra allow, soft_deny and hard_deny rules), and both hooks. Installed at `~/.llm-autopilot/settings.autopilot.json`. |
-| `guard/guard_hook.py` | Layer 3 PreToolUse hook for Bash, Write, Edit, MultiEdit, NotebookEdit, Read and Grep. Exit 2 blocks with a reason. Fails closed. Installed at `~/.llm-autopilot/guard/`. |
-| `guard/stop_failure_hook.py` | StopFailure hook: appends the failed turn's `error_type` to `~/.llm-autopilot/stopfailure.jsonl` so a runner can tell usage limits from auth failures and outages. |
-| `tests/test_guard_hook.py` | Unit tests for the hook. |
+| `autopilot.py` | The runner. Installed at `~/.llm-autopilot/bin/autopilot.py` (read-only to the agent); this is the source. |
+| `CYCLE_PROMPT.md` | The `/goal` cycle prompt. Installed at `~/.llm-autopilot/bin/CYCLE_PROMPT.md`. |
+| `status.sh` | Prints the heartbeat, recent events and the integration branch. Installed at `~/.llm-autopilot/bin/status.sh`. |
+| `guard/guard_hook.py` | Layer 3 `PreToolUse` hook for Bash, Write, Edit, MultiEdit, NotebookEdit, Read and Grep. Exit 2 blocks with a reason; it fails closed. Installed at `~/.llm-autopilot/guard/`. |
+| `guard/stop_failure_hook.py` | `StopFailure` hook: appends the failed turn's `error_type` (and `session_id`/`agent_id`) to `~/.llm-autopilot/stopfailure.jsonl` so the runner can tell usage limits from auth failures and outages. |
+| `settings.autopilot.template.json` | Template for the session settings, with `{{AP_HOME}}` and `{{HOST_DETAILS}}` placeholders. `install.sh` renders it to `~/.llm-autopilot/settings.autopilot.json` (the installed copy passed with `--settings`). Layer 1 is `permissions.deny`; layer 2 is `autoMode` (`environment`, `allow`, `soft_deny`, `hard_deny`); the hooks are layer 3. |
+| `host.example.json` | Template for `~/.llm-autopilot/host.json` (host names, addresses and ports). Never commit the filled copy: this repository is public. |
+| `llm-autopilot.service` | The systemd user unit template (`@AP_HOME@`, `@WORKTREE@`, `@HOME@`). `install.sh` renders it to `~/.config/systemd/user/llm-autopilot.service`. Its `MemoryHigh`/`MemoryMax` cap the runner tree (claude, subagents, tests); containers and image builds run under the Docker daemon, outside that cap, so the guard keeps them off the head (worker only, or small `--rm` tool containers). |
+| `tests/` | `test_guard_hook.py` (the hook's decisions), `test_runner.py` (runner acceptance and units, via `tests/stub_claude.py`), `test_merge_to_dev.py` (the dev gate). |
+| `../deploy/merge_to_dev.sh` | The only way the agent moves `dev`: a fast-forward to a reviewed, CI-green commit. Installed at `~/.llm-autopilot/bin/merge_to_dev.sh` and run as a plain command with no environment overrides. |
 
-Run the tests:
+Runtime state lives in `~/.llm-autopilot/`: `state.json`, `heartbeat.json`, `events.jsonl`, `logs/`, `lock`, and the control files `STOP`, `PAUSE`, `WAKE`, `RENEW`. These and the installed copies above are read-only to the agent (the guard, the deny rules and the classifier all refuse to change them).
+
+## Tests
 
 ```bash
-python3 -m unittest discover -s ops/autopilot/tests -v
+# system python3 has no pytest; use a venv that does, e.g. the orchestrator's:
+orchestrator/.venv/bin/python -m pytest ops/autopilot/tests -q -p no:cacheprovider
+# or, where python3 already has pytest:
+python3 -m pytest ops/autopilot/tests -q -p no:cacheprovider
 ```
 
-The installed copies in `~/.llm-autopilot/` are what sessions load; the agent may not modify them (the hook, the deny rules and the classifier all refuse). Change the source here and reinstall as the operator.
+`test_runner.py` scales time down (`AP_TIME_SCALE`) and uses a stub `claude`, so the acceptance tests cost no usage and finish in under a minute.
+
+## Install, start, stop (operator only)
+
+`install.sh` refuses to run inside an autopilot session. It needs `~/.llm-autopilot/host.json` and `~/.llm-autopilot/MASTER_PROMPT.md` to exist first.
+
+```bash
+ops/autopilot/install.sh                          # install + enable (does not start)
+ops/autopilot/install.sh --start                  # install + enable + start (first time)
+ops/autopilot/install.sh --restart-after-cycle    # install, then STOP, wait for the
+                                                   # cycle to finish, and start the new code
+```
+
+Re-run `install.sh` after changing anything here. The guard hooks, settings and `CYCLE_PROMPT.md` are re-read on every call or cycle and pick up changes at once. **`autopilot.py` is the exception:** `systemctl start` on an active unit is a no-op, so the running process keeps the old runner code until it is restarted. Use `--restart-after-cycle`; a plain `systemctl --user restart` would SIGTERM the in-flight cycle. `install.sh` warns when `autopilot.py` changed while the runner was active.
+
+Control the running runner through the host-only files:
+
+```bash
+touch ~/.llm-autopilot/STOP     # finish the current cycle, then exit (service stays stopped)
+touch ~/.llm-autopilot/PAUSE    # sleep without starting cycles; remove to resume
+touch ~/.llm-autopilot/WAKE     # end a wait (usage-limit reset, backoff) early
+touch ~/.llm-autopilot/RENEW    # after MAX_AUTONOMOUS_DAYS: reset the clock and continue
+~/.llm-autopilot/bin/status.sh  # heartbeat, events, branch
+```
+
+A pending wait (a usage-limit reset or the crash cap) is kept in `state.json` across `STOP`, `PAUSE` and a restart, so the runner still honours it when it comes back; `WAKE` clears it on purpose.
+
+Exit codes: `0` a test run finished, `3` another instance holds the lock, `64` stopped on purpose (`STOP`, complete, or expired — systemd does not restart on `3` or `64`).

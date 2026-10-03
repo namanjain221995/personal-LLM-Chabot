@@ -18,8 +18,12 @@ Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
 CPUWeight=20
-# The head's memory belongs to production inference: cap the whole tree
-# (claude, subagents, tests) and make it the first thing the kernel kills.
+# The head's memory belongs to production inference: cap the runner process
+# tree (claude, subagents, tests) and make it the first thing the kernel kills.
+# NOTE: containers and image builds run under the Docker daemon, in ITS cgroup,
+# not this one, so they are NOT covered by these caps. The guard keeps dev
+# containers and builds on the worker, and allows only small, capped, --rm tool
+# containers on the head.
 MemoryHigh=5G
 MemoryMax=6G
 MemorySwapMax=512M
