@@ -14,6 +14,7 @@ import colorsys
 import csv
 import io
 import json
+import mimetypes
 import os
 import re
 import subprocess
@@ -36,6 +37,26 @@ CHART_TYPES = {
 
 # =============================================================== client ==
 
+def chat_body(conversation_id: str, message: str, history: List[dict], effort: str, web_search: str = "off", *,
+              pdf_uploads: Optional[List[dict]] = None, deep_research: Optional[bool] = None,
+              test_case_id: Optional[str] = None, extra: Optional[dict] = None) -> dict:
+    """The JSON body Client.chat POSTs to /chat. The optional fields are added
+    only when given, so a caller that passes none gets the body run.py has
+    always sent."""
+    body = {"message": message, "messages": [*history, {"role": "user", "content": message}],
+            "session_id": conversation_id, "conversation_id": conversation_id, "mode": "assistant",
+            "model": "smart", "effort": effort, "web_search": web_search}
+    if pdf_uploads:
+        body["pdf_uploads"] = list(pdf_uploads)
+    if deep_research is not None:
+        body["deep_research"] = bool(deep_research)
+    if test_case_id is not None:
+        body["test_case_id"] = test_case_id
+    if extra:
+        body.update(extra)
+    return body
+
+
 class Client:
     def __init__(self, base: str, email: str, password: str, container: Optional[str] = None):
         port = base.rsplit(":", 1)[-1].split("/")[0]
@@ -55,37 +76,79 @@ class Client:
         self.me = me.json() if me.status_code == 200 else {}
         self.user_id = self.me.get("id") or (self.me.get("user") or {}).get("id")
 
-    def upload(self, conversation_id: str, path: str) -> dict:
+    def upload(self, conversation_id: str, path: str, purpose: str = "dataset",
+               content_type: Optional[str] = None) -> dict:
+        """POST /uploads. `purpose` "dataset" (the default, a CSV) or
+        "document" (the original is kept; the chat turn names it in
+        `pdf_uploads`)."""
+        if content_type is None:
+            content_type = "text/csv" if purpose == "dataset" else (
+                mimetypes.guess_type(path)[0] or "application/octet-stream")
         with open(path, "rb") as fh:
-            r = self.http.post(f"{self.base}/uploads", data={"conversation_id": conversation_id, "purpose": "dataset"},
-                               files={"file": (os.path.basename(path), fh, "text/csv")}, timeout=300.0)
+            r = self.http.post(f"{self.base}/uploads", data={"conversation_id": conversation_id, "purpose": purpose},
+                               files={"file": (os.path.basename(path), fh, content_type)}, timeout=300.0)
         if r.status_code != 200:
             raise RuntimeError(f"upload {r.status_code}: {r.text[:300]}")
         return r.json()
 
     def chat(self, conversation_id: str, message: str, history: List[dict], effort: str,
-             attachments: Optional[List[dict]] = None, web_search: str = "off") -> dict:
-        body = {"message": message, "messages": [*history, {"role": "user", "content": message}],
-                "session_id": conversation_id, "conversation_id": conversation_id, "mode": "assistant",
-                "model": "smart", "effort": effort, "web_search": web_search}
+             attachments: Optional[List[dict]] = None, web_search: str = "off", *,
+             pdf_uploads: Optional[List[dict]] = None, deep_research: Optional[bool] = None,
+             test_case_id: Optional[str] = None, extra: Optional[dict] = None,
+             max_seconds: Optional[float] = None) -> dict:
+        """POST /chat and follow the SSE stream.
+
+        The optional keyword fields are sent only when given, so a caller that
+        passes none (run.py) sends the body it always did. `max_seconds` stops
+        READING after that long (`timed_out` True); the generation itself is
+        detached server-side and keeps running until POST /chat/stop.
+
+        Besides `seconds` and `ttft`, the result carries `request_id` (the
+        X-Request-ID response header) and `timing`, each value float seconds
+        from just before the POST, or None when it never happened:
+        first_event_s (the first SSE event of any kind; an SSE comment such as
+        the `: keep-alive` heartbeat is not an event), first_token_s (the
+        first `token` event, even whitespace), first_answer_s (the first
+        `token` event with a non-whitespace character: no step, status,
+        reasoning, meta or heartbeat counts) and total_s (the stream closed).
+        """
+        body = chat_body(conversation_id, message, history, effort, web_search, pdf_uploads=pdf_uploads,
+                         deep_research=deep_research, test_case_id=test_case_id, extra=extra)
         tokens: List[str] = []
         reasoning: List[str] = []
         steps: Dict[int, dict] = {}
         meta: dict = {}
         errors: List[dict] = []
+        stream_kw = {} if max_seconds is None else {"timeout": httpx.Timeout(30.0, read=float(max_seconds))}
         started = time.perf_counter()
         first_token = None
-        with self.http.stream("POST", f"{self.base}/chat", json=body) as r:
+        first_event = first_answer = None
+        timed_out = False
+
+        def timing(total: Optional[float]) -> dict:
+            return {k: (round(v, 3) if v is not None else None) for k, v in (
+                ("first_event_s", first_event), ("first_token_s", first_token),
+                ("first_answer_s", first_answer), ("total_s", total))}
+
+        with self.http.stream("POST", f"{self.base}/chat", json=body, **stream_kw) as r:
+            request_id = r.headers.get("x-request-id")
             if r.status_code != 200:
                 return {"http": r.status_code, "answer": "", "meta": {}, "error": r.read()[:400].decode("utf-8", "replace"),
-                        "reasoning_events": 0, "reasoning_chars": 0, "steps": {}, "seconds": 0}
+                        "reasoning_events": 0, "reasoning_chars": 0, "steps": {}, "seconds": 0,
+                        "errors": [], "request_id": request_id, "timed_out": False,
+                        "timing": timing(time.perf_counter() - started)}
             event = None
             for line in r.iter_lines():
+                if max_seconds is not None and time.perf_counter() - started > max_seconds:
+                    timed_out = True
+                    break
                 if line.startswith("event:"):
                     event = line[6:].strip()
                     continue
                 if not line.startswith("data:"):
                     continue
+                if first_event is None:
+                    first_event = time.perf_counter() - started
                 try:
                     data = json.loads(line[5:].strip() or "{}")
                 except json.JSONDecodeError:
@@ -93,6 +156,8 @@ class Client:
                 if event == "token":
                     if first_token is None:
                         first_token = time.perf_counter() - started
+                    if first_answer is None and str(data.get("text", "")).strip():
+                        first_answer = time.perf_counter() - started
                     tokens.append(str(data.get("text", "")))
                 elif event == "reasoning":
                     reasoning.append(str(data.get("text", "")))
@@ -103,10 +168,12 @@ class Client:
                     meta = {**meta, **data} if isinstance(data, dict) else meta
                 elif event == "error":
                     errors.append(data)
+        total = time.perf_counter() - started
         return {"http": 200, "answer": "".join(tokens), "meta": meta, "steps": steps, "errors": errors,
                 "reasoning_events": len(reasoning), "reasoning_chars": sum(len(x) for x in reasoning),
-                "seconds": round(time.perf_counter() - started, 1),
-                "ttft": round(first_token, 2) if first_token is not None else None}
+                "seconds": round(total, 1),
+                "ttft": round(first_token, 2) if first_token is not None else None,
+                "request_id": request_id, "timed_out": timed_out, "timing": timing(total)}
 
     def trace(self, trace_id: str) -> Optional[dict]:
         if not trace_id:
