@@ -15,8 +15,10 @@ Between cycles it:
   * on an authentication failure, records the fix for the operator in
     ~/.llm-autopilot/NEEDS_HUMAN.runtime.md and retries every 30 minutes;
   * restarts after a crash in 60 s, and sleeps 2 h after 6 crashes in a row;
-    a cycle cut off by a signal resumes after the short pause once, but a run
-    of interrupted cycles counts toward that cap like crashes do;
+    a cycle cut off by a signal counts toward that cap like a crash, but a
+    lone one never triggers it and resumes after the short pause;
+  * treats a cycle that reaches its timeout (4 h; SIGKILL 120 s later if the
+    CLI ignores SIGTERM) as a normal end, like one that reaches max turns;
   * honours ~/.llm-autopilot/STOP (finish the cycle, exit), PAUSE and the
     AUTOPILOT_PAUSE_WINDOWS operator setting;
   * stops for good when RESUME.md says STATUS: COMPLETE and FINAL_REPORT.md
@@ -33,6 +35,7 @@ the agent cannot modify it; the copy in the repository is the source.
 import datetime
 import fcntl
 import json
+import math
 import os
 import pwd
 import random
@@ -52,6 +55,23 @@ EXIT_STOPPED = 64
 
 def env(name, default):
     return os.environ.get(name, default)
+
+
+def env_number(name, default, parse, ok, rule, ignored):
+    """Read a numeric setting from the environment. A value that does not parse
+    or fails `ok` gives `default`, and (name, reason) goes on `ignored`; the
+    runner reports those as operator-setting-ignored events when it starts."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = parse(raw.strip())
+    except ValueError:
+        value = None
+    if value is None or not ok(value):
+        ignored.append((name, f"{raw!r} is not {rule}; using the default {default:g}"))
+        return default
+    return value
 
 
 def _tool(name, *candidates):
@@ -77,7 +97,20 @@ TEST_DB_VARS = env("AP_TEST_DB_VARS", os.path.join(AP_HOME, "agent/test-db.vars"
 DOCS = os.path.join(WORKTREE, "docs/ai-platform-upgrade")
 TIME_SCALE = float(env("AP_TIME_SCALE", "1"))
 MAX_CYCLES = int(env("AP_MAX_CYCLES", "0"))
-CYCLE_TIMEOUT_S = int(env("AP_CYCLE_TIMEOUT_S", str(4 * 3600)))
+# Settings ignored at import, reported by Runner.run() once events can be written.
+ENV_IGNORED = []
+# `timeout 0` and `--kill-after=0` switch those limits off, so a cycle could run
+# forever (and with a 0 timeout every killed cycle would count as a timeout, not
+# a crash); a negative one makes `timeout` refuse to start any cycle. A value
+# that does not parse or is below the floor (60 s, scaled like the runner's
+# other waits so tests can use a few seconds) falls back to the default.
+MIN_CYCLE_TIMEOUT_S = 60
+CYCLE_TIMEOUT_S = env_number("AP_CYCLE_TIMEOUT_S", 4 * 3600, int,
+                             lambda v: v >= max(1, MIN_CYCLE_TIMEOUT_S * TIME_SCALE),
+                             f"a whole number of seconds of at least {MIN_CYCLE_TIMEOUT_S}", ENV_IGNORED)
+# A CLI still running KILL_AFTER_S after the cycle timeout's SIGTERM gets SIGKILL.
+KILL_AFTER_S = env_number("AP_KILL_AFTER_S", 120.0, float, lambda v: math.isfinite(v) and v > 0,
+                          "a number of seconds above 0", ENV_IGNORED)
 MAX_TURNS = int(env("AP_MAX_TURNS", "150"))
 HEARTBEAT_S = float(env("AP_HEARTBEAT_S", "60"))
 BETWEEN_CYCLES_S = float(env("AP_BETWEEN_CYCLES_S", "30"))
@@ -466,6 +499,12 @@ def _first(rx, blob):
 
 # Process exit codes that mean the cycle was cut off rather than finished.
 INTERRUPT_RCS = {143, -15, 130, -2, 129, -1}
+# Exit codes of a cycle that SIGKILL ended. `timeout` leads the cycle's process
+# group, and the SIGKILL it sends to that group after --kill-after reaches
+# `timeout` itself, so the runner sees -9 (137 where a shell reports it); the
+# same codes come from an outside kill such as the OOM killer. Only the time
+# the cycle ran tells the two apart.
+KILLED_RCS = {-9, 137}
 
 
 def rate_event_reset(rate_events):
@@ -483,9 +522,12 @@ def rate_event_reset(rate_events):
     return reset
 
 
-def classify(rc, result, texts, fails, stop_signal=False, rate_events=None):
+def classify(rc, result, texts, fails, stop_signal=False, rate_events=None, timed_out=False):
     """Map a finished cycle to ok, interrupted, max_turns, timeout, usage_limit,
     auth, config, transient or crash. Returns (outcome, reset_at, detail).
+
+    `timed_out` says the cycle ran for at least the cycle timeout, so a
+    SIGKILL ending (KILLED_RCS) was the timeout's kill-after, not a crash.
 
     `texts` carries only reliable signals (the final result text, stderr and
     system api_error messages), never assistant prose, so a cycle that merely
@@ -517,7 +559,7 @@ def classify(rc, result, texts, fails, stop_signal=False, rate_events=None):
     # the text heuristics so an answer that mentions a limit does not override it.
     if subtype == "error_max_turns":
         return "max_turns", None, "max turns reached"
-    if rc in (124, 137):
+    if rc == 124 or (rc in KILLED_RCS and timed_out):
         return "timeout", None, f"cycle timeout (rc={rc})"
     if LIMIT_RE.search(blob) and (is_error or rc != 0 or not result):
         return "usage_limit", rate_event_reset(rate_events) or parse_reset(blob), _first(LIMIT_RE, blob)
@@ -735,7 +777,7 @@ class Runner:
             prompt = fh.read().strip()
         cmd = [
             NICE, "-n", "10", IONICE, "-c2", "-n7",
-            TIMEOUT, "--kill-after=120", f"{CYCLE_TIMEOUT_S}s",
+            TIMEOUT, f"--kill-after={KILL_AFTER_S:g}s", f"{CYCLE_TIMEOUT_S}s",
             CLAUDE, "-p", prompt,
             "--permission-mode", "auto",
             "--permission-prompts", "none",
@@ -758,6 +800,7 @@ class Runner:
                           # for them instead. The cycle timeout still bounds it.
                           "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"})
         started = now()
+        started_mono = time.monotonic()
         stopfail_offset = os.path.getsize(STOPFAIL_FILE) if os.path.exists(STOPFAIL_FILE) else 0
         self.set_state("working", next_wake=None, cycle_started=iso(started))
         self.event("cycle-start", log=self.log_path, model=settings.get("AUTOPILOT_MODEL"), effort=settings.get("AUTOPILOT_EFFORT"))
@@ -825,7 +868,7 @@ class Runner:
         self.child = None
         return self.finish_cycle(n, started, rc, result, texts, stopfail_offset, main_session,
                                  rate_events=rate_events, turns_total=turns_total, cost_total=cost_total,
-                                 result_count=result_count)
+                                 result_count=result_count, elapsed_s=time.monotonic() - started_mono)
 
     def _terminate_child(self):
         child = self.child
@@ -843,7 +886,7 @@ class Runner:
                     pass
 
     def finish_cycle(self, n, started, rc, result, texts, stopfail_offset, main_session,
-                     rate_events=None, turns_total=None, cost_total=None, result_count=0):
+                     rate_events=None, turns_total=None, cost_total=None, result_count=0, elapsed_s=None):
         fails = []
         try:
             with open(STOPFAIL_FILE, encoding="utf-8") as fh:
@@ -862,7 +905,9 @@ class Runner:
                     fails.append(rec)
         except OSError:
             pass
-        outcome, reset_at, detail = classify(rc, result, texts, fails, stop_signal=self.stop_signal, rate_events=rate_events)
+        timed_out = elapsed_s is not None and elapsed_s >= CYCLE_TIMEOUT_S
+        outcome, reset_at, detail = classify(rc, result, texts, fails, stop_signal=self.stop_signal,
+                                             rate_events=rate_events, timed_out=timed_out)
         rec = {
             "cycle": n,
             "started": iso(started),
@@ -977,7 +1022,10 @@ class Runner:
             self.state["final_checkpoint_done"] = False
             os.remove(os.path.join(AP_HOME, "RENEW"))
             self.event("renewed")
-        self.event("runner-start", pid=os.getpid(), claude=CLAUDE, worktree=WORKTREE)
+        self.event("runner-start", pid=os.getpid(), claude=CLAUDE, worktree=WORKTREE,
+                   cycle_timeout_s=CYCLE_TIMEOUT_S, kill_after_s=KILL_AFTER_S)
+        for key, reason in ENV_IGNORED:
+            self._settings_warn(key, reason)
         try:
             return self.loop()
         finally:

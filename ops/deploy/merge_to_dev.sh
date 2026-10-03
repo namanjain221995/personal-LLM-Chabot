@@ -14,21 +14,29 @@
 #      autopilot/dev -> dev and succeeded, its "CI passed" check (GitHub
 #      Actions) succeeded, every other check run on the commit completed as
 #      success, skipped or neutral, and the combined commit status (if any) is
-#      success.
+#      success;
+#   6. GitHub's compare of origin/dev with the commit says "ahead" (or
+#      "identical"), so the fast-forward holds in the origin's history too.
+# Both branch tips are read from the origin itself (git ls-remote), never from
+# the repository's remote-tracking refs, which other processes can repoint.
 # It never touches main; the operator releases dev -> main.
 #
 # It trusts nothing from whoever runs it: bash -p ignores BASH_ENV, ENV and
 # exported functions, every other variable is cleared below, and the tools,
 # repository, branches, remote and log are fixed. It acts only when the
-# repository's git common directory is the expected one, and then on that
-# verified git directory alone. Every git call goes through one wrapper that
-# reads no replace refs and turns off the commands a repository's
+# repository's git directory is the expected main .git or a linked worktree's
+# directory inside it, and then runs git on that verified common directory
+# alone, pinned on every call. Every git call goes through one wrapper that
+# reads no replace refs or grafts and turns off the commands a repository's
 # configuration can make git run (hooks, fsmonitor, the alternate-refs
-# command, a pager, push signing, automatic maintenance), and git may use
-# only the origin's transport protocol. The autopilot runs the installed copy
-# (~/.llm-autopilot/bin/merge_to_dev.sh), which it cannot edit; this file is
-# the source. Tests run a copy with the configuration block replaced
-# (ops/autopilot/tests/test_merge_to_dev.py).
+# command, a pager, push signing, automatic maintenance, askpass and
+# credential helpers: only the operator's global helper answers, for the
+# origin's host alone), and git may use only the origin's transport protocol.
+# It refuses a repository whose configuration rewrites URLs or sets http.*,
+# core.sshCommand, a remote named by a URL or an include. The autopilot runs
+# the installed copy (~/.llm-autopilot/bin/merge_to_dev.sh), which it cannot
+# edit; this file is the source. Tests run a copy with the configuration block
+# replaced (ops/autopilot/tests/test_merge_to_dev.py).
 #
 # Usage: merge_to_dev.sh [--dry-run] [<40-hex commit> | origin/autopilot/dev]
 
@@ -44,7 +52,15 @@ LANG=C.UTF-8
 # git reads every object as stored, never through refs/replace, so the checks
 # below see the commit that is pushed and nothing standing in for it
 GIT_NO_REPLACE_OBJECTS=1
-export PATH HOME LANG GIT_NO_REPLACE_OBJECTS
+# nor through a grafts file in the repository (info/grafts would rewrite a
+# commit's parents as git reads them, for the ancestry and tree checks alike)
+GIT_GRAFT_FILE=/dev/null
+# git never asks anyone for a credential: no terminal prompt, and no askpass
+# program (the loop above cleared GIT_ASKPASS and SSH_ASKPASS with everything
+# else; they are named here so that stays true; core.askPass is pinned in g())
+GIT_TERMINAL_PROMPT=0
+unset GIT_ASKPASS SSH_ASKPASS
+export PATH HOME LANG GIT_NO_REPLACE_OBJECTS GIT_GRAFT_FILE GIT_TERMINAL_PROMPT
 umask 022
 
 # --- configuration (constants; tests replace this block in a temporary copy) ---
@@ -73,7 +89,7 @@ want=""
 for arg in "$@"; do
     case "$arg" in
         --dry-run) dry_run=1 ;;
-        -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,/^# Usage:/p' "$0"; exit 0 ;;
         *)
             if [ -z "$want" ] && { [[ "$arg" =~ ^[0-9a-f]{40}$ ]] || [ "$arg" = "origin/$SOURCE_BRANCH" ]; }; then
                 want=$arg
@@ -98,23 +114,29 @@ refuse() {
     exit 1
 }
 
-# The only way git runs here: in $REPO (on the git directory verified in step 0
-# once that is known), without replace objects or a pager, and with every
+# The only way git runs here: in $REPO (on the common directory verified in
+# step 0 once that is known), without replace objects, grafts, a commit-graph
+# file (whose stored parents the ancestry check would trust) or a pager, and with every
 # setting through which a repository's configuration makes git run a command
 # of its choosing pinned off: hooks (the hooks directory is /dev/null, so
 # neither .git/hooks nor a configured core.hooksPath runs), the fsmonitor hook,
-# the alternate-refs command, push-certificate signing (gpg.program) and
-# automatic maintenance (gc --auto and the commands it may run). A command-line
-# -c wins over every config file, and git hands it on to the git processes it
-# starts.
+# the alternate-refs command, push-certificate signing (gpg.program),
+# automatic maintenance (gc --auto and the commands it may run), the askpass
+# program and every configured credential helper. A command-line -c wins over
+# every config file, and git hands it on to the git processes it starts. An
+# empty credential.helper empties the list of helpers git has collected from
+# all config files (URL-scoped ones included); the one helper added back after
+# it ($cred, set in step 0d) is the operator's, from the global git config.
 git_dir=""
+cred=()
 g() {
     if [ -n "$git_dir" ]; then
         set -- --git-dir="$git_dir" "$@"
     fi
     "$GIT" --no-pager --no-replace-objects \
         -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.alternateRefsCommand=true \
-        -c push.gpgSign=false -c maintenance.auto=false -c gc.auto=0 \
+        -c push.gpgSign=false -c maintenance.auto=false -c gc.auto=0 -c core.commitGraph=false \
+        -c credential.useHttpPath=false -c core.askPass= -c credential.helper= ${cred[@]+"${cred[@]}"} \
         -C "$REPO" "$@"
 }
 
@@ -123,8 +145,15 @@ slug=${slug%.git}
 
 # 0. $REPO belongs to the expected repository: its git common directory (the
 #    main checkout's .git, which every linked worktree shares) is the expected
-#    one. From here on git runs on the git directory found now, so what $REPO
-#    or its .git file points to cannot change between this check and the push.
+#    one, and its git directory is that directory itself or a linked
+#    worktree's directory directly under its worktrees/ (where `git worktree
+#    add` makes them).
+#    From here on git runs on the verified common directory itself, named by
+#    --git-dir on every call and pinned in GIT_COMMON_DIR. The gate needs
+#    nothing that lives in a worktree's own git directory (no HEAD, no index),
+#    and git reads a git directory's commondir file again on every call (the
+#    ref store follows that file even when GIT_COMMON_DIR is set), so neither
+#    $REPO's .git file nor a commondir file can redirect git after this check.
 want_common=$(cd "$EXPECTED_COMMON_DIR" 2>/dev/null && pwd -P) \
     || refuse "the expected git common directory $EXPECTED_COMMON_DIR does not exist"
 found=$(g rev-parse --absolute-git-dir 2>/dev/null) && [ -n "$found" ] \
@@ -135,6 +164,21 @@ common=$(g rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -
 common=$(cd "$common" 2>/dev/null && pwd -P) || refuse "cannot resolve the git common directory $common of $REPO"
 [ "$common" = "$want_common" ] \
     || refuse "the git common directory of $REPO is $common, not the expected $want_common"
+not_ours="the git directory $git_dir of $REPO is not $want_common or a linked worktree's directory $want_common/worktrees/<name>"
+case "$git_dir" in
+    "$want_common") ;;
+    "$want_common"/worktrees/*/*) refuse "$not_ours" ;;
+    "$want_common"/worktrees/?*) ;;
+    *) refuse "$not_ours" ;;
+esac
+# a main repository's git directory has no commondir file; with one, git would
+# keep its refs wherever that file points
+if [ -e "$want_common/commondir" ] || [ -L "$want_common/commondir" ]; then
+    refuse "$want_common has a commondir file, so it is not the main repository's git directory"
+fi
+git_dir=$want_common
+GIT_COMMON_DIR=$want_common
+export GIT_COMMON_DIR
 
 # 0b. origin is exactly the repository, for fetches and pushes alike, and git
 #     resolves the URL the gate fetches from and lists as itself (insteadOf,
@@ -147,12 +191,73 @@ done
 url=$(g ls-remote --get-url "$ORIGIN_URL") || refuse "cannot resolve $ORIGIN_URL in $REPO"
 [ "$url" = "$ORIGIN_URL" ] || refuse "git in $REPO rewrites the URL $ORIGIN_URL to another one"
 
-g fetch --quiet --no-recurse-submodules "$ORIGIN_URL" \
+# 0c. the repository's own configuration (local, worktree and whatever they
+#     include) sets nothing that reroutes git's connection to the origin: no
+#     URL rewriting (url.*.insteadOf, url.*.pushInsteadOf), no http.* setting
+#     (proxy, curloptResolve, TLS, extra headers and the rest, URL-scoped ones
+#     included), no core.sshCommand, no remote section named by a URL (the
+#     fetch and push below name the origin by URL, and remote.<url>.pushurl
+#     would send the push elsewhere), and no include, so every key git reads
+#     is listed here. Only key NAMES are read, never values, and the log shows
+#     them without their subsection. The production checkout's repository
+#     configuration has none of these keys, so there is no exception; its
+#     credential.<url>.helper is not refused, because g() never lets any
+#     configured helper run. The system and global configuration are the
+#     operator's and are not checked. The check runs again right before the
+#     push, so a key added while the checks below run is refused too.
+refuse_rerouting_config() {
+    local names bad
+    names=$(g config --show-scope --name-only --list) || refuse "cannot list the git configuration names of $REPO"
+    bad=$(printf '%s\n' "$names" | awk -F'\t' '
+        $1 == "system" || $1 == "global" || $1 == "command" || NF < 2 { next }
+        {
+            k = tolower($2)
+            if (k ~ /^(url|http|include|includeif)\./ || k == "core.sshcommand" || k ~ /^remote\..*\/.*\.[^.]*$/) {
+                s = substr(k, 1, index(k, ".") - 1); v = k; sub(/^.*\./, "", v)
+                shown = k
+                if (length(s) + length(v) + 1 < length(k)) shown = s ".<...>." v
+                print shown
+            }
+        }' | sort -u | paste -sd, -)
+    [ -z "$bad" ] || refuse "the git configuration of $REPO sets $bad, which can reroute or rewrite the gate's fetch and push; the operator removes them (list them with: git -C $REPO config --show-scope --name-only --list)"
+}
+refuse_rerouting_config
+
+# 0d. the credential for the push comes only from the helper the operator's
+#     global git config names for the origin (gh's, where gh set up git),
+#     scoped to the origin's scheme and host, so it is never offered for any
+#     other server. Its value is passed on to git and never logged.
+case "$ORIGIN_URL" in
+    *://*)
+        host_part=${ORIGIN_URL#*://}
+        cred_scope=${ORIGIN_URL%%://*}://${host_part%%/*}
+        helper=$(g config --global --get-urlmatch credential.helper "$ORIGIN_URL" 2>/dev/null) || helper=""
+        if [ -n "$helper" ]; then
+            cred=(-c "credential.$cred_scope.helper=$helper")
+        fi
+        ;;
+esac
+
+# The fetch only brings the objects. Which commits the two branches are on is
+# read from the origin itself (ls-remote), never from the remote-tracking refs
+# the fetch updates: those live in the shared common directory, where any
+# process using the repository can repoint them while the checks below run.
+# The objects of both commits must then be here.
+g fetch --quiet --no-recurse-submodules --no-write-fetch-head "$ORIGIN_URL" \
     "+refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH" \
     "+refs/heads/$SOURCE_BRANCH:refs/remotes/origin/$SOURCE_BRANCH" \
     || refuse "git fetch of $TARGET_BRANCH and $SOURCE_BRANCH failed"
-tip=$(g rev-parse --verify "refs/remotes/origin/$SOURCE_BRANCH^{commit}") \
-    || refuse "origin/$SOURCE_BRANCH does not exist"
+heads=$(g ls-remote "$ORIGIN_URL" "refs/heads/$TARGET_BRANCH" "refs/heads/$SOURCE_BRANCH") \
+    || refuse "cannot list $TARGET_BRANCH and $SOURCE_BRANCH on origin"
+dev_sha=$(printf '%s\n' "$heads" | awk -F'\t' -v r="refs/heads/$TARGET_BRANCH" '$2 == r { print $1 }')
+tip=$(printf '%s\n' "$heads" | awk -F'\t' -v r="refs/heads/$SOURCE_BRANCH" '$2 == r { print $1 }')
+[[ "$tip" =~ ^[0-9a-f]{40}$ ]] || refuse "origin/$SOURCE_BRANCH does not exist"
+[[ "$dev_sha" =~ ^[0-9a-f]{40}$ ]] || refuse "origin/$TARGET_BRANCH does not exist"
+g cat-file -e "$tip^{commit}" && g cat-file -e "$dev_sha^{commit}" \
+    || refuse "the fetch did not bring origin's current $TARGET_BRANCH and $SOURCE_BRANCH (did one move during the fetch?); try again"
+if [ "$want" = "origin/$SOURCE_BRANCH" ]; then
+    want=$tip
+fi
 sha=$(g rev-parse --verify "${want:-$tip}^{commit}") \
     || refuse "cannot resolve ${want:-$tip}"
 
@@ -160,8 +265,8 @@ sha=$(g rev-parse --verify "${want:-$tip}^{commit}") \
 [ "$sha" = "$tip" ] || refuse "$sha is not the pushed tip of origin/$SOURCE_BRANCH ($tip)"
 
 # 2. fast-forward only
-g merge-base --is-ancestor "refs/remotes/origin/$TARGET_BRANCH" "$sha" \
-    || refuse "origin/$TARGET_BRANCH is not an ancestor of $sha; merge the latest $TARGET_BRANCH into $SOURCE_BRANCH, re-run everything, push, and try again"
+g merge-base --is-ancestor "$dev_sha" "$sha" \
+    || refuse "origin/$TARGET_BRANCH ($dev_sha) is not an ancestor of $sha; merge the latest $TARGET_BRANCH into $SOURCE_BRANCH, re-run everything, push, and try again"
 
 # 3. the final report is a non-empty regular file in the commit
 entry=$(g ls-tree "$sha" -- "$REPORT" | cut -f1)
@@ -174,10 +279,10 @@ size=$(g cat-file -s "$sha:$REPORT") || refuse "cannot read $REPORT in $sha"
 [ "$size" -gt 0 ] || refuse "$REPORT in $sha is empty"
 
 # 4. the CI definition is the one dev already has, or one the operator approved
-dev_ci=$(g rev-parse -q --verify "refs/remotes/origin/$TARGET_BRANCH:.github" || echo none)
+dev_ci=$(g rev-parse -q --verify "$dev_sha:.github" || echo none)
 new_ci=$(g rev-parse -q --verify "$sha:.github" || echo none)
 if [ "$dev_ci" != "$new_ci" ] && ! grep -qxF "$new_ci" "$CI_APPROVALS" 2>/dev/null; then
-    refuse "the CI definition (.github/) in $sha differs from origin/$TARGET_BRANCH, so its checks could have been graded by edited CI; the operator reviews git diff origin/$TARGET_BRANCH $sha -- .github/ and approves it by adding the tree $new_ci as a line of $CI_APPROVALS"
+    refuse "the CI definition (.github/) in $sha differs from origin/$TARGET_BRANCH ($dev_sha), so its checks could have been graded by edited CI; the operator reviews git diff $dev_sha $sha -- .github/ and approves it by adding the tree $new_ci as a line of $CI_APPROVALS"
 fi
 
 # 5. CI on this exact commit: the Pipeline run of the pull request source -> target, by GitHub Actions
@@ -209,14 +314,26 @@ if [ "$count" != "0" ] && [ "$state" != "success" ]; then
     refuse "combined commit status of $sha is $state"
 fi
 
+# 6. GitHub's own history agrees that the push is a fast-forward. Check 2 walks
+#    parent commits in the shared local object store, where git does not
+#    re-hash the parents it reads, and git push trusts the same walk.
+compare=$("$GH" api "repos/$slug/compare/$dev_sha...$sha?per_page=1" --jq .status) \
+    || refuse "could not compare origin/$TARGET_BRANCH ($dev_sha) with $sha on GitHub"
+case "$compare" in
+    ahead|identical) ;;
+    *) refuse "GitHub reports $sha as '$compare' against origin/$TARGET_BRANCH ($dev_sha), not ahead of it" ;;
+esac
+
 log "OK: $sha passes every gate ($(printf '%s\n' "$runs" | wc -l) check runs)"
 if [ "$dry_run" = 1 ]; then
     log "dry run: would push $sha to origin/$TARGET_BRANCH"
     exit 0
 fi
 
-g push --no-recurse-submodules "$ORIGIN_URL" "$sha:refs/heads/$TARGET_BRANCH" \
-    || refuse "push to origin/$TARGET_BRANCH failed (not a fast-forward any more?)"
-now=$(g ls-remote "$ORIGIN_URL" "refs/heads/$TARGET_BRANCH" | cut -f1)
+refuse_rerouting_config
+g push --no-follow-tags --no-verify --no-recurse-submodules "$ORIGIN_URL" "$sha:refs/heads/$TARGET_BRANCH" \
+    || refuse "push to origin/$TARGET_BRANCH failed (not a fast-forward any more, or no credential: the gate uses only the credential helper the operator's global git config names for the origin)"
+now=$(g ls-remote "$ORIGIN_URL" "refs/heads/$TARGET_BRANCH" | awk -F'\t' -v r="refs/heads/$TARGET_BRANCH" '$2 == r { print $1 }') \
+    || refuse "the push ran, but origin/$TARGET_BRANCH could not be read back to confirm it is $sha; check it by hand"
 [ "$now" = "$sha" ] || refuse "origin/$TARGET_BRANCH is $now after the push, expected $sha"
 log "MERGED: origin/$TARGET_BRANCH is now $sha"

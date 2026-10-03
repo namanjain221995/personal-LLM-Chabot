@@ -6,7 +6,8 @@ Each `-p` invocation consumes the next entry of the JSON list in $STUB_SCENARIO
 usage. Behaviours: success, limit (with "text"), crash (with "rc"), auth,
 max_turns, sleep (with "seconds", then success), sigterm (the cycle is killed
 by SIGTERM, as a service restart or a stray kill would do), sigkill (killed by
-SIGKILL, as the OOM killer would do).
+SIGKILL, as the OOM killer would do), ignore_term (ignores SIGTERM and runs on,
+so the cycle timeout's --kill-after has to SIGKILL it).
 """
 import json
 import os
@@ -59,6 +60,12 @@ if kind in ("sigterm", "sigkill"):
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}})
     os.kill(os.getpid(), signal.SIGTERM if kind == "sigterm" else signal.SIGKILL)
     time.sleep(30)
+    sys.exit(0)
+if kind == "ignore_term":
+    # a CLI that does not stop on the cycle timeout's SIGTERM
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}})
+    time.sleep(step.get("seconds", 600))
     sys.exit(0)
 if kind == "rate_event_limit":
     # the structured rate_limit_event the stream carries, with a reset epoch (R10)

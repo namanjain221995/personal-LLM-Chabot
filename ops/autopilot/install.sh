@@ -123,17 +123,25 @@ graceful_restart() {
             return 1
         fi
     done
-    # STOP goes before the handlers do, so an interrupt at any point either
-    # finds STOP gone or removes it itself.
+    # From here until the runner is started, INT, TERM and HUP are ignored (by
+    # systemctl too, which inherits that), so an interrupt cannot leave STOP
+    # removed but the runner not started. One that came just before this line
+    # still finds the handler, which removes STOP itself and says the runner
+    # is down.
+    echo "The old runner has exited; starting the new one. Interrupts are ignored until systemctl returns (up to a few minutes while the old unit finishes stopping)." >&2 || true
+    trap '' INT TERM HUP
     rm -f "$AP/STOP"
-    trap - INT TERM HUP PIPE
     systemctl --user start llm-autopilot.service
+    trap - INT TERM HUP PIPE
     echo "restarted on the new code; watch with: $AP/bin/status.sh"
 }
 
 restart_wait_interrupted() {
+    # Further INT, TERM and HUP are ignored from here on (and by the commands
+    # below, which inherit that): Ctrl-C pressed twice, or a closing terminal
+    # that delivers a second hangup, must not kill the shell before STOP is gone.
+    trap '' INT TERM HUP
     local code=$1 state
-    trap - INT TERM HUP
     set +e  # a message that cannot be written must not stop the cleanup or change the exit code
     if [ "${restart_stop_created:-0}" = 1 ]; then
         rm -f "$AP/STOP"
