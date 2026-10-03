@@ -25,13 +25,14 @@
 # alone, pinned on every call. Every git call goes through one wrapper that
 # reads no replace refs and turns off the commands a repository's
 # configuration can make git run (hooks, fsmonitor, the alternate-refs
-# command, a pager, push signing, automatic maintenance), and git may use
-# only the origin's transport protocol. It refuses a repository whose
-# configuration rewrites URLs or sets http.*, core.sshCommand, a remote named
-# by a URL or an include. The autopilot runs the installed copy
-# (~/.llm-autopilot/bin/merge_to_dev.sh), which it cannot edit; this file is
-# the source. Tests run a copy with the configuration block replaced
-# (ops/autopilot/tests/test_merge_to_dev.py).
+# command, a pager, push signing, automatic maintenance, askpass and
+# credential helpers: only the operator's global helper answers, for the
+# origin's host alone), and git may use only the origin's transport protocol.
+# It refuses a repository whose configuration rewrites URLs or sets http.*,
+# core.sshCommand, a remote named by a URL or an include. The autopilot runs
+# the installed copy (~/.llm-autopilot/bin/merge_to_dev.sh), which it cannot
+# edit; this file is the source. Tests run a copy with the configuration block
+# replaced (ops/autopilot/tests/test_merge_to_dev.py).
 #
 # Usage: merge_to_dev.sh [--dry-run] [<40-hex commit> | origin/autopilot/dev]
 
@@ -47,7 +48,12 @@ LANG=C.UTF-8
 # git reads every object as stored, never through refs/replace, so the checks
 # below see the commit that is pushed and nothing standing in for it
 GIT_NO_REPLACE_OBJECTS=1
-export PATH HOME LANG GIT_NO_REPLACE_OBJECTS
+# git never asks anyone for a credential: no terminal prompt, and no askpass
+# program (the loop above cleared GIT_ASKPASS and SSH_ASKPASS with everything
+# else; they are named here so that stays true; core.askPass is pinned in g())
+GIT_TERMINAL_PROMPT=0
+unset GIT_ASKPASS SSH_ASKPASS
+export PATH HOME LANG GIT_NO_REPLACE_OBJECTS GIT_TERMINAL_PROMPT
 umask 022
 
 # --- configuration (constants; tests replace this block in a temporary copy) ---
@@ -106,11 +112,15 @@ refuse() {
 # setting through which a repository's configuration makes git run a command
 # of its choosing pinned off: hooks (the hooks directory is /dev/null, so
 # neither .git/hooks nor a configured core.hooksPath runs), the fsmonitor hook,
-# the alternate-refs command, push-certificate signing (gpg.program) and
-# automatic maintenance (gc --auto and the commands it may run). A command-line
-# -c wins over every config file, and git hands it on to the git processes it
-# starts.
+# the alternate-refs command, push-certificate signing (gpg.program),
+# automatic maintenance (gc --auto and the commands it may run), the askpass
+# program and every configured credential helper. A command-line -c wins over
+# every config file, and git hands it on to the git processes it starts. An
+# empty credential.helper empties the list of helpers git has collected from
+# all config files (URL-scoped ones included); the one helper added back after
+# it ($cred, set in step 0d) is the operator's, from the global git config.
 git_dir=""
+cred=()
 g() {
     if [ -n "$git_dir" ]; then
         set -- --git-dir="$git_dir" "$@"
@@ -118,6 +128,7 @@ g() {
     "$GIT" --no-pager --no-replace-objects \
         -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.alternateRefsCommand=true \
         -c push.gpgSign=false -c maintenance.auto=false -c gc.auto=0 \
+        -c core.askPass= -c credential.helper= ${cred[@]+"${cred[@]}"} \
         -C "$REPO" "$@"
 }
 
@@ -181,8 +192,10 @@ url=$(g ls-remote --get-url "$ORIGIN_URL") || refuse "cannot resolve $ORIGIN_URL
 #     would send the push elsewhere), and no include, so every key git reads
 #     is listed here. Only key NAMES are read, never values, and the log shows
 #     them without their subsection. The production checkout's repository
-#     configuration has none of these keys, so there is no exception. The
-#     system and global configuration are the operator's and are not checked.
+#     configuration has none of these keys, so there is no exception; its
+#     credential.<url>.helper is not refused, because g() never lets any
+#     configured helper run. The system and global configuration are the
+#     operator's and are not checked.
 names=$(g config --show-scope --name-only --list) || refuse "cannot list the git configuration names of $REPO"
 bad=$(printf '%s\n' "$names" | awk -F'\t' '
     $1 == "system" || $1 == "global" || $1 == "command" || NF < 2 { next }
@@ -196,6 +209,21 @@ bad=$(printf '%s\n' "$names" | awk -F'\t' '
         }
     }' | sort -u | paste -sd, -)
 [ -z "$bad" ] || refuse "the git configuration of $REPO sets $bad, which can reroute or rewrite the gate's fetch and push; the operator removes them (list them with: git -C $REPO config --show-scope --name-only --list)"
+
+# 0d. the credential for the push comes only from the helper the operator's
+#     global git config names for the origin (gh's, where gh set up git),
+#     scoped to the origin's scheme and host, so it is never offered for any
+#     other server. Its value is passed on to git and never logged.
+case "$ORIGIN_URL" in
+    *://*)
+        host_part=${ORIGIN_URL#*://}
+        cred_scope=${ORIGIN_URL%%://*}://${host_part%%/*}
+        helper=$(g config --global --get-urlmatch credential.helper "$ORIGIN_URL" 2>/dev/null) || helper=""
+        if [ -n "$helper" ]; then
+            cred=(-c "credential.$cred_scope.helper=$helper")
+        fi
+        ;;
+esac
 
 g fetch --quiet --no-recurse-submodules "$ORIGIN_URL" \
     "+refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH" \
@@ -266,7 +294,7 @@ if [ "$dry_run" = 1 ]; then
 fi
 
 g push --no-recurse-submodules "$ORIGIN_URL" "$sha:refs/heads/$TARGET_BRANCH" \
-    || refuse "push to origin/$TARGET_BRANCH failed (not a fast-forward any more?)"
+    || refuse "push to origin/$TARGET_BRANCH failed (not a fast-forward any more, or no credential: the gate uses only the credential helper the operator's global git config names for the origin)"
 now=$(g ls-remote "$ORIGIN_URL" "refs/heads/$TARGET_BRANCH" | cut -f1)
 [ "$now" = "$sha" ] || refuse "origin/$TARGET_BRANCH is $now after the push, expected $sha"
 log "MERGED: origin/$TARGET_BRANCH is now $sha"

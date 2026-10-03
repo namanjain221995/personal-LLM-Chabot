@@ -753,8 +753,16 @@ class MergeToDev(GateHarness):
         self.assertIsNotNone(wrapper, "one git wrapper, g()")
         for flag in ("--no-pager", "--no-replace-objects", "-c core.hooksPath=/dev/null", "-c core.fsmonitor=false",
                      "-c core.alternateRefsCommand=true", "-c push.gpgSign=false", "-c maintenance.auto=false",
-                     "-c gc.auto=0", '--git-dir="$git_dir"'):
+                     "-c gc.auto=0", '--git-dir="$git_dir"', "-c core.askPass= -c credential.helper= "):
             self.assertIn(flag, wrapper.group(1), flag)
+        # the one helper added back comes after the reset, from $cred alone
+        self.assertIn('-c credential.helper= ${cred[@]+"${cred[@]}"}', wrapper.group(1))
+        self.assertEqual(len(re.findall(r"\bcred=\(", text)), 2, "cred is set empty, then once from the global config")
+        self.assertRegex(text, r'\n {12}cred=\(-c "credential\.\$cred_scope\.helper=\$helper"\)\n')
+        self.assertRegex(text, r'helper=\$\(g config --global --get-urlmatch credential\.helper "\$ORIGIN_URL"')
+        self.assertRegex(text, r"\nGIT_TERMINAL_PROMPT=0\n")
+        self.assertRegex(text, r"\nexport [^\n]*\bGIT_TERMINAL_PROMPT\b")
+        self.assertRegex(text, r"\nunset GIT_ASKPASS SSH_ASKPASS\n")
         for call in ("g fetch ", "g push "):
             lines = [ln for ln in text.splitlines() if ln.startswith(call)]
             self.assertEqual(len(lines), 1, call)
@@ -969,6 +977,108 @@ class HttpGate(GateHarness):
         path = os.path.join(self.home, ".gitconfig")
         if os.path.exists(path):
             os.remove(path)
+
+    def credential_script(self, name):
+        marker = os.path.join(self.tmp, name + ".ran")
+        path = os.path.join(self.tmp, name + ".sh")
+        with open(path, "w") as fh:  # answers like a helper (get) and like askpass (Username/Password)
+            fh.write(f"#!/bin/sh\necho \"$*\" >> '{marker}'\n"
+                     "case \"$1\" in get) printf 'username=u\\npassword=p\\n' ;; Username*) echo u ;; Password*) echo p ;; esac\n"
+                     "exit 0\n")
+        os.chmod(path, 0o755)
+        return marker, path
+
+    def test_the_operators_global_helper_authenticates_the_push(self):
+        for shape in ("gh", "generic"):
+            with self.subTest(shape):
+                self.operator_helper(shape)
+                self.new_tip(shape)
+                before = len(self.srv.authenticated_pushes())
+                r = self.run_gate()
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(self.origin_ref("dev"), self.origin_ref("autopilot/dev"))
+                self.assertGreater(len(self.srv.authenticated_pushes()), before, "the push carried the credential")
+
+    def test_without_the_operators_helper_the_push_is_refused_without_a_prompt(self):
+        self.no_operator_helper()
+        self.new_tip("no-helper")
+        dev_before = self.origin_ref("dev")
+        r = self.run_gate()
+        self.assert_refused(r, "push to origin/dev failed", dev_before)
+        self.assertIn("terminal prompts disabled", r.stderr)
+
+    def test_a_repository_credential_helper_never_runs(self):
+        port = self.srv.port
+        cases = {
+            "credential.helper appended": [("credential.helper", "!{script}")],
+            "credential.helper reset, then its own": [("credential.helper", ""), ("credential.helper", "!{script}")],
+            "URL-scoped to the host": [(f"credential.http://127.0.0.1:{port}.helper", "!{script}")],
+            "URL-scoped to the repository": [(f"credential.{self.url}.helper", "!{script}")],
+        }
+        config = os.path.join(self.wt, ".git", "config")
+        with open(config) as fh:
+            pristine = fh.read()
+        n = 0
+        for operator in (True, False):
+            for name, entries in cases.items():
+                with self.subTest(name, operator_helper=operator):
+                    n += 1
+                    if operator:
+                        self.operator_helper()
+                    else:
+                        self.no_operator_helper()
+                    marker, script = self.credential_script(f"repo-helper-{n}")
+                    try:
+                        for key, value in entries:
+                            git(self.wt, "config", "--add", key, value.format(script=script))
+                        self.new_tip(f"helper-{n}")
+                        dev_before = self.origin_ref("dev")
+                        r = self.run_gate()
+                        if operator:
+                            self.assertEqual(r.returncode, 0, r.stderr)
+                            self.assertEqual(self.origin_ref("dev"), self.origin_ref("autopilot/dev"))
+                        else:
+                            self.assert_refused(r, "push to origin/dev failed", dev_before)
+                        self.assertFalse(os.path.exists(marker), "a credential helper from the repository's configuration ran")
+                    finally:
+                        with open(config, "w") as fh:
+                            fh.write(pristine)
+
+    def test_a_repository_or_caller_askpass_never_runs(self):
+        config = os.path.join(self.wt, ".git", "config")
+        with open(config) as fh:
+            pristine = fh.read()
+        for operator in (True, False):
+            with self.subTest("core.askPass", operator_helper=operator):
+                if operator:
+                    self.operator_helper()
+                else:
+                    self.no_operator_helper()
+                marker, script = self.credential_script(f"askpass-{operator}")
+                try:
+                    git(self.wt, "config", "credential.helper", "")  # drops every helper read before it
+                    git(self.wt, "config", "core.askPass", script)
+                    self.new_tip(f"askpass-{operator}")
+                    dev_before = self.origin_ref("dev")
+                    r = self.run_gate()
+                    if operator:
+                        self.assertEqual(r.returncode, 0, r.stderr)
+                        self.assertEqual(self.origin_ref("dev"), self.origin_ref("autopilot/dev"))
+                    else:
+                        self.assert_refused(r, "push to origin/dev failed", dev_before)
+                    self.assertFalse(os.path.exists(marker), "core.askPass from the repository's configuration ran")
+                finally:
+                    with open(config, "w") as fh:
+                        fh.write(pristine)
+        with self.subTest("GIT_ASKPASS and SSH_ASKPASS from the caller"):
+            self.no_operator_helper()
+            marker, script = self.credential_script("caller-askpass")
+            self.new_tip("caller-askpass")
+            dev_before = self.origin_ref("dev")
+            r = self.run_gate(env={"GIT_ASKPASS": script, "SSH_ASKPASS": script, "SSH_ASKPASS_REQUIRE": "force",
+                                   "DISPLAY": ":0", "GIT_TERMINAL_PROMPT": "1"})
+            self.assert_refused(r, "push to origin/dev failed", dev_before)
+            self.assertFalse(os.path.exists(marker))
 
     def attacker(self, bind="127.0.0.2"):
         # another server on the origin's port, holding a copy of the origin
