@@ -18,6 +18,7 @@ import re
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -591,6 +592,158 @@ CODE_CONCAT_DENY = [
 ]
 
 
+# ===========================================================================
+# 7. Round 5.
+# ===========================================================================
+# grep/rg/ag are read option by option, per tool: `--` ends the options, a
+# flag never swallows the pattern (GNU/ugrep -T, ag -t, GNU --color), and the
+# pattern word or an option value that names an existing secret is refused.
+GREP_PARSE_DENY = [
+    Bc("grep -- '-\\|a' ~/.claude/.credentials.json"),
+    Bc("grep -T a ~/.claude/.credentials.json"),
+    Bc("grep -r -- -----BEGIN ~/.ssh/"),
+    Bc(f"grep -h -- -e {PROD}/.env"),
+    Bc("rg -- -x ~/.claude/.credentials.json"),
+    Bc("grep --color a ~/.claude/.credentials.json"),      # GNU --color takes no separate value
+    Bc("ag -t a ~/.claude/.credentials.json"),              # ag -t (--all-text) is a flag
+    Bc("grep --regex=a ~/.claude/.credentials.json"),      # abbreviated --regexp: every operand is a file
+    Bc("grep -ren a ~/.claude/.credentials.json"),         # -e takes the rest of the bundle
+    Bc("grep -f ~/.claude/.credentials.json orchestrator/app/main.py"),  # the pattern file is a secret
+    Bc("grep -r --exclude-from=.env X orchestrator", cwd=PROD),
+    Bc("grep -2 PASSWORD", cwd=PROD),                      # ugrep -NUM searches the cwd recursively
+    Bc("grep --directories=recurse PASSWORD", cwd=PROD),
+    Bc("grep -d recurse PASSWORD .", cwd=PROD),
+    Bc("grep -rn -e KEY -- .", cwd=PROD),
+]
+GREP_PARSE_ALLOW = [
+    Bc("grep -rn '\\.env' orchestrator/app"),
+    Bc("grep -T TODO orchestrator/app/main.py"),
+    Bc("grep -n -- --force ops/autopilot/README.md"),
+    Bc("grep -rn -e '-x' orchestrator"),
+    Bc("rg -n -- '--dry-run' ops"),
+    Bc("grep -C 3 stream_chat orchestrator/app/main.py"),
+    Bc("grep -rn --color=always TODO orchestrator"),
+    Bc("grep -E 'a|b' -c orchestrator/app/main.py"),
+    Bc("rg -t py -n TODO orchestrator"),
+    Bc("grep -rn --exclude=.env --exclude-dir=node_modules TODO orchestrator"),
+    Bc("git log --oneline | grep -2 fix"),                 # ugrep -NUM with a pipe, in the dev worktree
+]
+
+# Grep-tool globs: brace and list alternatives are each checked; only an
+# alternative that IS a public template is exempt.
+GREP_TOOL_GLOB_DENY = [
+    ("Grep", {"pattern": "PASS", "glob": "{.env.example,.env}"}, None),
+    ("Grep", {"pattern": "PASS", "glob": "{.env,.env.example}", "path": PROD}, None),
+    ("Grep", {"pattern": "PASS", "glob": "*.env.example,.env"}, None),
+    ("Grep", {"pattern": "PASS", "glob": "{*.py,{.env.sample,.env.local}}"}, None),
+    ("Grep", {"pattern": "PASS", "glob": ".env.example*"}, None),  # could select .env.example.local
+]
+GREP_TOOL_GLOB_ALLOW = [
+    ("Grep", {"pattern": "PASS", "glob": "*.env.example"}, DEV),
+    ("Grep", {"pattern": "PASS", "glob": "{.env.example,.env.sample}"}, DEV),
+    ("Grep", {"pattern": "PASS", "glob": "*.{py,ts}"}, DEV),
+    ("Grep", {"pattern": "PASS", "glob": "!.env"}, DEV),
+]
+
+# Recursive-search scoping tests the glob itself (and the glob with its
+# wildcards filled in), not only a fixed sample list; named types come from an
+# allow list; a custom --type-add, -M magic or --pre is never a scope.
+SCOPE_DENY = [
+    Bc("grep -rn PASS --include=.env.prod .", cwd=PROD),
+    Bc("grep -rn PASS --include=.env.prod", cwd=PROD),
+    Bc(f"grep -rn PASS --include=.env.dev {PROD}"),
+    Bc(f"grep -rn PASS --include=secrets.txt {PROD}"),
+    Bc(f"rg -n PASS -g .env.prod {PROD}"),
+    Bc(f"rg -n PASS -g '{{*.py,.env.prod}}' {PROD}"),
+    Bc(f"rg -n PASS -g '**/.runtime/*' {PROD}"),
+    Bc(f"grep -rn PASS -g '*.py,.env.staging' {PROD}"),   # ugrep -g takes a comma list
+    Bc(f"grep -rn PASS -O env {PROD}"),                    # ugrep -O: *.env
+    Bc(f"rg -t txt -n PASS {PROD}"),                       # txt selects secrets.txt
+    Bc(f"rg -t json -n PASS {PROD}"),
+    Bc(f"rg --type-add 'x:*.py' -t x -n PASS {PROD}"),     # a custom type is never trusted
+    Bc(f"rg -t py --pre /tmp/llmdev/x.sh -n PASS {PROD}"),
+    Bc("grep -rn PASS --include=*.py ~"),                  # $HOME holds secret directories
+    Bc("rg -t py PASS ~/.llm-autopilot"),
+]
+
+# A test-database URL set conditionally, computed, read or unset is never
+# dropped in favour of the hook's own (runner-set) value.
+TEST_DB_GOOD = "postgresql://t:t@192.0.2.20:15432/llmdev_test"
+TEST_DB_BAD = "postgresql://postgres:postgres@192.0.2.10:5432/techsara"
+ENV_DENY = [
+    f"cd orchestrator && export TEST_DATABASE_URL={TEST_DB_BAD} && python3 -m pytest -q",
+    f"true && cd orchestrator && export TEST_DATABASE_URL={TEST_DB_BAD} && python3 -m pytest -q",
+    f"export TEST_DATABASE_URL={TEST_DB_BAD}; cd orchestrator && python3 -m pytest -q",
+    f"[ -n \"$CI\" ] && export TEST_DATABASE_URL={TEST_DB_BAD}; cd orchestrator && python3 -m pytest -q",
+    f"if [ -n \"$CI\" ]; then export TEST_DATABASE_URL={TEST_DB_BAD}; fi; cd orchestrator && python3 -m pytest -q",
+    f"false || export TEST_DATABASE_URL={TEST_DB_BAD} && cd orchestrator && python3 -m pytest -q",
+    f"TEST_DATABASE_URL={TEST_DB_BAD}; cd orchestrator && python3 -m pytest -q",
+    f"TEST_DATABASE_URL={TEST_DB_BAD} :; cd orchestrator && python3 -m pytest -q",  # persists after a special builtin
+    "export TEST_DATABASE_URL=$(cat /tmp/llmdev/url); cd orchestrator && python3 -m pytest -q",
+    "cd orchestrator && export TEST_DATABASE_URL=$(cat /tmp/llmdev/url) && python3 -m pytest -q",
+    "read TEST_DATABASE_URL < /tmp/llmdev/url; cd orchestrator && python3 -m pytest -q",
+    "unset TEST_DATABASE_URL; cd orchestrator && python3 -m pytest -q",
+    "declare -u TEST_DATABASE_URL=x; cd orchestrator && python3 -m pytest -q",
+    f"set -a && . ./ops/dev/stack.vars && set +a && export TEST_DATABASE_URL=\"postgresql://t:t@127.0.0.1:${{POSTGRES_PORT:-5432}}/x_test\" && cd orchestrator && python3 -m pytest -q",
+]
+ENV_ALLOW = [
+    "cd orchestrator && python3 -m pytest -q",                                      # the runner's URL
+    f"cd orchestrator && export TEST_DATABASE_URL={TEST_DB_GOOD} && python3 -m pytest -q",
+    f"export TEST_DATABASE_URL={TEST_DB_GOOD}; cd orchestrator && python3 -m pytest -q",
+    f"cd orchestrator && export TEST_DATABASE_URL={TEST_DB_GOOD}; python3 -m pytest -q",  # agrees with the runner's
+    f"cd orchestrator && TEST_DATABASE_URL={TEST_DB_GOOD} python3 -m pytest -q",
+    "for f in a b; do echo $f; done; cd orchestrator && python3 -m pytest -q",
+    "while read -r line; do echo \"$line\"; done < /tmp/llmdev/list.txt; cd orchestrator && python3 -m pytest -q",
+]
+DOCKER_ENV_DENY = [
+    f"[ -n \"$CI\" ] && export DOCKER_HOST=ssh://{WORKER}; docker build -t llmdev-x .",
+    f"false && export DOCKER_HOST=ssh://{WORKER}; docker compose --env-file ops/dev/stack.vars up -d",
+    "export DOCKER_HOST=$(cat /tmp/llmdev/host); docker ps",
+    "true && export TECHSARA_STACK=$(cat /tmp/llmdev/stack); docker compose --env-file ops/dev/stack.vars down",
+    "[ -n \"$CI\" ] && export COMPOSE_PROJECT_NAME=llmdev; docker compose down",
+]
+DOCKER_ENV_ALLOW = [
+    f"export DOCKER_HOST=ssh://{WORKER} && docker compose --env-file ops/dev/stack.vars up -d",
+    f"export DOCKER_HOST=ssh://{WORKER}; docker build -t llmdev-x .",
+    "unset DOCKER_HOST; docker ps",
+]
+
+# case statements: an arm's patterns are patterns (never commands, never
+# "a glob builds the command name"); the arm bodies are analysed as before.
+CASE_ALLOW = [
+    "case \"$1\" in start) echo s;; stop) echo t;; *) echo usage;; esac",
+    "case $f in *.py) echo py;; *.md) echo md;; esac",
+    ("for i in 1 2 3; do st=$(gh run view 123 --json status,conclusion -q '.status+\" \"+.conclusion'); "
+     "case \"$st\" in \"completed success\") echo ok; break;; \"completed \"*) echo fail; break;; esac; sleep 30; done"),
+    "case x in (a|b) echo ab;; [cd]) echo cd;; ?) echo one;; esac",
+    "case \"$1\" in\n  --dry-run)\n    echo dry\n    ;;\n  *)\n    echo run\n    ;;\nesac",
+    "if true; then case $x in a) echo a;; esac; fi",
+    "for f in orchestrator/*.py; do case $f in */test_*) echo test;; *) echo src;; esac; done",
+    "case $x in a) echo a ;& b) echo b ;;& *) echo c ;; esac",
+    "case $x in\nesac",
+    "echo case in done fi esac",
+]
+CASE_DENY = [
+    "case x in *) sudo reboot;; esac",
+    "case x in a) echo a;; *) git push -f origin main;; esac",
+    "case x in a) echo a;; esac; sudo reboot",
+    "case $(sudo reboot) in a) echo a;; esac",
+    "case x in $(sudo reboot)) echo a;; esac",              # a substitution inside a pattern still runs
+    "case x in a|b) sudo reboot;; esac",
+    "case x in\n  a)\n    sudo reboot\n    ;;\nesac",
+    "case x in a) case y in b) sudo reboot;; esac;; esac",   # nested
+    "( \"case\" x in\nsudo reboot)",                       # a quoted case is a command, not a case
+    "( \"case\" x in\n$CMD)",
+    "case x in a) echo;; \"esac\") sudo reboot;; esac",    # a quoted esac is a pattern
+    "case x in a) BR=upgrade/i/x;; esac; git push origin HEAD:${BR:-main}",
+    # a keyword after then/do opens a body too, and a quoted fi/done closes none
+    "if false; then if true; then :; fi; BR=upgrade/i/x; fi; git push origin HEAD:${BR:-main}",
+    "if false; then :; \"fi\"; BR=upgrade/i/x; fi; git push origin HEAD:${BR:-main}",
+    "for i in 1; do case $i in 1) :;; esac; BR=upgrade/i/x; done; git push origin HEAD:${BR:-main}",
+    "while false; do while false; do :; done; BR=upgrade/i/x; done; git push origin HEAD:${BR:-main}",
+]
+
+
 # ---------------------------------------------------------------------------
 # Plumbing: keep compose rendering and gh/docker off the daemon and network.
 # ---------------------------------------------------------------------------
@@ -701,6 +854,116 @@ class Sweep(unittest.TestCase):
         with _patched()[0], _patched()[1], _patched()[2]:
             self._run(MATCHER_ALLOW, True)
 
+    # round 5
+    def test_grep_parse_deny(self):
+        self._run(GREP_PARSE_DENY, False)
+
+    def test_grep_parse_allow(self):
+        self._run(GREP_PARSE_ALLOW, True)
+
+    def test_grep_tool_glob_deny(self):
+        self._run(GREP_TOOL_GLOB_DENY, False)
+
+    def test_grep_tool_glob_allow(self):
+        self._run(GREP_TOOL_GLOB_ALLOW, True)
+
+    def test_scope_deny(self):
+        self._run(SCOPE_DENY, False)
+
+    def test_env_deny(self):
+        with mock.patch.dict(os.environ, {"TEST_DATABASE_URL": TEST_DB_GOOD}):
+            self._run(ENV_DENY, False)
+
+    def test_env_allow(self):
+        with mock.patch.dict(os.environ, {"TEST_DATABASE_URL": TEST_DB_GOOD}):
+            self._run(ENV_ALLOW, True)
+
+    def test_docker_env_deny(self):
+        with _patched()[0], _patched()[1], _patched()[2]:
+            self._run(DOCKER_ENV_DENY, False)
+
+    def test_docker_env_allow(self):
+        with _patched()[0], _patched()[1], _patched()[2]:
+            self._run(DOCKER_ENV_ALLOW, True)
+
+    def test_case_allow(self):
+        with _patched()[0], _patched()[1], _patched()[2]:
+            self._run(CASE_ALLOW, True)
+
+    def test_case_deny(self):
+        with _patched()[0], _patched()[1], _patched()[2]:
+            self._run(CASE_DENY, False)
+
+
+class CaseInScripts(unittest.TestCase):
+    """A shell script the guard reads keeps its case arms as patterns too."""
+
+    def test_script_case(self):
+        root = tempfile.mkdtemp(prefix="llmdev-p016-case-")
+        try:
+            ok_script, bad_script = os.path.join(root, "poll.sh"), os.path.join(root, "bad.sh")
+            with open(ok_script, "w", encoding="utf-8") as fh:
+                fh.write("#!/usr/bin/env bash\nset -euo pipefail\ncase \"${1:-}\" in\n  --dry-run) echo dry ;;\n  *) echo run ;;\nesac\n")
+            with open(bad_script, "w", encoding="utf-8") as fh:
+                fh.write("#!/usr/bin/env bash\ncase \"${1:-}\" in\n  --dry-run) echo dry ;;\n  *) sudo reboot ;;\nesac\n")
+            for p in (ok_script, bad_script):
+                os.chmod(p, 0o755)
+            bad = []
+            for cmd, cwd in ((ok_script, DEV), (f"bash {ok_script}", DEV), ("./poll.sh --dry-run", root)):
+                ok, why = bash(cmd, cwd=cwd)
+                if not ok:
+                    bad.append(f"FALSE POSITIVE: {cmd} -> {why}")
+            for cmd, cwd in ((bad_script, DEV), (f"bash {bad_script}", DEV), ("./bad.sh", root)):
+                if bash(cmd, cwd=cwd)[0]:
+                    bad.append(f"GAP (allowed): {cmd}")
+            ok, why = bash(f"{HOME}/.llm-autopilot/bin/merge_to_dev.sh upgrade/i/p0-16-guard-bypass-sweep", cwd=DEV)
+            if not ok:
+                bad.append(f"FALSE POSITIVE: the installed gate -> {why}")
+            self.assertEqual(bad, [], "\n".join(bad))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class SecretDirScoping(unittest.TestCase):
+    """A name glob scopes a recursive search off secrets only when the tree
+    holds no directory whose files are secret whatever their names."""
+
+    def _tree(self, extra):
+        root = tempfile.mkdtemp(prefix="llmdev-p016-scope-")
+        os.makedirs(os.path.join(root, "app"))
+        with open(os.path.join(root, "app", "main.py"), "w", encoding="utf-8") as fh:
+            fh.write("x = 1\n")
+        for rel in extra:
+            os.makedirs(os.path.join(root, os.path.dirname(rel)), exist_ok=True)
+            with open(os.path.join(root, rel), "w", encoding="utf-8") as fh:
+                fh.write("x\n")
+        return root
+
+    def _decide(self, root, cmd):
+        real = os.path.realpath(root)
+        with mock.patch.object(guard, "R_PROD", real), mock.patch.object(guard, "PROD_CHECKOUT", real):
+            return bash(cmd, cwd=DEV)
+
+    def test_secret_dirs_defeat_name_globs(self):
+        cases = [
+            (["deploy/secrets/db.py"], False),        # a secrets/ directory: every file in it is secret
+            ([".runtime/secrets-old.py"], False),     # .runtime/secrets*: secret by path
+            ([".runtime/secrets.d/db.py"], False),
+            ([".runtime/secrets.env"], True),         # a secret BASENAME that *.py cannot select
+            (["docs/readme.md"], True),
+        ]
+        bad = []
+        for extra, want in cases:
+            root = self._tree(extra)
+            try:
+                for cmd in (f"grep -rn X --include=*.py {root}", f"rg -g '*.py' X {root}", f"rg -t py X {root}"):
+                    ok, why = self._decide(root, cmd)
+                    if ok != want:
+                        bad.append(f"{extra}: {cmd} -> {'allowed' if ok else why}")
+            finally:
+                shutil.rmtree(root, ignore_errors=True)
+        self.assertEqual(bad, [], "\n".join(bad))
+
 
 class SymlinkedProtectedPaths(unittest.TestCase):
     """Pre-existing links into a protected (temporary) tree decide like the tree."""
@@ -741,35 +1004,87 @@ class SymlinkedProtectedPaths(unittest.TestCase):
 
 class PipPolyglotEntryPoint(unittest.TestCase):
     """A pip/distlib console-script entry point is a python program behind a
-    sh/python polyglot header; the guard reads it as python, not shell."""
+    sh/python polyglot header; the guard reads it as python, not shell. Only
+    the exact header whose interpreter is a real binary is exempt: any other
+    `'''exec'` file is analysed as shell (round 5)."""
 
-    POLYGLOT = (
-        "#!/bin/sh\n"
-        "'''exec' \"$(dirname \"$(readlink -f \"$0\")\")/python\" \"$0\" \"$@\"\n"
-        "' '''\n"
+    BODY = (
         "# -*- coding: utf-8 -*-\n"
         "import re, sys\n"
         "from pip._internal.cli.main import main\n"
         "if __name__ == '__main__':\n"
         "    sys.exit(main())\n"
     )
+    POLYGLOT = (
+        "#!/bin/sh\n"
+        "'''exec' \"$(dirname \"$(readlink -f \"$0\")\")/python\" \"$0\" \"$@\"\n"
+        "' '''\n" + BODY
+    )
+    UV_POLYGLOT = (
+        "#!/bin/sh\n"
+        "'''exec' \"$(dirname -- \"$(realpath -- \"$0\")\")/python3.11\" \"$0\" \"$@\"\n"
+        "' '''\n" + BODY
+    )
+
+    def _venv(self):
+        venv = tempfile.mkdtemp(prefix="llmdev-pwvenv-")
+        binp = os.path.join(venv, "bin")
+        os.makedirs(binp)
+        real_python = os.path.realpath(sys.executable)  # an ELF interpreter
+        for name in ("python", "python3.11"):
+            os.symlink(real_python, os.path.join(binp, name))
+        return venv, binp
+
+    def _write(self, path, text):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(path, 0o755)
 
     def test_entry_point_runs(self):
-        venv = tempfile.mkdtemp(prefix="llmdev-pwvenv-")
+        venv, binp = self._venv()
         try:
-            binp = os.path.join(venv, "bin")
-            os.makedirs(binp)
-            for name in ("pip", "pytest"):
-                with open(os.path.join(binp, name), "w", encoding="utf-8") as fh:
-                    fh.write(self.POLYGLOT)
-                os.chmod(os.path.join(binp, name), 0o755)
+            self._write(os.path.join(binp, "pip"), self.POLYGLOT)
+            self._write(os.path.join(binp, "pytest"), self.POLYGLOT)
+            self._write(os.path.join(binp, "pip3.11"), self.UV_POLYGLOT)
+            lit = self.POLYGLOT.replace("\"$(dirname \"$(readlink -f \"$0\")\")/python\"", f"\"{binp}/python\"")
+            self._write(os.path.join(binp, "pip-literal"), lit)
             bad = []
             for cmd in (f"{binp}/pip install -r requirements-dev.txt",
                         f"{binp}/pytest -q ops/autopilot/tests",
-                        f"{venv}/bin/pip list"):
+                        f"{venv}/bin/pip list",
+                        f"{binp}/pip3.11 --version",
+                        f"{binp}/pip-literal list"):
                 ok, why = bash(cmd, cwd=DEV)
                 if not ok:
                     bad.append(f"{cmd} -> {why}")
+            self.assertEqual(bad, [], "\n".join(bad))
+        finally:
+            shutil.rmtree(venv, ignore_errors=True)
+
+    def test_crafted_exec_files_are_shell(self):
+        venv, binp = self._venv()
+        try:
+            crafted = {
+                # sh runs line 2 as `exec sudo reboot ...`
+                "entry": "#!/bin/sh\n'''exec' sudo reboot \"$0\" \"$@\"\n' '''\n" + self.BODY,
+                # shell lines before the exec line
+                "early": "#!/bin/sh\nsudo reboot\n'''exec' \"$(dirname \"$(readlink -f \"$0\")\")/python\" \"$0\" \"$@\"\n' '''\n" + self.BODY,
+                # a third line that is not the closing quote: line 3 onwards is shell
+                "tail": "#!/bin/sh\n'''exec' \"$(dirname \"$(readlink -f \"$0\")\")/python\" \"$0\" \"$@\"\nsudo reboot\n",
+            }
+            for name, text in crafted.items():
+                self._write(os.path.join(binp, name), text)
+            # the exact header, but its "python" is a shell script that sh would run
+            sub = os.path.join(venv, "fake")
+            os.makedirs(sub)
+            self._write(os.path.join(sub, "python"), "#!/bin/sh\nsudo reboot\n")
+            self._write(os.path.join(sub, "pip"), self.POLYGLOT)
+            bad = []
+            for cmd in (f"{binp}/entry", f"sh {binp}/entry", f"bash {binp}/entry", f"{binp}/early",
+                        f"{binp}/tail", f"{sub}/pip list"):
+                ok, why = bash(cmd, cwd=DEV)
+                if ok:
+                    bad.append(f"GAP (allowed): {cmd}")
             self.assertEqual(bad, [], "\n".join(bad))
         finally:
             shutil.rmtree(venv, ignore_errors=True)

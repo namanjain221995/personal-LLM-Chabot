@@ -576,15 +576,30 @@ def split_heredocs(cmd):
 # variable or a home directory and turns them back into '$' / '~' before any
 # check, so they still read as computed text.
 LITERAL_DOLLAR, LITERAL_TILDE = "\x00", "\x01"
+# protect=True marks an unquoted, unescaped `case`, `esac`, `fi` or `done` word
+# with KW_MARK. Only a marked word opens a case statement or closes a compound
+# command in segments(): to bash a quoted "case" or "fi" is an ordinary command
+# word, so it must neither turn the words after it into (unchecked) patterns nor
+# make a body that may not run look like top-level code. _restore() drops the mark.
+KW_MARK = "\x04"
+CASE_KW = KW_MARK + "case"
+_MARKED_KEYWORDS = re.compile(r"(case|esac|fi|done)(?=$|[\s;|&()<>])")
 
 
 def prepare(text, protect=False):
     """Quote-aware: drop line continuations and comments, turn newlines into ';'.
     With protect=True, a '$' or '~' that bash reads literally becomes a
-    placeholder (see LITERAL_DOLLAR) so variable resolution cannot touch it."""
+    placeholder (see LITERAL_DOLLAR) so variable resolution cannot touch it,
+    and a bare compound keyword gets KW_MARK."""
     res, q, i, n = [], None, 0, len(text)
     while i < n:
         c = text[i]
+        if protect and q is None and c in "cefd" and (i == 0 or text[i - 1] in " \t\n;|&()"):
+            m = _MARKED_KEYWORDS.match(text, i)
+            if m:
+                res.append(KW_MARK + m.group(1))
+                i = m.end()
+                continue
         if q == "'":
             res.append(LITERAL_DOLLAR if protect and c == "$" else LITERAL_TILDE if protect and c == "~" else c)
             if c == "'":
@@ -625,8 +640,14 @@ REDIRECT_RE = re.compile(r"^\d*(>>?|>\||&>>?|<>?|<<<|<<-?|>&|<&)$")
 # while-case body) may or may not run, so a bare assignment there is NOT a
 # value the guard can trust later (it leaves the variable unresolved instead).
 UNCONDITIONAL_SEPARATORS = {None, ";", "&", "(", ")", ";;", "&;", ";&", ";;&"}
-COMPOUND_OPEN = {"if", "for", "while", "until", "case", "select"}
-COMPOUND_CLOSE = {"fi", "done", "esac"}
+COMPOUND_OPEN = {"if", "for", "while", "until", "select"}  # `case` is CASE_KW, see segments()
+COMPOUND_CLOSE = {KW_MARK + "fi", KW_MARK + "done", KW_MARK + "esac"}  # unquoted only, see prepare()
+ESAC_KW = KW_MARK + "esac"
+# Reserved words after which bash still reads a command keyword in the same
+# position (`then if ...`, `do case ...`, `! while ...`, `{ for ...`).
+LEAD_RESERVED = {"then", "do", "else", "elif", "if", "while", "until", "!", "{", "time"}
+CASE_ARM_ENDS = {";;", ";&", ";;&"}
+_PUNCT = set(";&|()<>")
 
 
 def tokenize(text):
@@ -648,7 +669,8 @@ def writes_output_file(redirs):
 
 
 def segments(tokens):
-    """Split tokens into simple commands: [(words, redirs, piped_in, unconditional)].
+    """Split tokens into simple commands:
+    [(words, redirs, piped_in, unconditional, before, after)].
 
     `unconditional` is True when a bare `V=value` assignment in the segment is
     certain to run in THIS shell: at the top level (not inside a subshell '(...)'
@@ -656,25 +678,77 @@ def segments(tokens):
     through '&&'/'||'/'|'), and not itself ended by '&', '|' or '|&' (a
     background job or a pipeline stage runs in a subshell, so its assignments
     never reach the next command). The guard trusts a variable's value only from
-    such a segment; everywhere else it leaves `$VAR` unresolved (fail-closed)."""
+    such a segment; everywhere else it leaves `$VAR` unresolved (fail-closed).
+    A compound keyword counts after leading reserved words too (`then if`,
+    `do case`), so a nested body is never read as top level.
+
+    `before` / `after` are the separators on either side of the segment (None at
+    the start / end of the text); analyze() follows '&&' chains with them.
+
+    A case statement opens only on CASE_KW (an unquoted `case` in command
+    position, followed by one word and `in`). Its `case WORD in` header is one
+    segment and each arm's body is ordinary segments. The words of an arm's
+    pattern list (`start)`, `*.py|*.md)`, `"completed "*)`) are patterns bash
+    matches and never runs, so they are dropped; a command substitution inside
+    one is still analysed (analyze() checks every substitution no segment
+    carries)."""
+    tokens = list(tokens)
     segs, words, redirs, piped_in, i = [], [], [], False, 0
-    sep, paren, compound, pending_open, seg_flag = None, 0, 0, 0, None
+    sep, paren, compound, pending_open, seg_flag, seg_before = None, 0, 0, 0, None, None
+    cases = []  # one entry per open case statement: "pattern" (reading an arm's patterns) or "body"
+    pat_started, pat_depth = False, 0
 
     def start_flag():
         return paren == 0 and compound == 0 and sep in UNCONDITIONAL_SEPARATORS
 
+    def begin():
+        nonlocal seg_flag, seg_before
+        if seg_flag is None:
+            seg_flag, seg_before = start_flag(), sep
+
+    def close(t):
+        nonlocal words, redirs, seg_flag, compound, pending_open
+        if words or redirs:
+            flag = seg_flag if seg_flag is not None else start_flag()
+            segs.append((words, redirs, piped_in, flag and t not in ("&", "|", "|&"), seg_before, t))
+            compound += pending_open
+            pending_open = 0
+        words, redirs, seg_flag = [], [], None
+
     while i < len(tokens):
         t = tokens[i]
+        if cases and cases[-1] == "pattern" and t != ESAC_KW:
+            # An arm's pattern list, up to the ')' that ends it: '|' separates
+            # patterns, a leading '(' is optional, newlines (';') are skipped.
+            # shlex glues runs of punctuation ('))', ');;'), so read them by char.
+            if set(t) <= _PUNCT:
+                rest = None
+                for k, ch in enumerate(t):
+                    if ch == "(" and pat_started:
+                        pat_depth += 1
+                    elif ch == ")" and pat_depth:
+                        pat_depth -= 1
+                    elif ch == ")":
+                        rest = t[k + 1 :]
+                        break
+                if rest is not None:
+                    cases[-1] = "body"
+                    sep, piped_in, pat_started, pat_depth = ")", False, False, 0
+                    if rest:
+                        tokens[i] = rest
+                        continue
+            else:
+                pat_started = True
+            i += 1
+            continue
         if t in SEPARATORS:
-            if words or redirs:
-                flag = seg_flag if seg_flag is not None else start_flag()
-                segs.append((words, redirs, piped_in, flag and t not in ("&", "|", "|&")))
-                compound += pending_open
-                pending_open = 0
-            words, redirs, seg_flag = [], [], None
+            close(t)
             piped_in = t in ("|", "|&")
             sep = t
-            if t == "(":
+            if t in CASE_ARM_ENDS and cases:
+                cases[-1] = "pattern"
+                pat_started, pat_depth = False, 0
+            elif t == "(":
                 paren += 1
             elif t == ")":
                 paren = max(0, paren - 1)
@@ -685,20 +759,35 @@ def segments(tokens):
                 words.pop()  # file-descriptor number, e.g. 2>
             target = tokens[i + 1] if i + 1 < len(tokens) else ""
             redirs.append((t, target))
-            if seg_flag is None:
-                seg_flag = start_flag()
+            begin()
             i += 2
             continue
-        if not words and seg_flag is None:
-            if t in COMPOUND_CLOSE:
-                compound = max(0, compound - 1)
-            seg_flag = start_flag()
-            if t in COMPOUND_OPEN:
-                pending_open = 1
+        lead = all(x in LEAD_RESERVED for x in words)
+        if t == CASE_KW and lead:
+            j, k = i + 1, i + 2
+            while k < len(tokens) and tokens[k] == ";":  # `case WORD` newline `in`
+                k += 1
+            if j < len(tokens) and not set(tokens[j]) <= _PUNCT and not REDIRECT_RE.match(tokens[j]) \
+                    and k < len(tokens) and tokens[k] == "in":
+                begin()
+                words += [t, tokens[j], "in"]
+                pending_open += 1
+                close("in")
+                sep, piped_in = "in", False
+                cases.append("pattern")
+                pat_started, pat_depth = False, 0
+                i = k + 1
+                continue
+        if not words and seg_flag is None and t in COMPOUND_CLOSE:
+            compound = max(0, compound - 1)
+            if t == ESAC_KW and cases:
+                cases.pop()
+        begin()
+        if lead and t in COMPOUND_OPEN:
+            pending_open += 1
         words.append(t)
         i += 1
-    if words or redirs:
-        segs.append((words, redirs, piped_in, seg_flag if seg_flag is not None else start_flag()))
+    close(None)
     return segs
 
 
@@ -825,7 +914,7 @@ def _usable(val):
 def _restore(word):
     """Turn the LITERAL_DOLLAR / LITERAL_TILDE placeholders back into '$' / '~'
     and an indexed substitution marker back into plain __SUBST__."""
-    word = word.replace(LITERAL_DOLLAR, "$").replace(LITERAL_TILDE, "~")
+    word = word.replace(LITERAL_DOLLAR, "$").replace(LITERAL_TILDE, "~").replace(KW_MARK, "")
     return SUBST_MARK.sub("__SUBST__", word) if "\x02" in word else word
 
 
@@ -892,7 +981,7 @@ def resolution_unsafe(text, tokens, segs, had_function):
         return True
     if any(t in ("{", "}") or re.match(r"IFS(\+?=|$)", t) for t in tokens):
         return True
-    for words, _redirs, _piped, _uncond in segs:
+    for words, *_rest in segs:
         _env, w, _bare = strip_prefix(words)
         if not w:
             continue
@@ -1005,10 +1094,29 @@ def analyze(cmd, ctx):
     resolve = not resolution_unsafe(unsafe_text, tokens, segs, had_function)
     known = dict(ctx.known) if resolve else {}
     analysed = set()
-    for idx, (pwords, predirs, piped_in, unconditional) in enumerate(segs):
+    # `env` is what the checks read (TEST_DATABASE_URL, DOCKER_HOST, ...). It
+    # over-approximates: a variable this text changes is never dropped (a check
+    # would then fall back to the hook's own environment); a value that is not
+    # certain becomes UNCERTAIN (see _note_env). `chain` holds the values set
+    # earlier in the current '&&' chain, which are certain whenever the
+    # segment runs (`cd x && export V=v && cmd`: cmd runs only after the export).
+    chain, prev = {}, None
+    for idx, (pwords, predirs, piped_in, unconditional, before, after) in enumerate(segs):
+        if prev is not None:
+            # The segment after `A && B` runs only if B ran in this shell, unless
+            # B came after '||' (`A || B && C`: B may not have run) or is a
+            # pipeline stage (a subshell). Any other separator ends the chain.
+            p_after, p_before, p_piped, p_new = prev
+            if p_after != "&&":
+                chain = {}
+            elif p_before != "||" and not p_piped:
+                chain.update(p_new)
+        new = {}  # what this segment assigns, for the chain after it
+        prev = (after, before, piped_in, new)
         words = [_restore(x) for x in pwords]
         redirs = [(op, _restore(t)) for op, t in predirs]
-        sctx = Ctx(ctx.raw, cwd, ctx.depth, env, piped_in, redirs, top=ctx.top, captured=ctx.captured)
+        seen = {**env, **chain}
+        sctx = Ctx(ctx.raw, cwd, ctx.depth, seen, piped_in, redirs, top=ctx.top, captured=ctx.captured)
         # A command substitution runs (in a subshell) when this segment expands
         # its words: check it with the variables known here, as at the top level.
         for x in list(pwords) + [t for _op, t in predirs]:
@@ -1026,7 +1134,7 @@ def analyze(cmd, ctx):
         # stay unresolved) and read on to the real command word.
         while pw and APPEND_OR_ELEMENT_ASSIGN.fullmatch(pw[0]):
             var = re.match(r"[A-Za-z_]\w*", pw[0]).group(0)
-            env.pop(var, None)
+            _note_env(env, new, var, None, unconditional)
             known.pop(var, None)
             more_env, pw, more_bare = strip_prefix(pw[1:])
             raw_env.update(more_env)
@@ -1036,15 +1144,11 @@ def analyze(cmd, ctx):
             sctx.deny("printing the environment exposes secrets")
         check_exec_env(senv, sctx)
         if not pw:
-            # A bare `FOO=bar` persists only when it is certain to run. When it is
-            # guarded by &&/||, inside a subshell or compound body, or ended by
-            # '&' / '|', the guard drops the variable so later `$FOO` stays
-            # unresolved (fail-closed).
+            # A bare `FOO=bar` is trusted for $FOO only when it is certain to run.
+            # When it is guarded by &&/||, inside a subshell or compound body, or
+            # ended by '&' / '|', later `$FOO` stays unresolved (fail-closed).
             for k, v in senv.items():
-                if unconditional and _usable(v):
-                    env[k] = v
-                else:
-                    env.pop(k, None)
+                _note_env(env, new, k, v, unconditional)
             for k, v in raw_env.items():
                 kv = _known_value(k, v) if unconditional else None
                 if kv is None:
@@ -1052,7 +1156,7 @@ def analyze(cmd, ctx):
                 else:
                     known[k] = kv
             continue
-        sctx.env = {**env, **senv}
+        sctx.env = {**seen, **senv}
         if resolve:
             pw = pw[:1] + [subst_vars(x, known) for x in pw[1:]]
         for k in raw_env:
@@ -1060,12 +1164,15 @@ def analyze(cmd, ctx):
         raw_args = pw[1:]
         w = [_restore(x) for x in pw]
         name = os.path.basename(w[0])
+        if name in POSIX_SPECIAL_BUILTINS:
+            for k, v in senv.items():
+                _note_env(env, new, k, v, False)
         if w[0] in ("cd", "pushd"):
             target = nonopt(w[1:])
             nxt = expand_path(target[0], cwd) if target else HOME
             cwd = nxt or cwd
             continue
-        track_var_mutations(name, raw_args, unconditional, env, known, sctx)
+        track_var_mutations(name, raw_args, unconditional, env, known, new, sctx)
         if re.search(r"\{[^{}]*,[^{}]*\}", w[0]):
             sctx.deny("brace expansion builds the command name; write the command literally so the guard can read it")
         if "$" in w[0] or "__SUBST__" in w[0] or "`" in w[0]:
@@ -1087,16 +1194,39 @@ def analyze(cmd, ctx):
 
 
 _VARNAME = re.compile(r"[A-Za-z_]\w*")
+# A value the guard cannot know: set by a segment that may not run, computed at
+# run time, read, looped over, appended to, or changed through declare options.
+# The checks that read a variable from ctx.env (TEST_DATABASE_URL, DOCKER_HOST,
+# DOCKER_CONTEXT/CONFIG, TECHSARA_STACK and COMPOSE_*, HOME for git push) refuse it.
+UNCERTAIN = "__UNCERTAIN__"
+# POSIX special builtins: an assignment in front of one persists in sh.
+POSIX_SPECIAL_BUILTINS = {":", ".", "source", "break", "continue", "eval", "exec", "exit", "export", "readonly",
+                          "return", "set", "shift", "times", "trap", "unset"}
 
 
-def track_var_mutations(name, raw_args, unconditional, env, known, ctx):
-    """Keep `env` (values handed to the checks) and `known` (values $VAR may
-    resolve to) in step with a command that sets, appends, reads, loops over,
-    declares or unsets shell variables, so later `$VAR` references resolve to a
-    trustworthy value or stay unresolved (fail-closed). `raw_args` still carry
-    the prepare() placeholders. A variable is trusted only after an
-    unconditional literal assignment; read/for/select/wait/declare options/
-    printf -v/unset/let/mapfile all drop it instead."""
+def _note_env(env, new, k, v, certain):
+    """Record that a segment sets `k` to `v` (None: a value the guard cannot
+    know). `env` over-approximates what later segments may see: a certain
+    assignment replaces the value; one that may not run keeps it only when both
+    agree (the old value is env's, else the hook's own environment), otherwise
+    the variable becomes UNCERTAIN. It is never dropped, so no check falls back
+    to the hook's environment for a variable this command changed. `new` gets
+    the value for the '&&' chain after the segment (see analyze())."""
+    val = v if v is not None and _usable(v) else UNCERTAIN
+    new[k] = val
+    if not certain and (env[k] if k in env else os.environ.get(k)) != val:
+        val = UNCERTAIN
+    env[k] = val
+
+
+def track_var_mutations(name, raw_args, unconditional, env, known, new, ctx):
+    """Keep `env` (values handed to the checks, see _note_env) and `known`
+    (values $VAR may resolve to) in step with a command that sets, appends,
+    reads, loops over, declares or unsets shell variables, so later `$VAR`
+    references resolve to a trustworthy value or stay unresolved (fail-closed).
+    `raw_args` still carry the prepare() placeholders. A variable is trusted
+    for $VAR only after an unconditional literal assignment; read/for/select/
+    wait/declare options/printf -v/unset/let/mapfile all drop it instead."""
     args = [_restore(a) for a in raw_args]
     if name in ("export", "declare", "typeset", "readonly", "local"):
         has_opts = any(a[:1] in "-+" for a in args)  # -n nameref, -l/-u case, -i integer, ...
@@ -1112,28 +1242,41 @@ def track_var_mutations(name, raw_args, unconditional, env, known, ctx):
                 bare.append(a)
         check_exec_env(assigned, ctx)
         for k, v in assigned.items():
-            if unconditional and not has_opts and _usable(v):
-                env[k] = v  # e.g. `declare BR=main` sets BR=main, so a later push to it is seen
-            else:
-                env.pop(k, None)
+            # e.g. `declare BR=main` sets BR=main, so a later push to it is seen
+            _note_env(env, new, k, None if has_opts else v, unconditional)
             kv = _known_value(k, raw_assigned[k]) if unconditional and not has_opts else None
             if kv is None:
                 known.pop(k, None)
             else:
                 known[k] = kv
         for k in bare:
-            env.pop(k, None)  # declared without a value: uncertain
+            # `export V` / `readonly V` keep V's value; declare/typeset/local may
+            # change it (attributes, a new local).
+            if name not in ("export", "readonly") or has_opts:
+                _note_env(env, new, k, None, unconditional)
             known.pop(k, None)
         return
-    if name in ("unset", "read", "mapfile", "readarray", "getopts", "wait", "for", "select", "let", "printf"):
+    targets = []
+    if name == "unset":
+        if not any(a.startswith("-") and "f" in a for a in args):  # unset -f names functions
+            targets = [(a, "") for a in args if _VARNAME.fullmatch(a)]
+    elif name in ("for", "select"):
+        targets = [(a, None) for a in args[:1]]  # the loop variable
+    elif name == "printf":
+        for i, a in enumerate(args):
+            if a == "-v" and i + 1 < len(args):
+                targets.append((args[i + 1], None))
+            elif a.startswith("-v"):
+                targets.append((a[2:], None))
+    elif name in ("read", "mapfile", "readarray", "getopts", "wait", "let"):
         # Every name-shaped argument may be (re)assigned: read/mapfile/getopts/
-        # wait -p targets, the for/select loop variable, let NAME=expr, printf -v.
-        for a in args:
-            m = re.match(r"^-?v?([A-Za-z_]\w*)", a) if name == "printf" else re.match(r"^([A-Za-z_]\w*)", a)
-            if m:
-                env.pop(m.group(1), None)
-                known.pop(m.group(1), None)
-        return
+        # wait -p targets, let NAME=expr.
+        targets = [(a, None) for a in args]
+    for a, v in targets:
+        m = re.match(r"^([A-Za-z_]\w*)", a)
+        if m:
+            _note_env(env, new, m.group(1), v, unconditional)
+            known.pop(m.group(1), None)
 
 
 # Pipe sinks that only print what they read: a pure reader piped into them still
@@ -1444,7 +1587,10 @@ def check_production_reach(cmd, args, ctx):
     if runs_pytest:
         where = (ctx.cwd or "") + " " + " ".join(args)
         if re.search(r"orchestrator|sync-worker", where):
-            url = ctx.env.get("TEST_DATABASE_URL") or os.environ.get("TEST_DATABASE_URL", "")  # inline, or set for the cycle by the runner
+            # inline or set earlier in this command; otherwise the runner sets it for the cycle
+            url = ctx.env["TEST_DATABASE_URL"] if "TEST_DATABASE_URL" in ctx.env else os.environ.get("TEST_DATABASE_URL", "")
+            if url == UNCERTAIN:
+                ctx.deny("TEST_DATABASE_URL is set conditionally or computed earlier in this command, so the guard cannot tell which database the tests would truncate; set it unconditionally (export TEST_DATABASE_URL=...; ...), in the same && chain, or inline in front of pytest")
             if not url:
                 ctx.deny(f"orchestrator tests TRUNCATE every table; pass TEST_DATABASE_URL (and TEST_DATABASE_ALLOWED_HOSTS) for the autopilot's dedicated test database inline; the URL is in {TEST_DB.get('url_file', '~/.llm-autopilot/agent/test-db.url')}")
             m = re.match(r"^postgres(?:ql)?(?:\+\w+)?://(?:[^@/]*@)?(\[[^\]]+\]|[^:/?]+)(?::(\d+))?/([^?\s]+)", url)
@@ -1766,6 +1912,40 @@ def check_code_text(code, ctx):
             ctx.deny(f"inline code writes or deletes under {root}, which is read-only to the autopilot (guard files and production/model trees)")
 
 
+# The exact header distlib / pip / uv write on a console-script entry point:
+#   #!/bin/sh
+#   '''exec' "<python>" "$0" "$@"
+#   ' '''
+# sh runs only line 2, which replaces sh with python on the same file. <python>
+# is a literal path, or the script's own directory plus python[X.Y].
+_PY_NAME = r"python[0-9.]*"
+_ENTRY_EXEC = re.compile(
+    r"'''exec' (?:"
+    r'"(?P<q>/[^"$`\\]*/' + _PY_NAME + r')"'
+    r"|(?P<u>/[^\s\"'$`\\;&|<>(){}*?\[\]]*/" + _PY_NAME + r")"
+    r'|"\$\(dirname (?:-- )?"\$\((?:readlink -f|realpath)(?: --)? "\$0"\)"\)/(?P<rel>' + _PY_NAME + r')"'
+    r') "\$0" "\$@"'
+)
+
+
+def is_python_entry_point(text, path):
+    """True only for the exact entry-point header above whose interpreter is a
+    real binary. Anything else with a `'''exec'` line is analysed as shell, and
+    so is an entry point whose "python" is a script (it would run as shell)."""
+    lines = text.split("\n", 3)
+    if len(lines) < 3 or lines[0].rstrip() != "#!/bin/sh" or lines[2].rstrip() != "' '''":
+        return False
+    m = _ENTRY_EXEC.fullmatch(lines[1].rstrip())
+    if not m:
+        return False
+    target = m.group("q") or m.group("u") or os.path.join(os.path.dirname(os.path.realpath(path)), m.group("rel"))
+    try:
+        with open(os.path.realpath(target), "rb") as fh:
+            return fh.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
 def analyze_script_file(path, ctx, force=False):
     p = expand_path(path, ctx.cwd)
     if p is None or not os.path.isfile(p):
@@ -1780,9 +1960,8 @@ def analyze_script_file(path, ctx, force=False):
     except OSError:
         return
     # A pip / distlib console-script entry point (pip, pytest, ...) is a Python
-    # program behind a sh/python polyglot header: `#!/bin/sh` then a line that
-    # starts with '''exec' re-execs python on it. It is python, not shell.
-    if re.match(r"#!\s*/bin/sh\b", text) and re.search(r"\n\s*'''exec'", text[:300]):
+    # program behind a sh/python polyglot header; sh runs only its exec line.
+    if is_python_entry_point(text, p):
         return
     if text.startswith("#!") and not re.match(r"#!\s*/(usr/)?bin/(env\s+)?(ba|z|da|k)?sh\b", text):
         return
@@ -1797,58 +1976,238 @@ def analyze_script_file(path, ctx, force=False):
 # A glob whose fixed part targets a secret file (cat .env*, cat .runtime/*).
 SECRET_GLOB = re.compile(r"(^|/)(\.env([.*?\[]|$)|secrets?([.*?\[]|$)|\.runtime/(secrets|\*|\.\*)|credentials|id_(rsa|dsa|ecdsa|ed25519)|[^/]*\.(pem|key|p12|pfx))", re.I)
 GREP_FAMILY = {"grep", "egrep", "fgrep", "rg", "ag"}
-GREP_VALUE_OPTS = {"-e", "--regexp", "-f", "--file", "-m", "--max-count", "-A", "-B", "-C", "--context",
-                   "--before-context", "--after-context", "-d", "--max-depth", "--include", "--exclude",
-                   "--exclude-dir", "--include-dir", "-g", "--glob", "--iglob", "-t", "--type", "-T",
-                   "--type-not", "--color", "--colour", "--colors"}
+# Options that take a value, per search tool: (short option letters, long
+# options). `grep` covers GNU grep and ugrep (Claude Code runs ugrep for
+# `grep`); a letter is listed when it takes a value in one and is invalid in the
+# other. An option missing here is read as a flag, which can only turn its value
+# into an operand the guard checks (fail-closed); a flag listed here would hide
+# the next word (the pattern, or a file) from review. Optional values (GNU
+# --color[=WHEN], ag -A/-B/-C [N]) are flags: only `--opt=value` attaches them.
+_GREP_VALUE = ("efmABCdDgtOMNJK", frozenset({
+    "--regexp", "--file", "--max-count", "--min-count", "--after-context", "--before-context", "--context",
+    "--directories", "--devices", "--include", "--exclude", "--exclude-dir", "--include-dir", "--exclude-from",
+    "--include-from", "--exclude-fs", "--include-fs", "--label", "--binary-files", "--and", "--andnot", "--not",
+    "--neg-regexp", "--colors", "--colours", "--delay", "--depth", "--encoding", "--file-type",
+    "--file-extension", "--file-magic", "--filter-magic-label", "--format", "--from", "--glob", "--iglob",
+    "--jobs", "--range", "--min-line", "--max-line", "--max-files", "--max-size", "--min-size", "--replace",
+    "--context-separator", "--zmax"}))
+GREP_VALUE_OPTS = {
+    "grep": _GREP_VALUE, "egrep": _GREP_VALUE, "fgrep": _GREP_VALUE,
+    "rg": ("efmABCgtTEjMrd", frozenset({
+        "--regexp", "--file", "--max-count", "--after-context", "--before-context", "--context", "--glob",
+        "--iglob", "--type", "--type-not", "--type-add", "--type-clear", "--encoding", "--threads",
+        "--max-columns", "--replace", "--max-depth", "--max-filesize", "--color", "--colors", "--path-separator",
+        "--pre", "--pre-glob", "--ignore-file", "--sort", "--sortr", "--engine", "--context-separator",
+        "--field-context-separator", "--field-match-separator", "--hostname-bin", "--hyperlink-format",
+        "--dfa-size-limit", "--regex-size-limit", "--generate"})),
+    "ag": ("GgmpW", frozenset({
+        "--max-count", "--file-search-regex", "--filename-pattern", "--depth", "--ignore", "--ignore-dir",
+        "--path-to-ignore", "--pager", "--width", "--workers", "--color-line-number", "--color-match",
+        "--color-path"})),
+}
+# Options whose value is a file the tool reads (patterns, ignore lists, a file list).
+GREP_FILE_OPTS = ("--file", "--exclude-from", "--include-from", "--from", "--ignore-file", "--ignore-files",
+                  "--path-to-ignore")
+# Options whose value is a pattern or a scoping glob/type, never a file.
+GREP_TEXT_OPTS = {"-e", "--regexp", "--and", "--andnot", "--not", "-N", "--neg-regexp", "--include", "--exclude",
+                  "--exclude-dir", "--include-dir", "--glob", "--iglob", "--type", "--type-not", "--type-add",
+                  "--file-type", "--file-extension", "--file-search-regex", "--filename-pattern", "--pre-glob",
+                  "-g", "-G", "-t", "-T", "-O", "-r", "--replace"}
 # Secret basenames a recursive search could print. A scoping glob (grep
-# --include, rg -g/--iglob) or a named file type (rg -t) is trusted to keep a
-# search out of secrets only when none of these could match it.
-SECRET_SAMPLES = (".env", ".env.local", ".env.production", "secrets.env", "app.env", "secrets.yaml",
-                  "secrets.yml", "secrets.json", "secrets.toml", "credentials.json", ".credentials.json",
-                  "id_rsa", "id_ed25519", "server.pem", "tls.key", "store.p12", "vault.pfx", ".netrc",
+# --include, ugrep -g/-O, rg -g/--iglob) is trusted to keep a search out of
+# secrets only when none of these can match it and the glob itself (and the
+# glob with its wildcards filled in) is no secret name; see _glob_can_match_secret.
+SECRET_SAMPLES = (".env", ".env.local", ".env.production", ".env.prod", ".env.dev", ".env.development",
+                  ".env.staging", ".env.test", ".env.bak", ".env.backup", "prod.env", "secrets.env", "app.env",
+                  "secrets.yaml", "secrets.yml", "secrets.json", "secrets.toml", "secrets.txt", "secrets.ini",
+                  "secrets.conf", "secrets.cfg", "secret", "secrets", "credentials", "credentials.json",
+                  ".credentials.json", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_rsa.pub", "server.pem",
+                  "tls.key", "store.p12", "vault.pfx", "app.jks", "app.keystore", "vault.kdbx", ".netrc",
                   ".pgpass", ".git-credentials", ".npmrc", ".pypirc", "Training_Module_Feature_Map_and_Memory.txt")
+# Named file types (rg -t, ugrep -t) whose globs select no secret basename. Any
+# other type (txt, json, yaml, toml, config, text, a --type-add one) is not trusted.
+SAFE_SEARCH_TYPES = {"py", "python", "Python", "js", "javascript", "ts", "typescript", "md", "markdown", "rust",
+                     "go", "html", "css", "c", "cpp", "c++", "java", "rst", "sql", "svelte", "vue", "php",
+                     "ruby", "sh", "shell", "Shell", "lua", "kotlin", "swift", "scala"}
+_GLOB_WILD = re.compile(r"\[[^\]]*\]|[*?]")
+
+
+def _glob_alternatives(glob, limit=64):
+    """The alternatives of a glob: `{a,b}` groups expanded (nested), then split
+    on commas and whitespace (ugrep -g and some tools take a list). None when
+    there are more than `limit` (the caller then fails closed)."""
+    out, todo = [], [glob]
+    while todo:
+        cur = todo.pop()
+        start = cur.find("{")
+        group = None
+        while start != -1 and group is None:
+            depth, j, cuts = 0, start, []
+            while j < len(cur):
+                if cur[j] == "{":
+                    depth += 1
+                elif cur[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                elif cur[j] == "," and depth == 1:
+                    cuts.append(j)
+                j += 1
+            if j < len(cur) and cuts:
+                bounds = [start] + cuts + [j]
+                group = (cur[:start], [cur[a + 1 : b] for a, b in zip(bounds, bounds[1:])], cur[j + 1 :])
+            else:
+                start = cur.find("{", start + 1)
+        if group is None:
+            out += [p for p in re.split(r"[,\s]+", cur) if p]
+        else:
+            pre, alts, post = group
+            todo += [pre + a + post for a in alts]
+        if len(out) + len(todo) > limit:
+            return None
+    return out
 
 
 def _glob_can_match_secret(glob):
-    """True when a positive include glob could select a secret basename (so a
-    recursive search restricted to it could still print a secret)."""
+    """True when a positive include glob could select a secret file, so a
+    recursive search restricted to it could still print one: one of its
+    alternatives matches a sample secret basename, is (or, with its wildcards
+    filled in, becomes) a secret name or path, or names a secret directory."""
     import fnmatch
     g = glob.strip()
     if not g or g.startswith("!"):  # empty or a negated (exclude) glob: not a positive include
         return False
-    base = g.rsplit("/", 1)[-1] or g
-    return any(fnmatch.fnmatch(s, base) for s in SECRET_SAMPLES)
+    alts = _glob_alternatives(g)
+    if alts is None:
+        return True
+    for alt in alts:
+        if alt.startswith("!"):
+            continue
+        base = alt.rstrip("/").rsplit("/", 1)[-1] or alt
+        if any(fnmatch.fnmatch(s, base) for s in SECRET_SAMPLES):
+            return True
+        for cand in {alt, _GLOB_WILD.sub("x", alt), _GLOB_WILD.sub("", alt)}:
+            cbase = cand.rstrip("/").rsplit("/", 1)[-1]
+            if SECRET_BASENAME.match(cbase) or SECRET_TOKEN_IN_TEXT.search(cand) or SECRET_PATH_PARTS.search(cand):
+                return True
+        for part in alt.split("/")[:-1]:  # a directory part such as secrets/ or .runtime/
+            if part not in ("", ".", "*", "**") and any(fnmatch.fnmatch(d, part) for d in ("secrets", "secret", ".runtime")):
+                return True
+    return False
 
 
-def _search_scoped_off_secrets(cmd, args):
-    """True when include globs / file types restrict the search to names that
-    cannot match a secret basename (so even a recursive search under a tree with
-    secrets reads none). False when there is no such restriction (fail-closed)."""
-    globs, types, i = [], [], 0
-    while i < len(args):
+def parse_search(cmd, args):
+    """Read a grep/rg/ag command line into (values, flags, operands): `values`
+    is [(option, value)] for each value option (`-e P`, `-eP`, `--file=F`,
+    `-rnA3`), `flags` the other options, `operands` the rest. Options end at
+    `--`; a short bundle is read letter by letter, a value letter taking the
+    rest of the bundle or the next word (see GREP_VALUE_OPTS)."""
+    shorts, longs = GREP_VALUE_OPTS.get(cmd, _GREP_VALUE)
+    values, flags, operands, i, n = [], [], [], 0, len(args)
+    while i < n:
         a = args[i]
-        if a in ("--include", "-g", "--glob", "--iglob") and i + 1 < len(args):
-            globs.append(args[i + 1]); i += 2; continue
-        if a.startswith(("--include=", "--glob=", "--iglob=")):
-            globs.append(a.split("=", 1)[1]); i += 1; continue
-        if a.startswith("-g") and not a.startswith("--") and len(a) > 2:
-            globs.append(a[2:]); i += 1; continue
-        if a in ("-t", "--type") and i + 1 < len(args):
-            types.append(args[i + 1]); i += 2; continue
-        if a.startswith("--type="):
-            types.append(a.split("=", 1)[1]); i += 1; continue
-        if a.startswith("-t") and not a.startswith("--") and len(a) > 2:
-            types.append(a[2:]); i += 1; continue
+        if a == "--":
+            operands += args[i + 1 :]
+            break
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            if eq:
+                values.append((name, val))
+            elif name in longs and i + 1 < n:
+                values.append((name, args[i + 1]))
+                i += 1
+            else:
+                flags.append(name)
+        elif a.startswith("-") and a != "-":
+            for j in range(1, len(a)):
+                if a[j] in shorts:
+                    if j + 1 < len(a):
+                        values.append(("-" + a[j], a[j + 1 :]))
+                    elif i + 1 < n:
+                        values.append(("-" + a[j], args[i + 1]))
+                        i += 1
+                    else:
+                        flags.append("-" + a[j])
+                    break
+                flags.append("-" + a[j])
+        else:
+            operands.append(a)
         i += 1
+    return values, flags, operands
+
+
+def _long_prefix(opt, longs, known=frozenset()):
+    """True when `opt` is one of `longs`, or an abbreviation of one (GNU
+    getopt accepts any unambiguous prefix) that is not itself a `known` option
+    (--exclude is not short for --exclude-from)."""
+    return opt in longs or (opt.startswith("--") and len(opt) > 3 and opt not in known
+                            and any(x.startswith(opt) for x in longs))
+
+
+def _search_scoped_off_secrets(cmd, values):
+    """True when include globs / file types restrict the search to names that
+    cannot match a secret basename (so a recursive search reads no secret file
+    by name; a secret DIRECTORY under the root is checked per root, see
+    _tree_may_hold_secret_dir). False when there is no such restriction, or one
+    the guard cannot evaluate (fail-closed)."""
+    globs, types = [], []
+    for o, v in values:
+        if o in ("--include", "--glob", "--iglob") or (o == "-g" and cmd != "ag"):
+            globs.append(v)
+        elif o in ("-O", "--file-extension") and cmd not in ("rg", "ag"):
+            globs += ["*." + e for e in v.split(",")]
+        elif o in ("-t", "--type", "--file-type") and cmd != "ag":
+            types += v.split(",")
+        elif o in ("--type-add", "-M", "--file-magic", "--pre", "--pre-glob"):
+            return False  # a custom type, content magic or a preprocessor: not a name restriction
     positives = [g for g in globs if g.strip() and not g.strip().startswith("!")]
     if not positives and not types:
         return False
     if any(_glob_can_match_secret(g) for g in positives):
         return False
-    # A named rg file type (letters/digits only) maps to source-file globs; none
-    # of the built-in types selects a dotfile such as .env. An odd value is not trusted.
-    return all(re.fullmatch(r"[A-Za-z0-9_+-]+", t) for t in types)
+    return all(t in SAFE_SEARCH_TYPES for t in types)
+
+
+# Directories a tree walk never descends: VCS data, dependencies and caches.
+_TREE_SKIP = {".git", "node_modules", ".venv", "venv", "__pycache__", "site-packages", ".mypy_cache",
+              ".pytest_cache", ".ruff_cache", ".next", ".cache"}
+
+
+def _tree_may_hold_secret_dir(root, max_depth=4, max_dirs=4000):
+    """True when a recursive search rooted at `root` may reach files that are
+    secret whatever their names (a SECRET_DIRS entry, a `secrets/` directory,
+    `.runtime/secrets*`), so a name glob cannot keep the search off them. Walks
+    `max_depth` levels below the root, skipping VCS, dependency and cache trees;
+    a walk that reaches `max_dirs` directories counts as True (fail-closed)."""
+    if root is None:
+        return True
+    if any(under(d, root) or under(root, d) for d in SECRET_DIRS):
+        return True
+    if not os.path.isdir(root):
+        return False
+    stack, visited = [(root, 0)], 0
+    while stack:
+        d, depth = stack.pop()
+        visited += 1
+        if visited > max_dirs:
+            return True
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        runtime = os.path.basename(d) == ".runtime"
+        for e in entries:
+            try:
+                is_dir = e.is_dir(follow_symlinks=False)
+                if (e.name == "secrets" and e.is_dir()) or (runtime and e.name.startswith("secrets") and (is_dir or not SECRET_BASENAME.match(e.name))):
+                    # every file in it is secret whatever its name (SECRET_PATH_PARTS);
+                    # a secret BASENAME elsewhere is _glob_can_match_secret's job
+                    return True
+            except OSError:
+                return True
+            if is_dir and depth < max_depth and e.name not in _TREE_SKIP:
+                stack.append((e.path, depth + 1))
+    return False
 
 
 def _looks_secret(val, cwd):
@@ -1859,6 +2218,24 @@ def _looks_secret(val, cwd):
         return True
     if p is None and SECRET_TOKEN_IN_TEXT.search(val):
         return True
+    return False
+
+
+def _names_existing_secret(val, cwd):
+    """True when `val`, read as a path (or, with glob characters, as the files
+    the shell would expand it to), names a secret file that exists."""
+    import glob as globmod
+    p = expand_path(val, cwd)
+    if not p:
+        return False
+    if os.path.lexists(p) and is_secret_path(p):
+        return True
+    if any(c in val for c in "*?["):
+        try:
+            hits = globmod.glob(p)[:64]
+        except Exception:
+            return True  # fail-closed
+        return any(is_secret_path(h) for h in hits)
     return False
 
 
@@ -1917,42 +2294,56 @@ def recursive_secret_root(p):
 
 
 def check_grep_reads(cmd, args, ctx):
-    """grep/rg/ag: the first positional is the PATTERN (not a file); the rest are
-    paths. Reject reading a secret file, and reject a RECURSIVE search rooted at a
-    tree that holds untracked secrets (the production checkout, $HOME, ~/.config,
-    the autopilot home, a secret directory). With NO path operand a recursive
-    search covers the cwd (rg/ag always recurse), so check the cwd too. An
-    --include / -g / -t that cannot match a secret basename scopes it off secrets."""
-    recursive = cmd in ("rg", "ag")  # ripgrep and the silver searcher recurse by default
-    pat_from_opt = any(a in ("-e", "--regexp", "-f", "--file") or a.startswith(("-e", "--regexp=", "-f", "--file=")) for a in args)
-    for idx, a in enumerate(args):
-        if a in ("-r", "-R", "--recursive", "--dereference-recursive"):
+    """grep/rg/ag, read with parse_search(): the first operand is the PATTERN
+    unless an option supplies it (-e/-f, rg --files, ag -g); the other operands
+    are paths. Reject reading a secret file (an operand, or the file named by
+    -f/--exclude-from/--from/--ignore-file), and a RECURSIVE search rooted at a
+    tree that holds untracked secrets (the production checkout, $HOME,
+    ~/.config, the autopilot home, a secret directory). With NO path operand a
+    recursive search covers the cwd (rg/ag always recurse), so check the cwd
+    too. An --include / -g / -t that cannot match a secret basename scopes it
+    off secrets, unless the root may hold a secret directory. Backstop: the
+    pattern word, and any other option value, that names an existing secret
+    file is refused too, so a misread option never moves a file out of review."""
+    values, flags, operands = parse_search(cmd, args)
+    opts = flags + [o for o, _v in values]
+    known = GREP_VALUE_OPTS.get(cmd, _GREP_VALUE)[1] | GREP_TEXT_OPTS
+    grep_like = cmd not in ("rg", "ag")
+    recursive = not grep_like  # ripgrep and the silver searcher recurse by default
+    for o in flags:
+        if (grep_like and o in ("-r", "-R")) or _long_prefix(o, ("--recursive", "--dereference-recursive")):
             recursive = True
-        elif a == "-d" and idx + 1 < len(args) and args[idx + 1] == "recurse":
+        elif grep_like and re.fullmatch(r"-\d", o):  # ugrep -NUM searches NUM levels deep
             recursive = True
-        elif a == "--directories=recurse":
+    for o, v in values:
+        if grep_like and (o == "-d" or _long_prefix(o, ("--directories",))) and not re.fullmatch(r"rea(d)?|s(k(ip?)?)?", v):
             recursive = True
-        elif a.startswith("-") and not a.startswith("--") and "r" in a[1:].lower():
+        elif grep_like and _long_prefix(o, ("--depth", "--recursive", "--dereference-recursive")):
             recursive = True
-    positionals, i = [], 0
-    while i < len(args):
-        a = args[i]
-        if a in GREP_VALUE_OPTS:
-            i += 2
-            continue
-        if a.startswith("-") and a != "-":
-            i += 1
-            continue
-        positionals.append(a)
-        i += 1
-    files = positionals if pat_from_opt else positionals[1:]  # drop the pattern
-    scoped = _search_scoped_off_secrets(cmd, args)
+    pat_from_opt = any((o in ("-e", "-f") and cmd != "ag") or _long_prefix(o, ("--regexp", "--file")) for o in opts) \
+        or (cmd == "ag" and any(o == "-g" or _long_prefix(o, ("--filename-pattern",)) for o in opts)) \
+        or (cmd == "rg" and any(o in ("--files", "--type-list") for o in opts))
+    files = operands if pat_from_opt else operands[1:]
+    pattern = None if pat_from_opt or not operands else operands[0]
+    for o, v in values:
+        if (o == "-f" and cmd != "ag") or (o == "-p" and cmd == "ag") or _long_prefix(o, GREP_FILE_OPTS, known):
+            if _looks_secret(v, ctx.cwd):
+                ctx.deny(f"reads a secret file ({v}); secrets must never enter the transcript, logs or commits (§3.3)")
+        elif o not in GREP_TEXT_OPTS and _names_existing_secret(v, ctx.cwd):
+            ctx.deny(f"reads a secret file ({v}); secrets must never enter the transcript, logs or commits (§3.3)")
+    if pattern is not None and _names_existing_secret(pattern, ctx.cwd):
+        ctx.deny(f"'{pattern}' names a secret file; a search must never read one (§3.3)")
+    scoped = _search_scoped_off_secrets(cmd, values)
+
+    def reaches_secrets(root):
+        return recursive_secret_root(root) and not (scoped and not _tree_may_hold_secret_dir(root))
+
     for val in files:
         if _looks_secret(val, ctx.cwd):
             ctx.deny(f"reads a secret file ({val}); secrets must never enter the transcript, logs or commits (§3.3)")
-        if recursive and not scoped and recursive_secret_root(expand_path(val, ctx.cwd)):
+        if recursive and reaches_secrets(expand_path(val, ctx.cwd)):
             ctx.deny(f"a recursive search rooted at {val} would read the untracked .env / .runtime / credential files under it; scope the search to a subdirectory that holds no secrets, or restrict it with --include/-g/-t to names that are not secrets (§3.3)")
-    if not files and recursive and not scoped and recursive_secret_root(_real(ctx.cwd or HOME)):
+    if not files and recursive and reaches_secrets(_real(ctx.cwd or HOME)):
         ctx.deny(f"a recursive search with no path searches the working directory {ctx.cwd}, which would read the untracked .env / .runtime / credential files under it; search a subdirectory that holds no secrets, or restrict it with --include/-g/-t to names that are not secrets (§3.3)")
 
 
@@ -2727,6 +3118,9 @@ DOCKER_READONLY_SUBS = {"ps", "ls", "logs", "images", "version", "info", "events
 
 def check_docker(args, ctx):
     a = list(args)
+    for k in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"):
+        if ctx.env.get(k) == UNCERTAIN:
+            ctx.deny(f"{k} is set conditionally or computed earlier in this command, so the guard cannot tell which docker engine this reaches; set it unconditionally or inline")
     docker_host = ctx.env.get("DOCKER_HOST", "")
     if ctx.env.get("DOCKER_CONTEXT"):
         ctx.deny("DOCKER_CONTEXT selects a docker context; contexts belong to the operator, point DOCKER_HOST at this host's socket or the worker instead")
@@ -2949,6 +3343,9 @@ def check_compose(rest, ctx, remote=False):
     # no longer shift a mutating subcommand into this allow-list.
     if sub in (None, "ps", "ls", "images", "top", "logs", "version", "port", "events", "stats"):
         return
+    uncertain = sorted(k for k, v in ctx.env.items() if v == UNCERTAIN and (k == "TECHSARA_STACK" or k.startswith("COMPOSE_")))
+    if uncertain:
+        ctx.deny(f"{', '.join(uncertain)} is set conditionally or computed earlier in this command, so the guard cannot tell which compose project this acts on; set it unconditionally or inline")
     if project_flag and project_flag.startswith(PROD_STACK):
         ctx.deny(f"'{project_flag}' is a production compose project")
     if any("$" in g or "__SUBST__" in g for g in globals_):
@@ -3286,10 +3683,29 @@ def check_file_tool(tool, ti, cwd):
         # public template, so the Glob tool is not subject to this block.
         if tool == "Grep":
             g = ti.get("glob") or ""
-            # Exempt the public example/sample/template/dist variants of .env.
-            if re.search(r"(^|[/*{,])\.env(\.(example|sample|template|dist)\b|[.*}]|$)|credentials|secrets?\.env|id_(rsa|ed25519)|\.pem\b|\.key\b", g) \
-                    and not re.search(r"\.env\.(example|sample|template|dist)\b", g):
+            if g and grep_tool_glob_reads_secret(g):
                 block(f"{TAG} {tool} glob={g} -> blocked: searching inside secret files is not allowed (§3.3).")
+
+
+# A Grep-tool glob alternative that reaches secret files.
+_GREP_TOOL_SECRET_GLOB = re.compile(r"(^|[/*{,])\.env([.*}]|$)|credentials|secrets?\.env|id_(rsa|ed25519)|\.pem\b|\.key\b")
+
+
+def grep_tool_glob_reads_secret(g):
+    """True when a Grep-tool glob can select a secret file. Brace groups and
+    lists are expanded first; an alternative that is exactly a public template
+    (.env.example/.sample/.template/.dist, optionally after a directory or `*`)
+    is exempt, every other alternative must be no secret glob. Too many
+    alternatives fail closed."""
+    alts = _glob_alternatives(g)
+    if alts is None:
+        return True
+    for alt in alts:
+        if alt.startswith("!"):
+            continue  # an exclusion never selects a file
+        if _GREP_TOOL_SECRET_GLOB.search(re.sub(r"\.env\.(example|sample|template|dist)$", ".TEMPLATE", alt)):
+            return True
+    return False
 
 
 # Tools whose input runs a shell command, analysed exactly like Bash. Monitor
