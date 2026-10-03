@@ -29,7 +29,7 @@ of them skips layer 3:
 |---|---|---|
 | `Bash`, `Monitor` | both run a shell command (Monitor can also open a WebSocket) | the full command analysis; a Monitor WebSocket to an external host is refused |
 | `Write`, `Edit`, `MultiEdit`, `NotebookEdit` | write files | refuse writes outside the autopilot's zones, over guard files or over a directory that holds one |
-| `Read`, `Grep`, `NotebookRead` | read file contents | refuse reads of secret files, and recursive greps (including a pathless one, which covers the working directory) rooted at a tree that holds untracked secrets, unless an `--include`/`-g`/`-t` scopes them off secret names |
+| `Read`, `Grep`, `NotebookRead` | read file contents | refuse reads of secret files, and recursive greps (including a pathless one, which covers the working directory) rooted at a tree that holds untracked secrets, unless an `--include`/`-g`/`-t` scopes them off secret names and the tree holds no secret directory |
 | `Glob` | list file names | refuse only a glob that points at a named secret path; a name-listing pattern such as `**/*.env` is allowed because a returned path is re-checked when `Read`/`Grep` opens it |
 | `WebFetch`, `WebSearch` | reach a URL or an external search service | refuse a production host, a private/link-local/loopback address, or a credential-shaped string |
 | `Agent`, `Task`, `Workflow`, `Skill` | spawn subagents / run a workflow (the operator REQUIRES multiple agents) | stay allowed — a subagent's own tool calls pass back through this hook — except an input that carries a secret shape or asks for remote/cloud isolation (running outside the local guard) |
@@ -48,6 +48,19 @@ from a variable stays unresolved and trips the literal-name / literal-refspec /
 literal-path refusals. The `docker` and `docker compose` parsers consume each
 global option's value (so a hidden `--tlskey`/`--workdir` cannot shift the
 subcommand) and fail closed on an unrecognised global option or subcommand.
+
+A variable set by a segment that may not run, or computed at run time, becomes
+uncertain rather than unset: the checks that read `TEST_DATABASE_URL`,
+`DOCKER_HOST`/`DOCKER_CONTEXT`/`DOCKER_CONFIG`, `TECHSARA_STACK` or `COMPOSE_*`
+then refuse instead of falling back to the hook's own environment. A value set
+earlier in the same `&&` chain counts as set. A `case` statement's arm patterns
+are read as patterns, never as commands; its arm bodies are analysed like any
+other command. `grep`, `rg` and `ag` are parsed per tool (options end at `--`,
+each tool has its own value-taking options), and a pattern word or option value
+that names an existing secret file is refused as well. A `#!/bin/sh` file is
+read as a Python console-script entry point only when its header is exactly the
+one pip/distlib writes and its interpreter is a real binary; otherwise it is
+analysed as shell.
 
 The matcher is a fixed alternation, so only the tools above (and any `mcp__*`)
 reach layer 3; a tool not named here is left to layers 1 and 2 (`permissions.deny`
