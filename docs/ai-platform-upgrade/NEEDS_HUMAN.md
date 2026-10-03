@@ -2,6 +2,18 @@
 
 Items only the operator can resolve. Each has the exact action, why, the risk, the command and the rollback. Open items first.
 
+## NH-011 — Approve a `.github/` change before the finish line (OPEN, action later)
+
+- **What:** `autopilot/dev` changes one CI file, `.github/workflows/gitleaks-baseline.json`: two reviewed entries for fabricated test values in `ops/autopilot/tests/test_runner.py` (commit df091d61), in the file's existing format. Without them the blocking secret scan fails on every run, because gitleaks reads history and the commit is already pushed.
+- **Why you:** once NH-007 is installed, the gate refuses a commit whose `.github/` tree differs from `origin/dev` until you approve that tree.
+- **When:** at the finish line, or whenever `.github/` changes again (the gate prints the tree hash). Review, then approve:
+  ```bash
+  git -C ~/work/llm-dev diff origin/dev origin/autopilot/dev -- .github/
+  git -C ~/work/llm-dev rev-parse origin/autopilot/dev:.github >> ~/.llm-autopilot/approved-ci-trees
+  ```
+- **Risk:** none until the finish line; an unapproved tree only holds the merge into `dev`.
+- **Rollback:** delete the line from `~/.llm-autopilot/approved-ci-trees`.
+
 ## NH-007 — Install the reviewed guardrail fixes (OPEN, action)
 
 - **What:** P0-15 fixed 25 review findings in the guard hook, the deny rules, the runner and the dev gate (`ops/autopilot/`, `ops/deploy/merge_to_dev.sh`; merged into `autopilot/dev` at b37e961e). The autopilot may not install its own guardrails (§3.3), so the running copies in `~/.llm-autopilot/` are still the Phase 0 ones.
