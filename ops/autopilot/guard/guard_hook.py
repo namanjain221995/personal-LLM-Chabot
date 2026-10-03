@@ -24,8 +24,10 @@ import os
 import pwd
 import re
 import shlex
+import signal
 import subprocess
 import sys
+import time
 
 HOME = pwd.getpwuid(os.getuid()).pw_dir
 WORK = os.path.join(HOME, "work")
@@ -85,6 +87,17 @@ LOAD_TOOLS = {"ab", "wrk", "wrk2", "hey", "oha", "vegeta", "k6", "locust", "sieg
 # model API, so add a table only after checking it holds no user content.
 PROD_DB_TABLE_ALLOW = re.compile(r"^(pg_catalog\.)?pg_\w+$|^information_schema\.\w+$", re.I)
 MIN_FREE_FRACTION = 0.15
+
+# Latency budget. The installed hook has a 60 s timeout and a hook that TIMES OUT
+# does not block (fail-open), so the guard sets its own wall-clock deadline well
+# under 60 s and fails CLOSED when it is reached (main() turns the alarm into
+# exit 2). The push-path secret scan gets a smaller budget below that.
+GUARD_DEADLINE_S = 40
+SCAN_DEADLINE_S = 25
+# Pathological-size fences. No ordinary hook payload or command reaches these; a
+# larger one fails closed rather than being parsed (a parser can be quadratic).
+MAX_PAYLOAD_BYTES = 48 * 1024 * 1024
+MAX_COMMAND_BYTES = 16 * 1024 * 1024
 
 TAG = "[autopilot-guard]"
 
@@ -190,6 +203,8 @@ SECRET_SHAPES = re.compile(
 
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
 INTERPRETERS = {"python", "python3", "node", "perl", "ruby", "php", "deno", "bun"}
+# Argument forms that make an interpreter read its program from stdin.
+STDIN_PATH = re.compile(r"^(-|/dev/stdin|/dev/fd/0|/proc/(self|\d+)/fd/0)$")
 WRAPPERS_NO_ARG = {"command", "builtin", "exec", "nohup", "time", "setsid", "unbuffer", "!", "then", "do", "else", "elif", "if", "while", "until", "{", "}", "coproc"}
 READONLY_CMDS = {
     "cat", "ls", "head", "tail", "less", "more", "wc", "stat", "file", "grep", "egrep", "fgrep", "rg",
@@ -319,6 +334,13 @@ def expand_path(p, cwd):
         return None
     if p.startswith("~/") or p == "~":
         p = HOME + p[1:]
+    elif p.startswith("~"):
+        m = re.match(r"^~([^/]+)(/.*|$)", p)
+        if m:
+            try:
+                p = pwd.getpwnam(m.group(1)).pw_dir + (m.group(2) or "")
+            except KeyError:
+                return None
     p = re.sub(r"^\$\{?HOME\}?(?=/|$)", HOME, p)
     if "$" in p or "`" in p or "__SUBST__" in p:
         return None
@@ -333,6 +355,12 @@ def under(path, root):
 
 def is_guard_path(path):
     return any(under(path, g) for g in GUARD_FILES)
+
+
+def holds_guard_file(path):
+    """True when `path` is, or is a directory that contains, a guard file.
+    Moving or deleting such a directory would disable the guardrails (P0-17)."""
+    return any(g == path or under(g, path) or under(path, g) for g in GUARD_FILES)
 
 
 def write_allowed(path):
@@ -466,6 +494,10 @@ def extract_substitutions(s):
             j = find_close(s, j + 1) if j is not None and j + 1 < n and s[j + 1] == ")" else j
             if j is None:
                 block(f"{TAG} {short(s)} -> blocked: unbalanced $(( (fail-closed).")
+            # bash still RUNS a command substitution inside arithmetic, e.g.
+            # $(( $(cmd) + 1 )); pull it out so it is analysed, not discarded.
+            _arith_rest, arith_inner = extract_substitutions(s[i + 3 : j])
+            inner.extend(arith_inner)
             out.append("0")
             i = j + 1
             continue
@@ -615,8 +647,25 @@ def strip_prefix(words):
             w.pop(0)
             continue
         base = os.path.basename(t)
+        if base == "coproc":
+            w.pop(0)
+            # `coproc NAME { body }`: drop the optional name so the { body } group
+            # is analysed (without the name, strip_prefix would treat it as a cmd).
+            if len(w) >= 2 and re.fullmatch(r"[A-Za-z_]\w*", w[0]) and w[1] == "{":
+                w.pop(0)
+            continue
         if base in WRAPPERS_NO_ARG:
             w.pop(0)
+            # Consume this wrapper's own options so '-p'/'-a name'/'--' are not
+            # mistaken for the real command (command -p sudo, exec -a x sudo).
+            while w and w[0].startswith("-") and w[0] != "-":
+                opt = w.pop(0)
+                if opt == "--":
+                    break
+                if base == "exec" and opt == "-a" and w:
+                    w.pop(0)
+                elif base == "time" and opt in ("-o", "--output", "-f", "--format") and w:
+                    w.pop(0)
             continue
         if base == "env":
             rest = w[1:]
@@ -679,6 +728,130 @@ def nonopt(args):
     return [a for a in args if not a.startswith("-")]
 
 
+# Shell specials that resolve to a number at run time; substituting them lets a
+# path like /tmp/x.$$ resolve instead of looking "computed".
+SHELL_SPECIAL = re.compile(r"\$\$|\$!|\$\{?(RANDOM|PPID|BASHPID)\}?")
+
+
+def _usable(val):
+    return val is not None and "`" not in val and "$(" not in val
+
+
+def subst_env(word, env):
+    """Resolve $VAR / ${VAR} / ${VAR:-WORD} using the literal values the command
+    set, and the benign shell specials ($$, $RANDOM, ...), so later checks see the
+    real path or command name instead of giving up at the '$'. A ${VAR:-WORD}
+    default is used only when VAR is unset, matching bash (so `U=sudo; ${U:-x}`
+    resolves to sudo, not x)."""
+    if "$" not in word:
+        return word
+    word = SHELL_SPECIAL.sub("0", word)
+    out, i, n = [], 0, len(word)
+    while i < n:
+        c = word[i]
+        if c == "$" and i + 1 < n and word[i + 1] == "{":
+            j = _brace_close(word, i + 2)
+            if j is not None:
+                m = re.match(r"^(!?)([A-Za-z_]\w*)(:?[-=+?])?(.*)$", word[i + 2 : j], re.S)
+                if m and not m.group(1):  # ${!x} indirection is left unresolved (stays '$', gets refused)
+                    name, op, arg = m.group(2), m.group(3), m.group(4)
+                    val = env.get(name)
+                    set_ = val is not None and val != ""
+                    rep = None
+                    if op in (":-", "-", ":=", "="):
+                        rep = val if set_ else arg
+                    elif op in (":+", "+"):
+                        rep = arg if set_ else ""
+                    elif op in (None,):
+                        rep = val
+                    if _usable(rep):
+                        out.append(rep)
+                        i = j + 1
+                        continue
+            out.append(c)
+            i += 1
+            continue
+        if c == "$" and i + 1 < n and (word[i + 1].isalpha() or word[i + 1] == "_"):
+            m = re.match(r"\$([A-Za-z_]\w*)", word[i:])
+            val = env.get(m.group(1))
+            if _usable(val):
+                out.append(val)
+            else:
+                out.append(word[i : i + m.end()])
+            i += m.end()
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _brace_close(s, i):
+    """Index just past the '}' matching the '{' before s[i] (i points past '{')."""
+    depth, n = 1, len(s)
+    while i < n:
+        if s[i] == "{":
+            depth += 1
+        elif s[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+_FUNC_HEADER = re.compile(r"(?:function\s+)?([A-Za-z_]\w*)\s*\(\s*\)\s*(?=\{)|function\s+([A-Za-z_]\w*)\s+(?=\{)")
+
+
+def strip_function_headers(text):
+    """Quote-aware: drop `name() {` and `function name {` headers (keeping the
+    `{ ... }` body) so the body is analysed as ordinary commands, and the body of
+    a `coproc name { ... }` is reached too."""
+    res, q, i, n = [], None, 0, len(text)
+    last_sig = ";"  # the last non-space character emitted (start acts like a separator)
+    while i < n:
+        c = text[i]
+        if q == "'":
+            res.append(c)
+            if c == "'":
+                q = None
+            last_sig = c
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            res.append(text[i : i + 2])
+            last_sig = text[i + 1]
+            i += 2
+            continue
+        if q == '"':
+            res.append(c)
+            if c == '"':
+                q = None
+            last_sig = c
+            i += 1
+            continue
+        if c in ("'", '"'):
+            q = c
+            res.append(c)
+            last_sig = c
+            i += 1
+            continue
+        if c in " \t":
+            res.append(c)
+            i += 1
+            continue
+        if last_sig in ";&|({\n" and (text[i].isalpha() or text[i] == "_" or text.startswith("function", i)):
+            m = _FUNC_HEADER.match(text, i)
+            if m:
+                res.append(" ")
+                i = m.end()
+                last_sig = " "
+                continue
+        res.append(c)
+        last_sig = c
+        i += 1
+    return "".join(res)
+
+
 # --------------------------------------------------------------------------
 # Analysis
 # --------------------------------------------------------------------------
@@ -692,6 +865,7 @@ def analyze(cmd, ctx):
     text, inners = extract_substitutions(text)
     for inner in inners:
         analyze(inner, ctx.child(captured=True))  # its output feeds the outer command, not the transcript
+    text = strip_function_headers(text)
     try:
         tokens = tokenize(prepare(text))
     except ValueError as exc:
@@ -708,8 +882,10 @@ def analyze(cmd, ctx):
             sctx.deny("printing the environment exposes secrets")
         check_exec_env(senv, sctx)
         if not w:
+            env.update(senv)  # a bare `FOO=bar` persists to later commands in this shell
             continue
         sctx.env = {**env, **senv}
+        w = [subst_env(x, sctx.env) for x in w]
         name = os.path.basename(w[0])
         if w[0] in ("cd", "pushd"):
             target = nonopt(w[1:])
@@ -725,7 +901,9 @@ def analyze(cmd, ctx):
             check_exec_env(assigned, sctx)
             if name == "export":
                 env.update(assigned)
-        if ("$" in w[0] or "__SUBST__" in w[0]) and ctx.top:
+        if re.search(r"\{[^{}]*,[^{}]*\}", w[0]):
+            sctx.deny("brace expansion builds the command name; write the command literally so the guard can read it")
+        if "$" in w[0] or "__SUBST__" in w[0]:
             sctx.deny("the command name is computed at run time and cannot be reviewed; write it literally")
         if cwd and not write_allowed(_real(cwd)) and name not in READONLY_CMDS and name not in SYSTEM_DENY:
             sctx.deny(f"the working directory {cwd} is read-only to the autopilot; cd to {DEV_WORKTREE} first")
@@ -762,7 +940,9 @@ EXEC_ENV = re.compile(
     r"GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|SSH_ASKPASS|EDITOR|VISUAL|GIT_EDITOR|GIT_SEQUENCE_EDITOR|GIT_PROXY_COMMAND|"
     r"GIT_EXEC_PATH|GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_CONFIG|GIT_CONFIG_GLOBAL|GIT_CONFIG_SYSTEM|GIT_CONFIG_PARAMETERS|"
     r"GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+|GIT_TEMPLATE_DIR|GH_CONFIG_DIR|GH_HOST|GH_TOKEN|GITHUB_TOKEN|"
-    r"GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|DOCKER_CONFIG|"
+    r"GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|DOCKER_CONFIG|DOCKER_CONTEXT|"
+    # interpreters that run code named by an environment variable on start-up.
+    r"PYTHONSTARTUP|RUBYOPT|NODE_OPTIONS|"
     # procps prints process environments under a BSD personality (ps -ef).
     r"PS_PERSONALITY|CMD_ENV)$"
 )
@@ -1087,8 +1267,8 @@ def check_command(cmd, args, ctx):
     if cmd in SHELLS:
         return check_shell(args, ctx)
     if cmd in ("source", "."):
-        if args and (args[0] == "__SUBST__" or args[0].startswith("/dev/fd")):
-            ctx.deny("sourcing generated input hides the commands")
+        if args and (args[0] == "__SUBST__" or args[0].startswith("/dev/fd") or STDIN_PATH.match(args[0]) or args[0].startswith("/proc/")):
+            ctx.deny("sourcing generated or stdin input (/dev/stdin, /dev/fd, /proc/self/fd) hides the commands; run them directly")
         if args and (os.path.basename(args[0]) == "merge_to_dev.sh" or expand_path(args[0], ctx.cwd) == _real(MERGE_TO_DEV)):
             ctx.deny(f"run the installed gate {MERGE_TO_DEV} directly; sourcing it runs it with the caller's functions and variables")
         if args:
@@ -1193,6 +1373,35 @@ def check_command(cmd, args, ctx):
             rest = nonopt(args)
             if len(rest) >= 2:
                 analyze_words(rest[1:], ctx)
+    if cmd == "trap":
+        # trap [-lp] ACTION SIGSPEC...: the action is shell run on the signal.
+        rest = [a for a in args if a not in ("-l", "-p", "--")]
+        if rest and rest[0] not in ("-", ""):
+            analyze(rest[0], ctx.child())
+        return
+    if cmd == "script":
+        for i, a in enumerate(args):
+            if a in ("-c", "--command") and i + 1 < len(args):
+                analyze(args[i + 1], ctx.child())
+            elif a.startswith("--command="):
+                analyze(a.split("=", 1)[1], ctx.child())
+        return
+    if cmd == "busybox":
+        if args:
+            return analyze_words(args, ctx)
+        return
+    if cmd in ("parallel", "rush"):
+        # GNU parallel runs the command before ':::'; analyse it.
+        inner = []
+        for a in args:
+            if a in (":::", "::::", "::::+", ":::+"):
+                break
+            if a.startswith("-"):
+                continue
+            inner.append(a)
+        if inner:
+            analyze_words(inner, ctx)
+        return
     if cmd in ("tmux", "screen"):
         if re.search(r"\b(new-session|new|new-window|neww|send-keys|send|split-window|splitw|respawn-pane|respawn-window)\b|(^|\s)-(dm|dmS|S|d)\b", " ".join(args)):
             ctx.deny("detached sessions outlive the cycle and hide their commands; run work in the foreground")
@@ -1223,6 +1432,9 @@ def check_shell(args, ctx):
             if rest:
                 analyze(rest[0], ctx.child())
             return
+    here = [t for op, t in ctx.redirs if op == "<<<"]
+    if here:
+        return analyze(here[0], ctx.child())
     scripts = nonopt(args)
     if scripts:
         if os.path.basename(scripts[0]) == "merge_to_dev.sh" or expand_path(scripts[0], ctx.cwd) == _real(MERGE_TO_DEV):
@@ -1230,6 +1442,8 @@ def check_shell(args, ctx):
         return analyze_script_file(scripts[0], ctx, force=True)
     src = [t for op, t in ctx.redirs if op == "<"]
     if src:
+        if STDIN_PATH.match(src[0]):
+            ctx.deny("feeding a shell from stdin (/dev/stdin, -) hides the commands from review; run them directly")
         return analyze_script_file(src[0], ctx, force=True)
     if ctx.piped_in:
         ctx.deny("piping into a shell hides the commands from review; run them directly")
@@ -1242,6 +1456,10 @@ def check_interpreter(cmd, args, ctx):
             i = args.index(flag)
             code = args[i + 1] if i + 1 < len(args) else ""
             break
+    if code is None:
+        here = [t for op, t in ctx.redirs if op == "<<<"]
+        if here:
+            code = here[0]  # `python3 <<< 'code'` runs the here-string as its program
     if code is not None:
         check_code_text(code, ctx)
     if cmd.startswith("python") and "-m" in args:
@@ -1249,6 +1467,8 @@ def check_interpreter(cmd, args, ctx):
         mod = args[i + 1] if i + 1 < len(args) else ""
         if mod == "pip":
             check_pip(args[i + 2 :], ctx)
+    if code is None and ctx.piped_in and any(STDIN_PATH.match(a) for a in nonopt(args)):
+        ctx.deny("piping code into an interpreter through stdin (/dev/stdin, /proc/self/fd/0, -) hides it from review; write a file under ~/work and run it")
     if ctx.piped_in and code is None and not nonopt(args):
         ctx.deny("piping code into an interpreter hides it from review; write a file under ~/work and run it")
     if ctx.cwd and not write_allowed(_real(ctx.cwd)) and code is None and not any(a in ("--version", "-V") for a in args):
@@ -1259,16 +1479,57 @@ def check_interpreter(cmd, args, ctx):
             ctx.deny("reads a secret file (§3.3)")
 
 
+# Inline code that shells out: the string handed to os.system / subprocess /
+# execSync / perl-ruby system is analysed as a shell command.
+_CODE_SHELL_STR = re.compile(
+    r"(?:os\.system|os\.popen|subprocess\.(?:getoutput|getstatusoutput)|commands\.getoutput|"
+    r"(?:child_process\.)?execSync|execFileSync|spawnSync|\bsystem)\s*\(?\s*(['\"])(.*?)\1",
+    re.S,
+)
+_CODE_SHELL_LIST = re.compile(r"subprocess\.\w+\(\s*\[([^\]]*)\]", re.S)
+_CODE_WRITE_OP = re.compile(
+    r"open\([^)]*['\"]\s*,\s*['\"][wax+]|\.write_(text|bytes)|shutil\.(rmtree|move|copy\w*)|"
+    r"os\.(remove|unlink|rename|replace|rmdir|makedirs|mkdir)|writeFileSync|rmSync|unlinkSync|renameSync|"
+    r"pathlib\.Path\([^)]*\)[^\n]*\.(write_|unlink|rename|replace|rmdir|mkdir)"
+)
+# A secret-shaped environment variable read from inline code.
+_CODE_SECRET_ENV = re.compile(
+    r"(?:os\.environ(?:\.get)?\s*[\[(]\s*|getenv\s*\(\s*|\bgetenv\s+|process\.env[.\[])\s*['\"]?"
+    r"[A-Za-z_]*(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|_KEY|PRIVATE|CREDENTIAL|COOKIE|AUTH)",
+    re.I,
+)
+
+
+def _join_string_concats(code):
+    """Join adjacent string literals spliced with + or . ('sud'+'o' -> 'sudo')."""
+    prev = None
+    for _ in range(8):
+        if prev == code:
+            break
+        prev = code
+        code = re.sub(r"(['\"])([^'\"\n]*)\1\s*[.+]\s*(['\"])([^'\"\n]*)\3",
+                      lambda m: m.group(1) + m.group(2) + m.group(4) + m.group(1), code)
+    return code
+
+
 def check_code_text(code, ctx):
     if re.search(r"(?<![\w-])sudo\s", code):
         ctx.deny("inline code calls sudo")
-    if SECRET_TOKEN_IN_TEXT.search(code) or re.search(r"/proc/[^\s'\"]*/environ|\benviron\.(items|copy|keys|values)\b|dict\(\s*os\.environ\s*\)|print\(\s*os\.environ\s*\)|process\.env\s*\)|JSON\.stringify\(\s*process\.env", code):
+    if SECRET_TOKEN_IN_TEXT.search(code) or _CODE_SECRET_ENV.search(code) or re.search(r"/proc/[^\s'\"]*/environ|\benviron\.(items|copy|keys|values)\b|dict\(\s*os\.environ\s*\)|print\(\s*os\.environ\s*\)|process\.env\s*\)|JSON\.stringify\(\s*process\.env", code):
         ctx.deny("inline code reads secrets or dumps the environment")
     if re.search(r"git\s+push[^\n'\"]*\s(-f|--force|--mirror|--delete)|docker\s+(volume\s+(rm|prune)|system\s+prune)|\bsudo\b", code):
         ctx.deny("inline code performs a forbidden git/docker/sudo action")
-    for root in (PROD_CHECKOUT, R_PROD, os.path.join(HOME, "Documents"), "~/Documents"):
-        if root in code and re.search(r"open\([^)]*['\"]\s*,\s*['\"][wax+]|\.write_(text|bytes)|shutil\.(rmtree|move|copy\w*)|os\.(remove|unlink|rename|replace|rmdir|makedirs|mkdir)|writeFileSync|rmSync|unlinkSync", code):
-            ctx.deny(f"inline code writes under {root}, which is read-only to the autopilot")
+    joined = _join_string_concats(code)
+    for m in _CODE_SHELL_STR.finditer(joined):
+        analyze(m.group(2), ctx.child())
+    for m in _CODE_SHELL_LIST.finditer(joined):
+        items = re.findall(r"['\"]([^'\"]*)['\"]", m.group(1))
+        if items:
+            analyze(" ".join(items), ctx.child())
+    for root in (PROD_CHECKOUT, R_PROD, os.path.join(HOME, "Documents"), "~/Documents",
+                 AUTOPILOT_HOME, "~/.llm-autopilot", "/.llm-autopilot/"):
+        if root in code and _CODE_WRITE_OP.search(code):
+            ctx.deny(f"inline code writes or deletes under {root}, which is read-only to the autopilot (guard files and production/model trees)")
 
 
 def analyze_script_file(path, ctx, force=False):
@@ -1294,8 +1555,29 @@ def analyze_script_file(path, ctx, force=False):
         raise Block(f"{b} (inside {path})")
 
 
+# A glob whose fixed part targets a secret file (cat .env*, cat .runtime/*).
+SECRET_GLOB = re.compile(r"(^|/)(\.env([.*?\[]|$)|secrets?([.*?\[]|$)|\.runtime/(secrets|\*|\.\*)|credentials|id_(rsa|dsa|ecdsa|ed25519)|[^/]*\.(pem|key|p12|pfx))", re.I)
+GREP_FAMILY = {"grep", "egrep", "fgrep", "rg", "ag"}
+GREP_VALUE_OPTS = {"-e", "--regexp", "-f", "--file", "-m", "--max-count", "-A", "-B", "-C", "--context",
+                   "--before-context", "--after-context", "-d", "--max-depth", "--include", "--exclude",
+                   "--exclude-dir", "--include-dir", "-g", "--glob", "--color", "--colour", "--colors"}
+
+
+def _looks_secret(val, cwd):
+    p = expand_path(val, cwd)
+    if p and is_secret_path(p):
+        return True
+    if any(c in val for c in "*?[") and SECRET_GLOB.search(val):
+        return True
+    if p is None and SECRET_TOKEN_IN_TEXT.search(val):
+        return True
+    return False
+
+
 def check_secret_args(cmd, args, ctx):
     """Block reading secret files. Listing, testing, hashing and writing are fine."""
+    if cmd in GREP_FAMILY:
+        return check_grep_reads(cmd, args, ctx)
     if cmd in {"ls", "stat", "test", "[", "[[", "du", "find", "touch", "chmod", "mkdir", "rm", "file", "md5sum",
                "sha256sum", "sha1sum", "realpath", "readlink", "basename", "dirname", "echo"}:
         return
@@ -1303,18 +1585,42 @@ def check_secret_args(cmd, args, ctx):
         return
     if cmd == "docker" and args[:1] == ["compose"] and "config" not in args:
         return  # --env-file is consumed, not printed
+    has_t = cmd in ("cp", "install", "mv") and ("-t" in args or any(a.startswith("--target-directory") for a in args))
     for idx, a in enumerate(args):
         val = a.split("=", 1)[1] if a.startswith("-") and "=" in a else a
-        if cmd in ("cp", "install", "mv") and idx == len(args) - 1:
-            continue  # destination
+        if cmd in ("cp", "install", "mv") and not has_t and idx == len(args) - 1:
+            continue  # destination (with -t the last positional is a source, not the destination)
         if val.startswith("-"):
             continue
-        p = expand_path(val, ctx.cwd)
-        secret = is_secret_path(p) if p else bool(SECRET_TOKEN_IN_TEXT.search(val))
-        if not secret and p is None and SECRET_TOKEN_IN_TEXT.search(val):
-            secret = True
-        if secret:
+        if _looks_secret(val, ctx.cwd):
             ctx.deny(f"reads a secret file ({val}); secrets must never enter the transcript, logs or commits (§3.3)")
+
+
+def check_grep_reads(cmd, args, ctx):
+    """grep/rg/ag: the first positional is the PATTERN (not a file); the rest are
+    paths. A recursive search rooted at a tree that holds untracked secrets (the
+    production checkout, $HOME) is refused."""
+    recursive = any(a in ("-r", "-R", "--recursive", "--dereference-recursive") or
+                    (a.startswith("-") and not a.startswith("--") and "r" in a[1:].lower()) for a in args)
+    pat_from_opt = any(a in ("-e", "--regexp", "-f", "--file") or a.startswith(("-e", "--regexp=", "-f", "--file=")) for a in args)
+    positionals, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in GREP_VALUE_OPTS:
+            i += 2
+            continue
+        if a.startswith("-") and a != "-":
+            i += 1
+            continue
+        positionals.append(a)
+        i += 1
+    files = positionals if pat_from_opt else positionals[1:]  # drop the pattern
+    for val in files:
+        if _looks_secret(val, ctx.cwd):
+            ctx.deny(f"reads a secret file ({val}); secrets must never enter the transcript, logs or commits (§3.3)")
+        p = expand_path(val, ctx.cwd)
+        if recursive and p is not None and (p == R_PROD or p == _real(HOME)):
+            ctx.deny(f"a recursive search rooted at {val} reads the untracked .env / .runtime secrets under it; scope the search to a subdirectory (§3.3)")
 
 
 WRITE_ALL_ARGS = {"rm", "rmdir", "unlink", "shred", "truncate", "touch", "mkdir", "mv", "tee", "setfacl", "mkfifo", "srm"}
@@ -1339,6 +1645,9 @@ def check_write_targets(cmd, args, ctx):
             targets = args[i + 1 : i + 2]
         elif na:
             targets = na[-1:]
+        if cmd == "rsync" and any(a == "--remove-source-files" for a in args):
+            # rsync removes the source files too: the sources are delete targets.
+            targets = targets + [t for t in na[:-1] if not re.match(r"^[\w.@-]+:", t)]
         if cmd in ("scp", "rsync"):
             targets = [t for t in targets if not re.match(r"^[\w.@-]+:", t)]
     elif cmd == "dd":
@@ -1370,20 +1679,41 @@ def check_write_targets(cmd, args, ctx):
                 break
             roots.append(a)
         targets = roots or ["."]
+    elif cmd == "gio" and "trash" in args:
+        targets = [a for a in args[args.index("trash") + 1 :] if not a.startswith("-")]
     elif cmd == "patch":
         targets = ["."]
     elif cmd in ("make", "cmake", "ninja", "cargo", "go", "mvn", "gradle"):
         targets = ["."]
+    move_or_delete = cmd in ("rm", "rmdir", "unlink", "shred", "srm", "mv", "find", "gio") \
+        or (cmd == "rsync" and any(a.startswith("--delete") or a == "--remove-source-files" for a in args))
     for t in targets:
+        if move_or_delete and re.search(r"[*?\[{]", t):
+            gp = _glob_parent(t, ctx.cwd)
+            if gp and holds_guard_file(gp):
+                ctx.deny("a glob or brace expansion here would delete or move the autopilot's guard files (guard/, bin/, agent/test-db.vars, CI approvals, ...), disabling the guardrails (§3.3/P0-17); name the individual files you created")
         p = expand_path(t, ctx.cwd)
         if p is None:
             if cmd in DESTRUCTIVE:
                 ctx.deny(f"'{t}' is computed at run time; destructive commands need literal paths")
             continue
-        if cmd in ("rm", "rmdir", "find", "shred") and (p in BROAD_DELETE or re.fullmatch(r"/(var/)?tmp/\*", t) or t.rstrip("/") in ("/tmp/*", "/tmp/.*", "~/*", "*", ".*", "/*")):
+        if move_or_delete and holds_guard_file(p):
+            ctx.deny("moving or deleting a directory that holds the autopilot's guard files (guard/, bin/, agent/, test-db.vars, CI approvals, ...) would disable the guardrails (§3.3/P0-17); operate only on individual files the autopilot created")
+        if cmd in ("rm", "rmdir", "shred") and (p in BROAD_DELETE or re.fullmatch(r"/(var/)?tmp/\*", t) or t.rstrip("/") in ("/tmp/*", "/tmp/.*", "~/*", "*", ".*", "/*")):
             ctx.deny(f"refuses the broad delete of {t}; delete only paths the autopilot created")
         if not write_allowed(p):
             ctx.deny(write_why(p))
+
+
+def _glob_parent(t, cwd):
+    """The directory a glob/brace target lives in: the literal prefix up to the
+    first metacharacter. Used to see whether an expansion would reach a guard file."""
+    m = re.search(r"[*?\[{]", t)
+    if not m:
+        return None
+    prefix = t[: m.start()]
+    d = prefix if prefix.endswith("/") else os.path.dirname(prefix)
+    return expand_path(d or ".", cwd)
 
 
 def check_disk(cmd, args, ctx):
@@ -1410,6 +1740,11 @@ GIT_DANGEROUS_C = re.compile(
 # Plumbing that can update remote refs without `git push`'s refspec checks.
 GIT_TRANSPORT_SUBCOMMANDS = {"send-pack", "http-push", "receive-pack", "upload-pack", "upload-archive", "http-fetch",
                              "remote-http", "remote-https", "remote-ext", "remote-fd", "remote-ftp", "remote-ftps", "subtree"}
+# Dangerous `git push` long options, as full names. git accepts any unambiguous
+# prefix (--dele -> --delete, --tag -> --tags), so the guard matches prefixes too.
+GIT_PUSH_DANGEROUS_LONG = ("delete", "all", "tags", "prune", "mirror", "force", "follow-tags", "force-with-lease", "force-if-includes")
+# git read subcommands that can print a file's contents (and so a secret file).
+GIT_READ_FILE_SUBS = {"show", "cat-file", "log", "diff", "grep", "blame", "annotate", "difftool", "whatchanged"}
 
 
 def check_git(args, ctx):
@@ -1439,6 +1774,16 @@ def check_git(args, ctx):
         ctx.deny(f"'git {sub}' talks to remotes without git push's checks; push one named branch with git push origin <branch>")
     if sub == "grep" and any(x.startswith(("-O", "--open-files-in-pager")) for x in rest):
         ctx.deny("git grep -O runs a program on the matches; print them instead")
+    if sub in GIT_READ_FILE_SUBS:
+        # git show HEAD:.env, git cat-file -p HEAD:.env, git log -p -- .runtime/secrets.env,
+        # git diff --no-index /dev/null .env: all print a secret file's contents.
+        for x in rest:
+            if x.startswith("-"):
+                continue
+            for cand in {x, x.rsplit(":", 1)[-1]}:
+                p = expand_path(cand, gdir or ctx.cwd)
+                if p and is_secret_path(p):
+                    ctx.deny(f"'git {sub}' would print the contents of the secret file {cand}; secrets must never enter the transcript (§3.3)")
     for j, x in enumerate(rest):
         out = x.split("=", 1)[1] if x.startswith("--output=") else (rest[j + 1] if x == "--output" and j + 1 < len(rest) else None)
         if out is not None:
@@ -1524,8 +1869,19 @@ def check_git(args, ctx):
 
 
 def check_git_push(rest, gdir, ctx):
+    # HOME/XDG_CONFIG_HOME relocate where git reads its global config, which can
+    # carry remote.origin.push or url.*.pushInsteadOf and remap the push. (The
+    # GIT_CONFIG* variables are refused for every command by EXEC_ENV.)
+    for k in ("HOME", "XDG_CONFIG_HOME"):
+        if ctx.env.get(k):
+            ctx.deny(f"{k} set in front of git push relocates git's global config, which can remap the push to another branch (remote.origin.push, url.*.pushInsteadOf); push with the normal environment")
     for x in rest:
+        # git accepts any unambiguous prefix of a long option (--dele -> --delete,
+        # --tag -> --tags), so match prefixes of the dangerous ones too.
+        long_name = x[2:].split("=", 1)[0] if x.startswith("--") else ""
+        abbrev = long_name and any(d.startswith(long_name) for d in GIT_PUSH_DANGEROUS_LONG)
         if x in ("-f", "--force", "--mirror", "--all", "--prune", "--delete", "-d", "--tags", "--follow-tags") \
+                or abbrev \
                 or x.startswith(("--force", "--mirror", "--receive-pack", "--exec", "--repo")) \
                 or (x.startswith("--recurse-submodules") and x.split("=", 1)[-1] in ("on-demand", "only", "--recurse-submodules")) \
                 or (re.fullmatch(r"-[a-zA-Z]+", x) and re.search(r"[fd]", x[1:])):
@@ -1676,13 +2032,25 @@ def scan_text_for_secrets(text, where, ctx, values=None):
 
 
 def scan_outgoing(sources, gdir, ctx):
-    """Scan commits that the push would publish for secrets, weights and dumps."""
+    """Scan commits that the push would publish for secrets, weights and dumps.
+
+    One overall wall-clock budget (SCAN_DEADLINE_S) governs the whole scan and
+    fails CLOSED when it runs out, so the scan can never outlast the hook timeout
+    and let the push through by timing out (P0-17)."""
+    deadline = time.monotonic() + SCAN_DEADLINE_S
+
+    def budget(reserve=0.5):
+        left = deadline - time.monotonic()
+        if left <= reserve:
+            ctx.deny("the outgoing-commit secret scan ran out of its time budget; push smaller batches so the scan can finish before the hook deadline (fail-closed)")
+        return left
+
     values = load_secret_values()
     for src in sources:
         ref = src or "HEAD"
         try:
             names = subprocess.run(["git", "-C", gdir or DEV_WORKTREE, "log", "--no-color", "--format=", "--name-status", "--no-renames", ref, "--not", "--remotes=origin"],
-                                   capture_output=True, text=True, timeout=20)
+                                   capture_output=True, text=True, timeout=min(20, budget()))
             for line in names.stdout.splitlines():
                 parts = line.split("\t")
                 if len(parts) == 2 and parts[0] in ("A", "M"):
@@ -1692,9 +2060,10 @@ def scan_outgoing(sources, gdir, ctx):
                         if not re.match(r"^(e2e/ci/ci\.env|launcher/tests/fixtures/.*|\.env\.example)$", f):
                             ctx.deny(f"an outgoing commit adds {f} (weights, data, dumps, archives, media or secret-like files never go to the PUBLIC repo)")
             sizes = subprocess.run(["git", "-C", gdir or DEV_WORKTREE, "log", "--no-color", "-p", "--no-ext-diff", "--no-textconv", "--format=commit %h", ref, "--not", "--remotes=origin"],
-                                   capture_output=True, text=True, timeout=30)
+                                   capture_output=True, text=True, timeout=min(30, budget()))
         except subprocess.TimeoutExpired:
             ctx.deny("the outgoing-commit secret scan timed out; push smaller batches (fail-closed)")
+        budget()
         out = sizes.stdout
         if len(out) > 60_000_000:
             ctx.deny("the outgoing diff is over 60 MB; something large is being published")
@@ -1803,9 +2172,11 @@ def check_gh(args, ctx):
 
 def check_gh_api(args, words, ctx):
     endpoint = words[1] if len(words) > 1 else ""
-    for m in gh_flag_values(args, ("-X",), ("--method",)):
+    methods = gh_flag_values(args, ("-X",), ("--method",))
+    for m in methods:
         if m.upper() not in ("GET", "HEAD"):
             ctx.deny("mutating REST calls are not allowed; use the typed gh commands")
+    explicit_read = bool(methods)  # every -X was GET/HEAD (loop above refused the rest)
     for h in gh_flag_values(args, ("-H",), ("--header",)):
         if re.search(r"method-override", h, re.I):
             ctx.deny("method-override headers turn reads into writes; not allowed")
@@ -1814,8 +2185,12 @@ def check_gh_api(args, words, ctx):
     fields = gh_flag_values(args, ("-f", "-F"), ("--field", "--raw-field"))
     inputs = gh_flag_values(args, (), ("--input",))
     if endpoint != "graphql":
-        if fields or inputs:
-            ctx.deny("gh api with fields or --input sends a POST; use the typed gh commands")
+        if inputs:
+            ctx.deny("gh api --input reads a request body from a file or stdin that the guard cannot check; pass an explicit GET (gh api -X GET ... -f key=value adds query parameters)")
+        # Without an explicit method, gh turns -f/-F into a POST body. With an
+        # explicit GET/HEAD they are query parameters (gh api -X GET -f q=...).
+        if fields and not explicit_read:
+            ctx.deny("gh api with fields sends a POST; add -X GET to pass them as query parameters, or use the typed gh commands")
         return
     if inputs or any("=@" in f or f.startswith("@") for f in fields):
         ctx.deny("GraphQL documents read from files or stdin cannot be checked; pass the query inline with -f query='query {...}'")
@@ -1878,15 +2253,23 @@ def run_is_detached(rest):
 def check_docker(args, ctx):
     a = list(args)
     docker_host = ctx.env.get("DOCKER_HOST", "")
+    if ctx.env.get("DOCKER_CONTEXT"):
+        ctx.deny("DOCKER_CONTEXT selects a docker context; contexts belong to the operator, point DOCKER_HOST at this host's socket or the worker instead")
+    if ctx.env.get("DOCKER_CONFIG"):
+        ctx.deny("DOCKER_CONFIG relocates docker's config (auth, contexts); it belongs to the operator")
     while a and a[0].startswith("-"):
         opt = a.pop(0)
         if opt in ("-H", "--host") and a:
             docker_host = a.pop(0)
         elif opt.startswith(("--host=", "-H=")):
             docker_host = opt.split("=", 1)[1]
-        elif opt in ("--context", "-c"):
+        elif opt.startswith("-H") and len(opt) > 2:
+            docker_host = opt[2:]
+        elif opt in ("--context", "-c") or opt.startswith(("--context=", "-c=")):
             ctx.deny("docker contexts belong to the operator; point DOCKER_HOST at the worker instead")
-        elif opt in ("--config", "-l", "--log-level") and a:
+        elif opt in ("--config",) or opt.startswith("--config="):
+            ctx.deny("docker --config relocates docker's config (auth, contexts); it belongs to the operator")
+        elif opt in ("-l", "--log-level") and a:
             a.pop(0)
     remote = docker_target_is_worker(docker_host)
     if docker_host and not remote and not re.match(r"^unix://", docker_host):
@@ -1903,9 +2286,9 @@ def check_docker(args, ctx):
         if op == "prune" or (sub == "volume" and op in ("rm", "remove")) or (sub == "network" and op in ("rm", "remove", "disconnect", "connect")):
             ctx.deny("prunes and volume/network removal can destroy production data or shared caches (§3.3)")
         if sub == "container":
-            return check_docker((["--host", docker_host] if docker_host else []) + [op] + rest[1:], ctx)
-        if sub == "image" and op in ("rm", "tag", "pull", "load", "import", "build", "push", "save"):
-            return check_docker((["--host", docker_host] if docker_host else []) + [{"rm": "rmi"}.get(op, op)] + rest[1:], ctx)
+            return check_docker((["--host", docker_host] if docker_host else []) + [{"remove": "rm"}.get(op, op)] + rest[1:], ctx)
+        if sub == "image" and op in ("rm", "remove", "tag", "pull", "load", "import", "build", "push", "save"):
+            return check_docker((["--host", docker_host] if docker_host else []) + [{"rm": "rmi", "remove": "rmi"}.get(op, op)] + rest[1:], ctx)
         if sub in ("buildx", "builder") and op in ("build", "bake"):
             return check_docker((["--host", docker_host] if docker_host else []) + ["build"] + rest[1:], ctx)
         if sub == "context" and op not in ("ls", "list", "inspect", "show"):
@@ -1914,11 +2297,21 @@ def check_docker(args, ctx):
             return check_docker(["inspect"] + rest[1:], ctx)
         return
     if sub in ("rm", "stop", "kill", "restart", "update", "pause", "unpause", "rename", "start", "commit", "attach", "wait", "cp"):
-        names = [x for x in rest if not x.startswith("-")]
+        # Drop option values (docker stop -t 5, docker kill -s TERM) so they are
+        # not mistaken for container names.
+        names, j = [], 0
+        while j < len(rest):
+            x = rest[j]
+            if x in ("-t", "--time", "-s", "--signal", "-f", "--filter"):
+                j += 2
+                continue
+            if x.startswith("-"):
+                j += 1
+                continue
+            names.append(x)
+            j += 1
         if sub == "cp":
             names = [x.split(":", 1)[0] for x in names if ":" in x]
-        if sub in ("update", "kill", "stop", "restart") and "-s" in rest:
-            pass
         if not names or any("$" in x or "__SUBST__" in x for x in names):
             ctx.deny("name the container literally; the guard cannot verify computed targets")
         for nm in names:
@@ -2014,16 +2407,29 @@ def check_compose(rest, ctx, remote=False):
             continue
         sub, sub_args = x, rest[i + 1 :]
         break
-    project_flag = next((globals_[j + 1] for j, x in enumerate(globals_[:-1]) if x in ("-p", "--project-name")), None) \
-        or next((x.split("=", 1)[1] for x in globals_ if x.startswith("--project-name=")), None) or ctx.env.get("COMPOSE_PROJECT_NAME")
-    if project_flag and project_flag.startswith(PROD_STACK):
-        ctx.deny(f"'{project_flag}' is a production compose project")
+    # Compose takes the LAST -p / --project-name, then COMPOSE_PROJECT_NAME.
+    project_flag = ctx.env.get("COMPOSE_PROJECT_NAME")
+    j = 0
+    while j < len(globals_):
+        g = globals_[j]
+        if g in ("-p", "--project-name") and j + 1 < len(globals_):
+            project_flag = globals_[j + 1]
+            j += 2
+            continue
+        if g.startswith("--project-name="):
+            project_flag = g.split("=", 1)[1]
+        elif g.startswith("-p") and not g.startswith("--") and len(g) > 2:
+            project_flag = g[2:].lstrip("=")
+        j += 1
     if sub == "config":
         if not set(sub_args) & {"-q", "--quiet", "--no-interpolate", "--services", "--volumes", "--images", "--profiles", "--hash"}:
             ctx.deny("'docker compose config' prints interpolated values, including secrets; add --no-interpolate or -q")
         return
+    # Read-only subcommands are fine even against the production project.
     if sub in (None, "ps", "ls", "images", "top", "logs", "version", "port", "events", "stats"):
         return
+    if project_flag and project_flag.startswith(PROD_STACK):
+        ctx.deny(f"'{project_flag}' is a production compose project")
     if any("$" in g or "__SUBST__" in g for g in globals_):
         ctx.deny("compose flags must be literal so the guard can render the project")
     doc = resolve_compose(globals_, ctx)
@@ -2122,6 +2528,10 @@ def check_docker_run(rest, ctx):
             check_mount_spec(nxt, ctx)
         elif x.startswith(("--volume=", "--mount=")) or re.match(r"^-v\S", x):
             check_mount_spec(x.split("=", 1)[1] if "=" in x else x[2:], ctx)
+        if x in ("--volumes-from",) or x.startswith("--volumes-from="):
+            srcname = (x.split("=", 1)[1] if "=" in x else nxt).split(":", 1)[0]
+            if not is_dev(srcname):
+                ctx.deny(f"--volumes-from mounts another container's volumes (here '{srcname}'); production and shared volumes must never be mounted, only {DEV}-* dev containers")
         if x in ("-e", "--env", "--env-file") and nxt:
             if x == "--env-file":
                 p = expand_path(nxt, ctx.cwd)
@@ -2342,17 +2752,34 @@ def check_file_tool(tool, ti, cwd):
         if re.search(r'"disableAllHooks"\s*:\s*true', content):
             block(f"{TAG} {tool} {raw_path} -> blocked: disabling hooks would switch off the autopilot's guardrails.")
         return
-    if tool in ("Read", "Grep", "NotebookRead"):
+    if tool in ("Read", "Grep", "NotebookRead", "Glob"):
         for key in ("file_path", "path", "notebook_path"):
             v = ti.get(key)
             if v:
                 p = expand_path(v, cwd)
                 if p and is_secret_path(p):
                     block(f"{TAG} {tool} {v} -> blocked: secret files must never enter the transcript (§3.3).")
-        if tool == "Grep":
-            g = ti.get("glob") or ""
-            if re.search(r"(^|[/*{,])\.env([.*}]|$)|credentials|secrets?\.env|id_(rsa|ed25519)|\.pem\b|\.key\b", g):
-                block(f"{TAG} Grep glob={g} -> blocked: searching inside secret files is not allowed (§3.3).")
+        g = ti.get("glob") if tool == "Grep" else (ti.get("pattern") if tool == "Glob" else "")
+        g = g or ""
+        if re.search(r"(^|[/*{,])\.env([.*}]|$)|credentials|secrets?\.env|id_(rsa|ed25519)|\.pem\b|\.key\b", g):
+            block(f"{TAG} {tool} glob={g} -> blocked: searching inside secret files is not allowed (§3.3).")
+
+
+# Tools whose input runs a shell command, analysed exactly like Bash. Monitor
+# runs a command and can open a WebSocket; both reach a `-p` auto-mode session.
+SHELL_TOOLS = ("Bash", "Monitor")
+FILE_WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+FILE_READ_TOOLS = ("Read", "Grep", "NotebookRead", "Glob")
+# Subagent and workflow tools. The operator REQUIRES multiple agents, and a
+# subagent's own tool calls pass back through this same PreToolUse hook, so these
+# stay allowed; only a secret-carrying prompt or a request to run outside the
+# local guard (remote isolation) is refused.
+AGENT_TOOLS = ("Agent", "Task", "Workflow", "Skill")
+MCP_READONLY = re.compile(r"(^|_|__)(get|list|read|view|search|fetch|query|describe|show|status|lookup|inspect|resolve|resources?|retrieve|count|watch)(_|$|[A-Z])")
+
+
+def _command_too_big(cmd):
+    return len(cmd) > MAX_COMMAND_BYTES
 
 
 def evaluate(payload):
@@ -2361,27 +2788,165 @@ def evaluate(payload):
     tool = payload.get("tool_name") or ""
     ti = payload.get("tool_input") or {}
     cwd = payload.get("cwd") or os.getcwd()
-    if tool == "Bash":
+    if tool in SHELL_TOOLS:
         cmd = ti.get("command") or ""
-        analyze(cmd, Ctx(short(cmd), cwd))
-    elif tool in ("Write", "Edit", "MultiEdit", "NotebookEdit", "Read", "Grep", "NotebookRead"):
+        if _command_too_big(cmd):
+            block(f"{TAG} the command is larger than {MAX_COMMAND_BYTES} bytes; blocking (fail-closed).")
+        if cmd:
+            analyze(cmd, Ctx(short(cmd), cwd))
+        check_monitor_channels(ti)
+    elif tool in FILE_WRITE_TOOLS or tool in FILE_READ_TOOLS:
         check_file_tool(tool, ti, cwd)
+    elif tool in ("WebFetch", "WebSearch"):
+        check_web(tool, ti)
+    elif tool in AGENT_TOOLS:
+        check_agent_tool(tool, ti)
+    elif tool in ("CronCreate", "ScheduleWakeup"):
+        check_schedule_tool(tool, ti)
+    elif tool == "EnterWorktree":
+        check_enter_worktree(ti, cwd)
+    elif tool.startswith("mcp__"):
+        check_mcp_tool(tool, ti)
+    else:
+        # A tool the guard does not know. If it runs a shell command, analyse it
+        # like Bash; if it carries a path, keep secret files out of it; a secret
+        # shape anywhere in its input is refused. Otherwise it is let through to
+        # layers 1 and 2 (permissions.deny and the auto-mode classifier).
+        cmd = ti.get("command")
+        if isinstance(cmd, str) and cmd:
+            if _command_too_big(cmd):
+                block(f"{TAG} the command is larger than {MAX_COMMAND_BYTES} bytes; blocking (fail-closed).")
+            analyze(cmd, Ctx(short(cmd), cwd))
+        for key in ("file_path", "path", "notebook_path"):
+            v = ti.get(key)
+            if isinstance(v, str) and v:
+                p = expand_path(v, cwd)
+                if p and is_secret_path(p):
+                    block(f"{TAG} {tool} {v} -> blocked: secret files must never enter the transcript (§3.3).")
+        _refuse_secret_shape_in(tool, ti)
+
+
+def _iter_strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_strings(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from _iter_strings(v)
+
+
+def _refuse_secret_shape_in(tool, ti):
+    for s in _iter_strings(ti):
+        m = SECRET_SHAPES.search(s)
+        if m:
+            block(f"{TAG} {tool} -> blocked: its input carries a credential-shaped string ({m.group(0)[:6]}… redacted); secrets never go to a tool, a subagent or an external service (§3.3).")
+
+
+# Hosts/addresses a WebFetch/WebSearch/WebSocket must never reach: production
+# control planes, and any private, link-local or loopback address.
+LINK_LOCAL_OR_PRIVATE = re.compile(
+    r"^(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|\[?::1\]?|169\.254\.\d+\.\d+|"
+    r"192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|"
+    r"fe80:[0-9a-f:]*|fc[0-9a-f:]+|fd[0-9a-f:]+|[\w-]+\.internal|host\.docker\.internal)$",
+    re.I,
+)
+
+
+def _url_host(text):
+    m = re.match(r"^\s*[a-z][a-z0-9+.-]*://(?:[^@/\s]+@)?(\[[^\]]+\]|[^/:\s?#]+)", text or "", re.I)
+    return (m.group(1) if m else "").strip("[]").lower()
+
+
+def check_web(tool, ti):
+    text = ti.get("url") if tool == "WebFetch" else ti.get("query")
+    text = text or ""
+    m = SECRET_SHAPES.search(text)
+    if m:
+        block(f"{TAG} {tool} -> blocked: the {'URL' if tool == 'WebFetch' else 'query'} carries a credential-shaped string ({m.group(0)[:6]}… redacted); secrets never leave the host (§3.3).")
+    host = _url_host(text)
+    if tool == "WebFetch" and host:
+        if host in PROD_HOSTS or LINK_LOCAL_OR_PRIVATE.match(host):
+            block(f"{TAG} WebFetch -> blocked: '{host}' is a production, private, link-local or loopback address; WebFetch reaches a hosted model and must not probe internal or production endpoints (§3.3).")
+    if tool == "WebSearch":
+        for h in PROD_HOSTS:
+            if h and h not in ("localhost", "127.0.0.1", "0.0.0.0", "[::1]", "::1") and re.search(rf"(?<![\w.-]){re.escape(h)}(?![\w.-])", text, re.I):
+                block(f"{TAG} WebSearch -> blocked: the query names a production host; internal host names must not reach an external search service (§3.3).")
+
+
+def check_monitor_channels(ti):
+    ws = ti.get("ws")
+    url = ws.get("url") if isinstance(ws, dict) else None
+    if url:
+        m = SECRET_SHAPES.search(url)
+        if m:
+            block(f"{TAG} Monitor -> blocked: the WebSocket URL carries a credential-shaped string; secrets never leave the host (§3.3).")
+        host = _url_host(url)
+        if host and host not in TRUSTED_HOSTS and not LINK_LOCAL_OR_PRIVATE.match(host) and host not in PROD_HOSTS:
+            block(f"{TAG} Monitor -> blocked: a WebSocket to '{host}' is a two-way channel to an external host; keep data on the host (§3.3).")
+
+
+def check_agent_tool(tool, ti):
+    iso = (ti.get("isolation") or ti.get("isolationMode") or "")
+    if isinstance(iso, str) and iso.lower() in ("remote", "cloud"):
+        block(f"{TAG} {tool} -> blocked: remote/cloud isolation runs the work outside this host's guard; keep subagents local so every tool call passes this hook (§3.3).")
+    _refuse_secret_shape_in(tool, ti)
+
+
+def check_schedule_tool(tool, ti):
+    # Scheduling itself is a layer-1/2 concern; the guard only refuses a prompt
+    # that would carry a secret into a scheduled run.
+    _refuse_secret_shape_in(tool, ti)
+
+
+def check_enter_worktree(ti, cwd):
+    raw = ti.get("path") or ""
+    if not raw:
+        return
+    p = expand_path(raw, cwd)
+    if p is None:
+        return
+    if under(p, R_PROD) or under(p, R_DOCUMENTS) or is_guard_path(p) or is_secret_path(p):
+        block(f"{TAG} EnterWorktree {raw} -> blocked: the session may not move its write access to the production checkout, ~/Documents, a secret path or the guard files; work in a worktree under {WORK} (§3.3).")
+
+
+def check_mcp_tool(tool, ti):
+    _refuse_secret_shape_in(tool, ti)
+    leaf = tool[len("mcp__"):]
+    if not MCP_READONLY.search(leaf):
+        block(f"{TAG} {tool} -> blocked: MCP tools reach external services; only clearly read-only MCP calls (get/list/read/view/search/...) pass this guard (§3.3).")
+
+
+def _deadline_reached(signum, frame):
+    raise Block(f"{TAG} the guard did not finish within its {GUARD_DEADLINE_S}s budget; blocking (fail-closed) so a slow check can never let a call through by timing out. Split or simplify the command.")
 
 
 def main():
     try:
-        payload = json.load(sys.stdin)
+        data = sys.stdin.read(MAX_PAYLOAD_BYTES + 1)
+        if len(data) > MAX_PAYLOAD_BYTES:
+            print(f"{TAG} the hook payload is larger than {MAX_PAYLOAD_BYTES} bytes; blocking (fail-closed).", file=sys.stderr)
+            return 2
+        payload = json.loads(data)
     except Exception as exc:
         print(f"{TAG} could not read the hook payload ({exc}); blocking (fail-closed).", file=sys.stderr)
         return 2
+    armed = hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer")
+    if armed:
+        signal.signal(signal.SIGALRM, _deadline_reached)
+        signal.setitimer(signal.ITIMER_REAL, GUARD_DEADLINE_S)
     try:
         evaluate(payload)
     except Block as b:
         print(str(b), file=sys.stderr)
         return 2
-    except Exception as exc:  # fail closed
+    except BaseException as exc:  # fail closed on anything, including the deadline alarm
         print(f"{TAG} internal error ({type(exc).__name__}: {exc}); blocking (fail-closed). Simplify the command.", file=sys.stderr)
         return 2
+    finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
     return 0
 
 

@@ -11,13 +11,34 @@ The runner starts fresh `claude -p` cycles in the dev worktree, one after anothe
 | `autopilot.py` | The runner. Installed at `~/.llm-autopilot/bin/autopilot.py` (read-only to the agent); this is the source. |
 | `CYCLE_PROMPT.md` | The `/goal` cycle prompt. Installed at `~/.llm-autopilot/bin/CYCLE_PROMPT.md`. |
 | `status.sh` | Prints the heartbeat, recent events and the integration branch. Installed at `~/.llm-autopilot/bin/status.sh`. |
-| `guard/guard_hook.py` | Layer 3 `PreToolUse` hook for Bash, Write, Edit, MultiEdit, NotebookEdit, Read and Grep. Exit 2 blocks with a reason; it fails closed. Installed at `~/.llm-autopilot/guard/`. |
+| `guard/guard_hook.py` | Layer 3 `PreToolUse` hook (see the matcher below for the tools it covers). Exit 2 blocks with a reason; it fails closed, and a wall-clock deadline (~40 s, under the 60 s hook timeout) blocks rather than letting a slow check time out and fall open. Installed at `~/.llm-autopilot/guard/`. |
 | `guard/stop_failure_hook.py` | `StopFailure` hook: appends the failed turn's `error_type` (and `session_id`/`agent_id`) to `~/.llm-autopilot/stopfailure.jsonl` so the runner can tell usage limits from auth failures and outages. |
 | `settings.autopilot.template.json` | Template for the session settings, with `{{AP_HOME}}` and `{{HOST_DETAILS}}` placeholders. `install.sh` renders it to `~/.llm-autopilot/settings.autopilot.json` (the installed copy passed with `--settings`). Layer 1 is `permissions.deny`; layer 2 is `autoMode` (`environment`, `allow`, `soft_deny`, `hard_deny`); the hooks are layer 3. |
 | `host.example.json` | Template for `~/.llm-autopilot/host.json` (host names, addresses and ports). Never commit the filled copy: this repository is public. |
 | `llm-autopilot.service` | The systemd user unit template (`@AP_HOME@`, `@WORKTREE@`, `@HOME@`). `install.sh` renders it to `~/.config/systemd/user/llm-autopilot.service`. Its `MemoryHigh`/`MemoryMax` cap the runner tree (claude, subagents, tests); containers and image builds run under the Docker daemon, outside that cap, so the guard keeps them off the head (worker only, or small `--rm` tool containers). |
-| `tests/` | `test_guard_hook.py` (the hook's decisions), `test_runner.py` (runner acceptance and units, via `tests/stub_claude.py`), `test_merge_to_dev.py` (the dev gate). |
+| `tests/` | `test_guard_hook.py` (the hook's decisions), `test_guard_sweep.py` (the P0-16 bypass-sweep regression tables, matcher coverage and latency deadline), `test_runner.py` (runner acceptance and units, via `tests/stub_claude.py`), `test_merge_to_dev.py` (the dev gate). |
 | `../deploy/merge_to_dev.sh` | The only way the agent moves `dev`: a fast-forward to a reviewed, CI-green commit. Installed at `~/.llm-autopilot/bin/merge_to_dev.sh` and run as a plain command with no environment overrides. |
+
+### Which tools the PreToolUse hook matches, and why
+
+The matcher in `settings.autopilot.template.json` names every tool that can run a
+shell command, touch a file, or reach the network or an external service, so none
+of them skips layer 3:
+
+| Tool(s) | Why matched | What the guard does |
+|---|---|---|
+| `Bash`, `Monitor` | both run a shell command (Monitor can also open a WebSocket) | the full command analysis; a Monitor WebSocket to an external host is refused |
+| `Write`, `Edit`, `MultiEdit`, `NotebookEdit` | write files | refuse writes outside the autopilot's zones, over guard files or over a directory that holds one |
+| `Read`, `Grep`, `Glob`, `NotebookRead` | read or list files | refuse reads of secret files and searches scoped to them |
+| `WebFetch`, `WebSearch` | reach a URL or an external search service | refuse a production host, a private/link-local/loopback address, or a credential-shaped string |
+| `Agent`, `Task`, `Workflow`, `Skill` | spawn subagents / run a workflow (the operator REQUIRES multiple agents) | stay allowed — a subagent's own tool calls pass back through this hook — except an input that carries a secret shape or asks for remote/cloud isolation (running outside the local guard) |
+| `CronCreate`, `ScheduleWakeup` | schedule a prompt or a wakeup | refuse only when the prompt carries a secret shape (the scheduling itself is a layer-1/2 concern) |
+| `EnterWorktree` | can move the session's write access | refuse pointing at the production checkout, `~/Documents`, a secret path or the guard files |
+| `mcp__.*` | MCP tools reach external services | refuse unless the tool name is clearly read-only (get/list/read/view/search/...) |
+
+Any other tool still reaches the hook: if its input has a `command` it is analysed
+like Bash, if it has a path the secret-file checks run, and a credential-shaped
+string anywhere in its input is refused; otherwise it is left to layers 1 and 2.
 
 The gate also refuses a commit whose `.github/` tree differs from `origin/dev`, because that commit's checks could have been graded by edited CI. When the programme changes `.github/`, the operator reviews `git diff origin/dev <commit> -- .github/` and approves it by adding the tree hash the gate prints as one line of `~/.llm-autopilot/approved-ci-trees` (operator-owned; the agent cannot write it). The agent raises a `NEEDS_HUMAN.md` item as soon as the trees first differ.
 
