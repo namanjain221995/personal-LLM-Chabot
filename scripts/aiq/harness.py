@@ -10,6 +10,7 @@ The checks are pure functions over what came back; cases.py holds the rubric.
 """
 from __future__ import annotations
 
+import codecs
 import colorsys
 import csv
 import io
@@ -57,24 +58,52 @@ def chat_body(conversation_id: str, message: str, history: List[dict], effort: s
     return body
 
 
+def sse_lines(chunks: Iterable[bytes]) -> Iterable[str]:
+    """The lines of an SSE body, split on "\\n" only, one trailing "\\r" dropped.
+
+    httpx's iter_lines also splits on U+2028, U+2029 and U+0085 (str.splitlines),
+    and the orchestrator writes those characters raw (app/sse.py: json.dumps
+    ensure_ascii=False), so a token or a meta holding one was cut in two and
+    both halves dropped as undecodable JSON. The body is decoded as UTF-8
+    incrementally, so a character split across two chunks survives."""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pending = ""
+    for chunk in chunks:
+        pending += decoder.decode(chunk)
+        *lines, pending = pending.split("\n")
+        for line in lines:
+            yield line[:-1] if line.endswith("\r") else line
+    pending += decoder.decode(b"", final=True)
+    if pending:
+        yield pending[:-1] if pending.endswith("\r") else pending
+
+
 class Client:
-    def __init__(self, base: str, email: str, password: str, container: Optional[str] = None):
+    def __init__(self, base: str, email: str, password: str, container: Optional[str] = None, *,
+                 request_timeout_s: Optional[float] = None):
+        """`request_timeout_s` bounds the sign-in, /auth/me and trace reads
+        (seconds); None keeps the client default run.py has always used."""
         port = base.rsplit(":", 1)[-1].split("/")[0]
         if port in PROD_PORTS or "techsarasolutions.com" in base:
             raise SystemExit(f"refusing to send test traffic to what looks like production: {base}")
         if container and not ("e2e" in container and "sf-local-ai" not in container):
             raise SystemExit(f"refusing docker exec into a non-e2e container: {container}")
         self.base, self.container = base.rstrip("/"), container
+        self.request_timeout_s = request_timeout_s
         self.http = httpx.Client(follow_redirects=True, timeout=httpx.Timeout(30.0, read=3600.0))
-        r = self.http.post(f"{self.base}/auth/login", json={"email": email, "password": password, "remember": True})
+        r = self.http.post(f"{self.base}/auth/login", json={"email": email, "password": password, "remember": True},
+                           **self._bounded())
         if r.status_code != 200:
             raise SystemExit(f"login failed: {r.status_code} {r.text[:200]}")
         pair = r.headers.get("set-cookie", "").split(";", 1)[0].strip()
         if "=" in pair:  # the cookie is Secure; pin it as a header over plain http
             self.http.headers["Cookie"] = pair
-        me = self.http.get(f"{self.base}/auth/me")
+        me = self.http.get(f"{self.base}/auth/me", **self._bounded())
         self.me = me.json() if me.status_code == 200 else {}
         self.user_id = self.me.get("id") or (self.me.get("user") or {}).get("id")
+
+    def _bounded(self) -> dict:
+        return {} if self.request_timeout_s is None else {"timeout": float(self.request_timeout_s)}
 
     def upload(self, conversation_id: str, path: str, purpose: str = "dataset",
                content_type: Optional[str] = None) -> dict:
@@ -95,13 +124,17 @@ class Client:
              attachments: Optional[List[dict]] = None, web_search: str = "off", *,
              pdf_uploads: Optional[List[dict]] = None, deep_research: Optional[bool] = None,
              test_case_id: Optional[str] = None, extra: Optional[dict] = None,
-             max_seconds: Optional[float] = None) -> dict:
+             max_seconds: Optional[float] = None, idle_timeout_s: Optional[float] = None) -> dict:
         """POST /chat and follow the SSE stream.
 
         The optional keyword fields are sent only when given, so a caller that
         passes none (run.py) sends the body it always did. `max_seconds` stops
         READING after that long (`timed_out` True); the generation itself is
         detached server-side and keeps running until POST /chat/stop.
+        `idle_timeout_s` caps the wait for any byte (the read timeout is the
+        smaller of the two): the server heartbeats every 15 s (app/sse.py
+        HEARTBEAT_SECONDS), so a silent pipe is a dead one and raises
+        httpx.ReadTimeout.
 
         Besides `seconds` and `ttft`, the result carries `request_id` (the
         X-Request-ID response header) and `timing`, each value float seconds
@@ -110,7 +143,18 @@ class Client:
         the `: keep-alive` heartbeat is not an event), first_token_s (the
         first `token` event, even whitespace), first_answer_s (the first
         `token` event with a non-whitespace character: no step, status,
-        reasoning, meta or heartbeat counts) and total_s (the stream closed).
+        reasoning, meta or heartbeat counts) and total_s (the stream closed
+        after its terminal `done`). total_s is None for a turn that did not
+        finish: an HTTP error, a read cut at `max_seconds`, or a stream that
+        ended in `error` or with no terminal event, so a failed turn is never
+        a latency sample.
+
+        `terminal` is "done", "error" or None (neither arrived); a stream
+        that closed with neither, unless reading was cut at `max_seconds`,
+        gets {"error": "stream ended without done"} in `errors`. `bad_frames`
+        counts `data:` lines that were not JSON (kept, never skipped
+        silently), `status_events` the texts of the `status` events (they
+        announce feature downgrades, among other things).
         """
         body = chat_body(conversation_id, message, history, effort, web_search, pdf_uploads=pdf_uploads,
                          deep_research=deep_research, test_case_id=test_case_id, extra=extra)
@@ -119,7 +163,11 @@ class Client:
         steps: Dict[int, dict] = {}
         meta: dict = {}
         errors: List[dict] = []
-        stream_kw = {} if max_seconds is None else {"timeout": httpx.Timeout(30.0, read=float(max_seconds))}
+        status_events: List[str] = []
+        bad_frames = 0
+        terminal: Optional[str] = None
+        limits = [float(x) for x in (max_seconds, idle_timeout_s) if x is not None]
+        stream_kw = {"timeout": httpx.Timeout(30.0, read=min(limits))} if limits else {}
         started = time.perf_counter()
         first_token = None
         first_event = first_answer = None
@@ -135,10 +183,10 @@ class Client:
             if r.status_code != 200:
                 return {"http": r.status_code, "answer": "", "meta": {}, "error": r.read()[:400].decode("utf-8", "replace"),
                         "reasoning_events": 0, "reasoning_chars": 0, "steps": {}, "seconds": 0,
-                        "errors": [], "request_id": request_id, "timed_out": False,
-                        "timing": timing(time.perf_counter() - started)}
+                        "errors": [], "request_id": request_id, "timed_out": False, "terminal": None,
+                        "bad_frames": 0, "status_events": [], "timing": timing(None)}
             event = None
-            for line in r.iter_lines():
+            for line in sse_lines(r.iter_bytes()):
                 if max_seconds is not None and time.perf_counter() - started > max_seconds:
                     timed_out = True
                     break
@@ -152,6 +200,7 @@ class Client:
                 try:
                     data = json.loads(line[5:].strip() or "{}")
                 except json.JSONDecodeError:
+                    bad_frames += 1
                     continue
                 if event == "token":
                     if first_token is None:
@@ -166,19 +215,28 @@ class Client:
                     steps[sid] = {**steps.get(sid, {}), **data}
                 elif event == "meta":
                     meta = {**meta, **data} if isinstance(data, dict) else meta
+                elif event == "status":
+                    status_events.append(str(data.get("text", "")) if isinstance(data, dict) else str(data))
                 elif event == "error":
                     errors.append(data)
+                    terminal = "error"
+                elif event == "done":
+                    terminal = terminal or "done"
         total = time.perf_counter() - started
+        if terminal is None and not timed_out:
+            errors.append({"error": "stream ended without done"})
         return {"http": 200, "answer": "".join(tokens), "meta": meta, "steps": steps, "errors": errors,
                 "reasoning_events": len(reasoning), "reasoning_chars": sum(len(x) for x in reasoning),
                 "seconds": round(total, 1),
                 "ttft": round(first_token, 2) if first_token is not None else None,
-                "request_id": request_id, "timed_out": timed_out, "timing": timing(total)}
+                "request_id": request_id, "timed_out": timed_out, "terminal": terminal,
+                "bad_frames": bad_frames, "status_events": status_events,
+                "timing": timing(total if terminal == "done" and not timed_out else None)}
 
     def trace(self, trace_id: str) -> Optional[dict]:
         if not trace_id:
             return None
-        r = self.http.get(f"{self.base}/chat/trace/{trace_id}")
+        r = self.http.get(f"{self.base}/chat/trace/{trace_id}", **self._bounded())
         return r.json() if r.status_code == 200 else None
 
     def wait_job(self, ref: dict, limit_s: float = 1800) -> dict:
