@@ -227,6 +227,16 @@ class Acceptance(RunnerHarness):
         hb = read_json(os.path.join(self.ap, "heartbeat.json"))
         self.assertIn("A-01", hb["current_task"] or "")
 
+    def test_cycle_waits_for_background_tasks(self):
+        # P0-17: print mode must not terminate a running workflow 600 s after
+        # the main turn ends; the runner sets the ceiling to 0 (wait), whatever
+        # its own environment says. The cycle timeout still bounds the wait.
+        self.scenario_is([{"kind": "success"}])
+        r = self.run_runner(1, CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="600000")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        call = json.loads(read(self.calls).splitlines()[0])
+        self.assertEqual(call["bg_wait_ceiling_ms"], "0")
+
 
 class AcceptanceFixes(RunnerHarness):
     def test_interrupted_cycle_is_not_recorded_as_success(self):
@@ -241,6 +251,59 @@ class AcceptanceFixes(RunnerHarness):
         self.assertEqual(rec["outcome"], "interrupted")
         self.assertEqual(rec["num_turns"], 46, "num_turns is summed across result events")
         self.assertGreaterEqual(rec["result_count"], 2)
+
+    def test_repeated_interrupted_cycles_reach_the_failure_cap(self):
+        # P0-17: a cycle killed by SIGTERM every time counts toward the crash cap
+        # (§5.5), so it cannot loop forever without the 2-hour sleep.
+        self.scenario_is([{"kind": "sigterm"}] * 6 + [{"kind": "success"}])
+        r = self.run_runner(7, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([e["outcome"] for e in self.events("cycle-end")], ["interrupted"] * 6 + ["ok"])
+        nxt = self.events("next")
+        self.assertEqual([e["state"] for e in nxt[:6]], ["resuming"] + ["restarting"] * 4 + ["failure-cap"])
+        self.assertLessEqual(nxt[0]["wait_s"], 5, "the first interruption resumes after the short pause")
+        self.assertTrue(all(55 <= e["wait_s"] <= 65 for e in nxt[1:5]), "repeated interruptions wait like crashes")
+        self.assertTrue(7100 <= nxt[5]["wait_s"] <= 7300)
+        caps = self.events("failure-cap")
+        self.assertEqual(len(caps), 1)
+        self.assertEqual((caps[0]["failures"], caps[0]["interrupted_in_a_row"]), (6, 6))
+        self.assertEqual(self.ncalls(), 7)
+        st = self._state()
+        self.assertEqual((st["consecutive_failures"], st["consecutive_interrupts"]), (0, 0))
+
+    def test_a_lone_interrupted_cycle_never_triggers_the_failure_cap(self):
+        # P0-17: one interruption (an operator restart) right after five crashes
+        # resumes after the short pause; it does not start the 2-hour sleep.
+        self.scenario_is([{"kind": "crash", "rc": 1}] * 5 + [{"kind": "sigterm"}, {"kind": "success"}])
+        r = self.run_runner(7, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([e["state"] for e in self.events("next")], ["restarting"] * 5 + ["resuming", "idle"])
+        self.assertEqual(self.events("failure-cap"), [])
+        st = self._state()
+        self.assertEqual((st["consecutive_failures"], st["consecutive_interrupts"]), (0, 0), "a finished cycle clears both counts")
+
+    def test_a_runner_restart_mid_cycle_resumes_without_backoff(self):
+        # P0-17: SIGTERM to the runner (systemctl restart) interrupts the cycle;
+        # the restarted runner resumes after the short pause and no cap is hit.
+        self.scenario_is([{"kind": "sleep", "seconds": 30}, {"kind": "success"}])
+        proc = subprocess.Popen([sys.executable, "-I", RUNNER], env=self.env(AP_MAX_CYCLES="1"),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(200):
+            if self.ncalls() and self._state().get("state") == "working":
+                break
+            time.sleep(0.05)
+        proc.terminate()
+        proc.wait(timeout=30)
+        st = self._state()
+        self.assertEqual(st["last_cycle"]["outcome"], "interrupted")
+        self.assertEqual((st["consecutive_failures"], st["consecutive_interrupts"]), (1, 1))
+        self.assertEqual(self.events("next")[-1]["state"], "resuming")
+        r = self.run_runner(1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([e["outcome"] for e in self.events("cycle-end")], ["interrupted", "ok"])
+        self.assertEqual(self.events("failure-cap"), [])
+        st = self._state()
+        self.assertEqual((st["consecutive_failures"], st["consecutive_interrupts"]), (0, 0))
 
     def test_non_object_json_line_does_not_crash_the_runner(self):
         # R12: a bare list/number line is skipped; the cycle still completes.

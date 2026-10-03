@@ -15,6 +15,8 @@ Between cycles it:
   * on an authentication failure, records the fix for the operator in
     ~/.llm-autopilot/NEEDS_HUMAN.runtime.md and retries every 30 minutes;
   * restarts after a crash in 60 s, and sleeps 2 h after 6 crashes in a row;
+    a cycle cut off by a signal resumes after the short pause once, but a run
+    of interrupted cycles counts toward that cap like crashes do;
   * honours ~/.llm-autopilot/STOP (finish the cycle, exit), PAUSE and the
     AUTOPILOT_PAUSE_WINDOWS operator setting;
   * stops for good when RESUME.md says STATUS: COMPLETE and FINAL_REPORT.md
@@ -560,6 +562,7 @@ class Runner:
         st.setdefault("cycle", 0)
         st.setdefault("state", "starting")
         st.setdefault("consecutive_failures", 0)
+        st.setdefault("consecutive_interrupts", 0)
         st.setdefault("limit_backoff_idx", 0)
         st.setdefault("net_backoff_idx", 0)
         st.setdefault("limit_wait_s_total", 0)
@@ -749,7 +752,11 @@ class Runner:
             self.event("test-db-vars-ignored", keys=sorted(set(dropped)))
         child_env.update(test_db)
         child_env.update({"LLM_AUTOPILOT": "1", "LLM_AUTOPILOT_CYCLE": str(n),
-                          "LLM_AUTOPILOT_PREV_OUTCOME": str(self.state.get("prev_outcome") or "")})
+                          "LLM_AUTOPILOT_PREV_OUTCOME": str(self.state.get("prev_outcome") or ""),
+                          # Print mode otherwise terminates background tasks (a
+                          # running workflow) 600 s after the main turn ends; wait
+                          # for them instead. The cycle timeout still bounds it.
+                          "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"})
         started = now()
         stopfail_offset = os.path.getsize(STOPFAIL_FILE) if os.path.exists(STOPFAIL_FILE) else 0
         self.set_state("working", next_wake=None, cycle_started=iso(started))
@@ -882,15 +889,25 @@ class Runner:
     # ---- policy after a cycle
     def after(self, outcome, reset_at, detail):
         t = now()
+        if outcome != "interrupted":
+            self.state["consecutive_interrupts"] = 0  # any other end breaks a run of interruptions
         if outcome in ("ok", "max_turns", "timeout"):
             self.state.update(consecutive_failures=0, limit_backoff_idx=0, net_backoff_idx=0, last_error=None)
             return t + datetime.timedelta(seconds=BETWEEN_CYCLES_S), "idle"
         if outcome == "interrupted":
-            # Cut off, not finished: start a fresh cycle soon, keep the crash
-            # counters where they are, and leave a resume hint for the next cycle.
-            self.state["last_error"] = f"cycle interrupted: {self.redact(detail or '')[:200]}"
-            self.state["interrupted_cycles"] = int(self.state.get("interrupted_cycles", 0)) + 1
-            return t + datetime.timedelta(seconds=BETWEEN_CYCLES_S), "resuming"
+            # Cut off, not finished (a service restart, a stray SIGTERM). One
+            # interruption on its own, such as an operator restart, starts a
+            # fresh cycle after the short pause and never the cap. A run of them
+            # is a failure like a crash (§5.5): each counts toward the crash cap,
+            # so a cycle that is killed every time cannot loop without backoff.
+            interrupts = int(self.state.get("consecutive_interrupts", 0)) + 1
+            fails = int(self.state.get("consecutive_failures", 0)) + 1
+            self.state.update(consecutive_interrupts=interrupts, consecutive_failures=fails,
+                              interrupted_cycles=int(self.state.get("interrupted_cycles", 0)) + 1)
+            self.state["last_error"] = f"cycle interrupted ({interrupts} in a row): {self.redact(detail or '')[:200]}"
+            if interrupts == 1:
+                return t + datetime.timedelta(seconds=BETWEEN_CYCLES_S), "resuming"
+            return self._failure_wait(t, fails, interrupts)
         if outcome == "usage_limit":
             if reset_at and t < reset_at < t + datetime.timedelta(days=8):
                 wake = reset_at + datetime.timedelta(seconds=random.uniform(*JITTER))
@@ -929,9 +946,14 @@ class Runner:
         fails = int(self.state.get("consecutive_failures", 0)) + 1
         self.state["consecutive_failures"] = fails
         self.state["last_error"] = f"crash #{fails}: {self.redact(detail or '')[:200]}"
+        return self._failure_wait(t, fails, 0)
+
+    def _failure_wait(self, t, fails, interrupts):
+        """Restart after CRASH_RESTART_S, or sleep CRASH_CAP_SLEEP_S and record
+        it once `fails` consecutive failures reach CRASH_CAP (§5.5)."""
         if fails >= CRASH_CAP:
-            self.state["consecutive_failures"] = 0
-            self.event("failure-cap", failures=fails, sleep_s=CRASH_CAP_SLEEP_S)
+            self.state.update(consecutive_failures=0, consecutive_interrupts=0)
+            self.event("failure-cap", failures=fails, interrupted_in_a_row=interrupts, sleep_s=CRASH_CAP_SLEEP_S)
             return t + datetime.timedelta(seconds=CRASH_CAP_SLEEP_S), "failure-cap"
         return t + datetime.timedelta(seconds=CRASH_RESTART_S), "restarting"
 
