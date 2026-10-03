@@ -1164,6 +1164,34 @@ def test_cli_refuses_an_output_path_that_is_an_input(tmp_path, capsys):
     assert B.main(["compare", str(out), victim, "--out", str(results)]) == 2 and results.read_text() == before
 
 
+def test_cli_writes_every_output_or_none_and_leaves_no_temporary_file(tmp_path, monkeypatch, capsys):
+    """Re-QA 9: a directory as --out left a tmp file; a failing --markdown left a baseline without its markdown."""
+    run = write_run(tmp_path, "run", three_repeats(), repeats=3)
+
+    def litter():
+        return sorted(p.name for p in tmp_path.iterdir() if ".tmp-" in p.name)
+
+    (tmp_path / "adir").mkdir()
+    assert B.main(["freeze", run, "--out", str(tmp_path / "adir")]) == 2
+    assert "is a directory" in capsys.readouterr().err and litter() == []
+    (tmp_path / "mddir").mkdir()
+    assert B.main(["freeze", run, "--out", str(tmp_path / "half.json"), "--markdown", str(tmp_path / "mddir")]) == 2
+    assert not (tmp_path / "half.json").exists() and litter() == []
+    # the second output fails while it is written: the first is not replaced either
+    old_json, old_md = tmp_path / "old.json", tmp_path / "old.md"
+    old_json.write_text("old json")
+    old_md.write_text("old md")
+    monkeypatch.setattr(B, "render_markdown", lambda doc: "cannot be encoded \ud800")
+    assert B.main(["freeze", run, "--out", str(old_json), "--markdown", str(old_md)]) == 2
+    assert "UnicodeEncodeError" in capsys.readouterr().err
+    assert old_json.read_text() == "old json" and old_md.read_text() == "old md" and litter() == []
+    monkeypatch.undo()
+    assert B.main(["freeze", run, "--out", str(old_json), "--markdown", str(old_md)]) == 0
+    assert json.loads(old_json.read_text())["kind"] == "evalset-baseline"
+    assert "## Eval-set baseline" in old_md.read_text()
+    assert B.main(["compare", str(old_json), run, "--out", str(tmp_path / "adir")]) == 2 and litter() == []
+
+
 def test_cli_runs_as_a_script(tmp_path):
     dirs = [write_run(tmp_path, f"r{i}", _ids([record("EV01", 1)], f"r{i}")) for i in (1, 2, 3)]
     out = tmp_path / "baseline.json"

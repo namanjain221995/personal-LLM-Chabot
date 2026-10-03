@@ -32,11 +32,13 @@ never reads as "did not pass".
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ipaddress
 import json
 import math
 import os
 import re
+import secrets
 import statistics
 import sys
 import unicodedata
@@ -1560,22 +1562,35 @@ def render_markdown(baseline: dict) -> str:
 
 # ---------------------------------------------------------------------- CLI --
 
-def _write_text(path: str, text: str) -> None:
-    parent = os.path.dirname(os.path.abspath(path))
-    os.makedirs(parent, exist_ok=True)
-    tmp = f"{path}.tmp-{os.getpid()}"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.replace(tmp, path)
+def _write_outputs(outputs: Sequence[tuple]) -> None:
+    """Write every (path, text): first each text to a temporary file next to its path, then replace the paths.
+    When any write fails, every temporary file is removed and no path has been replaced, so a baseline is never
+    left without the markdown asked for next to it. (_guard_outputs refuses a directory as an output beforehand,
+    the one cause of a failed replace that a successful temporary write does not rule out.)"""
+    staged: List[tuple] = []
+    try:
+        for path, text in outputs:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            tmp = f"{path}.tmp-{os.getpid()}-{secrets.token_hex(4)}"
+            fh = open(tmp, "x", encoding="utf-8")
+            staged.append(tmp)
+            with fh:
+                fh.write(text)
+        for tmp, (path, _text) in zip(staged, outputs):
+            os.replace(tmp, path)
+    finally:
+        for tmp in staged:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)                  # already gone after a successful replace
 
 
-def _write_json(path: str, doc: dict) -> None:
-    _write_text(path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+def _json_text(doc: dict) -> str:
+    return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
 
 def _guard_outputs(outputs: Sequence[tuple], inputs: Sequence[str]) -> None:
-    """Refuse an output path that is one of the inputs (a run's results.json or summary.json, the baseline), or
-    two outputs that are the same file."""
+    """Refuse an output path that is one of the inputs (a run's results.json or summary.json, the baseline), an
+    existing directory, or two outputs that are the same file."""
     real_in = {os.path.realpath(p) for p in inputs}
     seen: Dict[str, str] = {}
     for flag, path in outputs:
@@ -1584,6 +1599,8 @@ def _guard_outputs(outputs: Sequence[tuple], inputs: Sequence[str]) -> None:
         real = os.path.realpath(path)
         if real in real_in:
             raise BaselineError(f"{flag} {path} is one of the inputs; refusing to overwrite it")
+        if os.path.isdir(real):
+            raise BaselineError(f"{flag} {path} is a directory; give the path of the file to write")
         if real in seen:
             raise BaselineError(f"{flag} and {seen[real]} name the same file ({path})")
         seen[real] = flag
@@ -1645,10 +1662,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _guard_outputs([("--out", args.out), ("--markdown", args.markdown)], _run_inputs(args.run_dirs))
             records = load_runs(args.run_dirs, allow_mixed=args.allow_mixed_conditions)
             doc = freeze(records)
-            markdown = render_markdown(doc) if args.markdown else None
-            _write_json(args.out, doc)
-            if markdown is not None:
-                _write_text(args.markdown, markdown)
+            outputs = [(args.out, _json_text(doc))]
+            if args.markdown:
+                outputs.append((args.markdown, render_markdown(doc)))
+            _write_outputs(outputs)
             for i in insufficient_gated(doc["latency"]):
                 print(f"baseline.py: WARNING {_insufficient_text(i)}", file=sys.stderr)
             for d in doc["procedure_deviations"]:
@@ -1662,7 +1679,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             records = load_runs(args.run_dirs, allow_mixed=args.allow_mixed_conditions)
             report = compare(base, records, allow_insufficient=args.allow_insufficient)
             if args.out:
-                _write_json(args.out, report)
+                _write_outputs([(args.out, _json_text(report))])
             print(_summary(report))
             return 0 if report["passed"] else 1
         sys.stdout.write(render_markdown(load_baseline(args.baseline)))
