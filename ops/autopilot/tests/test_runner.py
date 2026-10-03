@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNNER = os.path.join(os.path.dirname(HERE), "autopilot.py")
@@ -328,6 +329,30 @@ class AcceptanceFixes(RunnerHarness):
         self.assertEqual([e["state"] for e in self.events("next")], ["idle", "idle", "idle"])
         self.assertEqual(self.events("failure-cap"), [])
 
+    def test_an_unusable_cycle_timeout_falls_back_to_the_default(self):
+        # P0-18: `timeout 0` and `--kill-after=0` switch those limits off, and
+        # with a 0 timeout an outside SIGKILL passed for the timeout's own; a
+        # negative value made `timeout` refuse every cycle, and one that did
+        # not parse stopped the runner at import. Each now runs with the
+        # default, and says so.
+        for timeout_s, kill_after_s in (("0", "0"), ("-5", "-1"), ("4h", "abc")):
+            with self.subTest(timeout_s=timeout_s, kill_after_s=kill_after_s):
+                self.tearDown()
+                self.setUp()
+                self.scenario_is([{"kind": "sigkill"}, {"kind": "success"}])
+                r = self.run_runner(2, timeout=60, AP_CYCLE_TIMEOUT_S=timeout_s, AP_KILL_AFTER_S=kill_after_s)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                start = self.events("runner-start")[0]
+                self.assertEqual((start["cycle_timeout_s"], start["kill_after_s"]), (4 * 3600, 120))
+                ignored = {e["key"]: e["reason"] for e in self.events("operator-setting-ignored")}
+                self.assertEqual(sorted(ignored), ["AP_CYCLE_TIMEOUT_S", "AP_KILL_AFTER_S"])
+                self.assertIn(f"{timeout_s!r} is not", ignored["AP_CYCLE_TIMEOUT_S"])
+                self.assertIn("using the default 14400", ignored["AP_CYCLE_TIMEOUT_S"])
+                self.assertIn("using the default 120", ignored["AP_KILL_AFTER_S"])
+                ends = self.events("cycle-end")
+                self.assertEqual([(e["rc"], e["outcome"]) for e in ends], [(-9, "crash"), (0, "ok")])
+                self.assertEqual(self.ncalls(), 2, "both cycles reached the CLI")
+
     def test_a_runner_restart_mid_cycle_resumes_without_backoff(self):
         # P0-17: SIGTERM to the runner (systemctl restart) interrupts the cycle;
         # the restarted runner resumes after the short pause and no cap is hit.
@@ -630,6 +655,43 @@ class Units(unittest.TestCase):
         for tool in (autopilot.NICE, autopilot.IONICE, autopilot.TIMEOUT):
             self.assertTrue(os.path.isabs(tool), tool)
 
+    @staticmethod
+    def load_runner(**env):
+        """A fresh copy of the runner module, imported with exactly these AP_* variables."""
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("AP_")}
+        with mock.patch.dict(os.environ, {**clean, **env}, clear=True):
+            s = importlib.util.spec_from_file_location("autopilot_env_check", RUNNER)
+            mod = importlib.util.module_from_spec(s)
+            s.loader.exec_module(mod)
+        return mod
+
+    def test_cycle_timeout_and_kill_after_must_be_usable(self):
+        # P0-18: 0 switches `timeout`'s limits off and a negative value makes it
+        # refuse to run; a timeout under a minute (at real time) is a typo. Those
+        # and unparsable values give the default and an entry in ENV_IGNORED.
+        default = self.load_runner(AP_TIME_SCALE="1")
+        self.assertEqual((default.CYCLE_TIMEOUT_S, default.KILL_AFTER_S, default.ENV_IGNORED), (4 * 3600, 120, []))
+        cases = [
+            ("AP_CYCLE_TIMEOUT_S", "CYCLE_TIMEOUT_S", "1", "7200", 7200),
+            ("AP_CYCLE_TIMEOUT_S", "CYCLE_TIMEOUT_S", "1", " 60 ", 60),
+            ("AP_CYCLE_TIMEOUT_S", "CYCLE_TIMEOUT_S", "0.001", "2", 2),  # the acceptance tests' scaled clock
+            ("AP_KILL_AFTER_S", "KILL_AFTER_S", "1", "30", 30),
+            ("AP_KILL_AFTER_S", "KILL_AFTER_S", "1", "0.5", 0.5),
+        ]
+        cases += [("AP_CYCLE_TIMEOUT_S", "CYCLE_TIMEOUT_S", "1", bad, None) for bad in ("0", "-5", "59", "1.5", "4h", "")]
+        cases += [("AP_CYCLE_TIMEOUT_S", "CYCLE_TIMEOUT_S", "0.001", bad, None) for bad in ("0", "-1")]
+        cases += [("AP_KILL_AFTER_S", "KILL_AFTER_S", "1", bad, None) for bad in ("0", "-1", "nan", "inf", "abc", "")]
+        for var, attr, scale, raw, want in cases:
+            with self.subTest(var=var, value=raw, scale=scale):
+                mod = self.load_runner(AP_TIME_SCALE=scale, **{var: raw})
+                if want is None:
+                    self.assertEqual(getattr(mod, attr), getattr(default, attr))
+                    self.assertEqual([k for k, _ in mod.ENV_IGNORED], [var])
+                    self.assertIn(repr(raw), mod.ENV_IGNORED[0][1])
+                else:
+                    self.assertEqual(getattr(mod, attr), want)
+                    self.assertEqual(mod.ENV_IGNORED, [])
+
     def test_operator_settings_parse(self):
         with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
             fh.write("x\n```yaml\nDEV_BRANCH: autopilot/dev   # comment\nMAX_AUTONOMOUS_DAYS: 14\nAUTOPILOT_PAUSE_WINDOWS: [\"10:00-18:00 Asia/Kolkata\"]\nMAX_PARALLEL_SUBAGENTS: unlimited\n```\n")
@@ -668,10 +730,17 @@ class Units(unittest.TestCase):
 
 
 # is-active prints the word in ./state (a one-shot ./hang file makes that call
-# hang until it is signalled); every call is logged in ./calls.
+# hang until it is signalled); every call is logged in ./calls. With a
+# ./signal-on-start file naming a signal, start sends it to its whole process
+# group (the shell that called it included) and logs "start done" only if it
+# survives that.
 FAKE_SYSTEMCTL = """#!/bin/sh
 d=$(dirname "$0")
 echo "$*" >> "$d/calls"
+if [ "$2" = start ] && [ -e "$d/signal-on-start" ]; then
+    kill -s "$(cat "$d/signal-on-start")" 0
+    echo "start done" >> "$d/calls"
+fi
 if [ "$2" = is-active ]; then
     if [ -e "$d/hang" ]; then
         rm -f "$d/hang"
@@ -853,9 +922,37 @@ class InstallScript(unittest.TestCase):
         self.assertNotIn("--user start llm-autopilot.service", self.calls())
 
     def test_the_normal_path_removes_stop_before_dropping_its_handlers(self):
-        # An interrupt between the two still finds STOP gone or removes it.
+        # P0-18: the handlers give way to ignoring the signals, not to the
+        # defaults, before STOP is removed; the defaults come back only once
+        # the runner is started.
         body = re.search(r"^graceful_restart\(\) \{\n(.*?)^\}\n", read(INSTALL), re.M | re.S).group(1)
-        self.assertIn('    rm -f "$AP/STOP"\n    trap - INT TERM HUP PIPE\n    systemctl --user start', body)
+        self.assertIn("    trap '' INT TERM HUP\n    rm -f \"$AP/STOP\"\n    systemctl --user start llm-autopilot.service\n"
+                      "    trap - INT TERM HUP PIPE\n", body)
+
+    def test_an_interrupt_during_the_final_start_still_starts_the_runner(self):
+        # P0-18: STOP is gone and the runner has exited on it; a Ctrl-C, TERM
+        # or closing terminal now must not leave it down. The fake systemctl
+        # signals the whole process group from inside `start`, so the signal
+        # always lands in that window: with default handlers there the shell
+        # and systemctl die and "start done" is never logged.
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(sig=sig.name):
+                for f in ("calls", "hang"):
+                    if os.path.exists(os.path.join(self.bin, f)):
+                        os.remove(os.path.join(self.bin, f))
+                with open(os.path.join(self.bin, "signal-on-start"), "w") as fh:
+                    fh.write(sig.name[3:] + "\n")
+                proc = self.start_wait()
+                self.assertTrue(self.wait_for(lambda: os.path.exists(self.stop)))
+                self.set_state("inactive")
+                out, err = proc.communicate(timeout=20)
+                calls = self.calls()
+                self.assertEqual(proc.returncode, 0, err)
+                self.assertFalse(os.path.exists(self.stop))
+                self.assertIn("--user start llm-autopilot.service", calls)
+                self.assertEqual(calls[-1], "start done", "systemctl ignored the signal and finished the start")
+                self.assertIn("restarted on the new code", out)
+                self.assertNotIn("interrupted", err)
 
     def test_an_interrupted_restart_wait_keeps_an_operator_stop_file(self):
         open(self.stop, "w").close()

@@ -35,6 +35,7 @@ the agent cannot modify it; the copy in the repository is the source.
 import datetime
 import fcntl
 import json
+import math
 import os
 import pwd
 import random
@@ -54,6 +55,23 @@ EXIT_STOPPED = 64
 
 def env(name, default):
     return os.environ.get(name, default)
+
+
+def env_number(name, default, parse, ok, rule, ignored):
+    """Read a numeric setting from the environment. A value that does not parse
+    or fails `ok` gives `default`, and (name, reason) goes on `ignored`; the
+    runner reports those as operator-setting-ignored events when it starts."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = parse(raw.strip())
+    except ValueError:
+        value = None
+    if value is None or not ok(value):
+        ignored.append((name, f"{raw!r} is not {rule}; using the default {default:g}"))
+        return default
+    return value
 
 
 def _tool(name, *candidates):
@@ -79,9 +97,20 @@ TEST_DB_VARS = env("AP_TEST_DB_VARS", os.path.join(AP_HOME, "agent/test-db.vars"
 DOCS = os.path.join(WORKTREE, "docs/ai-platform-upgrade")
 TIME_SCALE = float(env("AP_TIME_SCALE", "1"))
 MAX_CYCLES = int(env("AP_MAX_CYCLES", "0"))
-CYCLE_TIMEOUT_S = int(env("AP_CYCLE_TIMEOUT_S", str(4 * 3600)))
+# Settings ignored at import, reported by Runner.run() once events can be written.
+ENV_IGNORED = []
+# `timeout 0` and `--kill-after=0` switch those limits off, so a cycle could run
+# forever (and with a 0 timeout every killed cycle would count as a timeout, not
+# a crash); a negative one makes `timeout` refuse to start any cycle. A value
+# that does not parse or is below the floor (60 s, scaled like the runner's
+# other waits so tests can use a few seconds) falls back to the default.
+MIN_CYCLE_TIMEOUT_S = 60
+CYCLE_TIMEOUT_S = env_number("AP_CYCLE_TIMEOUT_S", 4 * 3600, int,
+                             lambda v: v >= max(1, MIN_CYCLE_TIMEOUT_S * TIME_SCALE),
+                             f"a whole number of seconds of at least {MIN_CYCLE_TIMEOUT_S}", ENV_IGNORED)
 # A CLI still running KILL_AFTER_S after the cycle timeout's SIGTERM gets SIGKILL.
-KILL_AFTER_S = float(env("AP_KILL_AFTER_S", "120"))
+KILL_AFTER_S = env_number("AP_KILL_AFTER_S", 120.0, float, lambda v: math.isfinite(v) and v > 0,
+                          "a number of seconds above 0", ENV_IGNORED)
 MAX_TURNS = int(env("AP_MAX_TURNS", "150"))
 HEARTBEAT_S = float(env("AP_HEARTBEAT_S", "60"))
 BETWEEN_CYCLES_S = float(env("AP_BETWEEN_CYCLES_S", "30"))
@@ -993,7 +1022,10 @@ class Runner:
             self.state["final_checkpoint_done"] = False
             os.remove(os.path.join(AP_HOME, "RENEW"))
             self.event("renewed")
-        self.event("runner-start", pid=os.getpid(), claude=CLAUDE, worktree=WORKTREE)
+        self.event("runner-start", pid=os.getpid(), claude=CLAUDE, worktree=WORKTREE,
+                   cycle_timeout_s=CYCLE_TIMEOUT_S, kill_after_s=KILL_AFTER_S)
+        for key, reason in ENV_IGNORED:
+            self._settings_warn(key, reason)
         try:
             return self.loop()
         finally:
