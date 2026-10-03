@@ -635,12 +635,64 @@ def test_a_case_that_never_passes_is_gated_per_check():
     assert compare(base, ev09(9))["passed"] is True
     r = compare(base, ev09(8))
     assert r["cases"]["EV09"]["pass_rate_verdict"] == "pass" and r["cases"]["EV09"]["verdict"] == "fail"
-    assert r["cases"]["EV09"]["check_fails"] == [{"check": "c08", "baseline": "3/3", "candidate": "0/3"}]
+    assert r["cases"]["EV09"]["check_fails"] == [{"check": "c08", "rule": "passes", "baseline": "3/3",
+                                                  "candidate": "0/3"}]
     assert "case EV09 check c08: 0/3 records pass < baseline 3/3 - 1/3" in r["fails"]
     # an errored record fails every check of its case; one of three is within one repeat
     crashed = ev09(9)
     crashed[0] = record("EV09", 1, turns=[], error="ReadTimeout: stalled", effort="max")
     assert compare(base, crashed)["cases"]["EV09"]["check_fails"] == []
+
+
+def _made_a_file(cid: str, repeat: int, done: bool = True) -> dict:
+    """A turn that made a file it should not have: `artifact` fails, and `job_completed` (the harness emits it only
+    when a turn made a file) runs."""
+    chk = checks(1, fail=["artifact"]) + [{"check": "job_completed", "dimension": "deliverable", "ok": done,
+                                           "detail": ""}]
+    return record(cid, repeat, [turn(chk)])
+
+
+def _no_file(cid: str, repeat: int) -> dict:
+    return record(cid, repeat, [turn(checks(1) + [{"check": "artifact", "dimension": "deliverable", "ok": True,
+                                                    "detail": ""}])])
+
+
+def test_a_conditional_check_is_gated_on_its_failure_rate():
+    """Re-QA 2: a candidate that stopped making an unwanted file lost job_completed (0/3 pass) and failed."""
+    base = frozen([_made_a_file("EV01", 1), _made_a_file("EV01", 2), _no_file("EV01", 3)])
+    case = base["quality"]["cases"]["EV01"]
+    assert case["check_runs"] == {"artifact": 3, "c00": 3, "job_completed": 2, "thinking_off": 3}
+    assert B.conditional_checks(case) == ["job_completed"] and B.check_failures(case, "job_completed") == 0
+    fixed = compare(base, [_no_file("EV01", r) for r in (1, 2, 3)])
+    assert fixed["passed"] is True and fixed["cases"]["EV01"]["check_fails"] == []
+    assert fixed["cases"]["EV01"]["conditional_checks"] == ["job_completed"]
+    # failing in one more record than the baseline is within one repeat; in every record it is not
+    one = compare(base, [_made_a_file("EV01", 1, done=False), _made_a_file("EV01", 2), _no_file("EV01", 3)])
+    assert one["cases"]["EV01"]["check_fails"] == []
+    broken = compare(base, [_made_a_file("EV01", r, done=False) for r in (1, 2, 3)])
+    assert {"check": "job_completed", "rule": "failures", "baseline": "0/3", "candidate": "3/3"} \
+        in broken["cases"]["EV01"]["check_fails"]
+    assert ("case EV01 check job_completed (conditional: absent from some baseline records): 3/3 records fail it > "
+            "baseline 0/3 + 1/3") in broken["fails"]
+    # an errored record fails a conditional check too
+    crashed = [record("EV01", r, turns=[], error="ReadTimeout: stalled") for r in (1, 2)] + [_no_file("EV01", 3)]
+    entry = compare(base, crashed)["cases"]["EV01"]["check_fails"]
+    assert {"check": "job_completed", "rule": "failures", "baseline": "0/3", "candidate": "2/3"} in entry
+
+
+def test_a_check_the_baseline_ran_in_every_complete_record_fails_when_absent():
+    base = frozen([_made_a_file("EV01", r) for r in (1, 2, 3)])          # job_completed in every record
+    r = compare(base, [_no_file("EV01", r) for r in (1, 2, 3)])
+    assert {"check": "job_completed", "rule": "passes", "baseline": "3/3", "candidate": "0/3"} \
+        in r["cases"]["EV01"]["check_fails"]
+    # an errored baseline record, or one without checks, does not make a check conditional
+    recs = [_made_a_file("EV01", r) for r in (1, 2)] + [record("EV01", 3, turns=[], error="Boom")]
+    assert B.conditional_checks(frozen(recs)["quality"]["cases"]["EV01"]) == []
+    recs = [_made_a_file("EV09", r) for r in (1, 2)] + [record("EV09", 3, [turn(chk=[])], effort="max")]
+    for rec in recs:
+        rec["effort"] = "max"
+    case = frozen(recs)["quality"]["cases"]["EV09"]
+    assert case["no_checks"] == 1 and B.conditional_checks(case) == []
 
 
 def test_overall_drop_of_exactly_one_twentieth_passes_and_more_fails():

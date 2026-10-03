@@ -123,8 +123,13 @@ METHOD = {
     "case_pass": "A record passes when every check is ok and it has no error. Case pass_rate = passing records / "
                  "records; mean_score = mean record score.",
     "case_check": "Per (case, check name): a record passes that check when it has no error, runs the check at "
-                  "least once and it never fails; a record that lacks the check fails it. check_passes counts "
-                  "those records.",
+                  "least once and it never fails (check_passes counts those records); check_runs counts the "
+                  "records with no error that ran it. A complete record has no error and at least one check. A "
+                  "check is conditional for a case when the baseline did not run it in every complete record "
+                  "(the harness emits some only when something happened, e.g. job_completed only when a turn "
+                  "made a file); a record fails a conditional check when it errored or the check failed in it. "
+                  "A check the baseline ran in every complete record is unconditional: a record that lacks it "
+                  "fails it.",
     "check_rate": "Per check name: ok / total over every (case, repeat, turn), errored records included (reported).",
     "overall": "Overall mean score = mean over cases of each case's mean_score (every case weighs the same), exact.",
     "fast_thinking": f"Fast thinking turns = turns of effort 'fast' records whose `{THINKING_CHECK}` check failed; "
@@ -203,9 +208,11 @@ METHOD = {
     "compare_case": "Only cases the baseline has are compared; new cases are listed. A case regresses when the "
                     "candidate pass_rate < baseline pass_rate - 1 / min(baseline repeats, candidate repeats), exact "
                     "fractions. A baseline case missing from the candidate fails.",
-    "compare_case_check": "Per (case, check): fails when the candidate's check_passes / repeats < the baseline's "
-                          "- 1 / min(baseline repeats, candidate repeats), exact fractions. This gates cases that "
-                          "never fully pass.",
+    "compare_case_check": "Per (case, check), exact fractions, k = min(baseline repeats, candidate repeats): an "
+                          "unconditional check fails when the candidate's check_passes / repeats < the baseline's "
+                          "- 1/k; a conditional check (see case_check) fails when the candidate's failing records / "
+                          "repeats > the baseline's + 1/k, so a candidate that stops emitting it (e.g. stops making "
+                          "an unwanted file) is not a regression. Both gate cases that never fully pass.",
     "compare_failed_turns": "Per case: fails when the candidate's failed-turn rate > the baseline's + 1 / "
                             "min(baseline repeats, candidate repeats), exact fractions.",
     "compare_overall": "The candidate regresses overall when its overall mean score, over the cases both have, is "
@@ -735,6 +742,24 @@ def _record_checks(rec: dict) -> List[dict]:
     return [c for t in rec.get("turns") or [] for c in t.get("checks") or []]
 
 
+def complete_records(case: dict) -> int:
+    """Records of a case (quality_stats' per-case counts) with no error and at least one check."""
+    return case["repeats"] - case["errors"] - case["no_checks"]
+
+
+def conditional_checks(case: dict) -> List[str]:
+    """The checks a case did not run in every complete record: the harness emits some only when something
+    happened (job_completed only when a turn made a file), so their absence is not a failure."""
+    full = complete_records(case)
+    return [name for name, runs in case["check_runs"].items() if runs < full]
+
+
+def check_failures(case: dict, name: str) -> int:
+    """Records that fail check `name`: errored ones, and complete ones in which it ran and failed at least once."""
+    runs = case["check_runs"].get(name, 0)
+    return case["errors"] + runs - case["check_passes"].get(name, 0)
+
+
 def quality_stats(records: Sequence[dict]) -> dict:
     names: Dict[str, set] = {}
     for rec in records:
@@ -751,7 +776,8 @@ def quality_stats(records: Sequence[dict]) -> dict:
         if a is None:
             a = acc[cid] = {"workload": w, "effort": effort, "category": rec.get("category"), "repeats": 0,
                             "passes": 0, "score": Fraction(0), "errors": 0, "no_checks": 0, "failing": Counter(),
-                            "check_passes": {name: 0 for name in sorted(names[cid])}, "failed_turns": 0, "turns": 0}
+                            "check_passes": {name: 0 for name in sorted(names[cid])},
+                            "check_runs": {name: 0 for name in sorted(names[cid])}, "failed_turns": 0, "turns": 0}
         elif (a["workload"], a["effort"]) != (w, effort):
             raise BaselineError(f"case {cid}: records disagree on workload/effort ({a['workload']}/{a['effort']} "
                                 f"vs {w}/{effort}); the runs used different eval-set versions")
@@ -774,6 +800,7 @@ def quality_stats(records: Sequence[dict]) -> dict:
             a["passes"] += ok == len(rec_checks)
         for name in a["check_passes"]:
             runs = [c["ok"] for c in rec_checks if c["check"] == name]
+            a["check_runs"][name] += (not errored) and bool(runs)
             a["check_passes"][name] += (not errored) and bool(runs) and all(runs)
         turns = rec.get("turns") or []
         if errored and not turns:
@@ -802,7 +829,7 @@ def quality_stats(records: Sequence[dict]) -> dict:
                       "mean_score": float(exact), "mean_score_exact": str(exact),
                       "errors": a["errors"], "no_checks": a["no_checks"],
                       "failed_turns": a["failed_turns"], "turns": a["turns"],
-                      "check_passes": a["check_passes"],
+                      "check_passes": a["check_passes"], "check_runs": a["check_runs"],
                       "failing_checks": dict(sorted(a["failing"].items(), key=lambda kv: (-kv[1], kv[0])))}
     overall = sum((Fraction(c["mean_score_exact"]) for c in cases.values()), Fraction(0)) / len(cases) \
         if cases else None
@@ -1140,10 +1167,19 @@ def compare(baseline: dict, candidate_records: Sequence[dict], *, allow_insuffic
             fails.append(f"case {cid}: pass rate {c['passes']}/{c['repeats']} < baseline {b['passes']}/"
                          f"{b['repeats']} - 1/{k}")
         check_fails = []
+        conditional = conditional_checks(b)
         for name, bp in b["check_passes"].items():
+            if name in conditional:
+                bf, cf = check_failures(b, name), check_failures(c, name)
+                if Fraction(cf, c["repeats"]) > Fraction(bf, b["repeats"]) + slack:
+                    check_fails.append({"check": name, "rule": "failures", "baseline": f"{bf}/{b['repeats']}",
+                                        "candidate": f"{cf}/{c['repeats']}"})
+                    fails.append(f"case {cid} check {name} (conditional: absent from some baseline records): "
+                                 f"{cf}/{c['repeats']} records fail it > baseline {bf}/{b['repeats']} + 1/{k}")
+                continue
             cp = c["check_passes"].get(name, 0)
             if Fraction(cp, c["repeats"]) < Fraction(bp, b["repeats"]) - slack:
-                check_fails.append({"check": name, "baseline": f"{bp}/{b['repeats']}",
+                check_fails.append({"check": name, "rule": "passes", "baseline": f"{bp}/{b['repeats']}",
                                     "candidate": f"{cp}/{c['repeats']}"})
                 fails.append(f"case {cid} check {name}: {cp}/{c['repeats']} records pass < baseline {bp}/"
                              f"{b['repeats']} - 1/{k}")
@@ -1157,7 +1193,7 @@ def compare(baseline: dict, candidate_records: Sequence[dict], *, allow_insuffic
                       "baseline_pass_rate": b["pass_rate"], "baseline_repeats": b["repeats"],
                       "candidate_pass_rate": c["pass_rate"], "candidate_repeats": c["repeats"],
                       "floor": float(b_rate - slack), "pass_rate_verdict": "fail" if regressed else "pass",
-                      "check_fails": check_fails,
+                      "check_fails": check_fails, "conditional_checks": conditional,
                       "new_checks": [n for n in c["check_passes"] if n not in b["check_passes"]],
                       "baseline_failed_turns": f"{b['failed_turns']}/{b['turns']}",
                       "candidate_failed_turns": f"{c['failed_turns']}/{c['turns']}",
