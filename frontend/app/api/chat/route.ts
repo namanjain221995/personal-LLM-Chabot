@@ -14,14 +14,13 @@ import { categoryForStatus, type ErrorCategory } from '@/lib/errorTypes';
 import { FIXTURES, MOCK_MODEL_IDS, pickFixtureEngine } from '@/lib/fixtures';
 import {
   REQUEST_ID_HEADER,
-  acceptRequestId,
   lastUserContent,
   newRequestId,
   toOrchestratorChatRequest,
   type ChatRequestBody,
 } from '@/lib/orchestrator';
 import { declaredBodyOverLimit, readBoundedBody } from '@/lib/proxy';
-import { logProxyError, requestIdOf } from '@/lib/serverLog';
+import { logProxyError } from '@/lib/serverLog';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -62,13 +61,14 @@ const SSE_HEADERS = {
 } as const;
 
 /**
- * This request's correlation id (B-03): the one an upstream proxy assigned
- * (`requestIdOf`) when it has the orchestrator's shape, a new one otherwise.
- * Never trimmed, escaped or truncated into shape — anything else a client
- * sends in those headers is simply not used.
+ * This request's correlation id (B-03): always minted here. Nothing upstream
+ * assigns ids in this deployment, so an `x-request-id` (or correlation/trace
+ * header) on the request came from the browser, and adopting it would let a
+ * user stamp another user's id onto their own log lines (B-03 QA). The
+ * inbound value, when well formed, is kept for the proxy log only.
  */
-function chatRequestId(req: Request): string {
-  return acceptRequestId(requestIdOf(req)) ?? newRequestId();
+function chatRequestId(): string {
+  return newRequestId();
 }
 
 /** Walk undici's nested `cause` chain for the machine-readable error code. */
@@ -309,7 +309,7 @@ export async function POST(req: Request): Promise<Response> {
   const startedAt = Date.now();
   // One id for this request, on every exit: the forwarded header, each log
   // line and the response header (B-03).
-  const requestId = chatRequestId(req);
+  const requestId = chatRequestId();
   // Bounded BEFORE it is read. A declared length over the cap is refused
   // without touching the socket; a body that declares nothing (or lies) is
   // measured chunk by chunk and cancelled the moment it goes over.

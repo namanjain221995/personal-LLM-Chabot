@@ -141,13 +141,15 @@ describe('chat proxy — server-side logging', () => {
     expect(line).toMatch(/timestamp="\d{4}-\d{2}-\d{2}T/);
   });
 
-  it('logs the correlation id when a well-formed one was supplied', async () => {
-    // B-03: the orchestrator's shape, `req_` + 32 hex — the id it adopts.
+  it('logs its own minted id, not a well-formed one the browser supplied', async () => {
+    // B-03 QA: nothing upstream assigns ids here, so a supplied one is the browser's.
     const id = `req_${'ab12'.repeat(8)}`;
     vi.stubGlobal('fetch', async () => new Response('x', { status: 500 }));
     const res = await POST(post({ headers: { 'x-request-id': id } }));
-    expect(errors.join('\n')).toContain(`request_id="${id}"`);
-    expect(res.headers.get('x-request-id')).toBe(id);
+    const minted = res.headers.get('x-request-id') ?? '';
+    expect(minted).toMatch(/^req_[0-9a-f]{32}$/);
+    expect(minted).not.toBe(id);
+    expect(errors.join('\n')).toContain(`request_id="${minted}"`);
   });
 
   it('logs a fresh id, not a malformed one, when the supplied one is not usable', async () => {

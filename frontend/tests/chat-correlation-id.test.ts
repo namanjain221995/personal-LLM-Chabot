@@ -112,12 +112,14 @@ describe('POST /api/chat — the correlation id', () => {
   });
 
   it.each([['x-request-id'], ['x-correlation-id']])(
-    'adopts a well-formed upstream id from %s',
+    'mints its own id even when %s carries a well-formed one (a browser chose it)',
     async (header) => {
       stubOrchestrator(sse);
       const res = await POST(post({ [header]: VALID }));
-      expect(sent[0].headers[REQUEST_ID_HEADER]).toBe(VALID);
-      expect(res.headers.get('x-request-id')).toBe(VALID);
+      const minted = res.headers.get('x-request-id') ?? '';
+      expect(minted).toMatch(/^req_[0-9a-f]{32}$/);
+      expect(minted).not.toBe(VALID);
+      expect(sent[0].headers[REQUEST_ID_HEADER]).toBe(minted);
     },
   );
 
@@ -164,7 +166,9 @@ describe('POST /api/chat — the correlation id', () => {
     );
     expect(res.status).toBe(400);
     expect(sent).toHaveLength(0);
-    expect(res.headers.get('x-request-id')).toBe(VALID);
-    expect(errors.join('\n')).toContain(`request_id="${VALID}"`);
+    const minted = res.headers.get('x-request-id') ?? '';
+    expect(minted).toMatch(/^req_[0-9a-f]{32}$/);
+    expect(minted).not.toBe(VALID);
+    expect(errors.join('\n')).toContain(`request_id="${minted}"`);
   });
 });
