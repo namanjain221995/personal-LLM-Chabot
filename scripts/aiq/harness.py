@@ -10,13 +10,16 @@ The checks are pure functions over what came back; cases.py holds the rubric.
 """
 from __future__ import annotations
 
+import codecs
 import colorsys
 import csv
 import io
 import json
+import mimetypes
 import os
 import re
 import subprocess
+import threading
 import time
 import zipfile
 from collections import defaultdict
@@ -36,82 +39,233 @@ CHART_TYPES = {
 
 # =============================================================== client ==
 
+def chat_body(conversation_id: str, message: str, history: List[dict], effort: str, web_search: str = "off", *,
+              pdf_uploads: Optional[List[dict]] = None, deep_research: Optional[bool] = None,
+              test_case_id: Optional[str] = None, extra: Optional[dict] = None) -> dict:
+    """The JSON body Client.chat POSTs to /chat. The optional fields are added
+    only when given, so a caller that passes none gets the body run.py has
+    always sent."""
+    body = {"message": message, "messages": [*history, {"role": "user", "content": message}],
+            "session_id": conversation_id, "conversation_id": conversation_id, "mode": "assistant",
+            "model": "smart", "effort": effort, "web_search": web_search}
+    if pdf_uploads:
+        body["pdf_uploads"] = list(pdf_uploads)
+    if deep_research is not None:
+        body["deep_research"] = bool(deep_research)
+    if test_case_id is not None:
+        body["test_case_id"] = test_case_id
+    if extra:
+        body.update(extra)
+    return body
+
+
+def sse_lines(chunks: Iterable[bytes]) -> Iterable[str]:
+    """The lines of an SSE body, split on "\\n" only, one trailing "\\r" dropped.
+
+    httpx's iter_lines also splits on U+2028, U+2029 and U+0085 (str.splitlines),
+    and the orchestrator writes those characters raw (app/sse.py: json.dumps
+    ensure_ascii=False), so a token or a meta holding one was cut in two and
+    both halves dropped as undecodable JSON. The body is decoded as UTF-8
+    incrementally, so a character split across two chunks survives."""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pending = ""
+    for chunk in chunks:
+        pending += decoder.decode(chunk)
+        *lines, pending = pending.split("\n")
+        for line in lines:
+            yield line[:-1] if line.endswith("\r") else line
+    pending += decoder.decode(b"", final=True)
+    if pending:
+        yield pending[:-1] if pending.endswith("\r") else pending
+
+
 class Client:
-    def __init__(self, base: str, email: str, password: str, container: Optional[str] = None):
+    def __init__(self, base: str, email: str, password: str, container: Optional[str] = None, *,
+                 request_timeout_s: Optional[float] = None):
+        """`request_timeout_s` bounds the sign-in, /auth/me and trace reads
+        (seconds); None keeps the client default run.py has always used."""
         port = base.rsplit(":", 1)[-1].split("/")[0]
         if port in PROD_PORTS or "techsarasolutions.com" in base:
             raise SystemExit(f"refusing to send test traffic to what looks like production: {base}")
         if container and not ("e2e" in container and "sf-local-ai" not in container):
             raise SystemExit(f"refusing docker exec into a non-e2e container: {container}")
         self.base, self.container = base.rstrip("/"), container
+        self.request_timeout_s = request_timeout_s
         self.http = httpx.Client(follow_redirects=True, timeout=httpx.Timeout(30.0, read=3600.0))
-        r = self.http.post(f"{self.base}/auth/login", json={"email": email, "password": password, "remember": True})
+        r = self.http.post(f"{self.base}/auth/login", json={"email": email, "password": password, "remember": True},
+                           **self._bounded())
         if r.status_code != 200:
             raise SystemExit(f"login failed: {r.status_code} {r.text[:200]}")
         pair = r.headers.get("set-cookie", "").split(";", 1)[0].strip()
         if "=" in pair:  # the cookie is Secure; pin it as a header over plain http
             self.http.headers["Cookie"] = pair
-        me = self.http.get(f"{self.base}/auth/me")
+        me = self.http.get(f"{self.base}/auth/me", **self._bounded())
         self.me = me.json() if me.status_code == 200 else {}
         self.user_id = self.me.get("id") or (self.me.get("user") or {}).get("id")
 
-    def upload(self, conversation_id: str, path: str) -> dict:
+    def _bounded(self) -> dict:
+        return {} if self.request_timeout_s is None else {"timeout": float(self.request_timeout_s)}
+
+    def upload(self, conversation_id: str, path: str, purpose: str = "dataset",
+               content_type: Optional[str] = None) -> dict:
+        """POST /uploads. `purpose` "dataset" (the default, a CSV) or
+        "document" (the original is kept; the chat turn names it in
+        `pdf_uploads`)."""
+        if content_type is None:
+            content_type = "text/csv" if purpose == "dataset" else (
+                mimetypes.guess_type(path)[0] or "application/octet-stream")
         with open(path, "rb") as fh:
-            r = self.http.post(f"{self.base}/uploads", data={"conversation_id": conversation_id, "purpose": "dataset"},
-                               files={"file": (os.path.basename(path), fh, "text/csv")}, timeout=300.0)
+            r = self.http.post(f"{self.base}/uploads", data={"conversation_id": conversation_id, "purpose": purpose},
+                               files={"file": (os.path.basename(path), fh, content_type)}, timeout=300.0)
         if r.status_code != 200:
             raise RuntimeError(f"upload {r.status_code}: {r.text[:300]}")
         return r.json()
 
     def chat(self, conversation_id: str, message: str, history: List[dict], effort: str,
-             attachments: Optional[List[dict]] = None, web_search: str = "off") -> dict:
-        body = {"message": message, "messages": [*history, {"role": "user", "content": message}],
-                "session_id": conversation_id, "conversation_id": conversation_id, "mode": "assistant",
-                "model": "smart", "effort": effort, "web_search": web_search}
+             attachments: Optional[List[dict]] = None, web_search: str = "off", *,
+             pdf_uploads: Optional[List[dict]] = None, deep_research: Optional[bool] = None,
+             test_case_id: Optional[str] = None, extra: Optional[dict] = None,
+             max_seconds: Optional[float] = None, idle_timeout_s: Optional[float] = None,
+             cancel: Optional[threading.Event] = None) -> dict:
+        """POST /chat and follow the SSE stream.
+
+        The optional keyword fields are sent only when given, so a caller that
+        passes none (run.py) sends the body it always did. `max_seconds` stops
+        READING after that long (`timed_out` True); the generation itself is
+        detached server-side and keeps running until POST /chat/stop.
+        `idle_timeout_s` caps the wait for any byte (the read timeout is the
+        smaller of the two): the server heartbeats every 15 s (app/sse.py
+        HEARTBEAT_SECONDS), so a pipe silent for `idle_timeout_s` is a dead
+        one and raises httpx.ReadTimeout. A read that times out once
+        `max_seconds` has run out is that cut instead (`timed_out` True, what
+        streamed so far kept), not a dead pipe.
+
+        `cancel`, when set, stops READING at the next line of the stream (a
+        token, any event, or a heartbeat) and is checked before the POST too:
+        the result has `cancelled` True (http None when nothing was sent).
+        Like `max_seconds` it ends no generation; the caller stops that.
+
+        Besides `seconds` and `ttft`, the result carries `request_id` (the
+        X-Request-ID response header) and `timing`, each value float seconds
+        from just before the POST, or None when it never happened:
+        first_event_s (the first SSE event of any kind; an SSE comment such as
+        the `: keep-alive` heartbeat is not an event), first_token_s (the
+        first `token` event, even whitespace), first_answer_s (the first
+        `token` event with a non-whitespace character: no step, status,
+        reasoning, meta or heartbeat counts) and total_s (the stream closed
+        after its terminal `done`). total_s is None for a turn that did not
+        finish: an HTTP error, a read cut at `max_seconds` or by `cancel`, or
+        a stream that ended in `error` or with no terminal event, so a failed
+        turn is never a latency sample.
+
+        `terminal` is "done", "error" or None (neither arrived); a stream
+        that closed with neither, unless reading was cut (`max_seconds`,
+        `cancel`), gets {"error": "stream ended without done"} in `errors`.
+        `bad_frames` counts `data:` lines that were not a JSON object
+        (counted, never skipped silently), `status_events` the texts of the
+        `status` events (they announce feature downgrades, among other
+        things).
+        """
+        body = chat_body(conversation_id, message, history, effort, web_search, pdf_uploads=pdf_uploads,
+                         deep_research=deep_research, test_case_id=test_case_id, extra=extra)
         tokens: List[str] = []
         reasoning: List[str] = []
         steps: Dict[int, dict] = {}
         meta: dict = {}
         errors: List[dict] = []
+        status_events: List[str] = []
+        bad_frames = 0
+        terminal: Optional[str] = None
+        limits = [float(x) for x in (max_seconds, idle_timeout_s) if x is not None]
+        stream_kw = {"timeout": httpx.Timeout(30.0, read=min(limits))} if limits else {}
         started = time.perf_counter()
         first_token = None
-        with self.http.stream("POST", f"{self.base}/chat", json=body) as r:
+        first_event = first_answer = None
+        timed_out = cancelled = False
+
+        def timing(total: Optional[float]) -> dict:
+            return {k: (round(v, 3) if v is not None else None) for k, v in (
+                ("first_event_s", first_event), ("first_token_s", first_token),
+                ("first_answer_s", first_answer), ("total_s", total))}
+
+        def unfinished(http: Optional[int], error: str, request_id: Optional[str], cut: bool = False) -> dict:
+            return {"http": http, "answer": "", "meta": {}, "error": error, "reasoning_events": 0,
+                    "reasoning_chars": 0, "steps": {}, "seconds": 0, "errors": [], "request_id": request_id,
+                    "timed_out": False, "cancelled": cut, "terminal": None, "bad_frames": 0, "status_events": [],
+                    "timing": timing(None)}
+
+        if cancel is not None and cancel.is_set():
+            return unfinished(None, "cancelled before the request was sent", None, cut=True)
+        with self.http.stream("POST", f"{self.base}/chat", json=body, **stream_kw) as r:
+            request_id = r.headers.get("x-request-id")
             if r.status_code != 200:
-                return {"http": r.status_code, "answer": "", "meta": {}, "error": r.read()[:400].decode("utf-8", "replace"),
-                        "reasoning_events": 0, "reasoning_chars": 0, "steps": {}, "seconds": 0}
+                return unfinished(r.status_code, r.read()[:400].decode("utf-8", "replace"), request_id)
             event = None
-            for line in r.iter_lines():
-                if line.startswith("event:"):
-                    event = line[6:].strip()
-                    continue
-                if not line.startswith("data:"):
-                    continue
-                try:
-                    data = json.loads(line[5:].strip() or "{}")
-                except json.JSONDecodeError:
-                    continue
-                if event == "token":
-                    if first_token is None:
-                        first_token = time.perf_counter() - started
-                    tokens.append(str(data.get("text", "")))
-                elif event == "reasoning":
-                    reasoning.append(str(data.get("text", "")))
-                elif event == "step":
-                    sid = int(data.get("id", 0) or 0)
-                    steps[sid] = {**steps.get(sid, {}), **data}
-                elif event == "meta":
-                    meta = {**meta, **data} if isinstance(data, dict) else meta
-                elif event == "error":
-                    errors.append(data)
+            try:
+                for line in sse_lines(r.iter_bytes()):
+                    if cancel is not None and cancel.is_set():
+                        cancelled = True
+                        break
+                    if max_seconds is not None and time.perf_counter() - started > max_seconds:
+                        timed_out = True
+                        break
+                    if line.startswith("event:"):
+                        event = line[6:].strip()
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    if first_event is None:
+                        first_event = time.perf_counter() - started
+                    try:
+                        data = json.loads(line[5:].strip() or "{}")
+                    except json.JSONDecodeError:
+                        bad_frames += 1
+                        continue
+                    if not isinstance(data, dict):  # every orchestrator frame carries an object
+                        bad_frames += 1
+                        continue
+                    if event == "token":
+                        if first_token is None:
+                            first_token = time.perf_counter() - started
+                        if first_answer is None and str(data.get("text", "")).strip():
+                            first_answer = time.perf_counter() - started
+                        tokens.append(str(data.get("text", "")))
+                    elif event == "reasoning":
+                        reasoning.append(str(data.get("text", "")))
+                    elif event == "step":
+                        sid = int(data.get("id", 0) or 0)
+                        steps[sid] = {**steps.get(sid, {}), **data}
+                    elif event == "meta":
+                        meta = {**meta, **data}
+                    elif event == "status":
+                        status_events.append(str(data.get("text", "")))
+                    elif event == "error":
+                        errors.append(data)
+                        terminal = "error"
+                    elif event == "done":
+                        terminal = terminal or "done"
+            except httpx.ReadTimeout:
+                if cancel is not None and cancel.is_set():
+                    cancelled = True
+                elif max_seconds is not None and time.perf_counter() - started >= max_seconds:
+                    timed_out = True  # the read timeout was the time left: a cut, not a dead pipe
+                else:
+                    raise
+        total = time.perf_counter() - started
+        if terminal is None and not timed_out and not cancelled:
+            errors.append({"error": "stream ended without done"})
         return {"http": 200, "answer": "".join(tokens), "meta": meta, "steps": steps, "errors": errors,
                 "reasoning_events": len(reasoning), "reasoning_chars": sum(len(x) for x in reasoning),
-                "seconds": round(time.perf_counter() - started, 1),
-                "ttft": round(first_token, 2) if first_token is not None else None}
+                "seconds": round(total, 1),
+                "ttft": round(first_token, 2) if first_token is not None else None,
+                "request_id": request_id, "timed_out": timed_out, "cancelled": cancelled, "terminal": terminal,
+                "bad_frames": bad_frames, "status_events": status_events,
+                "timing": timing(total if terminal == "done" and not timed_out and not cancelled else None)}
 
     def trace(self, trace_id: str) -> Optional[dict]:
         if not trace_id:
             return None
-        r = self.http.get(f"{self.base}/chat/trace/{trace_id}")
+        r = self.http.get(f"{self.base}/chat/trace/{trace_id}", **self._bounded())
         return r.json() if r.status_code == 200 else None
 
     def wait_job(self, ref: dict, limit_s: float = 1800) -> dict:
