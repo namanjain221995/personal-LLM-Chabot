@@ -210,6 +210,18 @@ def test_clock_skew_tests_are_expected_failures_only_against_a_remote_database(m
     assert mark.name == "xfail" and mark.kwargs["strict"] is False
 
 
+def test_every_clock_skew_entry_names_one_existing_test():
+    """An exact node id per entry: no whole files, no patterns, and no entry
+    left behind by a renamed test (which would then fail strictly again)."""
+    here = Path(__file__).parent
+    for nodeid in suite_setup.CLOCK_SKEW_SENSITIVE:
+        module, sep, name = nodeid.partition("::")
+        assert sep and module.endswith(".py") and "::" not in name, nodeid
+        assert name.startswith("test_") and name.isidentifier(), nodeid
+        source = (here / module).read_text(encoding="utf-8")
+        assert f"def {name}(" in source, f"{nodeid} names no test in {module}"
+
+
 def test_the_real_session_server_passes_and_a_foreign_database_on_it_is_refused(
     app_database, monkeypatch
 ):
