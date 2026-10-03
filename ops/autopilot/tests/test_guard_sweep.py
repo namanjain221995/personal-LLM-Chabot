@@ -5,12 +5,11 @@ Every case below is DATA: a string (or tool input) evaluated ONLY by
 guard.evaluate() through decide()/bash(). Nothing here is handed to a shell,
 run, pushed, or written to a real protected path. Credential-shaped values are
 built at run time from low-entropy parts so no literal secret is committed
-(gitleaks scans history). The symlink and push-path tests build their own
-temporary trees and patch the guard's lists to point at them.
+(gitleaks scans history). The symlink, pip-entry-point and push-path tests
+build their own temporary trees and patch the guard's lists to point at them.
 
-Run (from /home/techsphere/work/llm-p016):
-  /home/techsphere/work/llm-dev/orchestrator/.venv/bin/python -m pytest \
-      ops/autopilot/tests/test_guard_sweep.py -q -p no:cacheprovider
+Run from the worktree root:
+  <orchestrator-venv>/bin/python -m pytest ops/autopilot/tests -q -p no:cacheprovider
 """
 
 import json
@@ -145,6 +144,9 @@ ENCODING_ALLOW = [
     "PAGER=cat git log --oneline -3",
     "git -c user.email=bot@example.com commit -m x",
     "bash -c 'echo building'",
+    # inline-code prose: 'system' without a call paren is not analysed as shell
+    "python3 - <<'EOF'\nprint(\"the system's config lives in /etc\")\nEOF",
+    "python3 -c 'print(\"restart the system now\")'",
     "systemd-run --user --scope -p MemoryMax=2G python3 -c 'print(1)'",
     "echo \"$(git rev-parse --short HEAD)\"",
 ]
@@ -289,6 +291,9 @@ FS_ALLOW = [
     Bc("cat .env.example"),
     Bc("cat e2e/ci/ci.env"),
     Bc("git show HEAD:.env.example"),
+    Bc("git show HEAD:e2e/ci/ci.env"),                     # REV:path keeps the tracked-file exemption
+    Bc("git show main:e2e/ci/ci.env"),
+    Bc("git -C %s show HEAD:e2e/ci/ci.env" % DEV),
     Bc("ls -la .env ~/.ssh", cwd=PROD),
     Bc("git check-ignore -v .env"),
     Bc("grep -rn '\\.env' orchestrator/app"),              # pattern, not a file
@@ -457,6 +462,8 @@ MATCHER_DENY = [
     ("mcp__srv__delete_resource", {"id": 1}, None),
     ("SomeFutureShellTool", {"command": "sudo true"}, None),                         # unknown tool, runs a shell cmd
     ("SomeFutureFileTool", {"file_path": f"{PROD}/.env"}, None),                      # unknown tool, reads a secret
+    ("Grep", {"pattern": "KEY", "glob": "**/.env", "path": PROD}, None),             # Grep reads .env contents
+    ("Grep", {"pattern": "KEY", "glob": "*.pem", "path": PROD}, None),
 ]
 MATCHER_ALLOW = [
     ("Monitor", {"command": "tail -f /tmp/llmdev/dev.log", "description": "dev log", "timeout_ms": 60000}, DEV),
@@ -476,6 +483,11 @@ MATCHER_ALLOW = [
     ("mcp__linear__list_issues", {"team": "eng"}, None),
     ("NotebookRead", {"file_path": os.path.join(DEV, "nb.ipynb")}, DEV),
     ("SomeFutureTool", {"foo": "bar"}, None),                                         # unknown, no command/path/secret
+    # Glob only lists names (a returned path is re-checked when Read/Grep opens
+    # it), and .env.example is a public template.
+    ("Glob", {"pattern": "**/.env.example", "path": DEV}, DEV),
+    ("Glob", {"pattern": "**/*.env", "path": DEV}, DEV),
+    ("Grep", {"pattern": "DATABASE_URL", "glob": "*.env.example", "path": DEV}, DEV),  # a public template
 ]
 
 
@@ -725,6 +737,42 @@ class SymlinkedProtectedPaths(unittest.TestCase):
                 self.assertEqual(bad, [], "\n".join(bad))
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+
+class PipPolyglotEntryPoint(unittest.TestCase):
+    """A pip/distlib console-script entry point is a python program behind a
+    sh/python polyglot header; the guard reads it as python, not shell."""
+
+    POLYGLOT = (
+        "#!/bin/sh\n"
+        "'''exec' \"$(dirname \"$(readlink -f \"$0\")\")/python\" \"$0\" \"$@\"\n"
+        "' '''\n"
+        "# -*- coding: utf-8 -*-\n"
+        "import re, sys\n"
+        "from pip._internal.cli.main import main\n"
+        "if __name__ == '__main__':\n"
+        "    sys.exit(main())\n"
+    )
+
+    def test_entry_point_runs(self):
+        venv = tempfile.mkdtemp(prefix="llmdev-pwvenv-")
+        try:
+            binp = os.path.join(venv, "bin")
+            os.makedirs(binp)
+            for name in ("pip", "pytest"):
+                with open(os.path.join(binp, name), "w", encoding="utf-8") as fh:
+                    fh.write(self.POLYGLOT)
+                os.chmod(os.path.join(binp, name), 0o755)
+            bad = []
+            for cmd in (f"{binp}/pip install -r requirements-dev.txt",
+                        f"{binp}/pytest -q ops/autopilot/tests",
+                        f"{venv}/bin/pip list"):
+                ok, why = bash(cmd, cwd=DEV)
+                if not ok:
+                    bad.append(f"{cmd} -> {why}")
+            self.assertEqual(bad, [], "\n".join(bad))
+        finally:
+            shutil.rmtree(venv, ignore_errors=True)
 
 
 class MatcherTemplate(unittest.TestCase):

@@ -1705,11 +1705,17 @@ def check_interpreter(cmd, args, ctx):
 
 # Inline code that shells out: the string handed to os.system / subprocess /
 # execSync / perl-ruby system is analysed as a shell command.
+# A call with an open paren before the string (os.system("..."), execSync('...'),
+# perl/ruby system("...")). The '(' is mandatory so prose such as "the system's
+# config" is not read as a system() call and analysed as shell.
 _CODE_SHELL_STR = re.compile(
     r"(?:os\.system|os\.popen|subprocess\.(?:getoutput|getstatusoutput)|commands\.getoutput|"
-    r"(?:child_process\.)?execSync|execFileSync|spawnSync|\bsystem)\s*\(?\s*(['\"])(.*?)\1",
+    r"(?:child_process\.)?execSync|execFileSync|spawnSync|\bsystem)\s*\(\s*(['\"])(.*?)\1",
     re.S,
 )
+# perl/ruby `system "cmd"` / `system 'cmd'` without parentheses: whitespace
+# before the quote is required, so "system's" (apostrophe, no space) is prose.
+_CODE_SYSTEM_BARE = re.compile(r"\bsystem\s+(['\"])(.*?)\1", re.S)
 _CODE_SHELL_LIST = re.compile(r"subprocess\.\w+\(\s*\[([^\]]*)\]", re.S)
 _CODE_WRITE_OP = re.compile(
     r"open\([^)]*['\"]\s*,\s*['\"][wax+]|\.write_(text|bytes)|shutil\.(rmtree|move|copy\w*)|"
@@ -1748,6 +1754,8 @@ def check_code_text(code, ctx):
     joined = _join_string_concats(code)
     for m in _CODE_SHELL_STR.finditer(joined):
         analyze(m.group(2), ctx.child())
+    for m in _CODE_SYSTEM_BARE.finditer(joined):
+        analyze(m.group(2), ctx.child())
     for m in _CODE_SHELL_LIST.finditer(joined):
         items = re.findall(r"['\"]([^'\"]*)['\"]", m.group(1))
         if items:
@@ -1770,6 +1778,11 @@ def analyze_script_file(path, ctx, force=False):
         with open(p, "r", encoding="utf-8", errors="replace") as fh:
             text = fh.read()
     except OSError:
+        return
+    # A pip / distlib console-script entry point (pip, pytest, ...) is a Python
+    # program behind a sh/python polyglot header: `#!/bin/sh` then a line that
+    # starts with '''exec' re-execs python on it. It is python, not shell.
+    if re.match(r"#!\s*/bin/sh\b", text) and re.search(r"\n\s*'''exec'", text[:300]):
         return
     if text.startswith("#!") and not re.match(r"#!\s*/(usr/)?bin/(env\s+)?(ba|z|da|k)?sh\b", text):
         return
@@ -2197,10 +2210,14 @@ def check_git(args, ctx):
         for x in rest:
             if x.startswith("-"):
                 continue
-            for cand in {x, x.rsplit(":", 1)[-1]}:
-                p = expand_path(cand, gdir or ctx.cwd)
-                if p and is_secret_path(p):
-                    ctx.deny(f"'git {sub}' would print the contents of the secret file {cand}; secrets must never enter the transcript (§3.3)")
+            # A `REV:path` argument names committed content, so only the path
+            # after the last ':' is a candidate (the whole string is never a
+            # worktree file, and testing it would lose the tracked-file exemption
+            # for a tracked fixture such as e2e/ci/ci.env).
+            cand = x.rsplit(":", 1)[-1] if ":" in x else x
+            p = expand_path(cand, gdir or ctx.cwd)
+            if p and is_secret_path(p):
+                ctx.deny(f"'git {sub}' would print the contents of the secret file {cand}; secrets must never enter the transcript (§3.3)")
     for j, x in enumerate(rest):
         out = x.split("=", 1)[1] if x.startswith("--output=") else (rest[j + 1] if x == "--output" and j + 1 < len(rest) else None)
         if out is not None:
@@ -3263,10 +3280,16 @@ def check_file_tool(tool, ti, cwd):
                 p = expand_path(v, cwd)
                 if p and is_secret_path(p):
                     block(f"{TAG} {tool} {v} -> blocked: secret files must never enter the transcript (§3.3).")
-        g = ti.get("glob") if tool == "Grep" else (ti.get("pattern") if tool == "Glob" else "")
-        g = g or ""
-        if re.search(r"(^|[/*{,])\.env([.*}]|$)|credentials|secrets?\.env|id_(rsa|ed25519)|\.pem\b|\.key\b", g):
-            block(f"{TAG} {tool} glob={g} -> blocked: searching inside secret files is not allowed (§3.3).")
+        # Grep searches INSIDE the files a glob selects, so a glob that reaches a
+        # secret file would print its contents. Glob only LISTS names (a path it
+        # returns is re-checked when Read/Grep opens it), and .env.example is a
+        # public template, so the Glob tool is not subject to this block.
+        if tool == "Grep":
+            g = ti.get("glob") or ""
+            # Exempt the public example/sample/template/dist variants of .env.
+            if re.search(r"(^|[/*{,])\.env(\.(example|sample|template|dist)\b|[.*}]|$)|credentials|secrets?\.env|id_(rsa|ed25519)|\.pem\b|\.key\b", g) \
+                    and not re.search(r"\.env\.(example|sample|template|dist)\b", g):
+                block(f"{TAG} {tool} glob={g} -> blocked: searching inside secret files is not allowed (§3.3).")
 
 
 # Tools whose input runs a shell command, analysed exactly like Bash. Monitor
