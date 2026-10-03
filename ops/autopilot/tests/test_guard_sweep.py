@@ -235,13 +235,33 @@ FS_DENY = [
     Bc("grep -rn KEY /home"),                              # an ancestor of $HOME
     Bc(f"rg --hidden --no-ignore -n PASSWORD {PROD}"),     # rg recurses by default
     Bc(f"grep -d recurse -n PASSWORD {PROD}"),             # -d recurse is recursive
+    # recursive search with NO path operand: the working directory is the root
+    Bc("grep -rn DATABASE_URL", cwd=PROD),
+    Bc(f"cd {PROD} && grep -rn PASSWORD"),
+    Bc("rg -uu TOKEN", cwd=PROD),                          # rg always recurses; -uu reads ignored files
+    Bc("ag API_KEY", cwd=PROD),                            # the silver searcher recurses by default
+    Bc("grep -rn API_KEY", cwd=HOME),
+    Bc("git grep --no-index -n PASSWORD", cwd=PROD),       # searches untracked/ignored files in the cwd
+    Bc("git grep --untracked -n TOKEN", cwd=PROD),
+    Bc("grep -rn X --include=*.env .", cwd=PROD),          # an include that CAN match a secret basename
+    Bc("rg -g '*.pem' KEY", cwd=PROD),                     # a glob that matches a secret basename
     # P0-17: writing a guard file through a DIRECTORY destination or a hard link
     Bc("cp /tmp/llmdev/test-db.vars ~/.llm-autopilot/agent/"),
     Bc("cp -t ~/.llm-autopilot/agent /tmp/llmdev/test-db.vars"),
     Bc("tar -xf /tmp/llmdev/x.tar -C ~/.llm-autopilot/agent"),
+    Bc("tar -C ~/.llm-autopilot/agent -xf /tmp/llmdev/x.tar"),      # -C before the extract flag
+    Bc("tar xf /tmp/llmdev/x.tar -C ~/.llm-autopilot/agent"),       # classic no-dash form
+    Bc("tar --directory=/home/techsphere/.llm-autopilot/agent --extract -f /tmp/llmdev/x.tar"),
     Bc("ln -sf /tmp/llmdev/test-db.vars ~/.llm-autopilot/agent/"),
     Bc("ln ~/.llm-autopilot/guard/guard_hook.py ~/work/llm-dev/.g"),
     Bc("cp -l ~/.llm-autopilot/agent/test-db.vars /tmp/llmdev/t"),
+    Bc("link ~/.llm-autopilot/agent/test-db.vars ~/work/llm-dev/tdv"),  # the `link` command makes a hard link
+    # P0-17: a CONTENTS copy lands the source's own entries in the guard dir
+    Bc("rsync -a /tmp/llmdev-stage/ ~/.llm-autopilot/agent/"),
+    Bc("cp -rT /tmp/llmdev-stage ~/.llm-autopilot/agent"),
+    Bc("cp -r /tmp/llmdev-stage/. ~/.llm-autopilot/agent/"),
+    Bc("cp /tmp/llmdev-stage/* ~/.llm-autopilot/agent/"),
+    Bc("rsync -a /tmp/llmdev-stage/ ~/.llm-autopilot/bin/"),
     R(".env", cwd=PROD),
     R("$HOME/.config/gh/hosts.yml"),
     R(f"{PROD}/./.runtime//secrets.env"),
@@ -276,8 +296,18 @@ FS_ALLOW = [
     Bc("grep -rn TODO orchestrator/app"),                  # recursive, but no secrets in the subtree
     Bc("rg -n stream_chat orchestrator"),                  # recursive by default, worktree subtree
     Bc("grep -rn X ~/.llm-autopilot/agent/private"),       # the agent sandbox holds no secret
+    Bc("grep -rn TODO orchestrator", cwd=PROD),            # a subtree of prod that holds no secret
+    Bc("grep -rn X --include=*.py .", cwd=PROD),           # scoped to .py: cannot match a secret basename
+    Bc("grep -rn X --include='*.py' --include='*.md'", cwd=PROD),  # pathless, but scoped off secrets
+    Bc("rg -g '*.py' TODO", cwd=PROD),                     # rg glob scoped to source files
+    Bc("rg -t py stream_chat", cwd=PROD),                  # a named rg file type, no secrets
+    Bc("rg --iglob '!*.env' -g '*.rs' KEY", cwd=PROD),     # a positive glob that cannot match a secret
     Bc("cp /tmp/llmdev/a.txt ~/.llm-autopilot/agent/private/"),
     Bc("tar -xf /tmp/llmdev/x.tar -C ~/.llm-autopilot/agent/private"),
+    Bc("cp -a /tmp/llmdev-stage ~/.llm-autopilot/agent/"),          # STAGE becomes agent/stage, not a guard file
+    Bc("rsync -a /tmp/llmdev-stage/ ~/.llm-autopilot/agent/private/"),  # contents into the sandbox
+    Bc("cp -rT /tmp/llmdev-stage ~/.llm-autopilot/agent/private/scratch"),
+    Bc("tar -xzf /tmp/llmdev/x.tgz -C /tmp/llmdev-build"),
     Bc("cp /tmp/llmdev/a.txt /tmp/llmdev/b.txt"),
     Bc("ln -s /tmp/llmdev/a /tmp/llmdev/b"),               # symlink to a non-guard path
     R(f"{DEV}/.env.example"),

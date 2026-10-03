@@ -1786,7 +1786,56 @@ SECRET_GLOB = re.compile(r"(^|/)(\.env([.*?\[]|$)|secrets?([.*?\[]|$)|\.runtime/
 GREP_FAMILY = {"grep", "egrep", "fgrep", "rg", "ag"}
 GREP_VALUE_OPTS = {"-e", "--regexp", "-f", "--file", "-m", "--max-count", "-A", "-B", "-C", "--context",
                    "--before-context", "--after-context", "-d", "--max-depth", "--include", "--exclude",
-                   "--exclude-dir", "--include-dir", "-g", "--glob", "--color", "--colour", "--colors"}
+                   "--exclude-dir", "--include-dir", "-g", "--glob", "--iglob", "-t", "--type", "-T",
+                   "--type-not", "--color", "--colour", "--colors"}
+# Secret basenames a recursive search could print. A scoping glob (grep
+# --include, rg -g/--iglob) or a named file type (rg -t) is trusted to keep a
+# search out of secrets only when none of these could match it.
+SECRET_SAMPLES = (".env", ".env.local", ".env.production", "secrets.env", "app.env", "secrets.yaml",
+                  "secrets.yml", "secrets.json", "secrets.toml", "credentials.json", ".credentials.json",
+                  "id_rsa", "id_ed25519", "server.pem", "tls.key", "store.p12", "vault.pfx", ".netrc",
+                  ".pgpass", ".git-credentials", ".npmrc", ".pypirc", "Training_Module_Feature_Map_and_Memory.txt")
+
+
+def _glob_can_match_secret(glob):
+    """True when a positive include glob could select a secret basename (so a
+    recursive search restricted to it could still print a secret)."""
+    import fnmatch
+    g = glob.strip()
+    if not g or g.startswith("!"):  # empty or a negated (exclude) glob: not a positive include
+        return False
+    base = g.rsplit("/", 1)[-1] or g
+    return any(fnmatch.fnmatch(s, base) for s in SECRET_SAMPLES)
+
+
+def _search_scoped_off_secrets(cmd, args):
+    """True when include globs / file types restrict the search to names that
+    cannot match a secret basename (so even a recursive search under a tree with
+    secrets reads none). False when there is no such restriction (fail-closed)."""
+    globs, types, i = [], [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--include", "-g", "--glob", "--iglob") and i + 1 < len(args):
+            globs.append(args[i + 1]); i += 2; continue
+        if a.startswith(("--include=", "--glob=", "--iglob=")):
+            globs.append(a.split("=", 1)[1]); i += 1; continue
+        if a.startswith("-g") and not a.startswith("--") and len(a) > 2:
+            globs.append(a[2:]); i += 1; continue
+        if a in ("-t", "--type") and i + 1 < len(args):
+            types.append(args[i + 1]); i += 2; continue
+        if a.startswith("--type="):
+            types.append(a.split("=", 1)[1]); i += 1; continue
+        if a.startswith("-t") and not a.startswith("--") and len(a) > 2:
+            types.append(a[2:]); i += 1; continue
+        i += 1
+    positives = [g for g in globs if g.strip() and not g.strip().startswith("!")]
+    if not positives and not types:
+        return False
+    if any(_glob_can_match_secret(g) for g in positives):
+        return False
+    # A named rg file type (letters/digits only) maps to source-file globs; none
+    # of the built-in types selects a dotfile such as .env. An odd value is not trusted.
+    return all(re.fullmatch(r"[A-Za-z0-9_+-]+", t) for t in types)
 
 
 def _looks_secret(val, cwd):
@@ -1858,7 +1907,9 @@ def check_grep_reads(cmd, args, ctx):
     """grep/rg/ag: the first positional is the PATTERN (not a file); the rest are
     paths. Reject reading a secret file, and reject a RECURSIVE search rooted at a
     tree that holds untracked secrets (the production checkout, $HOME, ~/.config,
-    the autopilot home, a secret directory)."""
+    the autopilot home, a secret directory). With NO path operand a recursive
+    search covers the cwd (rg/ag always recurse), so check the cwd too. An
+    --include / -g / -t that cannot match a secret basename scopes it off secrets."""
     recursive = cmd in ("rg", "ag")  # ripgrep and the silver searcher recurse by default
     pat_from_opt = any(a in ("-e", "--regexp", "-f", "--file") or a.startswith(("-e", "--regexp=", "-f", "--file=")) for a in args)
     for idx, a in enumerate(args):
@@ -1882,11 +1933,14 @@ def check_grep_reads(cmd, args, ctx):
         positionals.append(a)
         i += 1
     files = positionals if pat_from_opt else positionals[1:]  # drop the pattern
+    scoped = _search_scoped_off_secrets(cmd, args)
     for val in files:
         if _looks_secret(val, ctx.cwd):
             ctx.deny(f"reads a secret file ({val}); secrets must never enter the transcript, logs or commits (§3.3)")
-        if recursive and recursive_secret_root(expand_path(val, ctx.cwd)):
-            ctx.deny(f"a recursive search rooted at {val} would read the untracked .env / .runtime / credential files under it; scope the search to a subdirectory that holds no secrets (§3.3)")
+        if recursive and not scoped and recursive_secret_root(expand_path(val, ctx.cwd)):
+            ctx.deny(f"a recursive search rooted at {val} would read the untracked .env / .runtime / credential files under it; scope the search to a subdirectory that holds no secrets, or restrict it with --include/-g/-t to names that are not secrets (§3.3)")
+    if not files and recursive and not scoped and recursive_secret_root(_real(ctx.cwd or HOME)):
+        ctx.deny(f"a recursive search with no path searches the working directory {ctx.cwd}, which would read the untracked .env / .runtime / credential files under it; search a subdirectory that holds no secrets, or restrict it with --include/-g/-t to names that are not secrets (§3.3)")
 
 
 WRITE_ALL_ARGS = {"rm", "rmdir", "unlink", "shred", "truncate", "touch", "mkdir", "mv", "tee", "setfacl", "mkfifo", "srm"}
@@ -1895,7 +1949,29 @@ WRITE_LAST_ARG = {"cp", "install", "rsync", "scp", "ln"}
 DESTRUCTIVE = {"rm", "rmdir", "unlink", "shred", "truncate", "mv", "chmod", "chown", "chgrp", "dd", "ln", "cp", "rsync", "tee", "find"}
 
 
-LINK_OR_COPY = {"cp", "mv", "install", "ln", "rsync"}
+LINK_OR_COPY = {"cp", "mv", "install", "ln", "rsync", "link"}
+
+
+def _tar_extract_info(args):
+    """(is_extraction, change-directory) for a tar command, reading -x/--extract/
+    --get and the bundled 'x' flag, and -C/--directory, from ANY argument."""
+    extract, cdir, i = False, None, 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--extract", "--get"):
+            extract = True
+        elif a == "--directory" and i + 1 < len(args):
+            cdir = args[i + 1]; i += 1
+        elif a.startswith("--directory="):
+            cdir = a.split("=", 1)[1]
+        elif a == "-C" and i + 1 < len(args):
+            cdir = args[i + 1]; i += 1
+        elif a.startswith("-C") and len(a) > 2 and not a.startswith("--"):
+            cdir = a[2:]
+        elif not a.startswith("--") and "x" in a.lstrip("-") and (a.startswith("-") or i == 0):
+            extract = True  # -x, -xzf, or the classic no-dash first word 'xf'
+        i += 1
+    return extract, cdir
 
 
 def check_copy_link_targets(cmd, args, ctx):
@@ -1907,7 +1983,8 @@ def check_copy_link_targets(cmd, args, ctx):
       - A HARD link (ln without -s, cp -l, rsync --link-dest) to a guard or secret
         file shares its inode, so later edits through the link change the original."""
     na = nonopt(args)
-    hard = (cmd == "ln" and not any(a in ("-s", "--symbolic") or (a.startswith("-") and not a.startswith("--") and "s" in a[1:]) for a in args)) \
+    hard = cmd == "link" \
+        or (cmd == "ln" and not any(a in ("-s", "--symbolic") or (a.startswith("-") and not a.startswith("--") and "s" in a[1:]) for a in args)) \
         or (cmd == "cp" and any(a in ("-l", "--link") or (a.startswith("-") and not a.startswith("--") and "l" in a[1:]) for a in args)) \
         or (cmd == "rsync" and any(a.startswith("--link-dest") for a in args))
     tdir = None
@@ -1933,9 +2010,20 @@ def check_copy_link_targets(cmd, args, ctx):
     dp = expand_path(dest, ctx.cwd)
     if dp is None:
         return
+    # A CONTENTS copy writes the source directory's own entries into the
+    # destination (dest/<name>), not a single dest/<basename-of-src>: an rsync
+    # trailing-slash source, cp -T/--no-target-directory, a 'src/.' source, or a
+    # glob source. The guard cannot enumerate the incoming names, so if the
+    # destination is or holds a guard file it refuses the whole copy (P0-17).
+    no_target_dir = any(a in ("-T", "--no-target-directory") or (a.startswith("-") and not a.startswith("--") and "T" in a[1:]) for a in args) and cmd in ("cp", "mv", "install")
+    contents_copy = no_target_dir \
+        or (cmd == "rsync" and any(s.endswith("/") for s in sources)) \
+        or any(s.rstrip("/").endswith("/.") or re.search(r"[*?\[]", s) for s in sources)
+    if contents_copy and (is_guard_path(dp) or holds_guard_file(dp)):
+        ctx.deny("copying a directory's contents into a directory that holds the autopilot's guard files would overwrite guard/, bin/, agent/test-db.vars or the CI approvals and disable the guardrails (§3.3/P0-17); operate only on files the autopilot created")
     if tdir is not None or dest.endswith("/") or os.path.isdir(dp):
         for s in sources:
-            cand = os.path.join(dp, os.path.basename(s.rstrip("/")))
+            cand = os.path.join(dp, os.path.basename(s.rstrip("/")) or ".")
             if is_guard_path(cand) or holds_guard_file(cand):
                 ctx.deny("writing into a directory that holds the autopilot's guard files would overwrite guard/, bin/, agent/test-db.vars or the CI approvals and disable the guardrails (§3.3/P0-17); operate only on files the autopilot created")
             if is_secret_path(cand):
@@ -1969,12 +2057,9 @@ def check_write_targets(cmd, args, ctx):
         targets = [a[3:] for a in args if a.startswith("of=")]
     elif cmd in ("sed", "perl") and any(a == "-i" or a.startswith("-i") or a.startswith("--in-place") or a == "-pi" for a in args):
         targets = nonopt(args)[1:]
-    elif cmd == "tar" and args and re.search(r"x", args[0].lstrip("-")):
-        if "-C" in args:
-            i = args.index("-C")
-            targets = args[i + 1 : i + 2]
-        else:
-            targets = ["."]
+    elif cmd == "tar" and _tar_extract_info(args)[0]:
+        cdir = _tar_extract_info(args)[1]
+        targets = [cdir] if cdir else ["."]
     elif cmd == "unzip":
         targets = [args[args.index("-d") + 1]] if "-d" in args and args.index("-d") + 1 < len(args) else ["."]
     elif cmd in ("curl", "wget"):
@@ -2004,7 +2089,7 @@ def check_write_targets(cmd, args, ctx):
         or (cmd == "rsync" and any(a.startswith("--delete") or a == "--remove-source-files" for a in args))
     # Extracting an archive into a directory that holds a guard file can overwrite
     # it (P0-17), just like a copy into that directory.
-    extract = (cmd == "tar" and args and re.search(r"x", args[0].lstrip("-"))) or cmd == "unzip"
+    extract = (cmd == "tar" and _tar_extract_info(args)[0]) or cmd == "unzip"
     for t in targets:
         if move_or_delete and re.search(r"[*?\[{]", t):
             gp = _glob_parent(t, ctx.cwd)
@@ -2092,6 +2177,20 @@ def check_git(args, ctx):
         ctx.deny(f"'git {sub}' talks to remotes without git push's checks; push one named branch with git push origin <branch>")
     if sub == "grep" and any(x.startswith(("-O", "--open-files-in-pager")) for x in rest):
         ctx.deny("git grep -O runs a program on the matches; print them instead")
+    if sub == "grep" and any(x in ("--no-index", "--untracked") for x in rest):
+        # git grep --no-index / --untracked searches untracked (and, with
+        # --no-index, ignored) files under the pathspec roots, or the cwd when
+        # none is given, so it can print a secret file just like grep -r.
+        # Only args after '--' are pathspecs; without one, the lone positional is
+        # the PATTERN and the search covers the whole working directory.
+        pathspecs = rest[rest.index("--") + 1 :] if "--" in rest else []
+        roots = pathspecs or [ctx.cwd or HOME]
+        for val in roots:
+            p = expand_path(val, gdir or ctx.cwd)
+            if p and is_secret_path(p):
+                ctx.deny(f"reads a secret file ({val}); secrets must never enter the transcript (§3.3)")
+            if recursive_secret_root(p if pathspecs else _real(gdir or ctx.cwd or HOME)):
+                ctx.deny(f"'git grep {'--untracked' if '--untracked' in rest else '--no-index'}' would read the untracked .env / .runtime / credential files under {val}; search a subdirectory that holds no secrets (§3.3)")
     if sub in GIT_READ_FILE_SUBS:
         # git show HEAD:.env, git cat-file -p HEAD:.env, git log -p -- .runtime/secrets.env,
         # git diff --no-index /dev/null .env: all print a secret file's contents.
