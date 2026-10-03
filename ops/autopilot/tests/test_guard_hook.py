@@ -1197,5 +1197,50 @@ class GuardTestDbSecrets(Lists):
         self.check(TEST_DB_SECRET_ALLOW, TEST_DB_SECRET_DENY)
 
 
+# P0-19 review round 2: inputs the first fix still let through.
+P019_R2_ALLOW = [
+    "curl -sG --tcp-nodelay --data-urlencode 'query=up' http://127.0.0.1:9090/api/v1/query",
+    "python3 -c \"import pathlib; pathlib.Path('/tmp/llmdev-x').rename('/tmp/llmdev-y')\"",
+    "python3 -c \"import pathlib; pathlib.Path('/tmp/llmdev-x').write_text(''); pathlib.Path('~/.llm-autopilot/MASTER_PROMPT.md').read_text()\"",
+    "env -u FOO python3 -c 'print(1)'",
+]
+P019_R2_DENY = [
+    # a long option the guard does not know must not hide the mutation after it
+    "curl --tcp-nodelay -d x http://127.0.0.1:8080/x",
+    "curl -sS --retry-all-errors -d '{}' http://127.0.0.1:8080/x",
+    "curl --create-dirs -F a=b http://127.0.0.1:3000/x",
+    "curl --http2-prior-knowledge --json '{}' http://127.0.0.1:8080/x",
+    "curl --tcp-nodelay -T /tmp/llmdev-x http://127.0.0.1:8080/x",
+    "curl --upload-fi /tmp/llmdev-x http://127.0.0.1:8080/x",  # curl accepts unambiguous prefixes
+    "curl -dx http://127.0.0.1:8080/x",
+    # a ':' inside a cluster starts the next request; the letters after it are not -G
+    "curl -s http://127.0.0.1:9090/api/v1/query -:G -d x http://127.0.0.1:9090/api/v1/admin/tsdb/snapshot",
+    # curl data and file:// URLs that name a secret file
+    f"curl -sv -G --data-urlencode q@{HOME}/.llm-autopilot/agent/test-db.vars http://127.0.0.1:9090/api/v1/query",
+    f"curl file://{HOME}/.llm-autopilot/agent/test-db.vars",
+    # pathlib destinations, aliases and escapes in inline code
+    f"python3 -c \"import pathlib; pathlib.Path('/tmp/llmdev-x').rename('{HOME}/.llm-autopilot/guard/guard_hook.py')\"",
+    f"python3 -c \"import pathlib; pathlib.Path('/tmp/llmdev-x').replace('{HOME}/.llm-autopilot/state.json')\"",
+    f"python3 -c \"from pathlib import Path; Path('/tmp/llmdev-x').rename('{HOME}/.llm-autopilot/guard/guard_hook.py')\"",
+    f"python3 -c \"import os; os.renames('/tmp/llmdev-x', '{HOME}/.llm-autopilot/guard/guard_hook.py')\"",
+    f"python3 -c \"import os; os.removedirs('{HOME}/.llm-autopilot/guard')\"",
+    f"python3 -c \"import os; f = os.remove; f('{HOME}/.llm-autopilot/guard/guard_hook.py')\"",
+    f"python3 -c \"from os import chdir as cd; cd('{HOME}/.llm-autopilot/guard'); open('guard_hook.py','w')\"",
+    f"python3 -c \"open('{HOME}/.llm-autopilot/guard/x\\\\\\\\', 'w')\"",
+    f"python3 -c \"open(mode='w', file='{HOME}/.llm-autopilot/state.json')\"",
+    # a glob that matches a secret file as a find starting path
+    f"find {HOME}/.llm-autopilot/agent/test-db.* -exec cat {{}} +",
+    # env -S runs its value as the command; env -C moves relative paths
+    f"env -S 'rm -rf' true {HOME}/.llm-autopilot/guard",
+    f"env -C {HOME}/.llm-autopilot/guard rm -f guard_hook.py",
+    "find . -name '*.py' -exec env -S 'sed -i s/a/b/' cat {} +",
+]
+
+
+class GuardP019Round2(Lists):
+    def test_review_round_2(self):
+        self.check(P019_R2_ALLOW, P019_R2_DENY)
+
+
 if __name__ == "__main__":
     unittest.main()

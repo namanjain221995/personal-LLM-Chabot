@@ -879,7 +879,12 @@ def strip_prefix(words):
                 if not rest[0].startswith("-"):
                     k, v = rest[0].split("=", 1)
                     env[k] = v
-                elif rest[0] in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string") and len(rest) > 1:
+                elif re.fullmatch(r"-[^-]*[SC].*|--(split-string|chdir)(=.*)?|--s(p(l(i(t(-(s(t(r(i(ng?)?)?)?)?)?)?)?)?)?)?|--ch(d(ir?)?)?", rest[0]):
+                    # -S/--split-string makes its value the command that runs and
+                    # -C/--chdir moves where relative paths land; neither can be
+                    # reviewed from these words (fail-closed).
+                    block(f"{TAG} env {rest[0]} -> blocked: env -S/--split-string and -C/--chdir hide the command or its directory from review; write the command and its paths directly")
+                elif rest[0] in ("-u", "--unset") and len(rest) > 1:
                     rest = rest[1:]
                 rest = rest[1:]
             if not rest:
@@ -1612,70 +1617,88 @@ _CURL_MUTATING_METHOD = re.compile(r"(^|\s)(-X|--request|--method)\s*=?\s*(POST|
 # the `G` in `-oG` is a file name, not --get.
 _CURL_SHORT_WITH_VALUE = set("AbcCdDeEFHKmoPQrtTuUwxXyYz")
 # Long options known to take no value. Any other long option written without
-# `=` is assumed to consume the next word, so a `-G` right after it is that
-# option's value, not --get (fail-closed: the request then counts as a POST).
+# `=` is assumed to consume the next word, so a `-G` right after it may be that
+# option's value and does not count as --get.
 _CURL_LONG_NO_VALUE = {"--get", "--silent", "--show-error", "--fail", "--fail-with-body", "--fail-early", "--location",
                        "--location-trusted", "--insecure", "--compressed", "--verbose", "--include", "--head",
                        "--globoff", "--no-progress-meter", "--no-buffer", "--no-keepalive", "--progress-bar",
                        "--http1.0", "--http1.1", "--http2", "--ipv4", "--ipv6", "--raw", "--path-as-is"}
 _CURL_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+_CURL_BODY_LONG = ("--data", "--data-ascii", "--data-binary", "--data-raw", "--data-urlencode")
+_CURL_UPLOAD_LONG = ("--json", "--form", "--form-string", "--upload-file", "--config")
+
+
+def _curl_long_kind(name):
+    """'body', 'upload' or 'method' for a long option, or None. curl accepts any
+    unambiguous prefix (--upload-fi, --jso, --dat), so a prefix of a mutating
+    option counts as that option (fail-closed)."""
+    if len(name) < 3:
+        return None
+    if name.startswith("--data") or any(full.startswith(name) for full in _CURL_BODY_LONG):
+        return "body"
+    if name.startswith("--form") or any(full.startswith(name) for full in _CURL_UPLOAD_LONG):
+        return "upload"
+    if len(name) >= 4 and "--request".startswith(name):
+        return "method"
+    return None
 
 
 def _curl_requests(args):
-    """Split curl's words into its requests: --next / -: start a new request with
-    fresh options. For each request return a dict: get (-G/--get seen), body
-    (-d/--data* seen), upload (-T/--upload-file, -F/--form*, --json, or a
-    -K/--config file whose options the guard cannot see) and methods (-X /
-    --request values)."""
-    reqs, i, n = [], 0, len(args)
-
+    """Split curl's words into its requests (--next, -: and a ':' inside a short
+    cluster start a new one with fresh options) and return, per request, a dict:
+    get (-G/--get definitely given), body (-d/--data*), upload (-T, -F/--form*,
+    --json, a -K/--config file the guard cannot read) and methods (-X/--request
+    values). Mutations are read from EVERY word, even one that may be another
+    option's value, so a misjudged value never hides a -d, -T, -F or -X
+    (fail-closed); only -G needs the value-aware reading, and a -G that may be a
+    value, or that follows a ':' in its cluster (curl ignores the rest of such a
+    cluster), never counts."""
     def fresh():
         return {"get": False, "body": False, "upload": False, "methods": []}
 
-    cur = fresh()
-
-    def option(name, val):
-        if name in ("-G", "--get"):
-            cur["get"] = True
-        elif name in ("-d",) or re.fullmatch(r"--data[\w-]*", name):
-            cur["body"] = True
-        elif name in ("-T", "-F", "-K", "--upload-file", "--json", "--config") or name.startswith("--form"):
-            cur["upload"] = True
-        elif name in ("-X", "--request", "--method"):
-            cur["methods"].append(val)
-
-    while i < n:
-        a = args[i]
-        if a in ("--next", "-:"):
-            reqs.append(cur)
-            cur = fresh()
-        elif a == "--":
-            break  # the rest are URLs
+    reqs, n, consumed, after_dashdash = [fresh()], len(args), False, False
+    for i, a in enumerate(args):
+        maybe_value, consumed = consumed, False
+        cur = reqs[-1]
+        if after_dashdash:
+            continue  # only URLs follow `--`
+        if a == "--" and not maybe_value:
+            after_dashdash = True
+        elif a in ("--next", "-:"):
+            reqs.append(fresh())
         elif a.startswith("--"):
             name, eq, val = a.partition("=")
+            kind = _curl_long_kind(name)
+            if kind == "body":
+                cur["body"] = True
+            elif kind == "upload":
+                cur["upload"] = True
+            elif kind == "method":
+                cur["methods"].append(val if eq else (args[i + 1] if i + 1 < n else ""))
+            if name == "--get" and not maybe_value:
+                cur["get"] = True
             if not eq and name not in _CURL_LONG_NO_VALUE and not name.startswith("--no-"):
-                val = args[i + 1] if i + 1 < n else ""
-                i += 1
-            option(name, val)
+                consumed = True
         elif a.startswith("-") and len(a) > 1:
-            j = 1
-            while j < len(a):
+            no_get = maybe_value
+            for j in range(1, len(a)):
                 c = a[j]
-                if c == ":":  # -: inside a cluster also starts the next request
-                    reqs.append(cur)
-                    cur = fresh()
-                elif c in _CURL_SHORT_WITH_VALUE:
+                if c == ":":
+                    reqs.append(fresh())
+                    cur, no_get = reqs[-1], True
+                    continue
+                if c == "G" and not no_get:
+                    cur["get"] = True
+                elif c == "d":
+                    cur["body"] = True
+                elif c in "TFK":
+                    cur["upload"] = True
+                if c in _CURL_SHORT_WITH_VALUE:
                     val = a[j + 1:]
-                    if not val:
-                        val = args[i + 1] if i + 1 < n else ""
-                        i += 1
-                    option("-" + c, val)
+                    if c == "X":
+                        cur["methods"].append(val or (args[i + 1] if i + 1 < n else ""))
+                    consumed = not val
                     break
-                else:
-                    option("-" + c, "")
-                j += 1
-        i += 1
-    reqs.append(cur)
     return reqs
 
 
@@ -1686,8 +1709,9 @@ def curl_request_mutates(cmd, args):
     command line (--next / -: start a new one with fresh options) is judged on
     its own, and any mutating one counts: an explicit method other than
     GET/HEAD/OPTIONS, an upload (-T, -F/--form, --json), a -K/--config file the
-    guard cannot read, or -d/--data* without -G. Any secret file named by a
-    -d @file / -T file argument is refused separately by check_secret_args."""
+    guard cannot read, or -d/--data* without a definite -G. Secret files named
+    by -d @file, --data-urlencode name@file, -F name=@file/<file, -T file or a
+    file:// URL are refused separately by check_secret_args."""
     text = " " + " ".join(args)
     if _CURL_MUTATING_METHOD.search(text):
         return True
@@ -1739,7 +1763,7 @@ def check_production_reach(cmd, args, ctx):
             if url == UNCERTAIN:
                 ctx.deny("TEST_DATABASE_URL is set conditionally or computed earlier in this command, so the guard cannot tell which database the tests would truncate; set it unconditionally (export TEST_DATABASE_URL=...; ...), in the same && chain, or inline in front of pytest")
             if not url:
-                ctx.deny(f"orchestrator tests TRUNCATE every table; pass TEST_DATABASE_URL (and TEST_DATABASE_ALLOWED_HOSTS) for the autopilot's dedicated test database inline; the URL is in {TEST_DB.get('url_file', '~/.llm-autopilot/agent/test-db.url')}")
+                ctx.deny(f"orchestrator tests TRUNCATE every table; pass TEST_DATABASE_URL (and TEST_DATABASE_ALLOWED_HOSTS) for the autopilot's dedicated test database inline; the runner exports both into every cycle (the file that holds them is secret)")
             m = re.match(r"^postgres(?:ql)?(?:\+\w+)?://(?:[^@/]*@)?(\[[^\]]+\]|[^:/?]+)(?::(\d+))?/([^?\s]+)", url)
             host, port, dbname = (m.group(1).lower(), m.group(2) or "5432", m.group(3)) if m else (None, None, "")
             want = (str(TEST_DB.get("host", "")).lower(), str(TEST_DB.get("port", "")))
@@ -2013,28 +2037,38 @@ _CODE_SHELL_LIST = re.compile(r"subprocess\.\w+\(\s*\[([^\]]*)\]", re.S)
 # protected path is (P0-19 false positive).
 _CODE_WRITE_CALL = re.compile(
     r"\bopen\s*\(|"
-    r"(?:shutil\.(?:rmtree|move|copy\w*)|os\.(?:remove|unlink|rename|replace|rmdir|makedirs|mkdir)|"
-    r"\bwriteFileSync|\brmSync|\bunlinkSync|\brenameSync)\s*\(|"
+    r"(?:shutil\.(?:rmtree|move|copy\w*)|os\.(?:remove|unlink|rename|renames|replace|rmdir|removedirs|makedirs|mkdir|truncate)|"
+    r"\bwriteFileSync|\bappendFileSync|\bcopyFileSync|\bcpSync|\brmSync|\bunlinkSync|\brenameSync|"
+    r"\bfs\.(?:promises\.)?(?:writeFile|appendFile|copyFile|cp|rm|unlink|rename))\s*\(|"
     r"(?:pathlib\.)?Path\s*\("
 )
 # Operations whose destination follows the source: every argument is a target.
-_CODE_TWO_PATH_OP = re.compile(r"shutil\.(?:move|copy\w*)|os\.(?:rename|replace)|renameSync")
-# Calls that change which file a later path reaches: after a chdir a relative
-# 'guard_hook.py' lands inside the new directory, and a symlink or hard link
-# makes a harmless-looking literal name a protected file. With a protected root
-# anywhere in the code, either one is refused (fail-closed).
+_CODE_TWO_PATH_OP = re.compile(r"shutil\.(?:move|copy\w*)|os\.(?:rename|renames|replace)|renameSync|copyFileSync|cpSync|"
+                               r"fs\.(?:promises\.)?(?:copyFile|cp|rename)\b")
+# Code that changes which file a later path reaches, or calls a write/delete
+# function under another name: after a chdir a relative 'guard_hook.py' lands
+# inside the new directory, a symlink or hard link makes a harmless-looking
+# literal name a protected file, and `f = os.remove` / `from os import remove`
+# / `import shutil as sh` hide the call head. With a protected root anywhere in
+# the code, any of these is refused (fail-closed).
 _CODE_PATH_INDIRECTION = re.compile(
-    r"\b(?:os\.)?f?chdir\s*\(|\bDir\.chdir\b|\b(?:os\.)?(?:sym)?link\s*\(|\b(?:sym)?linkSync\s*\(|"
-    r"\.\s*(?:symlink_to|hardlink_to|link_to)\s*\("
+    r"\bf?chdir\b|\b(?:os\.)?(?:sym)?link\s*\(|\b(?:sym)?linkSync\s*\(|"
+    r"\.\s*(?:symlink_to|hardlink_to|link_to)\s*\(|"
+    r"\b(?:os\.(?:remove|unlink|rename|renames|replace|rmdir|removedirs|makedirs|mkdir|truncate)|"
+    r"shutil\.(?:rmtree|move|copy\w*))\b(?!\s*\()|"
+    r"\bfrom\s+(?:os|shutil)\s+import\b|\bimport\s+(?:os|shutil)\s+as\b"
 )
 # A read-only open() mode: a literal made only of r, b and t.
 _OPEN_READ_MODE = re.compile(r"[rRbBuU]?(['\"])[rbt]*\1")
 # A target that is exactly one plain string literal: no f-string, no
-# concatenation, no format braces, no variable.
-_LITERAL_TARGET = re.compile(r"\s*[rRbBuU]?(['\"])[^'\"{}]*\1\s*")
-# A write/delete method applied to a Path(...) object anywhere later in the
-# code (Path(a).expanduser().write_text(...), (Path(a) / 'b').unlink()).
-_PATH_WRITE_METHOD = re.compile(r"\.\s*(?:write_text|write_bytes|unlink|rename|replace|rmdir|mkdir|touch)\s*\(")
+# concatenation, no format braces, no escapes, no variable.
+_LITERAL_TARGET = re.compile(r"\s*[rRbBuU]?(['\"])[^'\"{}\\]*\1\s*")
+# Methods that write or delete through a pathlib object; for the ones that
+# take a destination its first argument is a target too.
+_PATH_METHOD_CALL = re.compile(
+    r"\.\s*(write_text|write_bytes|unlink|rename|replace|rmdir|mkdir|touch|symlink_to|hardlink_to|"
+    r"copy|copy_into|move|move_into)\s*\(")
+_PATH_DEST_METHODS = {"rename", "replace", "symlink_to", "hardlink_to", "copy", "copy_into", "move", "move_into"}
 # A write method on a receiver the guard does not see built (p.write_text(...)
 # where p came from Path.home() / ...), unless the receiver is a Path(...) call.
 _BARE_WRITE_METHOD = re.compile(r"\.\s*write_(?:text|bytes)\s*\(")
@@ -2043,12 +2077,15 @@ _PATH_CALL_RECEIVER = re.compile(r"(?:pathlib\.)?Path\s*\(\s*[rRbBuU]?(['\"])[^'
 
 def _call_parts(text, i, limit=4000):
     """text[i] is just past a call's '('. Return (first_top_level_arg, full_inside,
-    index_just_past_the_matching_')'), quote- and nesting-aware (bounded)."""
+    index_just_past_the_matching_')'), quote-, escape- and nesting-aware (bounded)."""
     depth, q, j, n, first_end = 1, None, i, min(len(text), i + limit), None
     while j < n:
         c = text[j]
         if q:
-            if c == q and text[j - 1] != "\\":
+            if c == "\\":
+                j += 2
+                continue
+            if c == q:
                 q = None
         elif c in "'\"":
             q = c
@@ -2061,17 +2098,22 @@ def _call_parts(text, i, limit=4000):
         elif c == "," and depth == 1 and first_end is None:
             first_end = j
         j += 1
+    j = min(j, n)
     inside = text[i:j]
     first = text[i:first_end] if first_end is not None else inside
     return first, inside, j + 1  # j is the matching ')'; return the index past it
 
 
 def _top_args(inside):
-    """Split a call's argument text at its top-level commas (quote- and nesting-aware)."""
-    parts, depth, q, start = [], 0, None, 0
-    for j, c in enumerate(inside):
+    """Split a call's argument text at its top-level commas (quote-, escape- and nesting-aware)."""
+    parts, depth, q, start, j, n = [], 0, None, 0, 0, len(inside)
+    while j < n:
+        c = inside[j]
         if q:
-            if c == q and inside[j - 1] != "\\":
+            if c == "\\":
+                j += 2
+                continue
+            if c == q:
                 q = None
         elif c in "'\"":
             q = c
@@ -2082,34 +2124,49 @@ def _top_args(inside):
         elif c == "," and depth == 0:
             parts.append(inside[start:j])
             start = j + 1
+        j += 1
     parts.append(inside[start:])
     return [p for p in parts if p.strip()]
 
 
-def _open_writes(inside):
-    """True unless open()'s mode is absent or a literal read-only mode ('r',
-    'rb', 'rt'); a computed mode counts as a write (fail-closed)."""
-    mode = None
-    for x in _top_args(inside)[1:]:
-        x = x.strip()
-        kw = re.match(r"(\w+)\s*=(?!=)", x)
-        if kw:
-            if kw.group(1) == "mode":
-                mode = x[kw.end():].strip()
-            continue
-        if mode is None:
-            mode = x
-    return mode is not None and not _OPEN_READ_MODE.fullmatch(mode)
+def _kwarg(arg):
+    m = re.match(r"\s*(\w+)\s*=(?!=)", arg)
+    return (m.group(1), arg[m.end():].strip()) if m else (None, arg.strip())
+
+
+def _open_target_and_writes(inside):
+    """(target, writes) for open(...)/os.open(...): the target is the first
+    positional argument or file=/path=; it writes unless the mode (second
+    positional, mode= or flags=) is absent or a literal read-only mode ('r',
+    'rb', 'rt'). A computed mode or any flags count as a write (fail-closed)."""
+    positional, target, mode = [], None, None
+    for x in _top_args(inside):
+        k, v = _kwarg(x)
+        if k in ("mode", "flags"):
+            mode = v
+        elif k in ("file", "path"):
+            target = v
+        elif k is None:
+            positional.append(v)
+    if target is None and positional:
+        target = positional[0]
+    if mode is None and len(positional) > 1:
+        mode = positional[1]
+    writes = mode is not None and not _OPEN_READ_MODE.fullmatch(mode)
+    return (target if target is not None else ""), writes
 
 
 def _inline_write_hits_protected(joined, roots):
     """True when an inline write/delete operation ACTS ON a protected root: the
     root appears in that operation's own target argument(s) (a literal path;
-    every argument of a copy/move/rename), or a target is anything but one
-    plain string literal (a variable, concatenation, f-string or call) while
-    some protected root is present in the code, or the code changes directory
-    or creates a link while a root is present (fail-closed on indirection). A
-    root named only in unrelated data next to literal targets is ignored."""
+    every argument of a copy/move/rename; the destination of a pathlib
+    rename/replace/copy/move/link), or a target is anything but one plain
+    string literal (a variable, concatenation, f-string or call) while some
+    protected root is present in the code, or the code changes directory,
+    creates a link or aliases a write/delete function while a root is present
+    (fail-closed on indirection). A root named only in unrelated data next to
+    literal targets is ignored."""
+    import bisect
     present = [r for r in roots if r in joined]
     if present and _CODE_PATH_INDIRECTION.search(joined):
         return True
@@ -2117,14 +2174,31 @@ def _inline_write_hits_protected(joined, roots):
         for m in _BARE_WRITE_METHOD.finditer(joined):
             if not _PATH_CALL_RECEIVER.search(joined[max(0, m.start() - 400):m.start()]):
                 return True  # the receiver was built elsewhere: a computed target
+    methods = [(m.start(), m.group(1), m.end()) for m in _PATH_METHOD_CALL.finditer(joined)]
+    starts = [mm[0] for mm in methods]
+    for name, end in ((mm[1], mm[2]) for mm in methods):
+        if name in _PATH_DEST_METHODS and name != "replace":
+            dst = _call_parts(joined, end)[0]
+            if dst.strip() and (any(r in dst for r in roots) or (present and not _LITERAL_TARGET.fullmatch(dst))):
+                return True  # p.rename(<protected>) whatever p is
     for m in _CODE_WRITE_CALL.finditer(joined):
         head = m.group()
         first, inside, after = _call_parts(joined, m.end())
-        if head.lstrip().startswith("open") and not _open_writes(inside):
-            continue  # open() without a write mode is a read
-        if "Path(" in head and not _PATH_WRITE_METHOD.search(joined, after):
-            continue  # Path(...) with no write/delete method after it
-        targets = _top_args(inside) if _CODE_TWO_PATH_OP.search(head) else [first]
+        if head.lstrip().startswith("open"):
+            target, writes = _open_target_and_writes(inside)
+            if not writes:
+                continue  # open() without a write mode is a read
+            targets = [target]
+        elif "Path(" in head:
+            k = bisect.bisect_left(starts, after)
+            if k == len(methods):
+                continue  # Path(...) with no write/delete method after it
+            targets = [first]
+            if methods[k][1] in _PATH_DEST_METHODS:
+                targets.append(_call_parts(joined, methods[k][2])[0])
+        else:
+            targets = _top_args(inside) if _CODE_TWO_PATH_OP.search(head) else [first]
+        targets = [t for t in targets if t.strip()] or [""]
         if any(r in t for t in targets for r in roots):
             return True
         if present and any(not _LITERAL_TARGET.fullmatch(t) for t in targets):
@@ -2530,6 +2604,13 @@ def check_secret_args(cmd, args, ctx):
             continue
         if _looks_secret(val, ctx.cwd):
             ctx.deny(f"reads a secret file ({val}); secrets must never enter the transcript, logs or commits (§3.3)")
+        if cmd in ("curl", "wget"):
+            # -d @file, --data-urlencode name@file, -F name=@file / name=<file, file:///path
+            m = re.match(r"^(?:[^\s@=<]*=)?[@<](.+)$", val) or re.match(r"^[\w.-]+@(.+)$", val) \
+                or re.match(r"^file://(?:localhost)?(/.*)$", val, re.I)
+            ref = m.group(1) if m else None
+            if ref and (_looks_secret(ref, ctx.cwd) or _names_existing_secret(ref, ctx.cwd)):
+                ctx.deny(f"sends or prints a secret file ({ref}); secrets must never leave the host or enter the transcript (§3.3)")
 
 
 def _dir_holds_secret(p):
@@ -2894,7 +2975,7 @@ def check_find(args, ctx):
     if not execs:
         return
     for root in starts:
-        if _looks_secret(root, ctx.cwd):  # a secret FILE as the starting path: -exec reads that file itself
+        if _looks_secret(root, ctx.cwd) or _names_existing_secret(root, ctx.cwd):  # a secret FILE (or a glob matching one) as the starting path
             ctx.deny(f"find -exec on {root} reads a secret file; secrets must never enter the transcript, logs or commits (§3.3)")
     names = [v for o, v in values if o in FIND_NAME_TESTS]
     if any(_glob_names_secret(v) for v in names):
