@@ -1920,11 +1920,6 @@ _CODE_SHELL_STR = re.compile(
 # before the quote is required, so "system's" (apostrophe, no space) is prose.
 _CODE_SYSTEM_BARE = re.compile(r"\bsystem\s+(['\"])(.*?)\1", re.S)
 _CODE_SHELL_LIST = re.compile(r"subprocess\.\w+\(\s*\[([^\]]*)\]", re.S)
-_CODE_WRITE_OP = re.compile(
-    r"open\([^)]*['\"]\s*,\s*['\"][wax+]|\.write_(text|bytes)|shutil\.(rmtree|move|copy\w*)|"
-    r"os\.(remove|unlink|rename|replace|rmdir|makedirs|mkdir)|writeFileSync|rmSync|unlinkSync|renameSync|"
-    r"pathlib\.Path\([^)]*\)[^\n]*\.(write_|unlink|rename|replace|rmdir|mkdir)"
-)
 # The call head of a write/delete operation. _inline_write_hits_protected()
 # then reads the operation's OWN argument(s), so merely NAMING a protected path
 # in an unrelated string (e.g. writing a note to /tmp whose text mentions
