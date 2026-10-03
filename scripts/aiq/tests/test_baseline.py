@@ -222,21 +222,51 @@ def test_noise_ignores_the_case_mix():
     assert slow["latency"]["direct_fast"]["total_s"]["verdict"] == "fail" and slow["passed"] is False
 
 
-def test_a_quiet_class_takes_the_sigma_pooled_over_every_class_and_a_noisy_class_keeps_its_own():
-    # direct_fast EV01 10, 10, 10 (var 0); think EV06 1, 2, 4 (var (ln 2)^2)
-    doc = frozen(timed("EV01", (10, 10, 10)) + timed("EV06", (1, 2, 4), effort="think"))
-    quiet, noisy = latency(doc), latency(doc, "think")
-    pooled = math.log(2) / math.sqrt(2)                                # sqrt(mean(0, (ln 2)^2))
-    assert quiet["sigma_class"] == 0.0 and quiet["sigma_pooled"] == pytest.approx(pooled)
-    assert quiet["sigma"] == pytest.approx(pooled) and quiet["rel"] == pytest.approx(2 * pooled)
-    assert quiet["allowed_ratio"] == pytest.approx(1 + 2 * pooled + 0.5 / 10)
-    assert noisy["sigma_class"] == pytest.approx(math.log(2)) and noisy["sigma"] == pytest.approx(math.log(2))
-    # the pooled figure is part of the recomputation that guards a stored baseline
-    B._verify_baseline(json.loads(json.dumps(doc)))
+def _family_doc() -> dict:
+    # fast family: direct_fast EV01 10, 10, 10 (var 0), evidence_fast EV05 1, 2, 4 (var (ln 2)^2);
+    # slow family: think EV06 1, 4, 16 (var (ln 4)^2), max EV09 5, 5, 5 (var 0)
+    return frozen(timed("EV01", (10, 10, 10)) + timed("EV05", (1, 2, 4)) + timed("EV06", (1, 4, 16), effort="think")
+                  + timed("EV09", (5, 5, 5), effort="max"))
+
+
+def test_sigma_is_pooled_within_the_effort_family_and_never_across_families():
+    """Re-QA 1: pooling every class let think/max noise loosen the Fast gates (1.3x Fast slowdowns passed)."""
+    doc = _family_doc()
+    ln2 = math.log(2)
+    quiet, evidence, think, mx = (latency(doc, w) for w in ("direct_fast", "evidence_fast", "think", "max"))
+    assert quiet["sigma_family"] == evidence["sigma_family"] == "fast"
+    assert think["sigma_family"] == mx["sigma_family"] == "slow"
+    # the fast family pools EV01 and EV05 only: sqrt(mean(0, (ln 2)^2)); all four classes would give sqrt(5/4) ln 2
+    assert quiet["sigma_class"] == 0.0 and quiet["sigma_pooled"] == pytest.approx(ln2 / math.sqrt(2))
+    assert quiet["sigma"] == pytest.approx(ln2 / math.sqrt(2)) and quiet["rel"] == pytest.approx(math.sqrt(2) * ln2)
+    assert quiet["allowed_ratio"] == pytest.approx(1 + math.sqrt(2) * ln2 + 0.5 / 10)
+    assert evidence["sigma"] == pytest.approx(ln2)                     # its own figure is the larger
+    # the slow family pools EV06 and EV09: sqrt(mean((2 ln 2)^2, 0)) = sqrt(2) ln 2
+    assert mx["sigma_class"] == 0.0 and mx["sigma_pooled"] == pytest.approx(math.sqrt(2) * ln2)
+    assert mx["sigma"] == pytest.approx(math.sqrt(2) * ln2)
+    assert think["sigma"] == pytest.approx(2 * ln2) and think["sigma_pooled"] == pytest.approx(math.sqrt(2) * ln2)
+    assert B.CONSTANTS["sigma_families"] == {"fast": list(B.FAST_CLASSES), "slow": ["think", "max"]}
+    assert "effort family" in doc["method"]["noise"] and "never pooled together" in doc["method"]["noise"]
+
+
+def test_the_family_sigma_is_part_of_the_baseline_recomputation():
+    doc = json.loads(json.dumps(_family_doc()))
+    B._verify_baseline(doc)
     tampered = json.loads(json.dumps(doc))
     tampered["latency"]["direct_fast"]["total_s"]["sigma"] = 0.0
-    with pytest.raises(B.BaselineError):
+    with pytest.raises(B.BaselineError, match="disagree with a recomputation"):
         B._verify_baseline(tampered)
+    # rewrite think consistently with new samples: max (its family partner) no longer matches its recomputation,
+    # while the fast family is untouched by the change
+    rewritten = json.loads(json.dumps(doc))
+    think = rewritten["latency"]["think"]["total_s"]
+    units = {u: [6.0, 6.0, 6.0] for u in think["units"]}
+    slow = B.family_sigmas({"think": units, "max": {u: v["samples"] for u, v in
+                                                    rewritten["latency"]["max"]["total_s"]["units"].items()}})
+    rewritten["latency"]["think"]["total_s"] = B._describe("think", "total_s", units, think["missing"],
+                                                           think["excluded"], slow["think"])
+    with pytest.raises(B.BaselineError, match="latency.max.total_s"):
+        B._verify_baseline(rewritten)
 
 
 def test_values_at_or_below_the_floor_are_clamped_before_ln():
@@ -317,10 +347,18 @@ def test_output_token_rate_is_the_median_per_class_and_never_gates():
 
 def test_method_states_the_false_block_rate_and_the_tie_break():
     m = frozen(three_repeats())["method"]
-    assert "3 % of comparisons at sigma 0.10 and 7 % at sigma 0.15" in m["false_block"]
-    assert "15-19 % with spikes" in m["false_block"] and "1.3x slowdown blocks in 96-100 %" in m["false_block"]
-    assert "larger of the class sigma and the pooled sigma" in m["false_block"]
-    assert "max(the class's own sigma" in m["noise"]
+    fb = m["false_block"]
+    # the Monte Carlo of fix round 2 (uniform: 400 trials a row; heterogeneous: 300 trials a cell)
+    assert fb.startswith("Expected false blocks and power of the LATENCY gates only")
+    assert "blocked in 3.0 % at sigma 0.10 and 8.5 % at sigma 0.15 without spikes" in fb
+    assert "19 % (sigma 0.15) and 24 % (sigma 0.30) with spikes" in fb
+    assert ("1.3x is blocked in 99.8 % (sigma 0.10) and 96.5 % (sigma 0.15) without spikes, but only in 72-75 % "
+            "with spikes") in fb
+    assert "with spikes only in 54-57 %, against a 21-24 % false-block rate" in fb
+    assert "a real 1.3x slowdown passes about half the time" in fb
+    assert "Pooling sigma within the effort family" in fb
+    assert "max(the class's own sigma" in m["noise"] and "effort family" in m["noise"]
+    assert "35-58 %" in m["noise"] and "99 % within the family" in m["noise"]
     assert "re-run the BASELINE commit in the same window" in m["false_block"]
     assert "ceil(q x n)" in m["percentile"] and "ln x" in m["noise"] and "geometric mean" in m["ratio"]
 
@@ -335,7 +373,7 @@ def test_freeze_pools_three_run_directories(tmp_path):
     records = B.load_runs(dirs)
     assert len(records) == 9 and records[0]["_run"]["dir"] == dirs[0]
     doc = B.freeze(records, frozen_at=FROZEN_AT)
-    assert doc["kind"] == "evalset-baseline" and doc["schema"] == 2 and doc["frozen_at"] == FROZEN_AT
+    assert doc["kind"] == "evalset-baseline" and doc["schema"] == 3 and doc["frozen_at"] == FROZEN_AT
     assert doc["repeats_per_case"] == {"EV01": 3, "RQ01": 3, "EV08": 3}
     assert [s["dir"] for s in doc["sources"]] == ["run1", "run2", "run3"]           # basename only
     assert all(s["label"] == "synthetic stack, cap 2" and s["harness_commit"] == "0123abc"
@@ -801,6 +839,7 @@ def test_baseline_side_insufficiency_fails_unless_allowed():
     lambda d: d["latency"].pop("direct_fast"),
     lambda d: d["quality"]["checks"]["c00"].update(passed=9),
     lambda d: d.update(schema=1),
+    lambda d: d.update(schema=2),
 ])
 def test_compare_refuses_a_baseline_whose_numbers_disagree(mutate):
     base = json.loads(json.dumps(frozen(three_repeats())))
@@ -819,14 +858,14 @@ def test_render_markdown_has_every_table_and_a_workload_row(tmp_path):
     md = B.render_markdown(doc)
     assert ("| Case | Workload | Effort | Repeats | Pass rate | Mean score | Failed turns | "
             "Failing checks (most often) |") in md
-    assert ("| Class | Metric | Gated | n | Units | Missing | Excluded | p50 | p95 | min | max | Sigma (ln) | Scale | "
-            "Allowed ratio | Allowed p95 |") in md
+    assert ("| Class | Metric | Gated | n | Units | Missing | Excluded | p50 | p95 | min | max | Sigma (ln) | "
+            "Sigma from | Scale | Allowed ratio | Allowed p95 |") in md
     assert "| Check | Passed | Total | Rate |" in md and "### Output tokens per second" in md
     assert "### Conditions" in md and 'label "synthetic stack, cap 2"' in md and "`0123abc`" in md
     assert f"Eval set sha256 `{SHA}`" in md and "account 0 other conversations, 0 saved facts" in md
     assert "run `run1`" in md and str(tmp_path) not in md                     # the run's name, not the path
-    assert ("| direct_fast | total_s | yes | 3 | 1 | 0 | 0 | 1.00 | 1.00 | 1.00 | 1.00 | 0.000 | 1.00 | 1.700 | "
-            "reported (n < 20) |") in md
+    assert ("| direct_fast | total_s | yes | 3 | 1 | 0 | 0 | 1.00 | 1.00 | 1.00 | 1.00 | 0.000 | class | 1.00 | "
+            "1.700 | reported (n < 20) |") in md
     assert "| think | first_event_s | no | 3 |" in md and "| direct_fast | first_token_s | no | 3 |" in md
     assert "| EV08 | think | think | 3 | 0.000 | 0.667 | 0/3 | required_sections x3 |" in md
     assert "| EV01 | direct_fast | fast | 3 | 1.000 | 1.000 | 0/3 | none |" in md

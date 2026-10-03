@@ -44,8 +44,8 @@ from fractions import Fraction
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 RUN_KIND, RUN_SCHEMA = "evalset", 1
-BASELINE_KIND, BASELINE_SCHEMA = "evalset-baseline", 2
-REPORT_KIND, REPORT_SCHEMA = "evalset-comparison", 2
+BASELINE_KIND, BASELINE_SCHEMA = "evalset-baseline", 3
+REPORT_KIND, REPORT_SCHEMA = "evalset-comparison", 3
 
 # MASTER_PROMPT §24 workload classes for the eval set (the set has no large-document job case). The same map
 # lives in run_evalset.py, which writes it into every record; a record's own `workload` wins, this is the fallback.
@@ -60,6 +60,9 @@ WORKLOAD = {
 }
 CLASS_ORDER = ("direct_fast", "evidence_fast", "live_search_fast", "long_context", "think", "max")
 FAST_CLASSES = ("direct_fast", "evidence_fast", "live_search_fast", "long_context")
+# Effort families: a class borrows the noise of its family (the sigma pooled over the family's units) when its own
+# few units say less. Fast and think/max differ several-fold in repeat noise, so they are never pooled together.
+SIGMA_FAMILIES = {"fast": FAST_CLASSES, "slow": ("think", "max")}
 CLASS_ABS_S = {"direct_fast": 0.25, "evidence_fast": 0.5, "live_search_fast": 1.0, "long_context": 1.0,
                "think": 2.0, "max": 10.0}
 METRICS = ("first_event_s", "first_token_s", "first_answer_s", "total_s")
@@ -77,6 +80,11 @@ SAFE_ACCOUNT_KEYS = ("conversations", "facts", "checked", "allowed_used")
 _HEX_COMMIT = re.compile(r"[0-9a-f]{7,64}")
 
 
+def family_of(workload: str) -> str:
+    """The effort family whose units a class's noise is pooled with: 'fast' for the Fast classes, else 'slow'."""
+    return "fast" if workload in FAST_CLASSES else "slow"
+
+
 def gated_metrics(workload: str) -> tuple:
     """The metrics that gate a class: first_answer_s and total_s everywhere; first_event_s (the UI
     acknowledgment of §24) for the Fast classes only. first_token_s is reported, never gated."""
@@ -89,6 +97,7 @@ CONSTANTS = {
     "total_abs_factor": TOTAL_ABS_FACTOR, "min_samples": MIN_SAMPLES, "min_unit_samples": MIN_UNIT_SAMPLES,
     "p95_min_n": P95_MIN_N, "log_floor_s": LOG_FLOOR_S, "overall_drop": str(OVERALL_DROP),
     "thinking_check": THINKING_CHECK, "gated": {w: list(gated_metrics(w)) for w in CLASS_ORDER},
+    "sigma_families": {f: list(ws) for f, ws in SIGMA_FAMILIES.items()},
 }
 
 
@@ -136,8 +145,14 @@ METHOD = {
              f"of the sample variance (n - 1) of ln x), values <= {LOG_FLOOR_S:g} s clamped to {LOG_FLOOR_S:g} s "
              "before ln. It measures repeat-to-repeat noise of the same turn, not the spread between cases. "
              "The sigma used is max(the class's own sigma, the same figure pooled over the units of every class "
-             "for that metric): classes with one unit (long_context, max) would otherwise estimate their noise "
-             "from three samples, and a class that really is noisier keeps its own larger figure.",
+             "of its effort family for that metric); the families are fast (" + ", ".join(FAST_CLASSES) + ") "
+             "and slow (" + ", ".join(SIGMA_FAMILIES["slow"]) + "). Classes with one unit (long_context, max) "
+             "would otherwise estimate their noise from three samples, and a class that really is noisier keeps "
+             "its own larger figure. The families are never pooled together: think and max are several times "
+             "noisier than Fast, and pooling them in loosens every Fast gate: in the Monte Carlo of false_block, "
+             "with Fast sigma 0.08 and think/max sigma 0.40-0.60, a 1.3x Fast slowdown was blocked in only 35-58 % "
+             "of comparisons when every class was pooled and in 99 % within the family (sigma_class, sigma_pooled "
+             "and sigma_family are stored with each class/metric).",
     "ratio": "ratio = geometric mean, over the units with samples on both sides, of median(candidate unit) / "
              "median(baseline unit). scale = geometric mean of the baseline unit medians.",
     "tolerance": f"allowed_ratio = 1 + max({REL_FLOOR:.2f}, {SIGMA_FACTOR:g} x sigma) + abs / scale; abs by class: "
@@ -155,16 +170,28 @@ METHOD = {
                    "turns that did not fail and carry all three numbers with a positive denominator; median per "
                    "class, reported, never gated. completion_tokens sums every traced main-model call of the turn, "
                    "reasoning included, so for think and max the figure overstates decode speed.",
-    "false_block": "Expected false blocks, measured by a Monte Carlo of this exact freeze and compare (400 trials "
-                   "per row; the 16 eval-set cases, one turn each, at plausible medians; lognormal repeat noise "
-                   "sigma; spikes = 10 % of requests also slowed 1.5-3x by other load). 3 baseline runs vs 3 "
-                   "candidate runs block an unchanged build in about 3 % of comparisons at sigma 0.10 and 7 % at "
-                   "sigma 0.15 without spikes, and in 15-19 % with spikes; 5 baseline runs vs 3 candidate runs in "
-                   "about 2-5 % without spikes and 14-16 % with. Power (3 vs 3): a uniform 1.3x slowdown blocks in "
-                   "96-100 % without spikes and 63-66 % with them; 1.5x in 100 % without spikes and 91-94 % with; "
-                   "2x in 100 %. Taking the larger of the class sigma and the pooled sigma halves the false blocks "
-                   "of a per-class sigma alone (13 % / 33-42 % in the same Monte Carlo); the price is power under "
-                   "spikes (1.5x: 91-94 % against 97-100 %). More baseline runs lower false blocks further. "
+    "false_block": "Expected false blocks and power of the LATENCY gates only (no quality gate is in these figures: "
+                   "every simulated check passes), measured by a Monte Carlo of this exact freeze and compare: the "
+                   "16 eval-set cases, one turn each, at plausible medians, lognormal repeat noise sigma, spikes = "
+                   "10 % of requests also slowed 1.5-3x by other load, fixed seeds. UNIFORM noise (400 trials a "
+                   "row), 3 baseline runs vs 3 candidate runs, unchanged build: blocked in 3.0 % at sigma 0.10 and "
+                   "8.5 % at sigma 0.15 without spikes, 19 % (sigma 0.15) and 24 % (sigma 0.30) with spikes; with "
+                   "a noisy first_event 1-6 % and 25-27 %; 5 baseline runs vs 3 in 1.8 % / 4.8 % without spikes and "
+                   "16-18 % with. Power, 3 vs 3, every class slowed alike: 1.3x is blocked in 99.8 % (sigma 0.10) "
+                   "and 96.5 % (sigma 0.15) without spikes, but only in 72-75 % with spikes; 1.5x in 100 % without "
+                   "and 94.5-97 % with; 2x in 100 %. HETEROGENEOUS noise (300 trials a cell; Fast sigma 0.08 or 0.15, "
+                   "think/max sigma 0.35-0.60; only the Fast cases slowed): unchanged build blocked in 11-17 % "
+                   "without spikes (almost all by the noisy think/max classes; direct_fast 0-3 %) and 21-24 % with; "
+                   "a 1.3x Fast slowdown is blocked in 99 % (Fast sigma 0.08) and 87 % (0.15) without spikes, but "
+                   "with spikes only in 54-57 %, against a 21-24 % false-block rate in the same conditions, and the "
+                   "direct_fast gate itself catches it in 33-34 %. So under load spikes a real 1.3x slowdown passes "
+                   "about half the time: a latency pass in a spiky window is weak evidence, and only a quiet window "
+                   "or more runs make it strong. Pooling sigma within the effort family, not over every class, "
+                   "costs some false blocks under uniform noise (8.5 % against 6.5 % at sigma 0.15, 19 % against "
+                   "15 % with spikes: think and max then pool three units, not sixteen) and restores the Fast power "
+                   "when think/max are noisier (a 1.3x Fast slowdown blocked in 87-99 % against 35-70 % when every "
+                   "class was pooled); a per-class sigma alone blocks more unchanged builds (19-29 % without "
+                   "spikes, 39-42 % with). More baseline runs lower false blocks. "
                    "Procedure: when a latency gate fails, re-run the BASELINE commit in the same window (same "
                    "stack, same hour) as a tie-break and compare it with the frozen "
                    "baseline. If it fails the same gate, the window is slow, not the candidate: the latency verdict "
@@ -630,18 +657,29 @@ def _unit_log_vars(units: Dict[str, List[float]]) -> List[float]:
 
 
 def pooled_sigma(unit_maps: Iterable[Dict[str, List[float]]]) -> Optional[float]:
-    """Repeat noise of one metric pooled over the units of EVERY class: sqrt(mean log variance)."""
+    """Repeat noise of one metric pooled over the units of the given classes: sqrt(mean log variance)."""
     log_vars = [lv for units in unit_maps for lv in _unit_log_vars(units)]
     return math.sqrt(math.fsum(log_vars) / len(log_vars)) if log_vars else None
+
+
+def family_sigmas(unit_maps: Dict[str, Dict[str, List[float]]]) -> Dict[str, Optional[float]]:
+    """Per class (the keys of `unit_maps`, one metric's units per class): the sigma pooled over the units of every
+    class of the same effort family (SIGMA_FAMILIES). freeze and the baseline check both call this, so the stored
+    figure and its recomputation come from one rule."""
+    by_family = {f: pooled_sigma(units for w, units in unit_maps.items() if family_of(w) == f)
+                 for f in SIGMA_FAMILIES}
+    return {w: by_family[family_of(w)] for w in unit_maps}
 
 
 def _describe(workload: str, metric: str, units: Dict[str, List[float]], missing: int, excluded: int,
               sigma_pooled: Optional[float] = None) -> dict:
     """One baseline class/metric: the per-unit statistics, the class description and the allowed values.
 
-    The noise used is the larger of the class's own sigma and the sigma pooled over every class for this metric
-    (`sigma_pooled`): a class with one or two units estimates its own noise from very few samples, and the pooled
-    figure keeps that estimate from coming out too small; a class that really is noisier keeps its own."""
+    The noise used is the larger of the class's own sigma and `sigma_pooled`, the sigma pooled over the units of
+    every class of the same effort family for this metric (family_sigmas): a class with one or two units
+    estimates its own noise from very few samples, and the family figure keeps that estimate from coming out too
+    small; a class that really is noisier keeps its own. Fast and think/max are separate families, so the
+    several-fold larger noise of think and max never loosens the Fast classes."""
     unit_stats = {}
     for u, vs in units.items():
         if not vs:
@@ -668,7 +706,7 @@ def _describe(workload: str, metric: str, units: Dict[str, List[float]], missing
              "mean": math.fsum(values) / n if n else None,
              "p95_status": "gated" if n >= P95_MIN_N else "reported",
              "sigma": sigma, "sigma_class": sigma_class, "sigma_pooled": sigma_pooled if noisy else None,
-             "scale": scale, "rel": tol["rel"] if ok else None, "abs": tol["abs"],
+             "sigma_family": family_of(workload), "scale": scale, "rel": tol["rel"] if ok else None, "abs": tol["abs"],
              "allowed_ratio": 1 + tol["rel"] + tol["abs"] / scale if ok else None,
              "allowed_p95": None, "units": unit_stats}
     if ok and n >= P95_MIN_N:
@@ -682,8 +720,8 @@ def _rate_summary(rates: List[float]) -> dict:
 
 def latency_stats(records: Sequence[dict]) -> dict:
     coll = _collect(records)
-    pooled = {m: pooled_sigma(coll[w]["units"][m] for w in coll) for m in METRICS}
-    return {w: {m: _describe(w, m, coll[w]["units"][m], coll[w]["missing"][m], coll[w]["excluded"], pooled[m])
+    pooled = {m: family_sigmas({w: coll[w]["units"][m] for w in coll}) for m in METRICS}
+    return {w: {m: _describe(w, m, coll[w]["units"][m], coll[w]["missing"][m], coll[w]["excluded"], pooled[m][w])
                 for m in METRICS}
             for w in CLASS_ORDER if w in coll}
 
@@ -915,9 +953,9 @@ def _verify_baseline(doc, where: str = "baseline") -> None:
                     raise BaselineError(f"{lw}: {key} must be a count")
             stored[(w, m)] = (lw, e, samples)
     for m in METRICS:
-        pooled = pooled_sigma(samples for (_w, mm), (_lw, _e, samples) in stored.items() if mm == m)
+        pooled = family_sigmas({w: samples for (w, mm), (_lw, _e, samples) in stored.items() if mm == m})
         for (w, mm), (lw, e, samples) in stored.items():
-            if mm == m and not _same(e, _describe(w, m, samples, e["missing"], e["excluded"], pooled)):
+            if mm == m and not _same(e, _describe(w, m, samples, e["missing"], e["excluded"], pooled[w])):
                 raise BaselineError(f"{lw}: stored statistics or allowed values disagree with a recomputation from "
                                     "its unit samples and this script's constants")
     rates = doc.get("output_tokens_per_s")
@@ -1210,6 +1248,14 @@ def _fmt_num(v, digits: int = 3) -> str:
     return "n/a" if v is None else f"{v:.{digits}f}"
 
 
+def _sigma_source(e: dict) -> str:
+    """Which figure the sigma used came from: the class's own units, or the units of its effort family."""
+    if e["sigma"] is None:
+        return "n/a"
+    return "class" if e["sigma_pooled"] is None or e["sigma_class"] >= e["sigma_pooled"] else \
+        f"{e['sigma_family']} family"
+
+
 def render_markdown(baseline: dict) -> str:
     _verify_baseline(baseline)
     q, sources = baseline["quality"], baseline["sources"]
@@ -1253,9 +1299,9 @@ def render_markdown(baseline: dict) -> str:
                 allowed = ["insufficient samples", "n/a"]
             rows.append([w, m, "yes" if e["gated"] else "no", e["n"], e["units_n"], e["missing"], e["excluded"],
                          _fmt_s(e["p50"]), _fmt_s(e["p95"]), _fmt_s(e["min"]), _fmt_s(e["max"]),
-                         _fmt_num(e["sigma"]), _fmt_s(e["scale"])] + allowed)
+                         _fmt_num(e["sigma"]), _sigma_source(e), _fmt_s(e["scale"])] + allowed)
     out += _table(["Class", "Metric", "Gated", "n", "Units", "Missing", "Excluded", "p50", "p95", "min", "max",
-                   "Sigma (ln)", "Scale", "Allowed ratio", "Allowed p95"], rows)
+                   "Sigma (ln)", "Sigma from", "Scale", "Allowed ratio", "Allowed p95"], rows)
     out += ["", "### Output tokens per second", "", METHOD["output_rate"], ""]
     out += _table(["Class", "Samples", "Median tokens/s"],
                   [[w, r["n"], _fmt_num(r["median"], 1)] for w, r in baseline["output_tokens_per_s"].items()])
