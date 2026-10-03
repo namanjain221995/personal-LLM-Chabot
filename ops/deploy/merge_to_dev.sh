@@ -20,8 +20,9 @@
 # It trusts nothing from whoever runs it: bash -p ignores BASH_ENV, ENV and
 # exported functions, every other variable is cleared below, and the tools,
 # repository, branches, remote and log are fixed. It acts only when the
-# repository's git common directory is the expected one, and then on that
-# verified git directory alone. Every git call goes through one wrapper that
+# repository's git directory is the expected main .git or a linked worktree's
+# directory inside it, and then runs git on that verified common directory
+# alone, pinned on every call. Every git call goes through one wrapper that
 # reads no replace refs and turns off the commands a repository's
 # configuration can make git run (hooks, fsmonitor, the alternate-refs
 # command, a pager, push signing, automatic maintenance), and git may use
@@ -73,7 +74,7 @@ want=""
 for arg in "$@"; do
     case "$arg" in
         --dry-run) dry_run=1 ;;
-        -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,/^# Usage:/p' "$0"; exit 0 ;;
         *)
             if [ -z "$want" ] && { [[ "$arg" =~ ^[0-9a-f]{40}$ ]] || [ "$arg" = "origin/$SOURCE_BRANCH" ]; }; then
                 want=$arg
@@ -98,8 +99,8 @@ refuse() {
     exit 1
 }
 
-# The only way git runs here: in $REPO (on the git directory verified in step 0
-# once that is known), without replace objects or a pager, and with every
+# The only way git runs here: in $REPO (on the common directory verified in
+# step 0 once that is known), without replace objects or a pager, and with every
 # setting through which a repository's configuration makes git run a command
 # of its choosing pinned off: hooks (the hooks directory is /dev/null, so
 # neither .git/hooks nor a configured core.hooksPath runs), the fsmonitor hook,
@@ -123,8 +124,15 @@ slug=${slug%.git}
 
 # 0. $REPO belongs to the expected repository: its git common directory (the
 #    main checkout's .git, which every linked worktree shares) is the expected
-#    one. From here on git runs on the git directory found now, so what $REPO
-#    or its .git file points to cannot change between this check and the push.
+#    one, and its git directory is that directory itself or a linked
+#    worktree's directory directly under its worktrees/ (where `git worktree
+#    add` makes them).
+#    From here on git runs on the verified common directory itself, named by
+#    --git-dir on every call and pinned in GIT_COMMON_DIR. The gate needs
+#    nothing that lives in a worktree's own git directory (no HEAD, no index),
+#    and git reads a git directory's commondir file again on every call (the
+#    ref store follows that file even when GIT_COMMON_DIR is set), so neither
+#    $REPO's .git file nor a commondir file can redirect git after this check.
 want_common=$(cd "$EXPECTED_COMMON_DIR" 2>/dev/null && pwd -P) \
     || refuse "the expected git common directory $EXPECTED_COMMON_DIR does not exist"
 found=$(g rev-parse --absolute-git-dir 2>/dev/null) && [ -n "$found" ] \
@@ -135,6 +143,21 @@ common=$(g rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -
 common=$(cd "$common" 2>/dev/null && pwd -P) || refuse "cannot resolve the git common directory $common of $REPO"
 [ "$common" = "$want_common" ] \
     || refuse "the git common directory of $REPO is $common, not the expected $want_common"
+not_ours="the git directory $git_dir of $REPO is not $want_common or a linked worktree's directory $want_common/worktrees/<name>"
+case "$git_dir" in
+    "$want_common") ;;
+    "$want_common"/worktrees/*/*) refuse "$not_ours" ;;
+    "$want_common"/worktrees/?*) ;;
+    *) refuse "$not_ours" ;;
+esac
+# a main repository's git directory has no commondir file; with one, git would
+# keep its refs wherever that file points
+if [ -e "$want_common/commondir" ] || [ -L "$want_common/commondir" ]; then
+    refuse "$want_common has a commondir file, so it is not the main repository's git directory"
+fi
+git_dir=$want_common
+GIT_COMMON_DIR=$want_common
+export GIT_COMMON_DIR
 
 # 0b. origin is exactly the repository, for fetches and pushes alike, and git
 #     resolves the URL the gate fetches from and lists as itself (insteadOf,

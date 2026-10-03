@@ -374,6 +374,13 @@ class MergeToDev(unittest.TestCase):
         self.assert_refused(self.run_gate(), "URL of origin", dev_before)
         self.assertEqual(git(decoy, "for-each-ref"), "")
 
+    def test_help_prints_the_whole_header(self):
+        r = self.run_gate("--help")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = r.stdout.splitlines()
+        self.assertTrue(lines[0].startswith("# merge_to_dev.sh: "), lines[0])
+        self.assertTrue(lines[-1].startswith("# Usage: merge_to_dev.sh "), lines[-1])
+
     def test_source_has_no_environment_overrides(self):
         with open(SCRIPT, encoding="utf-8") as fh:
             text = fh.read()
@@ -499,6 +506,113 @@ class MergeToDev(unittest.TestCase):
         self.assertEqual(self.origin_ref("dev"), git(self.wt, "rev-parse", "refs/remotes/origin/autopilot/dev"))
         self.assertEqual(git(decoy, "rev-parse", "refs/remotes/origin/autopilot/dev"), stale,
                          "git kept to the verified git directory; the decoy was never fetched into")
+
+    # ---- P0-18: the git directory itself belongs to the expected repository
+    def swapping_git(self, trigger, path, content, swapped):
+        # a git stand-in that rewrites `path` the first time a call contains `trigger`
+        stand_in = os.path.join(self.tmp, "git-swapping")
+        with open(stand_in, "w") as fh:
+            fh.write(textwrap.dedent(f"""\
+                #!/bin/sh
+                case " $* " in
+                    *" {trigger} "*)
+                        if [ ! -e '{swapped}' ]; then
+                            printf '%s\\n' '{content}' > '{path}'
+                            : > '{swapped}'
+                        fi ;;
+                esac
+                exec /usr/bin/git "$@"
+                """))
+        os.chmod(stand_in, 0o755)
+        return stand_in
+
+    def agent_made_git_dir(self, fake, pointer):
+        # A git directory nobody made with `git worktree add`: its commondir file
+        # names the expected repository, so the common-directory check alone
+        # passes, but git re-reads that file on every call.
+        os.makedirs(fake)
+        os.makedirs(pointer, exist_ok=True)
+        with open(os.path.join(fake, "commondir"), "w") as fh:
+            fh.write(os.path.join(self.wt, ".git") + "\n")
+        with open(os.path.join(fake, "HEAD"), "w") as fh:
+            fh.write(git(self.wt, "rev-parse", "HEAD") + "\n")
+        with open(os.path.join(fake, "gitdir"), "w") as fh:
+            fh.write(os.path.join(pointer, ".git") + "\n")
+        with open(os.path.join(pointer, ".git"), "w") as fh:
+            fh.write(f"gitdir: {fake}\n")
+
+    def test_refuses_a_git_directory_outside_the_expected_repository(self):
+        dev_before = self.origin_ref("dev")
+        decoy = os.path.join(self.tmp, "decoy")
+        subprocess.run(["git", "clone", "-q", self.origin, decoy], check=True, capture_output=True)
+        wt_git = os.path.realpath(os.path.join(self.wt, ".git"))
+        linked = os.path.join(self.tmp, "linked")
+        git(self.wt, "worktree", "add", "-q", "--detach", linked, "HEAD")
+        places = {
+            "elsewhere": os.path.join(self.tmp, "agent-zone", "fake-gitdir"),
+            "nested under worktrees/": os.path.join(wt_git, "worktrees", "linked", "nested"),
+            "beside the repository": wt_git + "-fake",
+        }
+        for name, fake in places.items():
+            with self.subTest(name):
+                pointer = os.path.join(self.tmp, "pointer-" + name.replace(" ", "-").strip("/"))
+                self.agent_made_git_dir(fake, pointer)
+                swapped = os.path.join(fake, "swapped")
+                stand_in = self.swapping_git("remote get-url", os.path.join(fake, "commondir"), f"{decoy}/.git", swapped)
+                gate = self.make_gate(repo=pointer, name="gate-" + os.path.basename(pointer), git_bin=stand_in)
+                r = self.run_gate(gate=gate)
+                self.assert_refused(r, f"the git directory {os.path.realpath(fake)} of {pointer} is not", dev_before)
+                self.assertNotIn("OK:", r.stderr)
+                self.assertFalse(os.path.exists(swapped), "it refuses before git reads anything else")
+
+    def test_a_swapped_commondir_file_changes_nothing(self):
+        # A linked worktree of the expected repository passes step 0; its
+        # commondir file is then pointed at another repository. git must keep
+        # to the common directory the gate verified.
+        dev_before = self.origin_ref("dev")
+        decoy = os.path.join(self.tmp, "decoy")
+        subprocess.run(["git", "clone", "-q", self.origin, decoy], check=True, capture_output=True)
+        stale = git(decoy, "rev-parse", "refs/remotes/origin/autopilot/dev")
+        self.commit("more.txt", "more")
+        self.push_tip()
+        linked = os.path.join(self.tmp, "linked")
+        git(self.wt, "worktree", "add", "-q", "--detach", linked, "HEAD")
+        commondir = os.path.join(self.wt, ".git", "worktrees", "linked", "commondir")
+        self.assertTrue(os.path.exists(commondir))
+        for trigger in ("remote get-url", "fetch"):
+            with self.subTest(trigger):
+                with open(commondir, "w") as fh:
+                    fh.write("../..\n")
+                swapped = os.path.join(self.tmp, "swapped-" + trigger.replace(" ", "-"))
+                stand_in = self.swapping_git(trigger, commondir, f"{decoy}/.git", swapped)
+                gate = self.make_gate(repo=linked, name="gate-cd-" + trigger.replace(" ", "-"), git_bin=stand_in)
+                r = self.run_gate("--dry-run", gate=gate) if trigger == "fetch" else self.run_gate(gate=gate)
+                self.assertTrue(os.path.exists(swapped), "the commondir file was repointed during the run")
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(git(decoy, "rev-parse", "refs/remotes/origin/autopilot/dev"), stale,
+                                 "git kept to the verified common directory; the decoy was never fetched into")
+        self.assertNotEqual(self.origin_ref("dev"), dev_before)
+        self.assertEqual(self.origin_ref("dev"), self.origin_ref("autopilot/dev"))
+
+    def test_refuses_a_commondir_file_in_the_main_git_directory(self):
+        # git runs on the common directory after step 0; a commondir file there
+        # would take its refs elsewhere, so the gate refuses one, even dangling.
+        dev_before = self.origin_ref("dev")
+        decoy = os.path.join(self.tmp, "decoy")
+        subprocess.run(["git", "clone", "-q", self.origin, decoy], check=True, capture_output=True)
+        linked = os.path.join(self.tmp, "linked")
+        git(self.wt, "worktree", "add", "-q", "--detach", linked, "HEAD")
+        gate = self.make_gate(repo=linked, name="gate-main-commondir")
+        planted = os.path.join(self.wt, ".git", "commondir")
+        for name, plant in (("file", lambda: open(planted, "w").write(f"{decoy}/.git\n")),
+                            ("dangling symlink", lambda: os.symlink(os.path.join(self.tmp, "nowhere"), planted))):
+            with self.subTest(name):
+                plant()
+                try:
+                    self.assert_refused(self.run_gate(gate=gate), "has a commondir file", dev_before)
+                finally:
+                    os.remove(planted)
+        self.assertEqual(self.run_gate("--dry-run", gate=gate).returncode, 0)
 
     # ---- P0-17: repository configuration cannot make the gate's git run a command
     def marker_script(self, name, body=""):
@@ -628,6 +742,8 @@ class MergeToDev(unittest.TestCase):
         self.assertRegex(text, r"\nexport [^\n]*\bGIT_NO_REPLACE_OBJECTS\b")
         self.assertRegex(text, r"\nGIT_ALLOW_PROTOCOL=\$ORIGIN_PROTOCOL\n")
         self.assertRegex(text, r"\nexport [^\n]*\bGIT_ALLOW_PROTOCOL\b")
+        self.assertRegex(text, r"\nGIT_COMMON_DIR=\$want_common\n")
+        self.assertRegex(text, r"\nexport [^\n]*\bGIT_COMMON_DIR\b")
         wrapper = re.search(r"\ng\(\) \{\n(.*?)\n\}\n", text, re.S)
         self.assertIsNotNone(wrapper, "one git wrapper, g()")
         for flag in ("--no-pager", "--no-replace-objects", "-c core.hooksPath=/dev/null", "-c core.fsmonitor=false",
