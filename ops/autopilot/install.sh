@@ -132,8 +132,11 @@ graceful_restart() {
 }
 
 restart_wait_interrupted() {
+    # Further INT, TERM and HUP are ignored from here on (and by the commands
+    # below, which inherit that): Ctrl-C pressed twice, or a closing terminal
+    # that delivers a second hangup, must not kill the shell before STOP is gone.
+    trap '' INT TERM HUP
     local code=$1 state
-    trap - INT TERM HUP
     set +e  # a message that cannot be written must not stop the cleanup or change the exit code
     if [ "${restart_stop_created:-0}" = 1 ]; then
         rm -f "$AP/STOP"

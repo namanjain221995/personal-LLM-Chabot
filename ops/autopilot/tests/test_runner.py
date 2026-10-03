@@ -843,6 +843,45 @@ class InstallScript(unittest.TestCase):
         self.assertTrue(os.path.exists(self.stop), "a STOP file the operator made is not removed")
         self.assertIn("left in place", err)
 
+    def test_a_second_signal_during_the_cleanup_never_leaves_stop_behind(self):
+        # P0-18: Ctrl-C pressed twice, or a closed terminal (the kernel's SIGHUP
+        # plus the one the login shell forwards), delivers a second signal
+        # while the handler is running. It must not kill the shell before the
+        # handler has removed STOP.
+        body = re.search(r"^restart_wait_interrupted\(\) \{\n(.*?)^\}\n", read(INSTALL), re.M | re.S).group(1)
+        code = [ln.strip() for ln in body.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        self.assertEqual(code[0], "trap '' INT TERM HUP", "the handler ignores further signals before anything else")
+        pairs = [(signal.SIGINT, signal.SIGINT), (signal.SIGHUP, signal.SIGHUP), (signal.SIGTERM, signal.SIGTERM),
+                 (signal.SIGINT, signal.SIGHUP), (signal.SIGHUP, signal.SIGTERM)]
+        delays = (0.0005, 0.001, 0.002)
+        left, codes = [], {}
+        for i in range(30):
+            first, second = pairs[i % len(pairs)]
+            delay = delays[(i // len(pairs)) % len(delays)]
+            for f in ("calls", "hang"):
+                if os.path.exists(os.path.join(self.bin, f)):
+                    os.remove(os.path.join(self.bin, f))
+            proc = self.start_wait(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.assertTrue(self.wait_for(lambda: os.path.exists(self.stop)))
+            time.sleep(0.05)
+            os.killpg(proc.pid, first)
+            t0 = time.perf_counter()
+            while time.perf_counter() - t0 < delay:
+                pass
+            try:
+                os.killpg(proc.pid, second)
+            except ProcessLookupError:
+                pass
+            rc = proc.wait(timeout=20)
+            codes[rc] = codes.get(rc, 0) + 1
+            time.sleep(0.2)  # anything the shell left running has finished by now
+            if os.path.exists(self.stop):
+                left.append(f"{first.name}+{second.name} after {delay * 1000:g} ms")
+                os.remove(self.stop)
+            self.assertNotIn("--user start llm-autopilot.service", self.calls())
+        self.assertEqual(left, [], "STOP was left behind")
+        self.assertLessEqual(set(codes), {129, 130, 143}, codes)
+
     def test_an_interrupted_restart_wait_says_when_the_runner_is_down(self):
         # The runner exited on STOP just before Ctrl-C: the message says so and
         # how to start it, instead of leaving it stopped without a word.
