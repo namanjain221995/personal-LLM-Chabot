@@ -1598,6 +1598,23 @@ def ps_env_risk(args):
     return None
 
 
+_CURL_MUTATING_METHOD = re.compile(r"(^|\s)(-X|--request|--method)\s*=?\s*(POST|PUT|PATCH|DELETE)", re.I)
+
+
+def curl_request_mutates(cmd, args):
+    """True when an HTTP request changes server state. `curl -G`/`--get` sends
+    its -d/--data* payload as the URL query string of a GET (the Prometheus
+    /api/v1/query read), so it is NOT a mutation unless an explicit mutating
+    method (-X POST/PUT/PATCH/DELETE) overrides it. Any secret file named by a
+    -d @file / -T file argument is refused separately by check_secret_args."""
+    text = " " + " ".join(args)
+    if _CURL_MUTATING_METHOD.search(text):
+        return True
+    if cmd == "curl" and any(a in ("-G", "--get") or (re.fullmatch(r"-[A-Za-z]+", a) and "G" in a[1:]) for a in args):
+        return False
+    return bool(NET_UPLOAD.search(text))
+
+
 def check_production_reach(cmd, args, ctx):
     """Rules about what a command can reach in production, whatever the command is."""
     text = " ".join([f"{k}={v}" for k, v in ctx.env.items()] + list(args))
@@ -1651,7 +1668,7 @@ def check_production_reach(cmd, args, ctx):
             port, path = m.group(2) or "80", m.group(3) or "/"
             if path.startswith("/-/"):
                 ctx.deny("lifecycle endpoints such as /-/reload or /-/quit change production monitoring")
-            if port in PROD_CONTROL_PORTS and NET_UPLOAD.search(" " + " ".join(args)):
+            if port in PROD_CONTROL_PORTS and curl_request_mutates(cmd, args):
                 ctx.deny(f"mutating requests to production service port {port} change production state; read-only GETs only")
 
 
