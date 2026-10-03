@@ -6,12 +6,47 @@
   $PY scripts/aiq/run_evalset.py --dry-run --base http://127.0.0.1:28080
   # a run: loopback only, the password from a file, stdin or AIQ_PASSWORD (never the command line)
   $PY scripts/aiq/run_evalset.py --base http://127.0.0.1:28080 --email <account> --password-file <path> \\
-      --repeats 3 --workers 1 --label "<stack, image, topology, load>" [--only EV01,RQ03] [--out DIR]
+      --repeats 1 --workers 1 --label "<stack, image, topology, load>" [--only EV01,RQ03] [--out DIR] \\
+      [--deadline 07:00]
   # re-score a finished run after a check changed, without calling anything:
-  $PY scripts/aiq/run_evalset.py --rescore DIR
+  $PY scripts/aiq/run_evalset.py --rescore DIR [--force-rescore]
 
 Writes DIR/results.json (schema 1, below; rewritten after every finished
 record, so a killed run keeps what it finished) and DIR/summary.json.
+
+ACCOUNT STATE. The orchestrator answers from more than the request: saved
+facts are injected verbatim, and cross-chat recall (semantic and keyword)
+searches the account's OTHER conversations, its stored answers included
+(main.py read_facts / read_cross_chat, memory_semantic.cross_chat_block).
+So one fresh account per run directory; the baseline is N run directories
+of --repeats 1, each on its own fresh account (devstack.sh seed), so repeats
+never see each other; within one run the case order is fixed (workers 1), so
+leakage between cases is identical for baseline and candidate. Before the
+first case the runner counts the account's conversations (GET
+/history/conversations, active plus ?archived=true) and saved facts (GET
+/memory/facts) and keeps COUNTS ONLY in conditions.account; it refuses to
+start (exit 2) unless both are 0, or --allow-used-account is given
+(conditions.account.allowed_used true). The API exposes no per-user memory
+or recall switch (fact extraction and recall are deployment settings, and
+/auth/preferences is UI storage the chat path never reads), so
+conditions.account.memory_switch says that rather than guessing.
+
+WORKERS. Use --workers 1 for a baseline: the dev stack's cap allows two
+requests in flight, and Deep Research and fact extraction make parallel
+calls of their own, so a second worker changes the load being measured.
+
+STOPPING. Ctrl-C (or any BaseException reaching the main thread) stops the
+run: no new case or turn starts, queued cases are cancelled, POST /chat/stop
+goes out for every conversation with a case in flight (each outcome in
+results.stopped_on_interrupt), results.json is written with "interrupted"
+true and "finished" set, and the runner exits 130 (SIGINT) or re-raises.
+It then waits for the in-flight case's stream to close (the stop ends the
+generation; the stream's idle limit bounds the wait). --deadline HH:MM is
+the next time the host clock shows HH:MM (local time; the hosts run
+Asia/Kolkata, so 07:00 is the end of the 05:00-07:00 IST window; a time
+already past today means tomorrow): no case starts after it, the cases
+already running finish, and the run ends normally with "deadline_reached"
+true.
 
 ONE (case, repeat). A fresh conversation id; each `attachments` entry is
 uploaded first (POST /uploads, form fields file / conversation_id / purpose);
@@ -28,6 +63,16 @@ main.py ChatRequest) and a fresh `intent_id` per turn, as the browser does
 (V29: the first SSE event is then the meta that names the trace). A later turn
 carries the earlier turns and their real answers.
 
+TIMEOUTS. Sign-in, /auth/me, /health, the account counts, trace reads and
+/chat/stop: 30 s each. An upload: 300 s. The stream waits at most
+min(time left in the case, 60 s) for any byte (the server heartbeats every
+15 s, app/sse.py), so a dead tunnel fails in 60 s. --case-timeout-s
+(default 2400) bounds a whole case: the server's own hang guard
+GEN_WALL_CLOCK_S is 1800 s (config.py), and the runner's clock starts
+earlier (uploads, earlier turns), so it must not cut a full-length server
+generation first. A turn cut short is stopped (POST /chat/stop, outcome in
+the record's `stop`) BEFORE its trace is read, and the trace is read once.
+
 TIMING, per turn, float seconds from just before the POST (time.perf_counter),
 null when it never happened (harness.Client.chat):
   first_event_s   the first SSE event of any kind (an SSE comment such as the
@@ -36,7 +81,16 @@ null when it never happened (harness.Client.chat):
   first_answer_s  the first `token` event holding a non-whitespace character:
                   the first meaningful answer token. A step, status, research,
                   reasoning or meta event, or a heartbeat, never is one.
-  total_s         the stream closed
+  total_s         the stream closed after its terminal `done`; null for a
+                  turn that did not finish (an HTTP error, a timeout, a
+                  stream that ended in `error` or with no terminal event), so
+                  a failed turn is never a latency sample
+The stream is split into lines on "\\n" only (harness.sse_lines): the server
+writes U+2028, U+2029 and U+0085 raw, and a splitlines-style reader cuts a
+frame holding one in two. `terminal` is "done", "error" or null, and
+`bad_frames` counts `data:` lines that were not JSON. `status_events` keeps
+the `status` texts (a blocked tool is downgraded with one such line, main.py
+feature gate), and conditions.features the account's /auth/me feature map.
 
 SERVER STAGES, from GET /chat/trace/{meta.trace_id} (db.get_query_trace: the
 root row plus its query_trace_events; app/core/tracing.py), integer ms:
@@ -56,7 +110,10 @@ root row plus its query_trace_events; app/core/tracing.py), integer ms:
   A stage seen more than once (MODEL_* per model call, RERANK per call) is
   keyed STAGE, STAGE#2, STAGE#3 ... in trace order. server_total_ms is the
   root's total_duration_ms, trace_status its final_status, versions its
-  `versions` (application, schema, model id).
+  `versions` (application, schema, model id). A read that finds the trace
+  missing (404) or still "running" is repeated (TRACE_RETRIES x
+  TRACE_RETRY_S); summary.headline.turns_trace_not_ok counts the turns whose
+  trace_status is not "ok".
 USAGE: prompt/completion tokens summed over the MODEL_STREAM_ENDED events'
   `details.usage` (llm.stream_chat_events records each streamed main-model
   call's own counts, as the serving runtime reported them; the trace keeps
@@ -80,14 +137,28 @@ SCORING: harness.check_turn(expect, result + md_metrics(answer), effort=...,
 fail_text=eval_set.FAIL_TEXT, prev_file=None, upload_path=None), which also
 runs answer_checks.check: the path tests/test_eval_set.py scores the
 hand-written answers with. A `code` expect runs code_sandbox.run_code first,
-as run.py does. A case that crashed (an exception, an HTTP error from /chat,
---case-timeout-s) has `error` "Type: message", keeps the turns it finished,
-and scores 0.
+as run.py does, on a finished turn only. Before the run the sandbox must be
+able to run every selected coding language (conditions.code_sandbox records
+the backend); the runner refuses (exit 2) otherwise unless --no-code, which
+runs no code at all: run_code records the toolchain as unavailable, so
+code_runs and code_correct FAIL (code_present still reads the answer). A
+case that crashed (an exception, an HTTP error from /chat, a stream that
+ended in `error` or without `done`, --case-timeout-s) has `error`
+"Type: message", keeps the turns it finished, and scores 0.
 
-Safety: --base must be http(s)://127.0.0.1 or localhost (and never port 8080 or
-3000, harness.PROD_PORTS); at most two requests in flight (--workers <= 2,
-the dev stack's inference cap); the password is never printed or written; no
-credential reaches results.json; /health is reduced to names and statuses.
+RESCORE re-runs every check over the stored answers and records
+conditions.rescored {rescored_at, eval_set_sha256, original_eval_set_sha256,
+forced}. It refuses (exit 2) when the run's eval_set_sha256 is not the
+current set's, unless --force-rescore. A coding turn's stored code_result is
+re-scored as it is (the code is not run again), and the record says so in
+`rescore_note`.
+
+Safety: --base must be http(s)://127.0.0.1 or localhost WITH an explicit
+port (never 8080 or 3000, harness.PROD_PORTS), and no credentials, query or
+fragment; at most two requests in flight (--workers <= 2, the dev stack's
+inference cap); the password is never printed or written; no credential
+reaches results.json; /health is reduced to names and statuses, the account
+to counts.
 """
 from __future__ import annotations
 
@@ -105,7 +176,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 import httpx
@@ -122,6 +193,14 @@ from run import _trace_thinks as _run_trace_thinks  # noqa: E402
 SCHEMA = 1
 MAX_WORKERS = 2
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost"}
+#: sign-in, /auth/me, /health, account counts, trace reads, /chat/stop
+REQUEST_TIMEOUT_S = 30.0
+#: the longest the stream may go without a byte (the server heartbeats every 15 s)
+STREAM_IDLE_S = 60.0
+#: above the server's GEN_WALL_CLOCK_S (1800 s, config.py): the runner's clock starts first
+DEFAULT_CASE_TIMEOUT_S = 2400.0
+EXIT_REFUSED = 2
+EXIT_SIGINT = 130
 
 #: MASTER_PROMPT §24 latency classes (the eval set has no large-document job).
 #: The same map as baseline.py's; written into every record.
@@ -136,7 +215,7 @@ WORKLOAD: Dict[str, str] = {
 assert set(WORKLOAD) == set(ES.BY_ID), sorted(set(WORKLOAD) ^ set(ES.BY_ID))
 
 ORDER = {c["id"]: i for i, c in enumerate(ES.EVAL_SET_CASES)}
-#: a trace still being written when the stream closed is read again this often
+#: a trace not there yet (404) or still being written when the stream closed is read again this often
 TRACE_RETRIES, TRACE_RETRY_S = 5, 0.4
 #: a /health check name kept in conditions: a service name ("vllm-router",
 #: "app_db"), never anything with a dot, colon or slash in it (a host or URL)
@@ -152,22 +231,47 @@ class CaseTimeout(RuntimeError):
     """The case ran past --case-timeout-s."""
 
 
+class StreamFailed(RuntimeError):
+    """The stream ended in an `error` event, or with no terminal event at all."""
+
+
+class LoginFailed(RuntimeError):
+    """A worker could not sign in (harness.Client raises SystemExit for that)."""
+
+
+class Interrupted(RuntimeError):
+    """The run was stopped (Ctrl-C) between two steps of a case."""
+
+
 # ============================================================ guard rails ==
 
 def check_base(base: str) -> str:
-    """The base URL, or SystemExit when it is not a loopback orchestrator."""
+    """The base URL as scheme://host:port[/path], or SystemExit when it is not
+    a loopback orchestrator on an explicit, non-production port.
+
+    Parsed twice, by urlsplit and by httpx (the client that sends), and
+    refused when the two disagree on the host or the port."""
     try:
         parts = urlsplit(base)
         port = parts.port
-    except ValueError as exc:
+        sent = httpx.URL(base)
+    except (ValueError, httpx.InvalidURL) as exc:
         raise SystemExit(f"refusing --base {base!r}: {exc}")
-    if parts.scheme not in ("http", "https") or parts.username or parts.password:
+    if (parts.scheme not in ("http", "https") or parts.username or parts.password or "@" in parts.netloc
+            or "\\" in base):
         raise SystemExit(f"refusing --base {base!r}: only http(s)://127.0.0.1 or localhost, no credentials in the URL")
-    if (parts.hostname or "").lower() not in LOOPBACK_HOSTS:
+    if parts.query or parts.fragment:
+        raise SystemExit(f"refusing --base {base!r}: no query or fragment")
+    host = (parts.hostname or "").lower()
+    if host not in LOOPBACK_HOSTS:
         raise SystemExit(f"refusing --base {base!r}: the runner talks to 127.0.0.1 or localhost only")
-    if str(port or (443 if parts.scheme == "https" else 80)) in H.PROD_PORTS:
+    if port is None:
+        raise SystemExit(f"refusing --base {base!r}: give the port explicitly (e.g. http://127.0.0.1:28080)")
+    if str(port) in H.PROD_PORTS:
         raise SystemExit(f"refusing --base {base!r}: port {port} is a production port")
-    return base.rstrip("/")
+    if (sent.host or "").lower() != host or (sent.port or {"http": 80, "https": 443}[parts.scheme]) != port:
+        raise SystemExit(f"refusing --base {base!r}: the URL parsers disagree on its host or port")
+    return f"{parts.scheme}://{host}:{port}{parts.path.rstrip('/')}"
 
 
 def read_password(args) -> str:
@@ -204,7 +308,7 @@ def health_summary(client: "EvalClient") -> Optional[dict]:
     """GET /health, reduced to the overall status and each check's name and
     status: no URL, host, detail or error body survives."""
     try:
-        r = client.http.get(f"{client.base}/health", timeout=30.0)
+        r = client.http.get(f"{client.base}/health", timeout=REQUEST_TIMEOUT_S)
         body = r.json() if r.status_code == 200 else None
     except Exception:  # noqa: BLE001 — conditions are best effort
         return None
@@ -223,29 +327,187 @@ def health_summary(client: "EvalClient") -> Optional[dict]:
     return {"status": word(body.get("status")), "checks": dict(sorted(checks.items()))}
 
 
+#: what conditions.account.memory_switch says: there is nothing per user to read
+MEMORY_SWITCH_NOT_EXPOSED = ("not exposed by the API: fact extraction and cross-chat recall are deployment "
+                             "settings, and /auth/preferences is UI storage the chat path never reads")
+
+
+def account_state(client: "EvalClient", allowed_used: bool = False) -> dict:
+    """How much the account already holds, as COUNTS ONLY: its conversations
+    (active plus archived; history.py list_conversations) and its saved facts
+    (memory_api.py list_facts, {"facts": [...]}). checked false when a count
+    could not be read; nothing of the content is kept."""
+    out: Dict[str, Any] = {"checked": False, "conversations": None, "conversations_archived": None,
+                           "facts": None, "allowed_used": bool(allowed_used),
+                           "memory_switch": MEMORY_SWITCH_NOT_EXPOSED}
+
+    def count(path: str, key: Optional[str] = None) -> int:
+        r = client.http.get(f"{client.base}{path}", timeout=REQUEST_TIMEOUT_S)
+        if r.status_code != 200:
+            raise ValueError(f"GET {path.split('?')[0]} answered HTTP {r.status_code}")
+        body = r.json()
+        items = body.get(key) if key and isinstance(body, dict) else body
+        if not isinstance(items, list):
+            raise ValueError(f"GET {path.split('?')[0]} did not return a list")
+        return len(items)
+
+    try:
+        active = count("/history/conversations")
+        archived = count("/history/conversations?archived=true")
+        facts = count("/memory/facts", "facts")
+    except (httpx.HTTPError, ValueError) as exc:
+        out["why"] = f"{type(exc).__name__}: {exc}"[:200]
+        return out
+    out.update(checked=True, conversations=active + archived, conversations_archived=archived, facts=facts)
+    return out
+
+
+def account_refusal(account: dict) -> Optional[str]:
+    """Why the run must not start on this account, or None."""
+    if account.get("allowed_used"):
+        return None
+    if not account.get("checked"):
+        return (f"could not count the account's conversations and saved facts ({account.get('why')}); "
+                "a used account leaks cross-chat recall and saved facts into the measurements. "
+                "Use a fresh account (ops/dev/devstack.sh seed) or pass --allow-used-account")
+    if account["conversations"] or account["facts"]:
+        return (f"the account already has {account['conversations']} conversation(s) and {account['facts']} "
+                "saved fact(s): cross-chat recall and saved facts would leak into the measurements. "
+                "Use a fresh account (ops/dev/devstack.sh seed) or pass --allow-used-account")
+    return None
+
+
+def features_summary(me: Any) -> Dict[str, bool]:
+    """/auth/me `features` (authn/features.py), names and booleans only."""
+    raw = me.get("features") if isinstance(me, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in sorted(raw.items()) if isinstance(k, str) and _NAME.fullmatch(k) and isinstance(v, bool)}
+
+
+def code_languages(todo: List[dict]) -> List[str]:
+    return sorted({t["expect"]["code"]["lang"] for c in todo for t in c["turns"] if t["expect"].get("code")})
+
+
+def sandbox_conditions(todo: List[dict], toolchain, no_code: bool) -> dict:
+    """Can the sandbox run every selected coding language? Asked before the
+    first case, so a run never finds out at its coding case."""
+    langs = code_languages(todo)
+    out: Dict[str, Any] = {"needed": bool(langs), "languages": langs, "no_code": bool(no_code), "backend": None,
+                           "available": {}, "why": {}}
+    if not langs or no_code:
+        if langs:
+            out["available"] = {lang: False for lang in langs}
+            out["why"] = {lang: "not run: --no-code" for lang in langs}
+        return out
+    for lang in langs:
+        ok, why = toolchain.available(lang)
+        out["available"][lang] = bool(ok)
+        if why:
+            out["why"][lang] = why
+    out["backend"] = toolchain.backend
+    return out
+
+
+class _NoCode:
+    """The toolchain --no-code hands run_code: it runs nothing, so run_code
+    records the turn as unavailable and code_runs / code_correct fail."""
+
+    tsc = node = None
+
+    def isolation(self) -> dict:
+        return {"backend": None}
+
+    def available(self, lang: str) -> Tuple[bool, str]:
+        return False, "not run: --no-code"
+
+
+def parse_deadline(text: str, now: dt.datetime) -> dt.datetime:
+    """The next moment the clock shows HH:MM after `now` (the same day, or
+    the next one when that time has passed)."""
+    m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", (text or "").strip())
+    if not m:
+        raise SystemExit(f"--deadline {text!r}: use HH:MM, 24-hour, the host's local time")
+    at = now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+    return at if at > now else at + dt.timedelta(days=1)
+
+
+def _local_now() -> dt.datetime:
+    return dt.datetime.now().astimezone()
+
+
 # ================================================================ client ==
 
 class EvalClient(H.Client):
-    """harness.Client plus Stop, and a trace read that waits for its last write."""
+    """harness.Client with bounded sign-in and trace reads, plus Stop, and a
+    trace read that waits for its last write."""
 
-    def stop(self, conversation_id: str) -> None:
+    def __init__(self, base: str, email: str, password: str):
+        super().__init__(base, email, password, request_timeout_s=REQUEST_TIMEOUT_S)
+
+    def stop(self, conversation_id: str) -> dict:
+        """POST /chat/stop; {"http", "stopped"} or {"error"}, never raises."""
         try:
-            self.http.post(f"{self.base}/chat/stop", json={"conversation_id": conversation_id,
-                                                           "session_id": conversation_id}, timeout=30.0)
-        except Exception:  # noqa: BLE001 — best effort; the record already says it timed out
-            pass
+            r = self.http.post(f"{self.base}/chat/stop", json={"conversation_id": conversation_id,
+                                                               "session_id": conversation_id},
+                               timeout=REQUEST_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 — recorded, the run goes on
+            return {"error": f"{type(exc).__name__}: {exc}"[:200]}
+        try:
+            stopped = bool((r.json() or {}).get("stopped"))
+        except (ValueError, AttributeError):
+            stopped = False
+        return {"http": r.status_code, "stopped": stopped}
 
-    def settled_trace(self, trace_id: str) -> Optional[dict]:
+    def settled_trace(self, trace_id: str, retries: int = TRACE_RETRIES) -> Optional[dict]:
+        """The trace once it is written: a read that finds nothing (404, an
+        empty body) or a trace still "running" is repeated, `retries` reads
+        at most, TRACE_RETRY_S apart."""
         trace = None
-        for _ in range(TRACE_RETRIES):
+        for attempt in range(max(1, retries)):
+            if attempt:
+                time.sleep(TRACE_RETRY_S)
             try:
                 trace = self.trace(trace_id)
-            except Exception:  # noqa: BLE001 — a missing trace is recorded as {}
+            except Exception:  # noqa: BLE001 — an unreadable trace is recorded as {}
                 return None
-            if not trace or trace.get("final_status") != "running":
+            if trace and trace.get("final_status") != "running":
                 return trace
-            time.sleep(TRACE_RETRY_S)
         return trace
+
+
+class RunControl:
+    """What the worker threads share with the main thread: the stop flag,
+    the --deadline, and the conversations with a case in flight."""
+
+    def __init__(self, deadline: Optional[float] = None):
+        self.stop = threading.Event()
+        self.deadline = deadline  # epoch seconds, or None
+        self.deadline_reached = False
+        self._lock = threading.Lock()
+        self._inflight: Dict[str, EvalClient] = {}
+
+    def may_start(self) -> bool:
+        if self.stop.is_set():
+            return False
+        if self.deadline is not None and time.time() >= self.deadline:
+            self.deadline_reached = True
+            return False
+        return True
+
+    def begin(self, conversation_id: str, client: EvalClient) -> None:
+        with self._lock:
+            self._inflight[conversation_id] = client
+
+    def end(self, conversation_id: str) -> None:
+        with self._lock:
+            self._inflight.pop(conversation_id, None)
+
+    def stop_in_flight(self) -> List[dict]:
+        """POST /chat/stop for every conversation with a case running."""
+        with self._lock:
+            pending = sorted(self._inflight.items())
+        return [{"conversation_id": conv, **client.stop(conv)} for conv, client in pending]
 
 
 # ================================================================= trace ==
@@ -353,14 +615,38 @@ def _message_preview(text: str) -> str:
     return text[:300] + ("…" if len(text) > 300 else "")
 
 
-def run_one(client: EvalClient, case: dict, repeat: int, out_dir: str, toolchain=None,
-            case_timeout_s: float = 1800.0, log=print) -> dict:
-    """One (case, repeat): uploads, then each turn; never raises for a case failure."""
+def _signed_in(get_client: Callable[[], EvalClient]) -> EvalClient:
+    try:
+        return get_client()
+    except SystemExit as exc:  # harness.Client refuses a failed sign-in with SystemExit
+        raise LoginFailed(str(exc)) from None
+
+
+def _run_code(spec: dict, answer: str, workdir: str, toolchain, no_code: bool) -> dict:
+    if no_code:
+        return code_sandbox.run_code(spec, answer, workdir, _NoCode())
+    if toolchain is None:  # a direct caller; main() passes --code-root's
+        toolchain = code_sandbox.Toolchain(os.path.join(os.environ.get("AIQ_RUNTIME", os.path.join(HERE, ".runtime")),
+                                                        "code"))
+    return code_sandbox.run_code(spec, answer, workdir, toolchain)
+
+
+def run_one(get_client: Callable[[], EvalClient], case: dict, repeat: int, out_dir: str, toolchain=None,
+            case_timeout_s: float = DEFAULT_CASE_TIMEOUT_S, log=print, control: Optional[RunControl] = None,
+            no_code: bool = False) -> Optional[dict]:
+    """One (case, repeat): uploads, then each turn; never raises for a case
+    failure. None when the case was not started (the run was stopped, or
+    --deadline passed). The client comes from `get_client` INSIDE the try, so
+    a failed sign-in is this record's error, not the run's end."""
+    control = control or RunControl()
+    if not control.may_start():
+        return None
     started = time.perf_counter()
     conv = f"aiq-{case['id']}-r{repeat}-{int(time.time() * 1000)}"
     rec: Dict[str, Any] = {"id": case["id"], "category": case["category"], "section": case["section"],
                            "effort": case["effort"], "workload": WORKLOAD[case["id"]], "repeat": repeat,
-                           "conversation_id": conv, "error": None, "attachments": [], "turns": []}
+                           "conversation_id": conv, "error": None, "stop": None, "attachments": [], "turns": []}
+    client: Optional[EvalClient] = None
 
     def remaining() -> float:
         left = case_timeout_s - (time.perf_counter() - started)
@@ -368,10 +654,17 @@ def run_one(client: EvalClient, case: dict, repeat: int, out_dir: str, toolchain
             raise CaseTimeout(f"the case ran past --case-timeout-s {case_timeout_s:g}")
         return left
 
+    def not_stopped(what: str) -> None:
+        if control.stop.is_set():
+            raise Interrupted(f"the run was stopped before {what}")
+
     try:
+        client = _signed_in(get_client)
+        control.begin(conv, client)
         documents = []
         for att in case.get("attachments") or []:
             path = os.path.join(ES.FIXTURES, att["fixture"])
+            not_stopped("an upload")
             remaining()
             t_up = time.perf_counter()
             up = client.upload(conv, path, purpose=att["purpose"])
@@ -383,31 +676,39 @@ def run_one(client: EvalClient, case: dict, repeat: int, out_dir: str, toolchain
                 documents.append({"upload_id": up["upload_id"], "name": name})
         history = [{"role": m["role"], "content": m["content"]} for m in case.get("history") or []]
         for ti, t in enumerate(case["turns"]):
+            not_stopped(f"turn {ti + 1}")
             res = client.chat(conv, t["message"], history, case["effort"], web_search=case["web_search"],
                               pdf_uploads=documents if ti == 0 and documents else None,
                               deep_research=bool(case.get("deep_research")), test_case_id=case["id"],
-                              extra={"intent_id": uuid.uuid4().hex}, max_seconds=remaining())
+                              extra={"intent_id": uuid.uuid4().hex}, max_seconds=remaining(),
+                              idle_timeout_s=STREAM_IDLE_S)
+            timed_out = bool(res.get("timed_out"))
+            if timed_out:
+                # first, before the trace or the sandbox: the generation is
+                # detached, and a stream we stopped reading still holds one of
+                # the stack's two inference slots
+                rec["stop"] = client.stop(conv)
             meta = res.get("meta") or {}
             errors = list(res.get("errors") or [])
             if res.get("http") != 200:
                 errors.append({"http": res.get("http"), "body": str(res.get("error") or "")[:400]})
-            trace = client.settled_trace(str(meta.get("trace_id") or "")) if meta.get("trace_id") else None
+            trace_id = str(meta.get("trace_id") or "")
+            # a stopped turn's trace is still open: one read, no waiting for it to settle
+            trace = client.settled_trace(trace_id, retries=1 if timed_out else TRACE_RETRIES) if trace_id else None
             result: Dict[str, Any] = {
                 "http": res.get("http"), "answer": res.get("answer") or "", "errors": errors,
                 "request_id": res.get("request_id"), "meta": meta,
                 "reasoning_events": res.get("reasoning_events", 0), "reasoning_chars": res.get("reasoning_chars", 0),
-                "timing": res.get("timing") or {}, "timed_out": bool(res.get("timed_out")),
+                "timing": res.get("timing") or {}, "timed_out": timed_out, "terminal": res.get("terminal"),
+                "bad_frames": int(res.get("bad_frames") or 0), "status_events": list(res.get("status_events") or []),
                 **reduce_trace(trace),
                 "trace_thinks": trace_thinks(trace),
                 "source_passages": {}, "source_passages_captured": False,
             }
-            if t["expect"].get("code"):
+            finished = res.get("http") == 200 and not timed_out and not errors
+            if t["expect"].get("code") and finished:
                 workdir = os.path.join(out_dir, "code", case["id"], f"r{repeat}", f"t{ti + 1}")
-                if toolchain is None:  # a direct caller; main() passes --code-root's
-                    toolchain = code_sandbox.Toolchain(
-                        os.path.join(os.environ.get("AIQ_RUNTIME", os.path.join(HERE, ".runtime")), "code"))
-                result["code_result"] = code_sandbox.run_code(t["expect"]["code"], result["answer"], workdir,
-                                                              toolchain)
+                result["code_result"] = _run_code(t["expect"]["code"], result["answer"], workdir, toolchain, no_code)
             checks = score_turn(case, t, result)
             rec["turns"].append({"message": _message_preview(t["message"]), "expect": t["expect"],
                                  "checks": checks, "result": result})
@@ -418,17 +719,26 @@ def run_one(client: EvalClient, case: dict, repeat: int, out_dir: str, toolchain
                 + (f"  FAILED: {', '.join(failed)}" if failed else ""))
             if res.get("http") != 200:
                 raise ChatFailed(f"/chat returned HTTP {res.get('http')}: {str(res.get('error') or '')[:200]}")
-            if result["timed_out"]:
+            if timed_out:
                 raise CaseTimeout(f"the case ran past --case-timeout-s {case_timeout_s:g}; the generation was stopped")
+            if errors:
+                raise StreamFailed(f"the stream ended with {json.dumps(errors[0], ensure_ascii=False)[:200]}")
             history += [{"role": "user", "content": t["message"]}, {"role": "assistant", "content": result["answer"]}]
     except Exception as exc:  # noqa: BLE001 — a crashed case scores 0, with the reason
-        if isinstance(exc, (CaseTimeout, httpx.HTTPError)):
+        if rec["stop"] is None and client is not None and isinstance(exc, (CaseTimeout, httpx.HTTPError)):
             # the generation is detached: a stream we stopped reading would
             # otherwise hold one of the stack's two inference slots
-            client.stop(conv)
+            rec["stop"] = client.stop(conv)
         rec["error"] = f"{type(exc).__name__}: {exc}"
         rec["traceback"] = traceback.format_exc()[-2000:]
         log(f"  {case['id']} r{repeat} ERROR {rec['error']}")
+    except BaseException:
+        # this ends the run (main() handles it when the future yields it);
+        # set the flag first, or this worker takes the next case meanwhile
+        control.stop.set()
+        raise
+    finally:
+        control.end(conv)
     return rec
 
 
@@ -443,16 +753,42 @@ def _write_json(path: str, data: Any) -> None:
     os.replace(tmp, path)
 
 
+def rescore_refusal(results: dict) -> Optional[str]:
+    """Why --rescore must not re-score this run without --force-rescore, or None."""
+    stored = (results.get("conditions") or {}).get("eval_set_sha256")
+    current = eval_set_sha256()
+    if stored == current:
+        return None
+    return (f"the run was made with eval set {str(stored)[:12]}..., the current set is {current[:12]}...: its "
+            "answers were given to other questions or checks. Pass --force-rescore to re-score it anyway "
+            "(conditions.rescored records that)")
+
+
 def rescore(results: dict) -> dict:
-    """Re-run every check over the stored answers; nothing is called."""
+    """Re-run every check over the stored answers; nothing is called.
+
+    conditions.rescored says when and against which set; a coding turn's
+    stored code_result is scored as it is (the code is not run again), and
+    the record's `rescore_note` says so."""
+    stored = (results.get("conditions") or {}).get("eval_set_sha256")
+    current = eval_set_sha256()
     for rec in results.get("cases") or []:
         case = ES.BY_ID.get(rec["id"])
         if case is None:
             continue
         rec.setdefault("workload", WORKLOAD.get(rec["id"]))
-        for t, tr in zip(case["turns"], rec.get("turns") or []):
+        reused = []
+        for ti, (t, tr) in enumerate(zip(case["turns"], rec.get("turns") or [])):
             tr["expect"] = t["expect"]
+            if t["expect"].get("code") and (tr.get("result") or {}).get("code_result") is not None:
+                reused.append(ti + 1)
             tr["checks"] = score_turn(case, t, tr["result"])
+        if reused:
+            rec["rescore_note"] = (f"turn(s) {reused}: code_result is the original run's, re-scored as stored; "
+                                   "the code was not run again")
+    results.setdefault("conditions", {})["rescored"] = {
+        "rescored_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "eval_set_sha256": current,
+        "original_eval_set_sha256": stored, "forced": stored != current}
     results["cases"] = _sort(results.get("cases") or [])
     return results
 
@@ -465,7 +801,7 @@ def summarise(results: dict) -> dict:
                                                          "errors": 0, "turns": 0, "first_answer_s_n": 0,
                                                          "total_s_n": 0})
     by_check: Dict[str, List[int]] = defaultdict(lambda: [0, 0])
-    fast_turns = thinking = stream_errors = timed_out = no_passages = 0
+    fast_turns = thinking = stream_errors = timed_out = no_passages = trace_not_ok = bad_frames = 0
     thinking_ids = set()
     scores = []
     for rec in _sort(results.get("cases") or []):
@@ -492,6 +828,8 @@ def summarise(results: dict) -> dict:
             stream_errors += int(bool(res.get("errors")))
             timed_out += int(bool(res.get("timed_out")))
             no_passages += int(res.get("source_passages_captured") is False)
+            trace_not_ok += int(res.get("trace_status") != "ok")
+            bad_frames += int(bool(res.get("bad_frames")))
             if rec.get("effort") == "fast":
                 fast_turns += 1
                 if any(c["check"] == "thinking_off" and not c["ok"] for c in tr.get("checks") or []):
@@ -515,6 +853,8 @@ def summarise(results: dict) -> dict:
             "fast_thinking_case_ids": sorted(thinking_ids),
             "turns_with_stream_errors": stream_errors, "turns_timed_out": timed_out,
             "turns_without_source_passages": no_passages,
+            "turns_trace_not_ok": trace_not_ok, "turns_with_bad_frames": bad_frames,
+            "interrupted": bool(results.get("interrupted")), "deadline_reached": bool(results.get("deadline_reached")),
         },
         "cases": cases,
         "by_workload": {k: {**v, "cases": sorted(v["cases"], key=lambda c: ORDER.get(c, 99))}
@@ -529,7 +869,10 @@ def print_summary(s: dict) -> None:
           f"{h['cases_pass_every_repeat']}/{h['cases']} cases pass every repeat, {h['errors']} errored)")
     print(f"Fast turns that thought: {h['fast_turns_thinking']}/{h['fast_turns']} {h['fast_thinking_case_ids']}")
     print(f"turns with stream errors {h['turns_with_stream_errors']}, timed out {h['turns_timed_out']}, "
-          f"without source passages {h['turns_without_source_passages']}")
+          f"without source passages {h['turns_without_source_passages']}, trace not ok {h['turns_trace_not_ok']}, "
+          f"with bad frames {h['turns_with_bad_frames']}")
+    if h["interrupted"] or h["deadline_reached"]:
+        print("the run did not finish: " + ("interrupted" if h["interrupted"] else "--deadline reached"))
     print("\ncase  workload          effort  repeats  score  failed checks")
     for c in s["cases"]:
         marks = "".join("P" if r["pass"] else ("E" if r["error"] else "F") for r in c["repeats"])
@@ -594,21 +937,45 @@ def _parse_only(text: str) -> List[str]:
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base", default="", help="the orchestrator, http(s)://127.0.0.1 or localhost only")
+    ap.add_argument("--base", default="", help="the orchestrator, http(s)://127.0.0.1:PORT or localhost:PORT only")
     ap.add_argument("--email", default="", help="the account (default: AIQ_EMAIL)")
     ap.add_argument("--password-file", default="", help="a file holding the password")
     ap.add_argument("--password-stdin", action="store_true", help="read the password from the first line of stdin")
     ap.add_argument("--only", default="", help="comma-separated case ids, e.g. EV01,RQ03")
     ap.add_argument("--repeats", type=int, default=1)
-    ap.add_argument("--workers", type=int, default=1, help=f"requests in flight, 1..{MAX_WORKERS}")
+    ap.add_argument("--workers", type=int, default=1,
+                    help=f"requests in flight, 1..{MAX_WORKERS}; use 1 for a baseline")
     ap.add_argument("--out", default="", help="the run directory (default: runs/evalset-<stamp>)")
     ap.add_argument("--label", default="", help="free text naming the conditions: stack, image, topology, load")
     ap.add_argument("--rescore", default="", help="a run directory to re-score without calling anything")
-    ap.add_argument("--case-timeout-s", type=float, default=1800.0)
+    ap.add_argument("--force-rescore", action="store_true",
+                    help="re-score even when the run was made with a different eval set")
+    ap.add_argument("--case-timeout-s", type=float, default=DEFAULT_CASE_TIMEOUT_S,
+                    help="the longest one case may take (default 2400: above the server's GEN_WALL_CLOCK_S 1800)")
+    ap.add_argument("--deadline", default="", help="HH:MM, host local time: no case starts after it")
+    ap.add_argument("--allow-used-account", action="store_true",
+                    help="run on an account that already has conversations or saved facts (recorded)")
+    ap.add_argument("--no-code", action="store_true",
+                    help="run no model-written code; the coding turns' code_runs and code_correct then fail")
     ap.add_argument("--dry-run", action="store_true", help="print each request's shape; no network")
     ap.add_argument("--code-root", default=os.environ.get("AIQ_RUNTIME", os.path.join(HERE, ".runtime")),
                     help="where the coding cases' scratch toolchain lives (as run.py's --code-root)")
     return ap
+
+
+def _refuse(message: str) -> int:
+    print(f"refusing to run: {message}", file=sys.stderr, flush=True)
+    return EXIT_REFUSED
+
+
+def _finish(results: dict, t0: float, out: str, control: RunControl) -> dict:
+    results["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    results["seconds"] = round(time.perf_counter() - t0)
+    results["deadline_reached"] = bool(control.deadline_reached)
+    _write_json(os.path.join(out, "results.json"), results)
+    s = summarise(results)
+    _write_json(os.path.join(out, "summary.json"), s)
+    return s
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -617,7 +984,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.rescore:
         path = os.path.join(args.rescore, "results.json")
         with open(path, encoding="utf-8") as fh:
-            results = rescore(json.load(fh))
+            stored = json.load(fh)
+        why = rescore_refusal(stored)
+        if why and not args.force_rescore:
+            return _refuse(why)
+        results = rescore(stored)
         _write_json(path, results)
         s = summarise(results)
         _write_json(os.path.join(args.rescore, "summary.json"), s)
@@ -639,6 +1010,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     problems = ES.validate(todo)
     if problems:
         raise SystemExit("the evaluation set is not valid:\n" + "\n".join(problems))
+    deadline = parse_deadline(args.deadline, _local_now()) if args.deadline else None
 
     if args.dry_run:
         dry_run(todo, base, args.repeats)
@@ -648,19 +1020,32 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not email:
         raise SystemExit("no account: use --email or AIQ_EMAIL")
     password = read_password(args)
-    out = args.out or os.path.join(HERE, "runs", "evalset-" + time.strftime("%Y%m%d-%H%M%S"))
-    os.makedirs(out, exist_ok=True)
-    toolchain = (code_sandbox.Toolchain(os.path.join(args.code_root, "code"))
-                 if any(t["expect"].get("code") for c in todo for t in c["turns"]) else None)
+    toolchain = code_sandbox.Toolchain(os.path.join(args.code_root, "code")) if code_languages(todo) else None
+    sandbox = sandbox_conditions(todo, toolchain, args.no_code)
+    if sandbox["needed"] and not args.no_code and not all(sandbox["available"].values()):
+        return _refuse(f"the code sandbox cannot run {sorted(k for k, v in sandbox['available'].items() if not v)}: "
+                       f"{'; '.join(sandbox['why'].values())}. Fix the sandbox, or pass --no-code (the coding "
+                       "turns' code_runs and code_correct then fail)")
 
     first = EvalClient(base, email, password)
+    account = account_state(first, allowed_used=args.allow_used_account)
+    print(f"account: {account['conversations']} conversation(s), {account['facts']} saved fact(s)"
+          + ("" if account["checked"] else f" (not counted: {account.get('why')})"), flush=True)
+    why = account_refusal(account)
+    if why:
+        return _refuse(why)
+
+    out = args.out or os.path.join(HERE, "runs", "evalset-" + time.strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(out, exist_ok=True)
     results: Dict[str, Any] = {
         "kind": "evalset", "schema": SCHEMA, "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "finished": None, "seconds": None,
+        "finished": None, "seconds": None, "interrupted": False, "deadline_reached": False,
         "conditions": {"base": base, "harness_commit": harness_commit(), "label": args.label,
                        "workers": args.workers, "repeats": args.repeats, "only": only,
                        "health": health_summary(first), "case_timeout_s": args.case_timeout_s,
-                       "eval_set_sha256": eval_set_sha256()},
+                       "eval_set_sha256": eval_set_sha256(), "account": account,
+                       "features": features_summary(first.me), "code_sandbox": sandbox,
+                       "deadline": deadline.isoformat(timespec="minutes") if deadline else None},
         "cases": [],
     }
     results_path = os.path.join(out, "results.json")
@@ -668,6 +1053,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     lock = threading.Lock()
     local = threading.local()
     spare = [first]
+    control = RunControl(deadline.timestamp() if deadline else None)
 
     def client() -> EvalClient:
         if getattr(local, "client", None) is None:
@@ -687,22 +1073,38 @@ def main(argv: Optional[List[str]] = None) -> int:
     def log(line: str) -> None:
         print(line, flush=True)
 
-    with cf.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futs = [pool.submit(lambda c=c, r=r: run_one(client(), c, r, out, toolchain, args.case_timeout_s, log))
+    pool = cf.ThreadPoolExecutor(max_workers=args.workers)
+    try:
+        futs = [pool.submit(run_one, client, c, r, out, toolchain, args.case_timeout_s, log, control, args.no_code)
                 for c, r in jobs]
         for fut in cf.as_completed(futs):
             rec = fut.result()
+            if rec is None:  # not started: --deadline passed
+                continue
             with lock:
                 results["cases"] = _sort(results["cases"] + [rec])
                 _write_json(results_path, results)
-    results["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    results["seconds"] = round(time.perf_counter() - t0)
-    _write_json(results_path, results)
-    s = summarise(results)
-    _write_json(os.path.join(out, "summary.json"), s)
+    except BaseException as exc:
+        # Ctrl-C, or a BaseException out of a worker: start nothing more, stop
+        # what is generating, keep what finished, then let it propagate
+        control.stop.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+        results["interrupted"] = True
+        results["interrupted_by"] = type(exc).__name__
+        results["stopped_on_interrupt"] = control.stop_in_flight()
+        _finish(results, t0, out, control)
+        print(f"\nINTERRUPTED ({type(exc).__name__}): {len(results['cases'])} record(s) kept in {results_path}; "
+              f"/chat/stop sent for {len(results['stopped_on_interrupt'])} conversation(s) in flight",
+              file=sys.stderr, flush=True)
+        raise
+    pool.shutdown(wait=True)
+    s = _finish(results, t0, out, control)
     print_summary(s)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(EXIT_SIGINT)
