@@ -57,4 +57,5 @@ Status values: READY, IN_PROGRESS, BLOCKED, DONE. Work the highest READY task in
 | P2 | The `-p ci_statvfs84` pytest plugin named in the agent rules is not in the repository. |
 | P2 | Known flaky frontend test `tests/voice-session-recorder.test.tsx` (failed the first attempt of run 37092252160). |
 | P3 | `validate_long_context.py` defaults to the production engine; require an explicit target. |
+| P2 | `gh pr edit 98 --body-file` fails on the installed gh 2.45 (a projects-classic GraphQL error) and the guard blocks mutating `gh api` calls, so status-board updates go to PR #98 as comments (first: issuecomment-5967899544). A newer gh at user level would restore description edits. |
 | P3 | Cycle 2 scratch: `/tmp/p013-*`, `/tmp/p014`, `/tmp/p015*`, `/tmp/a05` can be deleted; a test-only database `llmdev_p013_test` exists on the test server (left in place: databases are never deleted). |
