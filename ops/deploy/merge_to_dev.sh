@@ -333,6 +333,7 @@ fi
 refuse_rerouting_config
 g push --no-follow-tags --no-verify --no-recurse-submodules "$ORIGIN_URL" "$sha:refs/heads/$TARGET_BRANCH" \
     || refuse "push to origin/$TARGET_BRANCH failed (not a fast-forward any more, or no credential: the gate uses only the credential helper the operator's global git config names for the origin)"
-now=$(g ls-remote "$ORIGIN_URL" "refs/heads/$TARGET_BRANCH" | awk -F'\t' -v r="refs/heads/$TARGET_BRANCH" '$2 == r { print $1 }')
+now=$(g ls-remote "$ORIGIN_URL" "refs/heads/$TARGET_BRANCH" | awk -F'\t' -v r="refs/heads/$TARGET_BRANCH" '$2 == r { print $1 }') \
+    || refuse "the push ran, but origin/$TARGET_BRANCH could not be read back to confirm it is $sha; check it by hand"
 [ "$now" = "$sha" ] || refuse "origin/$TARGET_BRANCH is $now after the push, expected $sha"
 log "MERGED: origin/$TARGET_BRANCH is now $sha"

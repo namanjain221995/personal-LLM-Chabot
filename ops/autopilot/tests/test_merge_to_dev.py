@@ -27,6 +27,8 @@ FAKE_GH = textwrap.dedent(
     import json, os, subprocess, sys
     scenario = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "scenario.json")))
     args = sys.argv[1:]
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "calls.log"), "a") as fh:
+        fh.write(" ".join(args) + "\\n")
     path = next((a for a in args if a.startswith("repos/")), "").split("?")[0]
     jq = args[args.index("--jq") + 1] if "--jq" in args else "."
     if scenario.get("fail"):
@@ -1015,6 +1017,12 @@ class MergeToDev(GateHarness):
                 self.assert_refused(self.run_gate(), needle, dev_before)
         self.set_scenario({**good(), "compare": "identical"})
         self.assertEqual(self.run_gate("--dry-run").returncode, 0)
+        # the comparison asked is origin's dev against the commit, in that order
+        with open(os.path.join(self.bin, "calls.log")) as fh:
+            asked = [ln.split()[1] for ln in fh if ln.startswith("api ") and "/compare/" in ln]
+        self.assertTrue(asked)
+        want = f"/compare/{dev_before}...{self.origin_ref('autopilot/dev')}?per_page=1"
+        self.assertEqual([a for a in asked if not a.endswith(want)], [], want)
 
     def test_a_branch_named_like_dev_does_not_confuse_the_tips(self):
         # ls-remote matches patterns on the ref name's tail, so branches like
