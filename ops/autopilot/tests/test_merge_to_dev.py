@@ -766,6 +766,7 @@ class MergeToDev(GateHarness):
         self.assertRegex(text, r"\nGIT_GRAFT_FILE=/dev/null\n")
         self.assertRegex(text, r"\nexport [^\n]*\bGIT_GRAFT_FILE\b")
         self.assertIn("-c credential.useHttpPath=false", wrapper.group(1))
+        self.assertIn("-c core.commitGraph=false", wrapper.group(1))
         for call, flags in (("g fetch ", ("--no-recurse-submodules", "--no-write-fetch-head")),
                             ("g push ", ("--no-recurse-submodules", "--no-follow-tags", "--no-verify"))):
             lines = [ln for ln in text.splitlines() if ln.startswith(call)]

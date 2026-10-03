@@ -113,7 +113,8 @@ refuse() {
 }
 
 # The only way git runs here: in $REPO (on the common directory verified in
-# step 0 once that is known), without replace objects or a pager, and with every
+# step 0 once that is known), without replace objects, grafts, a commit-graph
+# file (whose stored parents the ancestry check would trust) or a pager, and with every
 # setting through which a repository's configuration makes git run a command
 # of its choosing pinned off: hooks (the hooks directory is /dev/null, so
 # neither .git/hooks nor a configured core.hooksPath runs), the fsmonitor hook,
@@ -132,7 +133,7 @@ g() {
     fi
     "$GIT" --no-pager --no-replace-objects \
         -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.alternateRefsCommand=true \
-        -c push.gpgSign=false -c maintenance.auto=false -c gc.auto=0 \
+        -c push.gpgSign=false -c maintenance.auto=false -c gc.auto=0 -c core.commitGraph=false \
         -c credential.useHttpPath=false -c core.askPass= -c credential.helper= ${cred[@]+"${cred[@]}"} \
         -C "$REPO" "$@"
 }
