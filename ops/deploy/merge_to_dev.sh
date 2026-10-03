@@ -15,6 +15,8 @@
 #      Actions) succeeded, every other check run on the commit completed as
 #      success, skipped or neutral, and the combined commit status (if any) is
 #      success.
+# Both branch tips are read from the origin itself (git ls-remote), never from
+# the repository's remote-tracking refs, which other processes can repoint.
 # It never touches main; the operator releases dev -> main.
 #
 # It trusts nothing from whoever runs it: bash -p ignores BASH_ENV, ENV and
@@ -23,7 +25,7 @@
 # repository's git directory is the expected main .git or a linked worktree's
 # directory inside it, and then runs git on that verified common directory
 # alone, pinned on every call. Every git call goes through one wrapper that
-# reads no replace refs and turns off the commands a repository's
+# reads no replace refs or grafts and turns off the commands a repository's
 # configuration can make git run (hooks, fsmonitor, the alternate-refs
 # command, a pager, push signing, automatic maintenance, askpass and
 # credential helpers: only the operator's global helper answers, for the
@@ -48,12 +50,15 @@ LANG=C.UTF-8
 # git reads every object as stored, never through refs/replace, so the checks
 # below see the commit that is pushed and nothing standing in for it
 GIT_NO_REPLACE_OBJECTS=1
+# nor through a grafts file in the repository (info/grafts would rewrite a
+# commit's parents as git reads them, for the ancestry and tree checks alike)
+GIT_GRAFT_FILE=/dev/null
 # git never asks anyone for a credential: no terminal prompt, and no askpass
 # program (the loop above cleared GIT_ASKPASS and SSH_ASKPASS with everything
 # else; they are named here so that stays true; core.askPass is pinned in g())
 GIT_TERMINAL_PROMPT=0
 unset GIT_ASKPASS SSH_ASKPASS
-export PATH HOME LANG GIT_NO_REPLACE_OBJECTS GIT_TERMINAL_PROMPT
+export PATH HOME LANG GIT_NO_REPLACE_OBJECTS GIT_GRAFT_FILE GIT_TERMINAL_PROMPT
 umask 022
 
 # --- configuration (constants; tests replace this block in a temporary copy) ---
@@ -128,7 +133,7 @@ g() {
     "$GIT" --no-pager --no-replace-objects \
         -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.alternateRefsCommand=true \
         -c push.gpgSign=false -c maintenance.auto=false -c gc.auto=0 \
-        -c core.askPass= -c credential.helper= ${cred[@]+"${cred[@]}"} \
+        -c credential.useHttpPath=false -c core.askPass= -c credential.helper= ${cred[@]+"${cred[@]}"} \
         -C "$REPO" "$@"
 }
 
@@ -230,12 +235,26 @@ case "$ORIGIN_URL" in
         ;;
 esac
 
-g fetch --quiet --no-recurse-submodules "$ORIGIN_URL" \
+# The fetch only brings the objects. Which commits the two branches are on is
+# read from the origin itself (ls-remote), never from the remote-tracking refs
+# the fetch updates: those live in the shared common directory, where any
+# process using the repository can repoint them while the checks below run.
+# The objects of both commits must then be here.
+g fetch --quiet --no-recurse-submodules --no-write-fetch-head "$ORIGIN_URL" \
     "+refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH" \
     "+refs/heads/$SOURCE_BRANCH:refs/remotes/origin/$SOURCE_BRANCH" \
     || refuse "git fetch of $TARGET_BRANCH and $SOURCE_BRANCH failed"
-tip=$(g rev-parse --verify "refs/remotes/origin/$SOURCE_BRANCH^{commit}") \
-    || refuse "origin/$SOURCE_BRANCH does not exist"
+heads=$(g ls-remote "$ORIGIN_URL" "refs/heads/$TARGET_BRANCH" "refs/heads/$SOURCE_BRANCH") \
+    || refuse "cannot list $TARGET_BRANCH and $SOURCE_BRANCH on origin"
+dev_sha=$(printf '%s\n' "$heads" | awk -F'\t' -v r="refs/heads/$TARGET_BRANCH" '$2 == r { print $1 }')
+tip=$(printf '%s\n' "$heads" | awk -F'\t' -v r="refs/heads/$SOURCE_BRANCH" '$2 == r { print $1 }')
+[[ "$tip" =~ ^[0-9a-f]{40}$ ]] || refuse "origin/$SOURCE_BRANCH does not exist"
+[[ "$dev_sha" =~ ^[0-9a-f]{40}$ ]] || refuse "origin/$TARGET_BRANCH does not exist"
+g cat-file -e "$tip^{commit}" && g cat-file -e "$dev_sha^{commit}" \
+    || refuse "the fetch did not bring origin's current $TARGET_BRANCH and $SOURCE_BRANCH (did one move during the fetch?); try again"
+if [ "$want" = "origin/$SOURCE_BRANCH" ]; then
+    want=$tip
+fi
 sha=$(g rev-parse --verify "${want:-$tip}^{commit}") \
     || refuse "cannot resolve ${want:-$tip}"
 
@@ -243,8 +262,8 @@ sha=$(g rev-parse --verify "${want:-$tip}^{commit}") \
 [ "$sha" = "$tip" ] || refuse "$sha is not the pushed tip of origin/$SOURCE_BRANCH ($tip)"
 
 # 2. fast-forward only
-g merge-base --is-ancestor "refs/remotes/origin/$TARGET_BRANCH" "$sha" \
-    || refuse "origin/$TARGET_BRANCH is not an ancestor of $sha; merge the latest $TARGET_BRANCH into $SOURCE_BRANCH, re-run everything, push, and try again"
+g merge-base --is-ancestor "$dev_sha" "$sha" \
+    || refuse "origin/$TARGET_BRANCH ($dev_sha) is not an ancestor of $sha; merge the latest $TARGET_BRANCH into $SOURCE_BRANCH, re-run everything, push, and try again"
 
 # 3. the final report is a non-empty regular file in the commit
 entry=$(g ls-tree "$sha" -- "$REPORT" | cut -f1)
@@ -257,10 +276,10 @@ size=$(g cat-file -s "$sha:$REPORT") || refuse "cannot read $REPORT in $sha"
 [ "$size" -gt 0 ] || refuse "$REPORT in $sha is empty"
 
 # 4. the CI definition is the one dev already has, or one the operator approved
-dev_ci=$(g rev-parse -q --verify "refs/remotes/origin/$TARGET_BRANCH:.github" || echo none)
+dev_ci=$(g rev-parse -q --verify "$dev_sha:.github" || echo none)
 new_ci=$(g rev-parse -q --verify "$sha:.github" || echo none)
 if [ "$dev_ci" != "$new_ci" ] && ! grep -qxF "$new_ci" "$CI_APPROVALS" 2>/dev/null; then
-    refuse "the CI definition (.github/) in $sha differs from origin/$TARGET_BRANCH, so its checks could have been graded by edited CI; the operator reviews git diff origin/$TARGET_BRANCH $sha -- .github/ and approves it by adding the tree $new_ci as a line of $CI_APPROVALS"
+    refuse "the CI definition (.github/) in $sha differs from origin/$TARGET_BRANCH ($dev_sha), so its checks could have been graded by edited CI; the operator reviews git diff $dev_sha $sha -- .github/ and approves it by adding the tree $new_ci as a line of $CI_APPROVALS"
 fi
 
 # 5. CI on this exact commit: the Pipeline run of the pull request source -> target, by GitHub Actions
@@ -299,7 +318,7 @@ if [ "$dry_run" = 1 ]; then
 fi
 
 refuse_rerouting_config
-g push --no-recurse-submodules "$ORIGIN_URL" "$sha:refs/heads/$TARGET_BRANCH" \
+g push --no-follow-tags --no-verify --no-recurse-submodules "$ORIGIN_URL" "$sha:refs/heads/$TARGET_BRANCH" \
     || refuse "push to origin/$TARGET_BRANCH failed (not a fast-forward any more, or no credential: the gate uses only the credential helper the operator's global git config names for the origin)"
 now=$(g ls-remote "$ORIGIN_URL" "refs/heads/$TARGET_BRANCH" | cut -f1)
 [ "$now" = "$sha" ] || refuse "origin/$TARGET_BRANCH is $now after the push, expected $sha"

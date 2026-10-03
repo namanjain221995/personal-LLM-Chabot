@@ -763,10 +763,20 @@ class MergeToDev(GateHarness):
         self.assertRegex(text, r"\nGIT_TERMINAL_PROMPT=0\n")
         self.assertRegex(text, r"\nexport [^\n]*\bGIT_TERMINAL_PROMPT\b")
         self.assertRegex(text, r"\nunset GIT_ASKPASS SSH_ASKPASS\n")
-        for call in ("g fetch ", "g push "):
+        self.assertRegex(text, r"\nGIT_GRAFT_FILE=/dev/null\n")
+        self.assertRegex(text, r"\nexport [^\n]*\bGIT_GRAFT_FILE\b")
+        self.assertIn("-c credential.useHttpPath=false", wrapper.group(1))
+        for call, flags in (("g fetch ", ("--no-recurse-submodules", "--no-write-fetch-head")),
+                            ("g push ", ("--no-recurse-submodules", "--no-follow-tags", "--no-verify"))):
             lines = [ln for ln in text.splitlines() if ln.startswith(call)]
             self.assertEqual(len(lines), 1, call)
-            self.assertIn("--no-recurse-submodules", lines[0], call)
+            for flag in flags:
+                self.assertIn(flag, lines[0], call + flag)
+        # the remote-tracking refs are only written (by the fetch), never read
+        code = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+        tracking = [ln.strip() for ln in code if "refs/remotes/" in ln]
+        self.assertEqual(tracking, ['"+refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH" \\',
+                                    '"+refs/heads/$SOURCE_BRANCH:refs/remotes/origin/$SOURCE_BRANCH" \\'])
         # $GIT, ${GIT} or "$GIT" is used once, inside the wrapper, and nothing
         # outside the configuration line names the git binary or runs git bare
         uses = re.findall(r"\$\{?GIT\}?(?![A-Za-z0-9_])", text)
@@ -871,6 +881,118 @@ class MergeToDev(GateHarness):
             git(self.wt, "config", "--add", key, value)
         r = self.run_gate()
         self.assert_merged_without(marker, r)
+
+    # ---- P0-18 review: the branch tips come from the origin, not from the shared remote-tracking refs
+    def ci_edit_below_the_tip(self):
+        # The autopilot's history gets a commit that edits the CI definition
+        # (kept as the branch upgrade/ci-edit), then more work on top: dev ->
+        # CI edit -> tip is a fast-forward whose .github/ differs from dev's.
+        self.commit(".github/workflows/scripts/ci_gate.py", "sys.exit(0)  # every check passes now", msg="ci: always pass")
+        git(self.wt, "branch", "-q", "upgrade/ci-edit")
+        edit = git(self.wt, "rev-parse", "HEAD")
+        self.commit("more.txt", "work on top of the CI edit")
+        self.push_tip()
+        return edit
+
+    def repointing_git(self, ref, target):
+        # a git stand-in that points `ref` at `target` before every call made
+        # after the gate's fetch, as a concurrent process sharing the
+        # repository can
+        fetched = os.path.join(self.tmp, "fetched")
+        stand_in = os.path.join(self.tmp, "git-repointing")
+        with open(stand_in, "w") as fh:
+            fh.write(textwrap.dedent(f"""\
+                #!/bin/sh
+                if [ -e '{fetched}' ]; then
+                    /usr/bin/git --git-dir='{self.wt}/.git' update-ref '{ref}' '{target}'
+                fi
+                case " $* " in
+                    *" fetch "*) /usr/bin/git "$@"; rc=$?; : > '{fetched}'; exit $rc ;;
+                esac
+                exec /usr/bin/git "$@"
+                """))
+        os.chmod(stand_in, 0o755)
+        return stand_in, fetched
+
+    def test_a_repointed_dev_ref_cannot_hide_a_ci_change(self):
+        # With refs/remotes/origin/dev pointing at the CI edit, the edit would
+        # look like dev's own CI definition and an ancestor of the tip.
+        dev_before = self.origin_ref("dev")
+        edit = self.ci_edit_below_the_tip()
+        stand_in, fetched = self.repointing_git("refs/remotes/origin/dev", edit)
+        gate = self.make_gate(name="gate-repoint-dev", git_bin=stand_in)
+        r = self.run_gate(gate=gate)
+        self.assertTrue(os.path.exists(fetched), "the stand-in ran after the fetch")
+        self.assertEqual(git(self.wt, "rev-parse", "refs/remotes/origin/dev"), edit, "the ref was repointed")
+        self.assert_refused(r, "CI definition (.github/)", dev_before)
+        self.assertIn(dev_before, r.stderr, "the refusal names origin's dev, not the repointed ref")
+        self.assertNotIn("always pass", git(self.origin, "log", "--format=%s", "dev"))
+
+    def test_a_repointed_source_ref_cannot_offer_an_unpushed_commit(self):
+        # With refs/remotes/origin/autopilot/dev pointing at a commit that was
+        # never pushed, that commit would pass as the pushed tip.
+        dev_before = self.origin_ref("dev")
+        pushed = self.origin_ref("autopilot/dev")
+        self.commit("local.txt", "local only, never pushed")
+        local = git(self.wt, "rev-parse", "HEAD")
+        stand_in, fetched = self.repointing_git("refs/remotes/origin/autopilot/dev", local)
+        gate = self.make_gate(name="gate-repoint-tip", git_bin=stand_in)
+        r = self.run_gate("--dry-run", local, gate=gate)
+        self.assertTrue(os.path.exists(fetched), "the stand-in ran after the fetch")
+        self.assert_refused(r, "is not the pushed tip of origin/autopilot/dev", dev_before)
+        # the branch name means origin's tip, which passes: dev moves there, not to the local commit
+        r = self.run_gate("origin/autopilot/dev", gate=gate)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.origin_ref("dev"), pushed)
+
+    def test_a_background_loop_repointing_dev_never_gets_a_ci_change_merged(self):
+        # The probe from the review: a loop in a linked worktree keeps fetching
+        # the CI edit into the shared refs/remotes/origin/dev (a spelling of
+        # fetch that only writes local refs) while the gate runs.
+        dev_before = self.origin_ref("dev")
+        self.ci_edit_below_the_tip()
+        linked = os.path.join(self.tmp, "llm-dev")
+        git(self.wt, "worktree", "add", "-q", "--detach", linked, "HEAD")
+        gate = self.make_gate(repo=linked, name="gate-race")
+        loop = subprocess.Popen(
+            ["/bin/sh", "-c", f"while :; do git -C '{linked}' fetch -q . "
+                              "+refs/heads/upgrade/ci-edit:refs/remotes/origin/dev 2>/dev/null; done"],
+            start_new_session=True)
+        try:
+            results = [self.run_gate(gate=gate) for _ in range(5)]
+        finally:
+            os.killpg(loop.pid, 9)
+            loop.wait()
+        for r in results:
+            self.assertNotEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("MERGED", r.stderr)
+        self.assertTrue(any("CI definition (.github/)" in r.stderr for r in results),
+                        [r.stderr.strip().splitlines()[-1:] for r in results])
+        self.assertEqual(self.origin_ref("dev"), dev_before)
+        self.assertNotIn("always pass", git(self.origin, "log", "--format=%s", "dev"))
+
+    def test_a_grafts_file_cannot_fake_a_fast_forward(self):
+        # dev moves on without the autopilot; a grafts file that gives the tip
+        # dev's new commit as its parent would pass the ancestry check, and git
+        # push would then trust the same grafted history and rewind dev.
+        other = os.path.join(self.tmp, "other")
+        subprocess.run(["git", "clone", "-q", "-b", "dev", self.origin, other], check=True, capture_output=True)
+        git(other, "config", "user.email", "o@example.invalid")
+        git(other, "config", "user.name", "o")
+        with open(os.path.join(other, "operator.txt"), "w") as fh:
+            fh.write("operator work\n")
+        git(other, "add", "operator.txt")
+        git(other, "commit", "-q", "-m", "operator work on dev")
+        git(other, "push", "-q", "origin", "HEAD:refs/heads/dev")
+        dev_now = self.origin_ref("dev")
+        git(self.wt, "fetch", "-q", "origin", "dev")
+        tip = self.origin_ref("autopilot/dev")
+        os.makedirs(os.path.join(self.wt, ".git", "info"), exist_ok=True)
+        with open(os.path.join(self.wt, ".git", "info", "grafts"), "w") as fh:
+            fh.write(f"{tip} {dev_now}\n")
+        r = self.run_gate()
+        self.assert_refused(r, "is not an ancestor of", dev_now)
+        self.assertEqual(git(self.origin, "log", "-1", "--format=%s", "dev"), "operator work on dev")
 
 
 class GitHttpServer:
