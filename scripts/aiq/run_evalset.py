@@ -7,7 +7,7 @@
   # a run: loopback only, the password from a file, stdin or AIQ_PASSWORD (never the command line)
   $PY scripts/aiq/run_evalset.py --base http://127.0.0.1:28080 --email <account> --password-file <path> \\
       --repeats 1 --workers 1 --label "<stack, image, topology, load>" [--only EV01,RQ03] [--out DIR] \\
-      [--deadline 07:00]
+      [--not-before 05:00 --deadline 07:00]
   # re-score a finished run after a check changed, without calling anything:
   $PY scripts/aiq/run_evalset.py --rescore DIR [--force-rescore]
 
@@ -35,18 +35,38 @@ WORKERS. Use --workers 1 for a baseline: the dev stack's cap allows two
 requests in flight, and Deep Research and fact extraction make parallel
 calls of their own, so a second worker changes the load being measured.
 
-STOPPING. Ctrl-C (or any BaseException reaching the main thread) stops the
-run: no new case or turn starts, queued cases are cancelled, POST /chat/stop
-goes out for every conversation with a case in flight (each outcome in
-results.stopped_on_interrupt), results.json is written with "interrupted"
-true and "finished" set, and the runner exits 130 (SIGINT) or re-raises.
-It then waits for the in-flight case's stream to close (the stop ends the
-generation; the stream's idle limit bounds the wait). --deadline HH:MM is
-the next time the host clock shows HH:MM (local time; the hosts run
-Asia/Kolkata, so 07:00 is the end of the 05:00-07:00 IST window; a time
-already past today means tomorrow): no case starts after it, the cases
-already running finish, and the run ends normally with "deadline_reached"
-true.
+STOPPING. Ctrl-C, SIGTERM and SIGHUP (all three raise KeyboardInterrupt in
+the main thread; a signal the runner was started with ignored, as nohup
+ignores SIGHUP, stays ignored), or any BaseException reaching the main
+thread, stop the run: no new case or turn starts, queued cases are
+cancelled, results.json is written with "interrupted" true and "finished"
+set, THEN POST /chat/stop goes out for every conversation with a case in
+flight and results.json is rewritten with each outcome in
+results.stopped_on_interrupt ({"pending": true} until it is sent), so a
+stop that hangs cannot hide the interruption. interrupted_by names the
+signal (or the exception), and the runner exits 128 + the signal number
+(130 SIGINT, 143 SIGTERM, 129 SIGHUP) or re-raises. A case in flight
+stops reading its stream at the next line it receives (a token, any event,
+or the server's 15 s heartbeat), even when the stop fails and the server
+keeps streaming, and sends its own stop too (its POST /chat may have
+reached the server after main()'s stop did); a stream silent altogether
+is bounded by its read timeout (TIMEOUTS below), and only then can the
+process exit.
+
+WINDOW. --not-before HH:MM and --deadline HH:MM are TODAY's times on the
+host clock (24-hour; the hosts run Asia/Kolkata, so --not-before 05:00
+--deadline 07:00 is the 05:00-07:00 IST window). The runner refuses to
+start (exit 2, before signing in) when either is given and the host's UTC
+offset is not +05:30, unless --tz-ok; when --not-before is still ahead (a
+run meant for 05:00-07:00 cannot start at 04:55); when the deadline has
+already passed (it never rolls over to tomorrow, so a late start cannot
+become a run with no deadline) or is more than 12 h away. No case starts
+after the deadline, and it bounds a case already running: each turn reads
+for at most min(the case's time left, the time to the deadline), and a
+turn the deadline cuts is timed_out with timeout_reason "deadline",
+stopped, and its record's error is "DeadlineCut: ...". The run then ends
+with "deadline_reached" true. conditions keep deadline, not_before,
+utc_offset (always) and tz_ok. A --dry-run checks the HH:MM format only.
 
 ONE (case, repeat). A fresh conversation id; each `attachments` entry is
 uploaded first (POST /uploads, form fields file / conversation_id / purpose);
@@ -70,8 +90,12 @@ min(time left in the case, 60 s) for any byte (the server heartbeats every
 (default 2400) bounds a whole case: the server's own hang guard
 GEN_WALL_CLOCK_S is 1800 s (config.py), and the runner's clock starts
 earlier (uploads, earlier turns), so it must not cut a full-length server
-generation first. A turn cut short is stopped (POST /chat/stop, outcome in
-the record's `stop`) BEFORE its trace is read, and the trace is read once.
+generation first. A turn cut short (timed_out; timeout_reason
+"case_timeout" or "deadline"; a read that times out once the turn's time is
+up is such a cut, not a dead stream) is stopped (POST /chat/stop, outcome
+in the record's `stop`) BEFORE its trace is read, and the trace is read
+once. A case that ends any other way after its stream was opened (an HTTP
+or stream error, an exception) is stopped too: the generation is detached.
 
 TIMING, per turn, float seconds from just before the POST (time.perf_counter),
 null when it never happened (harness.Client.chat):
@@ -88,9 +112,10 @@ null when it never happened (harness.Client.chat):
 The stream is split into lines on "\\n" only (harness.sse_lines): the server
 writes U+2028, U+2029 and U+0085 raw, and a splitlines-style reader cuts a
 frame holding one in two. `terminal` is "done", "error" or null, and
-`bad_frames` counts `data:` lines that were not JSON. `status_events` keeps
-the `status` texts (a blocked tool is downgraded with one such line, main.py
-feature gate), and conditions.features the account's /auth/me feature map.
+`bad_frames` counts `data:` lines that were not a JSON object.
+`status_events` keeps the `status` texts (a blocked tool is downgraded with
+one such line, main.py feature gate), and conditions.features the account's
+/auth/me feature map.
 
 SERVER STAGES, from GET /chat/trace/{meta.trace_id} (db.get_query_trace: the
 root row plus its query_trace_events; app/core/tracing.py), integer ms:
@@ -169,6 +194,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -201,6 +227,10 @@ STREAM_IDLE_S = 60.0
 DEFAULT_CASE_TIMEOUT_S = 2400.0
 EXIT_REFUSED = 2
 EXIT_SIGINT = 130
+#: the hosts' clock: --deadline / --not-before are read on it (the 05:00-07:00 IST window)
+IST_OFFSET = "+05:30"
+#: a --deadline further ahead than this is a typo or the wrong day, not a window
+MAX_DEADLINE_AHEAD = dt.timedelta(hours=12)
 
 #: MASTER_PROMPT §24 latency classes (the eval set has no large-document job).
 #: The same map as baseline.py's; written into every record.
@@ -239,8 +269,16 @@ class LoginFailed(RuntimeError):
     """A worker could not sign in (harness.Client raises SystemExit for that)."""
 
 
+class DeadlineCut(CaseTimeout):
+    """--deadline came while the case was running: its turn was cut and stopped."""
+
+
 class Interrupted(RuntimeError):
-    """The run was stopped (Ctrl-C) between two steps of a case."""
+    """The run was stopped (Ctrl-C, SIGTERM, SIGHUP) during a case."""
+
+
+class Refused(Exception):
+    """A run that must not start (main() exits EXIT_REFUSED with the message)."""
 
 
 # ============================================================ guard rails ==
@@ -422,18 +460,63 @@ class _NoCode:
         return False, "not run: --no-code"
 
 
-def parse_deadline(text: str, now: dt.datetime) -> dt.datetime:
-    """The next moment the clock shows HH:MM after `now` (the same day, or
-    the next one when that time has passed)."""
+def _today_at(text: str, flag: str, now: dt.datetime) -> dt.datetime:
+    """HH:MM (24-hour) as a moment of `now`'s day, or SystemExit for a malformed time."""
     m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", (text or "").strip())
     if not m:
-        raise SystemExit(f"--deadline {text!r}: use HH:MM, 24-hour, the host's local time")
-    at = now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
-    return at if at > now else at + dt.timedelta(days=1)
+        raise SystemExit(f"{flag} {text!r}: use HH:MM, 24-hour, the host's local time")
+    return now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+
+
+def parse_deadline(text: str, now: dt.datetime) -> dt.datetime:
+    """Today's HH:MM. Refused when it has already passed (it never rolls over
+    to tomorrow: a late start must not become a run with no deadline) or is
+    more than MAX_DEADLINE_AHEAD away."""
+    at = _today_at(text, "--deadline", now)
+    if at <= now:
+        raise Refused(f"--deadline {at:%H:%M} has already passed (now {now:%H:%M})")
+    if at - now > MAX_DEADLINE_AHEAD:
+        raise Refused(f"--deadline {at:%H:%M} is more than {MAX_DEADLINE_AHEAD.total_seconds() / 3600:g} h away "
+                      f"(now {now:%H:%M})")
+    return at
+
+
+def parse_not_before(text: str, now: dt.datetime) -> dt.datetime:
+    """Today's HH:MM; refused while it is still ahead, so a run meant for the
+    window that opens then cannot start a few minutes early."""
+    at = _today_at(text, "--not-before", now)
+    if now < at:
+        raise Refused(f"--not-before {at:%H:%M} has not come yet (now {now:%H:%M}); start the run inside its window")
+    return at
 
 
 def _local_now() -> dt.datetime:
     return dt.datetime.now().astimezone()
+
+
+def utc_offset(now: dt.datetime) -> str:
+    """`now`'s UTC offset as +HH:MM."""
+    off = int((now.utcoffset() or dt.timedelta(0)).total_seconds()) // 60
+    return f"{'-' if off < 0 else '+'}{abs(off) // 60:02d}:{abs(off) % 60:02d}"
+
+
+def run_window(args, now: dt.datetime) -> dict:
+    """--deadline and --not-before as today's moments on the host clock, with
+    that clock's UTC offset; Refused when the host is not on IST (unless
+    --tz-ok), the window has not opened, or the deadline has passed."""
+    window: Dict[str, Any] = {"deadline": None, "not_before": None, "utc_offset": utc_offset(now),
+                              "tz_ok": bool(args.tz_ok)}
+    if not (args.deadline or args.not_before):
+        return window
+    if window["utc_offset"] != IST_OFFSET and not args.tz_ok:
+        raise Refused(f"the host's local UTC offset is {window['utc_offset']}, not {IST_OFFSET} (IST): --deadline and "
+                      "--not-before are read on the host clock, so the window would not be the IST one. Pass "
+                      "--tz-ok if host-local time is what you mean")
+    if args.not_before:
+        window["not_before"] = parse_not_before(args.not_before, now)
+    if args.deadline:
+        window["deadline"] = parse_deadline(args.deadline, now)
+    return window
 
 
 # ================================================================ client ==
@@ -486,6 +569,7 @@ class RunControl:
         self.deadline_reached = False
         self._lock = threading.Lock()
         self._inflight: Dict[str, EvalClient] = {}
+        self._halted: Optional[Dict[str, EvalClient]] = None
 
     def may_start(self) -> bool:
         if self.stop.is_set():
@@ -503,11 +587,19 @@ class RunControl:
         with self._lock:
             self._inflight.pop(conversation_id, None)
 
-    def stop_in_flight(self) -> List[dict]:
-        """POST /chat/stop for every conversation with a case running."""
+    def seconds_to_deadline(self) -> Optional[float]:
+        return None if self.deadline is None else self.deadline - time.time()
+
+    def halt(self) -> List[Tuple[str, EvalClient]]:
+        """Set the stop flag; the conversations that had a case in flight when
+        it was first set (a worker that then notices it ends its case and
+        leaves the in-flight set), plus any still in flight now."""
         with self._lock:
-            pending = sorted(self._inflight.items())
-        return [{"conversation_id": conv, **client.stop(conv)} for conv, client in pending]
+            if self._halted is None:
+                self._halted = dict(self._inflight)
+                self.stop.set()
+            self._halted.update(self._inflight)
+            return sorted(self._halted.items(), key=lambda kv: kv[0])
 
 
 # ================================================================= trace ==
@@ -658,6 +750,20 @@ def run_one(get_client: Callable[[], EvalClient], case: dict, repeat: int, out_d
         if control.stop.is_set():
             raise Interrupted(f"the run was stopped before {what}")
 
+    def turn_limit(turn: int) -> Tuple[float, str]:
+        """How long this turn may read, and what bounds it: the case's time
+        left, or the time to --deadline when that comes first."""
+        left = remaining()
+        to_deadline = control.seconds_to_deadline()
+        if to_deadline is None or to_deadline >= left:
+            return left, "case_timeout"
+        if to_deadline <= 0:
+            control.deadline_reached = True
+            raise DeadlineCut(f"--deadline passed before turn {turn}")
+        return to_deadline, "deadline"
+
+    #: a /chat stream was opened: its generation is detached, so a case that ends abnormally stops it
+    opened = False
     try:
         client = _signed_in(get_client)
         control.begin(conv, client)
@@ -677,11 +783,16 @@ def run_one(get_client: Callable[[], EvalClient], case: dict, repeat: int, out_d
         history = [{"role": m["role"], "content": m["content"]} for m in case.get("history") or []]
         for ti, t in enumerate(case["turns"]):
             not_stopped(f"turn {ti + 1}")
+            limit, bound_by = turn_limit(ti + 1)
+            opened = True
             res = client.chat(conv, t["message"], history, case["effort"], web_search=case["web_search"],
                               pdf_uploads=documents if ti == 0 and documents else None,
                               deep_research=bool(case.get("deep_research")), test_case_id=case["id"],
-                              extra={"intent_id": uuid.uuid4().hex}, max_seconds=remaining(),
-                              idle_timeout_s=STREAM_IDLE_S)
+                              extra={"intent_id": uuid.uuid4().hex}, max_seconds=limit,
+                              idle_timeout_s=STREAM_IDLE_S, cancel=control.stop)
+            if res.get("cancelled"):
+                opened = res.get("http") is not None
+                raise Interrupted(f"the run was stopped during turn {ti + 1}")
             timed_out = bool(res.get("timed_out"))
             if timed_out:
                 # first, before the trace or the sandbox: the generation is
@@ -699,7 +810,8 @@ def run_one(get_client: Callable[[], EvalClient], case: dict, repeat: int, out_d
                 "http": res.get("http"), "answer": res.get("answer") or "", "errors": errors,
                 "request_id": res.get("request_id"), "meta": meta,
                 "reasoning_events": res.get("reasoning_events", 0), "reasoning_chars": res.get("reasoning_chars", 0),
-                "timing": res.get("timing") or {}, "timed_out": timed_out, "terminal": res.get("terminal"),
+                "timing": res.get("timing") or {}, "timed_out": timed_out,
+                "timeout_reason": bound_by if timed_out else None, "terminal": res.get("terminal"),
                 "bad_frames": int(res.get("bad_frames") or 0), "status_events": list(res.get("status_events") or []),
                 **reduce_trace(trace),
                 "trace_thinks": trace_thinks(trace),
@@ -719,23 +831,28 @@ def run_one(get_client: Callable[[], EvalClient], case: dict, repeat: int, out_d
                 + (f"  FAILED: {', '.join(failed)}" if failed else ""))
             if res.get("http") != 200:
                 raise ChatFailed(f"/chat returned HTTP {res.get('http')}: {str(res.get('error') or '')[:200]}")
+            if timed_out and bound_by == "deadline":
+                control.deadline_reached = True
+                raise DeadlineCut(f"--deadline came during turn {ti + 1}; the generation was stopped")
             if timed_out:
                 raise CaseTimeout(f"the case ran past --case-timeout-s {case_timeout_s:g}; the generation was stopped")
             if errors:
                 raise StreamFailed(f"the stream ended with {json.dumps(errors[0], ensure_ascii=False)[:200]}")
             history += [{"role": "user", "content": t["message"]}, {"role": "assistant", "content": result["answer"]}]
     except Exception as exc:  # noqa: BLE001 — a crashed case scores 0, with the reason
-        if rec["stop"] is None and client is not None and isinstance(exc, (CaseTimeout, httpx.HTTPError)):
+        if rec["stop"] is None and client is not None and (opened or isinstance(exc, (CaseTimeout, httpx.HTTPError))):
             # the generation is detached: a stream we stopped reading would
-            # otherwise hold one of the stack's two inference slots
+            # otherwise hold one of the stack's two inference slots. Sent for
+            # an interrupted case too, in case its POST /chat reached the
+            # server after main()'s stop did.
             rec["stop"] = client.stop(conv)
         rec["error"] = f"{type(exc).__name__}: {exc}"
         rec["traceback"] = traceback.format_exc()[-2000:]
         log(f"  {case['id']} r{repeat} ERROR {rec['error']}")
     except BaseException:
         # this ends the run (main() handles it when the future yields it);
-        # set the flag first, or this worker takes the next case meanwhile
-        control.stop.set()
+        # halt first, or this worker takes the next case meanwhile
+        control.halt()
         raise
     finally:
         control.end(conv)
@@ -952,7 +1069,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="re-score even when the run was made with a different eval set")
     ap.add_argument("--case-timeout-s", type=float, default=DEFAULT_CASE_TIMEOUT_S,
                     help="the longest one case may take (default 2400: above the server's GEN_WALL_CLOCK_S 1800)")
-    ap.add_argument("--deadline", default="", help="HH:MM, host local time: no case starts after it")
+    ap.add_argument("--deadline", default="", help="HH:MM today, host local time (IST): no case starts after it, "
+                    "and a case running then is cut; refused once it has passed or when more than 12 h away")
+    ap.add_argument("--not-before", default="", help="HH:MM today, host local time (IST): refuse to start earlier")
+    ap.add_argument("--tz-ok", action="store_true",
+                    help="allow --deadline / --not-before on a host whose UTC offset is not +05:30 (recorded)")
     ap.add_argument("--allow-used-account", action="store_true",
                     help="run on an account that already has conversations or saved facts (recorded)")
     ap.add_argument("--no-code", action="store_true",
@@ -1010,11 +1131,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     problems = ES.validate(todo)
     if problems:
         raise SystemExit("the evaluation set is not valid:\n" + "\n".join(problems))
-    deadline = parse_deadline(args.deadline, _local_now()) if args.deadline else None
+    for flag, text in (("--deadline", args.deadline), ("--not-before", args.not_before)):
+        if text:
+            _today_at(text, flag, _local_now())  # the format; a dry run checks no more of the window
 
     if args.dry_run:
         dry_run(todo, base, args.repeats)
         return 0
+
+    try:
+        window = run_window(args, _local_now())
+    except Refused as exc:
+        return _refuse(str(exc))
+    deadline = window["deadline"]
 
     email = args.email or os.environ.get("AIQ_EMAIL", "")
     if not email:
@@ -1045,7 +1174,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                        "health": health_summary(first), "case_timeout_s": args.case_timeout_s,
                        "eval_set_sha256": eval_set_sha256(), "account": account,
                        "features": features_summary(first.me), "code_sandbox": sandbox,
-                       "deadline": deadline.isoformat(timespec="minutes") if deadline else None},
+                       "deadline": deadline.isoformat(timespec="minutes") if deadline else None,
+                       "not_before": (window["not_before"].isoformat(timespec="minutes")
+                                      if window["not_before"] else None),
+                       "utc_offset": window["utc_offset"], "tz_ok": window["tz_ok"]},
         "cases": [],
     }
     results_path = os.path.join(out, "results.json")
@@ -1085,17 +1217,32 @@ def main(argv: Optional[List[str]] = None) -> int:
                 results["cases"] = _sort(results["cases"] + [rec])
                 _write_json(results_path, results)
     except BaseException as exc:
-        # Ctrl-C, or a BaseException out of a worker: start nothing more, stop
-        # what is generating, keep what finished, then let it propagate
-        control.stop.set()
+        # Ctrl-C / SIGTERM / SIGHUP, or a BaseException out of a worker: start
+        # nothing more, keep what finished, stop what is generating, then let
+        # it propagate. results.json says "interrupted" BEFORE the first stop
+        # goes out, so a stop that hangs cannot hide the interruption.
+        in_flight = control.halt()
         pool.shutdown(wait=False, cancel_futures=True)
         results["interrupted"] = True
-        results["interrupted_by"] = type(exc).__name__
-        results["stopped_on_interrupt"] = control.stop_in_flight()
+        results["interrupted_by"] = signal.Signals(_SIGNALLED[-1]).name if _SIGNALLED else type(exc).__name__
+        stops = results["stopped_on_interrupt"] = [{"conversation_id": conv, "pending": True} for conv, _ in in_flight]
         _finish(results, t0, out, control)
-        print(f"\nINTERRUPTED ({type(exc).__name__}): {len(results['cases'])} record(s) kept in {results_path}; "
-              f"/chat/stop sent for {len(results['stopped_on_interrupt'])} conversation(s) in flight",
-              file=sys.stderr, flush=True)
+        sending = -1
+        try:
+            for sending, (conv, cl) in enumerate(in_flight):
+                stops[sending] = {"conversation_id": conv, **cl.stop(conv)}
+        finally:  # a second Ctrl-C during the stops still leaves an honest file
+            for i, entry in enumerate(stops):
+                if entry.pop("pending", None):
+                    entry["error"] = ("outcome unknown: interrupted again while this stop was being sent"
+                                      if i == sending else "not sent: interrupted again before this stop went out")
+            _write_json(results_path, results)
+        try:
+            print(f"\nINTERRUPTED ({results['interrupted_by']}): {len(results['cases'])} record(s) kept in "
+                  f"{results_path}; /chat/stop sent for {len(stops)} conversation(s) in flight",
+                  file=sys.stderr, flush=True)
+        except (OSError, ValueError):  # SIGHUP: the terminal may be gone
+            pass
         raise
     pool.shutdown(wait=True)
     s = _finish(results, t0, out, control)
@@ -1103,8 +1250,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 0
 
 
+#: the signals received, in order (_on_signal); the last one names the interruption
+_SIGNALLED: List[int] = []
+
+
+def _on_signal(signum, frame) -> None:
+    """SIGINT, SIGTERM and SIGHUP all take Ctrl-C's path: KeyboardInterrupt in the main thread."""
+    _SIGNALLED.append(signum)
+    signal.default_int_handler(signum, frame)
+
+
+def install_signal_handlers() -> None:
+    """For the command line only (main() called in-process changes no
+    handler). A signal the runner was started with ignored stays ignored:
+    nohup's SIGHUP is the operator asking the run to outlive the terminal."""
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(sig) is not signal.SIG_IGN:
+            signal.signal(sig, _on_signal)
+
+
 if __name__ == "__main__":
+    install_signal_handlers()
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        sys.exit(EXIT_SIGINT)
+        sys.exit(128 + _SIGNALLED[-1] if _SIGNALLED else EXIT_SIGINT)
