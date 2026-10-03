@@ -67,6 +67,20 @@ case "${DOCKER_HOST:-}" in
   ssh://?*) ;;
   *) die "set DOCKER_HOST=ssh://<worker> on the command line; the dev stack runs only on the worker daemon" ;;
 esac
+# This script cannot know the name of the worker without host data, so it
+# refuses only names that always mean this host, such as localhost or a
+# loopback address. Pinning DOCKER_HOST to the worker is the job of the
+# operator and of the installed autopilot guard, see README.md.
+target="${DOCKER_HOST#ssh://}"
+target="${target#*@}"
+case "$target" in
+  \[*) target="${target%%]*}]" ;;
+  *) target="${target%%[:/]*}" ;;
+esac
+case "${target,,}" in
+  "" | localhost | localhost.* | 127.* | 0.0.0.0 | "[::1]" | "[::]" | "[0:0:0:0:0:0:0:1]" | "[::ffff:127."*)
+    die "DOCKER_HOST=$DOCKER_HOST names this host, not the worker; the dev stack runs only on the worker daemon" ;;
+esac
 
 # A shell variable outranks the dev vars file in Compose interpolation, and
 # these would move the stack, its files or the set of services it starts.
@@ -81,6 +95,15 @@ esac
   die "TECHSARA_DEV_ENGINES_ENV is set in the environment to another value; unset it"
 [ -z "${COMPOSE_PROFILES:-}" ] ||
   die "COMPOSE_PROFILES is set in the environment; the dev stack starts its default services only"
+# A shell value of any of these also outranks the dev files in Compose
+# interpolation: it would replace a generated dev value, move a published
+# port or point OCR at a production engine. Refuse it when set at all, even
+# to an empty value.
+for steer in POSTGRES_PASSWORD POSTGRES_USER POSTGRES_DB SESSION_SECRET API_KEY_PEPPER \
+  ORCHESTRATOR_PORT FRONTEND_PORT TECHSARA_BIND_ADDRESS OCR_REMOTE_BASE_URL; do
+  [ -z "${!steer+set}" ] ||
+    die "$steer is set in the environment and would replace the dev value in Compose interpolation; unset it"
+done
 
 if [ ! -f ops/dev/.env ] || [ ! -f ops/dev/.runtime/orchestrator.env ] || [ ! -f ops/dev/.runtime/engines.env ]; then
   die "the env files of the dev stack are missing; run ops/dev/init-env.sh --main http://<head-address>:<port> first"

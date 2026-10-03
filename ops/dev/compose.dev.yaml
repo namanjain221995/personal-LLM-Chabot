@@ -21,8 +21,10 @@
 #   * restarts: "no" -- a crashed dev container stays down and visible;
 #   * outside services: Salesforce, paid search, speech, the voice archive,
 #     video, OCR and the v1-gateway are off, as literals (below);
-#   * ports: loopback only, never production's 8080/3000; Postgres is not
-#     published at all (use `exec -T postgres psql`);
+#   * ports: loopback only, never production's 8080/3000, written as
+#     literals (127.0.0.1:28080 and 127.0.0.1:23000) so a shell that exports
+#     ORCHESTRATOR_PORT, FRONTEND_PORT or TECHSARA_BIND_ADDRESS cannot move
+#     them; Postgres is not published at all (use `exec -T postgres psql`);
 #   * no bind mounts: with DOCKER_HOST=ssh:// a bind source resolves on the
 #     WORKER's filesystem, where this checkout does not exist.
 name: llmdev
@@ -92,8 +94,9 @@ services:
       - data:/data
       - reports:/reports
       - hf-cache:/root/.cache/huggingface
+    # A literal: a shell variable would outrank any --env-file value.
     ports: !override
-      - "127.0.0.1:${ORCHESTRATOR_PORT:-28080}:8080"
+      - "127.0.0.1:28080:8080"
     # No v1relay: that network exists for the v1-gateway, which dev does not
     # start, and leaving the orchestrator on it would create the pinned
     # 10.231.231.0/28 subnet on the worker for nothing.
@@ -114,13 +117,16 @@ services:
     environment:
       NEXT_PUBLIC_APP_NAME: TechSara AI (dev)
       V1_GATEWAY_URL: ""
+    # A literal, as for the orchestrator.
     ports: !override
-      - "127.0.0.1:${FRONTEND_PORT:-23000}:3000"
+      - "127.0.0.1:23000:3000"
 
   # The dev stack's only way to the model engines: a small proxy that routes
   # /<name>/<rest> to the upstream named <name> (CAP_UPSTREAMS in
-  # engines.env) and holds the whole stack to CAP_MAX_INFLIGHT (2) non-GET
-  # requests at a time. Built from ops/dev/inference_cap/ (its own README).
+  # engines.env) and holds the whole stack to CAP_MAX_INFLIGHT (2) engine
+  # requests at a time. Built from ops/dev/inference_cap/; how it works and
+  # its limits: the docstring of ops/dev/inference_cap/inference_cap.py and
+  # ops/dev/README.md ("Limits of the cap").
   inference-cap:
     <<: *dev-guards
     image: llmdev-inference-cap:dev
@@ -139,8 +145,10 @@ services:
       - /tmp:size=16m
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    mem_limit: 256m
-    memswap_limit: 256m
+    # The cap may hold up to CAP_MAX_BUFFERED_BYTES (512 MiB) of queued
+    # request bodies plus the two in flight; 1 GiB covers that and Python.
+    mem_limit: 1g
+    memswap_limit: 1g
     cpus: 1
     pids_limit: 128
     init: true

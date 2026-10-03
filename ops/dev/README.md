@@ -10,7 +10,7 @@ through a proxy that never lets it have more than two requests in flight.
 | `postgres` | a fresh, empty database (volume `llmdev_pgdata`) | 2 GiB, 2 CPUs |
 | `orchestrator` | the CPU image (`orchestrator/Dockerfile.cpu`), tagged `llmdev-orchestrator:cpu` | 6 GiB, 4 CPUs |
 | `frontend` | the web app, tagged `llmdev-frontend:portable` | 1 GiB, 2 CPUs |
-| `inference-cap` | the engine proxy, built from `ops/dev/inference_cap/` | 256 MiB, 1 CPU |
+| `inference-cap` | the engine proxy, built from `ops/dev/inference_cap/` | 1 GiB (it may buffer up to 512 MiB of queued bodies), 1 CPU |
 
 Not started: `sync-worker` (it logs in to the production Salesforce org),
 `v1-gateway` (public `/v1` traffic), `pgadmin`, `searxng`, and every model
@@ -20,7 +20,7 @@ engine.
 
 | File | Committed | What |
 |---|---|---|
-| `stack.vars` | yes | names, ports, the env-file paths and the outside-service switches; no hosts, no secrets |
+| `stack.vars` | yes | names, the env-file paths and the outside-service switches; no hosts, no secrets, no ports (the overlay writes them as literals) |
 | `compose.dev.yaml` | yes | the overlay on `compose.yaml` |
 | `init-env.sh` | yes | writes the three files below; runs no docker command |
 | `devstack.sh` | yes | `up`, `down`, `status`, `logs`, `smoke`, `seed` |
@@ -28,6 +28,7 @@ engine.
 | `.runtime/orchestrator.env` | no | the generated orchestrator settings; engine URLs point only at `http://inference-cap:9100/...` |
 | `.runtime/engines.env` | no | the cap's upstreams (`CAP_UPSTREAMS`) and limit (`CAP_MAX_INFLIGHT=2`); the only file with engine addresses |
 | `tests/test_dev_stack.py` | yes | renders, script and env-file tests (no daemon needed) |
+| `tests/test_inference_cap.py` | yes | the cap's own tests, against fake upstreams on loopback |
 
 ## Isolation
 
@@ -38,12 +39,27 @@ engine.
   of the three env-file paths to anything else, or `COMPOSE_PROFILES`. The
   autopilot guard renders the project before every mutating Compose command
   and refuses anything that resolves to a `sf-local-ai*` name.
-- **Daemon.** `devstack.sh` refuses unless `DOCKER_HOST` starts with
-  `ssh://`; nothing new runs on the head node (operator rule). It never sets
-  or exports `DOCKER_HOST` itself.
-- **Ports.** Loopback of the worker only: orchestrator `127.0.0.1:28080`,
-  frontend `127.0.0.1:23000`. Postgres is not published (production's file
-  publishes `127.0.0.1:5432`).
+- **Shell variables.** A variable exported in the shell outranks every
+  `--env-file` in Compose interpolation, so `devstack.sh` also refuses to run
+  when any of `POSTGRES_PASSWORD`, `POSTGRES_USER`, `POSTGRES_DB`,
+  `SESSION_SECRET`, `API_KEY_PEPPER`, `ORCHESTRATOR_PORT`, `FRONTEND_PORT`,
+  `TECHSARA_BIND_ADDRESS` or `OCR_REMOTE_BASE_URL` is set, even to an empty
+  value: they would replace the generated secrets, move a published port or
+  point OCR at production's engine. Unset them first (`env -u NAME ...`).
+- **Daemon.** `devstack.sh` requires `DOCKER_HOST=ssh://...`, a Docker daemon
+  reached through an SSH daemon, and never sets or exports `DOCKER_HOST`
+  itself. It has no host data, so it does not know which host is the worker
+  and cannot by itself keep the stack off the head node: any `ssh://`
+  destination that is this host runs the stack on this host. `ssh://localhost`
+  would do exactly that, so the script refuses the names that always mean
+  this host (`localhost`, `127.*`, `0.0.0.0`, `[::1]`); this host's own name
+  or LAN address still passes. What pins the stack to the worker (operator
+  rule: nothing new on the head node) is the operator naming the worker, and
+  for the autopilot the installed guard, which accepts `DOCKER_HOST` only
+  when it names the worker.
+- **Ports.** Loopback of the worker only, written as literals in the overlay:
+  orchestrator `127.0.0.1:28080`, frontend `127.0.0.1:23000`. Postgres is not
+  published (production's file publishes `127.0.0.1:5432`).
 - **Memory.** Every running service has a hard `mem_limit` (swap included),
   `cpus`, `pids_limit` and `oom_score_adj: 1000`, so under memory pressure the
   kernel kills dev containers before anything else; `restart: "no"` keeps a
@@ -65,7 +81,25 @@ engine.
 Only the main model engine, through `inference-cap`: the orchestrator's engine
 URLs are `http://inference-cap:9100/<name>/...` and the cap forwards to the
 upstream named `<name>` in `.runtime/engines.env`. It holds the whole dev stack
-to **at most two in-flight non-GET requests** (health probes are GETs).
+to **at most two in-flight engine requests**: every request with a body, and
+every method other than GET and HEAD, takes one of two slots; bodiless GET and
+HEAD (model lists, health probes) do not.
+
+### Limits of the cap
+
+- **Priority is not enforced.** The engines schedule first come, first served;
+  they do not know which requests come from dev. The cap only limits the dev
+  stack's share to two in-flight requests; a dev request already running
+  competes with production's on equal terms.
+- **Queue and buffer.** A request that finds both slots busy waits in a queue
+  of at most `CAP_MAX_QUEUED` (4) requests, whose bodies are buffered in the
+  cap's memory up to `CAP_MAX_BUFFERED_BYTES` (512 MiB) in total. A full
+  queue or a full buffer is answered at once with `503` and `Retry-After`, so
+  callers must retry later; a single body over `CAP_MAX_BODY_BYTES`
+  (128 MiB) is refused outright. The container's `mem_limit` (1 GiB) is sized
+  for that buffer plus the two requests in flight.
+- **Not in CI yet.** `ops/dev/tests` are not run by CI: adding them changes
+  `.github/`, which waits for the operator. Run them by hand (Tests, below).
 
 Heavy and long-context tests (large prompts, long generations, concurrency
 runs, evaluations) only in the measured low-traffic window: **05:00-07:00 IST**,
@@ -125,7 +159,8 @@ To use the web app, forward the worker's loopback ports, for example
 `ssh -N -L 23000:127.0.0.1:23000 -L 28080:127.0.0.1:28080 <worker>`, then open
 `http://127.0.0.1:23000`.
 
-`/health` reporting `degraded` is expected with engines disabled; the
+`/health` reporting `degraded` is expected: its `duckdb` check fails because
+the dev stack has no Salesforce warehouse (no sync-worker ever fills it). The
 container healthcheck needs only `checks.app_db.status == "ok"`.
 
 Notes for the autopilot guard: it renders the project (`docker compose ...
@@ -192,9 +227,13 @@ volume.
 ## Tests
 
 ```bash
-python3 -m pytest ops/dev/tests/test_dev_stack.py -q -p no:cacheprovider
+python3 -m pytest ops/dev/tests/test_dev_stack.py ops/dev/tests/test_inference_cap.py -q -p no:cacheprovider
 ```
 
-They render the dev and the production chains with `docker compose ... config`
-(no daemon; skipped without Docker Compose), run `init-env.sh` against a fake
-`/v1/models` server on loopback, and run `devstack.sh` against a stub `docker`.
+`tests/test_dev_stack.py` renders the dev and the production chains with
+`docker compose ... config` (no daemon; skipped without Docker Compose), runs
+`init-env.sh` against a fake `/v1/models` server on loopback, and runs
+`devstack.sh` against a stub `docker`. `tests/test_inference_cap.py` runs the
+cap against fake upstream engines on loopback (in process, except the exit
+code and SIGTERM drain tests). Neither is run by CI yet
+(see "Limits of the cap").

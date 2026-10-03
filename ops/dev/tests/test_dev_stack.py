@@ -44,9 +44,15 @@ ENGINE_URL_KEYS = (
 )
 MAIN_ID = "Qwen/Qwen3.6-35B-A3B-NVFP4"  # in config/model-manifest.yaml
 ROUTER_ID = "Qwen/Qwen3-VL-8B-Instruct-FP8"  # in config/model-manifest.yaml
+# Shell variables that outrank the dev files in Compose interpolation and that
+# devstack.sh therefore refuses when they are set at all.
+REFUSED_SHELL_VARS = (
+    "POSTGRES_PASSWORD", "POSTGRES_USER", "POSTGRES_DB", "SESSION_SECRET", "API_KEY_PEPPER",
+    "ORCHESTRATOR_PORT", "FRONTEND_PORT", "TECHSARA_BIND_ADDRESS", "OCR_REMOTE_BASE_URL",
+)
 # Variables that would steer a compose render or a script away from what the
 # test means to check; removed from every child environment.
-_STEERING = re.compile(r"^(TECHSARA_|COMPOSE_|DOCKER_|DEV_ENV_DIR$|DEV_INIT_)")
+_STEERING = re.compile(r"^(TECHSARA_|COMPOSE_|DOCKER_|DEV_ENV_DIR$|DEV_INIT_|(%s)$)" % "|".join(REFUSED_SHELL_VARS))
 
 
 def clean_env(**extra: str) -> dict:
@@ -132,9 +138,9 @@ def env_paths(out_dir: Path) -> tuple[Path, Path, Path]:
     return out_dir / ".env", out_dir / ".runtime" / "orchestrator.env", out_dir / ".runtime" / "engines.env"
 
 
-def compose_json(args: list[str], env: dict) -> dict:
-    done = subprocess.run(["docker", "compose", *args, "config", "--format", "json"], cwd=ROOT, env=env,
-                          capture_output=True, text=True, timeout=120)
+def compose_json(args: list[str], env: dict, *config_args: str) -> dict:
+    done = subprocess.run(["docker", "compose", *args, "config", "--format", "json", *config_args], cwd=ROOT,
+                          env=env, capture_output=True, text=True, timeout=120)
     if done.returncode != 0:
         raise AssertionError(f"docker compose config failed: {done.stderr[-2000:]}")
     return json.loads(done.stdout)
@@ -165,6 +171,7 @@ class DevRenderTest(unittest.TestCase):
             f"TECHSARA_DEV_ENGINES_ENV={engines}\n",
             encoding="utf-8",
         )
+        cls.secrets_file, cls.generated = secrets_file, generated
         cls.args = ["--env-file", "ops/dev/stack.vars", "--env-file", str(secrets_file), "--env-file", str(override),
                     "-f", "compose.yaml", "-f", "ops/dev/compose.dev.yaml", "-p", "llmdev"]
         cls.doc = compose_json(cls.args, clean_env())
@@ -221,10 +228,29 @@ class DevRenderTest(unittest.TestCase):
                 self.assertEqual(str(svc.get("memswap_limit")), str(svc.get("mem_limit")))
         gib = 1024 ** 3
         expected = {"postgres": (2 * gib, 2), "orchestrator": (6 * gib, 4), "frontend": (gib, 2),
-                    "inference-cap": (256 * 1024 ** 2, 1)}
+                    "inference-cap": (gib, 1)}
         for name, (mem, cpus) in expected.items():
             self.assertEqual(int(self.services()[name]["mem_limit"]), mem, name)
             self.assertEqual(float(self.services()[name]["cpus"]), float(cpus), name)
+
+    def test_the_cap_has_room_for_its_queued_bodies(self) -> None:
+        # The cap may buffer up to 512 MiB of queued request bodies
+        # (CAP_MAX_BUFFERED_BYTES) plus the two requests in flight.
+        cap = self.services()["inference-cap"]
+        self.assertGreaterEqual(int(cap["mem_limit"]), 1024 ** 3)
+        self.assertGreaterEqual(int(cap["memswap_limit"]), 1024 ** 3)
+
+    def test_orchestrator_reads_only_the_two_dev_env_files(self) -> None:
+        # Without `env_file: !override` compose.yaml's own list (the worktree
+        # root's .env and the production secrets layer) would come back. A
+        # plain render folds env files into `environment`; this one keeps them.
+        doc = compose_json(self.args, clean_env(), "--no-env-resolution")
+        entries = doc["services"]["orchestrator"]["env_file"]
+        paths = [Path(e["path"] if isinstance(e, dict) else e).resolve() for e in entries]
+        self.assertEqual(paths, [self.secrets_file.resolve(), self.generated.resolve()])
+        for entry in entries:
+            if isinstance(entry, dict):
+                self.assertTrue(entry.get("required", True), entry)
 
     def test_no_bind_mounts_anywhere(self) -> None:
         for name, svc in self.services().items():
@@ -291,6 +317,20 @@ class DevRenderTest(unittest.TestCase):
         self.assertEqual(env["SF_LIVE_ENABLED"], "false")
         self.assertEqual(env["SF_CLIENT_SECRET"], "")
 
+    def test_a_hostile_shell_cannot_move_ports_or_point_ocr_at_an_engine(self) -> None:
+        # The published ports are literals and OCR_BASE_URL is a literal, so
+        # the shell values below change nothing in the default services.
+        doc = compose_json(self.args, clean_env(ORCHESTRATOR_PORT="8080", FRONTEND_PORT="3000",
+                                                TECHSARA_BIND_ADDRESS="0.0.0.0",
+                                                OCR_REMOTE_BASE_URL="http://192.0.2.10:1/v1"))
+        published = sorted((name, port.get("host_ip"), str(port.get("published")), str(port.get("target")))
+                           for name, svc in doc["services"].items() for port in svc.get("ports") or [])
+        self.assertEqual(published, [("frontend", "127.0.0.1", "23000", "3000"),
+                                     ("orchestrator", "127.0.0.1", "28080", "8080")])
+        env = doc["services"]["orchestrator"]["environment"]
+        self.assertEqual(env["OCR_BASE_URL"], DISABLED_URL)
+        self.assertNotIn("192.0.2.10", json.dumps(doc["services"]))
+
 
 # --------------------------------------------------------------------------
 # (b) The production render is unchanged by ops/dev/
@@ -326,13 +366,14 @@ class ProductionRenderTest(unittest.TestCase):
     def test_stack_vars_names_only_dev_values(self) -> None:
         values = read_env(STACK_VARS)
         self.assertEqual(values["TECHSARA_STACK"], "llmdev")
-        self.assertEqual(values["TECHSARA_BIND_ADDRESS"], "127.0.0.1")
         self.assertEqual(values["SF_LIVE_ENABLED"], "false")
-        self.assertNotIn(values["ORCHESTRATOR_PORT"], {"8080"})
-        self.assertNotIn(values["FRONTEND_PORT"], {"3000"})
+        # The published ports are literals in the overlay; a value here would
+        # only suggest a knob that does not move them.
+        for key in ("ORCHESTRATOR_PORT", "FRONTEND_PORT", "TECHSARA_BIND_ADDRESS"):
+            self.assertNotIn(key, values)
         for key in ("TECHSARA_SECRET_ENV", "TECHSARA_GENERATED_ENV", "TECHSARA_DEV_ENGINES_ENV"):
             self.assertTrue(values[key].startswith("ops/dev/"), key)
-        # Non-empty values only for names, ports, paths and switches: no hosts.
+        # Non-empty values only for names, paths and switches: no hosts.
         text = STACK_VARS.read_text(encoding="utf-8")
         self.assertIsNone(re.search(r"\b\d{1,3}(\.\d{1,3}){3}\b(?!\.)", text.replace("127.0.0.1", "")))
         self.assertNotIn("://", text)
@@ -619,6 +660,31 @@ class DevstackTest(unittest.TestCase):
                 done = self.run_devstack("up", docker_host=host)
                 self.assertNotEqual(done.returncode, 0)
                 self.assertEqual(self.calls(), [])
+
+    def test_refuses_ssh_to_this_host(self) -> None:
+        # The script cannot know the worker's name; it refuses only the names
+        # that always mean this host (the guard pins the worker).
+        for host in ("ssh://localhost", "ssh://LocalHost:22", "ssh://user@localhost", "ssh://localhost.localdomain",
+                     "ssh://127.0.0.1", "ssh://user@127.0.0.2:2222", "ssh://0.0.0.0", "ssh://[::1]",
+                     "ssh://user@[::1]:22", "ssh://user@", "ssh://:22"):
+            with self.subTest(host=host):
+                done = self.run_devstack("up", docker_host=host)
+                self.assertEqual(done.returncode, 2, done.stderr)
+                self.assertIn("devstack:", done.stderr)
+                self.assertEqual(self.calls(), [])
+        for host in ("ssh://192.0.2.10", "ssh://user@192.0.2.10:22", "ssh://worker.example"):
+            with self.subTest(host=host):
+                self.assertEqual(self.run_devstack("status", docker_host=host).returncode, 0, host)
+        self.assertEqual(len(self.calls()), 3)
+
+    def test_refuses_shell_values_that_outrank_the_dev_files(self) -> None:
+        for key in REFUSED_SHELL_VARS:
+            for value in ("x", ""):
+                with self.subTest(key=key, value=value):
+                    done = self.run_devstack("up", **{key: value})
+                    self.assertEqual(done.returncode, 2, done.stderr)
+                    self.assertIn(f"{key} is set in the environment", done.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_up_uses_exactly_the_literal_flags(self) -> None:
         done = self.run_devstack("up")
