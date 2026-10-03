@@ -2,6 +2,22 @@
 
 History of the programme, newest first. Designed ≠ Implemented ≠ Tested ≠ Deployed; each entry says which.
 
+## 2026-10-03 — Autopilot cycle 2 (07:30–about 10:00 UTC)
+
+Cycle 1 (07:21–07:30 UTC) ended by SIGTERM when the operator restarted the service to add decision 10; it had committed 7ccbe9eb locally. Cycle 2 ran the work in parallel (decision 10): one agent for P0-14, a 7-agent workflow for P0-15, a 6-agent workflow for Phase A, one agent for A-05, one fresh reviewer for the P0-15 patch. Each worked in its own worktree under `~/work` on its own files; this session integrated. Nothing touched production; nothing is installed or deployed.
+
+| Item | State | Evidence (command → result) |
+|---|---|---|
+| P0-13 CI of PR #98 | TEST_PASSED | Run 37106060235 (bb0ac9f9): `1 failed, 4991 passed` in shard 3, `test_concurrent_callers_share_the_probe_in_flight`. Run 37108039568 (49489640): `1 failed, 5607 passed` in shard 1, `test_a_fatal_clip_cancels_its_siblings_instead_of_leaving_them_decoding`. Run 37109933435 (242bd04d): `1 failed, 6179 passed` in shard 2, `test_two_hours_transcribe_word_for_word_with_no_ceiling_and_flat_memory` (known flake); `gh run rerun --failed` → `completed success`; `gh pr checks 98` → all pass |
+| Health-cache flake fix (49489640) | Implemented, TEST_PASSED | Cause: the uncached engine overlay carries real-clock ages rounded to 0.1 s (`breaker` `since_s`): a probe printed `since_s: 0.1 -> 0.2` across 0.15 s. A reproduction with a 0.12 s pause per caller fails on the old fixture, passes on the new one; `tests/test_health_dependency_cache.py` → `43 passed` |
+| Video sibling-cancel flake fix (242bd04d) | Implemented, TEST_PASSED | Cause: window 0 raised while the sibling was still building its clip in a worker thread. With every clip build after the first slowed by 0.3 s: old test `assert 0 >= 1` (as on CI), new test passes; both changed files → `46 passed` |
+| P0-14 skew list (ba1f619d) | Implemented, TEST_PASSED | See TASK_BOARD P0-14: strict `3 failed, 16982 passed`; `main` `23 failed, 344 passed` on the candidate files; remote `16962 passed, 49 skipped, 30 xfailed, 1 xpassed`, 0 failed |
+| P0-15 guardrail review and fixes (95622dc6, 435a7196, df091d61, a8ad8b28) | Implemented, TEST_PASSED, not installed (NH-007) | `orchestrator/.venv/bin/python -m pytest ops/autopilot/tests -q` → `82 passed, 852 subtests passed`; each case added for the second review fails on the previous guard and passes now; hook latency about 33 ms median, 99 ms worst (second reviewer's measurement) |
+| Gate under a cleared environment | TEST_PASSED | `env -i HOME=… PATH=/usr/bin:/bin /usr/bin/gh api repos/<slug> --jq .full_name` → the repository name; `env -i … /usr/bin/git push --dry-run origin HEAD:refs/heads/autopilot/dev` → `Everything up-to-date` |
+| Phase A discovery (91421fb1) | Documented (code evidence) | `DISCOVERY.md`, 579 lines; host-detail scan clean |
+| A-05 capability registry (c418519f) | Documented (metadata) | `CONTEXT_CAPACITY.md`; GETs of `/v1/models`, `/version`, `/metrics` and 5 tiny `/tokenize` calls; no generation |
+| Lint and shards on the merged tree | TEST_PASSED | `ruff_gate.py` → clean; `shard_tests.py --check --of 3` → exit 0 |
+
 ## 2026-10-03 — Phase 0 (interactive bootstrap sessions)
 
 ### First session (refused at the runner)
