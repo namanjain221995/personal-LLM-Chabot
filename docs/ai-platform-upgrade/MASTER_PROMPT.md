@@ -43,6 +43,7 @@ These decisions were made by the operator after Phase 0 discovery. Where any tex
 7. **Isolation before the runner.** Compose project, volume and image names are parameterized in the compose files with today's values as defaults (production output unchanged), and the dev stack uses its own values on the worker's Docker daemon; the guard blocks any `docker compose` command that resolves to the production project. Database tests run against the dedicated test database on the worker node; tests refuse to run unless `TEST_DATABASE_URL` points at an allowed host and port and a database whose name ends in `_test`; the shared-test-server default is removed; tests that fail only because of clock skew between the nodes are marked as known failures when the test database is remote.
 8. **Status board.** A draft PR `autopilot/dev → dev`. It also produces the CI runs that `merge_to_dev.sh` checks (a push to `autopilot/dev` alone triggers no CI).
 9. **Runner.** On 2026-10-03 the operator approved creating and starting the unattended runner described in §5.5 (`ops/autopilot/autopilot.py`, `claude -p --permission-mode auto` cycles on this host with `~/.llm-autopilot/settings.autopilot.json`, as a systemd user service).
+10. **Multiple agents (2026-10-03).** Run independent parts of every task in parallel with multiple agents: the Agent tool, and the Workflow tool for multi-agent orchestration (the operator opts in), as many as the work needs. Keep file ownership disjoint: parallel edits go in separate worktrees under `~/work`, and one agent integrates.
 
 ---
 
