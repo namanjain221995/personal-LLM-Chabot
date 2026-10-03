@@ -971,8 +971,27 @@ CURL_METRICS_ALLOW = [
     "curl --get --data-urlencode query=up http://127.0.0.1:9090/api/v1/query",
     "curl -G -d @/tmp/llmdev-x.json http://127.0.0.1:9090/api/v1/query",
     "curl -s 'http://127.0.0.1:9090/api/v1/query?query=up'",
+    "curl -sS -G -o /tmp/llmdev-q.json --data-urlencode 'query=up' http://127.0.0.1:9090/api/v1/query",
+    "curl -sG --max-time 5 --data-urlencode 'query=up' http://127.0.0.1:9090/api/v1/query",
+    "curl -G -X GET -d 'query=up' http://127.0.0.1:9090/api/v1/query",
+    "curl -sGoG -d 'query=up' http://127.0.0.1:9090/api/v1/query",  # -s -G -o G: a GET
 ]
 CURL_METRICS_DENY = [
+    # -G turns -d into the query string of its own request only: uploads, forms,
+    # --json, a config file the guard cannot read, a non-GET method and a later
+    # request after --next / -: stay mutations
+    "curl -G -T /tmp/x http://127.0.0.1:9000/api/endpoints",
+    "curl -G --upload-file /tmp/x http://127.0.0.1:8080/x",
+    "curl -G -F a=b http://127.0.0.1:8080/x",
+    "curl -G --form a=b http://127.0.0.1:8080/x",
+    "curl -G --json '{}' http://127.0.0.1:8080/x",
+    "curl -G -K /tmp/cfg http://127.0.0.1:8080/x",
+    "curl -G -X PROPFIND http://127.0.0.1:8080/x",
+    "curl -G -d a http://127.0.0.1:9090/api/v1/query --next -d x http://127.0.0.1:8080/api/x",
+    "curl -G -d a http://127.0.0.1:9090/api/v1/query -: -d x http://127.0.0.1:8080/api/x",
+    # the G of -oG is -o's file name, and a -G after a value-taking option is its value
+    "curl -oG -d x http://127.0.0.1:8080/api/x",
+    "curl --user-agent -G -d x http://127.0.0.1:8080/api/x",
     # an explicit mutating method is a mutation even with -G
     "curl -X POST -G -d a=1 http://127.0.0.1:9090/api/v1/query",
     "curl -X DELETE http://127.0.0.1:8080/admin/users/1",
@@ -1054,6 +1073,16 @@ DOCKER_INFO_DENY = [
     "docker scout enroll org",
     "docker --config=/tmp/x --version",   # --config is refused before --version
     "docker --context other --help",
+    # an informational option is allowed only on its own
+    "docker -v run alpine",
+    "docker --help run alpine",
+    "docker help rm -f sf-local-ai-orchestrator-1",
+    # scout writes no files and records nothing in a Scout environment
+    "docker scout sbom --output ~/.llm-autopilot/guard/guard_hook.py alpine",
+    "docker scout sbom -o /tmp/x alpine",
+    "docker scout cves --output=/tmp/x alpine",
+    "docker scout environment staging llmdev-x:1",
+    "docker scout env staging llmdev-x:1",
 ]
 
 
@@ -1073,6 +1102,9 @@ class GuardInlineCodePathMention(unittest.TestCase):
             "python3 -c \"import pathlib; pathlib.Path('/tmp/llmdev-z').write_text('note: ~/.llm-autopilot/guard')\"",
             "python3 -c \"import pathlib; print(pathlib.Path('~/.llm-autopilot/guard').read_text())\"",
             "node -e \"require('fs').writeFileSync('/tmp/llmdev-a', JSON.stringify({note:'~/.llm-autopilot'}))\"",
+            "python3 -c \"import shutil; shutil.copy('/tmp/llmdev-a', '/tmp/llmdev-b'); print('~/.llm-autopilot')\"",
+            "python3 -c \"import os; os.chdir('/tmp'); open('llmdev-n','w')\"",
+            "python3 -c \"print(open('/tmp/llmdev-x','rb').read(), '~/.llm-autopilot')\"",
         ]
         for cmd in allow:
             with self.subTest(cmd=cmd):
@@ -1081,12 +1113,29 @@ class GuardInlineCodePathMention(unittest.TestCase):
 
     def test_write_at_protected_path_is_refused(self):
         deny = [
-            "python3 -c \"open('/home/techsphere/.llm-autopilot/guard/x','w').write('y')\"",
-            "python3 -c \"import os; os.remove('/home/techsphere/.llm-autopilot/guard/guard_hook.py')\"",
-            "python3 -c \"import shutil; shutil.rmtree('/home/techsphere/.llm-autopilot/agent')\"",
+            f"python3 -c \"open('{HOME}/.llm-autopilot/guard/x','w').write('y')\"",
+            f"python3 -c \"import os; os.remove('{HOME}/.llm-autopilot/guard/guard_hook.py')\"",
+            f"python3 -c \"import shutil; shutil.rmtree('{HOME}/.llm-autopilot/agent')\"",
             "python3 -c \"import pathlib; pathlib.Path('~/.llm-autopilot/guard/guard_hook.py').expanduser().write_text('')\"",
-            "python3 -c \"p='/home/techsphere/.llm-autopilot/guard/x'; open(p,'w')\"",
+            f"python3 -c \"p='{HOME}/.llm-autopilot/guard/x'; open(p,'w')\"",
             "node -e \"require('fs').rmSync(require('os').homedir() + '/.llm-autopilot/guard', {recursive: true})\"",
+            # a relative target after a chdir, and a literal name made into a link
+            f"python3 -c \"import os; os.chdir('{HOME}/.llm-autopilot/guard'); open('guard_hook.py','w')\"",
+            f"node -e \"process.chdir('{HOME}/.llm-autopilot/guard'); require('fs').writeFileSync('guard_hook.py','')\"",
+            f"python3 -c \"import os; os.symlink('{HOME}/.llm-autopilot/guard/guard_hook.py','/tmp/l'); open('/tmp/l','w')\"",
+            f"python3 -c \"import os; os.link('/tmp/x', '{HOME}/.llm-autopilot/guard/x')\"",
+            # the destination of a copy / move / rename is a target too
+            f"python3 -c \"import shutil; shutil.copy('/tmp/x', '{HOME}/.llm-autopilot/bin/merge_to_dev.sh')\"",
+            f"python3 -c \"import shutil; shutil.move('/tmp/x', '{HOME}/.llm-autopilot/settings.autopilot.json')\"",
+            f"python3 -c \"import os; os.rename('/tmp/x', '{HOME}/.llm-autopilot/guard/guard_hook.py')\"",
+            f"python3 -c \"import os; os.replace('/tmp/x', '{HOME}/.llm-autopilot/guard/guard_hook.py')\"",
+            # computed targets while a protected root is present
+            f"python3 -c \"d='{HOME}/.llm-autopilot'; open(d+'/guard/x','w')\"",
+            f"python3 -c \"h='{HOME}'; open(f'{{h}}/.llm-autopilot/guard/x','w')\"",
+            "python3 -c \"import pathlib; p = pathlib.Path.home() / '.llm-autopilot' / 'guard' / 'x'; p.write_text('')\"",
+            f"python3 -c \"import pathlib; (pathlib.Path('{HOME}/.llm-autopilot') / 'guard' / 'x').write_text('')\"",
+            # 'r+' writes
+            f"python3 -c \"open('{HOME}/.llm-autopilot/guard/guard_hook.py','r+').write('')\"",
         ]
         for cmd in deny:
             with self.subTest(cmd=cmd):
@@ -1110,12 +1159,23 @@ FIND_EXEC_DENY = [
     "find ~/.claude/projects -name '*.jsonl' -exec cp /dev/null {} \\;",
     "find . -name '*.py' -exec sudo rm {} \\;",
     "find . -name .env -exec cat {} +",
+    # commands that write one of their {} operands are not readers
+    "find ~/work -exec sort -o {} {} \\;",
+    "find . -name '*.py' -exec sort -o {} {} \\;",
+    "find ~/work -exec uniq {} {} \\;",
+    "find ~/work -name '*.md' -exec xxd {} {} \\;",
+    "find ~/work -exec rg --pre ./x y {} +",
+    # a secret file as the starting path, wherever it stands
+    "find " + PROD + "/.env -exec cat {} \\;",
+    "find " + PROD + "/.env -exec head {} +",
+    "find -exec cat {} \\; " + PROD + "/.env",
 ]
 
 
 class GuardFindExecReading(Lists):
     def test_find_exec_reading_vs_mutating(self):
         self.check(FIND_EXEC_ALLOW, FIND_EXEC_DENY)
+
 
 
 if __name__ == "__main__":
