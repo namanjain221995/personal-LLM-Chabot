@@ -16,7 +16,7 @@ History of the programme, newest first. Designed ≠ Implemented ≠ Tested ≠ 
 | Review of 9afe1f6a | Reviewed: fix_first | 383 cases, 18,000 fuzz inputs; 6 regressions in the `find` and argument-joining handling, fixed in 4ff6bbac |
 | P0-16 after 4ff6bbac | Implemented, TEST_PASSED | Same suite → `118 passed, 852 subtests passed`. The 383-case replay: no input refused by base and allowed by branch that runs anything (7 quoted `';'` arguments remain, which bash passes as data). Spec corpus replay (2,309 inputs): 3 new refusals (2 correct, 1 false positive → P0-19), 7 read-only relaxations, 0 internal errors, p99 1.04 ms in-process |
 | P0-16 merge (04e55f06) | Merged on autopilot/dev, TEST_PASSED, not installed | Merged-tree suite → `152 passed, 859 subtests passed` |
-| Last review of fb29fb03..4ff6bbac | TEST_NOT_RUN at checkpoint time | A fresh reviewer was still running when this entry was written; see `RESUME.md` |
+| Last review of fb29fb03..4ff6bbac | Reviewed: fix_first, fixed | 141 new cases plus the earlier 383, malformed `find` inputs: no fail-open; 1 regression (an argument-joining tool's operands skipped the secret-file check; the tool is not installed here), fixed in e969264c, merged b21088b3 → `152 passed, 859 subtests passed` |
 | P0-17 (11550954) | TEST_PASSED, not installed | Suite on 11550954 → `116 passed, 859 subtests passed` |
 | P0-17 re-QA | Reviewed: fix_first | The first QA's blocking item is fixed. 3 new blocking items → P0-18 (host-only `p0-17-reqa-2026-10-03.md`) |
 | P0-18 (c23b17e2..ea25fba1) | Implemented, TEST_PASSED by the builder, review pending | Builder's suite → `130 passed, 893 subtests passed`; each new test fails on the previous code (builder's check) |

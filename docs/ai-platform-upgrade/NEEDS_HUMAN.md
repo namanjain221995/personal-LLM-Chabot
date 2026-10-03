@@ -24,12 +24,12 @@ Items only the operator can resolve. Each has the exact action, why, the risk, t
 
 ## NH-007 — Install the reviewed guardrail fixes (OPEN, action)
 
-- **What:** P0-15, P0-16 and P0-17 (and P0-18 once merged) fixed the review findings in the guard hook, the deny rules, the runner and the dev gate (`ops/autopilot/`, `ops/deploy/merge_to_dev.sh`; P0-16 merged into `autopilot/dev` at 04e55f06). The autopilot may not install its own guardrails (§3.3), so the running copies in `~/.llm-autopilot/` are still the Phase 0 ones.
+- **What:** P0-15, P0-16 and P0-17 (and P0-18 once merged) fixed the review findings in the guard hook, the deny rules, the runner and the dev gate (`ops/autopilot/`, `ops/deploy/merge_to_dev.sh`; P0-16 merged into `autopilot/dev` at 04e55f06 and b21088b3). The autopilot may not install its own guardrails (§3.3), so the running copies in `~/.llm-autopilot/` are still the Phase 0 ones.
 - **Why:** the installed guard lacks every fix since Phase 0. The host-only reports `~/.llm-autopilot/agent/private/p0-15-review-2026-10-03.md`, `p0-16-sweep-2026-10-03.md` (see "Found while fixing") and `p0-17-reqa-2026-10-03.md` say why installing matters.
 - **Best moment:** after P0-18 is merged (see `RESUME.md`), so one install carries the gate fixes too. Installing earlier is safe; re-run it after P0-18.
 - **Command** (outside any autopilot session; `install.sh` refuses inside one):
   ```bash
-  cd ~/work/llm-dev && git log -1 --oneline   # a commit at or after 04e55f06
+  cd ~/work/llm-dev && git log -1 --oneline   # a commit at or after b21088b3
   ops/autopilot/install.sh --restart-after-cycle
   ```
   It re-installs the hook, settings, runner, gate and `status.sh`, then touches `STOP`, waits for the running cycle to end (up to its 4 h limit), removes `STOP` and starts the new runner. Do not use `systemctl --user restart`: it would kill the cycle in flight.
