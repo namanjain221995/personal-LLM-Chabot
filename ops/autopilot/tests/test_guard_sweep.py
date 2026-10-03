@@ -102,8 +102,8 @@ QUOTING_ALLOW = [
     "nice -n 19 make -j4",
     "env FOO=bar python3 script.py",
     "find orchestrator -name '*.pyc' -delete",
-    "find . -name '*.py' -exec grep -l TODO {} +",          # was a false positive (broad delete of .)
-    "find . -name __pycache__ -type d -exec rm -rf {} +",   # worktree cleanup
+    "find orchestrator -name '*.py' -exec grep -l TODO {} +",  # a reading find below the worktree root
+    "find orchestrator -name __pycache__ -type d -exec rm -rf {} +",   # cleanup below the worktree root
     "trap 'echo cleanup' EXIT",
     "trap 'rm -f /tmp/mytmp.$$' EXIT",                      # $$ is benign
     "bash -c 'set -e; cd orchestrator && echo ok'",
@@ -201,6 +201,40 @@ FS_DENY = [
     Bc("find . -delete", cwd=DEV),
     Bc("find . -name '*.pyc' -o -delete", cwd=DEV),
     Bc("find . -exec xargs rm {} +", cwd=DEV),
+    Bc("find . -name '*.py' -exec wc -l {} +", cwd=DEV),     # any -exec at a broad root (as on autopilot/dev)
+    # every -exec action is analysed, not only the first
+    Bc("find orchestrator -maxdepth 0 -exec true \\; -exec cat ~/.claude/.credentials.json \\;", cwd=DEV),
+    Bc("find orchestrator -maxdepth 0 -exec true {} + -exec git push origin HEAD:main \\;", cwd=DEV),
+    Bc("find orchestrator -name x -exec cat {} \\; -exec sudo reboot \\;", cwd=DEV),
+    Bc("find orchestrator -exec {} \\;", cwd=DEV),             # runs what it finds
+    # wrappers and file-emptying commands at a broad root
+    Bc("find ~/.claude/projects -exec setsid rm -rf {} +"),
+    Bc("find ~/work -exec stdbuf -oL rm -rf {} +"),
+    Bc("find ~/.claude/projects -name '*.jsonl' -exec cp /dev/null {} \\;"),
+    Bc("find ~/work -maxdepth 1 -exec git -C {} clean -fdx \\;"),
+    # a find -exec reads what it finds: no secret-named files, no secret trees
+    Bc("find ~/work -name .env -exec cat {} +"),
+    Bc("find orchestrator -name .env -exec cat {} +", cwd=DEV),
+    Bc("find orchestrator -iname '*.PEM' -exec cat {} +", cwd=DEV),
+    Bc("find ~/Documents/project/personal-LLM-Chabot/orchestrator -name '*.py' -o -name x -exec cat {} +", cwd=DEV),
+    # starting paths anywhere (bfs), behind -L/-H, from a file, or as a glob
+    Bc("find -name '*.jsonl' ~/.claude/projects -delete", cwd=DEV),
+    Bc("find -exec cat {} \\; ~/.claude/.credentials.json", cwd=DEV),
+    Bc("find -L ~/work -delete", cwd=DEV + "/orchestrator"),
+    Bc("find -H ~/.claude/projects -delete", cwd=DEV + "/orchestrator"),
+    Bc("find -files0-from /tmp/llmdev/r -name '*.jsonl' -delete", cwd=DEV),
+    Bc("find ~/work/* -delete"),
+    Bc("rm -rf ~/work/*"),
+    Bc("rm -rf ~/.claude/projects/-home-x/memory"),           # chats and memory are never deleted
+    Bc("rm -f ~/.claude/projects/-home-x/a.jsonl"),
+    Bc("grep -rh '' --include=.env ~/work"),                   # a search that selects secret files by name
+    Bc("rg -n PASS --iglob '*.ENV' orchestrator", cwd=DEV),
+    Bc("git submodule foreach echo ';' git push origin HEAD:main", cwd=DEV),  # foreach runs its words in a shell
+    Bc("git submodule foreach --recursive 'sudo reboot'", cwd=DEV),
+    Bc("git rebase -x 'git push origin HEAD:main' HEAD~1", cwd=DEV),
+    Bc("git rebase --exec='cat ~/.claude/.credentials.json' HEAD~1", cwd=DEV),
+    Bc("parallel echo ';' git push origin HEAD:main ::: x"),   # parallel runs its words through a shell
+    Bc("parallel 'sudo reboot' ::: x"),
     Bc("find /tmp/llmdev -name x -fprint ~/.llm-autopilot/guard/guard_hook.py"),  # -fprint truncates its file
     Bc("find /tmp/llmdev -fls ~/.llm-autopilot/settings.autopilot.json"),
     # P0-17: moving/deleting the guard dirs and agent/ (holds test-db.vars)
@@ -301,9 +335,13 @@ FS_DENY = [
     ("Grep", {"pattern": "token", "path": "~/.config/gh"}, None),
 ]
 FS_ALLOW = [
-    Bc("find . -name '*.py' -exec wc -l {} +", cwd=DEV),     # a find that only reads
-    Bc("find . -name '*.py' -exec grep -l TODO {} \\;", cwd=DEV),
+    Bc("find orchestrator -name '*.py' -exec wc -l {} +", cwd=DEV),     # a find that only reads
+    Bc("find orchestrator/app -name '*.py' -exec grep -l TODO {} \\;", cwd=DEV),
     Bc("find /tmp/llmdev -name '*.log' -delete"),
+    Bc("rm -rf orchestrator/.scratch-p016-*", cwd=DEV),        # a glob with a literal part
+    Bc("find orchestrator -name '*.json' -exec python3 -m json.tool {} \\;", cwd=DEV),
+    Bc("(( 1 > 0 )) && echo arith", cwd=DEV),
+    Bc("parallel -j 2 echo ::: a b", cwd=DEV),
     Bc("find orchestrator -name '*.py' -fprint /tmp/llmdev/py-files.txt", cwd=DEV),
     Bc("cat > /tmp/llmdev/probe.py <<'EOF'\nSEP = '\x01'\nEOF"),     # a here-document body is data
     W(f"{PRIVATE}/notes.md"),

@@ -135,6 +135,7 @@ WRITE_DENY_INSIDE_ALLOW = [
     _real(os.path.join(HOME, ".cache/vllm")),
 ]
 BROAD_DELETE = {"/tmp", "/var/tmp", R_WORK, R_DEV_WORKTREE, _real(HOME), "/", _real(os.path.join(HOME, ".cache")), _real(os.path.join(HOME, ".claude/projects"))}
+CLAUDE_PROJECTS = _real(os.path.join(HOME, ".claude/projects"))  # chat transcripts and memory: never deleted
 GUARD_FILES = [
     _real(os.path.join(AUTOPILOT_HOME, "guard")),
     _real(os.path.join(AUTOPILOT_HOME, "bin")),
@@ -667,7 +668,7 @@ _PUNCT = set(";&|()<>")
 # Shell operators, longest first. shlex returns a run of operator characters as
 # one token ('(true);git ...' gives ');', 'a &&(b)' gives '&&('), so tokenize()
 # splits each run into the operators bash reads.
-_OPERATORS = (";;&", "<<<", "&>>", ";;", ";&", "&&", "||", "|&", "&>", ">>", ">|", "<<", "<>", ">&", "<&",
+_OPERATORS = ("((", "))", ";;&", "<<<", "&>>", ";;", ";&", "&&", "||", "|&", "&>", ">>", ">|", "<<", "<>", ">&", "<&",
               ";", "&", "|", "(", ")", "<", ">")
 
 
@@ -1756,17 +1757,7 @@ def check_command(cmd, args, ctx):
             analyze_words(rest, ctx)
         return
     if cmd == "find":
-        for flag in ("-exec", "-execdir", "-ok", "-okdir"):
-            if flag in args:
-                i = args.index(flag)
-                inner = []
-                for a in args[i + 1 :]:
-                    if a in (";", "+", "\\;"):
-                        break
-                    inner.append(a)
-                inner = [a for a in inner if a != "{}"]
-                if inner:
-                    analyze_words(inner, ctx)
+        check_find(args, ctx)
     if cmd == "watch":
         rest = list(args)
         while rest and rest[0].startswith("-"):
@@ -1811,7 +1802,10 @@ def check_command(cmd, args, ctx):
                 continue
             inner.append(a)
         if inner:
-            analyze_words(inner, ctx)
+            if "-q" in args or "--quote" in args:
+                analyze_words(inner, ctx)
+            else:  # the words are joined and run by a shell
+                analyze(" ".join(inner), ctx.child())
         return
     if cmd in ("tmux", "screen"):
         if re.search(r"\b(new-session|new|new-window|neww|send-keys|send|split-window|splitw|respawn-pane|respawn-window)\b|(^|\s)-(dm|dmS|S|d)\b", " ".join(args)):
@@ -2111,13 +2105,15 @@ def _glob_alternatives(glob, limit=64):
     return out
 
 
-def _glob_can_match_secret(glob):
+def _glob_can_match_secret(glob, samples=True):
     """True when a positive include glob could select a secret file, so a
     recursive search restricted to it could still print one: one of its
-    alternatives matches a sample secret basename, is (or, with its wildcards
-    filled in, becomes) a secret name or path, or names a secret directory."""
+    alternatives matches a sample secret basename (only with samples=True), is
+    (or, with its wildcards filled in, becomes) a secret name or path, or names
+    a secret directory. Case-insensitive: rg --iglob, find -iname and
+    case-insensitive file systems match either case."""
     import fnmatch
-    g = glob.strip()
+    g = glob.strip().lower()
     if not g or g.startswith("!"):  # empty or a negated (exclude) glob: not a positive include
         return False
     alts = _glob_alternatives(g)
@@ -2127,16 +2123,23 @@ def _glob_can_match_secret(glob):
         if alt.startswith("!"):
             continue
         base = alt.rstrip("/").rsplit("/", 1)[-1] or alt
-        if any(fnmatch.fnmatch(s, base) for s in SECRET_SAMPLES):
+        if samples and any(fnmatch.fnmatchcase(s.lower(), base) for s in SECRET_SAMPLES):
             return True
-        for cand in {alt, _GLOB_WILD.sub("x", alt), _GLOB_WILD.sub("", alt)}:
+        for cand in {alt, _GLOB_WILD.sub("x", alt), _GLOB_WILD.sub("", alt), alt.replace("\\", "")}:
             cbase = cand.rstrip("/").rsplit("/", 1)[-1]
             if SECRET_BASENAME.match(cbase) or SECRET_TOKEN_IN_TEXT.search(cand) or SECRET_PATH_PARTS.search(cand):
                 return True
         for part in alt.split("/")[:-1]:  # a directory part such as secrets/ or .runtime/
-            if part not in ("", ".", "*", "**") and any(fnmatch.fnmatch(d, part) for d in ("secrets", "secret", ".runtime")):
+            if part not in ("", ".", "*", "**") and any(fnmatch.fnmatchcase(d, part) for d in ("secrets", "secret", ".runtime")):
                 return True
     return False
+
+
+def _glob_names_secret(glob):
+    """True when the glob itself is (or, with its wildcards filled in, becomes)
+    a secret name or path: `.env`, `*.pem`, `secrets/*`. A broad glob such as
+    `*.json` is not, though it can match a secret sample."""
+    return _glob_can_match_secret(glob, samples=False)
 
 
 def parse_search(cmd, args):
@@ -2376,6 +2379,10 @@ def check_grep_reads(cmd, args, ctx):
             ctx.deny(f"reads a secret file ({v}); secrets must never enter the transcript, logs or commits (§3.3)")
     if pattern is not None and _names_existing_secret(pattern, ctx.cwd):
         ctx.deny(f"'{pattern}' names a secret file; a search must never read one (§3.3)")
+    if recursive:
+        for o, v in values:
+            if (o in ("--include", "--glob", "--iglob") or (o == "-g" and cmd != "ag")) and _glob_names_secret(v):
+                ctx.deny(f"{o} {v} selects secret files by name; a search must never read one (§3.3)")
     scoped = _search_scoped_off_secrets(cmd, values)
 
     def reaches_secrets(root):
@@ -2480,7 +2487,7 @@ def check_copy_link_targets(cmd, args, ctx):
 def check_write_targets(cmd, args, ctx):
     if cmd in LINK_OR_COPY:
         check_copy_link_targets(cmd, args, ctx)
-    targets = []
+    targets, find_roots = [], []
     if cmd in WRITE_ALL_ARGS:
         targets = nonopt(args)
         if cmd == "truncate" and "-s" in args:
@@ -2520,15 +2527,12 @@ def check_write_targets(cmd, args, ctx):
         if cmd == "wget" and not targets:
             targets.append(".")
     elif cmd == "find":
-        if any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir") for a in args):
-            roots = []
-            for a in args:
-                if a.startswith("-") or a in ("(", "!"):
-                    break
-                roots.append(a)
-            targets = roots or ["."]
+        f_starts, f_execs, f_values, f_flags = parse_find(args)
+        if f_execs or "-delete" in f_flags:
+            find_roots = f_starts or ["."]
+            targets = list(find_roots)
         # -fprint/-fprint0/-fprintf/-fls FILE create or truncate FILE
-        targets = targets + [args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-fprint", "-fprint0", "-fprintf", "-fls")]
+        targets = targets + [v for o, v in f_values if o in FIND_OUTPUT_FILES]
     elif cmd == "gio" and "trash" in args:
         targets = [a for a in args[args.index("trash") + 1 :] if not a.startswith("-")]
     elif cmd == "patch":
@@ -2552,49 +2556,102 @@ def check_write_targets(cmd, args, ctx):
             continue
         if (move_or_delete or extract) and holds_guard_file(p):
             ctx.deny("moving into, extracting into, or deleting a directory that holds the autopilot's guard files (guard/, bin/, agent/, test-db.vars, CI approvals, ...) would disable the guardrails (§3.3/P0-17); operate only on individual files the autopilot created")
-        find_broad = cmd == "find" and find_deletes(args) and not (p == R_DEV_WORKTREE and find_is_narrow(args))
-        if (cmd in ("rm", "rmdir", "shred") or find_broad) and (p in BROAD_DELETE or re.fullmatch(r"/(var/)?tmp/\*", t) or t.rstrip("/") in ("/tmp/*", "/tmp/.*", "~/*", "*", ".*", "/*")):
+        deleting = cmd in ("rm", "rmdir", "unlink", "shred", "srm") or (cmd == "find" and t in find_roots)
+        if deleting and under(p, CLAUDE_PROJECTS):
+            ctx.deny("refuses deleting under ~/.claude/projects: chat transcripts and memory are never deleted (§3.3)")
+        if deleting and re.search(r"[*?\[]", t):
+            gparent = expand_path(os.path.dirname(t.rstrip("/")) or ".", ctx.cwd)
+            if gparent in BROAD_DELETE and not re.search(r"[A-Za-z0-9_]", os.path.basename(t.rstrip("/"))):
+                ctx.deny(f"refuses the broad delete of {t}; delete only paths the autopilot created")
+        if (cmd in ("rm", "rmdir", "shred") or (cmd == "find" and t in find_roots)) and (p in BROAD_DELETE or re.fullmatch(r"/(var/)?tmp/\*", t) or t.rstrip("/") in ("/tmp/*", "/tmp/.*", "~/*", "*", ".*", "/*")):
             ctx.deny(f"refuses the broad delete of {t}; delete only paths the autopilot created")
         if not write_allowed(p):
             ctx.deny(write_why(p))
 
 
-# What a `find -exec` may run that removes files, or runs a command the guard
-# reads only without its `{}` operands (so the roots are what it acts on).
-FIND_DELETING_EXEC = {"rm", "rmdir", "unlink", "shred", "srm", "mv", "truncate", "dd", "rsync", "gio", "trash",
-                      "trash-put", "xargs", "env", "nice", "nohup", "timeout", "busybox", "command", "exec",
-                      "parallel"} | SHELLS | INTERPRETERS
+# find primaries that take one value (GNU find and bfs); -fprintf takes two.
+FIND_VALUE_TESTS = {"-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex",
+                    "-lname", "-ilname", "-type", "-xtype", "-user", "-group", "-uid", "-gid", "-perm", "-size",
+                    "-newer", "-anewer", "-cnewer", "-mtime", "-atime", "-ctime", "-mmin", "-amin", "-cmin",
+                    "-used", "-inum", "-links", "-samefile", "-maxdepth", "-mindepth", "-fstype", "-context",
+                    "-printf", "-fprint", "-fprint0", "-fls", "-regextype", "-files0-from", "-limit"}
+FIND_NAME_TESTS = ("-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex",
+                   "-lname", "-ilname")
+FIND_EXEC = ("-exec", "-execdir", "-ok", "-okdir")
+FIND_OUTPUT_FILES = ("-fprint", "-fprint0", "-fprintf", "-fls")
 
 
-def find_deletes(args):
-    """True when a find command deletes what it finds: -delete, or an -exec /
-    -execdir / -ok / -okdir that runs a deleting command, a shell, an
-    interpreter or a wrapper. A find that only reads (-exec grep/wc/cat ...)
-    is not a delete."""
-    if "-delete" in args:
-        return True
-    for i, a in enumerate(args):
-        if a in ("-exec", "-execdir", "-ok", "-okdir"):
-            nxt = args[i + 1] if i + 1 < len(args) else ""
-            name = os.path.basename(nxt)
-            if not nxt or name in FIND_DELETING_EXEC or re.match(r"(python|pypy)[0-9.]*$", name) \
-                    or "$" in nxt or "__SUBST__" in nxt:
-                return True
-    return False
+def parse_find(args):
+    """Read a find command line into (starts, execs, values, flags). Leading
+    -H/-L/-P/-O<n>/-D <list> are skipped; a test or action that takes a value
+    consumes it (`values`: [(option, value)]); each -exec/-execdir/-ok/-okdir
+    consumes its command up to ';' or '+' (`execs`: [(action, words)]); every
+    other bare word is a starting path, wherever it stands (bfs, the find that
+    Claude Code's shell runs, accepts paths anywhere). Unknown options are
+    flags, so a value they might take is read as a starting path and checked."""
+    i, n = 0, len(args)
+    while i < n:
+        a = args[i]
+        if a in ("-H", "-L", "-P") or re.fullmatch(r"-O\d*", a):
+            i += 1
+        elif a == "-D" and i + 1 < n:
+            i += 2
+        else:
+            break
+    starts, execs, values, flags = [], [], [], []
+    while i < n:
+        a = args[i]
+        if a in FIND_EXEC:
+            j, inner = i + 1, []
+            while j < n and args[j] not in (";", "+", "\\;"):
+                inner.append(args[j])
+                j += 1
+            execs.append((a, inner))
+            i = j + 1
+        elif a == "-fprintf":  # FILE FORMAT
+            values.append((a, args[i + 1] if i + 1 < n else ""))
+            i += 3
+        elif a in FIND_VALUE_TESTS or re.fullmatch(r"-newer[aBcmt][aBcmt]t?", a):
+            values.append((a, args[i + 1] if i + 1 < n else ""))
+            i += 2
+        elif a.startswith("-") or a in ("(", ")", "!", ","):
+            flags.append(a)
+            i += 1
+        else:
+            starts.append(a)
+            i += 1
+    return starts, execs, values, flags
 
 
-_FIND_NAME_TESTS = ("-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex")
-
-
-def find_is_narrow(args):
-    """True when a deleting find selects files by a name test that is not a bare
-    wildcard (`-name __pycache__`, `-name '*.pyc'`) and has no operator that
-    could widen it (-o/-or/,/!/-not). Only such a find may clean up inside the
-    dev worktree; at every other broad root a deleting find is refused."""
-    if any(a in ("-o", "-or", ",", "!", "-not") for a in args):
-        return False
-    names = [args[i + 1] for i, a in enumerate(args[:-1]) if a in _FIND_NAME_TESTS]
-    return any(re.search(r"[^*?.\[\]/]", n) for n in names)
+def check_find(args, ctx):
+    """Every -exec/-execdir/-ok/-okdir command is analysed (without its `{}`
+    operands); a command named by `{}` is refused. A find that runs commands on
+    what it finds reads those files, so, like a recursive grep, it may not
+    select files named like secrets nor walk a tree that holds secrets unless a
+    name test scopes it off them. -files0-from hides the starting paths."""
+    starts, execs, values, flags = parse_find(args)
+    acts = bool(execs) or "-delete" in flags or any(o in FIND_OUTPUT_FILES for o, _v in values)
+    if acts and any(o == "-files0-from" for o, _v in values):
+        ctx.deny("find -files0-from reads its starting paths from a file the guard cannot review; name the paths")
+    for _action, inner in execs:
+        if not inner or "{}" in inner[0]:
+            ctx.deny("find -exec runs a program named by what it finds; write the command literally")
+        analyze_words([w for w in inner if w != "{}"], ctx)
+    if not execs:
+        return
+    names = [v for o, v in values if o in FIND_NAME_TESTS]
+    if any(_glob_names_secret(v) for v in names):
+        ctx.deny("find -exec on files named like secrets reads them; secrets must never enter the transcript, logs or commits (§3.3)")
+    widened = any(f in ("-o", "-or", ",", "!", "-not") for f in flags) \
+        or any(o in ("-regex", "-iregex") for o, _v in values)
+    scoped = bool(names) and not widened and not any(_glob_can_match_secret(v) for v in names)
+    for root in starts or ["."]:
+        p = expand_path(root, ctx.cwd)
+        if p is None:
+            continue  # check_write_targets refuses a computed starting path
+        if (recursive_secret_root(p) and not (scoped and not _tree_may_hold_secret_dir(p))) \
+                or (not scoped and _tree_may_hold_secret_dir(p)):
+            ctx.deny(f"find -exec under {root} would run its command on the untracked .env / .runtime / credential files there; start in a subdirectory that holds no secrets, or select files with -name tests that are not secrets (§3.3)")
 
 
 def _glob_parent(t, cwd):
@@ -2662,6 +2719,22 @@ def check_git(args, ctx):
     if not a:
         return
     sub, rest = a[0], a[1:]
+    # Subcommands that hand a command to a shell: `git submodule foreach CMD...`
+    # (its words joined) and `git rebase -x/--exec CMD`. Analyse that command.
+    if sub == "submodule" and "foreach" in rest:
+        cmd_words = rest[rest.index("foreach") + 1 :]
+        while cmd_words and cmd_words[0] in ("--recursive", "--quiet", "-q", "--"):
+            cmd_words = cmd_words[1:]
+        if cmd_words:
+            analyze(" ".join(cmd_words), ctx.child())
+    if sub == "rebase":
+        for i, x in enumerate(rest):
+            if x in ("-x", "--exec") and i + 1 < len(rest):
+                analyze(rest[i + 1], ctx.child())
+            elif x.startswith("--exec="):
+                analyze(x.split("=", 1)[1], ctx.child())
+            elif x.startswith("-x") and len(x) > 2:
+                analyze(x[2:], ctx.child())
     if sub in GIT_TRANSPORT_SUBCOMMANDS or sub.startswith("remote-"):
         ctx.deny(f"'git {sub}' talks to remotes without git push's checks; push one named branch with git push origin <branch>")
     if sub == "grep" and any(x.startswith(("-O", "--open-files-in-pager")) for x in rest):
