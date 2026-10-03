@@ -145,11 +145,22 @@ def test_a_fatal_clip_cancels_its_siblings_instead_of_leaving_them_decoding(monk
     _plan(monkeypatch, 8)
     monkeypatch.setattr(settings, "video_asr_concurrency", 2)
     state = {"started": 0, "finished": 0, "cancelled": 0}
+    sibling = {}
+
+    def sibling_in_engine() -> asyncio.Event:
+        return sibling.setdefault("event", asyncio.Event())  # first call is inside asyncio.run
 
     async def engine(audio, *, filename, content_type, **kwargs):
         state["started"] += 1
         if filename.startswith("w0000"):
+            # Fail once a sibling is inside the engine. Each window builds its
+            # clip in a worker thread first; on a loaded runner the sibling
+            # could still be there when this raised, be cancelled before it
+            # reached the engine, and leave `cancelled` at 0 (CI, 2026-10-03).
+            async with asyncio.timeout(4):
+                await sibling_in_engine().wait()
             raise RuntimeError("the engine client is broken")
+        sibling_in_engine().set()
         try:
             await asyncio.sleep(30)  # a real clip: minutes of decoding
         except asyncio.CancelledError:
