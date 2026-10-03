@@ -134,7 +134,10 @@ METHOD = {
                   "two middle samples for an even count).",
     "noise": f"Noise sigma per class/metric = sqrt(mean over the baseline units with >= {MIN_UNIT_SAMPLES} samples "
              f"of the sample variance (n - 1) of ln x), values <= {LOG_FLOOR_S:g} s clamped to {LOG_FLOOR_S:g} s "
-             "before ln. It measures repeat-to-repeat noise of the same turn, not the spread between cases.",
+             "before ln. It measures repeat-to-repeat noise of the same turn, not the spread between cases. "
+             "The sigma used is max(the class's own sigma, the same figure pooled over the units of every class "
+             "for that metric): classes with one unit (long_context, max) would otherwise estimate their noise "
+             "from three samples, and a class that really is noisier keeps its own larger figure.",
     "ratio": "ratio = geometric mean, over the units with samples on both sides, of median(candidate unit) / "
              "median(baseline unit). scale = geometric mean of the baseline unit medians.",
     "tolerance": f"allowed_ratio = 1 + max({REL_FLOOR:.2f}, {SIGMA_FACTOR:g} x sigma) + abs / scale; abs by class: "
@@ -155,13 +158,15 @@ METHOD = {
     "false_block": "Expected false blocks, measured by a Monte Carlo of this exact freeze and compare (400 trials "
                    "per row; the 16 eval-set cases, one turn each, at plausible medians; lognormal repeat noise "
                    "sigma; spikes = 10 % of requests also slowed 1.5-3x by other load). 3 baseline runs vs 3 "
-                   "candidate runs block an unchanged build in about 4 % of comparisons at sigma 0.10 and 13 % at "
-                   "sigma 0.15 without spikes, and in 33-42 % with spikes; 5 baseline runs vs 3 candidate runs in "
-                   "about 2-6 % without spikes and 25-27 % with. Power (3 vs 3): a uniform 1.3x slowdown blocks in "
-                   "99-100 % without spikes and 91-97 % with them; 1.5x and 2x in 100 %. Most false blocks come "
-                   "from sigma being estimated per class from few units (long_context and max have one); more "
-                   "baseline runs lower them. Procedure: when a latency gate fails, re-run the BASELINE commit in "
-                   "the same window (same stack, same hour) as a tie-break and compare it with the frozen "
+                   "candidate runs block an unchanged build in about 3 % of comparisons at sigma 0.10 and 7 % at "
+                   "sigma 0.15 without spikes, and in 15-19 % with spikes; 5 baseline runs vs 3 candidate runs in "
+                   "about 2-5 % without spikes and 14-16 % with. Power (3 vs 3): a uniform 1.3x slowdown blocks in "
+                   "96-100 % without spikes and 63-66 % with them; 1.5x in 100 % without spikes and 91-94 % with; "
+                   "2x in 100 %. Taking the larger of the class sigma and the pooled sigma halves the false blocks "
+                   "of a per-class sigma alone (13 % / 33-42 % in the same Monte Carlo); the price is power under "
+                   "spikes (1.5x: 91-94 % against 97-100 %). More baseline runs lower false blocks further. "
+                   "Procedure: when a latency gate fails, re-run the BASELINE commit in the same window (same "
+                   "stack, same hour) as a tie-break and compare it with the frozen "
                    "baseline. If it fails the same gate, the window is slow, not the candidate: the latency verdict "
                    "is void and the comparison is repeated in a quieter window. If it passes, the candidate's "
                    "failure stands.",
@@ -619,8 +624,24 @@ def _collect(records: Sequence[dict]) -> Dict[str, dict]:
     return out
 
 
-def _describe(workload: str, metric: str, units: Dict[str, List[float]], missing: int, excluded: int) -> dict:
-    """One baseline class/metric: the per-unit statistics, the class description and the allowed values."""
+def _unit_log_vars(units: Dict[str, List[float]]) -> List[float]:
+    """The sample variance of ln x of every unit with >= MIN_UNIT_SAMPLES samples."""
+    return [statistics.variance([_ln(float(v)) for v in vs]) for vs in units.values() if len(vs) >= MIN_UNIT_SAMPLES]
+
+
+def pooled_sigma(unit_maps: Iterable[Dict[str, List[float]]]) -> Optional[float]:
+    """Repeat noise of one metric pooled over the units of EVERY class: sqrt(mean log variance)."""
+    log_vars = [lv for units in unit_maps for lv in _unit_log_vars(units)]
+    return math.sqrt(math.fsum(log_vars) / len(log_vars)) if log_vars else None
+
+
+def _describe(workload: str, metric: str, units: Dict[str, List[float]], missing: int, excluded: int,
+              sigma_pooled: Optional[float] = None) -> dict:
+    """One baseline class/metric: the per-unit statistics, the class description and the allowed values.
+
+    The noise used is the larger of the class's own sigma and the sigma pooled over every class for this metric
+    (`sigma_pooled`): a class with one or two units estimates its own noise from very few samples, and the pooled
+    figure keeps that estimate from coming out too small; a class that really is noisier keeps its own."""
     unit_stats = {}
     for u, vs in units.items():
         if not vs:
@@ -633,7 +654,9 @@ def _describe(workload: str, metric: str, units: Dict[str, List[float]], missing
     values = [v for s in unit_stats.values() for v in s["samples"]]
     n = len(values)
     noisy = [s["log_var"] for s in unit_stats.values() if s["log_var"] is not None]
-    sigma = math.sqrt(math.fsum(noisy) / len(noisy)) if noisy else None
+    sigma_class = math.sqrt(math.fsum(noisy) / len(noisy)) if noisy else None
+    sigma = (max(sigma_class, sigma_pooled) if sigma_class is not None and sigma_pooled is not None
+             else sigma_class)
     scale = (math.exp(math.fsum(_ln(s["median"]) for s in unit_stats.values()) / len(unit_stats))
              if unit_stats else None)
     ok = n >= MIN_SAMPLES and bool(noisy)
@@ -644,7 +667,8 @@ def _describe(workload: str, metric: str, units: Dict[str, List[float]], missing
              "min": min(values) if n else None, "max": max(values) if n else None,
              "mean": math.fsum(values) / n if n else None,
              "p95_status": "gated" if n >= P95_MIN_N else "reported",
-             "sigma": sigma, "scale": scale, "rel": tol["rel"] if ok else None, "abs": tol["abs"],
+             "sigma": sigma, "sigma_class": sigma_class, "sigma_pooled": sigma_pooled if noisy else None,
+             "scale": scale, "rel": tol["rel"] if ok else None, "abs": tol["abs"],
              "allowed_ratio": 1 + tol["rel"] + tol["abs"] / scale if ok else None,
              "allowed_p95": None, "units": unit_stats}
     if ok and n >= P95_MIN_N:
@@ -658,7 +682,8 @@ def _rate_summary(rates: List[float]) -> dict:
 
 def latency_stats(records: Sequence[dict]) -> dict:
     coll = _collect(records)
-    return {w: {m: _describe(w, m, coll[w]["units"][m], coll[w]["missing"][m], coll[w]["excluded"])
+    pooled = {m: pooled_sigma(coll[w]["units"][m] for w in coll) for m in METRICS}
+    return {w: {m: _describe(w, m, coll[w]["units"][m], coll[w]["missing"][m], coll[w]["excluded"], pooled[m])
                 for m in METRICS}
             for w in CLASS_ORDER if w in coll}
 
@@ -864,6 +889,7 @@ def _verify_baseline(doc, where: str = "baseline") -> None:
     if set(latency) != classes:
         raise BaselineError(f"{where}: latency classes {sorted(latency)} differ from the cases' classes "
                             f"{sorted(classes)}")
+    stored: Dict[tuple, tuple] = {}
     for w, per in latency.items():
         if w not in CLASS_ABS_S or not isinstance(per, dict) or set(per) != set(METRICS):
             raise BaselineError(f"{where}: latency.{w} must be a known class with every metric")
@@ -887,7 +913,11 @@ def _verify_baseline(doc, where: str = "baseline") -> None:
             for key in ("missing", "excluded"):
                 if not (_is_int(e.get(key)) and e[key] >= 0):
                     raise BaselineError(f"{lw}: {key} must be a count")
-            if not _same(e, _describe(w, m, samples, e["missing"], e["excluded"])):
+            stored[(w, m)] = (lw, e, samples)
+    for m in METRICS:
+        pooled = pooled_sigma(samples for (_w, mm), (_lw, _e, samples) in stored.items() if mm == m)
+        for (w, mm), (lw, e, samples) in stored.items():
+            if mm == m and not _same(e, _describe(w, m, samples, e["missing"], e["excluded"], pooled)):
                 raise BaselineError(f"{lw}: stored statistics or allowed values disagree with a recomputation from "
                                     "its unit samples and this script's constants")
     rates = doc.get("output_tokens_per_s")

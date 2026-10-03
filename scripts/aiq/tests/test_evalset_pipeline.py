@@ -53,7 +53,9 @@ def test_three_repeats_of_the_whole_set_freeze_and_compare(fake, tmp_path, pwfil
     # every class the set covers has samples; each has at least three (one case x three repeats)
     for workload in ("direct_fast", "evidence_fast", "live_search_fast", "long_context", "think", "max"):
         metric = frozen["latency"][workload]["first_answer_s"]
-        assert metric["n"] >= 3 and metric.get("allowed_p95") is not None, (workload, metric)
+        assert metric["n"] >= 3 and metric["status"] == "ok" and metric["allowed_ratio"] is not None, (workload, metric)
+        # below 20 samples the nearest-rank p95 is the maximum: reported, never gated
+        assert metric["p95_status"] == ("gated" if metric["n"] >= 20 else "reported"), (workload, metric)
     # EV09 cannot pass: no endpoint exposes the passages a run read (source_passages_captured false)
     assert frozen["quality"]["cases"]["EV09"]["pass_rate"] == 0
     assert frozen["quality"]["checks"]["citation_passages"]["rate"] == 0
@@ -61,6 +63,8 @@ def test_three_repeats_of_the_whole_set_freeze_and_compare(fake, tmp_path, pwfil
     path = tmp_path / "baseline.json"
     assert B.main(["freeze", run_dir, "--out", str(path), "--markdown", str(tmp_path / "b.md")]) == 0
     assert B.main(["compare", str(path), run_dir]) == 0
+    same = B.compare(B.load_baseline(str(path)), B.load_runs([run_dir]))
+    assert same["passed"] is True and same["fails"] == [], same["fails"]
     md = (tmp_path / "b.md").read_text()
     assert "direct_fast" in md and "first_answer_s" in md
     assert fake.base not in md and fake.base not in path.read_text(), "a baseline must not carry the endpoint"
@@ -72,6 +76,7 @@ def test_three_repeats_of_the_whole_set_freeze_and_compare(fake, tmp_path, pwfil
     report = B.compare(B.load_baseline(str(path)), B.load_runs([cand]))
     assert report["passed"] is False
     assert B.main(["compare", str(path), cand]) == 1
-    blob = json.dumps(report)
-    assert "RQ03" in blob
+    # exactly one failure reason family: RQ03, whose names_only check failed on every repeat
+    assert report["fails"] and all("RQ03" in f for f in report["fails"]), report["fails"]
+    assert any("names_only" in f for f in report["fails"]), report["fails"]
     assert os.path.isdir(run_dir)

@@ -222,6 +222,23 @@ def test_noise_ignores_the_case_mix():
     assert slow["latency"]["direct_fast"]["total_s"]["verdict"] == "fail" and slow["passed"] is False
 
 
+def test_a_quiet_class_takes_the_sigma_pooled_over_every_class_and_a_noisy_class_keeps_its_own():
+    # direct_fast EV01 10, 10, 10 (var 0); think EV06 1, 2, 4 (var (ln 2)^2)
+    doc = frozen(timed("EV01", (10, 10, 10)) + timed("EV06", (1, 2, 4), effort="think"))
+    quiet, noisy = latency(doc), latency(doc, "think")
+    pooled = math.log(2) / math.sqrt(2)                                # sqrt(mean(0, (ln 2)^2))
+    assert quiet["sigma_class"] == 0.0 and quiet["sigma_pooled"] == pytest.approx(pooled)
+    assert quiet["sigma"] == pytest.approx(pooled) and quiet["rel"] == pytest.approx(2 * pooled)
+    assert quiet["allowed_ratio"] == pytest.approx(1 + 2 * pooled + 0.5 / 10)
+    assert noisy["sigma_class"] == pytest.approx(math.log(2)) and noisy["sigma"] == pytest.approx(math.log(2))
+    # the pooled figure is part of the recomputation that guards a stored baseline
+    B._verify_baseline(json.loads(json.dumps(doc)))
+    tampered = json.loads(json.dumps(doc))
+    tampered["latency"]["direct_fast"]["total_s"]["sigma"] = 0.0
+    with pytest.raises(B.BaselineError):
+        B._verify_baseline(tampered)
+
+
 def test_values_at_or_below_the_floor_are_clamped_before_ln():
     e = latency(frozen(timed("EV01", (0.0, 0.0005, 0.001))))
     assert e["units"]["EV01/t1"]["log_var"] == 0.0 and e["sigma"] == 0.0
@@ -300,8 +317,10 @@ def test_output_token_rate_is_the_median_per_class_and_never_gates():
 
 def test_method_states_the_false_block_rate_and_the_tie_break():
     m = frozen(three_repeats())["method"]
-    assert "4 % of comparisons at sigma 0.10 and 13 % at sigma 0.15" in m["false_block"]
-    assert "33-42 % with spikes" in m["false_block"] and "1.3x slowdown blocks in 99-100 %" in m["false_block"]
+    assert "3 % of comparisons at sigma 0.10 and 7 % at sigma 0.15" in m["false_block"]
+    assert "15-19 % with spikes" in m["false_block"] and "1.3x slowdown blocks in 96-100 %" in m["false_block"]
+    assert "larger of the class sigma and the pooled sigma" in m["false_block"]
+    assert "max(the class's own sigma" in m["noise"]
     assert "re-run the BASELINE commit in the same window" in m["false_block"]
     assert "ceil(q x n)" in m["percentile"] and "ln x" in m["noise"] and "geometric mean" in m["ratio"]
 
