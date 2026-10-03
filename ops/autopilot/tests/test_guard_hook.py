@@ -371,6 +371,9 @@ class GuardFileTools(unittest.TestCase):
         self.assertTrue(decide("Read", {"file_path": f"{DEV}/e2e/ci/ci.env"})[0])
         self.assertTrue(decide("Read", {"file_path": f"{DEV}/README.md"})[0])
         self.assertFalse(decide("Read", {"file_path": f"{DEV}/Training_Module_Feature_Map_and_Memory.txt"})[0])
+        self.assertFalse(decide("Read", {"file_path": "/proc/self/environ"})[0])
+        self.assertFalse(decide("Read", {"file_path": "/proc/1/task/1/environ"})[0])
+        self.assertTrue(decide("Read", {"file_path": "/proc/self/status"})[0])
         self.assertFalse(bash("grep -n key Training_Module_Feature_Map_and_Memory.txt")[0])
 
 
@@ -510,6 +513,13 @@ PS_DENY = [
     "ps $(echo e)",
     "cat /proc/1/environ",
     "cat /proc/self/environ",
+    "tr '\\0' '\\n' < /proc/self/environ",
+    "cd /proc/1 && cat environ",
+    "cat /proc/1/task/1/environ",
+    # a BSD personality makes the dash forms print environments
+    "PS_PERSONALITY=bsd ps -ef",
+    "PS_PERSONALITY=bsd ps -eo pid,args",
+    "CMD_ENV=bsd ps -ef",
 ]
 
 
@@ -621,6 +631,12 @@ PROD_READ_DENY = [
     "docker exec llmdev-x scripts/deploy.sh",
     "awk 'BEGIN{system(\"scripts/deploy.sh\")}'",
     "rg --pre scripts/deploy.sh x .",
+    "rg --pre=scripts/deploy.sh x .",
+    # rg runs the --hostname-bin program to build hyperlinks; ag runs its --pager
+    "rg --hostname-bin scripts/deploy.sh --hyperlink-format 'file://{host}{path}' --color always x .",
+    "rg --hostname-bin=scripts/cluster-up.sh --hyperlink-format 'file://{host}{path}' --color always x .",
+    "rg --hostname-bin orchestrator/scripts/validate_long_context.py --color always x .",
+    "ag --pager scripts/deploy.sh x .",
     "less scripts/deploy.sh",
     # a reader whose output is captured, written or piped on can feed a runner
     "cat scripts/deploy.sh > /tmp/llmdev-x.sh",

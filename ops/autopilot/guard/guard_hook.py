@@ -378,11 +378,15 @@ def is_tracked(path):
 ALWAYS_SECRET = re.compile(r"^Training_Module_Feature_Map_and_Memory\.txt$")
 
 
+# Any process's environment, this session's included (it holds the test-database URL).
+PROC_ENVIRON = re.compile(r"^/proc/[^/]+/(task/[^/]+/)?environ$")
+
+
 def is_secret_path(path):
     if path is None:
         return False
     base = os.path.basename(path)
-    if ALWAYS_SECRET.match(base):
+    if ALWAYS_SECRET.match(base) or PROC_ENVIRON.match(os.path.normpath(path)):
         return True
     hit = bool(SECRET_BASENAME.match(base)) or any(under(path, d) for d in SECRET_DIRS) \
         or bool(SECRET_PATH_PARTS.search(path))
@@ -758,7 +762,9 @@ EXEC_ENV = re.compile(
     r"GIT_SSH|GIT_SSH_COMMAND|GIT_ASKPASS|SSH_ASKPASS|EDITOR|VISUAL|GIT_EDITOR|GIT_SEQUENCE_EDITOR|GIT_PROXY_COMMAND|"
     r"GIT_EXEC_PATH|GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_CONFIG|GIT_CONFIG_GLOBAL|GIT_CONFIG_SYSTEM|GIT_CONFIG_PARAMETERS|"
     r"GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+|GIT_TEMPLATE_DIR|GH_CONFIG_DIR|GH_HOST|GH_TOKEN|GITHUB_TOKEN|"
-    r"GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|DOCKER_CONFIG)$"
+    r"GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|DOCKER_CONFIG|"
+    # procps prints process environments under a BSD personality (ps -ef).
+    r"PS_PERSONALITY|CMD_ENV)$"
 )
 EXEC_ENV_SAFE_VALUES = {"", "true", ":", "cat", "less", "/bin/true", "/usr/bin/true"}
 
@@ -821,15 +827,19 @@ def in_quiet_window():
     return QUIET_WINDOW_IST[0] <= now.hour < QUIET_WINDOW_IST[1]
 
 
-PURE_READERS = {"cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "ag", "diff", "cmp", "stat", "file", "ls",
+PURE_READERS = {"cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "diff", "cmp", "stat", "file", "ls",
                 "md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "b2sum", "cksum"}
 GIT_READERS = {"log", "diff", "show", "blame", "annotate"}
+# Reader options that run a program they name: rg --pre (per file) and
+# rg --hostname-bin (for hyperlinks). ag is not a reader for the same reason
+# (ag --pager).
+READER_EXEC_OPTIONS = ("--pre", "--hostname-bin")
 
 
 def is_pure_read(cmd, args):
     """Commands that only print files: they cannot run, write or replace what they read."""
     if cmd in PURE_READERS:
-        return not (cmd == "rg" and any(a.startswith("--pre") for a in args))  # rg --pre runs a program per file
+        return not any(a.startswith(READER_EXEC_OPTIONS) for a in args)
     if cmd == "sed":
         scripts, rest, i = [], [], 0
         while i < len(args):
@@ -1013,7 +1023,8 @@ def check_production_reach(cmd, args, ctx):
     # the output only reaches the transcript; running, copying or editing it is not.
     reading = is_pure_read(cmd, args) and not ctx.output_captured()
     for a in [cmd] + ([] if reading else list(args)):
-        if PROD_SCRIPTS.search(a) and not a.startswith("-"):
+        v = a.split("=", 1)[1] if a.startswith("-") and "=" in a else a  # --pre=<script>
+        if PROD_SCRIPTS.search(v) and not v.startswith("-"):
             ctx.deny(f"{a} acts on PRODUCTION (deploys, cluster, backups, host guard, reconciler, shared e2e stack); the programme never changes production (operator decision 3: prepare it and list it in NEEDS_HUMAN.md)")
         if HEAVY_HARNESS.search(a) and not in_quiet_window():
             ctx.deny(f"{a} loads the production engines; run it only in the measured low-traffic window {QUIET_WINDOW_IST[0]:02d}:00-{QUIET_WINDOW_IST[1]:02d}:00 IST (§9.3)")

@@ -19,6 +19,8 @@ The runner starts fresh `claude -p` cycles in the dev worktree, one after anothe
 | `tests/` | `test_guard_hook.py` (the hook's decisions), `test_runner.py` (runner acceptance and units, via `tests/stub_claude.py`), `test_merge_to_dev.py` (the dev gate). |
 | `../deploy/merge_to_dev.sh` | The only way the agent moves `dev`: a fast-forward to a reviewed, CI-green commit. Installed at `~/.llm-autopilot/bin/merge_to_dev.sh` and run as a plain command with no environment overrides. |
 
+The gate also refuses a commit whose `.github/` tree differs from `origin/dev`, because that commit's checks could have been graded by edited CI. When the programme changes `.github/`, the operator reviews `git diff origin/dev <commit> -- .github/` and approves it by adding the tree hash the gate prints as one line of `~/.llm-autopilot/approved-ci-trees` (operator-owned; the agent cannot write it). The agent raises a `NEEDS_HUMAN.md` item as soon as the trees first differ.
+
 Runtime state lives in `~/.llm-autopilot/`: `state.json`, `heartbeat.json`, `events.jsonl`, `logs/`, `lock`, and the control files `STOP`, `PAUSE`, `WAKE`, `RENEW`. These and the installed copies above are read-only to the agent (the guard, the deny rules and the classifier all refuse to change them).
 
 ## Tests
