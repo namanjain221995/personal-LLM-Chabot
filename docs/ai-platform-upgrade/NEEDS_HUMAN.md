@@ -2,6 +2,14 @@
 
 Items only the operator can resolve. Each has the exact action, why, the risk, the command and the rollback. Open items first.
 
+## NH-013 — How the dev stack should reach the router, embedding and reranker engines (OPEN, decision)
+
+- **What:** the dev stack (B-01, `ops/dev/README.md`) runs on the worker. From there only the production main engine answers; the router, embedding and reranker engines listen on the head's loopback. So the dev stack runs with the main model serving router, agent and vision calls, and with embeddings and reranking off. Baselines measured on it (B-04) say so, and questions about uploaded documents lose semantic retrieval there.
+- **Why you:** each way to close the gap changes how production engines are exposed or adds a long-lived process on the head, which the autopilot does not do on its own.
+- **Options:** (a) do nothing: dev keeps the shared-router, no-embedding setup and every dev measurement states it; (b) publish the three engines on the head's address on the link to the worker, allowed from the worker only in the host guard, then give the addresses to `ops/dev/init-env.sh --router … --embed … --rerank …` and re-run `ops/dev/devstack.sh up`; (c) run a reverse SSH tunnel from the head during evaluation runs only, as `scripts/aiq/aiq-stack.sh tunnel` describes (the dev orchestrator would then need the tunnel's ports reachable from its containers).
+- **Risk:** (b) widens what the worker can reach on the head; (c) is a process you start and stop by hand.
+- **Rollback:** (b) remove the publish and the host-guard rule; (c) stop the tunnel. Either way, re-run `init-env.sh` without the flags and `devstack.sh up`.
+
 ## NH-011 — Approve a `.github/` change before the finish line (OPEN, action later)
 
 - **What:** `autopilot/dev` changes one CI file, `.github/workflows/gitleaks-baseline.json`: two reviewed entries for fabricated test values in `ops/autopilot/tests/test_runner.py` (commit df091d61), in the file's existing format. Without them the blocking secret scan fails on every run, because gitleaks reads history and the commit is already pushed.
@@ -14,12 +22,13 @@ Items only the operator can resolve. Each has the exact action, why, the risk, t
 - **Risk:** none until the finish line; an unapproved tree only holds the merge into `dev`.
 - **Rollback:** delete the line from `~/.llm-autopilot/approved-ci-trees`.
 
-## NH-012 — Two leftover test processes (OPEN, action, harmless)
+## NH-012 — Leftover test processes (OPEN, action, harmless)
 
 - **What:** two `bash /tmp/ap-install-qaqw2crc/harness.sh` processes (PIDs 1009132 and 1009142) are left over from a cycle-5 QA probe of install.sh's signal handling. They are inside the `llm-autopilot.service` cgroup; one spins a CPU core.
 - **Why you:** the guard refused the agent's `kill`, and the autopilot does not work around a refusal.
 - **Risk:** none beyond one busy core. They only ask `systemctl --user is-active`, never start or stop anything, and they die at the next stop of the unit.
-- **Command:** `kill -KILL 1009142 1009132`
+- **Also (cycle 8):** a fake `/v1/models` server a B-01 test builder started and could not stop: PID 2486898, `python3 /tmp/gtest/fake_models.py 38471`, listening on 127.0.0.1 only. Harmless; the guard refused the kill.
+- **Command:** `kill -KILL 1009142 1009132 2486898`
 - **Rollback:** none needed.
 
 ## NH-007 — Install the reviewed guardrail fixes (OPEN, action)

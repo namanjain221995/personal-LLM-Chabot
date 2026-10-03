@@ -2,6 +2,24 @@
 
 History of the programme, newest first. Designed ≠ Implemented ≠ Tested ≠ Deployed; each entry says which.
 
+## 2026-10-03/04 — Autopilot cycle 8 (from about 18:13 UTC)
+
+B-01, the dev stack on the worker. Two builders ran in parallel in their own worktrees (`~/work/llm-b01-cap`: the inference cap; `~/work/llm-b01`: overlay, scripts, README); one read-only investigator mapped the engine environment contract; the main session built the images, integrated, brought the stack up and ran the smoke tests; a fresh-context QA reviewer read the final diff.
+
+| Item | State | Evidence (command → result) |
+|---|---|---|
+| Inference cap `ops/dev/inference_cap/` (1ad4b58b) | Implemented, TEST_PASSED | `python -m pytest ops/dev/tests/test_inference_cap.py` (orchestrator venv, Python 3.11) → `18 passed, 26 subtests passed`, twice in the main session |
+| Overlay, `init-env.sh`, `devstack.sh`, README (2e785b5f), stop grace 40 s (da6585e1) | Implemented, TEST_PASSED | `python -m pytest ops/dev/tests` on the merged branch → `60 passed, 55 subtests passed` |
+| Images on the worker | Built | `llmdev-orchestrator:cpu` 1.92 GB, `llmdev-frontend:portable` 221 MB, `llmdev-inference-cap:dev`; recorded in the manifest |
+| Stack up on the worker | Deployed (dev only) | `devstack.sh up` → postgres, inference-cap, orchestrator, frontend all healthy; `docker inspect` → memory 2g/6g/1g/256m, OomScoreAdj 1000, restart no, project label `llmdev` |
+| Smoke | TEST_PASSED | `devstack.sh smoke` → `/health` degraded (app_db ok, vllm ok, duckdb error: no warehouse in dev), frontend `/login` 200, cap `max_inflight` 2 |
+| End-to-end chat through the cap | TEST_PASSED | Seeded super admin (password on stdin); one Fast `/chat` inside the orchestrator container → 200, answer `dev stack works`, TTFT 1.82 s, total 2.3 s; cap after: served 15, `peak_inflight` 2, upstream errors 0 (one request, 00:15 IST, outside the low-traffic window; not a benchmark) |
+| Independent review (fresh-context QA) | `fix_first` → fixed | 1 blocking: the cap buffered whole bodies before taking a slot with no queue bound, its 256 MiB body limit equal to the container limit (reviewer probe: 217 MiB with three 64 MiB POSTs queued). Fixed eaad745c (`CAP_MAX_QUEUED` 4, `CAP_MAX_BUFFERED_BYTES` 512 MiB, `CAP_MAX_BODY_BYTES` 128 MiB, bodies always take a slot, method-override headers dropped, `POLLRDHUP` hang-up detection) and 0490a488 (literal ports, refusal of shell variables that would move ports or replace the synthetic secrets, local `ssh://` hosts refused, cap 1 GiB, env_file and OCR tests). Re-check with the reviewer's probe: 8 × 120 MiB → 4 queued, 4 refused, peak RSS 505 MiB |
+| Merged into autopilot/dev 0669102b | TEST_PASSED | `pytest ops/dev/tests` → `72 passed, 97 subtests passed`; `pytest ops/autopilot/tests` → `183 passed, 1083 subtests passed`; gitleaks (`dir`, committed ops/dev tree incl. the earlier fixture) → no leaks |
+| Redeploy with the fixes | Deployed (dev only), TEST_PASSED | `devstack.sh up` recreated only inference-cap (1 GiB); `smoke` as before; Fast `/chat` → 200, TTFT 0.53 s, total 0.92 s, cap `peak_inflight` 2, upstream errors 0 |
+
+Engine reachability from the worker (`curl` from the worker to the head): main 200; router, embed, reranker no answer (loopback-bound). Dev defaults: router/agent/vision shared on main, embeddings and reranking off (AD-010, NH-013).
+
 ## 2026-10-03 — Autopilot cycle 7 (from about 17:01 UTC)
 
 Finished P0-19 and Phase B tasks B-02 and B-05; built B-03. Agents ran in parallel, each in its own worktree: B-02 (`~/work/llm-b02`), B-03 (`~/work/llm-b03`), B-05 (`~/work/llm-b05`), one P0-19 reviewer and one B-03 QA reviewer (read-only). The main session alone edited the guard and integrated.
