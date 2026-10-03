@@ -313,6 +313,24 @@ def test_p95_gates_only_with_twenty_samples_on_each_side():
     assert r["passed"] is True
 
 
+def test_p95_just_below_the_allowed_value_passes_and_just_above_fails():
+    base = frozen([rec for i, cid in enumerate(DIRECT) for rec in timed(cid, (1.0 + i,) * 3)])   # 24 samples
+    allowed = latency(base)["allowed_p95"]
+    assert allowed == pytest.approx(8.0 * 1.2 + 0.5)
+
+    def cand(top: float) -> list:
+        c = [rec for i, cid in enumerate(DIRECT) for rec in timed(cid, (1.0 + i,) * 3)]
+        for idx in (len(c) - 3, len(c) - 6):      # r1 of the two slowest units: rank 23 of 24 becomes `top`
+            c[idx]["turns"][0]["result"]["timing"]["total_s"] = top
+        return c
+
+    below, above = compare(base, cand(allowed - 0.01)), compare(base, cand(allowed + 0.01))
+    eb, ea = below["latency"]["direct_fast"]["total_s"], above["latency"]["direct_fast"]["total_s"]
+    assert eb["candidate_p95"] == pytest.approx(allowed - 0.01) and eb["ratio"] == pytest.approx(1.0)
+    assert eb["over"] == [] and eb["verdict"] == "pass" and below["passed"] is True
+    assert ea["over"] == ["p95"] and ea["verdict"] == "fail" and above["passed"] is False
+
+
 def test_insufficient_needs_three_samples_and_a_unit_with_two():
     recs = [rec for cid in ("EV01", "RQ01", "RQ03") for rec in three_repeats(cid)]
     for rec in recs:
@@ -693,6 +711,13 @@ def test_identical_candidate_passes():
     assert {v["verdict"] for v in report["cases"].values()} == {"pass"}
     assert report["latency"]["direct_fast"]["total_s"]["verdict"] == "pass"
     assert report["overall"]["verdict"] == "pass" and report["fast_thinking"]["verdict"] == "pass"
+
+
+def test_a_new_candidate_case_is_listed_and_does_not_fail():
+    base, recs = base_and_records(cases=("EV01",))
+    r = compare(base, recs + three_repeats("RQ03"))
+    assert r["new_cases"] == ["RQ03"] and "RQ03" not in r["cases"]
+    assert r["passed"] is True and r["fails"] == []
 
 
 def test_case_regresses_only_when_more_than_one_repeat_worse():
