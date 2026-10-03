@@ -308,6 +308,23 @@ GIT_GH_DOCKER_DENY = [
     Bc("docker volume remove sf-local-ai_data"),
     Bc("docker system prune -af --volumes"),
     Bc("docker run --rm -m 256m --cpus 1 --volumes-from sf-local-ai-postgres-1 alpine ls /data"),
+    # docker rm -f: -f/-v/-l are boolean, so the production container right after
+    # them must still be checked (it used to be dropped as an option value).
+    Bc("docker rm -f sf-local-ai-orchestrator-1 llmdev-scratch"),
+    Bc("docker rm -v -f sf-local-ai-postgres-1 llmdev-scratch"),
+    Bc("docker container rm -f sf-local-ai-postgres-1 llmdev-x"),
+    Bc("docker rm -f sf-local-ai-orchestrator-1"),
+    # docker compose: a hidden value-taking global option (--workdir) must not be
+    # able to shift a mutating subcommand into the read-only shortcut.
+    Bc("docker compose -p sf-local-ai --workdir ps down -v"),
+    Bc("COMPOSE_PROJECT_NAME=sf-local-ai docker compose --workdir top down"),
+    Bc("docker compose --workdir logs -p sf-local-ai restart orchestrator"),
+    Bc("docker compose --frobnicate ps"),                  # unknown global option: fail closed
+    # gh api -F/--field @file (or =@) reads a file into the request and can send a
+    # secret to github.com even on a GET.
+    Bc("gh api -X GET search/issues -F q=@.env"),
+    Bc(f"gh api --method GET repos/{SLUG}/issues -F labels=@/tmp/llmdev/k"),
+    Bc(f"gh api -X GET repos/{SLUG}/issues --field q=@/tmp/llmdev/hosts.yml"),
 ]
 GIT_GH_DOCKER_ALLOW = [
     Bc(f"git push origin {BR}"),
@@ -330,7 +347,11 @@ GIT_GH_DOCKER_ALLOW = [
     Bc("docker compose --env-file ops/dev/stack.vars down"),
     Bc("docker stop -t 5 llmdev-orch"),
     Bc("docker kill -s TERM llmdev-orch"),
+    Bc("docker rm -f llmdev-a llmdev-b"),                   # ordinary dev cleanup, -f is boolean
+    Bc("docker rm -f llmdev-x"),
+    Bc("docker compose --progress plain --env-file ops/dev/stack.vars down"),  # known value + bool globals
     Bc("docker volume ls"),
+    Bc(f"gh api -X GET repos/{SLUG}/pulls --raw-field state=open"),  # -f/--raw-field send literals
 ]
 
 

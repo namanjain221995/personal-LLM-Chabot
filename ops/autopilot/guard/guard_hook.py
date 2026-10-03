@@ -2300,6 +2300,13 @@ def check_gh_api(args, words, ctx):
         ctx.deny(f"gh may only act on github.com/{REPO_SLUG}")
     fields = gh_flag_values(args, ("-f", "-F"), ("--field", "--raw-field"))
     inputs = gh_flag_values(args, (), ("--input",))
+    # -F/--field with @file or =@file reads a file (or '-' = stdin) INTO the
+    # request, so `gh api -X GET ... -F q=@.env` sends a secret to github.com even
+    # on a read. -f/--raw-field send literals and are fine. (The graphql branch
+    # already refuses @ below; this covers every REST endpoint too.)
+    for f in gh_flag_values(args, ("-F",), ("--field",)):
+        if f.startswith("@") or "=@" in f:
+            ctx.deny("gh api -F/--field with @file (or =@) reads a file into the request and can exfiltrate a secret to github.com; pass literals with -f/--raw-field")
     if endpoint != "graphql":
         if inputs:
             ctx.deny("gh api --input reads a request body from a file or stdin that the guard cannot check; pass an explicit GET (gh api -X GET ... -f key=value adds query parameters)")
@@ -2337,6 +2344,23 @@ def check_rerun(args, ctx):
 
 def is_dev(name):
     return bool(name) and name.startswith(DEV)
+
+
+# Options that take a VALUE, per container-targeting subcommand. Anything not
+# listed is treated as a boolean flag (its next word is NOT skipped), so a
+# container name can never be dropped by a mis-modelled flag. rm/pause/unpause/
+# wait/rename/cp take no value options (rm's -f/-v/-l are boolean).
+DOCKER_TARGET_VALUE_OPTS = {
+    "stop": {"-t", "--time", "-s", "--signal"},
+    "restart": {"-t", "--time", "-s", "--signal"},
+    "kill": {"-s", "--signal"},
+    "start": {"--detach-keys"},
+    "attach": {"--detach-keys"},
+    "commit": {"-a", "--author", "-c", "--change", "-m", "--message"},
+    "update": {"--cpus", "--memory", "-m", "--memory-swap", "--memory-reservation", "--restart",
+               "--cpuset-cpus", "--cpuset-mems", "--cpu-shares", "-c", "--pids-limit", "--blkio-weight",
+               "--cpu-period", "--cpu-quota", "--cpu-rt-period", "--cpu-rt-runtime", "--kernel-memory"},
+}
 
 
 def is_prod_db_text(text):
@@ -2413,16 +2437,19 @@ def check_docker(args, ctx):
             return check_docker(["inspect"] + rest[1:], ctx)
         return
     if sub in ("rm", "stop", "kill", "restart", "update", "pause", "unpause", "rename", "start", "commit", "attach", "wait", "cp"):
-        # Drop option values (docker stop -t 5, docker kill -s TERM) so they are
-        # not mistaken for container names.
+        # Drop ONLY the options that take a value for THIS subcommand (docker stop
+        # -t 5, docker kill -s TERM), so a value is never mistaken for a container
+        # name. For `rm`, -f/-v/-l are boolean: never skip the next word, or a
+        # production container named right after `-f` would escape the check.
+        value_opts = DOCKER_TARGET_VALUE_OPTS.get(sub, frozenset())
         names, j = [], 0
         while j < len(rest):
             x = rest[j]
-            if x in ("-t", "--time", "-s", "--signal", "-f", "--filter"):
-                j += 2
-                continue
-            if x.startswith("-"):
-                j += 1
+            if x.startswith("-") and x != "-":
+                if "=" not in x and x in value_opts:
+                    j += 2
+                else:
+                    j += 1
                 continue
             names.append(x)
             j += 1
@@ -2506,42 +2533,75 @@ def resolve_compose(globals_, ctx):
         ctx.deny("docker compose config did not print JSON; fail-closed")
 
 
+# docker compose global options (before the subcommand). VALUE options consume
+# the next word (so a hidden one such as the deprecated --workdir cannot fake a
+# read-only subcommand); BOOL options do not. Anything else fails closed.
+COMPOSE_GLOBAL_VALUE = {"-p", "--project-name", "-f", "--file", "--project-directory", "--workdir",
+                        "--env-file", "--profile", "--ansi", "--progress", "--parallel"}
+COMPOSE_GLOBAL_BOOL = {"--dry-run", "--compatibility", "--all-resources", "--no-ansi", "--verbose"}
+
+
 def check_compose(rest, ctx, remote=False):
     """docker compose: read-only subcommands pass; anything else must resolve to a
     dev project (operator decision 7: never a project, volume, network or image
     named after production) and, for long-lived services, run on the worker."""
-    globals_, sub, sub_args, i = [], None, [], 0
+    globals_, sub, sub_args, i, clean = [], None, [], 0, True
     while i < len(rest):
         x = rest[i]
-        if x in ("-p", "--project-name", "-f", "--file", "--project-directory", "--env-file", "--profile", "--ansi", "--progress", "--parallel") and i + 1 < len(rest):
-            globals_ += [x, rest[i + 1]]
-            i += 2
+        if not x.startswith("-"):
+            sub, sub_args = x, rest[i + 1 :]
+            break
+        base = x.split("=", 1)[0]
+        if base in COMPOSE_GLOBAL_VALUE:
+            if "=" in x:
+                globals_.append(x)
+                i += 1
+            elif i + 1 < len(rest):
+                globals_ += [x, rest[i + 1]]
+                i += 2
+            else:
+                clean = False
+                i += 1
             continue
-        if x.startswith("-"):
+        if x in COMPOSE_GLOBAL_BOOL:
             globals_.append(x)
             i += 1
             continue
-        sub, sub_args = x, rest[i + 1 :]
-        break
-    # Compose takes the LAST -p / --project-name, then COMPOSE_PROJECT_NAME.
-    project_flag = ctx.env.get("COMPOSE_PROJECT_NAME")
-    j = 0
-    while j < len(globals_):
-        g = globals_[j]
-        if g in ("-p", "--project-name") and j + 1 < len(globals_):
-            project_flag = globals_[j + 1]
-            j += 2
+        if x.startswith("-p") and not x.startswith("--") and len(x) > 2:  # -pNAME attached
+            globals_.append(x)
+            i += 1
             continue
-        if g.startswith("--project-name="):
-            project_flag = g.split("=", 1)[1]
-        elif g.startswith("-p") and not g.startswith("--") and len(g) > 2:
-            project_flag = g[2:].lstrip("=")
-        j += 1
+        # An unknown global option: the guard cannot tell whether it consumes the
+        # next word, so it cannot tell which word is the subcommand. Fail closed
+        # rather than guess (a hidden value flag could fake a read-only subcommand).
+        clean = False
+        globals_.append(x)
+        i += 1
+    # Compose takes the LAST -p / --project-name, then COMPOSE_PROJECT_NAME. A
+    # -p that appears AFTER the subcommand still selects the project by name.
+    project_flag = ctx.env.get("COMPOSE_PROJECT_NAME")
+    for section in (globals_, sub_args):
+        j = 0
+        while j < len(section):
+            g = section[j]
+            if g in ("-p", "--project-name") and j + 1 < len(section):
+                project_flag = section[j + 1]
+                j += 2
+                continue
+            if g.startswith("--project-name="):
+                project_flag = g.split("=", 1)[1]
+            elif g.startswith("-p") and not g.startswith("--") and len(g) > 2:
+                project_flag = g[2:].lstrip("=")
+            j += 1
+    if not clean:
+        ctx.deny("docker compose has an unrecognised global option, so the guard cannot tell which word is the subcommand or whether this acts on production; use only the known -p/-f/--project-directory/--env-file/--profile/--ansi/--progress/--parallel/--workdir flags and a named subcommand (fail-closed)")
     if sub == "config":
         if not set(sub_args) & {"-q", "--quiet", "--no-interpolate", "--services", "--volumes", "--images", "--profiles", "--hash"}:
             ctx.deny("'docker compose config' prints interpolated values, including secrets; add --no-interpolate or -q")
         return
-    # Read-only subcommands are fine even against the production project.
+    # Read-only subcommands are fine even against the production project. This is
+    # reached only after the clean-parse check above, so a hidden value flag can
+    # no longer shift a mutating subcommand into this allow-list.
     if sub in (None, "ps", "ls", "images", "top", "logs", "version", "port", "events", "stats"):
         return
     if project_flag and project_flag.startswith(PROD_STACK):
