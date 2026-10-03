@@ -227,6 +227,21 @@ FS_DENY = [
     Bc(f"cp -t /tmp/llmdev-cfg {PROD}/.env"),
     Bc("KEY=~/.ssh/id_ed25519; cat $KEY"),
     Bc("grep -rn API_KEY .", cwd=PROD),
+    # recursive searches rooted at a tree that holds untracked secrets
+    Bc("grep -rn POSTGRES ~/Documents/project"),           # an ancestor of the prod checkout
+    Bc(f"grep -rn PASSWORD {PROD}/.runtime"),
+    Bc("grep -rn oauth_token ~/.config"),                  # ancestor of ~/.config/gh
+    Bc("grep -R KEY ~/.llm-autopilot"),                    # host.json + secrets/, outside agent/
+    Bc("grep -rn KEY /home"),                              # an ancestor of $HOME
+    Bc(f"rg --hidden --no-ignore -n PASSWORD {PROD}"),     # rg recurses by default
+    Bc(f"grep -d recurse -n PASSWORD {PROD}"),             # -d recurse is recursive
+    # P0-17: writing a guard file through a DIRECTORY destination or a hard link
+    Bc("cp /tmp/llmdev/test-db.vars ~/.llm-autopilot/agent/"),
+    Bc("cp -t ~/.llm-autopilot/agent /tmp/llmdev/test-db.vars"),
+    Bc("tar -xf /tmp/llmdev/x.tar -C ~/.llm-autopilot/agent"),
+    Bc("ln -sf /tmp/llmdev/test-db.vars ~/.llm-autopilot/agent/"),
+    Bc("ln ~/.llm-autopilot/guard/guard_hook.py ~/work/llm-dev/.g"),
+    Bc("cp -l ~/.llm-autopilot/agent/test-db.vars /tmp/llmdev/t"),
     R(".env", cwd=PROD),
     R("$HOME/.config/gh/hosts.yml"),
     R(f"{PROD}/./.runtime//secrets.env"),
@@ -258,6 +273,13 @@ FS_ALLOW = [
     Bc("git check-ignore -v .env"),
     Bc("grep -rn '\\.env' orchestrator/app"),              # pattern, not a file
     Bc("rg -n 'id_ed25519' docs/"),                        # pattern, not a file
+    Bc("grep -rn TODO orchestrator/app"),                  # recursive, but no secrets in the subtree
+    Bc("rg -n stream_chat orchestrator"),                  # recursive by default, worktree subtree
+    Bc("grep -rn X ~/.llm-autopilot/agent/private"),       # the agent sandbox holds no secret
+    Bc("cp /tmp/llmdev/a.txt ~/.llm-autopilot/agent/private/"),
+    Bc("tar -xf /tmp/llmdev/x.tar -C ~/.llm-autopilot/agent/private"),
+    Bc("cp /tmp/llmdev/a.txt /tmp/llmdev/b.txt"),
+    Bc("ln -s /tmp/llmdev/a /tmp/llmdev/b"),               # symlink to a non-guard path
     R(f"{DEV}/.env.example"),
     ("Grep", {"pattern": "def evaluate", "path": f"{DEV}/ops/autopilot"}, None),
 ]

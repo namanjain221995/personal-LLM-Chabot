@@ -1706,13 +1706,54 @@ def check_secret_args(cmd, args, ctx):
             ctx.deny(f"reads a secret file ({val}); secrets must never enter the transcript, logs or commits (§3.3)")
 
 
+def _dir_holds_secret(p):
+    """True when directory `p` directly contains an untracked secret file."""
+    try:
+        for name in os.listdir(p):
+            if SECRET_BASENAME.match(name) and not is_tracked(os.path.join(p, name)):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def recursive_secret_root(p):
+    """True when a recursive read rooted at `p` would descend into a tree that
+    holds untracked secrets: the production checkout or $HOME (or any ancestor of
+    them), the autopilot home outside its agent sandbox, a secret directory (or
+    an ancestor of one, e.g. ~/.config), or a production subtree that holds a
+    secret basename (e.g. .runtime)."""
+    if p is None:
+        return False
+    agent = _real(os.path.join(AUTOPILOT_HOME, "agent"))
+    if under(R_PROD, p) or under(_real(HOME), p):  # p is, or is an ancestor of, prod/$HOME
+        return True
+    if under(p, AUTOPILOT_HOME) and not under(p, agent):
+        return True
+    for d in SECRET_DIRS + [_real(os.path.join(HOME, ".config"))]:
+        if under(p, d) or under(d, p):  # inside a secret dir, or an ancestor of one
+            return True
+    if under(p, R_PROD) and (os.path.basename(p) == ".runtime" or SECRET_PATH_PARTS.search(p) or _dir_holds_secret(p)):
+        return True
+    return False
+
+
 def check_grep_reads(cmd, args, ctx):
     """grep/rg/ag: the first positional is the PATTERN (not a file); the rest are
-    paths. A recursive search rooted at a tree that holds untracked secrets (the
-    production checkout, $HOME) is refused."""
-    recursive = any(a in ("-r", "-R", "--recursive", "--dereference-recursive") or
-                    (a.startswith("-") and not a.startswith("--") and "r" in a[1:].lower()) for a in args)
+    paths. Reject reading a secret file, and reject a RECURSIVE search rooted at a
+    tree that holds untracked secrets (the production checkout, $HOME, ~/.config,
+    the autopilot home, a secret directory)."""
+    recursive = cmd in ("rg", "ag")  # ripgrep and the silver searcher recurse by default
     pat_from_opt = any(a in ("-e", "--regexp", "-f", "--file") or a.startswith(("-e", "--regexp=", "-f", "--file=")) for a in args)
+    for idx, a in enumerate(args):
+        if a in ("-r", "-R", "--recursive", "--dereference-recursive"):
+            recursive = True
+        elif a == "-d" and idx + 1 < len(args) and args[idx + 1] == "recurse":
+            recursive = True
+        elif a == "--directories=recurse":
+            recursive = True
+        elif a.startswith("-") and not a.startswith("--") and "r" in a[1:].lower():
+            recursive = True
     positionals, i = [], 0
     while i < len(args):
         a = args[i]
@@ -1728,9 +1769,8 @@ def check_grep_reads(cmd, args, ctx):
     for val in files:
         if _looks_secret(val, ctx.cwd):
             ctx.deny(f"reads a secret file ({val}); secrets must never enter the transcript, logs or commits (§3.3)")
-        p = expand_path(val, ctx.cwd)
-        if recursive and p is not None and (p == R_PROD or p == _real(HOME)):
-            ctx.deny(f"a recursive search rooted at {val} reads the untracked .env / .runtime secrets under it; scope the search to a subdirectory (§3.3)")
+        if recursive and recursive_secret_root(expand_path(val, ctx.cwd)):
+            ctx.deny(f"a recursive search rooted at {val} would read the untracked .env / .runtime / credential files under it; scope the search to a subdirectory that holds no secrets (§3.3)")
 
 
 WRITE_ALL_ARGS = {"rm", "rmdir", "unlink", "shred", "truncate", "touch", "mkdir", "mv", "tee", "setfacl", "mkfifo", "srm"}
@@ -1739,7 +1779,56 @@ WRITE_LAST_ARG = {"cp", "install", "rsync", "scp", "ln"}
 DESTRUCTIVE = {"rm", "rmdir", "unlink", "shred", "truncate", "mv", "chmod", "chown", "chgrp", "dd", "ln", "cp", "rsync", "tee", "find"}
 
 
+LINK_OR_COPY = {"cp", "mv", "install", "ln", "rsync"}
+
+
+def check_copy_link_targets(cmd, args, ctx):
+    """cp/mv/install/ln/rsync: close two ways a guard or secret file is reached
+    that checking only the destination directory misses (P0-17).
+      - A DIRECTORY destination: the file actually written is join(dest, basename)
+        for each source, so a copy into ~/.llm-autopilot/agent/ would land on
+        test-db.vars even though agent/ itself is writable.
+      - A HARD link (ln without -s, cp -l, rsync --link-dest) to a guard or secret
+        file shares its inode, so later edits through the link change the original."""
+    na = nonopt(args)
+    hard = (cmd == "ln" and not any(a in ("-s", "--symbolic") or (a.startswith("-") and not a.startswith("--") and "s" in a[1:]) for a in args)) \
+        or (cmd == "cp" and any(a in ("-l", "--link") or (a.startswith("-") and not a.startswith("--") and "l" in a[1:]) for a in args)) \
+        or (cmd == "rsync" and any(a.startswith("--link-dest") for a in args))
+    tdir = None
+    for i, a in enumerate(args):
+        if a in ("-t", "--target-directory") and i + 1 < len(args):
+            tdir = args[i + 1]
+        elif a.startswith("--target-directory="):
+            tdir = a.split("=", 1)[1]
+    if tdir is not None:
+        dest, sources = tdir, list(na)
+    elif len(na) >= 2:
+        dest, sources = na[-1], na[:-1]
+    else:
+        return
+    sources = [s for s in sources if s != dest and not re.match(r"^[\w.@-]+:", s)]  # drop remote host:path
+    if hard:
+        for s in sources:
+            sp = expand_path(s, ctx.cwd)
+            if sp and (is_guard_path(sp) or is_secret_path(sp)):
+                ctx.deny("a hard link to a guard file or a secret file shares its inode, so a later edit through the link would change the protected file; copy the contents into your worktree instead (§3.3/P0-17)")
+    if re.match(r"^[\w.@-]+:", dest):  # remote destination: out of scope here
+        return
+    dp = expand_path(dest, ctx.cwd)
+    if dp is None:
+        return
+    if tdir is not None or dest.endswith("/") or os.path.isdir(dp):
+        for s in sources:
+            cand = os.path.join(dp, os.path.basename(s.rstrip("/")))
+            if is_guard_path(cand) or holds_guard_file(cand):
+                ctx.deny("writing into a directory that holds the autopilot's guard files would overwrite guard/, bin/, agent/test-db.vars or the CI approvals and disable the guardrails (§3.3/P0-17); operate only on files the autopilot created")
+            if is_secret_path(cand):
+                ctx.deny(f"this would overwrite the secret file {os.path.basename(s)} (§3.3)")
+
+
 def check_write_targets(cmd, args, ctx):
+    if cmd in LINK_OR_COPY:
+        check_copy_link_targets(cmd, args, ctx)
     targets = []
     if cmd in WRITE_ALL_ARGS:
         targets = nonopt(args)
@@ -1797,6 +1886,9 @@ def check_write_targets(cmd, args, ctx):
         targets = ["."]
     move_or_delete = cmd in ("rm", "rmdir", "unlink", "shred", "srm", "mv", "find", "gio") \
         or (cmd == "rsync" and any(a.startswith("--delete") or a == "--remove-source-files" for a in args))
+    # Extracting an archive into a directory that holds a guard file can overwrite
+    # it (P0-17), just like a copy into that directory.
+    extract = (cmd == "tar" and args and re.search(r"x", args[0].lstrip("-"))) or cmd == "unzip"
     for t in targets:
         if move_or_delete and re.search(r"[*?\[{]", t):
             gp = _glob_parent(t, ctx.cwd)
@@ -1807,8 +1899,8 @@ def check_write_targets(cmd, args, ctx):
             if cmd in DESTRUCTIVE:
                 ctx.deny(f"'{t}' is computed at run time; destructive commands need literal paths")
             continue
-        if move_or_delete and holds_guard_file(p):
-            ctx.deny("moving or deleting a directory that holds the autopilot's guard files (guard/, bin/, agent/, test-db.vars, CI approvals, ...) would disable the guardrails (§3.3/P0-17); operate only on individual files the autopilot created")
+        if (move_or_delete or extract) and holds_guard_file(p):
+            ctx.deny("moving into, extracting into, or deleting a directory that holds the autopilot's guard files (guard/, bin/, agent/, test-db.vars, CI approvals, ...) would disable the guardrails (§3.3/P0-17); operate only on individual files the autopilot created")
         if cmd in ("rm", "rmdir", "shred") and (p in BROAD_DELETE or re.fullmatch(r"/(var/)?tmp/\*", t) or t.rstrip("/") in ("/tmp/*", "/tmp/.*", "~/*", "*", ".*", "/*")):
             ctx.deny(f"refuses the broad delete of {t}; delete only paths the autopilot created")
         if not write_allowed(p):
