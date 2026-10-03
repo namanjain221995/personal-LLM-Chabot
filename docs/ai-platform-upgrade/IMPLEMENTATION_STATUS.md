@@ -2,6 +2,20 @@
 
 History of the programme, newest first. Designed ≠ Implemented ≠ Tested ≠ Deployed; each entry says which.
 
+## 2026-10-03 — Autopilot cycle 7 (from about 17:01 UTC)
+
+Finished P0-19 and Phase B tasks B-02 and B-05; built B-03. Agents ran in parallel, each in its own worktree: B-02 (`~/work/llm-b02`), B-03 (`~/work/llm-b03`), B-05 (`~/work/llm-b05`), one P0-19 reviewer and one B-03 QA reviewer (read-only). The main session alone edited the guard and integrated.
+
+| Item | State | Evidence (command → result) |
+|---|---|---|
+| P0-19 differential replay (no new bypass inputs) | TEST_EXECUTED | Base 1eab1707 vs 1820a187 through `evaluate()` only, TEST_HOST and real host config: committed test inputs 1,578/1,646, reviewer cases 578, spec corpus 2,866; base-refused/branch-allowed inputs reaching a hard limit found in four relaxations (details host-only) |
+| P0-19 fixes 33622efa, 6cebad03 | Implemented, TEST_PASSED | 39 new deny subtests fail on 1820a187 and pass; suite `159 passed, 993 subtests passed`; extended replay 190,269 inputs, 0 internal errors |
+| P0-19 fresh review → round 2 d4fa481d | Implemented, TEST_PASSED | Review `fix_first` (2 blocking, 7 non-blocking); every input it named now refused (its probe lists, three guards side by side); suite `160 passed, 1020 subtests passed`; spec replay p99 1.15 ms, max 5.8 ms |
+| P0-19 merged bffc6d7a | TEST_PASSED | `pytest ops/autopilot/tests` on merged autopilot/dev → `183 passed, 1083 subtests passed`; pushed. Not installed (NH-007) |
+| B-02 eval set (merged 0a32efca) | Implemented, TEST_PASSED | `pytest scripts/aiq/tests` → `78 passed` (main session, branch and merged tree); `eval_set.py` → `16 cases, valid`. Not yet run against a stack (B-04) |
+| B-05 low-traffic window (merged 5c3b2920) | Measured | 9 read-only `query_range` GETs, 13.2 days; 05:00–07:00 IST (2 h), 04:00–08:00 IST (4 h) |
+| B-03 correlation id + stage times | Implemented (branch), TEST_PASSED by builder, review pending | Builder: focused orchestrator files `78 passed`; vitest `162 passed`; two broad runs had failures from a concurrent pytest on the shared test DB that passed when re-run alone |
+
 ## 2026-10-03 — Autopilot cycle 6 (from about 16:10 UTC)
 
 Finished P0-18 and built P0-19. Agents ran in parallel, each in its own worktree: an install.sh/runner builder (`~/work/llm-p018-b`), a P0-19 guard builder (`~/work/llm-p019`), two P0-18 reviewers and one P0-19 reviewer (detached worktrees). The main session alone edited the gate and integrated.

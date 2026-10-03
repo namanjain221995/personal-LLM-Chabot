@@ -24,12 +24,12 @@ Items only the operator can resolve. Each has the exact action, why, the risk, t
 
 ## NH-007 — Install the reviewed guardrail fixes (OPEN, action)
 
-- **What:** P0-15, P0-16, P0-17 and P0-18 fixed the review findings in the guard hook, the deny rules, the runner and the dev gate (`ops/autopilot/`, `ops/deploy/merge_to_dev.sh`; P0-16 merged into `autopilot/dev` at 04e55f06 and b21088b3, P0-18 at 51f80b4b). The P0-18 gate adds check 6 (GitHub's compare must say the push is a fast-forward), so `gh` must reach the API when the gate runs. The autopilot may not install its own guardrails (§3.3), so the running copies in `~/.llm-autopilot/` are still the Phase 0 ones.
+- **What:** P0-15, P0-16, P0-17, P0-18 and P0-19 fixed the review findings in the guard hook, the deny rules, the runner and the dev gate (`ops/autopilot/`, `ops/deploy/merge_to_dev.sh`; P0-16 merged into `autopilot/dev` at 04e55f06 and b21088b3, P0-18 at 51f80b4b, P0-19 at bffc6d7a). The P0-18 gate adds check 6 (GitHub's compare must say the push is a fast-forward), so `gh` must reach the API when the gate runs. The autopilot may not install its own guardrails (§3.3), so the running copies in `~/.llm-autopilot/` are still the Phase 0 ones.
 - **Why:** the installed guard lacks every fix since Phase 0. The host-only reports `~/.llm-autopilot/agent/private/p0-15-review-2026-10-03.md`, `p0-16-sweep-2026-10-03.md` (see "Found while fixing") and `p0-17-reqa-2026-10-03.md` say why installing matters.
-- **Best moment:** now: P0-18 is merged (51f80b4b), so one install carries the gate fixes too. P0-19 (guard false positives) is still under review; re-run the install after it merges.
+- **Best moment:** now: P0-19 is merged (bffc6d7a), so one install carries every guard and gate fix so far. New refusals you may notice: `env -S`/`env -C`, any read of `~/.llm-autopilot/agent/test-db.vars` (it holds the test database password), curl data or `file://` URLs naming secret files, and inline code that writes through a variable or alias while it names a protected path.
 - **Command** (outside any autopilot session; `install.sh` refuses inside one):
   ```bash
-  cd ~/work/llm-dev && git log -1 --oneline   # a commit at or after 51f80b4b
+  cd ~/work/llm-dev && git log -1 --oneline   # a commit at or after bffc6d7a
   ops/autopilot/install.sh --restart-after-cycle
   ```
   It re-installs the hook, settings, runner, gate and `status.sh`, then touches `STOP`, waits for the running cycle to end (up to its 4 h limit), removes `STOP` and starts the new runner. Do not use `systemctl --user restart`: it would kill the cycle in flight.
