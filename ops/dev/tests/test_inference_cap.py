@@ -257,11 +257,13 @@ class CapTestCase(unittest.TestCase):
         return json.loads(body)
 
     def settled(self, srv, served=None):
-        """Stats once no request holds or waits for a slot (the cap releases a slot just after the
-        client has the last byte, so a client can look before the release)."""
+        """Stats once no request holds or waits for a slot or holds body bytes (the cap releases a
+        slot just after the client has the last byte, so a client can look before the release).
+        A reservation given back twice would leave buffered_bytes below zero and never settle."""
         def done():
             stats = self.stats(srv)
             return (stats["inflight"] == 0 and stats["queued"] == 0
+                    and stats["buffered_bytes"] == 0 and stats["queued_bytes"] == 0
                     and (served is None or stats["served"] >= served))
         self.assertTrue(wait_until(done), self.stats(srv))
         return self.stats(srv)
@@ -414,6 +416,29 @@ class TestCap(CapTestCase):
         self.settled(srv)
         self.assertFalse(up.release.is_set())
 
+    def test_a_client_that_pipelined_more_than_a_buffer_and_hung_up_releases_the_slot(self):
+        up = self.upstream()
+        srv = self.cap({"main": up}, CAP_MAX_INFLIGHT=1)
+        sock = socket.create_connection(("127.0.0.1", srv.port), timeout=WAIT)
+        # Request 1 streams; request 2 is pipelined behind it with far more than the cap's 8 KiB
+        # read buffer, so most of it still waits on the socket while request 1 is relayed.
+        sock.sendall(b"POST /main/v1/sse-silent HTTP/1.1\r\nHost: cap\r\nContent-Length: 2\r\n\r\n{}"
+                     + b"POST /main/v1/echo HTTP/1.1\r\nHost: cap\r\nContent-Length: 65536\r\n\r\n"
+                     + b"x" * 65536)
+        received = b""
+        while b"data: 1" not in received:
+            chunk = sock.recv(4096)
+            self.assertTrue(chunk, "stream ended before the first event")
+            received += chunk
+        self.assertEqual(self.stats(srv)["inflight"], 1)
+        sock.close()
+        started = time.monotonic()
+        status, _, _ = request(srv.port, "POST", "/main/v1/echo", b"{}", timeout=5)
+        self.assertEqual(status, 200)
+        self.assertLess(time.monotonic() - started, 4)
+        self.settled(srv)
+        self.assertFalse(up.release.is_set())
+
     def test_a_queued_client_that_hangs_up_never_reaches_the_upstream(self):
         up = self.upstream()
         srv = self.cap({"main": up}, CAP_MAX_INFLIGHT=1)
@@ -442,6 +467,158 @@ class TestCap(CapTestCase):
         self.assertEqual(self.stats(srv)["inflight"], 1)
         up.release.set()
         self.assertEqual(holder()[0], 200)
+
+    def test_get_and_head_with_a_body_take_a_slot(self):
+        up = self.upstream()
+        srv = self.cap({"main": up}, CAP_MAX_INFLIGHT=1, CAP_QUEUE_TIMEOUT_S=0.3)
+        holder = self.hold_the_slot(srv, up)
+        for method in ("GET", "HEAD"):
+            with self.subTest(method=method):
+                status, headers, _ = request(srv.port, method, "/main/v1/models", b'{"prompt": "x"}',
+                                             timeout=5)
+                self.assertEqual(status, 503)
+                self.assertEqual(headers.get("Retry-After"), "30")
+        self.assertEqual(self.stats(srv)["rejected_queue_timeout"], 2)
+        status, _, _ = request(srv.port, "GET", "/main/v1/models", timeout=5)
+        self.assertEqual(status, 200)  # a GET without a body still skips the slot
+        self.assertEqual(up.paths(), ["/v1/block", "/v1/models"])
+        up.release.set()
+        self.assertEqual(holder()[0], 200)
+        # With the slot free, a GET with a body is forwarded, body included, through a slot.
+        status, _, body = request(srv.port, "GET", "/main/v1/echo", b'{"prompt": "x"}')
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["body_len"], len(b'{"prompt": "x"}'))
+        self.assertEqual(self.settled(srv)["peak_inflight"], 1)
+
+    def test_method_override_headers_are_not_forwarded(self):
+        up = self.upstream()
+        srv = self.cap({"main": up})
+        status, _, body = request(srv.port, "POST", "/main/v1/echo", b"{}",
+                                  headers={"X-HTTP-Method-Override": "GET", "X-HTTP-Method": "GET",
+                                           "X-Method-Override": "GET", "X-Keep": "yes"})
+        self.assertEqual(status, 200)
+        seen = {k.lower() for k, _ in json.loads(body)["headers"]}
+        self.assertIn("x-keep", seen)
+        for name in ("x-http-method-override", "x-http-method", "x-method-override"):
+            self.assertNotIn(name, seen)
+
+    def test_queue_full_answers_503_at_once_without_reading_the_body(self):
+        up = self.upstream()
+        srv = self.cap({"main": up}, CAP_MAX_INFLIGHT=1, CAP_MAX_QUEUED=1)
+        holder = self.hold_the_slot(srv, up)
+        queued = self.background(request, srv.port, "POST", "/main/v1/queued", b"{}")
+        self.assertTrue(wait_until(lambda: self.stats(srv)["queued"] == 1))
+        # The third declares a body it never sends: an answer proves the cap did not wait to read it.
+        started = time.monotonic()
+        reply = raw_exchange(srv.port, b"POST /main/v1/third HTTP/1.1\r\nHost: cap\r\n"
+                                       b"Content-Length: 1000\r\n\r\n", timeout=5)
+        self.assertLess(time.monotonic() - started, 1.5)
+        head, _, body = reply.partition(b"\r\n\r\n")
+        self.assertTrue(head.startswith(b"HTTP/1.1 503 "), reply[:40])
+        self.assertIn(b"\r\nRetry-After: 30", head)
+        self.assertEqual(json.loads(body)["error"]["type"], "cap_queue_full")
+        # Expect: 100-continue gets the refusal, never a 100.
+        reply = raw_exchange(srv.port, b"POST /main/v1/third HTTP/1.1\r\nHost: cap\r\n"
+                                       b"Expect: 100-continue\r\nContent-Length: 1000\r\n\r\n", timeout=5)
+        self.assertTrue(reply.startswith(b"HTTP/1.1 503 "), reply[:40])
+        stats = self.stats(srv)
+        self.assertEqual((stats["rejected_queue_full"], stats["inflight"], stats["queued"]), (2, 1, 1))
+        up.release.set()
+        self.assertEqual(holder()[0], 200)
+        self.assertEqual(queued()[0], 200)
+        self.assertNotIn("/v1/third", up.paths())
+        self.settled(srv, served=2)
+
+    def test_buffer_full_answers_503_at_once_without_reading_the_body(self):
+        up = self.upstream()
+        srv = self.cap({"main": up}, CAP_MAX_INFLIGHT=1, CAP_MAX_BODY_BYTES=1000,
+                       CAP_MAX_BUFFERED_BYTES=1500)
+        holder = self.background(request, srv.port, "POST", "/main/v1/block", b"x" * 1000)
+        self.assertTrue(up.entered.wait(WAIT))
+        stats = self.stats(srv)
+        self.assertEqual((stats["buffered_bytes"], stats["queued_bytes"]), (1000, 0))
+        started = time.monotonic()
+        reply = raw_exchange(srv.port, b"POST /main/v1/second HTTP/1.1\r\nHost: cap\r\n"
+                                       b"Content-Length: 600\r\n\r\n", timeout=5)
+        self.assertLess(time.monotonic() - started, 1.5)
+        head, _, body = reply.partition(b"\r\n\r\n")
+        self.assertTrue(head.startswith(b"HTTP/1.1 503 "), reply[:40])
+        self.assertIn(b"\r\nRetry-After: 30", head)
+        self.assertEqual(json.loads(body)["error"]["type"], "cap_buffer_full")
+        # A body that fits next to the first one is admitted and waits for the slot.
+        fits = self.background(request, srv.port, "POST", "/main/v1/fits", b"y" * 500)
+        self.assertTrue(wait_until(lambda: self.stats(srv)["queued_bytes"] == 500))
+        self.assertEqual(self.stats(srv)["buffered_bytes"], 1500)
+        up.release.set()
+        self.assertEqual(holder()[0], 200)
+        self.assertEqual(fits()[0], 200)
+        stats = self.settled(srv, served=2)
+        self.assertEqual(stats["rejected_buffer_full"], 1)
+        self.assertNotIn("/v1/second", up.paths())
+
+    def test_the_byte_budget_is_given_back_on_success_error_and_hang_up(self):
+        up = self.upstream()
+        srv = self.cap({"main": up, "dead": free_port()}, CAP_MAX_INFLIGHT=1, CAP_MAX_BODY_BYTES=1000,
+                       CAP_MAX_BUFFERED_BYTES=1000)
+        # Each step uses the whole budget, so a reservation that leaked would refuse the next one.
+        for _ in range(2):
+            status, _, _ = request(srv.port, "POST", "/main/v1/echo", b"x" * 1000)
+            self.assertEqual(status, 200)
+            self.settled(srv)
+        status, _, body = request(srv.port, "POST", "/dead/v1/chat/completions", b"x" * 1000)
+        self.assertEqual(status, 502)
+        self.settled(srv)
+        # The client hangs up part-way through its body.
+        sock = socket.create_connection(("127.0.0.1", srv.port), timeout=WAIT)
+        sock.sendall(b"POST /main/v1/partial HTTP/1.1\r\nHost: cap\r\nContent-Length: 1000\r\n\r\n"
+                     + b"x" * 10)
+        self.assertTrue(wait_until(lambda: self.stats(srv)["buffered_bytes"] == 1000))
+        self.assertEqual(self.stats(srv)["queued"], 1)
+        sock.close()
+        self.settled(srv)
+        # The client hangs up mid-stream while it holds the slot.
+        sock = socket.create_connection(("127.0.0.1", srv.port), timeout=WAIT)
+        sock.sendall(b"POST /main/v1/sse-silent HTTP/1.1\r\nHost: cap\r\nContent-Length: 1000\r\n\r\n"
+                     + b"x" * 1000)
+        received = b""
+        while b"data: 1" not in received:
+            chunk = sock.recv(4096)
+            self.assertTrue(chunk, "stream ended before the first event")
+            received += chunk
+        stats = self.stats(srv)
+        self.assertEqual((stats["inflight"], stats["buffered_bytes"], stats["queued_bytes"]), (1, 1000, 0))
+        sock.close()
+        self.settled(srv)
+        status, _, _ = request(srv.port, "POST", "/main/v1/echo", b"x" * 1000)
+        self.assertEqual(status, 200)
+        stats = self.settled(srv)
+        self.assertEqual((stats["rejected_buffer_full"], stats["upstream_errors"]), (0, 1))
+        self.assertNotIn("/v1/partial", up.paths())
+
+    def test_expect_100_continue_is_answered_after_admission(self):
+        up = self.upstream()
+        srv = self.cap({"main": up})
+        sock = socket.create_connection(("127.0.0.1", srv.port), timeout=WAIT)
+        self.addCleanup(sock.close)
+        sock.sendall(b"POST /main/v1/echo HTTP/1.1\r\nHost: cap\r\nExpect: 100-continue\r\n"
+                     b"Content-Length: 5\r\n\r\n")
+        received = b""
+        while b"\r\n\r\n" not in received:
+            chunk = sock.recv(4096)
+            self.assertTrue(chunk, "closed before the 100")
+            received += chunk
+        self.assertTrue(received.startswith(b"HTTP/1.1 100 "), received[:40])
+        sock.sendall(b"hello")
+        received = received.partition(b"\r\n\r\n")[2]
+        while b'"body_len": 5' not in received:
+            chunk = sock.recv(65536)
+            self.assertTrue(chunk, received[-200:])
+            received += chunk
+        self.assertTrue(received.startswith(b"HTTP/1.1 200 "), received[:40])
+        # A request refused on its headers gets the refusal instead of a 100.
+        reply = raw_exchange(srv.port, b"POST /nope/v1/x HTTP/1.1\r\nHost: cap\r\n"
+                                       b"Expect: 100-continue\r\nContent-Length: 5\r\n\r\n", timeout=5)
+        self.assertTrue(reply.startswith(b"HTTP/1.1 404 "), reply[:40])
 
     def test_unknown_upstream_and_path_traversal(self):
         main, router = self.upstream(), self.upstream()
@@ -549,11 +726,16 @@ class TestCap(CapTestCase):
         status, _, body = request(srv.port, "GET", "/_cap/health")
         self.assertEqual((status, json.loads(body)), (200, {"ok": True}))
         stats = self.stats(srv)
-        self.assertEqual(set(stats), {"max_inflight", "inflight", "queued", "peak_inflight", "served",
-                                      "rejected_queue_timeout", "upstream_errors", "upstreams"})
+        self.assertEqual(set(stats), {"max_inflight", "max_queued", "max_buffered_bytes", "inflight",
+                                      "queued", "peak_inflight", "buffered_bytes", "queued_bytes",
+                                      "served", "rejected_queue_timeout", "rejected_queue_full",
+                                      "rejected_buffer_full", "upstream_errors", "upstreams"})
+        self.assertEqual((stats["max_queued"], stats["max_buffered_bytes"]), (4, 536870912))
         self.assertEqual(stats["upstreams"], ["main", "router"])
         status, _, _ = request(srv.port, "POST", "/_cap/health", b"{}")
         self.assertEqual(status, 405)
+        status, _, _ = request(srv.port, "GET", "/_cap/stats", b"{}")
+        self.assertEqual(status, 400)
         self.assertEqual(up.paths(), [])
 
 
@@ -570,13 +752,19 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.queue_timeout_s, 900)
         self.assertEqual(cfg.connect_timeout_s, 10)
         self.assertEqual(cfg.read_timeout_s, 4500)
-        self.assertEqual(cfg.max_body_bytes, 268435456)
+        self.assertEqual(cfg.max_body_bytes, 134217728)
+        self.assertEqual(cfg.max_queued, 4)
+        self.assertEqual(cfg.max_buffered_bytes, 536870912)
         self.assertEqual(list(cfg.upstreams), ["main", "router", "embed"])
         self.assertEqual(cfg.upstreams["router"].base_path, "/v1")
         self.assertEqual(cfg.upstreams["embed"].port, 80)
         self.assertEqual(cfg.upstreams["embed"].host_header, "embed")
         self.assertEqual(cfg.upstreams["main"].host_header, "192.0.2.10:8000")
         self.assertEqual(self.parse(CAP_UPSTREAMS=self.GOOD, CAP_MAX_INFLIGHT="1").max_inflight, 1)
+        self.assertEqual(self.parse(CAP_UPSTREAMS=self.GOOD, CAP_MAX_QUEUED="0").max_queued, 0)
+        self.assertEqual(self.parse(CAP_UPSTREAMS=self.GOOD, CAP_MAX_QUEUED="64").max_queued, 64)
+        cfg = self.parse(CAP_UPSTREAMS=self.GOOD, CAP_MAX_BODY_BYTES="1000", CAP_MAX_BUFFERED_BYTES="1000")
+        self.assertEqual((cfg.max_body_bytes, cfg.max_buffered_bytes), (1000, 1000))
 
     def test_refusals(self):
         bad = [
@@ -604,6 +792,12 @@ class TestConfig(unittest.TestCase):
             {"CAP_UPSTREAMS": self.GOOD, "CAP_QUEUE_TIMEOUT_S": "nan"},
             {"CAP_UPSTREAMS": self.GOOD, "CAP_READ_TIMEOUT_S": "600"},
             {"CAP_UPSTREAMS": self.GOOD, "CAP_MAX_BODY_BYTES": "1e9"},
+            {"CAP_UPSTREAMS": self.GOOD, "CAP_MAX_QUEUED": "65"},
+            {"CAP_UPSTREAMS": self.GOOD, "CAP_MAX_QUEUED": "-1"},
+            {"CAP_UPSTREAMS": self.GOOD, "CAP_MAX_QUEUED": "four"},
+            {"CAP_UPSTREAMS": self.GOOD, "CAP_MAX_BUFFERED_BYTES": "134217727"},
+            {"CAP_UPSTREAMS": self.GOOD, "CAP_MAX_BODY_BYTES": "1001", "CAP_MAX_BUFFERED_BYTES": "1000"},
+            {"CAP_UPSTREAMS": self.GOOD, "CAP_MAX_BUFFERED_BYTES": "0"},
         ]
         for env in bad:
             with self.subTest(env=env):
@@ -615,7 +809,9 @@ class TestConfig(unittest.TestCase):
 
     def test_main_exits_non_zero_with_one_line(self):
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "CAP_LISTEN": "127.0.0.1:0"}
-        for extra in ({}, {"CAP_UPSTREAMS": "main=http://192.0.2.10:8000", "CAP_MAX_INFLIGHT": "3"}):
+        for extra in ({}, {"CAP_UPSTREAMS": "main=http://192.0.2.10:8000", "CAP_MAX_INFLIGHT": "3"},
+                      {"CAP_UPSTREAMS": "main=http://192.0.2.10:8000", "CAP_MAX_QUEUED": "65"},
+                      {"CAP_UPSTREAMS": "main=http://192.0.2.10:8000", "CAP_MAX_BUFFERED_BYTES": "1024"}):
             with self.subTest(extra=extra):
                 proc = subprocess.run([sys.executable, CAP_PATH], env={**env, **extra},
                                       capture_output=True, text=True, timeout=30)

@@ -2,22 +2,39 @@
 """Inference cap: hold the dev stack to at most two in-flight requests to the production engines.
 
 The dev copy of the application reuses the production model engines (vLLM, OpenAI-compatible
-HTTP). The programme allows the dev stack at most two in-flight engine requests in total, at the
-lowest priority. This reverse proxy is that cap, enforced in code: the dev orchestrator's engine
-base URLs point here (for example http://inference-cap:9100/main/v1) and every request that can
-make an engine do work waits for one of at most two global slots.
+HTTP). The programme allows the dev stack at most two in-flight engine requests in total. This
+reverse proxy is that cap, enforced in code: the dev orchestrator's engine base URLs point here (for
+example http://inference-cap:9100/main/v1) and every request that can make an engine do work waits
+for one of at most two global slots. The cap only counts requests; it does not enforce a priority.
+The engines schedule whatever reaches them first come, first served, so dev requests are not ranked
+below production ones; what the cap guarantees is that the dev stack's share of the engines is never
+more than two in-flight requests.
 
 Standard library only (Python 3.11). Configuration comes from the environment and is validated at
 start; see parse_config(). Tests build a server from a config mapping with parse_config() and
 build_server() without touching the process environment or calling main().
 
-Slots: one threading.BoundedSemaphore(CAP_MAX_INFLIGHT) shared by every upstream. GET and HEAD
-(metadata: /v1/models, /health, /version, /metrics) skip it. A slot is taken before the upstream
-connection opens and released exactly once (try/finally) when the response has been relayed, the
-client has gone, the upstream failed or timed out, or anything raised. While a request holds a
-slot a watcher notices the client hanging up and shuts the upstream connection, so an abandoned
-request stops occupying the engine and the slot. A request still queued for a slot is dropped if
-its client hangs up.
+Slots: one threading.BoundedSemaphore(CAP_MAX_INFLIGHT) shared by every upstream. A request takes a
+slot when its method is not GET or HEAD, or when it carries a body whatever its method; only GET and
+HEAD without a body (metadata: /v1/models, /health, /version, /metrics) skip it. A slot is taken
+before the upstream connection opens and released exactly once (try/finally) when the response has
+been relayed, the client has gone, the upstream failed or timed out, or anything raised. While a
+request holds a slot a watcher notices the client hanging up and shuts the upstream connection, so an
+abandoned request stops occupying the engine and the slot. A request still queued for a slot is
+dropped if its client hangs up. Both checks use POLLRDHUP (Linux), so a client that pipelined its
+next request and then hung up is still noticed; where POLLRDHUP does not exist the watcher stops at
+the first pipelined byte that waits on the socket, and such a client keeps its slot until the
+upstream finishes.
+
+Memory: a request body is read whole, before its request waits for a slot, so what the process can
+buffer is bounded before any body byte is read. CAP_MAX_BODY_BYTES (default 128 MiB) caps one body
+(413). CAP_MAX_QUEUED (default 4, 0 to 64) caps the requests that may wait: once the requests in
+flight plus those waiting reach CAP_MAX_INFLIGHT + CAP_MAX_QUEUED, the next request that needs a slot
+gets 503 with Retry-After and its body is never read. CAP_MAX_BUFFERED_BYTES (default 512 MiB, at
+least CAP_MAX_BODY_BYTES) is a byte budget shared by every request that holds a body, queued or in
+flight: a body's Content-Length is reserved from it before the body is read and given back exactly
+once when the request ends for any reason; a body that does not fit gets the same unread 503. An
+Expect: 100-continue request gets its 100 only once it has been admitted.
 
 Logging: one line per request to stderr with the upstream name, method, path without the query,
 status, wait_ms, duration_ms and bytes out. Bodies, query strings and header values are never
@@ -53,6 +70,9 @@ QUEUE_POLL_S = 0.25
 WATCH_POLL_S = 0.25
 LINGER_S = 2.0
 LINGER_MAX_BYTES = 16 * 1024 * 1024
+MAX_QUEUED_LIMIT = 64
+# Linux reports a peer's FIN even while unread (pipelined) bytes wait on the socket; 0 elsewhere.
+POLLRDHUP = getattr(select, "POLLRDHUP", 0)
 
 DEFAULTS = {
     "CAP_LISTEN": "0.0.0.0:9100",
@@ -60,7 +80,9 @@ DEFAULTS = {
     "CAP_QUEUE_TIMEOUT_S": "900",
     "CAP_CONNECT_TIMEOUT_S": "10",
     "CAP_READ_TIMEOUT_S": "4500",
-    "CAP_MAX_BODY_BYTES": "268435456",
+    "CAP_MAX_BODY_BYTES": "134217728",
+    "CAP_MAX_QUEUED": "4",
+    "CAP_MAX_BUFFERED_BYTES": "536870912",
 }
 
 _NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
@@ -78,10 +100,14 @@ HOP_BY_HOP = frozenset({
 # Never copied from the client: the cap sets Host and Content-Length itself and has already
 # answered any Expect: 100-continue.
 _REQUEST_ONLY_DROP = frozenset({"host", "content-length", "expect"})
+# Never forwarded: an engine (or a framework in front of one) could take these as the real method
+# and turn a slotted request into something else, or a slot-free GET into a POST.
+_METHOD_OVERRIDE = frozenset({"x-http-method-override", "x-http-method", "x-method-override"})
 SLOT_FREE_METHODS = frozenset({"GET", "HEAD"})
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
 GRANTED, TIMED_OUT, ABANDONED = "granted", "timed_out", "abandoned"
+QUEUE_FULL, BUFFER_FULL = "queue_full", "buffer_full"
 
 
 # --------------------------------------------------------------------------- configuration
@@ -112,7 +138,9 @@ class Config:
     queue_timeout_s: float = 900.0
     connect_timeout_s: float = 10.0
     read_timeout_s: float = 4500.0
-    max_body_bytes: int = 268435456
+    max_body_bytes: int = 134217728
+    max_queued: int = 4
+    max_buffered_bytes: int = 536870912
 
 
 def _setting(env: Mapping[str, str], key: str) -> str:
@@ -215,6 +243,11 @@ def parse_config(env: Mapping[str, str]) -> Config:
     max_inflight = _parse_int(
         env, "CAP_MAX_INFLIGHT", 1, HARD_MAX_INFLIGHT,
         " (the dev stack's cap on production engines; it cannot be raised)")
+    max_body_bytes = _parse_int(env, "CAP_MAX_BODY_BYTES", 1, None)
+    max_buffered_bytes = _parse_int(env, "CAP_MAX_BUFFERED_BYTES", 1, None)
+    if max_buffered_bytes < max_body_bytes:
+        raise ConfigError("CAP_MAX_BUFFERED_BYTES must be at least CAP_MAX_BODY_BYTES "
+                          "(one largest body must fit in the buffer budget)")
     return Config(
         upstreams=upstreams,
         listen_host=listen_host,
@@ -225,7 +258,9 @@ def parse_config(env: Mapping[str, str]) -> Config:
         read_timeout_s=_parse_seconds(
             env, "CAP_READ_TIMEOUT_S", MIN_READ_TIMEOUT_S,
             " (it must outlast the application's generation wall clock)"),
-        max_body_bytes=_parse_int(env, "CAP_MAX_BODY_BYTES", 1, None),
+        max_body_bytes=max_body_bytes,
+        max_queued=_parse_int(env, "CAP_MAX_QUEUED", 0, MAX_QUEUED_LIMIT),
+        max_buffered_bytes=max_buffered_bytes,
     )
 
 
@@ -269,62 +304,107 @@ def _loggable_path(raw_path: str) -> str:
 
 # --------------------------------------------------------------------------- slots
 
-class SlotGate:
-    """The global cap: one BoundedSemaphore for every upstream, plus counters for /_cap/stats."""
+class Ticket:
+    """One admitted request's claim on the gate: a place in the queue, then a slot, plus the body
+    bytes it reserved. SlotGate.leave() gives everything back exactly once."""
 
-    def __init__(self, limit: int):
+    __slots__ = ("nbytes", "state")
+
+    def __init__(self, nbytes: int):
+        self.nbytes = nbytes
+        self.state = "waiting"  # -> "granted" -> "closed", or "waiting" -> "closed"
+
+
+class SlotGate:
+    """The global cap: one BoundedSemaphore for every upstream, the bound on waiting requests, the
+    shared budget for buffered request bodies, and counters for /_cap/stats."""
+
+    def __init__(self, limit: int, max_queued: int = 4, max_buffered_bytes: int = 536870912):
         self.limit = limit
+        self.max_queued = max_queued
+        self.max_buffered_bytes = max_buffered_bytes
         self._sem = threading.BoundedSemaphore(limit)
         self._lock = threading.Lock()
         self.inflight = 0
-        self.queued = 0
+        self.queued = 0  # admitted, not yet holding a slot (reading the body or waiting)
         self.peak = 0
+        self.buffered_bytes = 0  # reserved by every admitted request, queued or in flight
+        self.queued_bytes = 0  # the part of buffered_bytes held by queued requests
 
-    def _granted(self) -> str:
+    def admit(self, nbytes: int):
+        """Before a request's body is read: a Ticket, or QUEUE_FULL / BUFFER_FULL (nothing held)."""
         with self._lock:
+            if self.inflight + self.queued >= self.limit + self.max_queued:
+                return QUEUE_FULL
+            if self.buffered_bytes + nbytes > self.max_buffered_bytes:
+                return BUFFER_FULL
+            self.queued += 1
+            self.buffered_bytes += nbytes
+            self.queued_bytes += nbytes
+            return Ticket(nbytes)
+
+    def acquire(self, ticket: Ticket, timeout: float,
+                should_abandon: Optional[Callable[[], bool]] = None,
+                poll_s: float = QUEUE_POLL_S) -> str:
+        """Wait up to `timeout` seconds for a slot for an admitted ticket. Returns GRANTED,
+        TIMED_OUT or ABANDONED (when should_abandon() turned true while queued, e.g. the client hung
+        up). Whatever it returns, the caller still owes leave(ticket)."""
+        if ticket.state != "waiting":
+            raise RuntimeError("the ticket is not waiting for a slot")
+        deadline = time.monotonic() + timeout
+        acquired = self._sem.acquire(blocking=False)
+        while not acquired:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return TIMED_OUT
+            acquired = self._sem.acquire(timeout=min(remaining, poll_s))
+            if not acquired and should_abandon is not None and should_abandon():
+                return ABANDONED
+        with self._lock:
+            ticket.state = "granted"
+            self.queued -= 1
+            self.queued_bytes -= ticket.nbytes
             self.inflight += 1
             self.peak = max(self.peak, self.inflight)
         return GRANTED
 
-    def acquire(self, timeout: float, should_abandon: Optional[Callable[[], bool]] = None,
-                poll_s: float = QUEUE_POLL_S) -> str:
-        """Wait up to `timeout` seconds for a slot. Returns GRANTED, TIMED_OUT or ABANDONED (when
-        should_abandon() turned true while queued, e.g. the client hung up)."""
-        if self._sem.acquire(blocking=False):
-            return self._granted()
-        deadline = time.monotonic() + timeout
+    def leave(self, ticket: Ticket) -> None:
+        """Give back the ticket's queue place or slot and its reserved bytes; idempotent."""
         with self._lock:
-            self.queued += 1
-        try:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return TIMED_OUT
-                if self._sem.acquire(timeout=min(remaining, poll_s)):
-                    return self._granted()
-                if should_abandon is not None and should_abandon():
-                    return ABANDONED
-        finally:
-            with self._lock:
+            state = ticket.state
+            if state == "closed":
+                return
+            ticket.state = "closed"
+            self.buffered_bytes -= ticket.nbytes
+            if state == "granted":
+                self.inflight -= 1
+            else:
                 self.queued -= 1
+                self.queued_bytes -= ticket.nbytes
+        if state == "granted":
+            self._sem.release()
 
-    def release(self) -> None:
+    def snapshot(self) -> dict:
         with self._lock:
-            self.inflight -= 1
-        self._sem.release()
+            return {"inflight": self.inflight, "queued": self.queued, "peak_inflight": self.peak,
+                    "buffered_bytes": self.buffered_bytes, "queued_bytes": self.queued_bytes}
 
 
 # --------------------------------------------------------------------------- client liveness
 
+_GONE_EVENTS = select.POLLERR | select.POLLHUP | select.POLLNVAL | POLLRDHUP
+
+
 def _peer_closed(sock: socket.socket) -> bool:
-    """True when the client has hung up (EOF or error); never consumes request bytes."""
+    """True when the client has hung up (EOF or error), even behind pipelined bytes where
+    POLLRDHUP exists; never consumes request bytes."""
     try:
         poller = select.poll()
-        poller.register(sock, select.POLLIN | select.POLLPRI)
+        poller.register(sock, select.POLLIN | select.POLLPRI | POLLRDHUP)
         events = poller.poll(0)
         if not events:
             return False
-        if events[0][1] & (select.POLLERR | select.POLLNVAL):
+        if events[0][1] & _GONE_EVENTS:
             return True
         return sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
     except (BlockingIOError, InterruptedError):
@@ -363,7 +443,7 @@ class ClientWatch:
     def _run(self) -> None:
         try:
             poller = select.poll()
-            poller.register(self._client, select.POLLIN | select.POLLPRI)
+            poller.register(self._client, select.POLLIN | select.POLLPRI | POLLRDHUP)
         except (OSError, ValueError):
             return
         while not self._done.is_set():
@@ -373,7 +453,7 @@ class ClientWatch:
                 return
             if self._done.is_set() or not events:
                 continue
-            if events[0][1] & (select.POLLERR | select.POLLNVAL):
+            if events[0][1] & _GONE_EVENTS:
                 self._mark_gone()
                 return
             try:
@@ -384,10 +464,17 @@ class ClientWatch:
             except OSError:
                 self._mark_gone()
                 return
-            if data:
-                return  # the client pipelined its next request; nothing more to learn here
-            self._mark_gone()
-            return
+            if not data:
+                self._mark_gone()
+                return
+            # The client pipelined its next request. Those bytes stay unread (they are the next
+            # request), so POLLIN stays set; from here on wait only for the hang-up itself.
+            if not POLLRDHUP:
+                return  # no way to see EOF behind unread bytes here; see the module docstring
+            try:
+                poller.modify(self._client, POLLRDHUP)
+            except (OSError, ValueError):
+                return
 
     def _mark_gone(self) -> None:
         with self._lock:
@@ -459,6 +546,10 @@ class CapHandler(BaseHTTPRequestHandler):
         code = args[0] if args and isinstance(args[0], int) else "-"
         self.server.log(f"protocol_error status={code}")
 
+    def parse_request(self):
+        self._continue_pending = False
+        return super().parse_request()
+
     def do_GET(self):
         self._dispatch()
 
@@ -495,7 +586,10 @@ class CapHandler(BaseHTTPRequestHandler):
     def handle_expect_100(self):
         problem = self._framing_problem()
         if problem is None and not self.server.draining:
-            return super().handle_expect_100()
+            # The 100 goes out from _read_body(), once the request has been routed and admitted, so
+            # a refusal reaches the client before it sends the body.
+            self._continue_pending = True
+            return True
         rec = _Record(self.command)
         rec.path = _loggable_path(self.path.partition("?")[0])
         try:
@@ -566,10 +660,18 @@ class CapHandler(BaseHTTPRequestHandler):
                         **kwargs)
 
     def _reject_unread(self, rec: _Record, status: int, err_type: str, message: str,
-                       retry_after: bool = False) -> None:
-        self._send_error_json(rec, status, err_type, message, close=True, retry_after=retry_after)
+                       retry_after: bool = False, extra: tuple = ()) -> None:
+        self._send_error_json(rec, status, err_type, message, close=True, retry_after=retry_after,
+                              extra=extra)
         if self._declares_body():
             self._linger()
+
+    def _refuse(self, rec: _Record, status: int, err_type: str, message: str, **kwargs) -> None:
+        """Answer without reading the body: keep the connection when there is no body, else close
+        it (the unread body must not be parsed as the next request)."""
+        if self._body_length or self._declares_body():
+            return self._reject_unread(rec, status, err_type, message, **kwargs)
+        return self._send_error_json(rec, status, err_type, message, **kwargs)
 
     def _upstream_failed(self, rec: _Record, status: int, err_type: str, message: str) -> None:
         self.server.count("upstream_errors")
@@ -608,13 +710,15 @@ class CapHandler(BaseHTTPRequestHandler):
         raw_path, has_query, query = self.path.partition("?")
         rec.path = _loggable_path(raw_path)
 
+        # Everything up to the admission check runs on the headers alone; no body byte is read
+        # before the request holds a place in the queue and a reservation in the byte budget.
         if srv.draining:
             return self._reject_unread(rec, 503, "shutting_down", "the inference cap is shutting down",
                                        retry_after=True)
         problem = self._framing_problem()
         if problem is not None:
             return self._reject_unread(rec, *problem)
-        body = self._read_body()
+        length = self._body_length
 
         if raw_path == "/_cap" or raw_path.startswith("/_cap/"):
             rec.name = "_cap"
@@ -625,25 +729,44 @@ class CapHandler(BaseHTTPRequestHandler):
             if _CTL_RE.search(query):
                 raise PathRefused("the query string has control characters")
         except PathRefused as exc:
-            return self._send_error_json(rec, 400, "bad_request", str(exc))
+            return self._refuse(rec, 400, "bad_request", str(exc))
         upstream = cfg.upstreams.get(name)
         if upstream is None:
-            return self._send_error_json(rec, 404, "unknown_upstream",
-                                         "no such upstream; use /<name>/... with a configured name")
+            return self._refuse(rec, 404, "unknown_upstream",
+                                "no such upstream; use /<name>/... with a configured name")
         rec.name = name
         try:
-            headers = self._forward_headers(upstream, len(body))
+            headers = self._forward_headers(upstream, length)
         except _HeaderRefused as exc:
-            return self._send_error_json(rec, 400, "bad_request", str(exc))
+            return self._refuse(rec, 400, "bad_request", str(exc))
         target = (upstream.base_path + rest) or "/"
         if has_query:
             target += "?" + query
 
-        slotted = self.command not in SLOT_FREE_METHODS
-        if slotted:
+        # Only metadata reads skip the slot: a body can make an engine work whatever the method.
+        slotted = (self.command not in SLOT_FREE_METHODS or length > 0
+                   or self.headers.get("Transfer-Encoding") is not None)
+        if not slotted:
+            return self._relay(rec, upstream, target, headers, b"")
+
+        ticket = srv.gate.admit(length)
+        if ticket == QUEUE_FULL:
+            srv.count("rejected_queue_full")
+            return self._reject_unread(
+                rec, 503, "cap_queue_full",
+                f"the dev inference cap is full ({cfg.max_inflight} in flight, {cfg.max_queued} "
+                f"waiting); retry later", retry_after=True)
+        if ticket == BUFFER_FULL:
+            srv.count("rejected_buffer_full")
+            return self._reject_unread(
+                rec, 503, "cap_buffer_full",
+                "the dev inference cap is holding as many request bytes as it may; retry later",
+                retry_after=True)
+        try:
+            body = self._read_body()
             waited_from = time.monotonic()
             result = srv.gate.acquire(
-                cfg.queue_timeout_s,
+                ticket, cfg.queue_timeout_s,
                 should_abandon=lambda: srv.draining or _peer_closed(self.connection))
             rec.wait_ms = int((time.monotonic() - waited_from) * 1000)
             if result == TIMED_OUT:
@@ -658,16 +781,21 @@ class CapHandler(BaseHTTPRequestHandler):
                                                  "the inference cap is shutting down",
                                                  retry_after=True, close=True)
                 raise _ClientGone()
-        try:
             self._relay(rec, upstream, target, headers, body)
         finally:
-            if slotted:
-                srv.gate.release()
+            srv.gate.leave(ticket)
 
     def _read_body(self) -> bytes:
         length = self._body_length
         if not length:
             return b""
+        if self._continue_pending:
+            self._continue_pending = False
+            try:
+                self.send_response_only(100)
+                self.end_headers()
+            except OSError:
+                raise _ClientGone() from None
         try:
             body = self.rfile.read(length)
         except OSError:
@@ -678,8 +806,10 @@ class CapHandler(BaseHTTPRequestHandler):
 
     def _admin(self, rec: _Record, raw_path: str) -> None:
         if self.command not in SLOT_FREE_METHODS:
-            return self._send_error_json(rec, 405, "method_not_allowed", "use GET",
-                                         extra=(("Allow", "GET, HEAD"),))
+            return self._refuse(rec, 405, "method_not_allowed", "use GET",
+                                extra=(("Allow", "GET, HEAD"),))
+        if self._body_length or self._declares_body():
+            return self._refuse(rec, 400, "bad_request", "admin endpoints take no request body")
         if raw_path == "/_cap/health":
             return self._send_json(rec, 200, {"ok": True})
         if raw_path == "/_cap/stats":
@@ -692,7 +822,7 @@ class CapHandler(BaseHTTPRequestHandler):
         for key, value in self.headers.items():
             lowered = key.lower()
             if (lowered in HOP_BY_HOP or lowered.startswith("proxy-") or lowered in dropped
-                    or lowered in _REQUEST_ONLY_DROP):
+                    or lowered in _REQUEST_ONLY_DROP or lowered in _METHOD_OVERRIDE):
                 continue
             if not _TOKEN_RE.fullmatch(key):
                 raise _HeaderRefused("a request header name is not valid")
@@ -843,12 +973,15 @@ class CapServer(ThreadingHTTPServer):
     def __init__(self, config: Config, log_stream=None):
         self.config = config
         self.address_family = socket.AF_INET6 if ":" in config.listen_host else socket.AF_INET
-        self.gate = SlotGate(config.max_inflight)
+        if config.max_buffered_bytes < config.max_body_bytes:
+            raise ConfigError("CAP_MAX_BUFFERED_BYTES must be at least CAP_MAX_BODY_BYTES")
+        self.gate = SlotGate(config.max_inflight, config.max_queued, config.max_buffered_bytes)
         self.draining = False
         self._log_stream = log_stream if log_stream is not None else sys.stderr
         self._log_lock = threading.Lock()
         self._stats_lock = threading.Lock()
-        self._counters = {"served": 0, "rejected_queue_timeout": 0, "upstream_errors": 0}
+        self._counters = {"served": 0, "rejected_queue_timeout": 0, "rejected_queue_full": 0,
+                          "rejected_buffer_full": 0, "upstream_errors": 0}
         self._active = 0
         self._active_cond = threading.Condition()
         self._serve_thread: Optional[threading.Thread] = None
@@ -907,13 +1040,20 @@ class CapServer(ThreadingHTTPServer):
     def stats(self) -> dict:
         with self._stats_lock:
             counters = dict(self._counters)
+        gate = self.gate.snapshot()
         return {
             "max_inflight": self.config.max_inflight,
-            "inflight": self.gate.inflight,
-            "queued": self.gate.queued,
-            "peak_inflight": self.gate.peak,
+            "max_queued": self.config.max_queued,
+            "max_buffered_bytes": self.config.max_buffered_bytes,
+            "inflight": gate["inflight"],
+            "queued": gate["queued"],
+            "peak_inflight": gate["peak_inflight"],
+            "buffered_bytes": gate["buffered_bytes"],
+            "queued_bytes": gate["queued_bytes"],
             "served": counters["served"],
             "rejected_queue_timeout": counters["rejected_queue_timeout"],
+            "rejected_queue_full": counters["rejected_queue_full"],
+            "rejected_buffer_full": counters["rejected_buffer_full"],
             "upstream_errors": counters["upstream_errors"],
             "upstreams": list(self.config.upstreams),
         }
@@ -969,6 +1109,7 @@ def main(environ: Optional[Mapping[str, str]] = None) -> int:
     serving = server.start()
     host, port = server.server_address[:2]
     server.log(f"listening on {host}:{port} max_inflight={config.max_inflight} "
+               f"max_queued={config.max_queued} max_buffered_bytes={config.max_buffered_bytes} "
                f"queue_timeout_s={config.queue_timeout_s:g} read_timeout_s={config.read_timeout_s:g} "
                f"upstreams={','.join(config.upstreams)}")
     while not stop.wait(1.0):
