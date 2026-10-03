@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Show the autopilot runner's heartbeat, recent events and the integration branch.
+# Show the heartbeat of the autopilot runner, recent events and the integration branch.
+# (No apostrophes in comments: the guard reads this file before running it.)
 AP=${AP_HOME:-$HOME/.llm-autopilot}
 WT=${AP_WORKTREE:-$HOME/work/llm-dev}
 python3 - "$AP/heartbeat.json" <<'PY'

@@ -135,7 +135,23 @@
       "Bash(ops/deploy/merge_to_dev.sh*)",
       "Bash(./ops/deploy/merge_to_dev.sh*)",
       "Edit(~/.llm-autopilot/host.json)",
-      "Read(~/.llm-autopilot/host.json)"
+      "Read(~/.llm-autopilot/host.json)",
+      "Edit(~/.llm-autopilot/agent/test-db.vars)",
+      "Edit(~/.llm-autopilot/approved-ci-trees)",
+      "Bash(gh * pr merge*)",
+      "Bash(gh * workflow run*)",
+      "Bash(gh * workflow enable*)",
+      "Bash(gh * workflow disable*)",
+      "Bash(gh * run cancel*)",
+      "Bash(gh * run delete*)",
+      "Bash(gh repo new *)",
+      "Bash(git send-pack*)",
+      "Bash(git * send-pack*)",
+      "Bash(git http-push*)",
+      "Bash(git push * *:heads/dev)",
+      "Bash(git push * *:heads/main)",
+      "Bash(git push * heads/dev)",
+      "Bash(git push * heads/main)"
     ]
   },
   "autoMode": {
@@ -165,7 +181,7 @@
     ],
     "allow": [
       "$defaults",
-      "Release gate: running ~/.llm-autopilot/bin/merge_to_dev.sh, the operator-installed gate (operator decision 2026-10-03). It fast-forwards dev only when every check passed for that exact commit and FINAL_REPORT.md exists, and never touches main.",
+      "Release gate: running ~/.llm-autopilot/bin/merge_to_dev.sh, the operator-installed gate (operator decision 2026-10-03). It fast-forwards dev only when the Pipeline run of the autopilot/dev -> dev pull request and every check passed for that exact commit, the CI definition is unchanged from dev or operator-approved, and FINAL_REPORT.md exists, and never touches main. Run it as a plain command, with no variables or wrappers in front.",
       "Integration pushes: pushing the autopilot/dev branch, autopilot/* and upgrade/* feature branches, and baseline/*, release/* or rc/* tags to origin. These trigger CI at most, never a deploy. Merging origin/main and origin/dev into autopilot/dev (no rebase of shared history).",
       "Status board and CI: creating and editing the autopilot's own draft pull request autopilot/dev -> dev, commenting on it, reading issues, PRs and CI results, and re-running failed CI jobs of runs on the autopilot's own branches (never runs on main) - operator decision 2026-10-03.",
       "Dev stack and test database on the worker: creating, running, inspecting and removing the autopilot's own llmdev-* containers and llmdev* compose projects, and files under ~/work and /tmp on the worker node (ssh with existing keys), never touching sf-local-ai-* containers, ~/.techsara-cluster or other users' files there.",
@@ -192,7 +208,7 @@
       "Printing, logging, committing or passing to a subagent any secret (.env values, tokens, keys, credentials); sending private or company data to external services or into web search queries; committing hostnames, IP addresses, internal endpoints or security findings to the public repository.",
       "Creating paid services or accounts, replacing local inference with a hosted model, or training or fine-tuning on employee conversations or personal exports (finetune/ is out of scope).",
       "Disruptive load or failure testing against production, and filling any disk below 15% free.",
-      "Modifying the autopilot's own guardrails: ~/.llm-autopilot/guard, ~/.llm-autopilot/bin, ~/.llm-autopilot/settings.autopilot.json, ~/.llm-autopilot/host.json, ~/.llm-autopilot/MASTER_PROMPT.md, Claude Code settings files, the llm-autopilot systemd unit, or launching nested Claude sessions with weaker settings."
+      "Modifying the autopilot's own guardrails: ~/.llm-autopilot/guard, ~/.llm-autopilot/bin, ~/.llm-autopilot/settings.autopilot.json, ~/.llm-autopilot/host.json, ~/.llm-autopilot/MASTER_PROMPT.md, ~/.llm-autopilot/agent/test-db.vars, ~/.llm-autopilot/approved-ci-trees, Claude Code settings files, the llm-autopilot systemd unit, or launching nested Claude sessions with weaker settings."
     ]
   },
   "hooks": {

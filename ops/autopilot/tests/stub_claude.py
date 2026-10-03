@@ -35,6 +35,26 @@ def stopfailure(kind):
 
 emit({"type": "system", "subtype": "init", "session_id": f"stub-{n}"})
 kind = step["kind"]
+if kind == "badjson":
+    # a non-object JSON line must not crash the runner (R12)
+    print("[]", flush=True)
+    print("12345", flush=True)
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}})
+    emit({"type": "result", "subtype": "success", "is_error": False, "result": "done", "num_turns": 3})
+    sys.exit(0)
+if kind == "multi_results_then_sleep":
+    # several intermediate result events, then linger so a SIGTERM interrupts it (R2)
+    for t in step.get("turns", [45, 1]):
+        emit({"type": "result", "subtype": "success", "is_error": False, "result": "waiting", "num_turns": t})
+    time.sleep(step.get("seconds", 30))
+    emit({"type": "result", "subtype": "success", "is_error": False, "result": "done", "num_turns": 3})
+    sys.exit(0)
+if kind == "rate_event_limit":
+    # the structured rate_limit_event the stream carries, with a reset epoch (R10)
+    emit({"type": "system", "subtype": "rate_limit_event", "rate_limit_info": {"status": "rejected", "resetsAt": step["resets_at"]}})
+    emit({"type": "result", "subtype": "success", "is_error": True, "result": "You've hit your session limit", "num_turns": 1})
+    stopfailure("rate_limit")
+    sys.exit(1)
 if kind == "sleep":
     time.sleep(step.get("seconds", 1))
     kind = "success"

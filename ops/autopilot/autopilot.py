@@ -35,6 +35,7 @@ import os
 import pwd
 import random
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -51,9 +52,22 @@ def env(name, default):
     return os.environ.get(name, default)
 
 
+def _tool(name, *candidates):
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    found = shutil.which(name)
+    return found or candidates[0]
+
+
 AP_HOME = env("AP_HOME", os.path.join(HOME, ".llm-autopilot"))
 WORKTREE = env("AP_WORKTREE", os.path.join(HOME, "work/llm-dev"))
 CLAUDE = env("AP_CLAUDE", os.path.join(HOME, ".npm-global/bin/claude"))
+# Launch the wrappers by absolute path, so the cycle environment's PATH cannot
+# choose a different `nice`, `ionice` or `timeout` binary.
+NICE = _tool("nice", "/usr/bin/nice", "/bin/nice")
+IONICE = _tool("ionice", "/usr/bin/ionice", "/bin/ionice")
+TIMEOUT = _tool("timeout", "/usr/bin/timeout", "/bin/timeout")
 SETTINGS = env("AP_SETTINGS", os.path.join(AP_HOME, "settings.autopilot.json"))
 PROMPT_FILE = env("AP_PROMPT_FILE", os.path.join(AP_HOME, "bin/CYCLE_PROMPT.md"))
 MASTER = env("AP_MASTER", os.path.join(AP_HOME, "MASTER_PROMPT.md"))
@@ -72,6 +86,7 @@ CRASH_CAP = 6
 CRASH_CAP_SLEEP_S = 2 * 3600
 AUTH_RETRY_S = 30 * 60
 DISK_RETRY_S = 30 * 60
+FINAL_CHECKPOINT_MAX_ATTEMPTS = 8
 NET_BACKOFF_MAX_S = 30 * 60
 MIN_FREE_FRACTION = 0.15
 LOG_KEEP = int(env("AP_LOG_KEEP", "400"))
@@ -123,7 +138,30 @@ DEFAULT_SETTINGS = {
 }
 
 
-def operator_settings(path=None):
+LIST_KEYS = {"AUTOPILOT_PAUSE_WINDOWS"}
+
+
+def _parse_list(val):
+    """Parse a YAML/JSON flow list that may use single or double quotes.
+    Raises ValueError when the value cannot be read as a list."""
+    try:
+        return json.loads(val)
+    except ValueError:
+        pass
+    import ast
+    try:
+        parsed = ast.literal_eval(val)
+    except (ValueError, SyntaxError):
+        raise ValueError(f"not a list: {val!r}")
+    if isinstance(parsed, (list, tuple)):
+        return [str(x) for x in parsed]
+    raise ValueError(f"not a list: {val!r}")
+
+
+def operator_settings(path=None, warn=None):
+    """Read the operator settings from the YAML block of the master prompt. A
+    value that cannot be parsed is reported through `warn` (an event callback)
+    rather than silently dropped (R11)."""
     out = dict(DEFAULT_SETTINGS)
     try:
         with open(path or MASTER, encoding="utf-8") as fh:
@@ -133,21 +171,50 @@ def operator_settings(path=None):
     m = re.search(r"```yaml\n(.*?)```", text, re.S)
     if not m:
         return out
-    for line in m.group(1).splitlines():
-        line = re.sub(r"\s+#.*$", "", line).strip()
-        mm = re.match(r"^([A-Z_]+):\s*(.*)$", line)
+    lines = m.group(1).splitlines()
+    i = 0
+    while i < len(lines):
+        raw = re.sub(r"\s+#.*$", "", lines[i])
+        i += 1
+        mm = re.match(r"^([A-Z_]+):\s*(.*)$", raw.strip())
         if not mm:
             continue
         key, val = mm.group(1), mm.group(2).strip()
+        # Block list: 'KEY:' then indented '- item' lines.
+        if val == "":
+            items, block = [], False
+            while i < len(lines):
+                item = re.sub(r"\s+#.*$", "", lines[i])
+                bm = re.match(r"^\s+-\s+(.*)$", item)
+                if not bm:
+                    break
+                block = True
+                items.append(bm.group(1).strip().strip("'\""))
+                i += 1
+            if block:
+                out[key] = items
+                continue
         if val.startswith("["):
             try:
-                out[key] = json.loads(val)
-            except ValueError:
-                out[key] = []
+                out[key] = _parse_list(val)
+            except ValueError as exc:
+                if warn:
+                    warn(key, str(exc))
+                continue  # leave the default in place rather than guessing []
         elif re.fullmatch(r"-?\d+", val):
             out[key] = int(val)
-        else:
+        elif key in LIST_KEYS:
+            if warn:
+                warn(key, f"expected a list, got {val!r}")
+        elif val != "":
             out[key] = val.strip("'\"")
+    # A window string that does not match the expected shape is reported too.
+    windows = out.get("AUTOPILOT_PAUSE_WINDOWS")
+    if not isinstance(windows, list):
+        out["AUTOPILOT_PAUSE_WINDOWS"] = windows = []
+    for w in windows:
+        if not re.match(r"^\s*\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2}", str(w)) and warn:
+            warn("AUTOPILOT_PAUSE_WINDOWS", f"ignored window {w!r}: not HH:MM-HH:MM [tz]")
     return out
 
 
@@ -200,7 +267,9 @@ def parse_reset(text, at=None):
     m = re.search(r"limit reached\|(\d{10})\b", text or "")
     if m:
         return datetime.datetime.fromtimestamp(int(m.group(1)), datetime.timezone.utc)
-    m = re.search(r"resets?\s+(?:at\s+|on\s+)?(.+?)(?:\s*\(([A-Za-z_]+(?:/[A-Za-z_+\-0-9]+)+|UTC)\))?\s*(?:[.\n\"\\]|$)", text or "", re.I)
+    # Capture the time phrase, stopping at a timezone in parentheses or at the
+    # separators Claude Code appends ('·', '∙', '|', ' /...') (R10).
+    m = re.search(r"resets?\s+(?:at\s+|on\s+)?(.+?)(?:\s*\(([A-Za-z_]+(?:/[A-Za-z_+\-0-9]+)+|UTC)\))?\s*(?:[.\n\"\\·∙|]|\s/|$)", text or "", re.I)
     if not m:
         return None
     when, tzname = m.group(1).strip().rstrip(".,"), m.group(2)
@@ -213,6 +282,13 @@ def parse_reset(text, at=None):
     if rel and any(rel.groups()):
         d, h, mi = (int(x or 0) for x in rel.groups())
         return at + datetime.timedelta(days=d, hours=h, minutes=mi)
+    tom = re.match(r"^tomorrow(?:\s+at)?\s+(.+)$", when, re.I)
+    if tom:
+        c = _clock(tom.group(1))
+        if not c:
+            return None
+        target = local.replace(hour=c[0], minute=c[1], second=0, microsecond=0) + datetime.timedelta(days=1)
+        return target.astimezone(datetime.timezone.utc)
     wd = re.match(r"^(mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s+(.+)$", when, re.I)
     md = re.match(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(?:at\s+)?(.+)$", when, re.I)
     if wd:
@@ -239,6 +315,10 @@ def parse_reset(text, at=None):
             return None
         target = local.replace(hour=c[0], minute=c[1], second=0, microsecond=0)
         if target <= local:
+            # A bare clock time that has only just passed almost always means
+            # "now" (the limit cleared at that minute), not 24 h from now (R10).
+            if local - target <= datetime.timedelta(hours=2):
+                return at + datetime.timedelta(seconds=1)
             target += datetime.timedelta(days=1)
     return target.astimezone(datetime.timezone.utc)
 
@@ -255,10 +335,18 @@ SECRET_SHAPES = re.compile(
     r"|\bxox[abprs]-[A-Za-z0-9-]{10,}"
     r"|\bAKIA[0-9A-Z]{16}\b"
     r"|\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
-    r"|\bhf_[A-Za-z0-9]{30,})"
+    r"|\bhf_[A-Za-z0-9]{30,}"
+    r"|\btsk_(?:live|test)_[0-9a-f]{16}_[A-Za-z0-9_-]{8,}"       # this platform's API keys
+    r"|(?i:\bbearer)\s+[A-Za-z0-9._~+/=-]{8,}"                    # Authorization: Bearer <token>
+    r")"
 )
 URL_CRED = re.compile(r"\b((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|https?)://[^:/\s\"'@]+:)([^@\s\"']{3,})(@)")
-KV_SECRET = re.compile(r"(?i)(\b[\w.-]*(?:password|passwd|secret|token|api[_-]?key|authorization|cookie|private[_-]?key)[\w.-]*\b\s*[\"']?\s*[:=]\s*[\"']?)([^\s\"',;]{6,})")
+# key=value / key: value secrets. The value stops at the first structural
+# character so the surrounding JSON (quotes, commas, braces) stays intact.
+KV_SECRET = re.compile(r"(?i)(\b[\w.-]*(?:password|passwd|secret|token|api[_-]?key|authorization|cookie|private[_-]?key)[\w.-]*\b\s*[\"']?\s*[:=]\s*[\"']?)([^\s\"',;}\])]{6,})")
+# --password <v>, --token=<v>, 'password <v>' and similar CLI forms.
+KV_FLAG_SECRET = re.compile(r"(?i)(--?(?:password|passwd|secret|token|api[-_]?key|auth[-_]?token)[= ]\s*[\"']?)([^\s\"',;}\])]{3,})")
+KEYISH = re.compile(r"(?i)(password|passwd|secret|token|api[_-]?key|authorization|cookie|private[_-]?key)")
 
 
 def secret_files():
@@ -287,26 +375,74 @@ class Redactor:
                 continue
         self.values = sorted(set(self.values), key=len, reverse=True)
 
-    def __call__(self, text):
+    def _scrub(self, text):
+        """Redact secrets in a run of plain text (no structure to preserve)."""
         for v in self.values:
             if v in text:
                 text = text.replace(v, "[REDACTED]")
         text = SECRET_SHAPES.sub("[REDACTED]", text)
         text = URL_CRED.sub(r"\1[REDACTED]\3", text)
+        text = KV_FLAG_SECRET.sub(r"\1[REDACTED]", text)
         return KV_SECRET.sub(r"\1[REDACTED]", text)
 
+    def _walk(self, obj):
+        """Redact string leaves of a decoded JSON value; keep numbers and structure.
+        A string leaf is first decoded again, so escaped inner JSON is scrubbed too."""
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                if isinstance(v, str) and isinstance(k, str) and KEYISH.search(k):
+                    out[k] = "[REDACTED]"  # a secret-named field: redact its whole value
+                else:
+                    out[k] = self._walk(v)
+            return out
+        if isinstance(obj, list):
+            return [self._walk(v) for v in obj]
+        if isinstance(obj, str):
+            if obj.lstrip()[:1] in ("{", "[") and KEYISH.search(obj):
+                try:
+                    return json.dumps(self._walk(json.loads(obj)))
+                except ValueError:
+                    pass
+            return self._scrub(obj)
+        return obj  # int, float, bool, None: never a secret, never corrupt it
 
-def load_vars(path):
-    out = {}
+    def __call__(self, text):
+        stripped = text.strip()
+        if stripped[:1] in ("{", "["):
+            try:
+                obj = json.loads(stripped)
+            except ValueError:
+                obj = None
+            if obj is not None:
+                out = json.dumps(self._walk(obj), ensure_ascii=False)
+                return out + "\n" if text.endswith("\n") else out
+        return self._scrub(text)
+
+
+# The only keys the runner copies from test-db.vars into a cycle's environment.
+# Everything else is dropped: that file sits in the agent-writable zone, and a
+# PATH, NODE_OPTIONS, LD_PRELOAD or ANTHROPIC_* line there could otherwise
+# choose the binary or configuration that launches the next Claude session.
+TEST_DB_ALLOWED_KEYS = {"TEST_DATABASE_URL", "TEST_DATABASE_ALLOWED_HOSTS", "TEST_DATABASE_REMOTE"}
+
+
+def load_vars(path, allowed=None):
+    out, dropped = {}, []
     try:
         with open(path, encoding="utf-8") as fh:
             for line in fh:
-                m = re.match(r"^\s*([A-Z_][A-Z0-9_]*)=(.*)$", line.rstrip("\n"))
-                if m:
-                    out[m.group(1)] = m.group(2)
+                m = re.match(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line.rstrip("\n"))
+                if not m:
+                    continue
+                k = m.group(1)
+                if allowed is not None and k not in allowed:
+                    dropped.append(k)
+                    continue
+                out[k] = m.group(2)
     except OSError:
         pass
-    return out
+    return out, dropped
 
 
 # --------------------------------------------------------------------------
@@ -326,25 +462,67 @@ def _first(rx, blob):
     return blob[s : m.end() + 160].replace("\n", " ").strip()
 
 
-def classify(rc, result, texts, fails):
-    """Map a finished cycle to ok, max_turns, timeout, usage_limit, auth,
-    config, transient or crash. Returns (outcome, reset_at, detail)."""
+# Process exit codes that mean the cycle was cut off rather than finished.
+INTERRUPT_RCS = {143, -15, 130, -2, 129, -1}
+
+
+def rate_event_reset(rate_events):
+    """The resetsAt epoch of the most recent rejected rate_limit_event, or None."""
+    reset = None
+    for ev in rate_events or []:
+        info = ev if isinstance(ev, dict) else {}
+        status = str(info.get("status") or "").lower()
+        if status in ("rejected", "blocked", "exceeded"):
+            at = info.get("resetsAt") or info.get("resets_at")
+            if isinstance(at, (int, float)):
+                reset = datetime.datetime.fromtimestamp(int(at), datetime.timezone.utc)
+            elif isinstance(at, str) and at.isdigit():
+                reset = datetime.datetime.fromtimestamp(int(at), datetime.timezone.utc)
+    return reset
+
+
+def classify(rc, result, texts, fails, stop_signal=False, rate_events=None):
+    """Map a finished cycle to ok, interrupted, max_turns, timeout, usage_limit,
+    auth, config, transient or crash. Returns (outcome, reset_at, detail).
+
+    `texts` carries only reliable signals (the final result text, stderr and
+    system api_error messages), never assistant prose, so a cycle that merely
+    discusses rate limits or 429s is not misread as a usage limit.
+    `fails` are StopFailure records from the cycle's main session only.
+    """
     types = {f.get("error_type") for f in fails or []}
     blob = "\n".join([str((result or {}).get("result") or "")] + [str(x) for x in texts or []])
     subtype = (result or {}).get("subtype") or ""
     is_error = bool((result or {}).get("is_error"))
-    if "rate_limit" in types or (LIMIT_RE.search(blob) and (is_error or rc != 0 or not result)):
-        return "usage_limit", parse_reset(blob), _first(LIMIT_RE, blob)
-    if types & {"authentication_failed", "oauth_org_not_allowed", "account_on_hold", "billing_error"} or (AUTH_RE.search(blob) and (is_error or rc != 0)):
-        return "auth", None, _first(AUTH_RE, blob) or ",".join(sorted(t for t in types if t))
-    if types & {"model_not_found", "invalid_request"} or (CONFIG_RE.search(blob) and (is_error or rc != 0) and not result):
-        return "config", None, _first(CONFIG_RE, blob) or ",".join(sorted(t for t in types if t))
-    if result and subtype == "success" and not is_error:
+    clean_success = bool(result) and subtype == "success" and not is_error and rc == 0
+    rejected = any(str((e or {}).get("status") or "").lower() in ("rejected", "blocked", "exceeded") for e in rate_events or [])
+    # The cycle was cut off (service restart, SIGTERM) rather than finished (R2).
+    # This precedes the success branch: a cycle stopped by a signal did not run
+    # to its own end even if the last result it managed to emit was a success.
+    if rc in INTERRUPT_RCS or stop_signal:
+        return "interrupted", None, f"cycle interrupted (rc={rc}{', stop signal' if stop_signal else ''})"
+    # A genuine, completed success wins over any earlier StopFailure record (R8).
+    if clean_success:
         return "ok", None, None
-    if subtype == "error_max_turns" or (re.search(r"max(imum)?[ _-]turns", blob, re.I) and rc != 0):
+    # Structured limit/auth/config signals are reliable; take them before text.
+    if "rate_limit" in types or rejected:
+        return "usage_limit", rate_event_reset(rate_events) or parse_reset(blob), _first(LIMIT_RE, blob) or "rate limit"
+    if types & {"authentication_failed", "oauth_org_not_allowed", "account_on_hold", "billing_error"}:
+        return "auth", None, ",".join(sorted(t for t in types if t))
+    if types & {"model_not_found", "invalid_request"}:
+        return "config", None, ",".join(sorted(t for t in types if t))
+    # A max-turns or timeout end is a normal cycle end (§5.5); check it before
+    # the text heuristics so an answer that mentions a limit does not override it.
+    if subtype == "error_max_turns":
         return "max_turns", None, "max turns reached"
-    if rc in (124, 137) and not types:
+    if rc in (124, 137):
         return "timeout", None, f"cycle timeout (rc={rc})"
+    if LIMIT_RE.search(blob) and (is_error or rc != 0 or not result):
+        return "usage_limit", rate_event_reset(rate_events) or parse_reset(blob), _first(LIMIT_RE, blob)
+    if AUTH_RE.search(blob) and (is_error or rc != 0):
+        return "auth", None, _first(AUTH_RE, blob)
+    if CONFIG_RE.search(blob) and (is_error or rc != 0) and not result:
+        return "config", None, _first(CONFIG_RE, blob)
     if types & {"overloaded", "server_error"} or (TRANSIENT_RE.search(blob) and (is_error or rc != 0)):
         return "transient", None, _first(TRANSIENT_RE, blob) or ",".join(sorted(t for t in types if t))
     if result and subtype.startswith("error") and rc == 0:
@@ -364,6 +542,7 @@ class Runner:
         self.child = None
         self.stop_signal = False
         self.hb_stop = threading.Event()
+        self.hb_lock = threading.Lock()
         self.cycles_run = 0
         self.log_path = None
         self.log_bytes = 0
@@ -441,13 +620,19 @@ class Runner:
             "started_at": self.state.get("started_at"),
             "limit_wait_hours_total": round(self.state.get("limit_wait_s_total", 0) / 3600, 2),
         }
-        tmp = HEARTBEAT_FILE + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(hb, fh, indent=2)
-            os.replace(tmp, HEARTBEAT_FILE)
-        except OSError:
-            pass
+        # Both the heartbeat thread and set_state() write this file; a shared
+        # .tmp path would let them publish a half-written heartbeat (R13).
+        tmp = f"{HEARTBEAT_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with self.hb_lock:
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(hb, fh, indent=2)
+                os.replace(tmp, HEARTBEAT_FILE)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     def heartbeat_loop(self):
         while not self.hb_stop.wait(max(0.05, HEARTBEAT_S * TIME_SCALE)):
@@ -511,21 +696,29 @@ class Runner:
                 pass
         return fr
 
-    # ---- sleeping that stays responsive to STOP, PAUSE and signals
+    # ---- sleeping that stays responsive to STOP, PAUSE, WAKE and signals
     def sleep_until(self, wake, state_name):
+        # next_wake is already in state; keep it so a restart in the middle of
+        # this wait still honours the reset time (R3). Clear it only when the
+        # wait is served, WAKE is used, or a cycle starts.
         self.set_state(state_name, next_wake=iso(wake))
         left = (wake - now()).total_seconds()
         while left > 0:
-            if self.stop_signal or self.flag("STOP") or self.flag("WAKE"):
-                if self.flag("WAKE"):
-                    os.remove(os.path.join(AP_HOME, "WAKE"))
-                    self.event("woken")
-                    self.state["next_wake"] = None
+            if self.stop_signal or self.flag("STOP"):
+                return  # keep next_wake; a restart or unpause resumes the wait
+            if self.flag("WAKE"):
+                os.remove(os.path.join(AP_HOME, "WAKE"))
+                self.event("woken")
+                self.state["next_wake"] = None
+                self.save_state()
                 return
+            if self.flag("PAUSE"):
+                return  # a pause during a wait is visible, and the wait is not lost
             step = min(left, 60.0)
             nap(step)
             left -= step
         self.state["next_wake"] = None
+        self.save_state()
 
     # ---- one cycle
     def run_cycle(self, settings):
@@ -538,8 +731,8 @@ class Runner:
         with open(self.prompt_file, encoding="utf-8") as fh:
             prompt = fh.read().strip()
         cmd = [
-            "nice", "-n", "10", "ionice", "-c2", "-n7",
-            "timeout", "--kill-after=120", f"{CYCLE_TIMEOUT_S}s",
+            NICE, "-n", "10", IONICE, "-c2", "-n7",
+            TIMEOUT, "--kill-after=120", f"{CYCLE_TIMEOUT_S}s",
             CLAUDE, "-p", prompt,
             "--permission-mode", "auto",
             "--permission-prompts", "none",
@@ -551,13 +744,19 @@ class Runner:
             "--verbose",
         ]
         child_env = dict(os.environ)
-        child_env.update(load_vars(TEST_DB_VARS))
-        child_env.update({"LLM_AUTOPILOT": "1", "LLM_AUTOPILOT_CYCLE": str(n)})
+        test_db, dropped = load_vars(TEST_DB_VARS, allowed=TEST_DB_ALLOWED_KEYS)
+        if dropped:
+            self.event("test-db-vars-ignored", keys=sorted(set(dropped)))
+        child_env.update(test_db)
+        child_env.update({"LLM_AUTOPILOT": "1", "LLM_AUTOPILOT_CYCLE": str(n),
+                          "LLM_AUTOPILOT_PREV_OUTCOME": str(self.state.get("prev_outcome") or "")})
         started = now()
         stopfail_offset = os.path.getsize(STOPFAIL_FILE) if os.path.exists(STOPFAIL_FILE) else 0
         self.set_state("working", next_wake=None, cycle_started=iso(started))
         self.event("cycle-start", log=self.log_path, model=settings.get("AUTOPILOT_MODEL"), effort=settings.get("AUTOPILOT_EFFORT"))
         result, texts, cap = None, [], LOG_MAX_CYCLE_MB * 1024 * 1024
+        rate_events, main_session = [], None
+        turns_total, cost_total, result_count = 0, 0.0, 0
         with open(self.log_path, "w", encoding="utf-8") as log:
             try:
                 self.child = subprocess.Popen(cmd, cwd=WORKTREE, env=child_env, stdin=subprocess.DEVNULL,
@@ -566,7 +765,7 @@ class Runner:
             except OSError as exc:
                 self.child = None
                 log.write(json.dumps({"type": "runner_error", "error": str(exc)}) + "\n")
-                return self.finish_cycle(n, started, 127, None, [str(exc)], stopfail_offset)
+                return self.finish_cycle(n, started, 127, None, [str(exc)], stopfail_offset, None)
             err_lines = []
 
             def pump_err():
@@ -575,49 +774,88 @@ class Runner:
 
             t = threading.Thread(target=pump_err, daemon=True)
             t.start()
-            for line in self.child.stdout:
-                red = self.redact(line)
-                if self.log_bytes < cap:
-                    log.write(red if red.endswith("\n") else red + "\n")
-                    log.flush()
-                    self.log_bytes += len(red)
-                    if self.log_bytes >= cap:
-                        log.write(json.dumps({"type": "runner_note", "note": f"log truncated at {LOG_MAX_CYCLE_MB} MB"}) + "\n")
-                try:
-                    msg = json.loads(line)
-                except ValueError:
-                    texts.append(line[-2000:])
-                    continue
-                if msg.get("type") == "result":
-                    result = msg
-                elif msg.get("type") == "assistant":
-                    for block in (msg.get("message") or {}).get("content") or []:
-                        if isinstance(block, dict) and block.get("type") == "text" and LIMIT_RE.search(block.get("text", "")):
-                            texts.append(block["text"][-2000:])
-                elif msg.get("type") == "system" and msg.get("subtype") in ("api_error", "error", "api_retry"):
-                    texts.append(json.dumps(msg)[-2000:])
-            rc = self.child.wait()
+            try:
+                for line in self.child.stdout:
+                    red = self.redact(line)
+                    if self.log_bytes < cap:
+                        log.write(red if red.endswith("\n") else red + "\n")
+                        log.flush()
+                        self.log_bytes += len(red)
+                        if self.log_bytes >= cap:
+                            log.write(json.dumps({"type": "runner_note", "note": f"log truncated at {LOG_MAX_CYCLE_MB} MB"}) + "\n")
+                    try:
+                        msg = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(msg, dict):
+                        continue  # a bare list/number/null is not a stream event (R12)
+                    mtype = msg.get("type")
+                    if mtype == "result":
+                        result = msg  # keep the last; accumulate the totals
+                        result_count += 1
+                        if isinstance(msg.get("num_turns"), (int, float)):
+                            turns_total += msg["num_turns"]
+                        if isinstance(msg.get("total_cost_usd"), (int, float)):
+                            cost_total += msg["total_cost_usd"]
+                        if bool(msg.get("is_error")):
+                            texts.append(str(msg.get("result") or "")[-2000:])
+                    elif mtype == "system":
+                        if main_session is None and msg.get("subtype") == "init" and msg.get("session_id"):
+                            main_session = msg.get("session_id")
+                        info = msg.get("rate_limit_info") or msg.get("rate_limit") or (msg.get("message") or {}).get("rate_limit_info")
+                        if isinstance(info, dict):
+                            rate_events.append(info)
+                        if msg.get("subtype") in ("api_error", "error", "api_retry"):
+                            texts.append(json.dumps(msg)[-2000:])
+                rc = self.child.wait()
+            finally:
+                self._terminate_child()
             t.join(timeout=10)
             if err_lines:
                 tail = self.redact("".join(err_lines))[-20000:]
                 log.write(json.dumps({"type": "stderr", "text": tail}) + "\n")
                 texts.append(tail[-4000:])
         self.child = None
-        return self.finish_cycle(n, started, rc, result, texts, stopfail_offset)
+        return self.finish_cycle(n, started, rc, result, texts, stopfail_offset, main_session,
+                                 rate_events=rate_events, turns_total=turns_total, cost_total=cost_total,
+                                 result_count=result_count)
 
-    def finish_cycle(self, n, started, rc, result, texts, stopfail_offset):
+    def _terminate_child(self):
+        child = self.child
+        if child and child.poll() is None:
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                child.wait(timeout=5)
+            except Exception:
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+    def finish_cycle(self, n, started, rc, result, texts, stopfail_offset, main_session,
+                     rate_events=None, turns_total=None, cost_total=None, result_count=0):
         fails = []
         try:
             with open(STOPFAIL_FILE, encoding="utf-8") as fh:
                 fh.seek(stopfail_offset)
                 for line in fh:
                     try:
-                        fails.append(json.loads(line))
+                        rec = json.loads(line)
                     except ValueError:
-                        pass
+                        continue
+                    # Only the main session's own failed turns classify the cycle;
+                    # a subagent's failure or an intermediate turn does not (R8).
+                    if rec.get("agent_id"):
+                        continue
+                    if main_session and rec.get("session_id") and rec.get("session_id") != main_session:
+                        continue
+                    fails.append(rec)
         except OSError:
             pass
-        outcome, reset_at, detail = classify(rc, result, texts, fails)
+        outcome, reset_at, detail = classify(rc, result, texts, fails, stop_signal=self.stop_signal, rate_events=rate_events)
         rec = {
             "cycle": n,
             "started": iso(started),
@@ -625,8 +863,9 @@ class Runner:
             "rc": rc,
             "outcome": outcome,
             "subtype": (result or {}).get("subtype"),
-            "num_turns": (result or {}).get("num_turns"),
-            "cost_usd": (result or {}).get("total_cost_usd"),
+            "num_turns": turns_total if turns_total else (result or {}).get("num_turns"),
+            "result_count": result_count,
+            "cost_usd": cost_total if cost_total else (result or {}).get("total_cost_usd"),
             "permission_denials": len((result or {}).get("permission_denials") or []),
             "stop_failures": [f.get("error_type") for f in fails],
             "reset_at": iso(reset_at),
@@ -634,9 +873,10 @@ class Runner:
             "log": self.log_path,
         }
         self.state["last_cycle"] = rec
+        self.state["prev_outcome"] = outcome
         self.state["history"] = (self.state.get("history") or [])[-49:] + [rec]
         self.save_state()
-        self.event("cycle-end", **{k: rec[k] for k in ("rc", "outcome", "subtype", "num_turns", "permission_denials", "reset_at", "detail")})
+        self.event("cycle-end", **{k: rec[k] for k in ("rc", "outcome", "subtype", "num_turns", "result_count", "permission_denials", "reset_at", "detail")})
         return outcome, reset_at, detail
 
     # ---- policy after a cycle
@@ -645,6 +885,12 @@ class Runner:
         if outcome in ("ok", "max_turns", "timeout"):
             self.state.update(consecutive_failures=0, limit_backoff_idx=0, net_backoff_idx=0, last_error=None)
             return t + datetime.timedelta(seconds=BETWEEN_CYCLES_S), "idle"
+        if outcome == "interrupted":
+            # Cut off, not finished: start a fresh cycle soon, keep the crash
+            # counters where they are, and leave a resume hint for the next cycle.
+            self.state["last_error"] = f"cycle interrupted: {self.redact(detail or '')[:200]}"
+            self.state["interrupted_cycles"] = int(self.state.get("interrupted_cycles", 0)) + 1
+            return t + datetime.timedelta(seconds=BETWEEN_CYCLES_S), "resuming"
         if outcome == "usage_limit":
             if reset_at and t < reset_at < t + datetime.timedelta(days=8):
                 wake = reset_at + datetime.timedelta(seconds=random.uniform(*JITTER))
@@ -716,14 +962,23 @@ class Runner:
             self.hb_stop.set()
             self.write_heartbeat()
 
+    def _settings_warn(self, key, msg):
+        seen = self.__dict__.setdefault("_settings_warned", set())
+        if (key, msg) not in seen:
+            seen.add((key, msg))
+            self.event("operator-setting-ignored", key=key, reason=msg)
+            self.state["last_error"] = f"operator setting {key} ignored: {msg}"
+
     def loop(self):
         while True:
-            settings = operator_settings()
+            settings = operator_settings(warn=self._settings_warn)
+            # STOP always wins; keep next_wake so a later start still honours a
+            # pending usage-limit or crash-cap wait (R3).
             if self.stop_signal:
-                self.set_state("stopped", next_wake=None)
+                self.set_state("stopped")
                 return 0
             if self.flag("STOP"):
-                self.set_state("stopped", next_wake=None, last_error=None)
+                self.set_state("stopped", last_error=None)
                 self.event("stop-file")
                 return EXIT_STOPPED
             if self.complete():
@@ -731,28 +986,34 @@ class Runner:
                 self.event("complete")
                 self.disable_service()
                 return EXIT_STOPPED
-            started = parse_iso(self.state.get("started_at")) or now()
-            days = float(settings.get("MAX_AUTONOMOUS_DAYS") or 14)
-            if now() - started >= datetime.timedelta(days=days):
-                if not self.state.get("final_checkpoint_done"):
-                    self.event("max-days-reached", days=days)
-                    self.final_checkpoint(settings)
-                    self.state["final_checkpoint_done"] = True
-                self.set_state("expired", next_wake=None, last_error=f"MAX_AUTONOMOUS_DAYS={days:g} reached; touch {AP_HOME}/RENEW and restart to continue")
-                return EXIT_STOPPED
+            # PAUSE and the pause windows: sleep without starting cycles, and
+            # keep any pending next_wake and its waiting state (R3).
             if self.flag("PAUSE") or in_pause_window(settings.get("AUTOPILOT_PAUSE_WINDOWS")):
-                self.set_state("paused", next_wake=None)
+                if self.state.get("state") != "paused":
+                    self.set_state("paused", paused_from=self.state.get("state"))
                 nap(60)
                 continue
+            if self.state.get("state") == "paused":  # just unpaused: restore the pre-pause state name
+                self.set_state(self.state.get("paused_from") or "idle", paused_from=None)
+            # A pending wait (usage-limit reset, crash cap, backoff): honour it.
             wake = parse_iso(self.state.get("next_wake"))
             if wake and wake > now():
-                waiting = self.state.get("state") if self.state.get("state") in ("waiting-limit", "waiting-auth", "waiting-config", "backoff", "restarting", "failure-cap", "idle", "waiting-disk") else "waiting"
+                waiting = self.state.get("state") if self.state.get("state") in ("waiting-limit", "waiting-auth", "waiting-config", "backoff", "restarting", "resuming", "failure-cap", "idle", "waiting-disk") else "waiting"
                 self.sleep_until(wake, waiting)
                 continue
             if self.free_fraction() < MIN_FREE_FRACTION:
                 self.needs_human("Disk below 15% free", f"The autopilot paused cycles: a volume holding {WORKTREE} or {AP_HOME} has less than 15% free. Free space; nothing else is needed.")
                 self.state["last_error"] = "disk below 15% free"
                 self.sleep_until(now() + datetime.timedelta(seconds=DISK_RETRY_S), "waiting-disk")
+                continue
+            # MAX_AUTONOMOUS_DAYS: only after the gates above, so the final
+            # checkpoint waits for STOP, PAUSE, a pending reset and disk (R5).
+            started = parse_iso(self.state.get("started_at")) or now()
+            days = float(settings.get("MAX_AUTONOMOUS_DAYS") or 14)
+            if now() - started >= datetime.timedelta(days=days):
+                exit_code = self.run_final_checkpoint(settings, days)
+                if exit_code is not None:
+                    return exit_code
                 continue
             if MAX_CYCLES and self.cycles_run >= MAX_CYCLES:
                 self.set_state("test-finished", next_wake=None)
@@ -766,22 +1027,60 @@ class Runner:
             self.event("next", state=name, wake=iso(wake), wait_s=round((wake - now()).total_seconds()))
             self.set_state(name)
 
+    def run_final_checkpoint(self, settings, days):
+        """Write the final checkpoint, retrying on recoverable outcomes. Returns an
+        exit code to stop, or None to let the loop gate the next attempt."""
+        if self.state.get("final_checkpoint_done"):
+            self.set_state("expired", next_wake=None, last_error=f"MAX_AUTONOMOUS_DAYS={days:g} reached; touch {AP_HOME}/RENEW and restart to continue")
+            return EXIT_STOPPED
+        self.event("max-days-reached", days=days)
+        outcome, reset_at, detail = self.final_checkpoint(settings)
+        self.cycles_run += 1
+        if outcome in ("ok", "max_turns", "timeout"):
+            self.state["final_checkpoint_done"] = True
+            self.set_state("expired", next_wake=None, last_error=f"MAX_AUTONOMOUS_DAYS={days:g} reached; final checkpoint written; touch {AP_HOME}/RENEW and restart to continue")
+            return EXIT_STOPPED
+        attempts = int(self.state.get("final_checkpoint_attempts", 0)) + 1
+        self.state["final_checkpoint_attempts"] = attempts
+        if attempts >= FINAL_CHECKPOINT_MAX_ATTEMPTS:
+            self.needs_human("Final checkpoint could not be written",
+                             f"After {attempts} attempts the final checkpoint cycle still ends in '{outcome}'. The runner is stopping at MAX_AUTONOMOUS_DAYS without a fresh checkpoint. Detail: {self.redact(detail or '')[:300]}")
+            self.set_state("expired", next_wake=None, last_error=f"final checkpoint failed after {attempts} attempts ({outcome})")
+            return EXIT_STOPPED
+        # Reschedule through the normal policy (wait for a reset, back off, retry).
+        wake, name = self.after(outcome, reset_at, detail)
+        self.state["next_wake"] = iso(wake)
+        self.event("next", state=name, wake=iso(wake), wait_s=round((wake - now()).total_seconds()), final_checkpoint_attempt=attempts)
+        self.set_state(name)
+        return None
+
     def final_checkpoint(self, settings):
-        """One cycle that only writes and commits a final checkpoint."""
+        """One cycle that only writes and commits a final checkpoint. Returns the
+        cycle's (outcome, reset_at, detail)."""
+        # Keep this prompt and its directory out of the agent-writable zone's
+        # reach of a pre-placed symlink: write it with O_NOFOLLOW|O_TRUNC.
         path = os.path.join(AP_HOME, "agent", "FINAL_CHECKPOINT_PROMPT.md")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(
-                "MAX_AUTONOMOUS_DAYS has been reached and the autopilot runner is stopping. Following "
-                "docs/ai-platform-upgrade/MASTER_PROMPT.md (read it, then RESUME.md and TASK_BOARD.md), write a final "
-                "checkpoint: update RESUME.md (phase, what is finished, what is in progress, the exact next step, open branches, "
-                "running dev services and how to stop them, experiments in flight, last known-good production tag, blockers) and "
-                "IMPLEMENTATION_STATUS.md truthfully, commit them, and push autopilot/dev. Do not start new work. Never cross a "
-                "hard limit in section 3.3."
-            )
+        body = (
+            "MAX_AUTONOMOUS_DAYS has been reached and the autopilot runner is stopping. Following "
+            "docs/ai-platform-upgrade/MASTER_PROMPT.md (read it, then RESUME.md and TASK_BOARD.md), write a final "
+            "checkpoint: update RESUME.md (phase, what is finished, what is in progress, the exact next step, open branches, "
+            "running dev services and how to stop them, experiments in flight, last known-good production tag, blockers) and "
+            "IMPLEMENTATION_STATUS.md truthfully, commit them, and push autopilot/dev. Do not start new work. Never cross a "
+            "hard limit in section 3.3."
+        )
+        try:
+            if os.path.islink(path):
+                os.unlink(path)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(body)
+        except OSError as exc:
+            self.event("final-checkpoint-prompt-error", error=str(exc))
+            return "crash", None, f"could not write the final checkpoint prompt ({exc})"
         saved, self.prompt_file = self.prompt_file, path
         try:
-            self.run_cycle(settings)
+            return self.run_cycle(settings)
         finally:
             self.prompt_file = saved
 
