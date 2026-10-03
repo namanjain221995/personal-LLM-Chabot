@@ -29,12 +29,25 @@ of them skips layer 3:
 |---|---|---|
 | `Bash`, `Monitor` | both run a shell command (Monitor can also open a WebSocket) | the full command analysis; a Monitor WebSocket to an external host is refused |
 | `Write`, `Edit`, `MultiEdit`, `NotebookEdit` | write files | refuse writes outside the autopilot's zones, over guard files or over a directory that holds one |
-| `Read`, `Grep`, `Glob`, `NotebookRead` | read or list files | refuse reads of secret files and searches scoped to them |
+| `Read`, `Grep`, `NotebookRead` | read file contents | refuse reads of secret files, and recursive greps (including a pathless one, which covers the working directory) rooted at a tree that holds untracked secrets, unless an `--include`/`-g`/`-t` scopes them off secret names |
+| `Glob` | list file names | refuse only a glob that points at a named secret path; a name-listing pattern such as `**/*.env` is allowed because a returned path is re-checked when `Read`/`Grep` opens it |
 | `WebFetch`, `WebSearch` | reach a URL or an external search service | refuse a production host, a private/link-local/loopback address, or a credential-shaped string |
 | `Agent`, `Task`, `Workflow`, `Skill` | spawn subagents / run a workflow (the operator REQUIRES multiple agents) | stay allowed — a subagent's own tool calls pass back through this hook — except an input that carries a secret shape or asks for remote/cloud isolation (running outside the local guard) |
 | `CronCreate`, `ScheduleWakeup` | schedule a prompt or a wakeup | refuse only when the prompt carries a secret shape (the scheduling itself is a layer-1/2 concern) |
 | `EnterWorktree` | can move the session's write access | refuse pointing at the production checkout, `~/Documents`, a secret path or the guard files |
 | `mcp__.*` | MCP tools reach external services | refuse unless the tool name is clearly read-only (get/list/read/view/search/...) |
+
+The command analysis reads shell text best-effort and fails closed on anything
+it cannot follow. It resolves a `$VAR` only to a literal value a command set
+earlier in the same text in a segment certain to run, and only when that value
+is one word bash could neither split nor glob; it never resolves the command
+word, and it resolves nothing in a command that defines a function, sources a
+file, uses `printf -v`, a `:=`/`=` default-assignment or arithmetic, or sets
+`IFS`. So a computed command name, a space-separated refspec or a glob built
+from a variable stays unresolved and trips the literal-name / literal-refspec /
+literal-path refusals. The `docker` and `docker compose` parsers consume each
+global option's value (so a hidden `--tlskey`/`--workdir` cannot shift the
+subcommand) and fail closed on an unrecognised global option or subcommand.
 
 The matcher is a fixed alternation, so only the tools above (and any `mcp__*`)
 reach layer 3; a tool not named here is left to layers 1 and 2 (`permissions.deny`
