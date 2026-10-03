@@ -233,9 +233,30 @@ METHOD = {
     "compare_passed": "passed = no failure, and no gated class/metric whose BASELINE side is insufficient unless "
                       "--allow-insufficient. A candidate side with too few samples where the baseline had enough "
                       "is a failure, never waived.",
-    "compare_integrity": "compare recomputes every derived number of the baseline (unit medians and log variances, "
-                         "n, percentiles, sigma, scale, allowed values, counts against the sources) with the "
-                         "constants of this script and refuses a baseline that disagrees.",
+    "compare_integrity": "compare (and show) refuse a baseline that disagrees with itself. RECOMPUTED exactly from "
+                         "what the baseline stores, with this script's constants: every latency entry from its unit "
+                         "samples (unit n, median, log variance; class n, p50, p95, min, max, mean, sigma_class, "
+                         "the family-pooled sigma over the stored units of the family, sigma, scale, rel, abs, "
+                         "allowed_ratio, allowed_p95, status, p95_status); each case's pass_rate and mean_score "
+                         "from its exact counts; the overall mean from the cases' exact scores; each check's rate "
+                         "from passed/total; repeats_per_case; conditions and procedure_deviations from sources; "
+                         "each case's repeats against the sources' repeats and --only; the constants. BOUNDED only "
+                         "(they come from records the baseline does not keep): per case, passes, errors and "
+                         "no_checks in 0..repeats with passes + errors + no_checks <= repeats; complete = repeats - "
+                         "errors - no_checks; passes <= mean_score_exact x repeats <= complete, with equality at "
+                         "complete exactly when passes == complete and mean_score_exact == 1 exactly when passes "
+                         "== repeats; per check, 0 <= check_passes <= check_runs <= complete, passes <= "
+                         "check_passes + complete - check_runs, failing instances >= check_runs - check_passes "
+                         "(and, without errors, failing > 0 exactly when check_runs > check_passes, and check_runs "
+                         ">= 1); a Fast case runs thinking_off in every complete record; errors <= failed_turns <= "
+                         "turns and turns >= repeats - no_checks; per check name over all cases, total - passed == "
+                         "the sum of failing instances, total >= the sum of check_runs and passed >= the sum of "
+                         "check_passes; Fast turns between the Fast cases' turns minus their errors and their "
+                         "turns, Fast thinking turns <= the failing thinking_off instances; per class, samples + "
+                         "missing == turns - failed_turns of its cases for every metric and excluded between "
+                         "failed_turns - errors and failed_turns; output token samples <= turns that did not fail. "
+                         "A rewrite of the bounded counts that keeps every bound is NOT detectable: the frozen "
+                         "baseline must be reviewed and committed like code.",
 }
 
 
@@ -928,6 +949,7 @@ def quality_stats(records: Sequence[dict]) -> dict:
 # ------------------------------------------------------- baseline integrity --
 
 _FRACTION = re.compile(r"[0-9]+(?:/[1-9][0-9]*)?")
+_UNIT = re.compile(r".+/t[1-9][0-9]*")
 
 
 def _exact(value, where: str) -> Fraction:
@@ -991,49 +1013,30 @@ def _verify_baseline(doc, where: str = "baseline") -> None:
     cases = quality["cases"]
     exacts = []
     for cid, c in cases.items():
-        cw = f"{where}: quality.cases.{cid}"
-        if not isinstance(c, dict):
-            raise BaselineError(f"{cw}: not an object")
-        reps = c.get("repeats")
-        if not (_is_int(reps) and reps >= MIN_SAMPLES):
-            raise BaselineError(f"{cw}: repeats must be an integer >= {MIN_SAMPLES}")
-        if reps != _expected_repeats(sources, cid):
-            raise BaselineError(f"{cw}: {reps} records, but the sources' repeats add up to "
-                                f"{_expected_repeats(sources, cid)}")
-        for key in ("passes", "errors", "no_checks"):
-            if not (_is_int(c.get(key)) and 0 <= c[key] <= reps):
-                raise BaselineError(f"{cw}: {key} must be an integer in 0..{reps}")
-        if c["passes"] + c["errors"] + c["no_checks"] > reps:
-            raise BaselineError(f"{cw}: passes + errors + no_checks exceed repeats")
-        if not (isinstance(c.get("workload"), str) and c["workload"] in CLASS_ABS_S
-                and isinstance(c.get("effort"), str)):
-            raise BaselineError(f"{cw}: workload/effort missing or unknown")
-        exact = _exact(c.get("mean_score_exact"), cw)
-        if not 0 <= exact <= 1 or not _same(c.get("mean_score"), float(exact)) \
-                or not _same(c.get("pass_rate"), c["passes"] / reps) or (c["passes"] == reps and exact != 1):
-            raise BaselineError(f"{cw}: mean_score / pass_rate disagree with the exact counts")
-        exacts.append(exact)
-        cp = c.get("check_passes")
-        if not isinstance(cp, dict) or not all(isinstance(k, str) and _is_int(v) and 0 <= v <= reps
-                                               for k, v in cp.items()):
-            raise BaselineError(f"{cw}: check_passes must map check names to integers in 0..{reps}")
-        if not (_is_int(c.get("turns")) and _is_int(c.get("failed_turns")) and 0 <= c["failed_turns"] <= c["turns"]):
-            raise BaselineError(f"{cw}: failed_turns must be an integer in 0..turns")
+        exacts.append(_verify_case(c, _expected_repeats(sources, cid), f"{where}: quality.cases.{cid}"))
     if not _same(doc.get("repeats_per_case"), {cid: c["repeats"] for cid, c in cases.items()}):
         raise BaselineError(f"{where}: repeats_per_case disagrees with quality.cases")
     overall = sum(exacts, Fraction(0)) / len(exacts)
     if _exact(quality.get("overall_mean_score_exact"), f"{where}: quality") != overall \
             or not _same(quality.get("overall_mean_score"), float(overall)):
         raise BaselineError(f"{where}: overall_mean_score disagrees with the cases")
-    ft, fth = quality.get("fast_turns"), quality.get("fast_thinking_turns")
-    if not (_is_int(ft) and _is_int(fth) and 0 <= fth <= ft) or quality.get("fast_unchecked_turns") != 0:
-        raise BaselineError(f"{where}: fast_turns / fast_thinking_turns / fast_unchecked_turns are not valid counts")
     checks = quality.get("checks")
     if not isinstance(checks, dict) or not all(
             isinstance(c, dict) and _is_int(c.get("passed")) and _is_int(c.get("total"))
             and 0 <= c["passed"] <= c["total"] and c["total"] > 0 and _same(c.get("rate"), c["passed"] / c["total"])
             for c in checks.values()):
         raise BaselineError(f"{where}: quality.checks must hold passed <= total counts and their rate")
+    names = {n for c in cases.values() for n in c["check_passes"]}
+    if set(checks) != names:
+        raise BaselineError(f"{where}: quality.checks names {sorted(checks)} differ from the cases' check names "
+                            f"{sorted(names)}")
+    for n, tally in checks.items():
+        failing = sum(c["failing_checks"].get(n, 0) for c in cases.values())
+        if tally["total"] - tally["passed"] != failing \
+                or tally["total"] < sum(c["check_runs"].get(n, 0) for c in cases.values()) \
+                or tally["passed"] < sum(c["check_passes"].get(n, 0) for c in cases.values()):
+            raise BaselineError(f"{where}: quality.checks.{n} disagrees with the cases' check counts")
+    _verify_fast_thinking(quality, cases, checks, where)
 
     classes = {c["workload"] for c in cases.values()}
     if set(latency) != classes:
@@ -1051,6 +1054,8 @@ def _verify_baseline(doc, where: str = "baseline") -> None:
                 raise BaselineError(f"{lw}: `units` is missing")
             samples = {}
             for u, s in units.items():
+                if not _UNIT.fullmatch(u):
+                    raise BaselineError(f"{lw}: unit {u!r:.60} is not CASE/tN")
                 cid = u.rsplit("/t", 1)[0]
                 if not (isinstance(s, dict) and isinstance(s.get("samples"), list) and s["samples"]
                         and all(_is_number(v) and v >= 0 for v in s["samples"])):
@@ -1063,6 +1068,17 @@ def _verify_baseline(doc, where: str = "baseline") -> None:
             for key in ("missing", "excluded"):
                 if not (_is_int(e.get(key)) and e[key] >= 0):
                     raise BaselineError(f"{lw}: {key} must be a count")
+            # every turn that did not fail gives each metric a sample or a `missing`; failed turns are `excluded`,
+            # and a record that errored before any turn counts one failed turn but has nothing to exclude
+            mine = [c for c in cases.values() if c["workload"] == w]
+            good = sum(c["turns"] - c["failed_turns"] for c in mine)
+            failed, errored = sum(c["failed_turns"] for c in mine), sum(c["errors"] for c in mine)
+            first_excluded = per[METRICS[0]]["excluded"]
+            if sum(len(v) for v in samples.values()) + e["missing"] != good \
+                    or not failed - errored <= e["excluded"] <= failed or e["excluded"] != first_excluded:
+                raise BaselineError(f"{lw}: samples + missing must equal the class's turns that did not fail ({good}) "
+                                    f"and excluded must lie in {max(failed - errored, 0)}..{failed}, the same for "
+                                    "every metric")
             stored[(w, m)] = (lw, e, samples)
     for m in METRICS:
         pooled = family_sigmas({w: samples for (w, mm), (_lw, _e, samples) in stored.items() if mm == m})
@@ -1071,10 +1087,83 @@ def _verify_baseline(doc, where: str = "baseline") -> None:
                 raise BaselineError(f"{lw}: stored statistics or allowed values disagree with a recomputation from "
                                     "its unit samples and this script's constants")
     rates = doc.get("output_tokens_per_s")
-    if not isinstance(rates, dict) or not all(
-            w in CLASS_ABS_S and isinstance(r, dict) and _is_int(r.get("n")) and r["n"] >= 0
-            and (r.get("median") is None or _is_number(r["median"])) for w, r in rates.items()):
-        raise BaselineError(f"{where}: output_tokens_per_s is malformed")
+    if not isinstance(rates, dict) or set(rates) != classes or not all(
+            isinstance(r, dict) and _is_int(r.get("n")) and r["n"] >= 0
+            and (r.get("median") is None) == (r["n"] == 0)
+            and (r.get("median") is None or (_is_number(r["median"]) and r["median"] >= 0))
+            and r["n"] <= sum(c["turns"] - c["failed_turns"] for c in cases.values() if c["workload"] == w)
+            for w, r in rates.items()):
+        raise BaselineError(f"{where}: output_tokens_per_s is malformed or has more samples than turns")
+
+
+def _verify_case(c, expected_repeats: int, cw: str) -> Fraction:
+    """The invariants of one stored case (quality_stats' counts); returns its exact mean score. Counts cannot be
+    recomputed without the records, so they are bounded by each other: see METHOD['compare_integrity']."""
+    if not isinstance(c, dict):
+        raise BaselineError(f"{cw}: not an object")
+    reps = c.get("repeats")
+    if not (_is_int(reps) and reps >= MIN_SAMPLES):
+        raise BaselineError(f"{cw}: repeats must be an integer >= {MIN_SAMPLES}")
+    if reps != expected_repeats:
+        raise BaselineError(f"{cw}: {reps} records, but the sources' repeats add up to {expected_repeats}")
+    for key in ("passes", "errors", "no_checks"):
+        if not (_is_int(c.get(key)) and 0 <= c[key] <= reps):
+            raise BaselineError(f"{cw}: {key} must be an integer in 0..{reps}")
+    if c["passes"] + c["errors"] + c["no_checks"] > reps:
+        raise BaselineError(f"{cw}: passes + errors + no_checks exceed repeats")
+    if not (isinstance(c.get("workload"), str) and c["workload"] in CLASS_ABS_S
+            and isinstance(c.get("effort"), str) and c["effort"]):
+        raise BaselineError(f"{cw}: workload/effort missing or unknown")
+    full = reps - c["errors"] - c["no_checks"]               # complete records: no error, at least one check
+    exact = _exact(c.get("mean_score_exact"), cw)
+    total = exact * reps                                      # the sum of the record scores
+    if not 0 <= exact <= 1 or not _same(c.get("mean_score"), float(exact)) \
+            or not _same(c.get("pass_rate"), c["passes"] / reps):
+        raise BaselineError(f"{cw}: mean_score / pass_rate disagree with the exact counts")
+    if (exact == 1) != (c["passes"] == reps) or not c["passes"] <= total <= full \
+            or (total == full) != (c["passes"] == full):
+        raise BaselineError(f"{cw}: mean_score_exact {exact} cannot come from {c['passes']} passing of {reps} "
+                            f"records with {c['errors']} errored and {c['no_checks']} without checks (each passing "
+                            "record scores 1, each errored or unchecked one 0, every other one less than 1)")
+    cp, cr, fc = c.get("check_passes"), c.get("check_runs"), c.get("failing_checks")
+    if not (isinstance(cp, dict) and isinstance(cr, dict) and set(cp) == set(cr)
+            and all(isinstance(k, str) and k and _is_int(cp[k]) and _is_int(cr[k]) and 0 <= cp[k] <= cr[k] <= full
+                    for k in cp)):
+        raise BaselineError(f"{cw}: check_passes and check_runs must map the same check names to integers with "
+                            f"0 <= passes <= runs <= {full} (the complete records)")
+    if not (isinstance(fc, dict) and all(k in cp and _is_int(v) and v > 0 for k, v in fc.items())):
+        raise BaselineError(f"{cw}: failing_checks must map the case's check names to positive counts")
+    for k in cp:
+        failing = fc.get(k, 0)
+        if c["passes"] > cp[k] + full - cr[k] or failing < cr[k] - cp[k] \
+                or (c["errors"] == 0 and ((failing > 0) != (cr[k] > cp[k]) or cr[k] == 0)):
+            raise BaselineError(f"{cw}: check {k}: passes {cp[k]}, runs {cr[k]} and failing instances {failing} "
+                                f"disagree with {c['passes']} passing and {c['errors']} errored records")
+    if c["effort"] == "fast" and full and cr.get(THINKING_CHECK) != full:
+        raise BaselineError(f"{cw}: a Fast case runs `{THINKING_CHECK}` in every complete record")
+    if not (_is_int(c.get("turns")) and _is_int(c.get("failed_turns"))
+            and c["errors"] <= c["failed_turns"] <= c["turns"] and c["turns"] >= reps - c["no_checks"]):
+        raise BaselineError(f"{cw}: turns / failed_turns must satisfy errors <= failed_turns <= turns and turns >= "
+                            "repeats - no_checks")
+    return exact
+
+
+def _verify_fast_thinking(quality: dict, cases: dict, checks: dict, where: str) -> None:
+    ft, fth, ids = quality.get("fast_turns"), quality.get("fast_thinking_turns"), quality.get("fast_thinking_case_ids")
+    fast = {cid: c for cid, c in cases.items() if c["effort"] == "fast"}
+    turns, errors = sum(c["turns"] for c in fast.values()), sum(c["errors"] for c in fast.values())
+    tally = checks.get(THINKING_CHECK, {"passed": 0, "total": 0})
+    if not (_is_int(ft) and _is_int(fth) and 0 <= fth <= ft) or quality.get("fast_unchecked_turns") != 0 \
+            or quality.get("fast_unchecked_case_ids") != []:
+        raise BaselineError(f"{where}: fast_turns / fast_thinking_turns / fast_unchecked_turns are not valid counts")
+    if not turns - errors <= ft <= turns or ft > tally["total"] or fth > tally["total"] - tally["passed"] \
+            or fth > sum(c["failing_checks"].get(THINKING_CHECK, 0) for c in fast.values()):
+        raise BaselineError(f"{where}: fast_turns {ft} / fast_thinking_turns {fth} disagree with the Fast cases' "
+                            f"turns ({turns - errors}..{turns}) and their `{THINKING_CHECK}` counts")
+    if not (isinstance(ids, list) and len(set(ids)) == len(ids) and len(ids) <= fth and bool(ids) == (fth > 0)
+            and all(i in fast and fast[i]["failing_checks"].get(THINKING_CHECK, 0) > 0 for i in ids)):
+        raise BaselineError(f"{where}: fast_thinking_case_ids disagree with the Fast cases' `{THINKING_CHECK}` "
+                            "failures")
 
 
 def load_baseline(path: str) -> dict:

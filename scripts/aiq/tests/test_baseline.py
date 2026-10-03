@@ -988,6 +988,23 @@ def test_baseline_side_insufficiency_fails_unless_allowed():
     lambda d: d["quality"]["checks"]["c00"].update(passed=9),
     lambda d: d.update(schema=1),
     lambda d: d.update(schema=2),
+    # re-QA 8: counts that loosen a gate and were accepted
+    lambda d: d["quality"]["cases"]["EV01"].update(passes=0, pass_rate=0.0),          # mean_score_exact stays 1
+    lambda d: d["quality"]["cases"]["EV01"]["check_passes"].update(c00=0),
+    lambda d: d["quality"]["cases"]["EV01"].update(check_passes={}),
+    lambda d: d["quality"]["cases"]["EV01"]["check_runs"].update(c00=2),
+    lambda d: d["quality"]["cases"]["EV01"]["check_runs"].pop("c00"),
+    lambda d: d["quality"]["cases"]["EV01"].update(failing_checks={"c00": 1}),
+    lambda d: d["quality"]["cases"]["EV01"].update(failed_turns=3),
+    lambda d: d["quality"]["cases"]["EV01"].update(turns=2),
+    lambda d: d["quality"].update(fast_thinking_turns=3, fast_thinking_case_ids=["EV01"]),
+    lambda d: d["quality"].update(fast_turns=2),
+    lambda d: d["quality"]["checks"]["c00"].update(passed=2, rate=2 / 3),
+    lambda d: d["latency"]["direct_fast"]["total_s"].update(missing=1),
+    lambda d: d["latency"]["direct_fast"]["total_s"].update(excluded=1),
+    lambda d: d["latency"]["direct_fast"]["total_s"]["units"].update({"EV01/x": {"samples": [1.0]}}),
+    lambda d: d["output_tokens_per_s"].update(direct_fast={"n": 99, "median": 1.0}),
+    lambda d: d["output_tokens_per_s"].clear(),
     lambda d: d.update(procedure_deviations=[]),
     lambda d: d["sources"][0].update(dir="evalset-box.internal"),
 ])
@@ -997,6 +1014,27 @@ def test_compare_refuses_a_baseline_whose_numbers_disagree(mutate):
     mutate(base)
     with pytest.raises(B.BaselineError):
         B.compare(base, pooled(three_repeats()))
+
+
+def test_a_baseline_rewritten_to_pass_anything_is_refused():
+    """Re-QA 8 (q10): passes, check passes, Fast thinking, failed turns and every mean score rewritten together."""
+    recs = [record(cid, r, [turn(checks(2))]) for cid in ("EV01", "RQ01") for r in (1, 2, 3)]
+    doc = json.loads(json.dumps(frozen(recs)))
+    for c in doc["quality"]["cases"].values():
+        c.update(passes=0, pass_rate=0.0, check_passes={k: 0 for k in c["check_passes"]}, failed_turns=c["turns"],
+                 mean_score_exact="0", mean_score=0.0)
+    doc["quality"].update(fast_thinking_turns=doc["quality"]["fast_turns"], overall_mean_score_exact="0",
+                          overall_mean_score=0.0)
+    with pytest.raises(B.BaselineError):
+        B._verify_baseline(doc)
+
+
+def test_the_integrity_method_says_what_is_recomputed_and_what_only_bounded():
+    text = B.METHOD["compare_integrity"]
+    assert "RECOMPUTED exactly" in text and "BOUNDED only" in text and "NOT detectable" in text
+    for phrase in ("family-pooled sigma", "passes <= mean_score_exact x repeats <= complete",
+                   "total - passed == the sum of failing instances", "samples + missing == turns - failed_turns"):
+        assert phrase in text, phrase
 
 
 # --------------------------------------------------------------- markdown --
