@@ -1,11 +1,14 @@
 """B-04: the evaluation-set runner, against a fake orchestrator on 127.0.0.1.
 
 The fake speaks the parts of the orchestrator's HTTP surface the runner uses:
-/auth/login (a session cookie), /auth/me, /health, /uploads (multipart),
-/chat (an SSE stream with an x-request-id header), /chat/trace/{id} and
-/chat/stop. Its answers are eval_set_answers.py's hand-written ones, so a
-good answer must pass its case's checks end to end and a bad one must fail
-exactly as tests/test_eval_set.py says it does.
+/auth/login (a session cookie), /auth/me (the real {user, features} shape),
+/health, /history/conversations (+ ?archived=true), /memory/facts, /uploads
+(multipart), /chat (an SSE stream with an x-request-id header, framed by the
+orchestrator's OWN app/sse.py, ensure_ascii=False), /chat/trace/{id} and
+/chat/stop (which ends that conversation's stream). Its answers are
+eval_set_answers.py's hand-written ones, so a good answer must pass its
+case's checks end to end and a bad one must fail exactly as
+tests/test_eval_set.py says it does.
 
 Nothing here reaches a model, a stack or the network beyond 127.0.0.1, and
 every run writes into pytest's tmp directories, never under runs/.
@@ -14,10 +17,13 @@ from __future__ import annotations
 
 import email.parser
 import email.policy
+import importlib.util
 import io
 import json
 import os
 import re
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -38,18 +44,26 @@ import eval_set_answers as EA  # noqa: E402
 import harness as H  # noqa: E402
 import run_evalset as RE  # noqa: E402
 
+#: the orchestrator's REAL frame formatter, loaded by path (it imports nothing of the app)
+_SSE_SPEC = importlib.util.spec_from_file_location("orchestrator_sse", AIQ.parents[1] / "orchestrator" / "app" / "sse.py")
+SSE = importlib.util.module_from_spec(_SSE_SPEC)
+_SSE_SPEC.loader.exec_module(SSE)
+
 PASSWORD = "test-pw-bbbbbbbb"
 EMAIL = "aiq-runner@example.com"
 COOKIE = "ts_session=fake-session"
-RUN_KEYS = {"kind", "schema", "started", "finished", "seconds", "conditions", "cases"}
+RUN_KEYS = {"kind", "schema", "started", "finished", "seconds", "interrupted", "deadline_reached", "conditions",
+            "cases"}
 CONDITION_KEYS = {"base", "harness_commit", "label", "workers", "repeats", "only", "health", "case_timeout_s",
-                  "eval_set_sha256"}
-RECORD_KEYS = {"id", "category", "section", "effort", "workload", "repeat", "conversation_id", "error",
+                  "eval_set_sha256", "account", "features", "code_sandbox", "deadline"}
+RECORD_KEYS = {"id", "category", "section", "effort", "workload", "repeat", "conversation_id", "error", "stop",
                "attachments", "turns"}
 RESULT_KEYS = {"http", "answer", "errors", "request_id", "meta", "reasoning_events", "reasoning_chars", "timing",
-               "timed_out", "usage", "stages", "stage_offsets", "server_total_ms", "trace_status", "versions",
-               "trace_thinks", "source_passages", "source_passages_captured"}
+               "timed_out", "terminal", "bad_frames", "status_events", "usage", "stages", "stage_offsets",
+               "server_total_ms", "trace_status", "versions", "trace_thinks", "source_passages",
+               "source_passages_captured"}
 TIMING_KEYS = {"first_event_s", "first_token_s", "first_answer_s", "total_s"}
+FEATURES = {"artifacts": True, "attachments": True, "deep_research": True, "salesforce": False, "web_search": True}
 
 
 # ------------------------------------------------------------ the fake --
@@ -65,9 +79,24 @@ class Fake:
         self.logins = 0
         self.traces: dict = {}
         self.trace_reads: dict = {}
+        #: (monotonic time, what): "chat <conv>", "stop <conv>", "trace <id>", in the order they arrived
+        self.timeline: list = []
+        #: conversations a /chat/stop named: their stream ends at the next beat
+        self.stopped: set = set()
+        #: what the account already holds
+        self.conversations = self.archived = self.facts = 0
+        self.history_status = 200
+        #: sign-ins after this many answer 503
+        self.fail_login_after = None
+        self.login_delay_s = 0.0
         #: case id -> overrides: answer, sources, status, reasoning, trace_thinking,
-        #: trace_running_reads, stall_s, pre_answer_delay
+        #: trace_running_reads, trace_404_reads, stall_s, pre_answer_delay, silent_s,
+        #: end ("done" | "error" | "none"), raw_frames (extra frames before the answer)
         self.scripts: dict = {}
+
+    def note(self, what: str) -> None:
+        with self.lock:
+            self.timeline.append((time.monotonic(), what))
 
     def script(self, cid: str) -> dict:
         good = EA.GOOD.get(cid, {"answer": "ok"})
@@ -144,16 +173,28 @@ def _handler(fake: Fake):
             if not self._authed():
                 return
             if self.path == "/auth/me":
-                return self._json(200, {"id": 7, "email": EMAIL})
+                # authn/api.py _me_payload: the email is in it, and must not reach the run files
+                return self._json(200, {"username": "runner", "user": {"id": 7, "name": "Runner", "email": EMAIL},
+                                        "workspace": {"id": 1, "name": "dev", "role": "super_admin"},
+                                        "capabilities": ["members.manage"],
+                                        "features": {**FEATURES, "bad name/x": True, "voice_input": "yes"}})
+            if self.path in ("/history/conversations", "/history/conversations?archived=true"):
+                n = fake.archived if self.path.endswith("archived=true") else fake.conversations
+                return self._json(fake.history_status, [{"id": f"c{i}", "title": "private title", "pinned": False,
+                                                         "archived": self.path.endswith("true")} for i in range(n)])
+            if self.path == "/memory/facts":
+                return self._json(200, {"facts": [{"id": i, "fact": "a private fact"} for i in range(fake.facts)]})
             m = re.fullmatch(r"/chat/trace/([0-9a-f]{32})", self.path)
             if m:
+                fake.note(f"trace {m.group(1)}")
                 with fake.lock:
                     trace = fake.traces.get(m.group(1))
                     fake.trace_reads[m.group(1)] = fake.trace_reads.get(m.group(1), 0) + 1
                     reads = fake.trace_reads[m.group(1)]
-                if trace is None:
+                script = fake.script(trace["test_case_id"]) if trace else {}
+                if trace is None or reads <= int(script.get("trace_404_reads") or 0):
                     return self._json(404, {"detail": "query trace not found"})
-                running = int(fake.script(trace["test_case_id"]).get("trace_running_reads") or 0)
+                running = int(script.get("trace_running_reads") or 0)
                 return self._json(200, {**trace, "final_status": "running" if reads <= running else "ok"})
             return self._json(404, {"detail": "not found"})
 
@@ -161,10 +202,14 @@ def _handler(fake: Fake):
             raw = self._body()
             if self.path == "/auth/login":
                 body = json.loads(raw or b"{}")
+                time.sleep(fake.login_delay_s)
                 if body.get("email") != EMAIL or body.get("password") != PASSWORD:
                     return self._json(401, {"detail": "Invalid email or password."})
                 with fake.lock:
                     fake.logins += 1
+                    refused = fake.fail_login_after is not None and fake.logins > fake.fail_login_after
+                if refused:
+                    return self._json(503, {"detail": "busy"})
                 return self._json(200, {"user": {"id": 7}}, {"Set-Cookie": COOKIE + "; Path=/; HttpOnly; Secure"})
             if not self._authed():
                 return
@@ -185,14 +230,18 @@ def _handler(fake: Fake):
                 return self._json(200, {"upload_id": rec["upload_id"], "filename": rec["filename"],
                                         "bytes": len(rec["data"]), "files": 1, "notes": [], "profile": []})
             if self.path == "/chat/stop":
+                body = json.loads(raw or b"{}")
+                fake.note(f"stop {body.get('conversation_id')}")
                 with fake.lock:
-                    fake.stops.append(json.loads(raw or b"{}"))
+                    fake.stops.append(body)
+                    fake.stopped.add(body.get("conversation_id"))
                 return self._json(200, {"stopped": True})
             if self.path == "/chat":
                 return self._chat(json.loads(raw))
             return self._json(404, {"detail": "not found"})
 
         def _chat(self, body: dict):
+            fake.note(f"chat {body.get('conversation_id')}")
             with fake.lock:
                 fake.chats.append(body)
             cid = body.get("test_case_id") or ""
@@ -213,15 +262,18 @@ def _handler(fake: Fake):
                 self.wfile.flush()
 
             def ev(name: str, data: dict):
-                send(f"event: {name}\ndata: {json.dumps(data)}\n\n")
+                send(SSE.sse_event(name, data))  # the orchestrator's own framing: ensure_ascii=False
 
+            conv = body.get("conversation_id")
             try:
                 if body.get("intent_id"):
                     ev("meta", {"generation_id": gid, "trace_id": gid, "request_id": rid,
                                 "intent_id": body["intent_id"], "attempt": 1})
-                send(": keep-alive\n\n")
+                send(SSE.sse_comment())
                 ev("step", {"id": 1, "title": "Working", "status": "running"})
                 ev("status", {"text": "Reading the question"})
+                for frame in script.get("raw_frames") or []:
+                    send(frame)
                 time.sleep(float(script.get("pre_answer_delay", 0.05)))
                 if script.get("reasoning"):
                     ev("reasoning", {"text": "thinking about it"})
@@ -233,14 +285,20 @@ def _handler(fake: Fake):
                 stall = float(script.get("stall_s") or 0)
                 until = time.monotonic() + stall
                 while time.monotonic() < until:
-                    send(": keep-alive\n\n")
+                    if conv in fake.stopped:  # /chat/stop cancelled the generation: the stream ends
+                        return
+                    send(SSE.sse_comment())
                     time.sleep(0.05)
                 for i in range(40, len(answer), 40):
                     ev("token", {"text": answer[i:i + 40]})
                 ev("step", {"id": 1, "title": "Working", "status": "done"})
                 ev("meta", {"route": "chat", "sources": script["sources"], "generation_id": gid, "trace_id": gid,
                             "request_id": rid, "mode": "assistant", "effort": body.get("effort")})
-                ev("done", {"session_id": body.get("session_id")})
+                end = script.get("end", "done")
+                if end == "done":
+                    ev("done", {"session_id": body.get("session_id")})
+                elif end == "error":
+                    ev("error", {"message": "The model is unavailable."})
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
@@ -297,6 +355,22 @@ def _no_network(monkeypatch):
     def refuse(*a, **k):
         raise AssertionError("no network call is allowed here")
     monkeypatch.setattr(httpx.Client, "__init__", refuse)
+
+
+def _sandbox(monkeypatch, ok=True, backend="container"):
+    """The code sandbox as available (or not) without asking docker."""
+    monkeypatch.setattr(RE.code_sandbox.Toolchain, "available",
+                        lambda self, lang: (True, "") if ok else (False, "no sandbox image on this host"))
+    monkeypatch.setattr(RE.code_sandbox.Toolchain, "backend", property(lambda self: backend))
+
+
+def _fake_run_code(calls):
+    def run_code(spec, answer, workdir, tc):
+        calls.append((spec, answer, workdir))
+        return {"lang": "python", "blocks": 1, "source": answer, "ok": True,
+                "steps": [{"stage": "build", "name": "compile", "ok": True, "rc": 0, "tail": ""},
+                          {"stage": "check", "name": "check.py", "ok": True, "rc": 0, "tail": "ok"}]}
+    return run_code
 
 
 # ------------------------------------------------------- request bodies --
@@ -470,6 +544,7 @@ def test_a_server_error_on_one_case_is_recorded_and_the_run_goes_on(fake, tmp_pa
     assert by["RQ03"]["error"].startswith("ChatFailed: /chat returned HTTP 500")
     (turn,) = by["RQ03"]["turns"]
     assert turn["result"]["http"] == 500 and turn["result"]["errors"][0]["http"] == 500
+    assert turn["result"]["timing"] == dict.fromkeys(TIMING_KEYS), "an HTTP error is no latency sample"
     assert re.fullmatch(r"req_[0-9a-f]{32}", turn["result"]["request_id"])
     assert by["EV01"]["error"] is None and by["EV03"]["error"] is None
     rq03 = next(c for c in summary["cases"] if c["id"] == "RQ03")
@@ -512,14 +587,8 @@ def test_results_json_is_rewritten_after_every_record(fake, tmp_path, pwfile, mo
 
 def test_a_coding_turn_is_run_through_the_sandbox_and_scored(fake, tmp_path, pwfile, monkeypatch):
     calls = []
-
-    def run_code(spec, answer, workdir, tc):
-        calls.append((spec, answer, workdir))
-        return {"lang": "python", "blocks": 1, "source": answer, "ok": True,
-                "steps": [{"stage": "build", "name": "compile", "ok": True, "rc": 0, "tail": ""},
-                          {"stage": "check", "name": "check.py", "ok": True, "rc": 0, "tail": "ok"}]}
-
-    monkeypatch.setattr(RE.code_sandbox, "run_code", run_code)
+    _sandbox(monkeypatch)
+    monkeypatch.setattr(RE.code_sandbox, "run_code", _fake_run_code(calls))
     out, results, _ = _run(fake, tmp_path, pwfile, "--only", "RQ05")
     (spec, answer, workdir), = calls
     assert spec == ES.BY_ID["RQ05"]["turns"][0]["expect"]["code"] and answer.strip() == EA.GOOD["RQ05"]["answer"].strip()
@@ -662,3 +731,376 @@ def test_two_workers_run_side_by_side(fake, tmp_path, pwfile):
     assert [r["id"] for r in results["cases"]] == ["EV01", "EV03", "RQ03", "RQ07"]
     assert all(r["error"] is None for r in results["cases"]) and fake.logins == 2
     assert results["conditions"]["workers"] == 2
+
+
+# ------------------------------------------ failed turns are no samples --
+
+def test_a_timed_out_turn_keeps_its_first_answer_but_has_no_total(fake, tmp_path, pwfile):
+    fake.scripts["EV06"] = {"stall_s": 5}
+    _out, results, summary = _run(fake, tmp_path, pwfile, "--only", "EV06", "--case-timeout-s", "0.5")
+    rec = results["cases"][0]
+    tm = rec["turns"][0]["result"]["timing"]
+    assert rec["error"].startswith("CaseTimeout:")
+    assert tm["first_answer_s"] is not None, "what happened before the cut is kept"
+    assert tm["total_s"] is None, "a turn cut at --case-timeout-s is no total_s sample"
+    assert summary["by_workload"]["think"]["total_s_n"] == 0
+
+
+def test_a_stream_that_ends_in_error_fails_the_case_and_is_no_sample(fake, tmp_path, pwfile):
+    fake.scripts["EV01"] = {"end": "error"}
+    _out, results, summary = _run(fake, tmp_path, pwfile, "--only", "EV01,EV03")
+    ev01, ev03 = results["cases"]
+    res = ev01["turns"][0]["result"]
+    assert res["terminal"] == "error" and res["errors"] == [{"message": "The model is unavailable."}]
+    assert res["timing"]["total_s"] is None and res["timing"]["first_answer_s"] is not None
+    assert ev01["error"].startswith("StreamFailed:")
+    assert summary["cases"][0]["repeats"][0]["score"] == 0.0 and summary["cases"][0]["pass_rate"] == 0.0
+    assert ev03["error"] is None and ev03["turns"][0]["result"]["terminal"] == "done"
+
+
+def test_a_stream_with_no_terminal_event_is_a_stream_error(fake, tmp_path, pwfile):
+    fake.scripts["EV01"] = {"end": "none"}
+    _out, results, summary = _run(fake, tmp_path, pwfile, "--only", "EV01")
+    rec = results["cases"][0]
+    res = rec["turns"][0]["result"]
+    assert res["terminal"] is None and res["errors"] == [{"error": "stream ended without done"}]
+    assert res["answer"] == "\n" + EA.GOOD["EV01"]["answer"], "the whole answer arrived; only the done did not"
+    assert res["timing"]["total_s"] is None
+    assert rec["error"].startswith("StreamFailed:") and summary["cases"][0]["mean_score"] == 0.0
+    assert summary["headline"]["turns_with_stream_errors"] == 1
+
+
+def test_the_harness_reports_the_terminal_event(fake):
+    client = H.Client(fake.base, EMAIL, PASSWORD)
+    res = client.chat("conv-t", "hi", [], "fast", test_case_id="EV01")
+    assert (res["terminal"], res["errors"], res["bad_frames"]) == ("done", [], 0)
+    assert res["timing"]["total_s"] is not None
+
+
+# ----------------------------------------------------------- SSE lines --
+
+@pytest.mark.parametrize("sep", ["\u2028", "\u2029", "\x85"])
+def test_line_separators_inside_a_frame_are_kept(fake, sep):
+    # app/sse.py writes these raw (ensure_ascii=False); a splitlines reader cut the frame in two
+    answer = f"The battery lasts 14 months{sep}at the 5-minute interval, sampled hourly."
+    sources = [{"n": 1, "url": "https://example.org/x", "title": f"Spec{sep}sheet", "read": True}]
+    fake.scripts["EV01"] = {"answer": answer, "sources": sources}
+    client = H.Client(fake.base, EMAIL, PASSWORD)
+    res = client.chat("conv-sep", "q", [], "fast", test_case_id="EV01")
+    assert res["answer"] == "\n" + answer  # the fake's whitespace token, then the answer
+    assert res["meta"]["sources"] == sources and res["meta"]["route"] == "chat"
+    assert res["bad_frames"] == 0 and res["terminal"] == "done"
+
+
+def test_a_data_line_that_is_not_json_is_counted(fake, tmp_path, pwfile):
+    fake.scripts["EV01"] = {"raw_frames": ["event: status\ndata: {not json\n\n"]}
+    _out, results, summary = _run(fake, tmp_path, pwfile, "--only", "EV01")
+    res = results["cases"][0]["turns"][0]["result"]
+    assert res["bad_frames"] == 1 and res["answer"] == "\n" + EA.GOOD["EV01"]["answer"]
+    assert summary["headline"]["turns_with_bad_frames"] == 1
+
+
+def test_sse_lines_splits_on_newline_only_across_chunk_boundaries():
+    raw = "event: token\r\ndata: {\"text\": \"é\u2028ü\"}\n\n: c\n".encode("utf-8")
+    cut = raw.index("é".encode()) + 1  # inside the two bytes of é
+    chunks = [raw[:cut], raw[cut:cut + 3], raw[cut + 3:]]
+    assert list(H.sse_lines(chunks)) == ["event: token", 'data: {"text": "é\u2028ü"}', "", ": c"]
+    assert list(H.sse_lines([b"data: 1\r\n", b"data: 2"])) == ["data: 1", "data: 2"]
+
+
+# ------------------------------------------------------- stop, trace --
+
+def test_a_timed_out_turn_is_stopped_before_its_trace_is_read_once(fake, tmp_path, pwfile):
+    fake.scripts["EV01"] = {"stall_s": 5, "trace_running_reads": 99}
+    t0 = time.monotonic()
+    _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01", "--case-timeout-s", "0.5")
+    rec = results["cases"][0]
+    whats = [w for _t, w in fake.timeline]
+    stop_at = next(t for t, w in fake.timeline if w.startswith("stop "))
+    assert stop_at - t0 < 1.5, "the stop went out late"
+    assert whats.index(f"stop {rec['conversation_id']}") < next(i for i, w in enumerate(whats) if w.startswith("trace "))
+    assert sum(w.startswith("trace ") for w in whats) == 1, "a stopped turn's trace is read once, not waited on"
+    assert rec["stop"] == {"http": 200, "stopped": True} and len(fake.stops) == 1
+    assert rec["turns"][0]["result"]["trace_status"] == "running"
+
+
+def test_a_stop_that_cannot_be_sent_is_recorded_not_raised(fake):
+    client = RE.EvalClient(fake.base, EMAIL, PASSWORD)
+    assert client.stop("conv-x") == {"http": 200, "stopped": True}
+    client.base = "http://127.0.0.1:1"  # nothing listens there
+    out = client.stop("conv-x")
+    assert set(out) == {"error"} and out["error"].startswith("ConnectError")
+
+
+def test_a_trace_that_is_not_there_yet_is_read_again(fake, tmp_path, pwfile):
+    fake.scripts["EV01"] = {"trace_404_reads": 2}
+    _out, results, summary = _run(fake, tmp_path, pwfile, "--only", "EV01")
+    res = results["cases"][0]["turns"][0]["result"]
+    assert res["trace_status"] == "ok" and res["stages"]["MODE_RESOLVED"] == 12
+    assert list(fake.trace_reads.values()) == [3]
+    assert summary["headline"]["turns_trace_not_ok"] == 0
+
+
+def test_a_trace_that_never_appears_is_counted_in_the_headline(fake, tmp_path, pwfile, monkeypatch):
+    monkeypatch.setattr(RE, "TRACE_RETRY_S", 0.01)
+    fake.scripts["EV01"] = {"trace_404_reads": 99}
+    _out, results, summary = _run(fake, tmp_path, pwfile, "--only", "EV01,EV03")
+    assert results["cases"][0]["turns"][0]["result"]["trace_status"] is None
+    assert max(fake.trace_reads.values()) == RE.TRACE_RETRIES
+    assert summary["headline"]["turns_trace_not_ok"] == 1
+
+
+# ------------------------------------------------------------- timeouts --
+
+def test_sign_in_is_bounded(fake, monkeypatch):
+    monkeypatch.setattr(RE, "REQUEST_TIMEOUT_S", 0.3)
+    fake.login_delay_s = 2.0
+    t0 = time.monotonic()
+    with pytest.raises(httpx.ReadTimeout):
+        RE.EvalClient(fake.base, EMAIL, PASSWORD)
+    assert time.monotonic() - t0 < 1.5
+
+
+def test_a_silent_stream_fails_at_the_idle_limit_not_the_case_limit(fake, tmp_path, pwfile, monkeypatch):
+    monkeypatch.setattr(RE, "STREAM_IDLE_S", 0.4)
+    fake.scripts["EV01"] = {"silent_s": 3}
+    t0 = time.monotonic()
+    _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01", "--case-timeout-s", "60")
+    assert time.monotonic() - t0 < 2.5
+    rec = results["cases"][0]
+    assert rec["error"].startswith("ReadTimeout") and rec["stop"] == {"http": 200, "stopped": True}
+
+
+def test_the_default_case_timeout_outlasts_the_servers_wall_clock(fake, tmp_path, pwfile):
+    assert RE.build_parser().parse_args([]).case_timeout_s == 2400.0 > 1800.0
+    _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01")
+    assert results["conditions"]["case_timeout_s"] == 2400.0
+
+
+# ------------------------------------------------------- interruption --
+
+def test_a_baseexception_stops_the_run_and_the_generation_in_flight(fake, tmp_path, pwfile, monkeypatch):
+    fake.scripts["EV03"] = {"stall_s": 3}
+    real_score = RE.score_turn
+
+    def score(case, turn, result):
+        if case["id"] == "EV01":
+            time.sleep(0.4)  # EV03 is streaming on the other worker by now
+            raise KeyboardInterrupt
+        return real_score(case, turn, result)
+
+    monkeypatch.setattr(RE, "score_turn", score)
+    out = tmp_path / "run"
+    with pytest.raises(KeyboardInterrupt):
+        RE.main(["--base", fake.base, "--email", EMAIL, "--password-file", pwfile, "--out", str(out),
+                 "--only", "EV01,EV03,RQ03,RQ06,RQ07", "--workers", "2"])
+    results = json.loads((out / "results.json").read_text())
+    assert results["interrupted"] is True and results["interrupted_by"] == "KeyboardInterrupt"
+    assert results["finished"] and isinstance(results["seconds"], int)
+    ev03 = next(b["conversation_id"] for b in fake.chats if b["test_case_id"] == "EV03")
+    assert results["stopped_on_interrupt"] == [{"conversation_id": ev03, "http": 200, "stopped": True}]
+    time.sleep(0.5)
+    assert {b["test_case_id"] for b in fake.chats} == {"EV01", "EV03"}, "no case started after the interrupt"
+    assert json.loads((out / "summary.json").read_text())["headline"]["interrupted"] is True
+
+
+def test_ctrl_c_exits_130_keeps_what_finished_and_stops_what_runs(fake, tmp_path, pwfile):
+    for cid in ("EV01", "EV02", "EV03", "RQ01"):
+        fake.scripts[cid] = {"stall_s": 1.0}
+    out = tmp_path / "run"
+    proc = subprocess.Popen([sys.executable, os.path.join(RE.HERE, "run_evalset.py"), "--base", fake.base,
+                             "--email", EMAIL, "--password-file", pwfile, "--out", str(out),
+                             "--only", "EV01,EV02,EV03,RQ01", "--code-root", str(tmp_path / "cr")],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    deadline = time.monotonic() + 30
+    while len(fake.chats) < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert len(fake.chats) == 2, "the second case never started"
+    time.sleep(0.2)
+    sent = time.monotonic()
+    proc.send_signal(signal.SIGINT)
+    output, _ = proc.communicate(timeout=30)
+    assert proc.returncode == RE.EXIT_SIGINT, output
+    assert not [w for t, w in fake.timeline if t > sent and w.startswith("chat ")], "a case started after Ctrl-C"
+    results = json.loads((out / "results.json").read_text())
+    assert results["interrupted"] is True and results["finished"]
+    assert [r["id"] for r in results["cases"]] == ["EV01"], "the finished case is kept"
+    second = fake.chats[1]["conversation_id"]
+    assert results["stopped_on_interrupt"] == [{"conversation_id": second, "http": 200, "stopped": True}]
+    assert PASSWORD not in output
+
+
+def test_a_worker_that_cannot_sign_in_records_errors_and_the_run_goes_on(fake, tmp_path, pwfile):
+    fake.fail_login_after = 1  # the first worker's sign-in works, the second's is refused
+    fake.scripts["EV01"] = {"pre_answer_delay": 0.3}
+    _out, results, summary = _run(fake, tmp_path, pwfile, "--only", "EV01,EV03,RQ03,RQ06", "--workers", "2")
+    assert len(results["cases"]) == 4
+    errors = [r["error"] for r in results["cases"] if r["error"]]
+    assert errors and all(e.startswith("LoginFailed: login failed: 503") for e in errors)
+    assert any(r["error"] is None for r in results["cases"])
+    assert summary["headline"]["errors"] == len(errors)
+
+
+def test_parse_deadline_is_the_next_time_the_clock_shows_it():
+    ist = timezone(timedelta(hours=5, minutes=30))
+    at = datetime(2026, 10, 4, 5, 10, 30, tzinfo=ist)
+    assert RE.parse_deadline("07:00", at) == datetime(2026, 10, 4, 7, 0, tzinfo=ist)
+    assert RE.parse_deadline("05:10", at) == datetime(2026, 10, 5, 5, 10, tzinfo=ist), "already past: tomorrow"
+    assert RE.parse_deadline("7:05", datetime(2026, 10, 4, 23, 0, tzinfo=ist)) == datetime(2026, 10, 5, 7, 5, tzinfo=ist)
+    for bad in ("24:00", "7", "07:60", "07:00pm", ""):
+        with pytest.raises(SystemExit, match="HH:MM"):
+            RE.parse_deadline(bad, at)
+
+
+def test_no_case_starts_after_the_deadline(fake, tmp_path, pwfile, monkeypatch):
+    soon = datetime.now().astimezone() + timedelta(seconds=0.3)
+    monkeypatch.setattr(RE, "parse_deadline", lambda text, now: soon)
+    fake.scripts["EV01"] = {"pre_answer_delay": 0.6}
+    _out, results, summary = _run(fake, tmp_path, pwfile, "--only", "EV01,EV03,RQ03", "--deadline", "07:00")
+    assert [r["id"] for r in results["cases"]] == ["EV01"] and results["cases"][0]["error"] is None
+    assert results["deadline_reached"] is True and results["interrupted"] is False and results["finished"]
+    assert results["conditions"]["deadline"] == soon.isoformat(timespec="minutes")
+    assert [b["test_case_id"] for b in fake.chats] == ["EV01"]
+    assert summary["headline"]["deadline_reached"] is True
+
+
+# --------------------------------------------------------- account state --
+
+def test_a_fresh_account_is_counted_and_recorded(fake, tmp_path, pwfile):
+    _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01")
+    acct = results["conditions"]["account"]
+    assert acct == {"checked": True, "conversations": 0, "conversations_archived": 0, "facts": 0,
+                    "allowed_used": False, "memory_switch": RE.MEMORY_SWITCH_NOT_EXPOSED}
+
+
+@pytest.mark.parametrize("held", [{"conversations": 2}, {"archived": 1}, {"facts": 3}])
+def test_a_used_account_is_refused(fake, tmp_path, pwfile, capsys, held):
+    for k, v in held.items():
+        setattr(fake, k, v)
+    out = tmp_path / "run"
+    rc = RE.main(["--base", fake.base, "--email", EMAIL, "--password-file", pwfile, "--out", str(out),
+                  "--only", "EV01"])
+    assert rc == RE.EXIT_REFUSED and fake.chats == [] and not out.exists()
+    assert "--allow-used-account" in capsys.readouterr().err
+
+
+def test_an_account_that_cannot_be_counted_is_refused(fake, tmp_path, pwfile, capsys):
+    fake.history_status = 404
+    rc = RE.main(["--base", fake.base, "--email", EMAIL, "--password-file", pwfile, "--out", str(tmp_path / "r"),
+                  "--only", "EV01"])
+    assert rc == RE.EXIT_REFUSED and fake.chats == []
+    assert "could not count" in capsys.readouterr().err
+
+
+def test_allow_used_account_runs_and_says_so_in_counts_only(fake, tmp_path, pwfile):
+    fake.conversations, fake.archived, fake.facts = 4, 1, 2
+    out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01", "--allow-used-account")
+    acct = results["conditions"]["account"]
+    assert (acct["checked"], acct["conversations"], acct["conversations_archived"], acct["facts"],
+            acct["allowed_used"]) == (True, 5, 1, 2, True)
+    blob = (out / "results.json").read_text()
+    assert "private title" not in blob and "a private fact" not in blob
+
+
+# ------------------------------------------- features and status events --
+
+def test_status_events_and_features_are_recorded(fake, tmp_path, pwfile):
+    out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01")
+    assert results["cases"][0]["turns"][0]["result"]["status_events"] == ["Reading the question"]
+    assert results["conditions"]["features"] == FEATURES, "names and booleans only"
+    assert EMAIL not in (out / "results.json").read_text()
+
+
+# ---------------------------------------------------------- code sandbox --
+
+def test_an_unavailable_sandbox_refuses_a_run_with_a_coding_case(fake, tmp_path, pwfile, monkeypatch, capsys):
+    _sandbox(monkeypatch, ok=False)
+    rc = RE.main(["--base", fake.base, "--email", EMAIL, "--password-file", pwfile, "--out", str(tmp_path / "r"),
+                  "--code-root", str(tmp_path / "cr"), "--only", "RQ05,EV01"])
+    assert rc == RE.EXIT_REFUSED and fake.chats == [] and fake.logins == 0
+    assert "--no-code" in capsys.readouterr().err
+
+
+def test_no_code_runs_nothing_and_the_run_checks_fail(fake, tmp_path, pwfile, monkeypatch):
+    _sandbox(monkeypatch, ok=False)
+    real_run_code = RE.code_sandbox.run_code
+    monkeypatch.setattr(RE.code_sandbox, "run_sandboxed", lambda *a, **k: pytest.fail("--no-code ran something"))
+    seen = []
+    monkeypatch.setattr(RE.code_sandbox, "run_code", lambda *a: seen.append(a[3]) or real_run_code(*a))
+    _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "RQ05", "--no-code")
+    sb = results["conditions"]["code_sandbox"]
+    assert (sb["needed"], sb["no_code"], sb["backend"], sb["available"]) == (True, True, None, {"python": False})
+    turn = results["cases"][0]["turns"][0]
+    assert turn["result"]["code_result"]["unavailable"] == "not run: --no-code"
+    assert {"code_runs", "code_correct"} <= set(_failed(turn)), "an unrun check never passes"
+    assert all(isinstance(tc, RE._NoCode) for tc in seen)
+
+
+def test_an_available_sandbox_is_recorded(fake, tmp_path, pwfile, monkeypatch):
+    _sandbox(monkeypatch, backend="container")
+    monkeypatch.setattr(RE.code_sandbox, "run_code", _fake_run_code([]))
+    _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "RQ05")
+    sb = results["conditions"]["code_sandbox"]
+    assert (sb["needed"], sb["backend"], sb["available"], sb["no_code"]) == (True, "container", {"python": True}, False)
+
+
+def test_no_coding_case_never_asks_the_sandbox(fake, tmp_path, pwfile, monkeypatch):
+    monkeypatch.setattr(RE.code_sandbox, "Toolchain", lambda *a, **k: pytest.fail("the sandbox was asked"))
+    _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01")
+    assert results["conditions"]["code_sandbox"]["needed"] is False
+
+
+# --------------------------------------------------------------- rescore --
+
+def test_rescore_refuses_a_run_made_with_another_eval_set(fake, tmp_path, pwfile, monkeypatch, capsys):
+    out, results, _ = _run(fake, tmp_path, pwfile, "--only", "RQ03")
+    results["conditions"]["eval_set_sha256"] = "0" * 64
+    (out / "results.json").write_text(json.dumps(results))
+    before = (out / "results.json").read_text()
+    _no_network(monkeypatch)
+    assert RE.main(["--rescore", str(out)]) == RE.EXIT_REFUSED
+    assert (out / "results.json").read_text() == before
+    assert "--force-rescore" in capsys.readouterr().err
+    assert RE.main(["--rescore", str(out), "--force-rescore"]) == 0
+    again = json.loads((out / "results.json").read_text())
+    rs = again["conditions"]["rescored"]
+    assert (rs["eval_set_sha256"], rs["original_eval_set_sha256"], rs["forced"]) == (RE.eval_set_sha256(), "0" * 64, True)
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}", rs["rescored_at"])
+    assert again["conditions"]["eval_set_sha256"] == "0" * 64, "the set the run was made with stays on record"
+
+
+def test_rescore_reuses_a_stored_code_result_and_says_so(fake, tmp_path, pwfile, monkeypatch):
+    _sandbox(monkeypatch)
+    monkeypatch.setattr(RE.code_sandbox, "run_code", _fake_run_code([]))
+    out, _results, _ = _run(fake, tmp_path, pwfile, "--only", "RQ05,EV01")
+    monkeypatch.setattr(RE.code_sandbox, "run_code", lambda *a: pytest.fail("a rescore ran code"))
+    assert RE.main(["--rescore", str(out)]) == 0
+    again = json.loads((out / "results.json").read_text())
+    by = {r["id"]: r for r in again["cases"]}
+    assert "code was not run again" in by["RQ05"]["rescore_note"] and "rescore_note" not in by["EV01"]
+    assert again["conditions"]["rescored"]["forced"] is False
+    assert _failed(by["RQ05"]["turns"][0]) == []
+
+
+# ------------------------------------------------------------ the base --
+
+@pytest.mark.parametrize("base", ["http://localhost", "https://localhost", "http://127.0.0.1",
+                                  "http://127.0.0.1:28080/?x=1", "http://127.0.0.1:28080/#@example.org",
+                                  "http://127.0.0.1:28080\\@example.org", "http://127.0.0.1:08080"])
+def test_a_base_without_an_explicit_safe_port_is_refused(monkeypatch, base):
+    _no_network(monkeypatch)
+    with pytest.raises(SystemExit, match="refusing"):
+        RE.main(["--base", base, "--dry-run"])
+
+
+def test_an_accepted_base_is_normalised():
+    assert RE.check_base("http://LOCALHOST:28080/") == "http://localhost:28080"
+    assert RE.check_base("http://127.0.0.1:028080") == "http://127.0.0.1:28080"
+    assert RE.check_base("https://127.0.0.1:28443") == "https://127.0.0.1:28443"
+
+
+def test_the_docstring_states_the_baseline_protocol():
+    doc = " ".join(RE.__doc__.split())
+    assert "Use --workers 1 for a baseline" in doc
+    assert ("one fresh account per run directory; the baseline is N run directories of --repeats 1, each on its "
+            "own fresh account (devstack.sh seed), so repeats never see each other") in doc
