@@ -214,7 +214,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|Read|Grep",
+        "matcher": "Bash|Monitor|Write|Edit|MultiEdit|NotebookEdit|NotebookRead|Read|Grep|Glob|WebFetch|WebSearch|Agent|Task|Workflow|Skill|CronCreate|ScheduleWakeup|EnterWorktree|mcp__.*",
         "hooks": [
           {
             "type": "command",
