@@ -14,7 +14,9 @@
 #      autopilot/dev -> dev and succeeded, its "CI passed" check (GitHub
 #      Actions) succeeded, every other check run on the commit completed as
 #      success, skipped or neutral, and the combined commit status (if any) is
-#      success.
+#      success;
+#   6. GitHub's compare of origin/dev with the commit says "ahead" (or
+#      "identical"), so the fast-forward holds in the origin's history too.
 # Both branch tips are read from the origin itself (git ls-remote), never from
 # the repository's remote-tracking refs, which other processes can repoint.
 # It never touches main; the operator releases dev -> main.
@@ -312,6 +314,16 @@ if [ "$count" != "0" ] && [ "$state" != "success" ]; then
     refuse "combined commit status of $sha is $state"
 fi
 
+# 6. GitHub's own history agrees that the push is a fast-forward. Check 2 walks
+#    parent commits in the shared local object store, where git does not
+#    re-hash the parents it reads, and git push trusts the same walk.
+compare=$("$GH" api "repos/$slug/compare/$dev_sha...$sha" --jq .status) \
+    || refuse "could not compare origin/$TARGET_BRANCH ($dev_sha) with $sha on GitHub"
+case "$compare" in
+    ahead|identical) ;;
+    *) refuse "GitHub reports $sha as '$compare' against origin/$TARGET_BRANCH ($dev_sha), not ahead of it" ;;
+esac
+
 log "OK: $sha passes every gate ($(printf '%s\n' "$runs" | wc -l) check runs)"
 if [ "$dry_run" = 1 ]; then
     log "dry run: would push $sha to origin/$TARGET_BRANCH"
@@ -321,6 +333,6 @@ fi
 refuse_rerouting_config
 g push --no-follow-tags --no-verify --no-recurse-submodules "$ORIGIN_URL" "$sha:refs/heads/$TARGET_BRANCH" \
     || refuse "push to origin/$TARGET_BRANCH failed (not a fast-forward any more, or no credential: the gate uses only the credential helper the operator's global git config names for the origin)"
-now=$(g ls-remote "$ORIGIN_URL" "refs/heads/$TARGET_BRANCH" | cut -f1)
+now=$(g ls-remote "$ORIGIN_URL" "refs/heads/$TARGET_BRANCH" | awk -F'\t' -v r="refs/heads/$TARGET_BRANCH" '$2 == r { print $1 }')
 [ "$now" = "$sha" ] || refuse "origin/$TARGET_BRANCH is $now after the push, expected $sha"
 log "MERGED: origin/$TARGET_BRANCH is now $sha"

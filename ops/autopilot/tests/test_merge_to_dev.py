@@ -37,6 +37,10 @@ FAKE_GH = textwrap.dedent(
         doc = {"total_count": len(scenario["workflow_runs"]), "workflow_runs": scenario["workflow_runs"]}
     elif path.endswith("/status"):
         doc = scenario["status"]
+    elif "/compare/" in path:
+        if scenario.get("fail_compare"):
+            sys.exit(1)
+        doc = {"status": scenario.get("compare", "ahead")}
     else:
         sys.exit(1)
     r = subprocess.run(["/usr/bin/jq", "-r", jq], input=json.dumps(doc), text=True, capture_output=True)
@@ -994,6 +998,34 @@ class MergeToDev(GateHarness):
         r = self.run_gate()
         self.assert_refused(r, "is not an ancestor of", dev_now)
         self.assertEqual(git(self.origin, "log", "-1", "--format=%s", "dev"), "operator work on dev")
+
+    def test_github_must_agree_that_the_push_is_a_fast_forward(self):
+        # The local ancestry check reads parents from the shared object store
+        # without re-hashing them; GitHub's compare is asked as well.
+        dev_before = self.origin_ref("dev")
+        for compare, needle in (("diverged", "GitHub reports"), ("behind", "GitHub reports"),
+                                ("", "GitHub reports"), (None, "could not compare")):
+            with self.subTest(compare=compare):
+                s = good()
+                if compare is None:
+                    s["fail_compare"] = True
+                else:
+                    s["compare"] = compare
+                self.set_scenario(s)
+                self.assert_refused(self.run_gate(), needle, dev_before)
+        self.set_scenario({**good(), "compare": "identical"})
+        self.assertEqual(self.run_gate("--dry-run").returncode, 0)
+
+    def test_a_branch_named_like_dev_does_not_confuse_the_tips(self):
+        # ls-remote matches patterns on the ref name's tail, so branches like
+        # upgrade/refs/heads/dev are listed for refs/heads/dev too; only the
+        # exact names count, before the push and after it.
+        git(self.wt, "push", "-q", "origin", "HEAD~1:refs/heads/upgrade/refs/heads/dev",
+            "HEAD~1:refs/heads/x/refs/heads/autopilot/dev")
+        r = self.run_gate()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("MERGED", r.stderr)
+        self.assertEqual(self.origin_ref("dev"), self.origin_ref("autopilot/dev"))
 
 
 class GitHttpServer:
