@@ -121,6 +121,98 @@ def extract_code(answer: str, lang: str) -> Tuple[str, int]:
     return max(mine, key=len), len(mine)
 
 
+# A fence whose info string may carry more than the language ("python
+# inventory.py", "python title=\"inventory.py\""), closed by the same marker
+# at the start of a line. _FENCE_RE above skips such fences entirely, which is
+# right for the one-block coding cases and wrong for a multi-file answer.
+_NAMED_FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*([^\n`]*)\n(.*?)^[ \t]*\1[ \t]*$", re.S | re.M)
+_FILENAME_RE = re.compile(
+    r"(?<![\w./-])((?:[\w-]+/)*[\w-][\w.-]*\.(?:py|pyi|ts|tsx|js|mjs|sql|sh|bash|toml|txt|md|json|ya?ml|cfg|ini|csv))"
+    r"(?![\w-])")
+_FIRST_LINE_NAME_RE = re.compile(
+    r"^\s*(?:#|//|--|/\*)\s*(?:file(?:name)?\s*[:=]\s*)?(\S+?)\s*(?:\*/)?\s*$", re.I)
+
+
+def fences(answer: str) -> List[Tuple[str, str, str, int]]:
+    """[(tag, info string, body, offset)] for every fenced block, in order,
+    including fences whose info string carries more than the language."""
+    out = []
+    for m in _NAMED_FENCE_RE.finditer(answer or ""):
+        info = m.group(2).strip()
+        tag = re.split(r"[\s:{]", info, maxsplit=1)[0].lower() if info else ""
+        out.append((tag, info, m.group(3), m.start()))
+    return out
+
+
+def _safe_relative(name: str) -> Optional[str]:
+    """A relative POSIX path with no '..' and no root, or None."""
+    name = name.strip().strip("`'\"").replace("\\", "/")
+    while name.startswith("./"):
+        name = name[2:]
+    if not name or name.startswith("/") or any(part in ("", "..") for part in name.split("/")):
+        return None
+    return name
+
+
+def _one_name(text: str) -> Optional[str]:
+    names = {n for n in (_safe_relative(m) for m in _FILENAME_RE.findall(text or "")) if n}
+    return names.pop() if len(names) == 1 else None
+
+
+def extract_named_files(answer: str) -> Dict[str, str]:
+    """{file name: body} for every fenced block the answer names.
+
+    A multi-file answer names each block in one of three places, checked in
+    this order: the fence's info string (```python inventory.py), the block's
+    first line when it is only a comment holding the name (# inventory.py,
+    // file: app.ts), or the last non-blank line before the fence (a heading,
+    a bold line or "Here is `inventory.py`:"). A line that names two files is
+    ambiguous and names nothing. A name with '..' or a leading '/' is dropped.
+    When a name repeats, the longest block wins, as in extract_code.
+    """
+    text = answer or ""
+    out: Dict[str, str] = {}
+    for _tag, info, body, start in fences(text):
+        name = _one_name(info)
+        if not name:
+            first = body.split("\n", 1)[0]
+            fm = _FIRST_LINE_NAME_RE.match(first)
+            if fm and _FILENAME_RE.fullmatch(fm.group(1).strip("`'\"")):
+                name = _safe_relative(fm.group(1))
+        if not name:
+            before = [ln for ln in text[:start].splitlines()[-3:] if ln.strip()]
+            if before:
+                name = _one_name(before[-1])
+        if name and len(body) > len(out.get(name, "")):
+            out[name] = body
+    return out
+
+
+def answer_files(answer: str, wanted: List[str], lang: str = "python") -> Dict[str, str]:
+    """{wanted name: body} for the files a case asks for.
+
+    A named block matches a wanted file by its full path or by its base name
+    (src/inventory.py answers inventory.py). When the case asks for ONE file
+    and the answer names none, the longest block of the language is that file,
+    which is how a single-file answer usually arrives.
+    """
+    named = extract_named_files(answer)
+    found: Dict[str, str] = {}
+    for want in wanted:
+        if want in named:
+            found[want] = named[want]
+            continue
+        base = want.rsplit("/", 1)[-1]
+        hits = [body for name, body in named.items() if name.rsplit("/", 1)[-1] == base]
+        if hits:
+            found[want] = max(hits, key=len)
+    if not found and len(wanted) == 1:
+        source, _ = extract_code(answer, lang)
+        if source.strip():
+            found[wanted[0]] = source
+    return found
+
+
 # ============================================================== toolchain ==
 
 class Toolchain:
@@ -465,10 +557,26 @@ print(f"{len(stmts)} statement(s) prepared")
 
 
 def run_code(spec: dict, answer: str, workdir: str, tc: Toolchain) -> dict:
-    """Extract, build and check. Returns the record check_turn scores."""
+    """Extract, build and check. Returns the record check_turn scores.
+
+    `spec["layout"] == "files"` (Python only) is the multi-file shape: the
+    answer's blocks named in `spec["answer_files"]` are written under those
+    names (answer_files), every one is byte-compiled, and the checker runs.
+    A wanted file the answer does not contain fails the build without running
+    anything. Without `layout` this is the one-block shape every coding case
+    in coding_cases.py uses, unchanged.
+    """
     lang = spec["lang"]
     os.makedirs(workdir, exist_ok=True)
-    source, blocks = extract_code(answer, lang)
+    layout_files = spec.get("layout") == "files"
+    if layout_files:
+        if lang != "python":
+            raise ValueError(f"the files layout supports python only, not {lang!r}")
+        found = answer_files(answer, list(spec["answer_files"]), lang)
+        source = "\n".join(f"# ---- {name}\n{body}" for name, body in found.items())
+        blocks = len(fences(answer))
+    else:
+        source, blocks = extract_code(answer, lang)
     rec: dict = {"lang": lang, "blocks": blocks, "source": source, "steps": [],
                  "toolchain": {"tsc": tc.tsc, "node": tc.node, **tc.isolation()}}
     ok, why = tc.available(lang)
@@ -490,8 +598,25 @@ def run_code(spec: dict, answer: str, workdir: str, tc: Toolchain) -> dict:
     if not source.strip():
         return rec
     timeout = float(spec.get("timeout") or DEFAULT_TIMEOUT)
-    with open(os.path.join(workdir, SOURCE_NAME[lang]), "w", encoding="utf-8") as fh:
-        fh.write(source if source.endswith("\n") else source + "\n")
+    if layout_files:
+        rec["files"] = sorted(found)
+        missing = [name for name in spec["answer_files"] if name not in found]
+        if missing:
+            # Nothing is executed: a build that lacks a file it was asked for
+            # has already failed, and running the checker would only add noise.
+            rec["steps"] = [{"stage": "build", "name": "files present", "ok": False, "rc": None, "seconds": 0.0,
+                             "timed_out": False, "tail": f"missing from the answer: {', '.join(missing)}",
+                             "stdout": "", "stderr": ""}]
+            rec["ok"] = False
+            return rec
+        for name, body in found.items():
+            path = os.path.join(workdir, name)
+            os.makedirs(os.path.dirname(path) or workdir, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body if body.endswith("\n") else body + "\n")
+    else:
+        with open(os.path.join(workdir, SOURCE_NAME[lang]), "w", encoding="utf-8") as fh:
+            fh.write(source if source.endswith("\n") else source + "\n")
     for name, body in (spec.get("files") or {}).items():
         path = os.path.join(workdir, name)
         os.makedirs(os.path.dirname(path) or workdir, exist_ok=True)
@@ -503,7 +628,12 @@ def run_code(spec: dict, answer: str, workdir: str, tc: Toolchain) -> dict:
                 fh.write(body)
 
     steps: List[dict] = []
-    if lang == "python":
+    if layout_files:
+        compiled = [name for name in spec["answer_files"] if name.endswith(".py")]
+        steps.append(_step(tc, "build", "py_compile", "python", ["-m", "py_compile", *compiled], workdir, timeout))
+        if steps[-1]["ok"]:
+            steps.append(_step(tc, "check", "check.py", "python", ["check.py"], workdir, timeout))
+    elif lang == "python":
         steps.append(_step(tc, "build", "py_compile", "python", ["-m", "py_compile", "solution.py"], workdir, timeout))
         if steps[-1]["ok"]:
             steps.append(_step(tc, "check", "check.py", "python", ["check.py"], workdir, timeout))

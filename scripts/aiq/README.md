@@ -104,3 +104,32 @@ this round's own risk list says must hold, now that Fast never thinks.
 * `reference_solutions.py` is the control: CI proves every coding checker
   accepts a correct answer, so a broken checker cannot masquerade as a model
   regression.
+
+## The upgrade evaluation set (`eval_set.py`)
+
+Sixteen synthetic cases for the platform upgrade programme, kept OUT of
+`CASES` (and so out of the gate): the nine situations of MASTER_PROMPT §11
+(`EV01`-`EV09`: greeting, rewrite, informal multi-part, fresh fact, document
+question, complete files, long-conversation follow-up, Think task, Max
+research) and the seven request-understanding cases of §13 (`RQ01`-`RQ07`).
+They run in Fast, Think and Max, carry synthetic history and attachments
+(`fixtures/evalset/`), and are scored by deterministic checks only:
+`harness.check_turn` plus the opt-in keys of `answer_checks.py` (names only,
+code left unmodified, quoted text verbatim, citations resolving to sources the
+run READ, figures found in the cited passage, complete compiling code with no
+placeholder, numbers grounded in the source, a stated gap, required sections).
+Multi-file code runs through `code_sandbox.run_code` with `layout: "files"`.
+
+```bash
+orchestrator/.venv/bin/python scripts/aiq/eval_set.py                 # list and validate the set
+orchestrator/.venv/bin/python -m pytest scripts/aiq/tests -q          # the control
+```
+
+`eval_set_answers.py` is the control: one hand-written good answer per case
+that must pass every check, and bad answers that must fail exactly the checks
+they name; between them every check type rejects something. Nothing calls a
+model. Running the set needs a runner that seeds `history` as `messages`,
+uploads `attachments` (purpose `document`, then `pdf_uploads`), sends
+`deep_research`, and stores each cited source's fetched text in
+`res["source_passages"]` for `citations.passage_support` — without it that
+check fails rather than passes.

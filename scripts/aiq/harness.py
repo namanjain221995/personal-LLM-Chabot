@@ -24,6 +24,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import httpx
 
+import answer_checks
+
 PROD_PORTS = {"8080", "3000"}
 CHART_TYPES = {
     "bar", "horizontal_bar", "stacked_bar", "stacked_horizontal_bar", "percent_stacked_bar", "line", "area",
@@ -585,7 +587,23 @@ DIMENSION = {
     "chart_after_heading": "charts", "chart_hues_max": "charts", "chart_subject_hues_min": "charts",
     "status_colours": "charts", "no_chart_claimed": "fidelity",
     "code_present": "code", "code_runs": "code", "code_correct": "code",
+    # Added 2026-10-03 with the upgrade evaluation set (eval_set.py, task
+    # B-02): answer_checks.py owns these, each keyed on an `expect` no case in
+    # cases.CASES carries, so runs/baseline-20260917 re-scores unchanged.
+    **answer_checks.DIMENSION,
 }
+
+#: Every `expect` key check_turn reads. A key outside this set and
+#: answer_checks.EXPECT_KEYS is silently ignored, so eval_set.validate()
+#: refuses one.
+EXPECT_KEYS = frozenset({
+    "artifact", "formats_any", "kind_any", "same_artifact", "chart_type_any", "min_headings", "min_bullets",
+    "min_numbered", "min_bold", "min_code_blocks", "min_table_rows", "min_table_cols", "no_runon", "min_chars",
+    "max_chars", "must_contain", "forbidden", "order", "doc_min_pages", "doc_min_words", "doc_min_headings",
+    "doc_min_tables", "doc_growth", "doc_max_pages", "doc_max_words", "doc_max_growth", "min_charts",
+    "charts_real_values", "charts_multicolour", "chart_after_heading", "chart_hues_max", "chart_subject_hues_min",
+    "status_colours", "no_chart_claimed", "code",
+})
 
 
 def check_turn(exp: dict, res: dict, *, effort: str, fail_text: Iterable[str], prev_file: Optional[dict],
@@ -761,6 +779,7 @@ def check_turn(exp: dict, res: dict, *, effort: str, fail_text: Iterable[str], p
         add("code_correct", bool(checks) and all(s["ok"] for s in checks),
             "; ".join(f"{s['name']}: {s.get('tail', '')}" for s in checks if not s["ok"])[:300] or
             f"{len(checks)} check(s) ok")
+    out.extend(answer_checks.check(exp, res))
     return out
 
 
