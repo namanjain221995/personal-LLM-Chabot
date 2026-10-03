@@ -8031,18 +8031,40 @@ def start_query_trace(
     test_case_id: Optional[str] = None,
     versions: Optional[dict] = None,
     *,
+    started_at: Optional[datetime] = None,
     con: Optional[psycopg.Connection] = None,
 ) -> None:
     """Create the durable root before any routing or retrieval work begins.
-    `con`: write inside the caller's transaction (`write_query_trace_batch`)."""
-    now = _now()
+    `con`: write inside the caller's transaction (`write_query_trace_batch`).
+    `started_at`: when the request started (the recorder's clock), not when
+    this row is written; None means now.
+
+    A REUSED REQUEST ID (B-03, 2026-10-03). `request_id` is unique across
+    traces (V32) and, since the correlation id may come from the caller's
+    `X-Request-ID`, a client can send one twice. The second root is still
+    written, under a fresh id, instead of failing the insert and losing the
+    whole trace to the FK; its REQUEST_RECEIVED details keep the id the
+    request carried. (Two concurrent roots with one id: the loser's batch
+    fails, and the recorder's one-by-one retry lands here and takes the fresh
+    id.) The lookup repeats the partial index's own predicate so a generic
+    (prepared) plan can still use idx_query_traces_request."""
+    import uuid as _uuid
+
+    now = started_at or _now()
+    request_id = _text(request_id or "")
+    fallback = f"req_{_uuid.uuid4().hex}"
     with _on(con) as con:
         con.execute(
             """INSERT INTO query_traces
                    (trace_id, conversation_id, user_id, workspace_id,
                     original_question, requested_mode, resolved_mode,
                     request_id, test_case_id, versions, final_status, started_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'running', %s)
+               VALUES (%s, %s, %s, %s, %s, %s, %s,
+                       CASE WHEN %s::text <> '' AND EXISTS
+                                 (SELECT 1 FROM query_traces q
+                                   WHERE q.request_id = %s::text AND q.request_id <> '')
+                            THEN %s::text ELSE %s::text END,
+                       %s, %s, 'running', %s)
                ON CONFLICT (trace_id) DO NOTHING""",
             (
                 trace_id,
@@ -8052,7 +8074,10 @@ def start_query_trace(
                 _text(original_question or ""),
                 _text(requested_mode or ""),
                 _text(resolved_mode or ""),
-                _text(request_id or ""),
+                request_id,
+                request_id,
+                fallback,
+                request_id,
                 _text(test_case_id) if test_case_id else None,
                 _json_param(versions or {}),
                 now,
@@ -8072,10 +8097,13 @@ def append_query_trace_event(
     error_message: str = "",
     component_version: str = "",
     *,
+    occurred_at: Optional[datetime] = None,
     con: Optional[psycopg.Connection] = None,
 ) -> None:
-    """Append an ordered checkpoint; retries are idempotent by sequence."""
-    completed_at = _now()
+    """Append an ordered checkpoint; retries are idempotent by sequence.
+    `occurred_at`: when the stage happened (the recorder's clock); the write
+    can trail it by a group commit. None means now."""
+    completed_at = occurred_at or _now()
     elapsed = max(0, int(duration_ms or 0))
     started_at = completed_at - timedelta(milliseconds=elapsed)
     with _on(con) as con:
@@ -8115,9 +8143,11 @@ def finish_query_trace(
     error_type: str = "",
     error_message: str = "",
     meta: Optional[dict] = None,
+    completed_at: Optional[datetime] = None,
     con: Optional[psycopg.Connection] = None,
 ) -> None:
-    """Close a trace once; a late duplicate finalizer cannot rewrite it."""
+    """Close a trace once; a late duplicate finalizer cannot rewrite it.
+    `completed_at`: when the turn ended (the recorder's clock); None = now."""
     with _on(con) as con:
         con.execute(
             """UPDATE query_traces
@@ -8130,7 +8160,7 @@ def finish_query_trace(
                 WHERE trace_id = %s AND final_status = 'running'""",
             (
                 final_status,
-                _now(),
+                completed_at or _now(),
                 max(0, int(total_duration_ms)),
                 resolved_mode,
                 resolved_mode,
