@@ -300,15 +300,33 @@ class AcceptanceFixes(RunnerHarness):
 
     def test_a_cycle_killed_outright_is_a_crash_not_a_timeout(self):
         # The OOM killer's SIGKILL reaches the CLI, not `timeout`; `timeout`
-        # leads the cycle's process group, so it dies by the same signal
-        # (rc -9) and the cycle is a crash with its backoff. rc 124/137 come
-        # only from the cycle timeout itself.
+        # then ends by the same signal (rc -9), and well inside the cycle
+        # timeout that is a crash with its backoff. The cycle timeout's own
+        # kill-after SIGKILL also ends in rc -9 (it reaches `timeout`, which
+        # leads the process group); only the time the cycle ran tells them
+        # apart (test_a_cycle_killed_after_its_timeout_is_a_timeout).
         self.scenario_is([{"kind": "sigkill"}, {"kind": "success"}])
         r = self.run_runner(2, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         ends = self.events("cycle-end")
         self.assertEqual([(e["rc"], e["outcome"]) for e in ends], [(-9, "crash"), (0, "ok")])
         self.assertEqual([e["state"] for e in self.events("next")], ["restarting", "idle"])
+
+    def test_a_cycle_killed_after_its_timeout_is_a_timeout(self):
+        # P0-18: a CLI that ignores the timeout's SIGTERM is SIGKILLed
+        # --kill-after later. That SIGKILL reaches `timeout` too, so the cycle
+        # ends with rc -9, like an outside kill; having run its full time, it
+        # is a timeout (a normal end, no crash backoff). One that stops on the
+        # SIGTERM ends with timeout's own 124.
+        self.scenario_is([{"kind": "ignore_term"}, {"kind": "sleep", "seconds": 30}, {"kind": "success"}])
+        started = time.monotonic()
+        r = self.run_runner(3, timeout=120, AP_CYCLE_TIMEOUT_S="2", AP_KILL_AFTER_S="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertLess(time.monotonic() - started, 60, "the kill-after delay comes from AP_KILL_AFTER_S")
+        ends = self.events("cycle-end")
+        self.assertEqual([(e["rc"], e["outcome"]) for e in ends], [(-9, "timeout"), (124, "timeout"), (0, "ok")])
+        self.assertEqual([e["state"] for e in self.events("next")], ["idle", "idle", "idle"])
+        self.assertEqual(self.events("failure-cap"), [])
 
     def test_a_runner_restart_mid_cycle_resumes_without_backoff(self):
         # P0-17: SIGTERM to the runner (systemctl restart) interrupts the cycle;
@@ -495,6 +513,12 @@ class Units(unittest.TestCase):
         self.assertEqual(c(0, ok, [], [])[0], "ok")
         self.assertEqual(c(1, {"subtype": "error_max_turns", "is_error": True}, [], [])[0], "max_turns")
         self.assertEqual(c(124, None, [], [])[0], "timeout")
+        # a SIGKILL ending is a timeout only once the cycle has run its full time
+        for rc in (-9, 137):
+            self.assertEqual(c(rc, None, [], [], timed_out=True)[0], "timeout")
+            self.assertEqual(c(rc, None, [], [])[0], "crash")
+        self.assertEqual(c(1, None, ["boom"], [], timed_out=True)[0], "crash", "a timed-out cycle's own exit code still counts")
+        self.assertEqual(c(-9, None, [], [], stop_signal=True, timed_out=True)[0], "interrupted")
         self.assertEqual(c(1, None, ["x"], [{"error_type": "rate_limit"}])[0], "usage_limit")
         self.assertEqual(c(1, None, ["x"], [{"error_type": "overloaded"}])[0], "transient")
         self.assertEqual(c(1, {"subtype": "success", "is_error": True, "result": "API Error: 529 Overloaded"}, [], [])[0], "transient")
