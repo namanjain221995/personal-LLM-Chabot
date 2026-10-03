@@ -354,6 +354,15 @@ GIT_GH_DOCKER_DENY = [
     Bc("DOCKER_CONTEXT=other docker ps"),
     Bc("docker --config /tmp/llmdev-dockercfg ps"),
     Bc("docker -Htcp://198.51.100.9:2375 ps"),
+    # docker global value flags (--tlscacert, --tlskey) shift the subcommand; the
+    # guard must still see `rm`/`stop` and the production container after them.
+    Bc("docker --tlscacert /tmp/llmdev/ca.pem rm -f sf-local-ai-orchestrator-1"),
+    Bc("docker --tlskey /tmp/llmdev/k stop sf-local-ai-orchestrator-1"),
+    Bc("docker --tlscert=/tmp/llmdev/c.pem restart sf-local-ai-postgres-1"),
+    Bc("docker --frobnicate ps"),                           # an unknown global option: fail closed
+    Bc("docker --userland-proxy rm sf-local-ai-orchestrator-1"),
+    Bc("docker frobnicate sf-local-ai-orchestrator-1"),     # an unknown subcommand: fail closed
+    Bc("docker commit sf-local-ai-orchestrator-1 llmdev-snap"),  # snapshotting a prod container
     Bc("docker stop sf-local-ai-orchestrator-1"),
     Bc("docker container remove sf-local-ai-postgres-1"),
     Bc("docker image remove sf-local-ai-orchestrator:cpu"),
@@ -399,6 +408,11 @@ GIT_GH_DOCKER_ALLOW = [
     Bc("docker compose --env-file ops/dev/stack.vars down"),
     Bc("docker stop -t 5 llmdev-orch"),
     Bc("docker kill -s TERM llmdev-orch"),
+    Bc(f"docker --tls --tlsverify -H ssh://{WORKER} ps"),   # TLS boolean globals + a value global
+    Bc("docker --log-level debug ps"),                      # a value global before a read-only subcommand
+    Bc("docker --debug info"),
+    Bc("docker -D version"),
+    Bc(f"docker --tlscacert /tmp/llmdev/ca.pem -H ssh://{WORKER} stop llmdev-orch"),
     Bc("docker rm -f llmdev-a llmdev-b"),                   # ordinary dev cleanup, -f is boolean
     Bc("docker rm -f llmdev-x"),
     Bc("docker compose --progress plain --env-file ops/dev/stack.vars down"),  # known value + bool globals

@@ -2697,6 +2697,17 @@ def run_is_detached(rest):
     return False
 
 
+# docker global options (before the subcommand). VALUE options consume the next
+# word; BOOL options do not. --context/-c and --config are refused above.
+# Anything else fails closed so a hidden value flag cannot fake a subcommand.
+DOCKER_GLOBAL_VALUE = {"-l", "--log-level", "--tlscacert", "--tlscert", "--tlskey"}
+DOCKER_GLOBAL_BOOL = {"--tls", "--tlsverify", "-D", "--debug"}
+# Read-only subcommands the guard lets through after all the state-changing
+# branches; any other (unrecognised) subcommand fails closed.
+DOCKER_READONLY_SUBS = {"ps", "ls", "logs", "images", "version", "info", "events", "stats", "top",
+                        "port", "diff", "history", "search", "inspect", "df", "wait"}
+
+
 def check_docker(args, ctx):
     a = list(args)
     docker_host = ctx.env.get("DOCKER_HOST", "")
@@ -2716,8 +2727,16 @@ def check_docker(args, ctx):
             ctx.deny("docker contexts belong to the operator; point DOCKER_HOST at the worker instead")
         elif opt in ("--config",) or opt.startswith("--config="):
             ctx.deny("docker --config relocates docker's config (auth, contexts); it belongs to the operator")
-        elif opt in ("-l", "--log-level") and a:
-            a.pop(0)
+        elif opt.split("=", 1)[0] in DOCKER_GLOBAL_VALUE:
+            if "=" not in opt and a:
+                a.pop(0)  # consume the value (--tlscacert FILE, --log-level debug)
+        elif opt in DOCKER_GLOBAL_BOOL:
+            continue
+        else:
+            # An unknown global option could consume the next word, so the guard
+            # cannot tell which word is the subcommand (a hidden value flag could
+            # fake a read-only subcommand). Fail closed rather than guess.
+            ctx.deny(f"'docker {opt}' is an unrecognised global option; use only -H/--host and the TLS/--log-level/--debug flags so the guard can tell which word is the subcommand (fail-closed)")
     remote = docker_target_is_worker(docker_host)
     if docker_host and not remote and not re.match(r"^unix://", docker_host):
         ctx.deny("DOCKER_HOST may point only at this host's socket or the worker node")
@@ -2812,6 +2831,8 @@ def check_docker(args, ctx):
         if fmt is None or re.search(r"\bEnv\b|\bjson\s+\.\s*\}\}|\{\{\s*\.\s*\}\}|\{\{\s*json\s+\.Config\s*\}\}|\.Config\s*\}\}", fmt):
             ctx.deny("docker inspect prints container environments (secrets); use --format with only the fields you need (never Env, never the whole .Config)")
         return
+    if sub not in DOCKER_READONLY_SUBS:
+        ctx.deny(f"'docker {sub}' is not on the guard's allow list; a subcommand that could change state goes through ops/deploy on production or runs against a {DEV}* dev target (fail-closed)")
 
 
 WORKER_HOSTS = {h.lower() for h in (HOST.get("worker_hosts") or [])} | ({str(HOST["worker_ssh"]).lower()} if HOST.get("worker_ssh") else set())
