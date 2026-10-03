@@ -144,7 +144,8 @@ services:
     cpus: 1
     pids_limit: 128
     init: true
-    stop_grace_period: 10s
+    # Above the cap's own 30 s SIGTERM drain, so Docker never kills a draining relay.
+    stop_grace_period: 40s
     healthcheck:
       test:
         - CMD
