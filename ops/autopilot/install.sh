@@ -128,6 +128,7 @@ graceful_restart() {
     # removed but the runner not started. One that came just before this line
     # still finds the handler, which removes STOP itself and says the runner
     # is down.
+    echo "The old runner has exited; starting the new one. Interrupts are ignored until systemctl returns (up to a few minutes while the old unit finishes stopping)." >&2 || true
     trap '' INT TERM HUP
     rm -f "$AP/STOP"
     systemctl --user start llm-autopilot.service
