@@ -63,7 +63,7 @@ A pending wait (a usage-limit reset or the crash cap) is kept in `state.json` ac
 
 How a cycle ends decides what comes next:
 
-- A cycle runs for at most 4 hours (`AP_CYCLE_TIMEOUT_S`); a CLI that ignores the timeout's SIGTERM is killed 120 s later (`AP_KILL_AFTER_S`). Reaching the timeout or the turn limit is a normal end, also when the CLI had to be killed; the next cycle starts after the short pause.
+- A cycle runs for at most 4 hours (`AP_CYCLE_TIMEOUT_S`); a CLI that ignores the timeout's SIGTERM is killed 120 s later (`AP_KILL_AFTER_S`). Reaching the timeout or the turn limit is a normal end, also when the CLI had to be killed; the next cycle starts after the short pause. `timeout` treats 0 as "no limit", so an `AP_CYCLE_TIMEOUT_S` below 60 or an `AP_KILL_AFTER_S` of 0 or less (or either one unparsable) is ignored: the runner uses the default and records an `operator-setting-ignored` event when it starts. Its `runner-start` event shows the values in force.
 - A crash restarts after 60 s; six crashes in a row (interrupted cycles included, below) start a 2-hour sleep (the crash cap).
 - A cycle cut off by a signal (`systemctl --user restart`, a stray SIGTERM) is *interrupted*. Interrupted cycles count toward the crash cap like crashes, but a lone one never triggers the cap: after it the runner resumes after the short pause. A second interruption in a row waits like a crash.
 - The runner sets `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` for every cycle, so print mode keeps the cycle open while its background tasks (a running workflow) finish instead of ending them 600 s after the main turn. The 4-hour cycle timeout still bounds that wait.

@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNNER = os.path.join(os.path.dirname(HERE), "autopilot.py")
@@ -328,6 +329,30 @@ class AcceptanceFixes(RunnerHarness):
         self.assertEqual([e["state"] for e in self.events("next")], ["idle", "idle", "idle"])
         self.assertEqual(self.events("failure-cap"), [])
 
+    def test_an_unusable_cycle_timeout_falls_back_to_the_default(self):
+        # P0-18: `timeout 0` and `--kill-after=0` switch those limits off, and
+        # with a 0 timeout an outside SIGKILL passed for the timeout's own; a
+        # negative value made `timeout` refuse every cycle, and one that did
+        # not parse stopped the runner at import. Each now runs with the
+        # default, and says so.
+        for timeout_s, kill_after_s in (("0", "0"), ("-5", "-1"), ("4h", "abc")):
+            with self.subTest(timeout_s=timeout_s, kill_after_s=kill_after_s):
+                self.tearDown()
+                self.setUp()
+                self.scenario_is([{"kind": "sigkill"}, {"kind": "success"}])
+                r = self.run_runner(2, timeout=60, AP_CYCLE_TIMEOUT_S=timeout_s, AP_KILL_AFTER_S=kill_after_s)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                start = self.events("runner-start")[0]
+                self.assertEqual((start["cycle_timeout_s"], start["kill_after_s"]), (4 * 3600, 120))
+                ignored = {e["key"]: e["reason"] for e in self.events("operator-setting-ignored")}
+                self.assertEqual(sorted(ignored), ["AP_CYCLE_TIMEOUT_S", "AP_KILL_AFTER_S"])
+                self.assertIn(f"{timeout_s!r} is not", ignored["AP_CYCLE_TIMEOUT_S"])
+                self.assertIn("using the default 14400", ignored["AP_CYCLE_TIMEOUT_S"])
+                self.assertIn("using the default 120", ignored["AP_KILL_AFTER_S"])
+                ends = self.events("cycle-end")
+                self.assertEqual([(e["rc"], e["outcome"]) for e in ends], [(-9, "crash"), (0, "ok")])
+                self.assertEqual(self.ncalls(), 2, "both cycles reached the CLI")
+
     def test_a_runner_restart_mid_cycle_resumes_without_backoff(self):
         # P0-17: SIGTERM to the runner (systemctl restart) interrupts the cycle;
         # the restarted runner resumes after the short pause and no cap is hit.
@@ -629,6 +654,43 @@ class Units(unittest.TestCase):
     def test_tools_resolve_to_absolute_paths(self):
         for tool in (autopilot.NICE, autopilot.IONICE, autopilot.TIMEOUT):
             self.assertTrue(os.path.isabs(tool), tool)
+
+    @staticmethod
+    def load_runner(**env):
+        """A fresh copy of the runner module, imported with exactly these AP_* variables."""
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("AP_")}
+        with mock.patch.dict(os.environ, {**clean, **env}, clear=True):
+            s = importlib.util.spec_from_file_location("autopilot_env_check", RUNNER)
+            mod = importlib.util.module_from_spec(s)
+            s.loader.exec_module(mod)
+        return mod
+
+    def test_cycle_timeout_and_kill_after_must_be_usable(self):
+        # P0-18: 0 switches `timeout`'s limits off and a negative value makes it
+        # refuse to run; a timeout under a minute (at real time) is a typo. Those
+        # and unparsable values give the default and an entry in ENV_IGNORED.
+        default = self.load_runner(AP_TIME_SCALE="1")
+        self.assertEqual((default.CYCLE_TIMEOUT_S, default.KILL_AFTER_S, default.ENV_IGNORED), (4 * 3600, 120, []))
+        cases = [
+            ("AP_CYCLE_TIMEOUT_S", "CYCLE_TIMEOUT_S", "1", "7200", 7200),
+            ("AP_CYCLE_TIMEOUT_S", "CYCLE_TIMEOUT_S", "1", " 60 ", 60),
+            ("AP_CYCLE_TIMEOUT_S", "CYCLE_TIMEOUT_S", "0.001", "2", 2),  # the acceptance tests' scaled clock
+            ("AP_KILL_AFTER_S", "KILL_AFTER_S", "1", "30", 30),
+            ("AP_KILL_AFTER_S", "KILL_AFTER_S", "1", "0.5", 0.5),
+        ]
+        cases += [("AP_CYCLE_TIMEOUT_S", "CYCLE_TIMEOUT_S", "1", bad, None) for bad in ("0", "-5", "59", "1.5", "4h", "")]
+        cases += [("AP_CYCLE_TIMEOUT_S", "CYCLE_TIMEOUT_S", "0.001", bad, None) for bad in ("0", "-1")]
+        cases += [("AP_KILL_AFTER_S", "KILL_AFTER_S", "1", bad, None) for bad in ("0", "-1", "nan", "inf", "abc", "")]
+        for var, attr, scale, raw, want in cases:
+            with self.subTest(var=var, value=raw, scale=scale):
+                mod = self.load_runner(AP_TIME_SCALE=scale, **{var: raw})
+                if want is None:
+                    self.assertEqual(getattr(mod, attr), getattr(default, attr))
+                    self.assertEqual([k for k, _ in mod.ENV_IGNORED], [var])
+                    self.assertIn(repr(raw), mod.ENV_IGNORED[0][1])
+                else:
+                    self.assertEqual(getattr(mod, attr), want)
+                    self.assertEqual(mod.ENV_IGNORED, [])
 
     def test_operator_settings_parse(self):
         with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
