@@ -13,7 +13,10 @@ import { parseSimulateCommand, simulationEnabled } from '@/lib/devErrors';
 import { categoryForStatus, type ErrorCategory } from '@/lib/errorTypes';
 import { FIXTURES, MOCK_MODEL_IDS, pickFixtureEngine } from '@/lib/fixtures';
 import {
+  REQUEST_ID_HEADER,
+  acceptRequestId,
   lastUserContent,
+  newRequestId,
   toOrchestratorChatRequest,
   type ChatRequestBody,
 } from '@/lib/orchestrator';
@@ -57,6 +60,16 @@ const SSE_HEADERS = {
   Connection: 'keep-alive',
   'X-Accel-Buffering': 'no',
 } as const;
+
+/**
+ * This request's correlation id (B-03): the one an upstream proxy assigned
+ * (`requestIdOf`) when it has the orchestrator's shape, a new one otherwise.
+ * Never trimmed, escaped or truncated into shape — anything else a client
+ * sends in those headers is simply not used.
+ */
+function chatRequestId(req: Request): string {
+  return acceptRequestId(requestIdOf(req)) ?? newRequestId();
+}
 
 /** Walk undici's nested `cause` chain for the machine-readable error code. */
 function causeCode(err: unknown): string | undefined {
@@ -154,7 +167,7 @@ function tokenize(text: string): string[] {
   return text.match(/\S+\s*|\s+/g) ?? [];
 }
 
-function mockStream(body: ChatRequestBody): Response {
+function mockStream(body: ChatRequestBody, requestId: string): Response {
   const lastUser = lastUserContent(body);
   const fixture =
     FIXTURES[
@@ -234,7 +247,9 @@ function mockStream(body: ChatRequestBody): Response {
     },
   });
 
-  return new Response(stream, { headers: SSE_HEADERS });
+  return new Response(stream, {
+    headers: { ...SSE_HEADERS, [REQUEST_ID_HEADER]: requestId },
+  });
 }
 
 /**
@@ -246,7 +261,7 @@ function mockStream(body: ChatRequestBody): Response {
  * orchestrator sentence — or anything it quoted — can reach the DOM.
  */
 function failure(
-  req: Request,
+  requestId: string,
   info: {
     status: number | null;
     category: ErrorCategory;
@@ -261,7 +276,7 @@ function failure(
     status: info.status,
     category: info.category,
     message: info.logMessage,
-    requestId: requestIdOf(req),
+    requestId,
     durationMs: Date.now() - info.startedAt,
     retryable: true,
     exception: info.exception,
@@ -272,7 +287,7 @@ function failure(
     // A transport failure has no status of its own; 502 is what this proxy
     // reports for "I could not complete this upstream call", while `code`
     // carries the distinction the page actually renders.
-    { status: info.status ?? 502 },
+    { status: info.status ?? 502, headers: { [REQUEST_ID_HEADER]: requestId } },
   );
 }
 
@@ -292,11 +307,14 @@ function describeThrown(err: unknown): string {
 
 export async function POST(req: Request): Promise<Response> {
   const startedAt = Date.now();
+  // One id for this request, on every exit: the forwarded header, each log
+  // line and the response header (B-03).
+  const requestId = chatRequestId(req);
   // Bounded BEFORE it is read. A declared length over the cap is refused
   // without touching the socket; a body that declares nothing (or lies) is
   // measured chunk by chunk and cancelled the moment it goes over.
   if (declaredBodyOverLimit(req, MAX_CHAT_BODY_BYTES)) {
-    return failure(req, {
+    return failure(requestId, {
       status: 413,
       category: categoryForStatus(413),
       logMessage: `declared chat body over ${MAX_CHAT_BODY_BYTES} bytes`,
@@ -305,7 +323,7 @@ export async function POST(req: Request): Promise<Response> {
   }
   const raw = await readBoundedBody(req, MAX_CHAT_BODY_BYTES);
   if (raw === null) {
-    return failure(req, {
+    return failure(requestId, {
       status: 413,
       category: categoryForStatus(413),
       logMessage: `chat body over ${MAX_CHAT_BODY_BYTES} bytes`,
@@ -316,7 +334,7 @@ export async function POST(req: Request): Promise<Response> {
   try {
     body = JSON.parse(new TextDecoder().decode(raw)) as ChatRequestBody;
   } catch {
-    return failure(req, {
+    return failure(requestId, {
       status: 400,
       category: 'APPLICATION_ERROR',
       logMessage: 'request body was not JSON',
@@ -332,7 +350,7 @@ export async function POST(req: Request): Promise<Response> {
     const simulation = parseSimulateCommand(lastUserContent(body));
     if (simulation) {
       const status = simulation.kind === 'network' ? null : simulation.status;
-      return failure(req, {
+      return failure(requestId, {
         status,
         category:
           simulation.kind === 'network'
@@ -346,7 +364,7 @@ export async function POST(req: Request): Promise<Response> {
   }
 
   if (process.env.MOCK_MODE === 'true') {
-    return mockStream(body);
+    return mockStream(body, requestId);
   }
 
   const orchestratorUrl =
@@ -357,7 +375,7 @@ export async function POST(req: Request): Promise<Response> {
   // translate before forwarding (§10).
   const chatRequest = toOrchestratorChatRequest(body);
   if (!chatRequest) {
-    return failure(req, {
+    return failure(requestId, {
       status: 400,
       category: 'APPLICATION_ERROR',
       logMessage: 'no user message or image in request',
@@ -371,6 +389,9 @@ export async function POST(req: Request): Promise<Response> {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        // B-03: the correlation id, so the orchestrator's trace, its logs and
+        // this proxy's log line name the same request.
+        [REQUEST_ID_HEADER]: requestId,
         // V9: forward the session cookie so the orchestrator can identify the
         // signed-in user and pull in cross-chat memory.
         ...(req.headers.get('cookie')
@@ -383,13 +404,15 @@ export async function POST(req: Request): Promise<Response> {
   } catch (err) {
     // The browser navigated away or hit Stop: the fetch it was reading is
     // already gone, so there is nobody left to read a body.
-    if (isAbort(err)) return new Response(null, { status: 499 });
+    if (isAbort(err)) {
+      return new Response(null, { status: 499, headers: { [REQUEST_ID_HEADER]: requestId } });
+    }
     // "Unreachable" must mean unreachable. undici reports the real cause in a
     // nested chain: a refused/unresolvable host is a down service, while a
     // timeout means the orchestrator DID answer the socket and then went
     // quiet — a different problem, and a different thing for the user to do.
     const timedOut = isTimeout(err);
-    return failure(req, {
+    return failure(requestId, {
       // A refused socket has no HTTP status and must not be given a fake one:
       // the page says "Error / Connection unavailable" rather than inventing
       // a number the service never sent.
@@ -412,10 +435,10 @@ export async function POST(req: Request): Promise<Response> {
       // No error log line — it is an answer, and the browser acts on it.
       return Response.json(
         { code: 'image_ref_missing', missing: missingImages },
-        { status: 422 },
+        { status: 422, headers: { [REQUEST_ID_HEADER]: requestId } },
       );
     }
-    return failure(req, {
+    return failure(requestId, {
       status: upstream.status,
       category: categoryForStatus(upstream.status),
       logMessage: message,
@@ -423,6 +446,9 @@ export async function POST(req: Request): Promise<Response> {
     });
   }
 
-  // Pipe the SSE stream through untouched.
-  return new Response(upstream.body, { headers: SSE_HEADERS });
+  // Pipe the SSE stream through untouched. The id is the one forwarded
+  // above, which the orchestrator adopted (same shape on both sides).
+  return new Response(upstream.body, {
+    headers: { ...SSE_HEADERS, [REQUEST_ID_HEADER]: requestId },
+  });
 }
