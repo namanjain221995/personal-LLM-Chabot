@@ -235,6 +235,12 @@ FS_DENY = [
     Bc("git rebase --exec='cat ~/.claude/.credentials.json' HEAD~1", cwd=DEV),
     Bc("parallel echo ';' git push origin HEAD:main ::: x"),   # parallel runs its words through a shell
     Bc("parallel 'sudo reboot' ::: x"),
+    Bc("parallel cat {} ::: ~/.ssh/id_rsa"),                  # the ::: operands are what it reads
+    Bc("rush cat {} ::: ~/.claude/.credentials.json"),
+    Bc("parallel -q cat ::: .env", cwd=DEV),
+    Bc("parallel cat :::: /tmp/llmdev/list"),
+    Bc("srm -r ~/work/llm-dev"),
+    Bc("unlink ~/work"),
     Bc("find /tmp/llmdev -name x -fprint ~/.llm-autopilot/guard/guard_hook.py"),  # -fprint truncates its file
     Bc("find /tmp/llmdev -fls ~/.llm-autopilot/settings.autopilot.json"),
     # P0-17: moving/deleting the guard dirs and agent/ (holds test-db.vars)
