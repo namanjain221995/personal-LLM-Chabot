@@ -1,25 +1,25 @@
 # Resume
 
-STATUS: IN PROGRESS — Phase 0 hardening (P0-18 under review, P0-19 open), then Phase B
+STATUS: IN PROGRESS — Phase 0 hardening (P0-19 built, review pending), then Phase B
 
-Updated 2026-10-03 about 16:00 UTC by autopilot cycle 5.
+Updated 2026-10-03 about 17:00 UTC by autopilot cycle 6.
 
 ## Phase and active task
 
-- **Phase:** 0 and A are done except guardrail hardening. P0-16 and P0-17 are DONE (source; not installed). Phase B (baseline and evaluation harness, §11) follows.
-- **Active task: P0-18** (dev gate, install.sh and runner follow-ups from the P0-17 re-QA). It is built on `upgrade/i/p0-18-gate-followups` (`~/work/llm-p018`, 7 commits c23b17e2..ea25fba1; the builder's suite gave `130 passed, 893 subtests passed`). Its independent review finished in cycle 5 (worktree `~/work/llm-p018-rv`, detached at ea25fba1).
-- **Review done (fix_first):** all five re-QA items closed; one older blocking gate item remains. Its details, a tested prototype fix (`/tmp/p018-qa/gate.fixA.sh`) and the non-blocking list are in the last section of `~/.llm-autopilot/agent/private/p0-17-reqa-2026-10-03.md`.
-- **Exact next step:** apply that fix in `~/work/llm-p018` with a regression test (a background loop that repoints the remote-tracking refs), apply the cheap non-blocking items if they stay small, and run the suite. Then merge into `autopilot/dev` and run `orchestrator/.venv/bin/python -m pytest ops/autopilot/tests -q -p no:cacheprovider`. Push, and update NH-007 (one install carries P0-15..P0-18).
-- P0-16's last fresh review (fb29fb03..4ff6bbac) is done; its one finding is fixed (e969264c, merged b21088b3).
-- Then P0-19 (non-blocking guard follow-ups) in parallel with Phase B: B-02/B-03/B-05 are independent (decision 10).
+- **Phase:** 0 and A are done except guardrail hardening. P0-16, P0-17 and P0-18 are DONE (source; not installed, NH-007). Phase B (baseline and evaluation harness, §11) follows.
+- **P0-18 DONE in cycle 6:** merged into `autopilot/dev` at 51f80b4b and pushed. Merged-tree suite: `175 passed, 922 subtests passed`. Two fresh reviews returned `ship`; their non-blocking findings were fixed or recorded (host-only `~/.llm-autopilot/agent/private/p0-17-reqa-2026-10-03.md`, last three sections).
+- **Active task: P0-19** (guard false positives and the fetch-destination rule). Built on `upgrade/i/p0-19-guard-followups` (`~/work/llm-p019`, 7 commits f2b9d60d..1820a187, from 1eab1707). Builder's suite: `158 passed, 938 subtests passed`. **Not merged.**
+- **Why not merged:** its independent review did not finish. A safety classifier stopped the reviewer while it read the guard's network-check code, before any comparison ran. The reviewer did not continue another way, and neither did the main session.
+- **Exact next step for P0-19:** run a differential regression review that needs no new bypass inputs: replay the committed guard test inputs and the spec corpus (cycle 5's method, `p0-16-sweep-2026-10-03.md`) through the base (1eab1707) and branch guards, and list every input that base refuses and branch allows. Read-only worktree `~/work/llm-p019-rv` (detached at 1820a187). If that also stops, mark P0-19 BLOCKED and add a NEEDS_HUMAN item asking the operator to run the adversarial review interactively. Then merge with `--no-ff` into `autopilot/dev`, run `orchestrator/.venv/bin/python -m pytest ops/autopilot/tests -q -p no:cacheprovider`, push, and update NH-007.
+- **In parallel with P0-19:** Phase B. B-02, B-03 and B-05 are independent (decision 10).
 - Operator decisions in `MASTER_PROMPT.md` §0 govern everything: integrate on `autopilot/dev`; never touch `main` or production; `dev` only through `~/.llm-autopilot/bin/merge_to_dev.sh` at the finish line.
 
 ## Branches and worktrees
 
-- `~/work/llm-dev` on `autopilot/dev`. Draft PR #98 `autopilot/dev → dev` is the status board and runs CI.
-- Merged and kept: `upgrade/a/discovery`, `upgrade/g/capability-registry`, `upgrade/i/p0-14-clock-skew`, `upgrade/i/p0-15-guardrail-review`, `upgrade/i/p0-16-guard-bypass-sweep` (worktree `~/work/llm-p016`), `upgrade/i/p0-17-runner-gate-hardening` (worktree `~/work/llm-p017`).
-- Open: `upgrade/i/p0-18-gate-followups` (worktree `~/work/llm-p018`).
-- Detached review worktrees, no changes, removable: `~/work/llm-p016-rv1`..`rv4`, `~/work/llm-p017-rv`, `~/work/llm-p018-rv`.
+- `~/work/llm-dev` on `autopilot/dev` (51f80b4b, pushed). Draft PR #98 `autopilot/dev → dev` is the status board and runs CI.
+- Merged and kept: `upgrade/a/discovery`, `upgrade/g/capability-registry`, `upgrade/i/p0-14-clock-skew`, `upgrade/i/p0-15-guardrail-review`, `upgrade/i/p0-16-guard-bypass-sweep` (`~/work/llm-p016`), `upgrade/i/p0-17-runner-gate-hardening` (`~/work/llm-p017`), `upgrade/i/p0-18-gate-followups` (`~/work/llm-p018`), `upgrade/i/p0-18-install-runner` (`~/work/llm-p018-b`, merged through the P0-18 branch).
+- Open: `upgrade/i/p0-19-guard-followups` (`~/work/llm-p019`).
+- Detached review worktrees, no changes, removable: `~/work/llm-p016-rv1`..`rv4`, `~/work/llm-p017-rv`, `~/work/llm-p018-rv`. Keep `~/work/llm-p019-rv` for the P0-19 review.
 - Tag `baseline/pre-upgrade-2026-10-03` → `3c75af1c` (production before the programme).
 
 ## Running services
@@ -30,7 +30,7 @@ Updated 2026-10-03 about 16:00 UTC by autopilot cycle 5.
 
 ## Experiments in flight
 
-None. Cycle 4–5 scratch is listed in the TASK_BOARD backlog (P3).
+None. Scratch from cycles 4–6 is listed in the TASK_BOARD backlog (P3).
 
 ## Known CI flakes
 
@@ -42,4 +42,4 @@ None. Cycle 4–5 scratch is listed in the TASK_BOARD backlog (P3).
 
 ## Blockers
 
-None for the agent. Operator items: NH-007 (install guardrail fixes, best after P0-18), NH-012 (two leftover processes), NH-011 (approve the `.github/` tree at the finish line), NH-008, NH-009, NH-010, NH-004, NH-005, NH-006.
+None for the agent. Operator items: NH-007 (install guardrail fixes; one install now carries P0-15..P0-18), NH-008 (one `dev` repository setting; the cycle-6 gate review adds a reason, host-only), NH-012 (two leftover processes), NH-011 (approve the `.github/` tree at the finish line), NH-009, NH-010, NH-004, NH-005, NH-006.

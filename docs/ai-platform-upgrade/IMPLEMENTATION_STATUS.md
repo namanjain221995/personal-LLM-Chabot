@@ -2,6 +2,22 @@
 
 History of the programme, newest first. Designed ≠ Implemented ≠ Tested ≠ Deployed; each entry says which.
 
+## 2026-10-03 — Autopilot cycle 6 (from about 16:10 UTC)
+
+Finished P0-18 and built P0-19. Agents ran in parallel, each in its own worktree: an install.sh/runner builder (`~/work/llm-p018-b`), a P0-19 guard builder (`~/work/llm-p019`), two P0-18 reviewers and one P0-19 reviewer (detached worktrees). The main session alone edited the gate and integrated.
+
+| Item | State | Evidence (command → result) |
+|---|---|---|
+| Gate reads both tips from the origin (f896cbe0) | Implemented, TEST_PASSED | 4 new tests (a ref repointed after the fetch, the review's background fetch loop, a planted grafts file); on ea25fba1's gate each merged (`MERGED`, or `dry run: would push`); on f896cbe0 they pass |
+| No commit-graph file (b6f4966b) | Implemented, TEST_PASSED | Static test of the wrapper flags |
+| Review of f896cbe0/b6f4966b | Reviewed: ship | Race closed; reviewer's own run of the new tests against the old gate → all 5 fail; suite `134 passed, 893 subtests passed`. Two older non-blocking findings (host-only) |
+| Check 6: GitHub compare (8f5d33e3, 621c2c1b, 3e7d3ac4); exact post-push ref match | Implemented, TEST_PASSED | Read-only `gh api …/compare/<dev>...<autopilot/dev>` → `ahead`, reverse → `behind`, same → `identical`. New tests fail on b6f4966b (`5 failed`), pass after |
+| install.sh final start ignores interrupts (cccf963d, 755d4005) | Implemented, TEST_PASSED | Fake `systemctl` signals its process group from inside `start`; old code → rc −2/−15/−1, new → start completes, STOP gone |
+| Unusable cycle timeout falls back (7a9da45b) | Implemented, TEST_PASSED | `0`, `-5`, `4h` → default 14400/120 with `operator-setting-ignored` events; old code: `0` → kill counted as timeout, `-5` → every cycle exit 125, `4h` → `ValueError` at import |
+| Review of cccf963d, 7a9da45b, 8f5d33e3, 621c2c1b | Reviewed: ship | Old code fails the new tests (`13 failed, 6 passed`); suite `139 passed, 922 subtests passed`. Non-blocking findings fixed in 3e7d3ac4 and 755d4005, or recorded |
+| P0-18 merge (51f80b4b) | Merged on autopilot/dev, pushed, TEST_PASSED, not installed | `orchestrator/.venv/bin/python -m pytest ops/autopilot/tests -q -p no:cacheprovider` → `175 passed, 922 subtests passed` |
+| P0-19 (f2b9d60d..1820a187) | Implemented, TEST_PASSED on its branch; not reviewed; not merged | Builder's suite `158 passed, 938 subtests passed`; the reviewer's run gave the same. A safety classifier stopped the review before any comparison ran |
+
 ## 2026-10-03 — Autopilot cycles 3–5 (10:07–about 16:00 UTC)
 
 - **Cycle 3** (10:07–10:24 UTC, 19 turns): 051b4235 (status-board updates go to PR #98 as comments) and 64e4f699 (gitleaks baseline for two fabricated test values). It ended without updating `RESUME.md`.
