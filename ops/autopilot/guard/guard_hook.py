@@ -2836,10 +2836,39 @@ def check_git(args, ctx):
         ctx.deny("force-adding ignored files risks committing secrets, data or weights; fix .gitignore or rename instead")
     if sub == "symbolic-ref" and len(nonopt(rest)) >= 2:
         readonly = False
-    if sub == "fetch" and any(":" in x and not x.startswith("-") for x in rest):
-        for x in rest:
-            if ":" in x and re.search(r":(refs/heads/)?(main|master|dev)$", x.lstrip("+")):
+    if sub in ("fetch", "pull"):
+        # A fetch/pull refspec SRC:DST writes DST. The destination may be a
+        # positional refspec or the value of --refmap. A plain fetch/pull (git
+        # fetch / origin / origin dev / --all) carries no ':' destination and git
+        # maps the remote-tracking refs itself, so it stays allowed.
+        dsts = []
+        j = 0
+        while j < len(rest):
+            x = rest[j]
+            if x == "--refmap" and j + 1 < len(rest):
+                rm = rest[j + 1]
+                j += 2
+                if ":" in rm:
+                    dsts.append(rm)
+                continue
+            if x.startswith("--refmap="):
+                rm = x.split("=", 1)[1]
+                if ":" in rm:
+                    dsts.append(rm)
+            elif not x.startswith("-") and ":" in x:
+                dsts.append(x)
+            j += 1
+        for spec in dsts:
+            dst = spec.lstrip("+").rsplit(":", 1)[1]
+            if re.fullmatch(r"(refs/heads/)?(main|master|dev)", dst):
                 ctx.deny("fetching into local main/dev changes refs the production checkout and the operator's worktree use")
+            # Defence in depth (P0-18): a plain fetch lets git maintain the
+            # origin/dev and origin/autopilot/dev remote-tracking refs; an explicit
+            # refspec that writes them (any spelling: refs/remotes/origin/dev,
+            # remotes/origin/dev, origin/dev) makes the local copy lie about origin
+            # and could feed a later merge/reset. Let a plain `git fetch` map them.
+            if re.fullmatch(r"(refs/remotes/|remotes/)?origin/(dev|autopilot/dev)", dst):
+                ctx.deny("do not fetch an explicit refspec into refs/remotes/origin/dev or refs/remotes/origin/autopilot/dev; a plain 'git fetch' (or 'git fetch origin') maps those remote-tracking refs itself")
     if sub == "push":
         readonly = False
         check_git_push(rest, gdir, ctx)
