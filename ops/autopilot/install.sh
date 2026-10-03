@@ -30,7 +30,8 @@ case "$mode" in
     ""|--start|--restart-after-cycle) ;;
     *) echo "install.sh: unknown option $mode (use --start or --restart-after-cycle)" >&2; exit 2 ;;
 esac
-SRC=$(cd "$(dirname "$0")" && pwd)
+SRC=$(dirname -- "$0")
+SRC=$(cd "$SRC" && pwd)
 REPO=$(cd "$SRC/../.." && pwd)
 AP=${AP_HOME:-$HOME/.llm-autopilot}
 WT=${AP_WORKTREE:-$REPO}
@@ -97,8 +98,12 @@ runner_changed=0
 graceful_restart() {
     echo "runner is active; letting the current cycle finish before starting the new code (a cycle can run up to its 4 h timeout)..."
     # Ctrl-C, TERM or a closed terminal during the wait must not leave the
-    # runner to exit on our STOP file and stay down without a word.
+    # runner to exit on our STOP file and stay down without a word. With the
+    # terminal gone, a write to it (the Hangup line bash prints itself
+    # included) fails instead of killing this shell with SIGPIPE before the
+    # handler runs.
     restart_stop_created=0
+    trap '' PIPE
     trap 'restart_wait_interrupted 130' INT
     trap 'restart_wait_interrupted 143' TERM
     trap 'restart_wait_interrupted 129' HUP
@@ -112,14 +117,16 @@ graceful_restart() {
         sleep 2
         waited=$((waited + 2))
         if [ "$waited" -ge "$limit" ]; then
-            trap - INT TERM HUP
             if [ "$restart_stop_created" = 1 ]; then rm -f "$AP/STOP"; fi
+            trap - INT TERM HUP PIPE
             echo "ERROR: the runner did not exit within 5 h after STOP; it is left as-is. Investigate, then start it yourself." >&2
             return 1
         fi
     done
-    trap - INT TERM HUP
+    # STOP goes before the handlers do, so an interrupt at any point either
+    # finds STOP gone or removes it itself.
     rm -f "$AP/STOP"
+    trap - INT TERM HUP PIPE
     systemctl --user start llm-autopilot.service
     echo "restarted on the new code; watch with: $AP/bin/status.sh"
 }
@@ -127,6 +134,7 @@ graceful_restart() {
 restart_wait_interrupted() {
     local code=$1 state
     trap - INT TERM HUP
+    set +e  # a message that cannot be written must not stop the cleanup or change the exit code
     if [ "${restart_stop_created:-0}" = 1 ]; then
         rm -f "$AP/STOP"
         echo "install.sh: interrupted while waiting for the cycle to finish; removed the STOP file it created." >&2

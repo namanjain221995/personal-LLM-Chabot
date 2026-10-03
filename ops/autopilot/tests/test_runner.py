@@ -287,6 +287,29 @@ class AcceptanceFixes(RunnerHarness):
         st = self._state()
         self.assertEqual((st["consecutive_failures"], st["consecutive_interrupts"]), (0, 0), "a finished cycle clears both counts")
 
+    def test_a_lone_interrupted_cycle_still_counts_toward_the_failure_cap(self):
+        # P0-17: a lone interruption never starts the cap itself, but it is a
+        # failure in the run: four crashes, an operator restart and one more
+        # crash make six in a row.
+        self.scenario_is([{"kind": "crash", "rc": 1}] * 4 + [{"kind": "sigterm"}, {"kind": "crash", "rc": 1}, {"kind": "success"}])
+        r = self.run_runner(7, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([e["state"] for e in self.events("next")], ["restarting"] * 4 + ["resuming", "failure-cap", "idle"])
+        caps = self.events("failure-cap")
+        self.assertEqual((caps[0]["failures"], caps[0]["interrupted_in_a_row"]), (6, 0))
+
+    def test_a_cycle_killed_outright_is_a_crash_not_a_timeout(self):
+        # The OOM killer's SIGKILL reaches the CLI, not `timeout`; `timeout`
+        # leads the cycle's process group, so it dies by the same signal
+        # (rc -9) and the cycle is a crash with its backoff. rc 124/137 come
+        # only from the cycle timeout itself.
+        self.scenario_is([{"kind": "sigkill"}, {"kind": "success"}])
+        r = self.run_runner(2, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        ends = self.events("cycle-end")
+        self.assertEqual([(e["rc"], e["outcome"]) for e in ends], [(-9, "crash"), (0, "ok")])
+        self.assertEqual([e["state"] for e in self.events("next")], ["restarting", "idle"])
+
     def test_a_runner_restart_mid_cycle_resumes_without_backoff(self):
         # P0-17: SIGTERM to the runner (systemctl restart) interrupts the cycle;
         # the restarted runner resumes after the short pause and no cap is hit.
@@ -717,7 +740,7 @@ class InstallScript(unittest.TestCase):
         self.assertEqual(self.strays(), [])
 
     # ---- the --restart-after-cycle wait
-    def start_wait(self, state="active"):
+    def start_wait(self, state="active", stdout=subprocess.PIPE, stderr=subprocess.PIPE):
         funcs = re.findall(r"^[a-z_]+\(\) \{\n.*?^\}\n", read(INSTALL), re.M | re.S)
         self.assertIn("graceful_restart", [f.split("(")[0] for f in funcs])
         harness = os.path.join(self.tmp, "harness.sh")
@@ -735,7 +758,7 @@ class InstallScript(unittest.TestCase):
             for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
                 signal.signal(s, signal.SIG_DFL)
 
-        return subprocess.Popen(["/bin/bash", harness, self.ap], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        return subprocess.Popen(["/bin/bash", harness, self.ap], env=env, stdout=stdout, stderr=stderr,
                                 text=True, start_new_session=True, preexec_fn=default_signals)
 
     def set_state(self, word):
@@ -768,7 +791,7 @@ class InstallScript(unittest.TestCase):
     def test_an_interrupted_restart_wait_removes_its_stop_file(self):
         # P0-17: Ctrl-C (or TERM) during the wait must not leave the runner to
         # stop silently at the end of its cycle.
-        for sig, code in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
+        for sig, code in ((signal.SIGINT, 130), (signal.SIGTERM, 143), (signal.SIGHUP, 129)):
             with self.subTest(sig=sig.name):
                 for f in ("calls", "hang"):
                     if os.path.exists(os.path.join(self.bin, f)):
@@ -782,6 +805,33 @@ class InstallScript(unittest.TestCase):
                 self.assertIn("removed the STOP file", err)
                 self.assertIn("still active", err)
                 self.assertNotIn("--user start llm-autopilot.service", self.calls())
+
+    def test_a_hangup_with_the_terminal_gone_still_removes_the_stop_file(self):
+        # P0-17: `install.sh --restart-after-cycle 2>&1 | tee log` and the
+        # terminal closes: stdout and stderr are a pipe nobody reads. Writing
+        # there (bash reports the killed sleep as Hangup) must not kill the shell
+        # with SIGPIPE before the handler removes STOP.
+        r, w = os.pipe()
+        proc = self.start_wait(stdout=w, stderr=w)
+        os.close(w)
+        try:
+            self.assertTrue(self.wait_for(lambda: os.path.exists(self.stop)))
+            os.set_blocking(r, False)
+            try:
+                os.read(r, 65536)
+            except BlockingIOError:
+                pass
+        finally:
+            os.close(r)  # the reader is gone: every later write fails with EPIPE
+        os.killpg(proc.pid, signal.SIGHUP)
+        self.assertEqual(proc.wait(timeout=20), 129)
+        self.assertFalse(os.path.exists(self.stop), "the STOP file it created is gone")
+        self.assertNotIn("--user start llm-autopilot.service", self.calls())
+
+    def test_the_normal_path_removes_stop_before_dropping_its_handlers(self):
+        # An interrupt between the two still finds STOP gone or removes it.
+        body = re.search(r"^graceful_restart\(\) \{\n(.*?)^\}\n", read(INSTALL), re.M | re.S).group(1)
+        self.assertIn('    rm -f "$AP/STOP"\n    trap - INT TERM HUP PIPE\n    systemctl --user start', body)
 
     def test_an_interrupted_restart_wait_keeps_an_operator_stop_file(self):
         open(self.stop, "w").close()

@@ -5,7 +5,8 @@ Each `-p` invocation consumes the next entry of the JSON list in $STUB_SCENARIO
 (the last entry repeats) and records its arguments in $STUB_CALLS. It costs no
 usage. Behaviours: success, limit (with "text"), crash (with "rc"), auth,
 max_turns, sleep (with "seconds", then success), sigterm (the cycle is killed
-by SIGTERM, as a service restart or a stray kill would do).
+by SIGTERM, as a service restart or a stray kill would do), sigkill (killed by
+SIGKILL, as the OOM killer would do).
 """
 import json
 import os
@@ -52,10 +53,11 @@ if kind == "multi_results_then_sleep":
     time.sleep(step.get("seconds", 30))
     emit({"type": "result", "subtype": "success", "is_error": False, "result": "done", "num_turns": 3})
     sys.exit(0)
-if kind == "sigterm":
-    # killed mid-cycle by SIGTERM, without the runner itself being signalled
+if kind in ("sigterm", "sigkill"):
+    # killed mid-cycle by SIGTERM or SIGKILL (the OOM killer), without the
+    # runner itself being signalled
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "working"}]}})
-    os.kill(os.getpid(), signal.SIGTERM)
+    os.kill(os.getpid(), signal.SIGTERM if kind == "sigterm" else signal.SIGKILL)
     time.sleep(30)
     sys.exit(0)
 if kind == "rate_event_limit":
