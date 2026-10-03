@@ -723,7 +723,7 @@ class DevstackTest(unittest.TestCase):
             self.assertEqual(argv[: len(base)], base)
 
     def test_seed_sends_the_password_on_stdin_only(self) -> None:
-        password = "correct horse battery staple 42"
+        password = "test-pw-aaaaaaaa"
         done = self.run_devstack("seed", "alice", stdin=password + "\n")
         self.assertEqual(done.returncode, 0, done.stderr)
         (call,) = self.calls()
