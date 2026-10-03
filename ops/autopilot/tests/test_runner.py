@@ -5,13 +5,17 @@ with time scaled down 1000x, so they cost no usage and finish in seconds.
 Run: python3 -m unittest discover -s ops/autopilot/tests -v
 Items 6 (systemd restart) and 7 (guard layers in a real session) are run by
 hand; see docs/ai-platform-upgrade/IMPLEMENTATION_STATUS.md.
+InstallScript covers two pieces of install.sh without running install.sh.
 """
 
 import datetime
 import importlib.util
 import json
 import os
+import re
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,6 +25,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNNER = os.path.join(os.path.dirname(HERE), "autopilot.py")
 STUB = os.path.join(HERE, "stub_claude.py")
+INSTALL = os.path.join(os.path.dirname(HERE), "install.sh")
 
 spec = importlib.util.spec_from_file_location("autopilot", RUNNER)
 autopilot = importlib.util.module_from_spec(spec)
@@ -227,6 +232,16 @@ class Acceptance(RunnerHarness):
         hb = read_json(os.path.join(self.ap, "heartbeat.json"))
         self.assertIn("A-01", hb["current_task"] or "")
 
+    def test_cycle_waits_for_background_tasks(self):
+        # P0-17: print mode must not terminate a running workflow 600 s after
+        # the main turn ends; the runner sets the ceiling to 0 (wait), whatever
+        # its own environment says. The cycle timeout still bounds the wait.
+        self.scenario_is([{"kind": "success"}])
+        r = self.run_runner(1, CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="600000")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        call = json.loads(read(self.calls).splitlines()[0])
+        self.assertEqual(call["bg_wait_ceiling_ms"], "0")
+
 
 class AcceptanceFixes(RunnerHarness):
     def test_interrupted_cycle_is_not_recorded_as_success(self):
@@ -241,6 +256,82 @@ class AcceptanceFixes(RunnerHarness):
         self.assertEqual(rec["outcome"], "interrupted")
         self.assertEqual(rec["num_turns"], 46, "num_turns is summed across result events")
         self.assertGreaterEqual(rec["result_count"], 2)
+
+    def test_repeated_interrupted_cycles_reach_the_failure_cap(self):
+        # P0-17: a cycle killed by SIGTERM every time counts toward the crash cap
+        # (§5.5), so it cannot loop forever without the 2-hour sleep.
+        self.scenario_is([{"kind": "sigterm"}] * 6 + [{"kind": "success"}])
+        r = self.run_runner(7, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([e["outcome"] for e in self.events("cycle-end")], ["interrupted"] * 6 + ["ok"])
+        nxt = self.events("next")
+        self.assertEqual([e["state"] for e in nxt[:6]], ["resuming"] + ["restarting"] * 4 + ["failure-cap"])
+        self.assertLessEqual(nxt[0]["wait_s"], 5, "the first interruption resumes after the short pause")
+        self.assertTrue(all(55 <= e["wait_s"] <= 65 for e in nxt[1:5]), "repeated interruptions wait like crashes")
+        self.assertTrue(7100 <= nxt[5]["wait_s"] <= 7300)
+        caps = self.events("failure-cap")
+        self.assertEqual(len(caps), 1)
+        self.assertEqual((caps[0]["failures"], caps[0]["interrupted_in_a_row"]), (6, 6))
+        self.assertEqual(self.ncalls(), 7)
+        st = self._state()
+        self.assertEqual((st["consecutive_failures"], st["consecutive_interrupts"]), (0, 0))
+
+    def test_a_lone_interrupted_cycle_never_triggers_the_failure_cap(self):
+        # P0-17: one interruption (an operator restart) right after five crashes
+        # resumes after the short pause; it does not start the 2-hour sleep.
+        self.scenario_is([{"kind": "crash", "rc": 1}] * 5 + [{"kind": "sigterm"}, {"kind": "success"}])
+        r = self.run_runner(7, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([e["state"] for e in self.events("next")], ["restarting"] * 5 + ["resuming", "idle"])
+        self.assertEqual(self.events("failure-cap"), [])
+        st = self._state()
+        self.assertEqual((st["consecutive_failures"], st["consecutive_interrupts"]), (0, 0), "a finished cycle clears both counts")
+
+    def test_a_lone_interrupted_cycle_still_counts_toward_the_failure_cap(self):
+        # P0-17: a lone interruption never starts the cap itself, but it is a
+        # failure in the run: four crashes, an operator restart and one more
+        # crash make six in a row.
+        self.scenario_is([{"kind": "crash", "rc": 1}] * 4 + [{"kind": "sigterm"}, {"kind": "crash", "rc": 1}, {"kind": "success"}])
+        r = self.run_runner(7, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([e["state"] for e in self.events("next")], ["restarting"] * 4 + ["resuming", "failure-cap", "idle"])
+        caps = self.events("failure-cap")
+        self.assertEqual((caps[0]["failures"], caps[0]["interrupted_in_a_row"]), (6, 0))
+
+    def test_a_cycle_killed_outright_is_a_crash_not_a_timeout(self):
+        # The OOM killer's SIGKILL reaches the CLI, not `timeout`; `timeout`
+        # leads the cycle's process group, so it dies by the same signal
+        # (rc -9) and the cycle is a crash with its backoff. rc 124/137 come
+        # only from the cycle timeout itself.
+        self.scenario_is([{"kind": "sigkill"}, {"kind": "success"}])
+        r = self.run_runner(2, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        ends = self.events("cycle-end")
+        self.assertEqual([(e["rc"], e["outcome"]) for e in ends], [(-9, "crash"), (0, "ok")])
+        self.assertEqual([e["state"] for e in self.events("next")], ["restarting", "idle"])
+
+    def test_a_runner_restart_mid_cycle_resumes_without_backoff(self):
+        # P0-17: SIGTERM to the runner (systemctl restart) interrupts the cycle;
+        # the restarted runner resumes after the short pause and no cap is hit.
+        self.scenario_is([{"kind": "sleep", "seconds": 30}, {"kind": "success"}])
+        proc = subprocess.Popen([sys.executable, "-I", RUNNER], env=self.env(AP_MAX_CYCLES="1"),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(200):
+            if self.ncalls() and self._state().get("state") == "working":
+                break
+            time.sleep(0.05)
+        proc.terminate()
+        proc.wait(timeout=30)
+        st = self._state()
+        self.assertEqual(st["last_cycle"]["outcome"], "interrupted")
+        self.assertEqual((st["consecutive_failures"], st["consecutive_interrupts"]), (1, 1))
+        self.assertEqual(self.events("next")[-1]["state"], "resuming")
+        r = self.run_runner(1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([e["outcome"] for e in self.events("cycle-end")], ["interrupted", "ok"])
+        self.assertEqual(self.events("failure-cap"), [])
+        st = self._state()
+        self.assertEqual((st["consecutive_failures"], st["consecutive_interrupts"]), (0, 0))
 
     def test_non_object_json_line_does_not_crash_the_runner(self):
         # R12: a bare list/number line is skipped; the cycle still completes.
@@ -550,6 +641,225 @@ class Units(unittest.TestCase):
         self.assertEqual(got, [], "a scalar is not a window list")
         got, warns = windows("AUTOPILOT_PAUSE_WINDOWS: [\"notatime\"]")
         self.assertTrue(any(k == "AUTOPILOT_PAUSE_WINDOWS" for k, _ in warns), "a malformed window is reported")
+
+
+# is-active prints the word in ./state (a one-shot ./hang file makes that call
+# hang until it is signalled); every call is logged in ./calls.
+FAKE_SYSTEMCTL = """#!/bin/sh
+d=$(dirname "$0")
+echo "$*" >> "$d/calls"
+if [ "$2" = is-active ]; then
+    if [ -e "$d/hang" ]; then
+        rm -f "$d/hang"
+        echo hanging >> "$d/calls"
+        sleep 30
+    fi
+    s=$(cat "$d/state")
+    echo "$s"
+    [ "$s" = active ]
+    exit $?
+fi
+exit 0
+"""
+
+
+class InstallScript(unittest.TestCase):
+    """install.sh is operator-only and refuses inside an autopilot session, so
+    these tests never run it. They run the two pieces they cover, the settings
+    renderer (its python heredoc) and the --restart-after-cycle wait (its shell
+    functions), in a temporary directory with a fake systemctl first on PATH."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ap-install-")
+        self.ap = os.path.join(self.tmp, "ap")
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.ap)
+        os.makedirs(self.bin)
+        self.settings = os.path.join(self.ap, "settings.autopilot.json")
+        self.stop = os.path.join(self.ap, "STOP")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_install_script_parses(self):
+        # bash -n reads the script without running any of it
+        r = subprocess.run(["/bin/bash", "-n", INSTALL], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr, "")
+
+    # ---- the settings renderer
+    def render(self, private):
+        m = re.search(r"<<'PY'\n(.*?\n)PY\n", read(INSTALL), re.S)
+        self.assertIsNotNone(m, "install.sh renders the settings with a python heredoc")
+        script = os.path.join(self.tmp, "render.py")
+        template = os.path.join(self.tmp, "template.json")
+        host = os.path.join(self.tmp, "host.json")
+        with open(script, "w") as fh:
+            fh.write(m.group(1))
+        with open(template, "w") as fh:
+            json.dump({"permissions": {"deny": ["Bash(sudo:*)"]},
+                       "autoMode": {"environment": ["state lives in {{AP_HOME}}", "{{HOST_DETAILS}}"]}}, fh)
+        with open(host, "w") as fh:
+            json.dump({"automode_environment_private": private}, fh)
+        return subprocess.run([sys.executable, "-I", script, template, host, self.ap, self.settings],
+                              capture_output=True, text=True, timeout=30)
+
+    def old_settings(self):
+        with open(self.settings, "w") as fh:
+            fh.write('{"old": true}\n')
+        os.chmod(self.settings, 0o444)
+        return os.stat(self.settings).st_ino
+
+    def strays(self):
+        return sorted(f for f in os.listdir(self.ap) if f != "settings.autopilot.json")
+
+    def test_settings_are_replaced_atomically(self):
+        # P0-17: a new file is renamed over the installed one, so a cycle that
+        # starts meanwhile never reads a half-written settings file.
+        inode = self.old_settings()
+        r = self.render(["a private fact"])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        st = os.stat(self.settings)
+        self.assertNotEqual(st.st_ino, inode, "renamed into place, not rewritten in place")
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o444)
+        self.assertEqual(read_json(self.settings)["autoMode"]["environment"], [f"state lives in {self.ap}", "a private fact"])
+        self.assertEqual(self.strays(), [], "no temporary file is left behind")
+
+    def test_a_failed_render_leaves_the_installed_settings_alone(self):
+        self.old_settings()
+        r = self.render(["{{UNRENDERED}}"])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(read(self.settings), '{"old": true}\n')
+        self.assertEqual(self.strays(), [])
+        # a failure at the rename removes the temporary file too
+        os.chmod(self.settings, 0o644)
+        os.remove(self.settings)
+        os.makedirs(os.path.join(self.settings, "x"))
+        r = self.render([])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.strays(), [])
+
+    # ---- the --restart-after-cycle wait
+    def start_wait(self, state="active", stdout=subprocess.PIPE, stderr=subprocess.PIPE):
+        funcs = re.findall(r"^[a-z_]+\(\) \{\n.*?^\}\n", read(INSTALL), re.M | re.S)
+        self.assertIn("graceful_restart", [f.split("(")[0] for f in funcs])
+        harness = os.path.join(self.tmp, "harness.sh")
+        with open(harness, "w") as fh:
+            fh.write('set -euo pipefail\nAP=$1\n' + "".join(funcs) + "graceful_restart\n")
+        fake = os.path.join(self.bin, "systemctl")
+        with open(fake, "w") as fh:
+            fh.write(FAKE_SYSTEMCTL)
+        os.chmod(fake, 0o755)
+        self.set_state(state)
+        env = {"PATH": self.bin + ":/usr/bin:/bin", "HOME": self.tmp, "LANG": "C.UTF-8"}
+        self.assertEqual(shutil.which("systemctl", path=env["PATH"]), fake, "only the fake systemctl is reachable")
+
+        def default_signals():  # Ctrl-C must reach the shell even if the test runner ignores it
+            for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                signal.signal(s, signal.SIG_DFL)
+
+        return subprocess.Popen(["/bin/bash", harness, self.ap], env=env, stdout=stdout, stderr=stderr,
+                                text=True, start_new_session=True, preexec_fn=default_signals)
+
+    def set_state(self, word):
+        with open(os.path.join(self.bin, "state"), "w") as fh:
+            fh.write(word + "\n")
+
+    def calls(self):
+        try:
+            return read(os.path.join(self.bin, "calls")).splitlines()
+        except OSError:
+            return []
+
+    def wait_for(self, cond, timeout=10):
+        end = time.time() + timeout
+        while time.time() < end:
+            if cond():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_restart_wait_starts_the_runner_once_it_has_stopped(self):
+        proc = self.start_wait()
+        self.assertTrue(self.wait_for(lambda: os.path.exists(self.stop)))
+        self.set_state("inactive")
+        out, err = proc.communicate(timeout=20)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertFalse(os.path.exists(self.stop))
+        self.assertIn("--user start llm-autopilot.service", self.calls())
+
+    def test_an_interrupted_restart_wait_removes_its_stop_file(self):
+        # P0-17: Ctrl-C (or TERM) during the wait must not leave the runner to
+        # stop silently at the end of its cycle.
+        for sig, code in ((signal.SIGINT, 130), (signal.SIGTERM, 143), (signal.SIGHUP, 129)):
+            with self.subTest(sig=sig.name):
+                for f in ("calls", "hang"):
+                    if os.path.exists(os.path.join(self.bin, f)):
+                        os.remove(os.path.join(self.bin, f))
+                proc = self.start_wait()
+                self.assertTrue(self.wait_for(lambda: os.path.exists(self.stop)))
+                os.killpg(proc.pid, sig)
+                out, err = proc.communicate(timeout=20)
+                self.assertEqual(proc.returncode, code, err)
+                self.assertFalse(os.path.exists(self.stop), "the STOP file it created is gone")
+                self.assertIn("removed the STOP file", err)
+                self.assertIn("still active", err)
+                self.assertNotIn("--user start llm-autopilot.service", self.calls())
+
+    def test_a_hangup_with_the_terminal_gone_still_removes_the_stop_file(self):
+        # P0-17: `install.sh --restart-after-cycle 2>&1 | tee log` and the
+        # terminal closes: stdout and stderr are a pipe nobody reads. Writing
+        # there (bash reports the killed sleep as Hangup) must not kill the shell
+        # with SIGPIPE before the handler removes STOP.
+        r, w = os.pipe()
+        proc = self.start_wait(stdout=w, stderr=w)
+        os.close(w)
+        try:
+            self.assertTrue(self.wait_for(lambda: os.path.exists(self.stop)))
+            os.set_blocking(r, False)
+            try:
+                os.read(r, 65536)
+            except BlockingIOError:
+                pass
+        finally:
+            os.close(r)  # the reader is gone: every later write fails with EPIPE
+        os.killpg(proc.pid, signal.SIGHUP)
+        self.assertEqual(proc.wait(timeout=20), 129)
+        self.assertFalse(os.path.exists(self.stop), "the STOP file it created is gone")
+        self.assertNotIn("--user start llm-autopilot.service", self.calls())
+
+    def test_the_normal_path_removes_stop_before_dropping_its_handlers(self):
+        # An interrupt between the two still finds STOP gone or removes it.
+        body = re.search(r"^graceful_restart\(\) \{\n(.*?)^\}\n", read(INSTALL), re.M | re.S).group(1)
+        self.assertIn('    rm -f "$AP/STOP"\n    trap - INT TERM HUP PIPE\n    systemctl --user start', body)
+
+    def test_an_interrupted_restart_wait_keeps_an_operator_stop_file(self):
+        open(self.stop, "w").close()
+        proc = self.start_wait()
+        self.assertTrue(self.wait_for(lambda: any("is-active" in c for c in self.calls())))
+        os.killpg(proc.pid, signal.SIGINT)
+        out, err = proc.communicate(timeout=20)
+        self.assertEqual(proc.returncode, 130, err)
+        self.assertTrue(os.path.exists(self.stop), "a STOP file the operator made is not removed")
+        self.assertIn("left in place", err)
+
+    def test_an_interrupted_restart_wait_says_when_the_runner_is_down(self):
+        # The runner exited on STOP just before Ctrl-C: the message says so and
+        # how to start it, instead of leaving it stopped without a word.
+        proc = self.start_wait()
+        self.assertTrue(self.wait_for(lambda: os.path.exists(self.stop)))
+        # Hold the loop inside one is-active call, then let the runner "exit":
+        # only the interrupt handler's own check can see it.
+        open(os.path.join(self.bin, "hang"), "w").close()
+        self.assertTrue(self.wait_for(lambda: "hanging" in self.calls()))
+        self.set_state("inactive")
+        os.killpg(proc.pid, signal.SIGINT)
+        out, err = proc.communicate(timeout=20)
+        self.assertEqual(proc.returncode, 130, err)
+        self.assertFalse(os.path.exists(self.stop))
+        self.assertIn("not active", err)
+        self.assertIn("systemctl --user start llm-autopilot.service", err)
+        self.assertNotIn("--user start llm-autopilot.service", self.calls())
 
 
 if __name__ == "__main__":
