@@ -428,6 +428,23 @@ def test_freeze_refuses_duplicate_conversation_ids(tmp_path):
         B.freeze(B.load_runs([src, str(tmp_path / "orig-copy")]))
 
 
+@pytest.mark.parametrize("conv", [None, ""])
+def test_a_record_without_a_conversation_id_is_refused(tmp_path, conv):
+    """Re-QA 7: with null conversation ids a copied run directory pooled as new samples."""
+    recs = three_repeats()
+    for rec in recs:
+        rec["conversation_id"] = conv
+    a = write_run(tmp_path, "a", recs, repeats=3)
+    shutil.copytree(a, str(tmp_path / "a-copy"))
+    with pytest.raises(B.BaselineError, match="has no conversation_id"):
+        B.freeze(B.load_runs([a, str(tmp_path / "a-copy")]))
+    with pytest.raises(B.BaselineError, match="has no conversation_id"):
+        B.freeze(B.load_runs([a]))
+    base = frozen(three_repeats())
+    with pytest.raises(B.BaselineError, match="has no conversation_id"):
+        B.compare(base, B.load_runs([a]))
+
+
 def test_mixed_condition_labels_are_refused_without_the_flag(tmp_path):
     a = write_run(tmp_path, "a", three_repeats(), label="dev stack, cap 2", repeats=3)
     b = write_run(tmp_path, "b", [record("EV01", 4)], label="dev stack, cap 4", repeats=1,

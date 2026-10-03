@@ -469,8 +469,8 @@ def _run_name(src: dict) -> str:
 def _check_pool(records: Sequence[dict], side: str) -> List[dict]:
     """The integrity of pooled records; returns their run conditions. Refuses (BaselineError): a record without
     run conditions, an unfinished, interrupted or deadline-cut run, runs with different eval_set_sha256 or
-    workers, a run whose record count per case differs from its conditions.repeats or its --only, and a
-    conversation id seen twice."""
+    workers, a run whose record count per case differs from its conditions.repeats or its --only, a record
+    without a non-empty string conversation_id, and a conversation id seen twice."""
     if any(not isinstance(r.get("_run"), dict) for r in records):
         raise BaselineError(f"{side}: a record carries no run conditions (`_run`); read run directories with "
                             "load_runs")
@@ -507,8 +507,10 @@ def _check_pool(records: Sequence[dict], side: str) -> List[dict]:
     seen: Dict[str, str] = {}
     for rec in records:
         conv = rec.get("conversation_id")
-        if conv is None:
-            continue
+        if not isinstance(conv, str) or not conv:
+            raise BaselineError(f"{side} run {_run_name(rec['_run'])}: case {rec['id']} has no conversation_id; "
+                                "without it a copied run directory cannot be told from a new one (run_evalset.py "
+                                "writes one on every record)")
         if conv in seen:
             raise BaselineError(f"{side}: conversation id {conv!r} appears twice ({seen[conv]} and "
                                 f"{_run_name(rec['_run'])}); a copied run directory would double-count its samples")
