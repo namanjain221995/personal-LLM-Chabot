@@ -201,6 +201,8 @@ FS_DENY = [
     Bc("find . -delete", cwd=DEV),
     Bc("find . -name '*.pyc' -o -delete", cwd=DEV),
     Bc("find . -exec xargs rm {} +", cwd=DEV),
+    Bc("find /tmp/llmdev -name x -fprint ~/.llm-autopilot/guard/guard_hook.py"),  # -fprint truncates its file
+    Bc("find /tmp/llmdev -fls ~/.llm-autopilot/settings.autopilot.json"),
     # P0-17: moving/deleting the guard dirs and agent/ (holds test-db.vars)
     Bc("rm -rf ~/.llm-autopilot/guard"),
     Bc("rmdir ${HOME}/.llm-autopilot/bin"),
@@ -302,6 +304,8 @@ FS_ALLOW = [
     Bc("find . -name '*.py' -exec wc -l {} +", cwd=DEV),     # a find that only reads
     Bc("find . -name '*.py' -exec grep -l TODO {} \\;", cwd=DEV),
     Bc("find /tmp/llmdev -name '*.log' -delete"),
+    Bc("find orchestrator -name '*.py' -fprint /tmp/llmdev/py-files.txt", cwd=DEV),
+    Bc("cat > /tmp/llmdev/probe.py <<'EOF'\nSEP = '\x01'\nEOF"),     # a here-document body is data
     W(f"{PRIVATE}/notes.md"),
     W("~/.llm-autopilot/agent/private/p016.json"),
     W("private/scratch.md", cwd=AGENT),

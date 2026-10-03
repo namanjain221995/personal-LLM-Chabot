@@ -1113,9 +1113,9 @@ def strip_function_headers(text):
 def analyze(cmd, ctx):
     if ctx.depth > 8:
         ctx.deny("the command nests too deeply for review (fail-closed)")
-    if INTERNAL_MARKS.search(cmd):
-        ctx.deny("the command carries control characters (\\x00-\\x06) that the guard cannot review; remove them (fail-closed)")
     text, docs = split_heredocs(cmd)
+    if INTERNAL_MARKS.search(text):  # a here-document body is data; a shell consumer's body is analysed by check_heredoc
+        ctx.deny("the command carries control characters the guard uses as internal markers (\\x00-\\x06, \\x0e-\\x12); remove them (fail-closed)")
     for consumer, body in docs:
         check_heredoc(consumer, body, ctx)
     unsafe_text = text  # heredoc bodies are data here; they are analysed above
@@ -2519,13 +2519,16 @@ def check_write_targets(cmd, args, ctx):
                     targets.append(args[i + 1])
         if cmd == "wget" and not targets:
             targets.append(".")
-    elif cmd == "find" and any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir") for a in args):
-        roots = []
-        for a in args:
-            if a.startswith("-") or a in ("(", "!"):
-                break
-            roots.append(a)
-        targets = roots or ["."]
+    elif cmd == "find":
+        if any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir") for a in args):
+            roots = []
+            for a in args:
+                if a.startswith("-") or a in ("(", "!"):
+                    break
+                roots.append(a)
+            targets = roots or ["."]
+        # -fprint/-fprint0/-fprintf/-fls FILE create or truncate FILE
+        targets = targets + [args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-fprint", "-fprint0", "-fprintf", "-fls")]
     elif cmd == "gio" and "trash" in args:
         targets = [a for a in args[args.index("trash") + 1 :] if not a.startswith("-")]
     elif cmd == "patch":
