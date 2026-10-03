@@ -8,6 +8,7 @@ configuration block points at the temporary repositories and the fake gh.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -107,14 +108,17 @@ class MergeToDev(unittest.TestCase):
         with open(os.path.join(self.bin, "scenario.json"), "w") as fh:
             json.dump(scenario, fh)
 
-    def make_gate(self, repo=None, name="gate"):
+    def make_gate(self, repo=None, name="gate", protocol="file", git_bin="/usr/bin/git"):
+        # The throwaway origin is a local path, which git's allow-list calls "file".
         with open(SCRIPT, encoding="utf-8") as fh:
             text = fh.read()
         subs = {
+            "GIT=/usr/bin/git": f"GIT={git_bin}",
             "GH=/usr/bin/gh": f"GH={self.gh}",
             "REPO=$HOME/work/llm-dev": f"REPO={repo or self.wt}",
             "EXPECTED_COMMON_DIR=$HOME/Documents/project/personal-LLM-Chabot/.git": f"EXPECTED_COMMON_DIR={self.wt}/.git",
             "ORIGIN_URL=https://github.com/namanjain221995/personal-LLM-Chabot.git": f"ORIGIN_URL={self.origin}",
+            "ORIGIN_PROTOCOL=https": f"ORIGIN_PROTOCOL={protocol}",
             "LOG=$HOME/.llm-autopilot/logs/merge_to_dev.log": f"LOG={self.log}",
             "CI_APPROVALS=$HOME/.llm-autopilot/approved-ci-trees": f"CI_APPROVALS={self.approvals}",
         }
@@ -442,7 +446,7 @@ class MergeToDev(unittest.TestCase):
         plain = os.path.join(self.tmp, "plain")
         os.makedirs(plain)
         gate = self.make_gate(repo=plain, name="gate-plain")
-        self.assert_refused(self.run_gate(gate=gate), f"cannot read the git common directory of {plain}", dev_before)
+        self.assert_refused(self.run_gate(gate=gate), f"cannot read the git directory of {plain}", dev_before)
 
     def test_refuses_when_the_expected_repository_is_missing(self):
         dev_before = self.origin_ref("dev")
@@ -458,13 +462,191 @@ class MergeToDev(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.origin_ref("dev"), self.origin_ref("autopilot/dev"))
 
+    def test_the_git_directory_is_pinned_after_the_check(self):
+        # Once step 0 has verified the repository, repointing $REPO's .git file
+        # (here: by a git stand-in, between the check and the next call) must
+        # not move the fetch and push to another repository.
+        dev_before = self.origin_ref("dev")
+        decoy = os.path.join(self.tmp, "decoy")
+        subprocess.run(["git", "clone", "-q", self.origin, decoy], check=True, capture_output=True)
+        stale = git(decoy, "rev-parse", "refs/remotes/origin/autopilot/dev")
+        self.commit("more.txt", "more")
+        self.push_tip()
+        pointer = os.path.join(self.tmp, "pointer")
+        os.makedirs(pointer)
+        with open(os.path.join(pointer, ".git"), "w") as fh:
+            fh.write(f"gitdir: {self.wt}/.git\n")
+        swapped = os.path.join(self.tmp, "swapped")
+        stand_in = os.path.join(self.tmp, "git-swapping")
+        with open(stand_in, "w") as fh:
+            fh.write(textwrap.dedent(f"""\
+                #!/bin/sh
+                case " $* " in
+                    *" remote get-url "*)
+                        if [ ! -e '{swapped}' ]; then
+                            printf 'gitdir: %s\\n' '{decoy}/.git' > '{pointer}/.git'
+                            : > '{swapped}'
+                        fi ;;
+                esac
+                exec /usr/bin/git "$@"
+                """))
+        os.chmod(stand_in, 0o755)
+        gate = self.make_gate(repo=pointer, name="gate-swap", git_bin=stand_in)
+        r = self.run_gate(gate=gate)
+        self.assertTrue(os.path.exists(swapped), "the .git file was repointed during the run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotEqual(self.origin_ref("dev"), dev_before)
+        self.assertEqual(self.origin_ref("dev"), git(self.wt, "rev-parse", "refs/remotes/origin/autopilot/dev"))
+        self.assertEqual(git(decoy, "rev-parse", "refs/remotes/origin/autopilot/dev"), stale,
+                         "git kept to the verified git directory; the decoy was never fetched into")
+
+    # ---- P0-17: repository configuration cannot make the gate's git run a command
+    def marker_script(self, name, body=""):
+        marker = os.path.join(self.tmp, name + ".ran")
+        path = os.path.join(self.tmp, name + ".sh")
+        with open(path, "w") as fh:
+            fh.write(f"#!/bin/sh\necho ran >> '{marker}'\n{body}exit 1\n")
+        os.chmod(path, 0o755)
+        return marker, path
+
+    def assert_merged_without(self, marker, r):
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.origin_ref("dev"), self.origin_ref("autopilot/dev"))
+        self.assertFalse(os.path.exists(marker), "a command from the repository's configuration ran inside the gate")
+
+    def test_a_configured_fsmonitor_never_runs(self):
+        # core.fsmonitor names a hook program, which core.hooksPath does not
+        # cover. A fetch that recurses into submodules reads the index and so
+        # asks it; the gate pins it off and also fetches without recursing, so
+        # this fails only if both go (test_every_git_call_is_hardened checks each).
+        marker, script = self.marker_script("fsmonitor")
+        git(self.wt, "config", "core.fsmonitor", script)
+        self.assert_merged_without(marker, self.run_gate())
+
+    def test_a_configured_alternate_refs_command_never_runs(self):
+        marker, script = self.marker_script("alternate-refs")
+        alternate = os.path.join(self.tmp, "alternate.git")
+        subprocess.run(["git", "clone", "-q", "--bare", self.origin, alternate], check=True, capture_output=True)
+        with open(os.path.join(self.wt, ".git", "objects", "info", "alternates"), "w") as fh:
+            fh.write(os.path.join(alternate, "objects") + "\n")
+        git(self.wt, "config", "core.alternateRefsCommand", script)
+        other = os.path.join(self.tmp, "other")  # a new tip the gate's fetch must negotiate for
+        subprocess.run(["git", "clone", "-q", "-b", "autopilot/dev", self.origin, other], check=True, capture_output=True)
+        git(other, "config", "user.email", "o@example.invalid")
+        git(other, "config", "user.name", "o")
+        with open(os.path.join(other, "more.txt"), "w") as fh:
+            fh.write("more\n")
+        git(other, "add", "more.txt")
+        git(other, "commit", "-q", "-m", "more")
+        git(other, "push", "-q", "origin", "HEAD:refs/heads/autopilot/dev")
+        self.assert_merged_without(marker, self.run_gate())
+
+    def test_the_push_is_never_signed_by_a_configured_program(self):
+        marker, script = self.marker_script("gpg")
+        git(self.origin, "config", "receive.certNonceSeed", "test-seed")  # origin accepts signed pushes
+        git(self.wt, "config", "push.gpgSign", "true")
+        git(self.wt, "config", "gpg.program", script)
+        self.assert_merged_without(marker, self.run_gate())
+
+    def test_automatic_maintenance_never_runs(self):
+        marker, script = self.marker_script("recent-objects")
+        packs = os.path.join(self.wt, ".git", "objects", "pack")
+        for i in range(3):  # three packs where gc.autoPackLimit allows one
+            self.commit(f"pack{i}.txt", f"pack {i}")
+            git(self.wt, "repack", "-q")
+        self.push_tip()
+        before = sorted(f for f in os.listdir(packs) if f.endswith(".pack"))
+        self.assertGreater(len(before), 1)
+        for key, value in (("gc.auto", "1"), ("gc.autoPackLimit", "1"), ("gc.autoDetach", "false"),
+                           ("maintenance.auto", "true"), ("gc.recentObjectsHook", script)):
+            git(self.wt, "config", key, value)
+        self.assert_merged_without(marker, self.run_gate())
+        self.assertEqual(sorted(f for f in os.listdir(packs) if f.endswith(".pack")), before,
+                         "git gc --auto repacked the repository inside the gate")
+
+    def test_a_configured_pager_never_runs_on_a_terminal(self):
+        import pty
+        marker, script = self.marker_script("pager", body="cat >/dev/null\n")
+        for cmd in ("fetch", "push", "ls-remote", "rev-parse", "merge-base"):
+            git(self.wt, "config", f"pager.{cmd}", script)
+        master, slave = pty.openpty()
+        try:
+            e = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/tmp")}
+            r = subprocess.run([self.gate], env=e, stdin=subprocess.DEVNULL, stdout=slave, stderr=subprocess.PIPE,
+                               text=True, timeout=60)
+        finally:
+            os.close(slave)
+            os.close(master)
+        self.assert_merged_without(marker, r)
+
+    # ---- P0-17: the URL git resolves for origin, and the transports it may use
+    def test_refuses_origin_urls_that_differ_from_the_origin_in_any_way(self):
+        # The origin URL without its .git suffix names the same repository on
+        # GitHub, but git resolves it differently; only the exact URL passes.
+        dev_before = self.origin_ref("dev")
+        marker, script = self.marker_script("ext")
+        git(self.wt, "remote", "set-url", "origin", self.origin[: -len(".git")])
+        git(self.wt, "config", f"url.ext::{script} %S.insteadOf", self.origin)
+        git(self.wt, "config", "protocol.ext.allow", "always")
+        self.assert_refused(self.run_gate(), "the fetch URL of origin", dev_before)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_refuses_when_git_rewrites_the_url_the_gate_fetches_from(self):
+        # origin's own URL reads back as the origin, but the explicit URL the
+        # gate fetches from and lists is rewritten to somewhere else.
+        dev_before = self.origin_ref("dev")
+        marker, script = self.marker_script("ext")
+        decoy = os.path.join(self.tmp, "decoy.git")
+        subprocess.run(["git", "clone", "-q", "--bare", self.origin, decoy], check=True, capture_output=True)
+        alias = os.path.join(self.tmp, "alias-of-origin")
+        git(self.wt, "remote", "set-url", "origin", alias)
+        git(self.wt, "config", f"url.{self.origin}.insteadOf", alias)
+        git(self.wt, "config", "protocol.ext.allow", "always")
+        for name, target in (("another repository", decoy), ("a command", f"ext::{script} %S")):
+            with self.subTest(name):
+                git(self.wt, "config", f"url.{target}.insteadOf", self.origin)
+                self.assertEqual(git(self.wt, "remote", "get-url", "origin"), self.origin)
+                self.assertEqual(git(self.wt, "remote", "get-url", "--push", "origin"), self.origin)
+                self.assert_refused(self.run_gate(), "rewrites the URL", dev_before)
+                self.assertFalse(os.path.exists(marker))
+                self.assertEqual(git(decoy, "rev-parse", "dev"), dev_before)
+                git(self.wt, "config", "--remove-section", f"url.{target}")
+
+    def test_git_may_use_only_the_origins_protocol(self):
+        # The gate allows git one transport (https for GitHub). Allowing only
+        # https here, where the origin is a local path, stops the fetch.
+        dev_before = self.origin_ref("dev")
+        gate = self.make_gate(name="gate-https-only", protocol="https")
+        r = self.run_gate(gate=gate)
+        self.assert_refused(r, "git fetch of dev and autopilot/dev failed", dev_before)
+        self.assertIn("transport 'file' not allowed", r.stderr)
+
     def test_every_git_call_is_hardened(self):
         with open(SCRIPT, encoding="utf-8") as fh:
             text = fh.read()
         self.assertRegex(text, r"\nGIT_NO_REPLACE_OBJECTS=1\n")
         self.assertRegex(text, r"\nexport [^\n]*\bGIT_NO_REPLACE_OBJECTS\b")
-        self.assertIn("-c core.hooksPath=/dev/null", text)
-        self.assertEqual(text.count('"$GIT"'), 1, "git runs only through the one hardened wrapper")
+        self.assertRegex(text, r"\nGIT_ALLOW_PROTOCOL=\$ORIGIN_PROTOCOL\n")
+        self.assertRegex(text, r"\nexport [^\n]*\bGIT_ALLOW_PROTOCOL\b")
+        wrapper = re.search(r"\ng\(\) \{\n(.*?)\n\}\n", text, re.S)
+        self.assertIsNotNone(wrapper, "one git wrapper, g()")
+        for flag in ("--no-pager", "--no-replace-objects", "-c core.hooksPath=/dev/null", "-c core.fsmonitor=false",
+                     "-c core.alternateRefsCommand=true", "-c push.gpgSign=false", "-c maintenance.auto=false",
+                     "-c gc.auto=0", '--git-dir="$git_dir"'):
+            self.assertIn(flag, wrapper.group(1), flag)
+        for call in ("g fetch ", "g push "):
+            lines = [ln for ln in text.splitlines() if ln.startswith(call)]
+            self.assertEqual(len(lines), 1, call)
+            self.assertIn("--no-recurse-submodules", lines[0], call)
+        # $GIT, ${GIT} or "$GIT" is used once, inside the wrapper, and nothing
+        # outside the configuration line names the git binary or runs git bare
+        uses = re.findall(r"\$\{?GIT\}?(?![A-Za-z0-9_])", text)
+        self.assertEqual(len(uses), 1, "git runs only through the one hardened wrapper")
+        self.assertIn('"$GIT"', wrapper.group(1))
+        self.assertEqual(text.count("/usr/bin/git"), 1, "the binary is named only in the configuration block")
+        code = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+        bare = [ln for ln in code if re.search(r"(?:^|[;&|({]|\$\()\s*(?:command\s+|exec\s+|env\s+|\\)?git(?:\s|$)", ln)]
+        self.assertEqual(bare, [], "git is called outside the wrapper")
 
 
 class Syntax(unittest.TestCase):

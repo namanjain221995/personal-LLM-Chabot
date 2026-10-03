@@ -19,10 +19,13 @@
 #
 # It trusts nothing from whoever runs it: bash -p ignores BASH_ENV, ENV and
 # exported functions, every other variable is cleared below, and the tools,
-# repository, branches, remote and log are fixed. Every git call goes through
-# one wrapper that runs no repository hooks and reads no replace refs, and the
-# gate acts only when the repository's git common directory is the expected
-# one. The autopilot runs the installed copy
+# repository, branches, remote and log are fixed. It acts only when the
+# repository's git common directory is the expected one, and then on that
+# verified git directory alone. Every git call goes through one wrapper that
+# reads no replace refs and turns off the commands a repository's
+# configuration can make git run (hooks, fsmonitor, the alternate-refs
+# command, a pager, push signing, automatic maintenance), and git may use
+# only the origin's transport protocol. The autopilot runs the installed copy
 # (~/.llm-autopilot/bin/merge_to_dev.sh), which it cannot edit; this file is
 # the source. Tests run a copy with the configuration block replaced
 # (ops/autopilot/tests/test_merge_to_dev.py).
@@ -50,6 +53,7 @@ GH=/usr/bin/gh
 REPO=$HOME/work/llm-dev
 EXPECTED_COMMON_DIR=$HOME/Documents/project/personal-LLM-Chabot/.git
 ORIGIN_URL=https://github.com/namanjain221995/personal-LLM-Chabot.git
+ORIGIN_PROTOCOL=https
 LOG=$HOME/.llm-autopilot/logs/merge_to_dev.log
 CI_APPROVALS=$HOME/.llm-autopilot/approved-ci-trees
 # --- end of configuration ---
@@ -59,13 +63,17 @@ REPORT=docs/ai-platform-upgrade/FINAL_REPORT.md
 REQUIRED_WORKFLOW=Pipeline
 REQUIRED_CHECK="CI passed"
 REQUIRED_APP=github-actions
+# git may use no transport but the origin's: whatever URL a configuration
+# rewrites the origin to, it cannot reach a command (ext::), a local path or ssh
+GIT_ALLOW_PROTOCOL=$ORIGIN_PROTOCOL
+export GIT_ALLOW_PROTOCOL
 
 dry_run=0
 want=""
 for arg in "$@"; do
     case "$arg" in
         --dry-run) dry_run=1 ;;
-        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
         *)
             if [ -z "$want" ] && { [[ "$arg" =~ ^[0-9a-f]{40}$ ]] || [ "$arg" = "origin/$SOURCE_BRANCH" ]; }; then
                 want=$arg
@@ -90,35 +98,56 @@ refuse() {
     exit 1
 }
 
-# The only way git runs here: in $REPO, without replace objects, and with the
-# hooks directory at /dev/null, so no hook from the repository or from a
-# configured core.hooksPath runs (a command-line -c wins over every config file,
-# and git hands it on to the git processes it starts).
+# The only way git runs here: in $REPO (on the git directory verified in step 0
+# once that is known), without replace objects or a pager, and with every
+# setting through which a repository's configuration makes git run a command
+# of its choosing pinned off: hooks (the hooks directory is /dev/null, so
+# neither .git/hooks nor a configured core.hooksPath runs), the fsmonitor hook,
+# the alternate-refs command, push-certificate signing (gpg.program) and
+# automatic maintenance (gc --auto and the commands it may run). A command-line
+# -c wins over every config file, and git hands it on to the git processes it
+# starts.
+git_dir=""
 g() {
-    "$GIT" --no-replace-objects -c core.hooksPath=/dev/null -C "$REPO" "$@"
+    if [ -n "$git_dir" ]; then
+        set -- --git-dir="$git_dir" "$@"
+    fi
+    "$GIT" --no-pager --no-replace-objects \
+        -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.alternateRefsCommand=true \
+        -c push.gpgSign=false -c maintenance.auto=false -c gc.auto=0 \
+        -C "$REPO" "$@"
 }
 
 slug=${ORIGIN_URL#https://github.com/}
 slug=${slug%.git}
 
 # 0. $REPO belongs to the expected repository: its git common directory (the
-#    main checkout's .git, which every linked worktree shares) is the expected one
+#    main checkout's .git, which every linked worktree shares) is the expected
+#    one. From here on git runs on the git directory found now, so what $REPO
+#    or its .git file points to cannot change between this check and the push.
 want_common=$(cd "$EXPECTED_COMMON_DIR" 2>/dev/null && pwd -P) \
     || refuse "the expected git common directory $EXPECTED_COMMON_DIR does not exist"
+found=$(g rev-parse --absolute-git-dir 2>/dev/null) && [ -n "$found" ] \
+    || refuse "cannot read the git directory of $REPO (not a git repository?)"
+git_dir=$(cd "$found" 2>/dev/null && pwd -P) || refuse "cannot resolve the git directory $found of $REPO"
 common=$(g rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -n "$common" ] \
-    || refuse "cannot read the git common directory of $REPO (not a git repository?)"
+    || refuse "cannot read the git common directory of $REPO"
 common=$(cd "$common" 2>/dev/null && pwd -P) || refuse "cannot resolve the git common directory $common of $REPO"
 [ "$common" = "$want_common" ] \
     || refuse "the git common directory of $REPO is $common, not the expected $want_common"
 
-# 0b. origin is the repository, for fetches and pushes alike (insteadOf and pushurl are expanded here)
+# 0b. origin is exactly the repository, for fetches and pushes alike, and git
+#     resolves the URL the gate fetches from and lists as itself (insteadOf,
+#     pushInsteadOf and pushurl are expanded by these reads)
 for kind in fetch push; do
     if [ "$kind" = push ]; then url=$(g remote get-url --push origin) || refuse "cannot read the push URL of origin in $REPO"
     else url=$(g remote get-url origin) || refuse "cannot read the URL of origin in $REPO"; fi
-    [ "${url%.git}" = "${ORIGIN_URL%.git}" ] || refuse "the $kind URL of origin in $REPO is not $ORIGIN_URL"
+    [ "$url" = "$ORIGIN_URL" ] || refuse "the $kind URL of origin in $REPO is not $ORIGIN_URL"
 done
+url=$(g ls-remote --get-url "$ORIGIN_URL") || refuse "cannot resolve $ORIGIN_URL in $REPO"
+[ "$url" = "$ORIGIN_URL" ] || refuse "git in $REPO rewrites the URL $ORIGIN_URL to another one"
 
-g fetch --quiet "$ORIGIN_URL" \
+g fetch --quiet --no-recurse-submodules "$ORIGIN_URL" \
     "+refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH" \
     "+refs/heads/$SOURCE_BRANCH:refs/remotes/origin/$SOURCE_BRANCH" \
     || refuse "git fetch of $TARGET_BRANCH and $SOURCE_BRANCH failed"
@@ -186,7 +215,7 @@ if [ "$dry_run" = 1 ]; then
     exit 0
 fi
 
-g push "$ORIGIN_URL" "$sha:refs/heads/$TARGET_BRANCH" \
+g push --no-recurse-submodules "$ORIGIN_URL" "$sha:refs/heads/$TARGET_BRANCH" \
     || refuse "push to origin/$TARGET_BRANCH failed (not a fast-forward any more?)"
 now=$(g ls-remote "$ORIGIN_URL" "refs/heads/$TARGET_BRANCH" | cut -f1)
 [ "$now" = "$sha" ] || refuse "origin/$TARGET_BRANCH is $now after the push, expected $sha"
