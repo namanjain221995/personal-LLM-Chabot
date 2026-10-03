@@ -317,7 +317,7 @@ fi
 # 6. GitHub's own history agrees that the push is a fast-forward. Check 2 walks
 #    parent commits in the shared local object store, where git does not
 #    re-hash the parents it reads, and git push trusts the same walk.
-compare=$("$GH" api "repos/$slug/compare/$dev_sha...$sha" --jq .status) \
+compare=$("$GH" api "repos/$slug/compare/$dev_sha...$sha?per_page=1" --jq .status) \
     || refuse "could not compare origin/$TARGET_BRANCH ($dev_sha) with $sha on GitHub"
 case "$compare" in
     ahead|identical) ;;
