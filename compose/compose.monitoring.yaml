@@ -376,6 +376,6 @@ services:
 
 volumes:
   prometheus-data:
-    name: sf-local-ai_prometheus
+    name: ${TECHSARA_STACK:-sf-local-ai}_prometheus
   grafana-data:
-    name: sf-local-ai_grafana
+    name: ${TECHSARA_STACK:-sf-local-ai}_grafana

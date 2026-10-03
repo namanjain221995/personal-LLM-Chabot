@@ -218,6 +218,32 @@ export function forwardableAnswerBranch(value: unknown): AnswerBranch | null {
 }
 
 /**
+ * The correlation id of one chat request (2026-10-03, programme task B-03).
+ *
+ * ONE id end to end: the /api/chat proxy sends it to the orchestrator as
+ * `X-Request-ID`, writes it on its own log lines and returns it to the
+ * browser in the same header; the orchestrator stores it as the trace's
+ * `request_id`, returns it in its response header and in the first `meta`
+ * event. The shape is the orchestrator's own (`req_` + 32 hex), which its
+ * persisted trace contract pins and which it accepts in nothing else — so an
+ * id the proxy forwards is never silently replaced on the other side.
+ */
+export const REQUEST_ID_HEADER = 'X-Request-ID';
+const REQUEST_ID_RE = /^req_[0-9A-Fa-f]{32}$/;
+
+/** `value` when it is a well-formed correlation id, else null. */
+export function acceptRequestId(value: unknown): string | null {
+  return typeof value === 'string' && REQUEST_ID_RE.test(value) ? value : null;
+}
+
+/** A fresh correlation id: `req_` + 128 random bits as hex. */
+export function newRequestId(): string {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return `req_${Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')}`;
+}
+
+/**
  * Instructions used when the user sends only an attachment with no text — the
  * orchestrator requires a non-empty `message` (min_length=1).
  */

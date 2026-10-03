@@ -118,9 +118,17 @@
     "                              a retried POST /audio/sessions is idempotent. A request",
     "                              label that authorises nothing. The commit is already on",
     "                              origin (fix/voice-server-round2, dev), so it cannot be",
-    "                              rewritten; merge, never squash or rebase it."
+    "                              rewritten; merge, never squash or rebase it.",
+    "",
+    "2026-10-03 (reviewed, two entropy hits from the autopilot runner tests, none a credential):",
+    "  * ops/autopilot/tests/test_runner.py, commit df091d6, lines 473 and 490",
+    "                            - a fabricated Bearer value (ten zeros and ten `a`) and a",
+    "                              fabricated `--token=abcd1234efgh`, fed to the runner's",
+    "                              log redactor by the tests that prove it removes them.",
+    "                              Never minted. The commit is already on origin",
+    "                              (autopilot/dev); merge it, never squash or rebase it."
   ],
-  "reviewed": "2026-09-29",
+  "reviewed": "2026-10-03",
   "findings": [
     {
       "fingerprint": "187d950902882905b969149fdd2ffc8f24eb73d5:docs/_evidence/sync-worker.md:generic-api-key:230",
@@ -283,6 +291,18 @@
       "rule": "generic-api-key",
       "file": "orchestrator/tests/test_voice_round2.py",
       "line": 331
+    },
+    {
+      "fingerprint": "df091d61e909631f71266d2c5905cbe087432b25:ops/autopilot/tests/test_runner.py:generic-api-key:473",
+      "rule": "generic-api-key",
+      "file": "ops/autopilot/tests/test_runner.py",
+      "line": 473
+    },
+    {
+      "fingerprint": "df091d61e909631f71266d2c5905cbe087432b25:ops/autopilot/tests/test_runner.py:generic-api-key:490",
+      "rule": "generic-api-key",
+      "file": "ops/autopilot/tests/test_runner.py",
+      "line": 490
     }
   ]
 }

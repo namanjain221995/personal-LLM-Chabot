@@ -16,7 +16,7 @@ x-nvidia-devices: &nvidia-devices
 
 services:
   orchestrator:
-    image: sf-local-ai-orchestrator:cuda
+    image: ${TECHSARA_STACK:-sf-local-ai}-orchestrator:cuda
     build:
       context: ./orchestrator
       dockerfile: Dockerfile.cuda
@@ -482,4 +482,4 @@ volumes:
   # Named like hf-cache in compose.yaml so `docker volume ls` reads the same
   # way on both nodes (the worker's is sf-local-ai-worker_kernel-cache).
   vllm-kernel-cache:
-    name: sf-local-ai_vllm-kernel-cache
+    name: ${TECHSARA_STACK:-sf-local-ai}_vllm-kernel-cache

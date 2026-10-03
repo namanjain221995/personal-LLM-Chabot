@@ -19,15 +19,26 @@ connections, which cannot see an outer test transaction — every history test
 would read an empty database).
 
 THE ONE REAL COST: the suite now needs a reachable PostgreSQL. It stays
-offline in every other sense — no vLLM, no GPU, no torch, no network. Point it
-somewhere with TEST_DATABASE_URL, or start a throwaway server. It must be a
-DEDICATED test server: the suite refuses one that also holds a non-test
-database (the production instance holds `techsara`), see `_assert_test_server`.
+offline in every other sense — no vLLM, no GPU, no torch, no network. There is
+no default server (2026-10-03): the suite runs only when it is told exactly
+which dedicated test database to use —
 
-    docker run -d --name pg-test -p 55432:5432 \\
-        -e POSTGRES_PASSWORD=test -e POSTGRES_USER=test -e POSTGRES_DB=test \\
-        postgres:18-alpine
-    export TEST_DATABASE_URL=postgresql://test:test@127.0.0.1:55432/test
+    TEST_DATABASE_URL=postgresql://<user>:<password>@<host>:<port>/<name>_test
+    TEST_DATABASE_ALLOWED_HOSTS=<host>:<port>[,<host>:<port>…]
+
+The database name must end in `_test`, its host:port must be listed in
+TEST_DATABASE_ALLOWED_HOSTS (GitHub Actions jobs, which bring their own
+service container, are exempt), and the server must hold nothing but test
+databases (the production instance holds `techsara`, see `_assert_test_server`).
+A throwaway server for a developer box:
+
+    docker run -d --name pg-test-$USER -p 127.0.0.1:<free port>:5432 \\
+        -e POSTGRES_PASSWORD=test -e POSTGRES_USER=test \\
+        -e POSTGRES_INITDB_ARGS='--locale=C --encoding=UTF8' postgres:18-alpine
+
+A test database on another host (TEST_DATABASE_REMOTE=1) sees that host's
+clock; the few tests that compare Python timestamps with the server's now()
+are then expected to fail, see CLOCK_SKEW_SENSITIVE.
 """
 from __future__ import annotations
 
@@ -159,37 +170,64 @@ _APP_TABLES = (
     "users",
 )
 
-_DEFAULT_TEST_DSN = "postgresql://postgres:postgres@127.0.0.1:55432/techsara_test"
-
-
 def _assert_safe_test_dsn(dsn: str) -> str:
     """Refuse any database name that is not unmistakably test-only.
 
     This guard is deliberately positive: merely differing from the configured
     production DSN is not enough protection for the unconditional TRUNCATE
-    fixture below.
+    fixture below. Since 2026-10-03 the one accepted shape is a name ending in
+    `_test` (the CI shards use `techsara_orchestrator_shard<N>_test`).
     """
     parsed = urlsplit(dsn)
     database = unquote(parsed.path.lstrip("/")).strip().lower()
-    marked_test = (
-        database == "test"
-        or database.startswith(("test_", "test-"))
-        or database.endswith(("_test", "-test"))
-    )
-    if parsed.scheme not in {"postgres", "postgresql"} or not database or not marked_test:
+    marked_test = database.endswith("_test") and len(database) > len("_test")
+    if parsed.scheme not in {"postgres", "postgresql"} or not marked_test:
         raise pytest.UsageError(
             "Refusing to run destructive fixtures: TEST_DATABASE_URL must use "
-            "PostgreSQL and a database named `test`, prefixed `test_`/`test-`, "
-            "or suffixed `_test`/`-test`."
+            "PostgreSQL and a database whose name ends in `_test`."
         )
     return dsn
 
 
-def _test_dsn() -> str:
-    """Where the suite's database lives, in order of preference.
+def _server_label(dsn: str) -> str:
+    parsed = urlsplit(dsn)
+    host = (parsed.hostname or "").lower()
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{host}:{parsed.port or 5432}"
 
-    1. TEST_DATABASE_URL — an explicit override always wins.
-    2. A throwaway container on 55432 (see the module docstring).
+
+def _assert_allowed_server(dsn: str) -> None:
+    """Refuse a server that is not named as the dedicated test database.
+
+    The name guard says the DATABASE is disposable and the server guard below
+    says the SERVER holds nothing else; neither says it is the server this
+    machine is meant to use. Developer boxes and the autopilot share hosts with
+    other people's test servers (one sat on the old default port), so the
+    host:port must be listed in TEST_DATABASE_ALLOWED_HOSTS. GitHub Actions
+    jobs are exempt: each brings its own service container.
+    """
+    allowed = {
+        h.strip().lower() for h in (os.environ.get("TEST_DATABASE_ALLOWED_HOSTS") or "").split(",")
+        if h.strip()
+    }
+    if not allowed and os.environ.get("GITHUB_ACTIONS") == "true":
+        return
+    label = _server_label(dsn)
+    if label not in allowed:
+        raise pytest.UsageError(
+            f"Refusing to run destructive fixtures on {label}: it is not listed in "
+            "TEST_DATABASE_ALLOWED_HOSTS (comma-separated host:port of the dedicated "
+            "test database). Set it next to TEST_DATABASE_URL; there is no default server."
+        )
+
+
+def _test_dsn() -> str:
+    """Where the suite's database lives: TEST_DATABASE_URL, and nothing else.
+
+    There is no default server since 2026-10-03: the old default
+    (a loopback port on a shared host) was another session's test server, and
+    a default run truncated its tables.
 
     Deliberately NOT derived from APP_DATABASE_URL or POSTGRES_USER/PASSWORD
     any more (removed 2026-09-14). Both named the APPLICATION's server, so
@@ -201,9 +239,16 @@ def _test_dsn() -> str:
     refuses such a server even when TEST_DATABASE_URL points at it.
     """
     explicit = (os.environ.get("TEST_DATABASE_URL") or "").strip()
-    if explicit:
-        return _assert_safe_test_dsn(explicit)
-    return _assert_safe_test_dsn(_DEFAULT_TEST_DSN)
+    if not explicit:
+        raise pytest.UsageError(
+            "TEST_DATABASE_URL is not set. The suite TRUNCATEs every table, so it has "
+            "no default server: point TEST_DATABASE_URL at a dedicated test database "
+            "whose name ends in `_test`, and list its host:port in "
+            "TEST_DATABASE_ALLOWED_HOSTS."
+        )
+    dsn = _assert_safe_test_dsn(explicit)
+    _assert_allowed_server(dsn)
+    return dsn
 
 
 #: Databases every PostgreSQL server has; they say nothing about its purpose.
@@ -287,11 +332,12 @@ def _assert_test_server(dsn: str) -> None:
             "application server force checkpoints, WAL growth and exclusive locks "
             "onto its users.\n"
             "Start a throwaway server and point the suite at it:\n"
-            "    docker run -d --rm --memory=2g --name pg-test-$USER -p 127.0.0.1:55432:5432 "
+            "    docker run -d --rm --memory=2g --name pg-test-$USER -p 127.0.0.1:<free port>:5432 "
             "-e POSTGRES_PASSWORD=postgres -e POSTGRES_USER=postgres "
             "-e POSTGRES_INITDB_ARGS='--locale=C --encoding=UTF8' postgres:18-alpine "
             "-c fsync=off -c synchronous_commit=off -c full_page_writes=off\n"
-            "    export TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/techsara_test\n"
+            "    export TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:<port>/techsara_test\n"
+            "    export TEST_DATABASE_ALLOWED_HOSTS=127.0.0.1:<port>\n"
             "A development server that holds other scratch databases can list them in "
             "TEST_DATABASE_ALLOW_SHARED_SERVER (never the application database)."
         )
@@ -302,6 +348,7 @@ def _ensure_database(dsn: str) -> None:
     there at all. A skip would be worse than an error: the whole history, auth
     and upload surface would silently stop being tested."""
     _assert_safe_test_dsn(dsn)
+    _assert_allowed_server(dsn)
     import psycopg
 
     try:
@@ -310,11 +357,8 @@ def _ensure_database(dsn: str) -> None:
         raise pytest.UsageError(
             f"the test suite needs a PostgreSQL server at {dsn!r} and could not "
             f"reach it:\n    {exc}\n"
-            "Start one with:\n"
-            "    docker run -d --name pg-test -p 55432:5432 "
-            "-e POSTGRES_PASSWORD=postgres -e POSTGRES_USER=postgres "
-            "-e POSTGRES_DB=postgres postgres:18-alpine\n"
-            "or point the suite elsewhere with TEST_DATABASE_URL."
+            "Start a dedicated test server (module docstring) and point "
+            "TEST_DATABASE_URL and TEST_DATABASE_ALLOWED_HOSTS at it."
         ) from exc
 
     try:
@@ -325,11 +369,8 @@ def _ensure_database(dsn: str) -> None:
             raise pytest.UsageError(
                 f"the test suite needs a PostgreSQL server at {dsn!r} and could not "
                 f"reach it:\n    {exc}\n"
-                "Start one with:\n"
-                "    docker run -d --name pg-test -p 55432:5432 "
-                "-e POSTGRES_PASSWORD=postgres -e POSTGRES_USER=postgres "
-                "-e POSTGRES_DB=postgres postgres:18-alpine\n"
-                "or point the suite elsewhere with TEST_DATABASE_URL."
+                "Start a dedicated test server (module docstring) and point "
+                "TEST_DATABASE_URL and TEST_DATABASE_ALLOWED_HOSTS at it."
             ) from exc
 
     base, _, dbname = dsn.rpartition("/")
@@ -344,6 +385,84 @@ def _ensure_database(dsn: str) -> None:
             f'CREATE DATABASE "{dbname}" TEMPLATE template0 '
             "LC_COLLATE 'C' LC_CTYPE 'C' ENCODING 'UTF8'"
         )
+
+
+#: Tests that compare a Python-side timestamp with the database server's now().
+#: Against a test database on ANOTHER host (TEST_DATABASE_REMOTE=1) they see
+#: that host's clock, tens of milliseconds off and in either direction (16-17 ms
+#: measured 2026-09-18 and 2026-09-30; -36 ms then +15 ms within one hour on
+#: 2026-10-03), and fail on untouched main too. Which ones fail depends on the
+#: sign: the crawl entry when the server is behind, the rest when it is ahead.
+#: They stay strict everywhere else: CI runs Postgres on the same host.
+#: Exact node ids relative to orchestrator/tests/, each proven on main.
+CLOCK_SKEW_SENSITIVE = frozenset({
+    # `enqueue_web_crawl(..., recent_hours=0)` compares a Python-written
+    # finished_at with the server's now() (fails on every remote run).
+    "test_crawl_queue.py::test_enqueue_is_deduped_by_scope_and_recent_crawls",
+    # Webhook deliveries are queued with next_attempt_at = the server's now()
+    # and found due by `db.due_webhook_deliveries` /
+    # `queue.claim_due_deliveries` against Python's now (server ahead: none due).
+    # db.enqueue_webhook_delivery, then due_webhook_deliveries()[0].
+    "test_api_platform_db.py::test_a_webhook_endpoint_round_trips_and_refuses_a_plaintext_target",
+    # db.enqueue_webhook_delivery, then due_webhook_deliveries() is empty.
+    "test_api_platform_db.py::test_an_event_is_queued_to_an_endpoint_once_and_carries_it_to_the_sweep",
+    # Re-enabled endpoint: due_webhook_deliveries() is empty.
+    "test_api_platform_db.py::test_a_disabled_endpoints_queue_is_paused_rather_than_lost",
+    # db.enqueue_webhook_delivery, then due_webhook_deliveries()[0].
+    "test_api_platform_db.py::test_no_list_read_of_an_endpoint_carries_the_secret_that_signs_its_deliveries",
+    # db.enqueue_webhook_delivery, then due_webhook_deliveries()[0].
+    "test_api_platform_db.py::test_a_console_retry_may_only_record_an_attempt_on_its_own_delivery",
+    # db.enqueue_webhook_delivery, then due_webhook_deliveries()[0].
+    "test_api_platform_db.py::test_no_row_any_key_or_endpoint_accessor_returns_carries_a_digest_or_a_signing_secret",
+    # emit_response_event, then due_webhook_deliveries() is empty.
+    "test_api_platform_webhooks.py::test_an_event_is_queued_to_every_subscribed_endpoint_and_to_no_other",
+    # worker.run_once() claims nothing (due 0).
+    "test_api_platform_webhooks.py::test_a_successful_delivery_is_recorded_and_clears_the_endpoints_failure_count",
+    # worker.run_once() sends nothing, so nothing is captured to verify.
+    "test_api_platform_webhooks.py::test_a_delivery_is_signed_with_the_endpoints_secret_and_verifies_end_to_end",
+    # emit_response_event, then due_webhook_deliveries()[0].
+    "test_api_platform_webhooks.py::test_a_failing_delivery_retries_with_a_growing_delay_and_stops_at_the_attempt_cap",
+    # worker.run_once() claims nothing (dropped 0).
+    "test_api_platform_webhooks.py::test_an_endpoint_that_points_somewhere_forbidden_is_dropped_on_the_first_attempt",
+    # worker.run_once() claims nothing (retrying 0).
+    "test_api_platform_webhooks.py::test_a_transient_network_failure_is_retried_rather_than_dropped",
+    # worker.run_once() after re-enabling claims nothing (delivered 0).
+    "test_api_platform_webhooks.py::test_a_disabled_endpoints_queue_is_paused_and_resumes_rather_than_being_lost",
+    # worker.run_once() claims nothing (dropped 0).
+    "test_api_platform_webhooks.py::test_an_endpoint_with_no_signing_secret_is_dropped_rather_than_sent_unsigned",
+    # worker.run_once() claims nothing (due 0, not 2).
+    "test_api_platform_webhooks.py::test_one_broken_delivery_does_not_stop_the_others_in_the_same_sweep",
+    # worker.run_once() claims nothing (delivered 0).
+    "test_api_platform_webhooks.py::test_a_test_delivery_goes_through_the_same_signing_and_retry_path",
+    # queue.claim_due_deliveries() claims nothing.
+    "test_api_platform_webhooks.py::test_a_lapsed_rotation_stops_signing_with_the_old_secret_on_a_real_queue_row",
+    # queue.claim_due_deliveries() claims nothing.
+    "test_api_platform_webhooks.py::test_an_open_rotation_read_from_the_database_still_signs_with_both_secrets",
+    # Background job's webhook: due_webhook_deliveries() is empty.
+    "test_publicapi_background.py::test_a_completed_job_queues_its_webhook_without_the_generated_text",
+    # Background job's webhook: due_webhook_deliveries() is empty.
+    "test_publicapi_background.py::test_a_cancelled_job_queues_the_cancelled_event",
+    # Files: not_before = the server's now() + delay, measured against
+    # Python's now (server ahead: the delay overshoots its upper bound).
+    # `assert 250 < delay <= 300` sees 300.01.
+    "test_apifiles_jobs.py::test_an_unavailable_engine_defers_with_backoff_and_the_fifth_deferral_fails_processing_unavailable",
+    # `5.0 < _not_before_in(after) <= 15.0` sees 15.01.
+    "test_apifiles_outage.py::test_a_file_indexed_while_the_embedding_engine_is_down_is_never_failed_and_processes_once_it_is_back",
+    # `_not_before_in(after) <= 300` sees 300.01.
+    "test_apifiles_outage.py::test_a_500_while_the_engine_answers_a_probe_spends_attempts_and_the_fifth_fails_processing_unavailable",
+})
+
+
+def pytest_collection_modifyitems(config, items):
+    if os.environ.get("TEST_DATABASE_REMOTE") != "1":
+        return
+    marker = pytest.mark.xfail(
+        reason="clock skew between this host and the remote test database (TEST_DATABASE_REMOTE=1)",
+        strict=False,
+    )
+    for item in items:
+        if item.nodeid.rsplit("tests/", 1)[-1] in CLOCK_SKEW_SENSITIVE:
+            item.add_marker(marker)
 
 
 @pytest.fixture(scope="session", autouse=True)

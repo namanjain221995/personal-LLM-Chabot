@@ -1,0 +1,41 @@
+# Installed by ops/autopilot/install.sh as ~/.config/systemd/user/llm-autopilot.service.
+[Unit]
+Description=LLM platform upgrade autopilot (docs/ai-platform-upgrade/MASTER_PROMPT.md)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=@WORKTREE@
+ExecStart=/usr/bin/python3 -I @AP_HOME@/bin/autopilot.py
+Restart=always
+RestartSec=60
+# 3 = another instance holds the lock, 64 = stopped on purpose (STOP, COMPLETE, expired)
+RestartPreventExitStatus=3 64
+SuccessExitStatus=64
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUWeight=20
+# The head's memory belongs to production inference: cap the runner process
+# tree (claude, subagents, tests) and make it the first thing the kernel kills.
+# NOTE: containers and image builds run under the Docker daemon, in ITS cgroup,
+# not this one, so they are NOT covered by these caps. The guard keeps dev
+# containers and builds on the worker, and allows only small, capped, --rm tool
+# containers on the head.
+MemoryHigh=5G
+MemoryMax=6G
+MemorySwapMax=512M
+TasksMax=2048
+OOMScoreAdjust=1000
+KillMode=mixed
+TimeoutStopSec=180
+Environment=HOME=@HOME@
+Environment=PATH=@HOME@/.npm-global/bin:@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LANG=C.UTF-8
+Environment=TZ=Asia/Kolkata
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

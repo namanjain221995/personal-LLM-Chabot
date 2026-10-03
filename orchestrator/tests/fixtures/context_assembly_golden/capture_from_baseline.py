@@ -15,7 +15,8 @@ commits 02b509f and 82265d5 carry the same tree):
        "$BASE/orchestrator/tests/fixtures/context_assembly_golden/"
     cd "$BASE/orchestrator"
     CONTEXT_GOLDEN_CAPTURE_DIR=/some/scratch/dir \
-    TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/golden_capture_test \
+    TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:<port>/golden_capture_test \
+    TEST_DATABASE_ALLOWED_HOSTS=127.0.0.1:<port> \
       python -m pytest -q -p no:cacheprovider \
       tests/fixtures/context_assembly_golden/capture_from_baseline.py
 

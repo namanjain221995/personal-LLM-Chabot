@@ -1,13 +1,14 @@
 """Prove the Files conformance tests of BOTH SDK suites against the real
 handlers, and prove they catch what they claim to (2026-09-13).
 
-    TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/test_files_conformance \
+    TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:<port>/files_conformance_test \
+    TEST_DATABASE_ALLOWED_HOSTS=127.0.0.1:<port> \
       conformance/python/.venv/bin/python conformance/python/selftest/files_selftest.py \
         --orchestrator-python orchestrator/.venv/bin/python --node "$(command -v node)"
 
 Run it with the conformance suite's own Python (openai, httpx2, pytest).
 `--orchestrator-python` is a Python that can import the orchestrator (FastAPI,
-psycopg, PIL); TEST_DATABASE_URL a private `test_*` Postgres database.
+psycopg, PIL); TEST_DATABASE_URL a private `*_test` Postgres database listed in TEST_DATABASE_ALLOWED_HOSTS.
 
 WHAT IT CHECKS, against `files_local_target.py` (read its docstring for what
 that harness stubs):
@@ -289,7 +290,7 @@ def main() -> int:
     parser.add_argument("--work", default="", help="keep logs and reports here (default: a temporary directory)")
     args = parser.parse_args()
     if not args.dsn:
-        print("set TEST_DATABASE_URL to a private test_* database", file=sys.stderr)
+        print("set TEST_DATABASE_URL to a private *_test database listed in TEST_DATABASE_ALLOWED_HOSTS", file=sys.stderr)
         return 2
     sys.path.insert(0, str(HERE))
     from files_local_target import DEFECTS  # names only: the module imports no orchestrator code at top level

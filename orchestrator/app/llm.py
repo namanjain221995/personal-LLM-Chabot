@@ -36,6 +36,7 @@ from . import context, engine_state, metrics
 from .config import settings
 from .context import clip_message_contents
 from .core import answer_sampling
+from .core import tracing as _tracing
 from .model_capabilities import ModelCapabilities, ReasoningField
 from .resilience import ModelUnavailable, resilient, sidecar_recovery_s, wait_admitted  # noqa: F401 — re-exported for callers
 
@@ -572,6 +573,18 @@ async def _fit_continuation(
     return msgs, sent
 
 
+def _traced_dispatch(model_clock: "_tracing.ModelCallClock", on_dispatch: Optional[Callable[[], None]]):
+    """The dispatch hook of a traced call: stamp MODEL_DISPATCHED, then the
+    caller's own hook, if any (B-03)."""
+
+    def hook() -> None:
+        model_clock.dispatched()
+        if on_dispatch is not None:
+            on_dispatch()
+
+    return hook
+
+
 def _fire_dispatch(on_dispatch: Optional[Callable[[], None]]) -> None:
     """Call a caller's dispatch hook; a hook that raises must never fail the
     request it observes."""
@@ -779,18 +792,29 @@ async def _settling(sized: Sequence[dict], base_url: str):
 
 
 @contextlib.asynccontextmanager
-async def _consume(stream):
+async def _consume(stream, on_exit: Optional[Callable[[Optional[BaseException]], None]] = None):
     """Iterate a stream and, on ANY early exit — the wall-clock guard, a
     thinking overrun, the consumer being cancelled or closed — close it, so
     the breaker permit and the admission lane it holds are released. A
-    stream read to its end is left alone (its close is a no-op)."""
+    stream read to its end is left alone (its close is a no-op).
+
+    `on_exit` (observation only, B-03): called once the stream is closed,
+    with the exception that ended the block or None; it must not raise, and
+    is suppressed if it does."""
+    ended_by: Optional[BaseException] = None
     try:
         yield stream
+    except BaseException as exc:
+        ended_by = exc
+        raise
     finally:
         closer = getattr(stream, "close", None)
         if closer is not None:
             with contextlib.suppress(Exception):
                 await closer()
+        if on_exit is not None:
+            with contextlib.suppress(Exception):
+                on_exit(ended_by)
 
 
 def _bad_request_error():
@@ -1529,6 +1553,11 @@ async def stream_chat_events(
     # Cleared before anything can fail, so a call that dies in sizing never
     # leaves the previous call's ceiling standing for its caller to report.
     reset_applied_max_tokens()
+    # §11 model stages on the chat turn's trace (B-03): prompt prepared,
+    # dispatched, first chunk, ended. None outside a traced turn (/v1, tests)
+    # and past the per-turn cap, and then nothing below records anything.
+    model_clock = _tracing.model_call(model_choice=model_choice, effort=effort)
+    usage_before = get_usage() if model_clock is not None else None
     base_url, api_key, model_id = resolve_model_choice(model_choice)
     thinking_on = wants_thinking(model_choice, effort)
     plan_thinking = getattr(answer_plan, "enable_thinking", None) if answer_plan is not None else None
@@ -1581,8 +1610,9 @@ async def stream_chat_events(
         client = _client(base_url, api_key, read_timeout=float(read_timeout_s))
     clock = _wall_clock_for(wall_clock_s)
     send: dict = {}
-    if on_dispatch is not None:
-        send["on_dispatch"] = on_dispatch
+    dispatch_hook = _traced_dispatch(model_clock, on_dispatch) if model_clock is not None else on_dispatch
+    if dispatch_hook is not None:
+        send["on_dispatch"] = dispatch_hook
     if admission_patient:
         send["patient"] = True
     if admission_run_id is not None:
@@ -1659,6 +1689,30 @@ async def stream_chat_events(
     started = _generation_clock()
     reset_finish_reason()
     dispatched = False
+
+    def call_ended(exc: Optional[BaseException]) -> None:
+        """MODEL_STREAM_ENDED, with this call's own token counts (the
+        turn's accounting before and after it) and why it stopped."""
+        if model_clock is None:
+            return
+        after = get_usage()
+        before = usage_before or {}
+        usage = None
+        if after and after.get("calls", 0) > before.get("calls", 0):
+            usage = {key: after.get(key, 0) - before.get(key, 0) for key in ("prompt_tokens", "completion_tokens")}
+        model_clock.ended(
+            "completed" if exc is None
+            else "cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+            else "error",
+            finish_reason=_finish_reason.get(),
+            reasoning_chunks=reasoning_seen,
+            answer_chunks=token_seen,
+            usage=usage,
+        )
+
+    clock_exit = call_ended if model_clock is not None else None
+    if model_clock is not None:
+        model_clock.prepared(thinking=bool(thinking_on), output_budget=budget, messages=len(sized))
     try:
         try:
             opened = await _open_stream(client, request, **send)
@@ -1679,17 +1733,21 @@ async def stream_chat_events(
         dispatched = True
     except BaseException as exc:
         _withdraw_window_on_size_refusal(exc, base_url)
+        if clock_exit is not None:
+            clock_exit(exc)
         raise
     finally:
         # Synchronous, so nothing can be cancelled between the dispatch and
         # the stream being taken below.
         if not dispatched:
             context.cancel_pending_count()
-    async with _consume(opened) as stream:
+    async with _consume(opened, on_exit=clock_exit) as stream:
         # Settled with the stream already held: a Stop here closes it.
         await context.settle_pending_count(sized, base_url)
         async for chunk in stream:
             engine_state.note_chunk()
+            if model_clock is not None and model_clock.first_chunk_at is None:
+                model_clock.first_chunk()
             _capture_finish(chunk)
             elapsed = _generation_clock() - started
             if clock is not None and elapsed > clock:
@@ -1725,6 +1783,8 @@ async def stream_chat_events(
             reasoning = _reasoning_delta(delta, capabilities)
             if reasoning:
                 reasoning_seen += 1
+                if model_clock is not None and model_clock.first_reasoning_at is None:
+                    model_clock.delta("reasoning")
                 if cap is not None and reasoning_seen > cap:
                     # Forced closure: the model is looping in its own head. Stop
                     # paying for it and answer the question directly — the
@@ -1780,12 +1840,16 @@ async def stream_chat_events(
                                 continue
                             fb_content = _delta_value(fb_delta, "content")
                             if fb_content:
+                                if model_clock is not None and model_clock.first_content_at is None:
+                                    model_clock.delta("token")
                                 yield "token", str(fb_content)
                     return
                 yield "reasoning", reasoning
             content = _delta_value(delta, "content")
             if content:
                 token_seen += 1
+                if model_clock is not None and model_clock.first_content_at is None:
+                    model_clock.delta("token")
                 yield "token", str(content)
     # Usage telemetry (log-only): with budgets off this is the record of what
     # unbounded thinking actually cost, and the data a future budget decision

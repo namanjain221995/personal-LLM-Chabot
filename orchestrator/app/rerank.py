@@ -445,6 +445,7 @@ async def score(
         raise RerankUnavailable(f"reranker tripped: {breaker_reason()}")
     if wait is None:
         wait = float(settings.rerank_wait_s)
+    queued = time.perf_counter()
     slot = await _acquire(kind, wait)
     started = time.perf_counter()
     _inflight += 1
@@ -454,6 +455,7 @@ async def score(
     except Exception as exc:  # noqa: BLE001 — every failure is one outcome for callers
         metrics.inc("rerank_requests_total", outcome="error", kind=kind)
         log.debug("rerank failed", exc_info=True)
+        _trace_rerank("error", kind, len(documents), queued, started)
         raise RerankUnavailable(str(exc)) from exc
     finally:
         _inflight -= 1
@@ -462,9 +464,36 @@ async def score(
         metrics.observe("rerank_seconds", time.perf_counter() - started, kind=kind, n=str(_bucket(len(documents))))
     if degenerate(scores):
         metrics.inc("rerank_requests_total", outcome="degenerate", kind=kind)
+        _trace_rerank("degenerate", kind, len(documents), queued, started)
         raise RerankUnavailable("reranker returned degenerate scores")
     metrics.inc("rerank_requests_total", outcome="ok", kind=kind)
+    _trace_rerank("ok", kind, len(documents), queued, started)
     return scores
+
+
+def _trace_rerank(outcome: str, kind: str, documents: int, queued: float, started: float) -> None:
+    """§11 reranking on the chat turn's trace (B-03): one RERANK stage per
+    scored batch, the first MAX_TRACED_RERANKS of a turn. Its duration is
+    the request to the reranker; `wait_ms` the wait for a slot before it.
+    A no-op outside a traced turn (/v1, warm-ups)."""
+    from .core import tracing
+
+    if tracing.admit("rerank", tracing.MAX_TRACED_RERANKS) is None:
+        return
+    now = time.perf_counter()
+    tracing.event_nowait(
+        "RERANK",
+        status="success" if outcome == "ok" else "failed",
+        component="orchestrator.app.rerank",
+        duration_ms=max(0, round((now - started) * 1000)),
+        details={
+            "outcome": outcome,
+            "kind": kind,
+            "documents": documents,
+            "wait_ms": max(0, round((started - queued) * 1000)),
+        },
+        at=now,
+    )
 
 
 def _bucket(n: int) -> int:
