@@ -52,6 +52,17 @@ def _cwd(c):
 # 1. Quoting, evaluation and wrapper tricks.
 # ===========================================================================
 QUOTING_DENY = [
+    # operators written without spaces are split like bash splits them
+    "( true ); git push origin main",
+    "(true);git push origin main",
+    "true &&(git push origin main)",
+    "true;(git push origin main)",
+    "true|(git push -f origin dev)",
+    "( true )&& git push origin main",
+    "( true )|| sudo reboot",
+    "(cd /tmp)&&rm -rf ~/work",
+    "echo \";\" BR=upgrade/i/x; git push origin HEAD:$BR",  # a quoted ';' splits nothing
+    "find ~/.claude/projects \\( -name '*.jsonl' \\) -delete",
     "foo() { sudo reboot ; } ; foo",                        # function body analysed
     "function g { git push -f origin main ; }; g",          # `function` keyword form
     "echo $(( $(sudo reboot) + 1 ))",                       # cmd-subst inside arithmetic
@@ -76,6 +87,10 @@ QUOTING_DENY = [
     "xargs sudo < /dev/null",
 ]
 QUOTING_ALLOW = [
+    "(cd orchestrator && git status --short);git log --oneline -3",
+    "git status&&git log --oneline -1||echo none",
+    "echo \"a;b|c&d<e>f(g)\" 'x;y' \\; \\|",
+    "grep -rn --include='*.py' -e 'foo(' -e 'bar|baz' orchestrator/app",
     "echo \"hello $USER\"",
     "echo \"${HOME:-/tmp}\"",
     "VAR=$(git rev-parse HEAD) && echo \"$VAR\"",
@@ -173,6 +188,19 @@ def Bc(cmd, cwd=None):
 
 
 FS_DENY = [
+    # a find that deletes keeps the broad-delete refusal (chats, worktrees, scratch roots)
+    Bc("find ~/.claude/projects -delete"),
+    Bc("find ~/.claude/projects -name '*.jsonl' -delete"),
+    Bc("find ~/work -delete"),
+    Bc("find ~/work -mindepth 1 -maxdepth 1 -exec rm -rf {} +"),
+    Bc("find ~/work -mindepth 1 -execdir sh -c 'rm -rf \"$1\"' _ {} \\;"),
+    Bc("find ~/work -okdir rm {} \\;"),
+    Bc("find /tmp -delete"),
+    Bc("find /var/tmp -delete"),
+    Bc("find ~/.cache -delete"),
+    Bc("find . -delete", cwd=DEV),
+    Bc("find . -name '*.pyc' -o -delete", cwd=DEV),
+    Bc("find . -exec xargs rm {} +", cwd=DEV),
     # P0-17: moving/deleting the guard dirs and agent/ (holds test-db.vars)
     Bc("rm -rf ~/.llm-autopilot/guard"),
     Bc("rmdir ${HOME}/.llm-autopilot/bin"),
@@ -254,7 +282,7 @@ FS_DENY = [
     Bc("tar -xf /tmp/llmdev/x.tar -C ~/.llm-autopilot/agent"),
     Bc("tar -C ~/.llm-autopilot/agent -xf /tmp/llmdev/x.tar"),      # -C before the extract flag
     Bc("tar xf /tmp/llmdev/x.tar -C ~/.llm-autopilot/agent"),       # classic no-dash form
-    Bc("tar --directory=/home/techsphere/.llm-autopilot/agent --extract -f /tmp/llmdev/x.tar"),
+    Bc(f"tar --directory={HOME}/.llm-autopilot/agent --extract -f /tmp/llmdev/x.tar"),
     Bc("ln -sf /tmp/llmdev/test-db.vars ~/.llm-autopilot/agent/"),
     Bc("ln ~/.llm-autopilot/guard/guard_hook.py ~/work/llm-dev/.g"),
     Bc("cp -l ~/.llm-autopilot/agent/test-db.vars /tmp/llmdev/t"),
@@ -271,6 +299,9 @@ FS_DENY = [
     ("Grep", {"pattern": "token", "path": "~/.config/gh"}, None),
 ]
 FS_ALLOW = [
+    Bc("find . -name '*.py' -exec wc -l {} +", cwd=DEV),     # a find that only reads
+    Bc("find . -name '*.py' -exec grep -l TODO {} \\;", cwd=DEV),
+    Bc("find /tmp/llmdev -name '*.log' -delete"),
     W(f"{PRIVATE}/notes.md"),
     W("~/.llm-autopilot/agent/private/p016.json"),
     W("private/scratch.md", cwd=AGENT),
@@ -722,6 +753,10 @@ CASE_ALLOW = [
     "case $x in a) echo a ;& b) echo b ;;& *) echo c ;; esac",
     "case $x in\nesac",
     "echo case in done fi esac",
+    # quoted or escaped parentheses are ordinary pattern characters
+    "case \"$c\" in \"(\") echo open;; \")\") echo close;; *) echo other;; esac",
+    "case \"$c\" in '(') echo open;; \\)) echo close;; esac",
+    "echo \"(\" \\( \")\"",
 ]
 CASE_DENY = [
     "case x in *) sudo reboot;; esac",
@@ -741,6 +776,20 @@ CASE_DENY = [
     "if false; then :; \"fi\"; BR=upgrade/i/x; fi; git push origin HEAD:${BR:-main}",
     "for i in 1; do case $i in 1) :;; esac; BR=upgrade/i/x; done; git push origin HEAD:${BR:-main}",
     "while false; do while false; do :; done; BR=upgrade/i/x; done; git push origin HEAD:${BR:-main}",
+    # a quoted or escaped parenthesis in a pattern never hides the arm body
+    "case x in a|\"(\") git push origin main;; esac",
+    "case x in a|'(') git push origin main;; esac",
+    "case x in a|\\() git push origin main;; esac",
+    "case x in (a|\"(\") sudo reboot;; esac",
+    "case x in a|\"((\") sudo reboot;; esac",
+    "case x in\n  a|\"(\")\n    sudo reboot\n    ;;\nesac",
+    "case x in a|\")\") sudo reboot;; esac",
+    "case x in a|\")\")) sudo reboot;; esac",
+    "( case x in @(a|b)) :;; esac; BR=upgrade/i/x ); git push origin HEAD:${BR:-main}",
+    "( echo \")\"; BR=upgrade/i/x ); git push origin HEAD:${BR:-main}",
+    # text can never forge the guard's internal markers
+    "case x in a) echo;; \x04esac) sudo reboot;; esac",
+    "echo \x05 \x06; ls",
 ]
 
 

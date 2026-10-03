@@ -582,6 +582,17 @@ LITERAL_DOLLAR, LITERAL_TILDE = "\x00", "\x01"
 # word, so it must neither turn the words after it into (unchecked) patterns nor
 # make a body that may not run look like top-level code. _restore() drops the mark.
 KW_MARK = "\x04"
+# protect=True also turns a quoted or backslash-escaped shell operator
+# character ( ) ; & | < > into a placeholder: to bash it is an ordinary word
+# character, but shlex hands a lone quoted ";" or "(" back as the same token as
+# a real operator, which would split a command or open a subshell or an
+# extglob group in segments(). _restore() turns them back.
+LITERAL_OPS = {"(": "\x05", ")": "\x06", ";": "\x0e", "&": "\x0f", "|": "\x10", "<": "\x11", ">": "\x12"}
+_LITERAL = {"$": LITERAL_DOLLAR, "~": LITERAL_TILDE, **LITERAL_OPS}
+_RESTORE_OPS = str.maketrans({v: k for k, v in LITERAL_OPS.items()})
+# Characters the guard uses as internal markers; a command that carries one
+# itself is refused (see analyze()), so text can never forge a marker.
+INTERNAL_MARKS = re.compile("[\x00-\x06\x0e-\x12]")
 CASE_KW = KW_MARK + "case"
 _MARKED_KEYWORDS = re.compile(r"(case|esac|fi|done)(?=$|[\s;|&()<>])")
 
@@ -601,21 +612,24 @@ def prepare(text, protect=False):
                 i = m.end()
                 continue
         if q == "'":
-            res.append(LITERAL_DOLLAR if protect and c == "$" else LITERAL_TILDE if protect and c == "~" else c)
+            res.append(_LITERAL[c] if protect and c in _LITERAL else c)
             if c == "'":
                 q = None
         elif c == "\\" and i + 1 < n:
             if text[i + 1] == "\n":
                 i += 2
                 continue
-            if protect and text[i + 1] in "$~":
-                res.append(LITERAL_DOLLAR if text[i + 1] == "$" else LITERAL_TILDE)
+            if protect and text[i + 1] in _LITERAL:
+                res.append(_LITERAL[text[i + 1]])
             else:
                 res.append(text[i : i + 2])
             i += 2
             continue
         elif q == '"':
-            res.append(LITERAL_TILDE if protect and c == "~" else c)
+            # $( ) and ` ` were extracted before prepare(), so an operator
+            # character left inside double quotes is literal (or part of a
+            # $(( )) expansion); a '$' there still expands.
+            res.append(_LITERAL[c] if protect and c != "$" and c in _LITERAL else c)
             if c == '"':
                 q = None
         elif c in ("'", '"'):
@@ -650,11 +664,37 @@ CASE_ARM_ENDS = {";;", ";&", ";;&"}
 _PUNCT = set(";&|()<>")
 
 
+# Shell operators, longest first. shlex returns a run of operator characters as
+# one token ('(true);git ...' gives ');', 'a &&(b)' gives '&&('), so tokenize()
+# splits each run into the operators bash reads.
+_OPERATORS = (";;&", "<<<", "&>>", ";;", ";&", "&&", "||", "|&", "&>", ">>", ">|", "<<", "<>", ">&", "<&",
+              ";", "&", "|", "(", ")", "<", ">")
+
+
+def split_operators(run):
+    out, i = [], 0
+    while i < len(run):
+        op = next(o for o in _OPERATORS if run.startswith(o, i))
+        out.append(op)
+        i += len(op)
+    return out
+
+
 def tokenize(text):
+    """shlex tokens with every run of unquoted operator characters split into
+    shell operators. With prepare(protect=True), a quoted or escaped operator
+    character is a placeholder, so a token made only of operator characters is
+    always real shell syntax."""
     lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>")
     lex.whitespace_split = True
     lex.commenters = ""
-    return list(lex)
+    out = []
+    for t in lex:
+        if len(t) > 1 and set(t) <= _PUNCT:
+            out += split_operators(t)
+        else:
+            out.append(t)
+    return out
 
 
 def writes_output_file(redirs):
@@ -915,6 +955,7 @@ def _restore(word):
     """Turn the LITERAL_DOLLAR / LITERAL_TILDE placeholders back into '$' / '~'
     and an indexed substitution marker back into plain __SUBST__."""
     word = word.replace(LITERAL_DOLLAR, "$").replace(LITERAL_TILDE, "~").replace(KW_MARK, "")
+    word = word.translate(_RESTORE_OPS)
     return SUBST_MARK.sub("__SUBST__", word) if "\x02" in word else word
 
 
@@ -1072,6 +1113,8 @@ def strip_function_headers(text):
 def analyze(cmd, ctx):
     if ctx.depth > 8:
         ctx.deny("the command nests too deeply for review (fail-closed)")
+    if INTERNAL_MARKS.search(cmd):
+        ctx.deny("the command carries control characters (\\x00-\\x06) that the guard cannot review; remove them (fail-closed)")
     text, docs = split_heredocs(cmd)
     for consumer, body in docs:
         check_heredoc(consumer, body, ctx)
@@ -2476,7 +2519,7 @@ def check_write_targets(cmd, args, ctx):
                     targets.append(args[i + 1])
         if cmd == "wget" and not targets:
             targets.append(".")
-    elif cmd == "find" and any(a in ("-delete", "-exec", "-execdir", "-ok") for a in args):
+    elif cmd == "find" and any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir") for a in args):
         roots = []
         for a in args:
             if a.startswith("-") or a in ("(", "!"):
@@ -2506,10 +2549,49 @@ def check_write_targets(cmd, args, ctx):
             continue
         if (move_or_delete or extract) and holds_guard_file(p):
             ctx.deny("moving into, extracting into, or deleting a directory that holds the autopilot's guard files (guard/, bin/, agent/, test-db.vars, CI approvals, ...) would disable the guardrails (§3.3/P0-17); operate only on individual files the autopilot created")
-        if cmd in ("rm", "rmdir", "shred") and (p in BROAD_DELETE or re.fullmatch(r"/(var/)?tmp/\*", t) or t.rstrip("/") in ("/tmp/*", "/tmp/.*", "~/*", "*", ".*", "/*")):
+        find_broad = cmd == "find" and find_deletes(args) and not (p == R_DEV_WORKTREE and find_is_narrow(args))
+        if (cmd in ("rm", "rmdir", "shred") or find_broad) and (p in BROAD_DELETE or re.fullmatch(r"/(var/)?tmp/\*", t) or t.rstrip("/") in ("/tmp/*", "/tmp/.*", "~/*", "*", ".*", "/*")):
             ctx.deny(f"refuses the broad delete of {t}; delete only paths the autopilot created")
         if not write_allowed(p):
             ctx.deny(write_why(p))
+
+
+# What a `find -exec` may run that removes files, or runs a command the guard
+# reads only without its `{}` operands (so the roots are what it acts on).
+FIND_DELETING_EXEC = {"rm", "rmdir", "unlink", "shred", "srm", "mv", "truncate", "dd", "rsync", "gio", "trash",
+                      "trash-put", "xargs", "env", "nice", "nohup", "timeout", "busybox", "command", "exec",
+                      "parallel"} | SHELLS | INTERPRETERS
+
+
+def find_deletes(args):
+    """True when a find command deletes what it finds: -delete, or an -exec /
+    -execdir / -ok / -okdir that runs a deleting command, a shell, an
+    interpreter or a wrapper. A find that only reads (-exec grep/wc/cat ...)
+    is not a delete."""
+    if "-delete" in args:
+        return True
+    for i, a in enumerate(args):
+        if a in ("-exec", "-execdir", "-ok", "-okdir"):
+            nxt = args[i + 1] if i + 1 < len(args) else ""
+            name = os.path.basename(nxt)
+            if not nxt or name in FIND_DELETING_EXEC or re.match(r"(python|pypy)[0-9.]*$", name) \
+                    or "$" in nxt or "__SUBST__" in nxt:
+                return True
+    return False
+
+
+_FIND_NAME_TESTS = ("-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex")
+
+
+def find_is_narrow(args):
+    """True when a deleting find selects files by a name test that is not a bare
+    wildcard (`-name __pycache__`, `-name '*.pyc'`) and has no operator that
+    could widen it (-o/-or/,/!/-not). Only such a find may clean up inside the
+    dev worktree; at every other broad root a deleting find is refused."""
+    if any(a in ("-o", "-or", ",", "!", "-not") for a in args):
+        return False
+    names = [args[i + 1] for i, a in enumerate(args[:-1]) if a in _FIND_NAME_TESTS]
+    return any(re.search(r"[^*?.\[\]/]", n) for n in names)
 
 
 def _glob_parent(t, cwd):
