@@ -64,6 +64,12 @@ def probes(monkeypatch):
     monkeypatch.setattr(health, "_check_web_index", web_index_ok)
     monkeypatch.setattr(health, "_check_work", lambda: {"live_generations": 0})
     monkeypatch.setattr(health, "_check_artifacts", lambda: {"status": "ok"})
+    # The engine overlay is deliberately NOT cached and carries real-clock ages
+    # rounded to 0.1 s (breaker since_s, last_poll_age_s). Two callers either
+    # side of a rounding edge, e.g. across a GC pause on a hosted runner, got
+    # different reports (CI shard 3, 2026-10-03). Pin it: these tests are about
+    # the cached fan-out; the verdict's freshness has its own test below.
+    monkeypatch.setattr(health, "engine_availability", lambda: {"answer_engine": "main"})
     monkeypatch.setattr(health, "HEALTH_DEPENDENCY_CACHE_S", 4.0)
     # health.py prefers the Settings attribute since 2026-09-13; pin both.
     monkeypatch.setattr(health.settings, "health_dependency_cache_s", 4.0, raising=False)
