@@ -2,6 +2,25 @@
 
 History of the programme, newest first. Designed ≠ Implemented ≠ Tested ≠ Deployed; each entry says which.
 
+## 2026-10-03 — Autopilot cycles 3–5 (10:07–about 16:00 UTC)
+
+- **Cycle 3** (10:07–10:24 UTC, 19 turns): 051b4235 (status-board updates go to PR #98 as comments) and 64e4f699 (gitleaks baseline for two fabricated test values). It ended without updating `RESUME.md`.
+- **Cycle 4** (10:24–14:24 UTC) hit the 4 h cycle timeout (rc 124) while a workflow agent was running the final suite. It merged P0-17 (11550954) and took P0-16 through rounds 2–4 on its branch. The round-5 fixes were left uncommitted in `~/work/llm-p016`. `RESUME.md` and `TASK_BOARD.md` were not updated.
+- **Cycle 5** (from 14:25 UTC): verified and committed round 5, ran independent reviews in parallel, fixed what they found, merged P0-16, and built P0-18. Agents: a differential regression reviewer, a corpus false-positive reviewer, a P0-17 re-QA, a P0-18 builder, two further guard reviewers and a P0-18 reviewer. Each had its own detached worktree or branch; the main session alone edited the guard.
+
+| Item | State | Evidence (command → result) |
+|---|---|---|
+| P0-16 round 5 (fdc58202) | Implemented, TEST_PASSED | `orchestrator/.venv/bin/python -m pytest ops/autopilot/tests -q -p no:cacheprovider` in `~/work/llm-p016` → `118 passed, 852 subtests passed` |
+| Review of fdc58202, regression lens | Reviewed: ship | 148 inputs through base (autopilot/dev) and branch guards: 0 refused by base and allowed by branch, 0 internal errors |
+| Review of fdc58202, corpus lens | Reviewed: fix_first | 2,114 spec and 185,951 extended corpus inputs; 2 regressions and 1 hygiene item, fixed in 9afe1f6a and fb29fb03 (details host-only) |
+| Review of 9afe1f6a | Reviewed: fix_first | 383 cases, 18,000 fuzz inputs; 6 regressions in the `find` and argument-joining handling, fixed in 4ff6bbac |
+| P0-16 after 4ff6bbac | Implemented, TEST_PASSED | Same suite → `118 passed, 852 subtests passed`. The 383-case replay: no input refused by base and allowed by branch that runs anything (7 quoted `';'` arguments remain, which bash passes as data). Spec corpus replay (2,309 inputs): 3 new refusals (2 correct, 1 false positive → P0-19), 7 read-only relaxations, 0 internal errors, p99 1.04 ms in-process |
+| P0-16 merge (04e55f06) | Merged on autopilot/dev, TEST_PASSED, not installed | Merged-tree suite → `152 passed, 859 subtests passed` |
+| Last review of fb29fb03..4ff6bbac | TEST_NOT_RUN at checkpoint time | A fresh reviewer was still running when this entry was written; see `RESUME.md` |
+| P0-17 (11550954) | TEST_PASSED, not installed | Suite on 11550954 → `116 passed, 859 subtests passed` |
+| P0-17 re-QA | Reviewed: fix_first | The first QA's blocking item is fixed. 3 new blocking items → P0-18 (host-only `p0-17-reqa-2026-10-03.md`) |
+| P0-18 (c23b17e2..ea25fba1) | Implemented, TEST_PASSED by the builder, review pending | Builder's suite → `130 passed, 893 subtests passed`; each new test fails on the previous code (builder's check) |
+
 ## 2026-10-03 — Autopilot cycle 2 (07:30–about 10:00 UTC)
 
 Cycle 1 (07:21–07:30 UTC) ended by SIGTERM when the operator restarted the service to add decision 10; it had committed 7ccbe9eb locally. Cycle 2 ran the work in parallel (decision 10): one agent for P0-14, a 7-agent workflow for P0-15, a 6-agent workflow for Phase A, one agent for A-05, one fresh reviewer for the P0-15 patch. Each worked in its own worktree under `~/work` on its own files; this session integrated. Nothing touched production; nothing is installed or deployed.
