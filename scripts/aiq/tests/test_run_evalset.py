@@ -83,6 +83,9 @@ class Fake:
         self.timeline: list = []
         #: conversations a /chat/stop named: their stream ends at the next beat
         self.stopped: set = set()
+        #: a /chat/stop that does nothing (the generation keeps streaming), or answers late
+        self.ignore_stop = False
+        self.stop_delay_s = 0.0
         #: what the account already holds
         self.conversations = self.archived = self.facts = 0
         self.history_status = 200
@@ -232,10 +235,12 @@ def _handler(fake: Fake):
             if self.path == "/chat/stop":
                 body = json.loads(raw or b"{}")
                 fake.note(f"stop {body.get('conversation_id')}")
+                time.sleep(fake.stop_delay_s)
                 with fake.lock:
                     fake.stops.append(body)
-                    fake.stopped.add(body.get("conversation_id"))
-                return self._json(200, {"stopped": True})
+                    if not fake.ignore_stop:
+                        fake.stopped.add(body.get("conversation_id"))
+                return self._json(200, {"stopped": not fake.ignore_stop})
             if self.path == "/chat":
                 return self._chat(json.loads(raw))
             return self._json(404, {"detail": "not found"})
@@ -562,11 +567,16 @@ def test_a_case_past_its_timeout_is_stopped_and_recorded(fake, tmp_path, pwfile)
     assert fake.stops == [{"conversation_id": rec["conversation_id"], "session_id": rec["conversation_id"]}]
 
 
-def test_a_silent_stream_is_a_read_timeout_and_the_generation_is_stopped(fake, tmp_path, pwfile):
+def test_a_silent_stream_cut_at_the_case_limit_is_a_timeout_not_a_dead_pipe(fake, tmp_path, pwfile):
+    # the read timeout is the case's time left (60 s idle limit not reached): when it fires the case's
+    # time is up, so the turn is timed_out like any other cut, and what it streamed is kept
     fake.scripts["EV01"] = {"silent_s": 3}
     _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01,EV03", "--case-timeout-s", "0.6")
     ev01, ev03 = results["cases"]
-    assert ev01["error"].startswith("ReadTimeout") and ev01["turns"] == []
+    assert ev01["error"].startswith("CaseTimeout:")
+    res = ev01["turns"][0]["result"]
+    assert (res["timed_out"], res["timing"]["total_s"]) == (True, None)
+    assert res["answer"] == "\n" + EA.GOOD["EV01"]["answer"][:40] and res["timing"]["first_answer_s"] is not None
     assert fake.stops == [{"conversation_id": ev01["conversation_id"], "session_id": ev01["conversation_id"]}]
     assert ev03["error"] is None, "the next case still runs"
 
@@ -1104,3 +1114,39 @@ def test_the_docstring_states_the_baseline_protocol():
     assert "Use --workers 1 for a baseline" in doc
     assert ("one fresh account per run directory; the baseline is N run directories of --repeats 1, each on its "
             "own fresh account (devstack.sh seed), so repeats never see each other") in doc
+
+
+# ------------------------------------------------- the harness reader --
+
+def test_chat_stops_reading_on_cancel_while_bytes_keep_flowing(fake):
+    fake.ignore_stop = True
+    fake.scripts["EV01"] = {"stall_s": 30}  # a heartbeat every 50 ms, for 30 s
+    client = H.Client(fake.base, EMAIL, PASSWORD)
+    cancel = threading.Event()
+    threading.Timer(0.4, cancel.set).start()
+    t0 = time.monotonic()
+    res = client.chat("conv-c", "hi", [], "fast", test_case_id="EV01", cancel=cancel)
+    assert time.monotonic() - t0 < 1.5
+    assert (res["cancelled"], res["timed_out"], res["terminal"], res["errors"]) == (True, False, None, [])
+    assert res["timing"]["total_s"] is None and res["http"] == 200
+
+
+def test_chat_cancelled_before_the_post_sends_nothing(fake):
+    client = H.Client(fake.base, EMAIL, PASSWORD)
+    cancel = threading.Event()
+    cancel.set()
+    res = client.chat("conv-c", "hi", [], "fast", test_case_id="EV01", cancel=cancel)
+    assert (res["cancelled"], res["http"], res["timing"]["total_s"]) == (True, None, None)
+    assert fake.chats == []
+    assert client.chat("conv-d", "hi", [], "fast", test_case_id="EV01")["cancelled"] is False
+
+
+def test_a_data_frame_that_is_json_but_not_an_object_is_a_bad_frame(fake, tmp_path, pwfile):
+    fake.scripts["EV01"] = {"raw_frames": [f"event: {ev}\ndata: {payload}\n\n" for ev in ("token", "status", "meta")
+                                           for payload in ('"just a string"', "[1, 2]", "42", "null")]}
+    _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01")
+    rec = results["cases"][0]
+    res = rec["turns"][0]["result"]
+    assert rec["error"] is None, rec["error"]
+    assert res["bad_frames"] == 12 and res["answer"] == "\n" + EA.GOOD["EV01"]["answer"]
+    assert res["status_events"] == ["Reading the question"] and res["terminal"] == "done"
