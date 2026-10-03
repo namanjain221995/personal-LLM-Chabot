@@ -68,7 +68,9 @@ def git(cwd, *args):
 
 
 @unittest.skipUnless(os.path.exists(JQ), "the fake gh needs jq")
-class MergeToDev(unittest.TestCase):
+class GateHarness(unittest.TestCase):
+    """A throwaway origin and checkout, a fake gh and helpers; no tests of its own."""
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="mtd-test-")
         self.origin = os.path.join(self.tmp, "origin.git")
@@ -156,6 +158,9 @@ class MergeToDev(unittest.TestCase):
         self.assertIn(needle, r.stderr)
         self.assertEqual(self.origin_ref("dev"), dev_before)
 
+
+@unittest.skipUnless(os.path.exists(JQ), "the fake gh needs jq")
+class MergeToDev(GateHarness):
     # ---- the original gates
     def test_happy_path_fast_forwards_dev_and_never_touches_main(self):
         main_before = self.origin_ref("main")
@@ -763,6 +768,246 @@ class MergeToDev(unittest.TestCase):
         code = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
         bare = [ln for ln in code if re.search(r"(?:^|[;&|({]|\$\()\s*(?:command\s+|exec\s+|env\s+|\\)?git(?:\s|$)", ln)]
         self.assertEqual(bare, [], "git is called outside the wrapper")
+
+    # ---- P0-18: repository configuration that reroutes the transport is refused
+    def test_refuses_repository_configuration_that_reroutes_the_transport(self):
+        dev_before = self.origin_ref("dev")
+        other = os.path.join(self.tmp, "elsewhere.git")
+        subprocess.run(["git", "init", "--bare", "-q", other], check=True)
+        included = os.path.join(self.tmp, "included.cfg")
+        with open(included, "w") as fh:
+            fh.write("[http]\n\tproxy = http://127.0.0.1:9\n")
+        config = os.path.join(self.wt, ".git", "config")
+        worktree_config = os.path.join(self.wt, ".git", "config.worktree")
+        with open(config) as fh:
+            pristine = fh.read()
+
+        def worktree_scope():
+            with open(config, "a") as fh:
+                fh.write("[extensions]\n\tworktreeConfig = true\n")
+            with open(worktree_config, "w") as fh:
+                fh.write(f'[remote "origin"]\n\tpushurl = {self.origin}\n[url "{other}"]\n\tpushInsteadOf = {self.origin}\n')
+
+        cases = [
+            # get-url --push origin shows the explicit pushurl, but the gate's push by URL is rewritten
+            ("url.<...>.pushinsteadof", [("remote.origin.pushurl", self.origin), (f"url.{other}.pushInsteadOf", self.origin)]),
+            ("url.<...>.insteadof", [("url.https://example.invalid/.insteadOf", "unrelated:")]),
+            ("http.proxy", [("http.proxy", "http://127.0.0.1:9")]),
+            ("http.<...>.extraheader", [("http.https://example.invalid/.extraHeader", "X-Probe: 1")]),
+            ("http.curloptresolve", [("http.curloptResolve", "example.invalid:443:127.0.0.1")]),
+            ("http.<...>.sslverify", [(f"http.{self.origin}.sslVerify", "false")]),
+            ("core.sshcommand", [("core.sshCommand", "false")]),
+            ("remote.<...>.pushurl", [(f"remote.file://{self.origin}.pushurl", other)]),
+            ("include.path", [("include.path", included)]),
+            ("includeif.<...>.path", [("includeIf.gitdir:/.path", included)]),
+            ("url.<...>.pushinsteadof", worktree_scope),
+        ]
+        for needle, change in cases:
+            with self.subTest(needle, change=change if isinstance(change, list) else "config.worktree"):
+                try:
+                    if callable(change):
+                        change()
+                    else:
+                        for key, value in change:
+                            git(self.wt, "config", key, value)
+                    r = self.run_gate()
+                    self.assert_refused(r, "sets ", dev_before)
+                    self.assertIn(needle, r.stderr.split("sets ", 1)[1].split(", which", 1)[0].split(","))
+                    self.assertNotIn("OK:", r.stderr)
+                    for value in ("example.invalid", "X-Probe", "127.0.0.1:9"):
+                        self.assertNotIn(value, r.stderr, "the log shows key names without values or subsections")
+                    self.assertEqual(git(other, "for-each-ref"), "", "nothing was pushed elsewhere")
+                finally:
+                    with open(config, "w") as fh:
+                        fh.write(pristine)
+                    if os.path.exists(worktree_config):
+                        os.remove(worktree_config)
+        r = self.run_gate("--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_the_production_shaped_configuration_passes(self):
+        # The production checkout's repository configuration (key names checked
+        # 2026-10-03): branch metadata, pull.rebase and a URL-scoped credential
+        # helper, which the gate neutralises rather than refuses.
+        marker, script = self.marker_script("repo-helper")
+        for key, value in (("pull.rebase", "false"), ("branch.dev.github-pr-owner-number", "o#r#1"),
+                           ("branch.main.vscode-merge-base", "origin/main"),
+                           ("credential.https://github.com.helper", ""),
+                           ("credential.https://github.com.helper", "!" + script)):
+            git(self.wt, "config", "--add", key, value)
+        r = self.run_gate()
+        self.assert_merged_without(marker, r)
+
+
+class GitHttpServer:
+    """A smart-HTTP git server over `git http-backend`, like GitHub for these
+    tests: fetches are anonymous (the repository is public) and a push needs
+    Basic auth u:p. Every request is recorded with the Authorization it carried."""
+
+    def __init__(self, root, bind="127.0.0.1", port=0):
+        import base64
+        import http.server
+        import threading
+
+        self.seen = []
+        want = "Basic " + base64.b64encode(b"u:p").decode()
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _run(self):
+                path, _, query = self.path.partition("?")
+                auth = self.headers.get("Authorization")
+                outer.seen.append((self.command, self.path, auth))
+                push = "git-receive-pack" in self.path
+                if push and auth != want:
+                    self.send_response(401)
+                    self.send_header("WWW-Authenticate", 'Basic realm="test"')
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                n = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(n) if n else b""
+                env = {"PATH": "/usr/bin:/bin", "HOME": root, "GIT_CONFIG_NOSYSTEM": "1", "GIT_PROJECT_ROOT": root,
+                       "GIT_HTTP_EXPORT_ALL": "1", "PATH_INFO": path, "QUERY_STRING": query,
+                       "REQUEST_METHOD": self.command, "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+                       "CONTENT_LENGTH": str(len(body)), "REMOTE_ADDR": "127.0.0.1"}
+                for header, var in (("Content-Encoding", "HTTP_CONTENT_ENCODING"), ("Git-Protocol", "GIT_PROTOCOL")):
+                    if self.headers.get(header):
+                        env[var] = self.headers[header]
+                if push:
+                    env["REMOTE_USER"] = "u"
+                p = subprocess.run(["git", "http-backend"], input=body, env=env, capture_output=True)
+                head, _, rest = p.stdout.partition(b"\r\n\r\n")
+                status, headers = 200, []
+                for line in head.split(b"\r\n"):
+                    if line:
+                        k, _, v = line.decode().partition(":")
+                        if k.lower() == "status":
+                            status = int(v.strip().split()[0])
+                        else:
+                            headers.append((k, v.strip()))
+                self.send_response(status)
+                for k, v in headers:
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(rest)))
+                self.end_headers()
+                self.wfile.write(rest)
+
+            do_GET = _run
+            do_POST = _run
+
+        self.httpd = http.server.ThreadingHTTPServer((bind, port), Handler)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def authenticated_pushes(self):
+        return [p for (m, p, a) in self.seen if m == "POST" and "git-receive-pack" in p and a]
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+@unittest.skipUnless(os.path.exists(JQ), "the fake gh needs jq")
+class HttpGate(GateHarness):
+    """The gate against an http origin that wants a credential for the push.
+    The gate copy's HOME is a temporary directory whose .gitconfig plays the
+    operator's global git config; the real one is never read."""
+
+    def setUp(self):
+        super().setUp()
+        self.home = os.path.join(self.tmp, "home")
+        os.makedirs(self.home)
+        self.srv = GitHttpServer(self.tmp)
+        self.servers = [self.srv]
+        self.url = f"http://127.0.0.1:{self.srv.port}/origin.git"
+        self.gate = self.http_gate(self.url)
+
+    def tearDown(self):
+        for s in self.servers:
+            s.close()
+        super().tearDown()
+
+    def http_gate(self, url, name="gate-http"):
+        git(self.wt, "remote", "set-url", "origin", url)
+        gate = self.make_gate(name=name, protocol="http")
+        with open(gate) as fh:
+            text = fh.read()
+        for old, new in (('HOME=$(getent passwd "$(id -u)" | cut -d: -f6)', f"HOME={self.home}"),
+                         (f"ORIGIN_URL={self.origin}", f"ORIGIN_URL={url}")):
+            self.assertEqual(text.count("\n" + old + "\n"), 1, old)
+            text = text.replace("\n" + old + "\n", "\n" + new + "\n")
+        with open(gate, "w") as fh:
+            fh.write(text)
+        return gate
+
+    def push_tip(self):
+        # straight into the origin's directory: the test's own git has no credential
+        git(self.wt, "push", "-q", self.origin, "HEAD:refs/heads/autopilot/dev")
+
+    def new_tip(self, name):
+        # something new to merge, so every run pushes (and needs the credential)
+        self.commit(f"{name}.txt", name)
+        self.push_tip()
+
+    def operator_helper(self, shape="gh", host=None):
+        store = os.path.join(self.home, "creds")
+        host = host or f"127.0.0.1:{self.srv.port}"
+        with open(store, "w") as fh:
+            fh.write(f"http://u:p@{host}\n")
+        if shape == "gh":  # what `gh auth setup-git` writes: a reset, then its helper, for one host
+            text = f'[credential "http://{host}"]\n\thelper =\n\thelper = store --file {store}\n'
+        else:
+            text = f"[credential]\n\thelper = store --file {store}\n"
+        with open(os.path.join(self.home, ".gitconfig"), "w") as fh:
+            fh.write(text)
+
+    def no_operator_helper(self):
+        path = os.path.join(self.home, ".gitconfig")
+        if os.path.exists(path):
+            os.remove(path)
+
+    def attacker(self, bind="127.0.0.2"):
+        # another server on the origin's port, holding a copy of the origin
+        root = os.path.join(self.tmp, "attacker")
+        os.makedirs(root)
+        subprocess.run(["git", "clone", "-q", "--bare", self.origin, os.path.join(root, "origin.git")], check=True)
+        bad = GitHttpServer(root, bind=bind, port=self.srv.port)
+        self.servers.append(bad)
+        return bad
+
+    def test_repository_configuration_cannot_send_the_push_or_credential_elsewhere(self):
+        port = self.srv.port
+        cases = [
+            ("http.curloptresolve", "localhost", [("http.curloptResolve", f"localhost:{port}:127.0.0.2")]),
+            ("http.<...>.curloptresolve", "localhost",
+             [(f"http.http://localhost:{port}/origin.git.curloptResolve", f"localhost:{port}:127.0.0.2")]),
+            ("remote.<...>.pushurl", "127.0.0.1",
+             [(f"remote.http://127.0.0.1:{port}/origin.git.pushurl", f"http://127.0.0.2:{port}/origin.git")]),
+        ]
+        bad = self.attacker()
+        config = os.path.join(self.wt, ".git", "config")
+        for needle, host, entries in cases:
+            with self.subTest(needle):
+                url = f"http://{host}:{port}/origin.git"
+                self.operator_helper("generic", host=f"{host}:{port}")
+                gate = self.http_gate(url, name="gate-" + needle.replace("<...>", "x"))
+                with open(config) as fh:
+                    pristine = fh.read()
+                try:
+                    for key, value in entries:
+                        git(self.wt, "config", key, value)
+                    self.new_tip(needle.replace("<...>", "x"))
+                    dev_before = self.origin_ref("dev")
+                    r = self.run_gate(gate=gate)
+                    self.assert_refused(r, f"sets {needle}, which", dev_before)
+                    self.assertEqual(bad.seen, [], "the other server never heard from the gate")
+                finally:
+                    with open(config, "w") as fh:
+                        fh.write(pristine)
 
 
 class Syntax(unittest.TestCase):

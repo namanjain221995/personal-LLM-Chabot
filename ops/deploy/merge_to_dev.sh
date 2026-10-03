@@ -26,7 +26,9 @@
 # reads no replace refs and turns off the commands a repository's
 # configuration can make git run (hooks, fsmonitor, the alternate-refs
 # command, a pager, push signing, automatic maintenance), and git may use
-# only the origin's transport protocol. The autopilot runs the installed copy
+# only the origin's transport protocol. It refuses a repository whose
+# configuration rewrites URLs or sets http.*, core.sshCommand, a remote named
+# by a URL or an include. The autopilot runs the installed copy
 # (~/.llm-autopilot/bin/merge_to_dev.sh), which it cannot edit; this file is
 # the source. Tests run a copy with the configuration block replaced
 # (ops/autopilot/tests/test_merge_to_dev.py).
@@ -169,6 +171,31 @@ for kind in fetch push; do
 done
 url=$(g ls-remote --get-url "$ORIGIN_URL") || refuse "cannot resolve $ORIGIN_URL in $REPO"
 [ "$url" = "$ORIGIN_URL" ] || refuse "git in $REPO rewrites the URL $ORIGIN_URL to another one"
+
+# 0c. the repository's own configuration (local, worktree and whatever they
+#     include) sets nothing that reroutes git's connection to the origin: no
+#     URL rewriting (url.*.insteadOf, url.*.pushInsteadOf), no http.* setting
+#     (proxy, curloptResolve, TLS, extra headers and the rest, URL-scoped ones
+#     included), no core.sshCommand, no remote section named by a URL (the
+#     fetch and push below name the origin by URL, and remote.<url>.pushurl
+#     would send the push elsewhere), and no include, so every key git reads
+#     is listed here. Only key NAMES are read, never values, and the log shows
+#     them without their subsection. The production checkout's repository
+#     configuration has none of these keys, so there is no exception. The
+#     system and global configuration are the operator's and are not checked.
+names=$(g config --show-scope --name-only --list) || refuse "cannot list the git configuration names of $REPO"
+bad=$(printf '%s\n' "$names" | awk -F'\t' '
+    $1 == "system" || $1 == "global" || $1 == "command" || NF < 2 { next }
+    {
+        k = tolower($2)
+        if (k ~ /^(url|http|include|includeif)\./ || k == "core.sshcommand" || k ~ /^remote\..*\/.*\.[^.]*$/) {
+            s = substr(k, 1, index(k, ".") - 1); v = k; sub(/^.*\./, "", v)
+            shown = k
+            if (length(s) + length(v) + 1 < length(k)) shown = s ".<...>." v
+            print shown
+        }
+    }' | sort -u | paste -sd, -)
+[ -z "$bad" ] || refuse "the git configuration of $REPO sets $bad, which can reroute or rewrite the gate's fetch and push; the operator removes them (list them with: git -C $REPO config --show-scope --name-only --list)"
 
 g fetch --quiet --no-recurse-submodules "$ORIGIN_URL" \
     "+refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH" \
