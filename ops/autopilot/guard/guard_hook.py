@@ -2531,7 +2531,12 @@ def check_write_targets(cmd, args, ctx):
             targets.append(".")
     elif cmd == "find":
         f_starts, f_execs, f_values, f_flags = parse_find(args)
-        if f_execs or "-delete" in f_flags:
+        # A find is a delete/move only when it uses -delete or runs an -exec that
+        # is not a pure read. A reading -exec (find . -exec wc -l {} +) at the dev
+        # worktree root is not a broad delete (P0-19 false positive); its secret
+        # reaches are still checked by check_find.
+        deletes = "-delete" in f_flags or any(not _find_exec_reads_only(inner) for _a, inner in f_execs)
+        if deletes:
             find_roots = f_starts or ["."]
             targets = list(find_roots)
         # -fprint/-fprint0/-fprintf/-fls FILE create or truncate FILE
@@ -2582,6 +2587,27 @@ FIND_NAME_TESTS = ("-name", "-iname", "-path", "-ipath", "-wholename", "-iwholen
                    "-lname", "-ilname")
 FIND_EXEC = ("-exec", "-execdir", "-ok", "-okdir")
 FIND_OUTPUT_FILES = ("-fprint", "-fprint0", "-fprintf", "-fls")
+# Commands a find -exec may run that only READ what they find, so running them
+# at a broad root (the dev worktree, ~/work, /tmp, ~/.claude/projects, ...) is
+# not a delete. Anything not listed (rm, mv, cp, tee, sh -c, xargs, sed -i,
+# git clean, ...) is treated as mutating (fail-closed); its -exec command is
+# still analysed separately by check_find/analyze_words.
+FIND_EXEC_READERS = {"cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "ag", "stat", "file", "ls",
+                     "md5sum", "sha1sum", "sha224sum", "sha256sum", "sha384sum", "sha512sum", "b2sum", "cksum",
+                     "cmp", "diff", "od", "xxd", "hexdump", "strings", "nl", "cut", "tr", "sort", "uniq", "column",
+                     "basename", "dirname", "realpath", "readlink", "echo", "printf", "true", "false", "test", "[", "du"}
+
+
+def _find_exec_reads_only(inner):
+    """True when a find -exec/-ok command only reads (so a find that runs it at a
+    broad root is not a delete). Wrappers (env/nice/timeout/stdbuf/setsid/...) are
+    stripped; a command word that is `{}`, computed, or not a known pure reader is
+    treated as mutating."""
+    words = [w for w in inner if w != "{}" and "{}" not in w]
+    _env, w, _bare = strip_prefix(words)
+    if not w:
+        return False
+    return os.path.basename(w[0]) in FIND_EXEC_READERS
 
 
 def parse_find(args):

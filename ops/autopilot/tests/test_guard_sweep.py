@@ -201,7 +201,6 @@ FS_DENY = [
     Bc("find . -delete", cwd=DEV),
     Bc("find . -name '*.pyc' -o -delete", cwd=DEV),
     Bc("find . -exec xargs rm {} +", cwd=DEV),
-    Bc("find . -name '*.py' -exec wc -l {} +", cwd=DEV),     # any -exec at a broad root (as on autopilot/dev)
     # every -exec action is analysed, not only the first
     Bc("find orchestrator -maxdepth 0 -exec true \\; -exec cat ~/.claude/.credentials.json \\;", cwd=DEV),
     Bc("find orchestrator -maxdepth 0 -exec true {} + -exec git push origin HEAD:main \\;", cwd=DEV),
@@ -216,7 +215,6 @@ FS_DENY = [
     Bc("find ~/work -name .env -exec cat {} +"),
     Bc("find orchestrator -name .env -exec cat {} +", cwd=DEV),
     Bc("find orchestrator -iname '*.PEM' -exec cat {} +", cwd=DEV),
-    Bc("find ~/Documents/project/personal-LLM-Chabot/orchestrator -name '*.py' -o -name x -exec cat {} +", cwd=DEV),
     # starting paths anywhere (bfs), behind -L/-H, from a file, or as a glob
     Bc("find -name '*.jsonl' ~/.claude/projects -delete", cwd=DEV),
     Bc("find -exec cat {} \\; ~/.claude/.credentials.json", cwd=DEV),
@@ -343,6 +341,12 @@ FS_DENY = [
 FS_ALLOW = [
     Bc("find orchestrator -name '*.py' -exec wc -l {} +", cwd=DEV),     # a find that only reads
     Bc("find orchestrator/app -name '*.py' -exec grep -l TODO {} \\;", cwd=DEV),
+    # P0-19: a reading -exec (no -delete, no mutating command) is not a broad
+    # delete, so it is allowed even at the dev worktree root or a prod subtree
+    # the autopilot may read; a mutating -exec at a broad root stays refused (above).
+    Bc("find . -name '*.py' -exec wc -l {} +", cwd=DEV),
+    Bc("find . -exec grep -l foo {} +", cwd=DEV),
+    Bc("find ~/Documents/project/personal-LLM-Chabot/orchestrator -name '*.py' -o -name x -exec cat {} +", cwd=DEV),
     Bc("find /tmp/llmdev -name '*.log' -delete"),
     Bc("rm -rf orchestrator/.scratch-p016-*", cwd=DEV),        # a glob with a literal part
     Bc("find orchestrator -name '*.json' -exec python3 -m json.tool {} \\;", cwd=DEV),
