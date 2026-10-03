@@ -168,6 +168,12 @@ SECRET_DIRS = [
     _real(os.path.join(HOME, ".docker")),
     _real(os.path.join(HOME, ".claude/.credentials.json")),
     _real(os.path.join(AUTOPILOT_HOME, "secrets")),
+    # The test database's connection variables and URL carry its password; the
+    # runner exports them into each cycle, so no tool call needs to print them.
+    _real(TEST_DB_VARS),
+    _real(_hp(TEST_DB.get("url_file") or os.path.join(AUTOPILOT_HOME, "agent", "test-db.url"))),
+    _real(os.path.join(HOME, ".cache/huggingface/token")),
+    _real(os.path.join(HOME, ".cache/huggingface/stored_tokens")),
     "/run/secrets",
     "/etc/shadow",
     "/etc/gshadow",

@@ -1177,6 +1177,25 @@ class GuardFindExecReading(Lists):
         self.check(FIND_EXEC_ALLOW, FIND_EXEC_DENY)
 
 
+# The test database's connection variables and URL file carry its password.
+TEST_DB_SECRET_ALLOW = [
+    "ls -la ~/.llm-autopilot/agent",
+    "grep -rn foo ~/.llm-autopilot/agent/private",
+    "cat ~/.llm-autopilot/agent/private/notes.md",
+]
+TEST_DB_SECRET_DENY = [
+    "cat ~/.llm-autopilot/agent/test-db.vars",
+    "head -1 ~/.llm-autopilot/agent/test-db.url",
+    "grep -r . ~/.llm-autopilot/agent",
+    "find ~/.llm-autopilot/agent -exec cat {} +",
+    "cat ~/.cache/huggingface/token",
+]
+
+
+class GuardTestDbSecrets(Lists):
+    def test_test_db_credentials_are_secret(self):
+        self.check(TEST_DB_SECRET_ALLOW, TEST_DB_SECRET_DENY)
+
 
 if __name__ == "__main__":
     unittest.main()
