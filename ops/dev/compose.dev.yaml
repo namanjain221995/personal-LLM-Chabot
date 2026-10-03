@@ -1,0 +1,196 @@
+# The dev stack: compose.yaml's application plane, isolated, on the WORKER
+# node's Docker daemon. Used only as
+#
+#   docker compose --env-file ops/dev/stack.vars --env-file ops/dev/.env \
+#     -f compose.yaml -f ops/dev/compose.dev.yaml -p llmdev <command>
+#
+# from the worktree root, with DOCKER_HOST=ssh://<worker> -- which is what
+# ops/dev/devstack.sh runs (README.md). Every relative path below resolves
+# against the worktree root (the first file's directory); build contexts are
+# sent from here, so the worker needs no checkout.
+#
+# What this file changes, and why:
+#   * names: the project, images and volumes are llmdev* as LITERALS, not
+#     only through TECHSARA_STACK, so a shell that exports another value
+#     cannot point this stack at production's volumes or image tags;
+#   * engines: the orchestrator reaches inference only through the new
+#     inference-cap service, which holds the whole stack to two in-flight
+#     model requests against production's engines (ops/dev/inference_cap/);
+#   * memory: every service that runs has a hard memory and CPU limit and
+#     oom_score_adj 1000, so under pressure the kernel kills dev first;
+#   * restarts: "no" -- a crashed dev container stays down and visible;
+#   * outside services: Salesforce, paid search, speech, the voice archive,
+#     video, OCR and the v1-gateway are off, as literals (below);
+#   * ports: loopback only, never production's 8080/3000, written as
+#     literals (127.0.0.1:28080 and 127.0.0.1:23000) so a shell that exports
+#     ORCHESTRATOR_PORT, FRONTEND_PORT or TECHSARA_BIND_ADDRESS cannot move
+#     them; Postgres is not published at all (use `exec -T postgres psql`);
+#   * no bind mounts: with DOCKER_HOST=ssh:// a bind source resolves on the
+#     WORKER's filesystem, where this checkout does not exist.
+name: llmdev
+
+x-dev-guards: &dev-guards
+  # The kernel's first choice under memory pressure (production's engines
+  # run at -450 and its expendables at 700-900).
+  oom_score_adj: 1000
+  restart: "no"
+
+services:
+  postgres:
+    <<: *dev-guards
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: 2
+    pids_limit: 256
+    # Not published: compose.yaml publishes 127.0.0.1:5432, which the
+    # worker's test database may hold, and nothing in dev needs it.
+    ports: !reset []
+
+  orchestrator:
+    <<: *dev-guards
+    image: llmdev-orchestrator:cpu
+    mem_limit: 6g
+    memswap_limit: 6g
+    cpus: 4
+    # Threads count: anyio's pool, libuv's 16, the DB pool, renderers.
+    pids_limit: 1024
+    # Only the dev stack's own files. compose.yaml also reads the worktree
+    # root's `.env` and defaults the secrets layer to `.runtime/secrets.env`;
+    # neither belongs to this stack.
+    env_file: !override
+      - path: ${TECHSARA_SECRET_ENV:?TECHSARA_SECRET_ENV is set by ops/dev/stack.vars}
+        required: true
+      - path: ${TECHSARA_GENERATED_ENV:?TECHSARA_GENERATED_ENV is set by ops/dev/stack.vars}
+        required: true
+    environment:
+      # Literals: `environment:` outranks env_file, and these must hold
+      # whatever the shell or an env file says.
+      SF_LIVE_ENABLED: "false"
+      SF_CLIENT_ID: ""
+      SF_CLIENT_SECRET: ""
+      SF_USERNAME: ""
+      SF_LOGIN_URL: ""
+      SF_PRIVATE_KEY_B64: ""
+      TAVILY_API_KEY: ""
+      BRAVE_API_KEY: ""
+      ASR_ENABLED: "false"
+      ASR_BASE_URL: ""
+      ASR_BASE_URLS: ""
+      VIDEO_ANALYSIS_ENABLED: "false"
+      VOICE_ARCHIVE_ENABLED: "false"
+      VOICE_ARCHIVE_URL: ""
+      VOICE_ARCHIVE_TLS_CERT_B64: ""
+      OCR_BASE_URL: http://disabled.invalid/v1
+      PUBLIC_API_GATEWAY_PEERS: ""
+      PUBLIC_API_TRUSTED_PROXIES: ""
+      # No model downloads: the CPU image needs none, and a dev container
+      # must not pull from the internet on a cache miss.
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    # Named volumes only. The base also bind-mounts ./brain/packs, which on
+    # the worker's daemon would resolve to a path that does not exist there
+    # (brain packs are optional: core/brain.py reports them absent).
+    volumes: !override
+      - data:/data
+      - reports:/reports
+      - hf-cache:/root/.cache/huggingface
+    # A literal: a shell variable would outrank any --env-file value.
+    ports: !override
+      - "127.0.0.1:28080:8080"
+    # No v1relay: that network exists for the v1-gateway, which dev does not
+    # start, and leaving the orchestrator on it would create the pinned
+    # 10.231.231.0/28 subnet on the worker for nothing.
+    networks: !override
+      application:
+      inference:
+    depends_on:
+      inference-cap:
+        condition: service_healthy
+
+  frontend:
+    <<: *dev-guards
+    image: llmdev-frontend:portable
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 2
+    pids_limit: 256
+    environment:
+      NEXT_PUBLIC_APP_NAME: TechSara AI (dev)
+      V1_GATEWAY_URL: ""
+    # A literal, as for the orchestrator.
+    ports: !override
+      - "127.0.0.1:23000:3000"
+
+  # The dev stack's only way to the model engines: a small proxy that routes
+  # /<name>/<rest> to the upstream named <name> (CAP_UPSTREAMS in
+  # engines.env) and holds the whole stack to CAP_MAX_INFLIGHT (2) engine
+  # requests at a time. Built from ops/dev/inference_cap/; how it works and
+  # its limits: the docstring of ops/dev/inference_cap/inference_cap.py and
+  # ops/dev/README.md ("Limits of the cap").
+  inference-cap:
+    <<: *dev-guards
+    image: llmdev-inference-cap:dev
+    build:
+      context: ./ops/dev/inference_cap
+    env_file:
+      - path: ${TECHSARA_DEV_ENGINES_ENV:?TECHSARA_DEV_ENGINES_ENV is set by ops/dev/stack.vars}
+        required: true
+    # `application` only: it needs egress to the head's engines, and the
+    # `inference` network is internal (no route out).
+    networks:
+      - application
+    # No ports: the orchestrator reaches it as inference-cap:9100.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # The cap may hold up to CAP_MAX_BUFFERED_BYTES (512 MiB) of queued
+    # request bodies plus the two in flight; 1 GiB covers that and Python.
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 1
+    pids_limit: 128
+    init: true
+    # Above the cap's own 30 s SIGTERM drain, so Docker never kills a draining relay.
+    stop_grace_period: 40s
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - |
+          import urllib.request
+          with urllib.request.urlopen("http://127.0.0.1:9100/_cap/health", timeout=4) as response:
+              raise SystemExit(0 if response.status == 200 else 1)
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Never started in dev: the sync-worker logs in to the production Salesforce
+  # org and the v1-gateway exists for public /v1 traffic. No command enables
+  # the `dev-off` profile.
+  sync-worker:
+    profiles: [dev-off]
+  v1-gateway:
+    profiles: [dev-off]
+
+volumes:
+  data:
+    name: llmdev_data
+  reports:
+    name: llmdev_reports
+  pgdata:
+    name: llmdev_pgdata
+  pgadmin:
+    name: llmdev_pgadmin
+  hf-cache:
+    name: llmdev_hf-cache
+  v1gateway_spool:
+    name: llmdev_v1gateway_spool
