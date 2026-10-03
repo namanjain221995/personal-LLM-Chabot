@@ -833,6 +833,32 @@ class MergeToDev(GateHarness):
         r = self.run_gate("--dry-run")
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    def test_a_rerouting_key_added_during_the_checks_is_refused_before_the_push(self):
+        # The configuration is listed again right before the push: a key that
+        # appears after the first check (here: added by a git stand-in while
+        # the gate reads the commit) still stops it.
+        dev_before = self.origin_ref("dev")
+        added = os.path.join(self.tmp, "added")
+        stand_in = os.path.join(self.tmp, "git-adding")
+        with open(stand_in, "w") as fh:
+            fh.write(textwrap.dedent(f"""\
+                #!/bin/sh
+                case " $* " in
+                    *" ls-tree "*)
+                        if [ ! -e '{added}' ]; then
+                            printf '[url "{self.tmp}/elsewhere.git"]\\n\\tpushInsteadOf = {self.origin}\\n' >> '{self.wt}/.git/config'
+                            : > '{added}'
+                        fi ;;
+                esac
+                exec /usr/bin/git "$@"
+                """))
+        os.chmod(stand_in, 0o755)
+        gate = self.make_gate(name="gate-late-key", git_bin=stand_in)
+        r = self.run_gate(gate=gate)
+        self.assertTrue(os.path.exists(added), "the key was added after the first check")
+        self.assert_refused(r, "sets url.<...>.pushinsteadof, which", dev_before)
+        self.assertIn("OK:", r.stderr, "every other check had passed")
+
     def test_the_production_shaped_configuration_passes(self):
         # The production checkout's repository configuration (key names checked
         # 2026-10-03): branch metadata, pull.rebase and a URL-scoped credential

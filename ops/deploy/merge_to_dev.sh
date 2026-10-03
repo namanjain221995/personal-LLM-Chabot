@@ -195,20 +195,25 @@ url=$(g ls-remote --get-url "$ORIGIN_URL") || refuse "cannot resolve $ORIGIN_URL
 #     configuration has none of these keys, so there is no exception; its
 #     credential.<url>.helper is not refused, because g() never lets any
 #     configured helper run. The system and global configuration are the
-#     operator's and are not checked.
-names=$(g config --show-scope --name-only --list) || refuse "cannot list the git configuration names of $REPO"
-bad=$(printf '%s\n' "$names" | awk -F'\t' '
-    $1 == "system" || $1 == "global" || $1 == "command" || NF < 2 { next }
-    {
-        k = tolower($2)
-        if (k ~ /^(url|http|include|includeif)\./ || k == "core.sshcommand" || k ~ /^remote\..*\/.*\.[^.]*$/) {
-            s = substr(k, 1, index(k, ".") - 1); v = k; sub(/^.*\./, "", v)
-            shown = k
-            if (length(s) + length(v) + 1 < length(k)) shown = s ".<...>." v
-            print shown
-        }
-    }' | sort -u | paste -sd, -)
-[ -z "$bad" ] || refuse "the git configuration of $REPO sets $bad, which can reroute or rewrite the gate's fetch and push; the operator removes them (list them with: git -C $REPO config --show-scope --name-only --list)"
+#     operator's and are not checked. The check runs again right before the
+#     push, so a key added while the checks below run is refused too.
+refuse_rerouting_config() {
+    local names bad
+    names=$(g config --show-scope --name-only --list) || refuse "cannot list the git configuration names of $REPO"
+    bad=$(printf '%s\n' "$names" | awk -F'\t' '
+        $1 == "system" || $1 == "global" || $1 == "command" || NF < 2 { next }
+        {
+            k = tolower($2)
+            if (k ~ /^(url|http|include|includeif)\./ || k == "core.sshcommand" || k ~ /^remote\..*\/.*\.[^.]*$/) {
+                s = substr(k, 1, index(k, ".") - 1); v = k; sub(/^.*\./, "", v)
+                shown = k
+                if (length(s) + length(v) + 1 < length(k)) shown = s ".<...>." v
+                print shown
+            }
+        }' | sort -u | paste -sd, -)
+    [ -z "$bad" ] || refuse "the git configuration of $REPO sets $bad, which can reroute or rewrite the gate's fetch and push; the operator removes them (list them with: git -C $REPO config --show-scope --name-only --list)"
+}
+refuse_rerouting_config
 
 # 0d. the credential for the push comes only from the helper the operator's
 #     global git config names for the origin (gh's, where gh set up git),
@@ -293,6 +298,7 @@ if [ "$dry_run" = 1 ]; then
     exit 0
 fi
 
+refuse_rerouting_config
 g push --no-recurse-submodules "$ORIGIN_URL" "$sha:refs/heads/$TARGET_BRANCH" \
     || refuse "push to origin/$TARGET_BRANCH failed (not a fast-forward any more, or no credential: the gate uses only the credential helper the operator's global git config names for the origin)"
 now=$(g ls-remote "$ORIGIN_URL" "refs/heads/$TARGET_BRANCH" | cut -f1)
