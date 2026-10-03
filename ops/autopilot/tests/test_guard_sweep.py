@@ -459,11 +459,67 @@ VAR_CERTAINTY_DENY = [
     "false && U=echo; ${U:-sudo} reboot",
     "P=x$HOME/.llm-autopilot/guard; rm -rf ${P:1}",
     "D=/tmp/llmdev/x; [ -d $D ] || unset D; rm -rf ${D:-$HOME/.llm-autopilot}",
+    # The command word is never resolved, and a value that bash would split or
+    # glob is never substituted as one word.
+    "U=echo; $U hi",
+    "CMD=\"sudo reboot\"; $CMD",
+    "CMD=\"git push --force origin upgrade/i/x\"; $CMD",
+    "PUSH=\"git push origin HEAD:dev\"; $PUSH",
+    "BRANCHES=\"upgrade/i/x dev\"; git push origin $BRANCHES",
+    "REFS=\"HEAD:upgrade/i/x HEAD:dev\"; git push origin $REFS",
+    "BR=\"upgrade/i/x --force\"; git push origin $BR",
+    "C=\"llmdev-a sf-local-ai-orchestrator-1\"; docker restart $C",
+    f"T=\"/tmp/llmdev/x {HOME}/.llm-autopilot/guard\"; rm -rf $T",
+    f"T=\"/tmp/llmdev/x {HOME}/.llm-autopilot/agent/test-db.vars\"; rm -f $T",
+    "CMD='/usr/bin/sud?'; $CMD reboot",
+    "T='/tmp/llmdev/*'; rm -rf $T",                        # a glob value is never one literal path
+    "/usr/bin/sud? reboot",                                # a glob in the command name
+    "/usr/bin/s[u]do reboot",
+    "C=sudo; nice $C reboot",                              # wrappers do not make the name resolvable
+    "CMD='sudo reboot'; xargs $CMD < /dev/null",          # a computed command behind a wrapper
+    "find . -name x -exec $RUN {} +",
+    # Assignments that never run in this shell, run later, or are overridden.
+    "f() { BR=dev; }; BR=upgrade/i/x; f; git push origin HEAD:$BR",
+    "BR=upgrade/i/x; f() { git push origin HEAD:$BR; }; BR=dev; f",
+    "BR=dev; true || { :; BR=upgrade/i/x; }; git push origin HEAD:$BR",
+    "BR=dev; BR=upgrade/i/x & git push origin HEAD:$BR",
+    "BR=dev; BR=upgrade/i/x | cat; git push origin HEAD:$BR",
+    "BR=dev; BR=upgrade/i/x |& cat; git push origin HEAD:$BR",
+    "BR=dev; export BR=upgrade/i/x & git push origin HEAD:$BR",
+    "BR=; : ${BR:=dev}; git push origin HEAD:${BR:-upgrade/i/x}",
+    "BR=upgrade/i/x; : ${BR=dev}; git push origin HEAD:$BR",
+    "BR=upgrade/i/x; printf -vBR dev; git push origin HEAD:$BR",
+    "BR=upgrade/i/x; printf -v BR dev; git push origin HEAD:$BR",
+    "BR=upgrade/i/x; declare -l BR; git push origin HEAD:$BR",
+    "BR=upgrade/i/x; trap 'BR=dev' DEBUG; git push origin HEAD:$BR",
+    "BR=upgrade/i/x; select BR in dev; do git push origin HEAD:$BR; done",
+    "BR=upgrade/i/x; BR[0]=dev; git push origin HEAD:$BR",
+    "BR=dev; BR=upgrade/i/x git push origin HEAD:$BR",     # a prefix assignment does not reach $BR
+    "BR=upgrade/i/x; BR=dev :; git push origin HEAD:$BR",  # ... but persists after a special builtin in sh
+    "D=/tmp/llmdev/x; IFS=x; rm -rf $D",                   # IFS changes how $D splits
+    "_=/tmp/llmdev/x; ls ~/.llm-autopilot/guard; rm -rf $_",  # bash resets $_ after every command
+    "PWD=/tmp/llmdev; cd ~/.llm-autopilot/agent; rm -f $PWD/test-db.vars",
+    # Quoted or escaped '$' and '~' are literal to bash: never resolved.
+    "C=echo; bash -c '$C git push origin HEAD:dev'",
+    "C=echo; bash -c \"\\$C git push origin HEAD:dev\"",
+    "BR=upgrade/i/x; bash -c 'git push origin HEAD:${BR:-dev}'",  # the child shell does not see BR
+    f"rm -rf ${{HOME/work/x}}",                             # ${HOME/...} is a substitution, not $HOME
+    # $VAR inside $( ) follows the same rule as the top level.
+    f"D=$HOME/.llm-autopilot/guard; echo $(rm -rf $D)",    # inner resolves, trips the guard-file rule
+    "PY=/usr/bin/python3; F=$($PY -c 'import os')",        # a computed command name, even inside $( )
 ]
 VAR_CERTAINTY_ALLOW = [
     "D=/tmp/llmdev/x; rm -rf $D",                          # one unconditional assignment: resolves
-    "U=echo; $U hi",                                       # resolves to a benign command
+    "D=/tmp/llmdev/x; rm -rf \"$D\"/build ${D}/dist",
     "BR=upgrade/i/x; git push origin HEAD:$BR",            # resolves to an allowed upgrade branch
+    "BR=upgrade/i/x && git push origin HEAD:$BR",
+    "BR=upgrade/i/x; C=sudo; echo $C; git push origin HEAD:${BR:-dev}",
+    "D=/tmp/llmdev/x; mkdir -p $D && cd $D && rm -rf ./out",
+    "C=sudo; bash -c \"echo $C\"",                          # a double-quoted value reaches the child
+    "trap 'rm -f /tmp/llmdev/x.$$' EXIT; echo ok",          # trap only stops resolution
+    "f() { echo hi; }; f",
+    "while IFS= read -r line; do echo \"$line\"; done < /tmp/llmdev/list.txt",
+    "D=/tmp/llmdev/x; echo $(ls $D)",                       # inner $D resolves to a benign path
     "command -v gh",
     "command -v claude",
     "command -V git",

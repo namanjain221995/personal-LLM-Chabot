@@ -310,11 +310,16 @@ class Ctx:
         # captured by $(...), written to a file or piped into a non-reader).
         self.captured = captured
         self.out_ok = True
+        # Literal variable values a command substitution inherits from the
+        # segment it runs in (see analyze()). Never passed to a child shell,
+        # script or handler: those see only exported variables.
+        self.known = {}
 
     def child(self, **kw):
         c = Ctx(self.raw, kw.get("cwd", self.cwd), self.depth + 1, kw.get("env", self.env),
                 kw.get("piped_in", False), kw.get("redirs", []), top=False,
                 captured=kw.get("captured", self.output_captured()))
+        c.known = dict(kw.get("known") or {})
         return c
 
     def output_captured(self):
@@ -341,7 +346,8 @@ def expand_path(p, cwd):
                 p = pwd.getpwnam(m.group(1)).pw_dir + (m.group(2) or "")
             except KeyError:
                 return None
-    p = re.sub(r"^\$\{?HOME\}?(?=/|$)", HOME, p)
+    # Only the plain forms: ${HOME/a/b} or ${HOME:-x} are expansions, not $HOME.
+    p = re.sub(r"^(?:\$HOME|\$\{HOME\})(?=/|$)", lambda _m: HOME, p)
     if "$" in p or "`" in p or "__SUBST__" in p:
         return None
     if not os.path.isabs(p):
@@ -461,8 +467,20 @@ def find_close(s, i):
     return None
 
 
+# A command substitution's place in the text: __SUBST__ plus its index in the
+# list extract_substitutions() returns, so analyze() can check the inner command
+# with the variables known where it runs. _restore() drops the index again.
+SUBST_MARK = re.compile("__SUBST__\x02(\\d+)\x02")
+
+
+def subst_marker(n):
+    return f"__SUBST__\x02{n}\x02"
+
+
 def extract_substitutions(s):
-    """Replace $(...), `...`, <(...) and >(...) by __SUBST__; return the inner commands."""
+    """Replace $(...), `...`, <(...) and >(...) by an indexed __SUBST__ marker
+    (see SUBST_MARK); return the inner commands. Inners found inside $(( ))
+    carry no marker."""
     out, inner, q, i, n = [], [], None, 0, len(s)
     while i < n:
         c = s[i]
@@ -506,7 +524,7 @@ def extract_substitutions(s):
             if j is None:
                 block(f"{TAG} {short(s)} -> blocked: unbalanced $( (fail-closed).")
             inner.append(s[i + 2 : j])
-            out.append("__SUBST__")
+            out.append(subst_marker(len(inner) - 1))
             i = j + 1
             continue
         if c == "`":
@@ -516,7 +534,7 @@ def extract_substitutions(s):
             if j >= n:
                 block(f"{TAG} {short(s)} -> blocked: unbalanced backtick (fail-closed).")
             inner.append(s[i + 1 : j])
-            out.append("__SUBST__")
+            out.append(subst_marker(len(inner) - 1))
             i = j + 1
             continue
         out.append(c)
@@ -553,24 +571,36 @@ def split_heredocs(cmd):
     return "\n".join(out), docs
 
 
-def prepare(text):
-    """Quote-aware: drop line continuations and comments, turn newlines into ';'."""
+# Placeholders for a '$' or '~' that bash reads literally (single-quoted,
+# escaped, or a '~' inside double quotes). analyze() never resolves them as a
+# variable or a home directory and turns them back into '$' / '~' before any
+# check, so they still read as computed text.
+LITERAL_DOLLAR, LITERAL_TILDE = "\x00", "\x01"
+
+
+def prepare(text, protect=False):
+    """Quote-aware: drop line continuations and comments, turn newlines into ';'.
+    With protect=True, a '$' or '~' that bash reads literally becomes a
+    placeholder (see LITERAL_DOLLAR) so variable resolution cannot touch it."""
     res, q, i, n = [], None, 0, len(text)
     while i < n:
         c = text[i]
         if q == "'":
-            res.append(c)
+            res.append(LITERAL_DOLLAR if protect and c == "$" else LITERAL_TILDE if protect and c == "~" else c)
             if c == "'":
                 q = None
         elif c == "\\" and i + 1 < n:
             if text[i + 1] == "\n":
                 i += 2
                 continue
-            res.append(text[i : i + 2])
+            if protect and text[i + 1] in "$~":
+                res.append(LITERAL_DOLLAR if text[i + 1] == "$" else LITERAL_TILDE)
+            else:
+                res.append(text[i : i + 2])
             i += 2
             continue
         elif q == '"':
-            res.append(c)
+            res.append(LITERAL_TILDE if protect and c == "~" else c)
             if c == '"':
                 q = None
         elif c in ("'", '"'):
@@ -621,10 +651,12 @@ def segments(tokens):
     """Split tokens into simple commands: [(words, redirs, piped_in, unconditional)].
 
     `unconditional` is True when a bare `V=value` assignment in the segment is
-    certain to run: at the top level (not inside a subshell '(...)' nor an
-    if/for/while/until/case body) and reached by ';'/'&'/newline/start, never
-    through '&&'/'||'/'|'. The guard trusts a variable's value only from such a
-    segment; everywhere else it leaves `$VAR` unresolved (fail-closed)."""
+    certain to run in THIS shell: at the top level (not inside a subshell '(...)'
+    nor an if/for/while/until/case body), reached by ';'/'&'/newline/start (never
+    through '&&'/'||'/'|'), and not itself ended by '&', '|' or '|&' (a
+    background job or a pipeline stage runs in a subshell, so its assignments
+    never reach the next command). The guard trusts a variable's value only from
+    such a segment; everywhere else it leaves `$VAR` unresolved (fail-closed)."""
     segs, words, redirs, piped_in, i = [], [], [], False, 0
     sep, paren, compound, pending_open, seg_flag = None, 0, 0, 0, None
 
@@ -635,7 +667,8 @@ def segments(tokens):
         t = tokens[i]
         if t in SEPARATORS:
             if words or redirs:
-                segs.append((words, redirs, piped_in, seg_flag if seg_flag is not None else start_flag()))
+                flag = seg_flag if seg_flag is not None else start_flag()
+                segs.append((words, redirs, piped_in, flag and t not in ("&", "|", "|&")))
                 compound += pending_open
                 pending_open = 0
             words, redirs, seg_flag = [], [], None
@@ -767,45 +800,61 @@ def nonopt(args):
 
 # Shell specials that resolve to a number at run time; substituting them lets a
 # path like /tmp/x.$$ resolve instead of looking "computed".
-SHELL_SPECIAL = re.compile(r"\$\$|\$!|\$\{?(RANDOM|PPID|BASHPID)\}?")
+SHELL_SPECIAL = re.compile(r"\$\$|\$!|\$(?:RANDOM|PPID|BASHPID)\b|\$\{(?:RANDOM|PPID|BASHPID)\}")
+# The only values the guard substitutes for $VAR: one word that bash can neither
+# split nor glob (no whitespace, glob, quote, brace, '$', '`', '\\' or '~').
+LITERAL_VALUE = re.compile(r"[A-Za-z0-9_./:@%+=,-]+")
+# Variables bash changes by itself (cd, every command, read, getopts, ...) or
+# whose effect reaches past their own value (IFS, PATH, HOME): never resolved.
+SHELL_MANAGED = re.compile(
+    r"^(_|PWD|OLDPWD|REPLY|OPTARG|OPTIND|OPTERR|RANDOM|SRANDOM|SECONDS|LINENO|EPOCHSECONDS|EPOCHREALTIME|HISTCMD|"
+    r"PPID|UID|EUID|SHLVL|DIRSTACK|GROUPS|FUNCNAME|PIPESTATUS|IFS|HOME|PATH|CDPATH|MAPFILE|COPROC\w*|HOSTNAME|"
+    r"SHELLOPTS|GLOBIGNORE|BASH\w*|COMP\w*)$"
+)
+# Text that can change a variable in ways the guard does not follow: ${V:=w} /
+# ${V=w}, and arithmetic (( )) / $(( )) / $[ ] (which can assign).
+ASSIGNING_EXPANSION = re.compile(r"\$\{[!#]?[A-Za-z_]\w*(\[[^\]]*\])?:?=|\(\(|\$\[")
+# `VAR+=x` and `VAR[i]=x` / `VAR[i]+=x`: assignments strip_prefix leaves in place.
+APPEND_OR_ELEMENT_ASSIGN = re.compile(r"[A-Za-z_]\w*(\[[^\]]*\])?\+?=.*", re.S)
 
 
 def _usable(val):
     return val is not None and "`" not in val and "$(" not in val
 
 
-def _resolve_braced(body, env):
-    """Resolve a ${...} expansion ONLY for the forms whose value is certain:
-    ${V}, ${V:-w}, ${V-w}, ${V:=w}, ${V=w} with exact bash set/null semantics,
-    where V is a variable the command assigned a trustworthy literal value.
-    Every other operator (':offset', '#', '##', '%', '%%', '/', '//', '^', '^^',
-    ',', ',,', '@', ':+', '+', '!' indirection, array '[...]') returns None, so
-    the caller leaves the '$' in place and the computed-at-run-time deny fires."""
-    m = re.match(r"^([A-Za-z_]\w*)(:-|:=|-|=)?(.*)$", body, re.S)
-    if not m:
-        return None  # ${!x}, ${#x}, ${1}, ... : not a plain name
-    name, op, arg = m.group(1), m.group(2), m.group(3)
-    if op is None and arg:
-        return None  # ${V<op>...} with an unsupported operator or an array index
-    if name not in env:
-        return None  # V is uncertain or inherited from the environment: leave it
-    val = env[name]
-    if op in (None, ""):
-        return val
-    if op in (":-", ":="):
-        return val if val != "" else arg  # set-and-non-empty keeps the value
-    # '-' / '=' use the default only when V is UNSET; V is set here, so keep val
-    return val
+def _restore(word):
+    """Turn the LITERAL_DOLLAR / LITERAL_TILDE placeholders back into '$' / '~'
+    and an indexed substitution marker back into plain __SUBST__."""
+    word = word.replace(LITERAL_DOLLAR, "$").replace(LITERAL_TILDE, "~")
+    return SUBST_MARK.sub("__SUBST__", word) if "\x02" in word else word
 
 
-def subst_env(word, env):
-    """Resolve $VAR / ${VAR} / ${VAR:-WORD} using the values the command set
-    UNCONDITIONALLY (see track_var_mutations / segments), plus the benign shell
-    specials ($$, $RANDOM, ...), so later checks see the real path or command
-    name. A variable that may be reassigned, read, looped, declared or unset at
-    run time, or an unsupported ${...} operator, is left unresolved on purpose:
-    the '$' then trips the computed-command / literal-path / literal-refspec
-    denials (fail-closed)."""
+def _known_value(name, val):
+    """The value `name=val` stores, when the guard can know it exactly; else None.
+    `val` still carries the prepare() placeholders, so a quoted or escaped '$'
+    or '~' is never read as a variable or a home directory."""
+    if SHELL_MANAGED.match(name) or not val or "__SUBST__" in val:
+        return None
+    val = re.sub(r"^(?:\$HOME|\$\{HOME\})(?=/|$)", lambda _m: HOME, val)
+    if val == "~" or val.startswith("~/"):
+        val = HOME + val[1:]
+    return val if LITERAL_VALUE.fullmatch(val) else None
+
+
+def _resolve_braced(body, known):
+    """Resolve ${V}, ${V:-w} or ${V-w} for a variable in `known` (whose value is a
+    non-empty literal, so both defaults keep it). Every other operator (':=' and
+    '=' assign; ':offset', '#', '%', '/', '^', ',', '@', ':+', '!', '[...]')
+    returns None, so the '$' stays and the computed-at-run-time denials fire."""
+    m = re.fullmatch(r"([A-Za-z_]\w*)(?::?-.*)?", body, re.S)
+    return known.get(m.group(1)) if m else None
+
+
+def subst_vars(word, known):
+    """Resolve $VAR / ${VAR} / ${VAR:-WORD} from `known` (see analyze()), plus the
+    benign numeric specials ($$, $RANDOM, ...), so later checks see the real path
+    or refspec. Anything else keeps its '$' on purpose: it then trips the
+    computed-command / literal-path / literal-refspec denials (fail-closed)."""
     if "$" not in word:
         return word
     word = SHELL_SPECIAL.sub("0", word)
@@ -814,8 +863,8 @@ def subst_env(word, env):
         c = word[i]
         if c == "$" and i + 1 < n and word[i + 1] == "{":
             j = _brace_close(word, i + 2)
-            rep = _resolve_braced(word[i + 2 : j], env) if j is not None else None
-            if rep is not None and _usable(rep):
+            rep = _resolve_braced(word[i + 2 : j], known) if j is not None else None
+            if rep is not None:
                 out.append(rep)
                 i = j + 1
                 continue
@@ -824,16 +873,37 @@ def subst_env(word, env):
             continue
         if c == "$" and i + 1 < n and (word[i + 1].isalpha() or word[i + 1] == "_"):
             m = re.match(r"\$([A-Za-z_]\w*)", word[i:])
-            val = env.get(m.group(1))
-            if _usable(val):
-                out.append(val)
-            else:
-                out.append(word[i : i + m.end()])
+            val = known.get(m.group(1))
+            out.append(val if val is not None else word[i : i + m.end()])
             i += m.end()
             continue
         out.append(c)
         i += 1
     return "".join(out)
+
+
+def resolution_unsafe(text, tokens, segs, had_function):
+    """True when the command can change a variable in a way the guard does not
+    follow, so analyze() resolves no $VAR in it at all (fail-closed): a function
+    definition or a { } group (bodies run later, or conditionally), sourcing a
+    file, a trap handler, printf -v, declare-family options (namerefs, case and
+    integer attributes), IFS, ${V:=w} / ${V=w}, or arithmetic that can assign."""
+    if had_function or ASSIGNING_EXPANSION.search(text):
+        return True
+    if any(t in ("{", "}") or re.match(r"IFS(\+?=|$)", t) for t in tokens):
+        return True
+    for words, _redirs, _piped, _uncond in segs:
+        _env, w, _bare = strip_prefix(words)
+        if not w:
+            continue
+        name = os.path.basename(w[0])
+        if name in (".", "source", "trap"):
+            return True
+        if name == "printf" and any(a.startswith("-v") for a in w[1:]):
+            return True
+        if name in ("declare", "typeset", "local", "readonly", "export") and any(a[:1] in "-+" for a in w[1:]):
+            return True
+    return False
 
 
 def _brace_close(s, i):
@@ -856,8 +926,10 @@ _FUNC_HEADER = re.compile(r"(?:function\s+)?([A-Za-z_]\w*)\s*\(\s*\)\s*(?=\{)|fu
 def strip_function_headers(text):
     """Quote-aware: drop `name() {` and `function name {` headers (keeping the
     `{ ... }` body) so the body is analysed as ordinary commands, and the body of
-    a `coproc name { ... }` is reached too."""
-    res, q, i, n = [], None, 0, len(text)
+    a `coproc name { ... }` is reached too. Returns (text, whether a header was
+    dropped): a function body runs later, so its assignments make every $VAR in
+    the command uncertain."""
+    res, q, i, n, found = [], None, 0, len(text), False
     last_sig = ";"  # the last non-space character emitted (start acts like a separator)
     while i < n:
         c = text[i]
@@ -896,11 +968,12 @@ def strip_function_headers(text):
                 res.append(" ")
                 i = m.end()
                 last_sig = " "
+                found = True
                 continue
         res.append(c)
         last_sig = c
         i += 1
-    return "".join(res)
+    return "".join(res), found
 
 
 # --------------------------------------------------------------------------
@@ -913,55 +986,92 @@ def analyze(cmd, ctx):
     text, docs = split_heredocs(cmd)
     for consumer, body in docs:
         check_heredoc(consumer, body, ctx)
+    unsafe_text = text  # heredoc bodies are data here; they are analysed above
     text, inners = extract_substitutions(text)
-    for inner in inners:
-        analyze(inner, ctx.child(captured=True))  # its output feeds the outer command, not the transcript
-    text = strip_function_headers(text)
+    text, had_function = strip_function_headers(text)
     try:
-        tokens = tokenize(prepare(text))
+        tokens = tokenize(prepare(text, protect=True))
     except ValueError as exc:
         ctx.deny(f"could not parse the command ({exc}); simplify quoting (fail-closed)")
     cwd = ctx.cwd
     env = dict(ctx.env)
     segs = segments(tokens)
-    for idx, (words, redirs, piped_in, unconditional) in enumerate(segs):
+    # $VAR resolution. `known` holds only literal values assigned earlier in THIS
+    # text by a segment certain to run in this shell (plus, inside a command
+    # substitution, the values known where it runs). Nothing else is inherited: a
+    # child shell, script or handler sees only exported variables, and an outer
+    # value may be stale there. The command word is never resolved, and a command
+    # that can change variables in ways the guard does not follow resolves nothing.
+    resolve = not resolution_unsafe(unsafe_text, tokens, segs, had_function)
+    known = dict(ctx.known) if resolve else {}
+    analysed = set()
+    for idx, (pwords, predirs, piped_in, unconditional) in enumerate(segs):
+        words = [_restore(x) for x in pwords]
+        redirs = [(op, _restore(t)) for op, t in predirs]
         sctx = Ctx(ctx.raw, cwd, ctx.depth, env, piped_in, redirs, top=ctx.top, captured=ctx.captured)
+        # A command substitution runs (in a subshell) when this segment expands
+        # its words: check it with the variables known here, as at the top level.
+        for x in list(pwords) + [t for _op, t in predirs]:
+            for m in SUBST_MARK.finditer(x):
+                n = int(m.group(1))
+                if n < len(inners):
+                    analysed.add(n)
+                    # its output feeds the outer command, not the transcript
+                    analyze(inners[n], sctx.child(captured=True, known=known if resolve else {}))
         sctx.out_ok = not writes_output_file(redirs) and pipeline_tail_is_safe(segs, idx)
         check_redirects(sctx)
-        senv, w, bare_env = strip_prefix(words)
+        raw_env, pw, bare_env = strip_prefix(pwords)
+        # `VAR+=suffix` (append) and `VAR[i]=x` (array element) are assignments
+        # too, and make the value uncertain: drop the variable (later references
+        # stay unresolved) and read on to the real command word.
+        while pw and APPEND_OR_ELEMENT_ASSIGN.fullmatch(pw[0]):
+            var = re.match(r"[A-Za-z_]\w*", pw[0]).group(0)
+            env.pop(var, None)
+            known.pop(var, None)
+            more_env, pw, more_bare = strip_prefix(pw[1:])
+            raw_env.update(more_env)
+            bare_env = bare_env or more_bare
+        senv = {k: _restore(v) for k, v in raw_env.items()}
         if bare_env:
             sctx.deny("printing the environment exposes secrets")
         check_exec_env(senv, sctx)
-        if not w:
+        if not pw:
             # A bare `FOO=bar` persists only when it is certain to run. When it is
-            # guarded by &&/||, or inside a subshell or compound body, the guard
-            # drops the variable so later `$FOO` stays unresolved (fail-closed).
+            # guarded by &&/||, inside a subshell or compound body, or ended by
+            # '&' / '|', the guard drops the variable so later `$FOO` stays
+            # unresolved (fail-closed).
             for k, v in senv.items():
                 if unconditional and _usable(v):
                     env[k] = v
                 else:
                     env.pop(k, None)
+            for k, v in raw_env.items():
+                kv = _known_value(k, v) if unconditional else None
+                if kv is None:
+                    known.pop(k, None)
+                else:
+                    known[k] = kv
             continue
         sctx.env = {**env, **senv}
-        w = [subst_env(x, sctx.env) for x in w]
-        # `VAR+=suffix` (append) and other appends make the value uncertain: drop
-        # the variable so later references are not resolved to a stale value.
-        while w and re.fullmatch(r"[A-Za-z_]\w*\+=.*", w[0]):
-            env.pop(w[0].split("+=", 1)[0], None)
-            w.pop(0)
-        if not w:
-            continue
+        if resolve:
+            pw = pw[:1] + [subst_vars(x, known) for x in pw[1:]]
+        for k in raw_env:
+            known.pop(k, None)  # a prefix assignment persists after a special builtin (POSIX sh)
+        raw_args = pw[1:]
+        w = [_restore(x) for x in pw]
         name = os.path.basename(w[0])
         if w[0] in ("cd", "pushd"):
             target = nonopt(w[1:])
             nxt = expand_path(target[0], cwd) if target else HOME
             cwd = nxt or cwd
             continue
-        track_var_mutations(name, w, unconditional, env, sctx)
+        track_var_mutations(name, raw_args, unconditional, env, known, sctx)
         if re.search(r"\{[^{}]*,[^{}]*\}", w[0]):
             sctx.deny("brace expansion builds the command name; write the command literally so the guard can read it")
-        if "$" in w[0] or "__SUBST__" in w[0]:
+        if "$" in w[0] or "__SUBST__" in w[0] or "`" in w[0]:
             sctx.deny("the command name is computed at run time and cannot be reviewed; write it literally")
+        if re.search(r"[*?]", w[0]) or ("[" in w[0] and w[0] not in ("[", "[[")):
+            sctx.deny("a glob builds the command name; write the command literally so the guard can read it")
         if cwd and not write_allowed(_real(cwd)) and name not in READONLY_CMDS and name not in SYSTEM_DENY:
             sctx.deny(f"the working directory {cwd} is read-only to the autopilot; cd to {DEV_WORKTREE} first")
         if name == "merge_to_dev.sh":
@@ -969,56 +1079,60 @@ def analyze(cmd, ctx):
         if ("/" in w[0] or w[0].endswith(".sh")) and name not in SHELLS and name not in INTERPRETERS:
             analyze_script_file(w[0], sctx)
         check_command(name, w[1:], sctx)
+    # Substitutions with no marker in any segment (inside $(( )), or in a
+    # comment) are still checked, with no variable resolved.
+    for n, inner in enumerate(inners):
+        if n not in analysed:
+            analyze(inner, ctx.child(captured=True))
 
 
 _VARNAME = re.compile(r"[A-Za-z_]\w*")
 
 
-def track_var_mutations(name, w, unconditional, env, ctx):
-    """Keep the certain-value map `env` in step with a command that sets, appends,
-    reads, loops over, declares or unsets shell variables, so later `$VAR`
-    references resolve to a trustworthy value or stay unresolved (fail-closed).
-    A variable is trusted only after a single unconditional literal assignment;
-    read/for/declare/printf -v/unset/let/mapfile all drop it instead."""
+def track_var_mutations(name, raw_args, unconditional, env, known, ctx):
+    """Keep `env` (values handed to the checks) and `known` (values $VAR may
+    resolve to) in step with a command that sets, appends, reads, loops over,
+    declares or unsets shell variables, so later `$VAR` references resolve to a
+    trustworthy value or stay unresolved (fail-closed). `raw_args` still carry
+    the prepare() placeholders. A variable is trusted only after an
+    unconditional literal assignment; read/for/select/wait/declare options/
+    printf -v/unset/let/mapfile all drop it instead."""
+    args = [_restore(a) for a in raw_args]
     if name in ("export", "declare", "typeset", "readonly", "local"):
-        nameref = any(a == "-n" or (a.startswith("-") and not a.startswith("--") and "n" in a[1:]) for a in w[1:])
-        assigned = {}
-        bare = []
-        for a in w[1:]:
-            if a.startswith("-"):
+        has_opts = any(a[:1] in "-+" for a in args)  # -n nameref, -l/-u case, -i integer, ...
+        assigned, raw_assigned, bare = {}, {}, []
+        for a, ra in zip(args, raw_args):
+            if a[:1] in "-+":
                 continue
             if "=" in a:
                 k, v = a.split("=", 1)
                 assigned[k] = v
+                raw_assigned[k] = ra.split("=", 1)[1]
             elif _VARNAME.fullmatch(a):
                 bare.append(a)
         check_exec_env(assigned, ctx)
         for k, v in assigned.items():
-            if unconditional and not nameref and _usable(v):
+            if unconditional and not has_opts and _usable(v):
                 env[k] = v  # e.g. `declare BR=main` sets BR=main, so a later push to it is seen
             else:
                 env.pop(k, None)
+            kv = _known_value(k, raw_assigned[k]) if unconditional and not has_opts else None
+            if kv is None:
+                known.pop(k, None)
+            else:
+                known[k] = kv
         for k in bare:
             env.pop(k, None)  # declared without a value: uncertain
+            known.pop(k, None)
         return
-    if name in ("unset", "read", "mapfile", "readarray", "getopts"):
-        for a in w[1:]:
-            if _VARNAME.fullmatch(a):
-                env.pop(a, None)
-        return
-    if name == "for" and len(w) >= 2 and _VARNAME.fullmatch(w[1]):
-        env.pop(w[1], None)  # the loop variable is reassigned each iteration
-        return
-    if name == "printf":
-        for i in range(1, len(w)):
-            if w[i] == "-v" and i + 1 < len(w) and _VARNAME.fullmatch(w[i + 1]):
-                env.pop(w[i + 1], None)
-        return
-    if name == "let":
-        for a in w[1:]:
-            m = re.match(r"^([A-Za-z_]\w*)\s*(?:[-+*/%&|^]|<<|>>)?=", a)
+    if name in ("unset", "read", "mapfile", "readarray", "getopts", "wait", "for", "select", "let", "printf"):
+        # Every name-shaped argument may be (re)assigned: read/mapfile/getopts/
+        # wait -p targets, the for/select loop variable, let NAME=expr, printf -v.
+        for a in args:
+            m = re.match(r"^-?v?([A-Za-z_]\w*)", a) if name == "printf" else re.match(r"^([A-Za-z_]\w*)", a)
             if m:
                 env.pop(m.group(1), None)
+                known.pop(m.group(1), None)
         return
 
 
@@ -1375,7 +1489,7 @@ def check_command(cmd, args, ctx):
     if cmd in SHELLS:
         return check_shell(args, ctx)
     if cmd in ("source", "."):
-        if args and (args[0] == "__SUBST__" or args[0].startswith("/dev/fd") or STDIN_PATH.match(args[0]) or args[0].startswith("/proc/")):
+        if args and ("__SUBST__" in args[0] or args[0].startswith("/dev/fd") or STDIN_PATH.match(args[0]) or args[0].startswith("/proc/")):
             ctx.deny("sourcing generated or stdin input (/dev/stdin, /dev/fd, /proc/self/fd) hides the commands; run them directly")
         if args and (os.path.basename(args[0]) == "merge_to_dev.sh" or expand_path(args[0], ctx.cwd) == _real(MERGE_TO_DEV)):
             ctx.deny(f"run the installed gate {MERGE_TO_DEV} directly; sourcing it runs it with the caller's functions and variables")
@@ -1525,6 +1639,8 @@ def analyze_words(words, ctx):
     if not w:
         return
     c = ctx.child(env={**ctx.env, **env})
+    if "$" in w[0] or "__SUBST__" in w[0] or "`" in w[0] or re.search(r"[*?]|\{[^{}]*,[^{}]*\}", w[0]):
+        ctx.deny("the command that xargs, find -exec, parallel or another wrapper runs is computed at run time; write it literally")
     name = os.path.basename(w[0])
     if name in ("techsara",) or w[0].endswith("/techsara"):
         name = "techsara"
