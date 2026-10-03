@@ -196,7 +196,7 @@ def _hold_database(dsn: str) -> None:
     if not held:
         raise SystemExit(
             "another files_local_target already serves this database; its job runners would claim this "
-            "target's blobs. Stop it, or point TEST_DATABASE_URL at another test_* database."
+            "target's blobs. Stop it, or point TEST_DATABASE_URL at another *_test database."
         )
     _GUARD.append(guard)  # the lock lives as long as this connection, i.e. the process
 

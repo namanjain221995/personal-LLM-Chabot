@@ -10,7 +10,8 @@ conftest fixture for that module only (pytest resolves a fixture name to the
 closest definition).
 
 Point the run at a private database, e.g.
-    TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/test_files_storage_uploads
+    TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:<port>/files_storage_uploads_test
+    TEST_DATABASE_ALLOWED_HOSTS=127.0.0.1:<port>
 """
 from __future__ import annotations
 

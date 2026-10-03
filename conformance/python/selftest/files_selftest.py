@@ -290,7 +290,7 @@ def main() -> int:
     parser.add_argument("--work", default="", help="keep logs and reports here (default: a temporary directory)")
     args = parser.parse_args()
     if not args.dsn:
-        print("set TEST_DATABASE_URL to a private test_* database", file=sys.stderr)
+        print("set TEST_DATABASE_URL to a private *_test database listed in TEST_DATABASE_ALLOWED_HOSTS", file=sys.stderr)
         return 2
     sys.path.insert(0, str(HERE))
     from files_local_target import DEFECTS  # names only: the module imports no orchestrator code at top level
