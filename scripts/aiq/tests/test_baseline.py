@@ -609,6 +609,13 @@ def test_workload_comes_from_the_record_then_the_map():
     "dev stack at http://box:28080", "worker 192.0.2.7 cap 2", "head 2001:db8::1 cap 2", "loopback [::1]:28080",
     "node host-a.internal", "box.local stack", "runs on example.com", "two\nlines", "tab\there",
     "evil ‮gnp.exe", "isolate ⁦x⁩", "bell \x07", "line sep  ",
+    # re-QA 5: invisible and look-alike text, HTML comments, host:port and e-mail
+    "soft\u00adhyphen box", "hidden\U000E0069\U000E0067 tag chars", "zero\u200bwidth", "BOM\ufeffinside",
+    "private \ue000 use", "unassigned \u0378 point",
+    "fullwidth ip \uff11\uff19\uff18.\uff15\uff11.\uff11\uff10\uff10.\uff12\uff13",
+    "arabic-indic digits \u0661\u0669\u0668.\u0665\u0661.\u0661\u0660\u0660.\u0662\u0663",
+    "one-dot-leader 198\u202451\u2024100\u202423", "ideographic stop box\u3002internal", "html comment <!-- hidden",
+    "fullwidth comment \uff1c!-- hidden", "localhost:28080 on the head", "gpu-node-7:30123", "mail ops@box-internal",
 ])
 def test_freeze_refuses_a_label_that_is_not_public(label):
     with pytest.raises(B.BaselineError, match="conditions.label holds"):
@@ -618,9 +625,29 @@ def test_freeze_refuses_a_label_that_is_not_public(label):
 @pytest.mark.parametrize("label", [
     "dev stack llmdev, CPU image, router shared on main, no embed/rerank/search, cap 2",
     "Qwen3.6-35B-A3B-NVFP4, vLLM 0.11.1rc2, e.g. no search", "window 05:10-06:40 IST, workers 1",
+    "Hindi label: \u092c\u0947\u0938\u0932\u093e\u0907\u0928 \u0930\u0928",
+    "ZWJ in Devanagari \u0915\u094d\u200d\u0937", "ZWNJ in Hindi \u0915\u0940\u200c\u092e\u0924",
+    "Hebrew \u05d1\u05d3\u05d9\u05e7\u05d4 mixed RTL", "C++::std style text", "ratio 1:2:3, time 05:00:30",
+    "cap 2 @ 05:00 IST", "p95 <= 1.2 s, 1.5x probe",
 ])
 def test_freeze_accepts_a_plain_label(label):
     assert frozen(three_repeats(), label=label)["sources"][0]["label"] == label
+
+
+def test_the_label_refusal_names_the_harmless_text_it_also_refuses():
+    with pytest.raises(B.BaselineError) as exc:
+        frozen(three_repeats(), label="Next.js 16 front end")
+    text = str(exc.value)
+    assert "a dotted host name ('Next.js')" in text and "run_evalset.py" in text and "must be rewritten" in text
+
+
+@pytest.mark.parametrize("name", ["evalset-node-b.internal-r1", "evalset-192.0.2.7-r2", "evalset-\u202egnp.r3",
+                                  "run-localhost:28080"])
+def test_freeze_refuses_a_run_directory_name_that_is_not_public(tmp_path, name):
+    """Re-QA 4: the basename of a run directory went into the baseline unscreened."""
+    d = write_run(tmp_path, name, three_repeats(), repeats=3)
+    with pytest.raises(B.BaselineError, match="the run directory's name"):
+        B.freeze(B.load_runs([d]))
 
 
 def test_freeze_refuses_an_empty_label():
@@ -962,6 +989,7 @@ def test_baseline_side_insufficiency_fails_unless_allowed():
     lambda d: d.update(schema=1),
     lambda d: d.update(schema=2),
     lambda d: d.update(procedure_deviations=[]),
+    lambda d: d["sources"][0].update(dir="evalset-box.internal"),
 ])
 def test_compare_refuses_a_baseline_whose_numbers_disagree(mutate):
     base = json.loads(json.dumps(frozen(three_repeats())))
@@ -992,7 +1020,7 @@ def test_render_markdown_has_every_table_and_a_workload_row(tmp_path):
     assert "- **run `run1`: repeats**: --repeats 3: the repeats of a case shared one account" in md
     assert "### Gated latency without enough samples\n\nNone: every gated class/metric has enough samples." in md
     assert ("| direct_fast | total_s | yes | 3 | 1 | 0 | 0 | 1.00 | 1.00 | 1.00 | 1.00 | 0.000 | class | 1.00 | "
-            "1.700 | reported (n < 20) |") in md
+            "1.700 | reported (n &lt; 20) |") in md
     assert "| think | first_event_s | no | 3 |" in md and "| direct_fast | first_token_s | no | 3 |" in md
     assert "| EV08 | think | think | 3 | 0.000 | 0.667 | 0/3 | required_sections x3 |" in md
     assert "| EV01 | direct_fast | fast | 3 | 1.000 | 1.000 | 0/3 | none |" in md
@@ -1000,8 +1028,9 @@ def test_render_markdown_has_every_table_and_a_workload_row(tmp_path):
     assert "### Method" in md and "re-run the BASELINE commit" in md
 
 
-def test_render_markdown_escapes_pipes_in_labels():
-    assert 'label "a \\| b"' in B.render_markdown(frozen(three_repeats(), label="a | b"))
+def test_render_markdown_escapes_pipes_and_angle_brackets_in_labels():
+    md = B.render_markdown(frozen(three_repeats(), label="a | b <b>x</b>"))
+    assert 'label "a \\| b &lt;b>x&lt;/b>"' in md and "<b>" not in md
 
 
 # -------------------------------------------------------------------- CLI --

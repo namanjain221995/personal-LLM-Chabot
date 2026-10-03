@@ -20,8 +20,10 @@ baseline lists the conditions of every run it pools.
 
 A baseline may be committed to the public repository. It keeps no endpoint,
 no health detail and no account detail beyond counts; run directories are
-named by their last path component only; a conditions label holding a URL,
-an IP address, a dotted host name, a control or a bidi character is refused.
+named by their last path component only; a conditions label or run directory
+name holding a URL, an IP address, a dotted host name, a host:port, an e-mail
+address, an HTML comment opener, a control, bidi or other invisible character
+is refused (public_text_problem).
 
 Exit codes: 0 done (compare: passed), 1 compare did not pass, 2 bad input or
 anything else that is not a verdict (an internal error included), so a crash
@@ -254,37 +256,72 @@ def _opt(value, check, where: str, what: str) -> None:
 
 _URL = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://|\bwww\.", re.IGNORECASE)
 _IPV4 = re.compile(r"(?<![0-9.])[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?![0-9])")
-_IPV6_TOKEN = re.compile(r"[0-9A-Fa-f:.%]*:[0-9A-Fa-f:.%]*:[0-9A-Fa-f:.%]*")
+_IPV6_TOKEN = re.compile(r"(?<![0-9A-Za-z:.%])[0-9A-Fa-f:.%]*:[0-9A-Fa-f:.%]*:[0-9A-Fa-f:.%]*(?![0-9A-Za-z])")
 _HOST = re.compile(r"(?<![A-Za-z0-9-])(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,63}"
-                   r"(?![A-Za-z0-9-])")
+                   r"(?![A-Za-z0-9])")             # a '-' may follow: run directories read node-b.internal-r1
+_HOST_PORT = re.compile(r"(?<![A-Za-z0-9.:-])[A-Za-z][A-Za-z0-9-]*:[0-9]{2,5}(?![0-9A-Za-z])")
+_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+")
 _BIDI = set(range(0x202A, 0x202F)) | set(range(0x2066, 0x206A)) | {0x200E, 0x200F, 0x061C}
+_JOINERS = {0x200C, 0x200D}     # ZWNJ and ZWJ: Indic scripts need them, so they are the format characters allowed
+_ODD_CATEGORIES = {"Cf": "an invisible format character", "Co": "a private-use character",
+                   "Cn": "an unassigned code point", "Cs": "a lone surrogate"}
+PUBLIC_TEXT_REFUSES = (
+    "The screen is broad on purpose, so some harmless text is refused too and must be rewritten: a dotted name "
+    "such as Next.js, Node.js or run_evalset.py (write 'Next JS', drop the file suffix), a four-part version such "
+    "as 1.2.3.4, 'word:digits' such as batch:16 (write 'batch 16'), 'a@b', and C++-style 'a::b'.")
+
+
+def _screen_form(text: str) -> str:
+    """The form the regexes see: NFKC (fullwidth digits and dots, the one-dot leader and the like become ASCII),
+    the ideographic full stop as '.', and every decimal digit of any script as its ASCII digit."""
+    norm = unicodedata.normalize("NFKC", text).replace("\u3002", ".")
+    return "".join(str(unicodedata.decimal(ch)) if not ch.isascii() and unicodedata.decimal(ch, None) is not None
+                   else ch for ch in norm)
 
 
 def public_text_problem(text: str) -> Optional[str]:
-    """Why `text` must not go into a public document, or None. Refused: a URL, an IPv4 or IPv6 address, a
-    dotted host name (labels joined by dots ending in an alphabetic tail of two or more letters, e.g.
-    host-a.internal, box.local, example.com), a control character (line breaks included) and a bidi
-    control (U+202A-U+202E, U+2066-U+2069, U+200E, U+200F, U+061C)."""
+    """Why `text` must not go into a public document, or None.
+
+    Refused, character by character: a control character (line breaks included), a bidi control (U+202A-U+202E,
+    U+2066-U+2069, U+200E, U+200F, U+061C), any other invisible format character (Unicode category Cf, except
+    the joiners U+200C and U+200D), a private-use character (Co), an unassigned code point (Cn) and a lone
+    surrogate (Cs). Then, on the NFKC form with every script's digits made ASCII (_screen_form): an HTML comment
+    opener '<!--', a URL, an IPv4 or IPv6 address, a dotted host name (labels joined by dots ending in an
+    alphabetic tail of two or more letters, e.g. host-a.internal, box.local, example.com), a host:port
+    (localhost:28080) and an e-mail address or user@host."""
     for ch in text:
         cat = unicodedata.category(ch)
         if cat == "Cc" or cat in ("Zl", "Zp"):
             return f"a control character U+{ord(ch):04X}"
         if ord(ch) in _BIDI:
             return f"a bidi control U+{ord(ch):04X}"
-    if _URL.search(text):
+        if cat in _ODD_CATEGORIES and ord(ch) not in _JOINERS:
+            return f"{_ODD_CATEGORIES[cat]} U+{ord(ch):04X}"
+    norm = _screen_form(text)
+    if "<!--" in norm:
+        return "an HTML comment opener '<!--'"
+    if _URL.search(norm):
         return "a URL"
-    if _IPV4.search(text):
+    if _IPV4.search(norm):
         return "an IPv4 address"
-    for token in _IPV6_TOKEN.findall(text):
+    for token in _IPV6_TOKEN.findall(norm):
         token = token.strip("[]").rstrip(".").split("%")[0]
+        if not any(c.isalnum() for c in token):
+            continue                                       # a bare '::' names no address
         try:
             if isinstance(ipaddress.ip_address(token), ipaddress.IPv6Address):
                 return "an IPv6 address"
         except ValueError:
             pass
-    m = _HOST.search(text)
+    m = _HOST.search(norm)
     if m:
         return f"a dotted host name ({m.group(0)!r})"
+    m = _HOST_PORT.search(norm)
+    if m:
+        return f"a host:port ({m.group(0)!r})"
+    m = _EMAIL.search(norm)
+    if m:
+        return f"an e-mail address or user@host ({m.group(0)!r})"
     return None
 
 
@@ -601,7 +638,8 @@ def _check_public_source(s: dict, where: str) -> None:
     problem = public_text_problem(label)
     if problem:
         raise BaselineError(f"{where}: conditions.label holds {problem}; a baseline may be committed to a public "
-                            "repository. Re-run with a label that names the conditions without hosts or addresses")
+                            "repository. Re-run with a label that names the conditions without hosts or addresses "
+                            "(run_evalset.py --label). " + PUBLIC_TEXT_REFUSES)
     commit = s.get("harness_commit")
     if commit is not None and not _HEX_COMMIT.fullmatch(commit):
         raise BaselineError(f"{where}: harness_commit {commit!r:.80} is not a hex commit id")
@@ -609,8 +647,15 @@ def _check_public_source(s: dict, where: str) -> None:
         problem = public_text_problem(model)
         if problem:
             raise BaselineError(f"{where}: model id {model!r:.80} holds {problem}")
-    if s.get("dir") is not None and ("/" in s["dir"] or "\\" in s["dir"]):
-        raise BaselineError(f"{where}: sources[].dir must be a last path component, not {s['dir']!r:.80}")
+    run_dir = s.get("dir")
+    if run_dir is not None:
+        if "/" in run_dir or "\\" in run_dir:
+            raise BaselineError(f"{where}: sources[].dir must be a last path component, not {run_dir!r:.80}")
+        problem = public_text_problem(run_dir)
+        if problem:
+            raise BaselineError(f"{where}: the run directory's name {run_dir!r:.80} holds {problem}; the baseline "
+                                "keeps that name and may be committed to a public repository. Rename the directory "
+                                "(e.g. evalset-20261004-r1). " + PUBLIC_TEXT_REFUSES)
 
 
 # --------------------------------------------------------------- statistics --
@@ -1301,7 +1346,14 @@ def compare(baseline: dict, candidate_records: Sequence[dict], *, allow_insuffic
 # ----------------------------------------------------------------- markdown --
 
 def _cell(value) -> str:
-    return str(value).replace("\r", " ").replace("\n", " ").replace("|", "\\|")
+    """Text for a markdown table cell or list item: one line, pipes escaped, '<' as &lt; so no text can open an
+    HTML tag or comment."""
+    return str(value).replace("\r", " ").replace("\n", " ").replace("|", "\\|").replace("<", "&lt;")
+
+
+def _code(value) -> str:
+    """A markdown code span: one line, no backtick that could close it early (code spans need no other escape)."""
+    return "`" + str(value).replace("\r", " ").replace("\n", " ").replace("`", "'") + "`"
 
 
 def insufficient_gated(latency: dict) -> List[dict]:
@@ -1352,12 +1404,12 @@ def render_markdown(baseline: dict) -> str:
     cond = baseline["conditions"]
     deviations, thin = baseline["procedure_deviations"], insufficient_gated(baseline["latency"])
     out = ["## Eval-set baseline", "",
-           f"Frozen {baseline.get('frozen_at')} by `scripts/aiq/baseline.py` from {len(sources)} run(s). Every "
-           "number below holds only under the conditions listed here.", "", "### Procedure deviations", ""]
+           f"Frozen {_cell(baseline.get('frozen_at'))} by `scripts/aiq/baseline.py` from {len(sources)} run(s). "
+           "Every number below holds only under the conditions listed here.", "", "### Procedure deviations", ""]
     if deviations:
         out += [f"**{len(deviations)} deviation(s) from the procedure (method `runs`): the numbers below were "
                 "measured under weaker conditions than the procedure asks for.**", ""]
-        out += [f"- **run `{_cell(d['run'])}`: {_cell(d['deviation'])}**: {_cell(d['detail'])}" for d in deviations]
+        out += [f"- **run {_code(d['run'])}: {_cell(d['deviation'])}**: {_cell(d['detail'])}" for d in deviations]
     else:
         out.append("None: every run followed the procedure (method `runs`).")
     out += ["", "### Gated latency without enough samples", ""]
@@ -1368,16 +1420,17 @@ def render_markdown(baseline: dict) -> str:
     else:
         out.append("None: every gated class/metric has enough samples.")
     out += ["", "### Conditions", "",
-            f"Eval set sha256 `{cond['eval_set_sha256']}`; workers {cond['workers']}; model ids "
-            f"{', '.join(f'`{m}`' for m in cond['model_ids']) or 'not reported'}.", ""]
+            f"Eval set sha256 {_code(cond['eval_set_sha256'])}; workers {cond['workers']}; model ids "
+            f"{', '.join(_code(m) for m in cond['model_ids']) or 'not reported'}.", ""]
     for s in sources:
         only, acct = s.get("only"), s.get("account")
         acct_text = ("not checked" if not acct or not acct.get("checked") else
                      f"{acct.get('conversations')} other conversations, {acct.get('facts')} saved facts"
                      + (" (used account allowed)" if acct.get("allowed_used") else ""))
-        out.append(f"- run `{_cell(s.get('dir'))}`: label \"{_cell(s.get('label'))}\"; started {s.get('started')}; "
-                   f"finished {s.get('finished')}; harness commit `{s.get('harness_commit')}`; repeats "
-                   f"{s.get('repeats')}; cases {', '.join(only) if only else 'all'}; account {acct_text}")
+        out.append(f"- run {_code(s.get('dir'))}: label \"{_cell(s.get('label'))}\"; started "
+                   f"{_cell(s.get('started'))}; finished {_cell(s.get('finished'))}; harness commit "
+                   f"{_code(s.get('harness_commit'))}; repeats {s.get('repeats')}; cases "
+                   f"{_cell(', '.join(only)) if only else 'all'}; account {acct_text}")
     n_records = sum(c["repeats"] for c in q["cases"].values())
     out += ["", "### Quality", "",
             f"Overall mean case score {_fmt_rate(q['overall_mean_score'])} (exact {q['overall_mean_score_exact']}) "
@@ -1389,9 +1442,8 @@ def render_markdown(baseline: dict) -> str:
                     _fmt_rate(c["mean_score"]), f"{c['failed_turns']}/{c['turns']}", _failing_text(c)]
                    for cid, c in q["cases"].items()])
     out += ["", "### Latency by workload class", "",
-            "Seconds. " + METHOD["latency_unit"] + " " + METHOD["percentile"] + " " + METHOD["noise"] + " "
-            + METHOD["ratio"] + " " + METHOD["tolerance"] + " " + METHOD["p95"] + " " + METHOD["gated"] + " "
-            + METHOD["insufficient"], ""]
+            _cell("Seconds. " + " ".join(METHOD[k] for k in ("latency_unit", "percentile", "noise", "ratio",
+                                                             "tolerance", "p95", "gated", "insufficient"))), ""]
     rows = []
     for w, per in baseline["latency"].items():
         for m in METRICS:
