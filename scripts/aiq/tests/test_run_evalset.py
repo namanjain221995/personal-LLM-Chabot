@@ -55,15 +55,17 @@ COOKIE = "ts_session=fake-session"
 RUN_KEYS = {"kind", "schema", "started", "finished", "seconds", "interrupted", "deadline_reached", "conditions",
             "cases"}
 CONDITION_KEYS = {"base", "harness_commit", "label", "workers", "repeats", "only", "health", "case_timeout_s",
-                  "eval_set_sha256", "account", "features", "code_sandbox", "deadline"}
+                  "eval_set_sha256", "account", "features", "code_sandbox", "deadline", "not_before", "utc_offset",
+                  "tz_ok"}
 RECORD_KEYS = {"id", "category", "section", "effort", "workload", "repeat", "conversation_id", "error", "stop",
                "attachments", "turns"}
 RESULT_KEYS = {"http", "answer", "errors", "request_id", "meta", "reasoning_events", "reasoning_chars", "timing",
-               "timed_out", "terminal", "bad_frames", "status_events", "usage", "stages", "stage_offsets",
+               "timed_out", "timeout_reason", "terminal", "bad_frames", "status_events", "usage", "stages", "stage_offsets",
                "server_total_ms", "trace_status", "versions", "trace_thinks", "source_passages",
                "source_passages_captured"}
 TIMING_KEYS = {"first_event_s", "first_token_s", "first_answer_s", "total_s"}
 FEATURES = {"artifacts": True, "attachments": True, "deep_research": True, "salesforce": False, "web_search": True}
+IST = timezone(timedelta(hours=5, minutes=30))
 
 
 # ------------------------------------------------------------ the fake --
@@ -83,6 +85,9 @@ class Fake:
         self.timeline: list = []
         #: conversations a /chat/stop named: their stream ends at the next beat
         self.stopped: set = set()
+        #: a /chat/stop that does nothing (the generation keeps streaming), or answers late
+        self.ignore_stop = False
+        self.stop_delay_s = 0.0
         #: what the account already holds
         self.conversations = self.archived = self.facts = 0
         self.history_status = 200
@@ -232,10 +237,12 @@ def _handler(fake: Fake):
             if self.path == "/chat/stop":
                 body = json.loads(raw or b"{}")
                 fake.note(f"stop {body.get('conversation_id')}")
+                time.sleep(fake.stop_delay_s)
                 with fake.lock:
                     fake.stops.append(body)
-                    fake.stopped.add(body.get("conversation_id"))
-                return self._json(200, {"stopped": True})
+                    if not fake.ignore_stop:
+                        fake.stopped.add(body.get("conversation_id"))
+                return self._json(200, {"stopped": not fake.ignore_stop})
             if self.path == "/chat":
                 return self._chat(json.loads(raw))
             return self._json(404, {"detail": "not found"})
@@ -562,11 +569,16 @@ def test_a_case_past_its_timeout_is_stopped_and_recorded(fake, tmp_path, pwfile)
     assert fake.stops == [{"conversation_id": rec["conversation_id"], "session_id": rec["conversation_id"]}]
 
 
-def test_a_silent_stream_is_a_read_timeout_and_the_generation_is_stopped(fake, tmp_path, pwfile):
+def test_a_silent_stream_cut_at_the_case_limit_is_a_timeout_not_a_dead_pipe(fake, tmp_path, pwfile):
+    # the read timeout is the case's time left (60 s idle limit not reached): when it fires the case's
+    # time is up, so the turn is timed_out like any other cut, and what it streamed is kept
     fake.scripts["EV01"] = {"silent_s": 3}
     _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01,EV03", "--case-timeout-s", "0.6")
     ev01, ev03 = results["cases"]
-    assert ev01["error"].startswith("ReadTimeout") and ev01["turns"] == []
+    assert ev01["error"].startswith("CaseTimeout:")
+    res = ev01["turns"][0]["result"]
+    assert (res["timed_out"], res["timeout_reason"], res["timing"]["total_s"]) == (True, "case_timeout", None)
+    assert res["answer"] == "\n" + EA.GOOD["EV01"]["answer"][:40] and res["timing"]["first_answer_s"] is not None
     assert fake.stops == [{"conversation_id": ev01["conversation_id"], "session_id": ev01["conversation_id"]}]
     assert ev03["error"] is None, "the next case still runs"
 
@@ -897,8 +909,10 @@ def test_a_baseexception_stops_the_run_and_the_generation_in_flight(fake, tmp_pa
     results = json.loads((out / "results.json").read_text())
     assert results["interrupted"] is True and results["interrupted_by"] == "KeyboardInterrupt"
     assert results["finished"] and isinstance(results["seconds"], int)
-    ev03 = next(b["conversation_id"] for b in fake.chats if b["test_case_id"] == "EV03")
-    assert results["stopped_on_interrupt"] == [{"conversation_id": ev03, "http": 200, "stopped": True}]
+    ev01, ev03 = (next(b["conversation_id"] for b in fake.chats if b["test_case_id"] == c) for c in ("EV01", "EV03"))
+    # both cases were in flight when EV01's worker raised: EV03 streaming, EV01 scoring
+    assert results["stopped_on_interrupt"] == [{"conversation_id": c, "http": 200, "stopped": True}
+                                               for c in sorted((ev01, ev03))]
     time.sleep(0.5)
     assert {b["test_case_id"] for b in fake.chats} == {"EV01", "EV03"}, "no case started after the interrupt"
     assert json.loads((out / "summary.json").read_text())["headline"]["interrupted"] is True
@@ -941,21 +955,104 @@ def test_a_worker_that_cannot_sign_in_records_errors_and_the_run_goes_on(fake, t
     assert summary["headline"]["errors"] == len(errors)
 
 
-def test_parse_deadline_is_the_next_time_the_clock_shows_it():
-    ist = timezone(timedelta(hours=5, minutes=30))
-    at = datetime(2026, 10, 4, 5, 10, 30, tzinfo=ist)
-    assert RE.parse_deadline("07:00", at) == datetime(2026, 10, 4, 7, 0, tzinfo=ist)
-    assert RE.parse_deadline("05:10", at) == datetime(2026, 10, 5, 5, 10, tzinfo=ist), "already past: tomorrow"
-    assert RE.parse_deadline("7:05", datetime(2026, 10, 4, 23, 0, tzinfo=ist)) == datetime(2026, 10, 5, 7, 5, tzinfo=ist)
+def test_parse_deadline_is_today_and_never_rolls_over_to_tomorrow():
+    at = datetime(2026, 10, 4, 5, 10, 30, tzinfo=IST)
+    assert RE.parse_deadline("07:00", at) == datetime(2026, 10, 4, 7, 0, tzinfo=IST)
+    assert RE.parse_deadline("17:10", at) == datetime(2026, 10, 4, 17, 10, tzinfo=IST), "12 h away is allowed"
+    with pytest.raises(RE.Refused, match=r"^--deadline 05:10 has already passed \(now 05:10\)$"):
+        RE.parse_deadline("05:10", at)
+    with pytest.raises(RE.Refused, match=r"^--deadline 07:05 has already passed \(now 23:00\)$"):
+        RE.parse_deadline("7:05", datetime(2026, 10, 4, 23, 0, tzinfo=IST))
+    with pytest.raises(RE.Refused, match=r"more than 12 h away \(now 05:10\)"):
+        RE.parse_deadline("17:11", at)
     for bad in ("24:00", "7", "07:60", "07:00pm", ""):
         with pytest.raises(SystemExit, match="HH:MM"):
             RE.parse_deadline(bad, at)
 
 
+def test_parse_not_before_refuses_a_start_before_the_window():
+    assert RE.parse_not_before("05:00", datetime(2026, 10, 5, 5, 0, tzinfo=IST)) == datetime(2026, 10, 5, 5, 0,
+                                                                                          tzinfo=IST)
+    assert RE.parse_not_before("05:00", datetime(2026, 10, 5, 6, 59, tzinfo=IST)) == datetime(2026, 10, 5, 5, 0,
+                                                                                           tzinfo=IST)
+    with pytest.raises(RE.Refused, match=r"^--not-before 05:00 has not come yet \(now 04:55\)"):
+        RE.parse_not_before("05:00", datetime(2026, 10, 5, 4, 55, 59, tzinfo=IST))
+    with pytest.raises(SystemExit, match="HH:MM"):
+        RE.parse_not_before("5am", datetime(2026, 10, 5, 4, 55, tzinfo=IST))
+
+
+def _at(monkeypatch, when):
+    """The host clock as the runner reads it (its UTC offset included)."""
+    monkeypatch.setattr(RE, "_local_now", lambda: when)
+
+
+def _refused(fake, tmp_path, pwfile, capsys, *extra):
+    out = tmp_path / "run"
+    rc = RE.main(["--base", fake.base, "--email", EMAIL, "--password-file", pwfile, "--out", str(out),
+                  "--code-root", str(tmp_path / "cr"), "--only", "EV01", *extra])
+    assert rc == RE.EXIT_REFUSED
+    assert fake.logins == 0 and fake.chats == [] and not out.exists(), "refused before signing in"
+    return capsys.readouterr().err
+
+
+def test_a_deadline_that_has_passed_is_refused_not_moved_to_tomorrow(fake, tmp_path, pwfile, monkeypatch, capsys):
+    _at(monkeypatch, datetime(2026, 10, 5, 7, 5, tzinfo=IST))  # a late start for the 05:00-07:00 window
+    err = _refused(fake, tmp_path, pwfile, capsys, "--deadline", "07:00")
+    assert "--deadline 07:00 has already passed (now 07:05)" in err
+
+
+def test_a_deadline_more_than_12_hours_away_is_refused(fake, tmp_path, pwfile, monkeypatch, capsys):
+    _at(monkeypatch, datetime(2026, 10, 5, 4, 0, tzinfo=IST))
+    err = _refused(fake, tmp_path, pwfile, capsys, "--deadline", "16:01")
+    assert "--deadline 16:01 is more than 12 h away (now 04:00)" in err
+
+
+def test_not_before_refuses_an_early_start(fake, tmp_path, pwfile, monkeypatch, capsys):
+    _at(monkeypatch, datetime(2026, 10, 5, 4, 55, tzinfo=IST))
+    err = _refused(fake, tmp_path, pwfile, capsys, "--not-before", "05:00", "--deadline", "07:00")
+    assert "--not-before 05:00 has not come yet (now 04:55)" in err
+
+
+def test_a_start_inside_the_window_records_it(fake, tmp_path, pwfile, monkeypatch):
+    _at(monkeypatch, datetime(2026, 10, 5, 5, 10, tzinfo=IST))
+    _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01", "--not-before", "05:00")
+    cond = results["conditions"]
+    assert (cond["not_before"], cond["deadline"], cond["utc_offset"], cond["tz_ok"]) == (
+        "2026-10-05T05:00+05:30", None, "+05:30", False)
+    assert results["cases"][0]["error"] is None
+
+
+def test_a_window_on_a_host_that_is_not_on_ist_is_refused(fake, tmp_path, pwfile, monkeypatch, capsys):
+    _at(monkeypatch, datetime.now(timezone.utc))
+    err = _refused(fake, tmp_path, pwfile, capsys, "--deadline", "23:59")
+    assert "UTC offset is +00:00, not +05:30" in err and "--tz-ok" in err
+
+
+def test_tz_ok_runs_on_host_local_time_and_says_so(fake, tmp_path, pwfile, monkeypatch):
+    now = datetime.now(timezone.utc)
+    _at(monkeypatch, now)
+    _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01", "--not-before", "00:00", "--tz-ok")
+    cond = results["conditions"]
+    assert (cond["utc_offset"], cond["tz_ok"]) == ("+00:00", True)
+    assert cond["not_before"] == now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(timespec="minutes")
+
+
+def test_no_window_needs_no_ist_but_the_offset_is_recorded(fake, tmp_path, pwfile, monkeypatch):
+    _at(monkeypatch, datetime.now(timezone(timedelta(hours=-7))))
+    _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01")
+    assert (results["conditions"]["utc_offset"], results["conditions"]["tz_ok"]) == ("-07:00", False)
+
+
 def test_no_case_starts_after_the_deadline(fake, tmp_path, pwfile, monkeypatch):
-    soon = datetime.now().astimezone() + timedelta(seconds=0.3)
+    soon = datetime.now().astimezone() + timedelta(seconds=0.6)
     monkeypatch.setattr(RE, "parse_deadline", lambda text, now: soon)
-    fake.scripts["EV01"] = {"pre_answer_delay": 0.6}
+    real_score = RE.score_turn
+
+    def slow_score(case, turn, result):  # EV01's stream is over well before the deadline; scoring runs past it
+        time.sleep(0.9)
+        return real_score(case, turn, result)
+
+    monkeypatch.setattr(RE, "score_turn", slow_score)
     _out, results, summary = _run(fake, tmp_path, pwfile, "--only", "EV01,EV03,RQ03", "--deadline", "07:00")
     assert [r["id"] for r in results["cases"]] == ["EV01"] and results["cases"][0]["error"] is None
     assert results["deadline_reached"] is True and results["interrupted"] is False and results["finished"]
@@ -1104,3 +1201,213 @@ def test_the_docstring_states_the_baseline_protocol():
     assert "Use --workers 1 for a baseline" in doc
     assert ("one fresh account per run directory; the baseline is N run directories of --repeats 1, each on its "
             "own fresh account (devstack.sh seed), so repeats never see each other") in doc
+
+
+# ------------------------------------------- the deadline bounds a case --
+
+@pytest.mark.parametrize("script", [{"stall_s": 5}, {"silent_s": 5}], ids=["streaming", "silent"])
+def test_a_case_running_at_the_deadline_is_cut_and_stopped(fake, tmp_path, pwfile, monkeypatch, script):
+    soon = datetime.now().astimezone() + timedelta(seconds=0.8)
+    monkeypatch.setattr(RE, "parse_deadline", lambda text, now: soon)
+    fake.scripts["EV01"] = script
+    t0 = time.monotonic()
+    _out, results, summary = _run(fake, tmp_path, pwfile, "--only", "EV01,EV03", "--deadline", "07:00")
+    assert time.monotonic() - t0 < 3, "the deadline did not bound the case in flight"
+    (rec,) = results["cases"]
+    assert rec["error"].startswith("DeadlineCut:"), rec["error"]
+    res = rec["turns"][0]["result"]
+    assert (res["timed_out"], res["timeout_reason"], res["timing"]["total_s"]) == (True, "deadline", None)
+    assert rec["stop"] == {"http": 200, "stopped": True}
+    assert [s["conversation_id"] for s in fake.stops] == [rec["conversation_id"]]
+    assert results["deadline_reached"] is True and [b["test_case_id"] for b in fake.chats] == ["EV01"]
+    assert summary["headline"]["turns_timed_out"] == 1
+
+
+def test_the_case_limit_still_cuts_when_it_comes_before_the_deadline(fake, tmp_path, pwfile, monkeypatch):
+    later = datetime.now().astimezone() + timedelta(hours=1)
+    monkeypatch.setattr(RE, "parse_deadline", lambda text, now: later)
+    fake.scripts["EV01"] = {"stall_s": 5}
+    _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01", "--deadline", "07:00", "--case-timeout-s", "0.5")
+    rec = results["cases"][0]
+    assert rec["error"].startswith("CaseTimeout:") and not rec["error"].startswith("DeadlineCut")
+    assert rec["turns"][0]["result"]["timeout_reason"] == "case_timeout" and results["deadline_reached"] is False
+
+
+# ---------------------------------------------- SIGTERM, SIGHUP, cancel --
+
+def _launch(fake, tmp_path, pwfile, *extra, **popen):
+    out = tmp_path / "run"
+    proc = subprocess.Popen([sys.executable, os.path.join(RE.HERE, "run_evalset.py"), "--base", fake.base,
+                             "--email", EMAIL, "--password-file", pwfile, "--out", str(out),
+                             "--code-root", str(tmp_path / "cr"), *extra],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **popen)
+    end = time.monotonic() + 30
+    while not fake.chats and time.monotonic() < end:
+        time.sleep(0.02)
+    assert fake.chats, "the first case never started"
+    time.sleep(0.3)
+    return proc, out
+
+
+@pytest.mark.parametrize("sig,rc", [(signal.SIGTERM, 143), (signal.SIGHUP, 129)], ids=["SIGTERM", "SIGHUP"])
+def test_sigterm_and_sighup_take_the_ctrl_c_path(fake, tmp_path, pwfile, sig, rc):
+    fake.scripts["EV01"] = {"stall_s": 20}
+    proc, out = _launch(fake, tmp_path, pwfile, "--only", "EV01,EV03")
+    sent = time.monotonic()
+    proc.send_signal(sig)
+    output, _ = proc.communicate(timeout=30)
+    assert proc.returncode == rc, output
+    results = json.loads((out / "results.json").read_text())
+    assert results["interrupted"] is True and results["finished"]
+    assert results["interrupted_by"] == sig.name
+    conv = fake.chats[0]["conversation_id"]
+    assert results["stopped_on_interrupt"] == [{"conversation_id": conv, "http": 200, "stopped": True}]
+    assert not [w for t, w in fake.timeline if t > sent and w.startswith("chat ")], "a case started after the signal"
+
+
+def test_a_sighup_the_runner_was_started_ignoring_stays_ignored(fake, tmp_path, pwfile):
+    # nohup: the operator asked for the run to survive the terminal closing
+    fake.scripts["EV01"] = {"stall_s": 1.0}
+    proc, out = _launch(fake, tmp_path, pwfile, "--only", "EV01",
+                        preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
+    proc.send_signal(signal.SIGHUP)
+    output, _ = proc.communicate(timeout=30)
+    assert proc.returncode == 0, output
+    results = json.loads((out / "results.json").read_text())
+    assert results["interrupted"] is False and results["cases"][0]["error"] is None
+
+
+def test_chat_stops_reading_on_cancel_while_bytes_keep_flowing(fake):
+    fake.ignore_stop = True
+    fake.scripts["EV01"] = {"stall_s": 30}  # a heartbeat every 50 ms, for 30 s
+    client = H.Client(fake.base, EMAIL, PASSWORD)
+    cancel = threading.Event()
+    threading.Timer(0.4, cancel.set).start()
+    t0 = time.monotonic()
+    res = client.chat("conv-c", "hi", [], "fast", test_case_id="EV01", cancel=cancel)
+    assert time.monotonic() - t0 < 1.5
+    assert (res["cancelled"], res["timed_out"], res["terminal"], res["errors"]) == (True, False, None, [])
+    assert res["timing"]["total_s"] is None and res["http"] == 200
+
+
+def test_chat_cancelled_before_the_post_sends_nothing(fake):
+    client = H.Client(fake.base, EMAIL, PASSWORD)
+    cancel = threading.Event()
+    cancel.set()
+    res = client.chat("conv-c", "hi", [], "fast", test_case_id="EV01", cancel=cancel)
+    assert (res["cancelled"], res["http"], res["timing"]["total_s"]) == (True, None, None)
+    assert fake.chats == []
+    assert client.chat("conv-d", "hi", [], "fast", test_case_id="EV01")["cancelled"] is False
+
+
+def test_ctrl_c_exits_promptly_when_the_server_ignores_the_stop(fake, tmp_path, pwfile):
+    fake.ignore_stop = True
+    fake.scripts["EV01"] = {"stall_s": 30}
+    proc, out = _launch(fake, tmp_path, pwfile, "--only", "EV01,EV03", "--case-timeout-s", "20")
+    sent = time.monotonic()
+    proc.send_signal(signal.SIGINT)
+    output, _ = proc.communicate(timeout=60)
+    assert time.monotonic() - sent < 6, "the worker kept reading a stream the stop did not end"
+    assert proc.returncode == RE.EXIT_SIGINT, output
+    results = json.loads((out / "results.json").read_text())
+    assert results["interrupted"] is True
+    conv = fake.chats[0]["conversation_id"]
+    assert results["stopped_on_interrupt"] == [{"conversation_id": conv, "http": 200, "stopped": False}]
+
+
+def test_results_json_says_interrupted_before_any_stop_goes_out(fake, tmp_path, pwfile, monkeypatch):
+    fake.scripts["EV03"] = {"stall_s": 3}
+    out = tmp_path / "run"
+    seen = []
+    real_stop = RE.EvalClient.stop
+
+    def stop(self, conv):
+        if threading.current_thread() is threading.main_thread():
+            on_disk = json.loads((out / "results.json").read_text())
+            seen.append((on_disk["interrupted"], bool(on_disk["finished"]), on_disk.get("stopped_on_interrupt")))
+        return real_stop(self, conv)
+
+    real_score = RE.score_turn
+
+    def score(case, turn, result):
+        if case["id"] == "EV01":
+            time.sleep(0.4)
+            raise KeyboardInterrupt
+        return real_score(case, turn, result)
+
+    monkeypatch.setattr(RE.EvalClient, "stop", stop)
+    monkeypatch.setattr(RE, "score_turn", score)
+    with pytest.raises(KeyboardInterrupt):
+        RE.main(["--base", fake.base, "--email", EMAIL, "--password-file", pwfile, "--out", str(out),
+                 "--only", "EV01,EV03", "--workers", "2"])
+    assert seen and all(interrupted and finished for interrupted, finished, _ in seen), seen
+    assert all(e.get("pending") is True for e in seen[0][2]), "the stops are marked as not sent yet"
+    after = json.loads((out / "results.json").read_text())["stopped_on_interrupt"]
+    assert after and all(e.get("http") == 200 and "pending" not in e for e in after), "rewritten with the outcomes"
+
+
+# ------------------------------------------------- frames, mid-stream --
+
+def test_a_data_frame_that_is_json_but_not_an_object_is_a_bad_frame(fake, tmp_path, pwfile):
+    fake.scripts["EV01"] = {"raw_frames": [f"event: {ev}\ndata: {payload}\n\n" for ev in ("token", "status", "meta")
+                                           for payload in ('"just a string"', "[1, 2]", "42", "null")]}
+    _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01")
+    rec = results["cases"][0]
+    res = rec["turns"][0]["result"]
+    assert rec["error"] is None, rec["error"]
+    assert res["bad_frames"] == 12 and res["answer"] == "\n" + EA.GOOD["EV01"]["answer"]
+    assert res["status_events"] == ["Reading the question"] and res["terminal"] == "done"
+
+
+def test_an_exception_mid_stream_stops_the_detached_generation(fake, tmp_path, pwfile, monkeypatch):
+    fake.scripts["EV01"] = {"stall_s": 3}
+    real_lines = H.sse_lines
+
+    def broken(chunks):
+        for i, line in enumerate(real_lines(chunks)):
+            if i == 20:  # inside the stall: the generation is still running on the server
+                raise ValueError("a reader bug")
+            yield line
+
+    monkeypatch.setattr(H, "sse_lines", broken)
+    _out, results, _ = _run(fake, tmp_path, pwfile, "--only", "EV01")
+    rec = results["cases"][0]
+    assert rec["error"] == "ValueError: a reader bug"
+    assert rec["stop"] == {"http": 200, "stopped": True}
+    assert fake.stops == [{"conversation_id": rec["conversation_id"], "session_id": rec["conversation_id"]}]
+
+
+def test_the_docstring_states_how_a_stop_ends_the_wait():
+    doc = " ".join(RE.__doc__.split())
+    assert "the stream's idle limit bounds the wait" not in doc
+    assert "stops reading its stream at the next line it receives" in doc
+
+
+def test_a_second_interrupt_during_the_stops_leaves_an_honest_file(fake, tmp_path, pwfile, monkeypatch):
+    fake.scripts["EV03"] = {"stall_s": 3}
+    out = tmp_path / "run"
+    real_stop = RE.EvalClient.stop
+    main_stops = []
+
+    def stop(self, conv):
+        if threading.current_thread() is threading.main_thread():
+            main_stops.append(conv)
+            raise KeyboardInterrupt  # the operator presses Ctrl-C again while the first stop is out
+        return real_stop(self, conv)
+
+    def score(case, turn, result):
+        time.sleep(0.3)  # EV03 is streaming on the other worker by now
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(RE.EvalClient, "stop", stop)
+    monkeypatch.setattr(RE, "score_turn", score)
+    with pytest.raises(KeyboardInterrupt):
+        RE.main(["--base", fake.base, "--email", EMAIL, "--password-file", pwfile, "--out", str(out),
+                 "--only", "EV01,EV03", "--workers", "2"])
+    results = json.loads((out / "results.json").read_text())
+    stops = results["stopped_on_interrupt"]
+    assert results["interrupted"] is True and results["finished"] and len(main_stops) == 1
+    assert [e["conversation_id"] for e in stops] == sorted(b["conversation_id"] for b in fake.chats)
+    assert stops[0]["error"] == "outcome unknown: interrupted again while this stop was being sent"
+    assert stops[1]["error"] == "not sent: interrupted again before this stop went out"
+    assert not any("pending" in e for e in stops)

@@ -19,6 +19,7 @@ import mimetypes
 import os
 import re
 import subprocess
+import threading
 import time
 import zipfile
 from collections import defaultdict
@@ -124,7 +125,8 @@ class Client:
              attachments: Optional[List[dict]] = None, web_search: str = "off", *,
              pdf_uploads: Optional[List[dict]] = None, deep_research: Optional[bool] = None,
              test_case_id: Optional[str] = None, extra: Optional[dict] = None,
-             max_seconds: Optional[float] = None, idle_timeout_s: Optional[float] = None) -> dict:
+             max_seconds: Optional[float] = None, idle_timeout_s: Optional[float] = None,
+             cancel: Optional[threading.Event] = None) -> dict:
         """POST /chat and follow the SSE stream.
 
         The optional keyword fields are sent only when given, so a caller that
@@ -133,8 +135,15 @@ class Client:
         detached server-side and keeps running until POST /chat/stop.
         `idle_timeout_s` caps the wait for any byte (the read timeout is the
         smaller of the two): the server heartbeats every 15 s (app/sse.py
-        HEARTBEAT_SECONDS), so a silent pipe is a dead one and raises
-        httpx.ReadTimeout.
+        HEARTBEAT_SECONDS), so a pipe silent for `idle_timeout_s` is a dead
+        one and raises httpx.ReadTimeout. A read that times out once
+        `max_seconds` has run out is that cut instead (`timed_out` True, what
+        streamed so far kept), not a dead pipe.
+
+        `cancel`, when set, stops READING at the next line of the stream (a
+        token, any event, or a heartbeat) and is checked before the POST too:
+        the result has `cancelled` True (http None when nothing was sent).
+        Like `max_seconds` it ends no generation; the caller stops that.
 
         Besides `seconds` and `ttft`, the result carries `request_id` (the
         X-Request-ID response header) and `timing`, each value float seconds
@@ -145,16 +154,17 @@ class Client:
         `token` event with a non-whitespace character: no step, status,
         reasoning, meta or heartbeat counts) and total_s (the stream closed
         after its terminal `done`). total_s is None for a turn that did not
-        finish: an HTTP error, a read cut at `max_seconds`, or a stream that
-        ended in `error` or with no terminal event, so a failed turn is never
-        a latency sample.
+        finish: an HTTP error, a read cut at `max_seconds` or by `cancel`, or
+        a stream that ended in `error` or with no terminal event, so a failed
+        turn is never a latency sample.
 
         `terminal` is "done", "error" or None (neither arrived); a stream
-        that closed with neither, unless reading was cut at `max_seconds`,
-        gets {"error": "stream ended without done"} in `errors`. `bad_frames`
-        counts `data:` lines that were not JSON (kept, never skipped
-        silently), `status_events` the texts of the `status` events (they
-        announce feature downgrades, among other things).
+        that closed with neither, unless reading was cut (`max_seconds`,
+        `cancel`), gets {"error": "stream ended without done"} in `errors`.
+        `bad_frames` counts `data:` lines that were not a JSON object
+        (counted, never skipped silently), `status_events` the texts of the
+        `status` events (they announce feature downgrades, among other
+        things).
         """
         body = chat_body(conversation_id, message, history, effort, web_search, pdf_uploads=pdf_uploads,
                          deep_research=deep_research, test_case_id=test_case_id, extra=extra)
@@ -171,67 +181,86 @@ class Client:
         started = time.perf_counter()
         first_token = None
         first_event = first_answer = None
-        timed_out = False
+        timed_out = cancelled = False
 
         def timing(total: Optional[float]) -> dict:
             return {k: (round(v, 3) if v is not None else None) for k, v in (
                 ("first_event_s", first_event), ("first_token_s", first_token),
                 ("first_answer_s", first_answer), ("total_s", total))}
 
+        def unfinished(http: Optional[int], error: str, request_id: Optional[str], cut: bool = False) -> dict:
+            return {"http": http, "answer": "", "meta": {}, "error": error, "reasoning_events": 0,
+                    "reasoning_chars": 0, "steps": {}, "seconds": 0, "errors": [], "request_id": request_id,
+                    "timed_out": False, "cancelled": cut, "terminal": None, "bad_frames": 0, "status_events": [],
+                    "timing": timing(None)}
+
+        if cancel is not None and cancel.is_set():
+            return unfinished(None, "cancelled before the request was sent", None, cut=True)
         with self.http.stream("POST", f"{self.base}/chat", json=body, **stream_kw) as r:
             request_id = r.headers.get("x-request-id")
             if r.status_code != 200:
-                return {"http": r.status_code, "answer": "", "meta": {}, "error": r.read()[:400].decode("utf-8", "replace"),
-                        "reasoning_events": 0, "reasoning_chars": 0, "steps": {}, "seconds": 0,
-                        "errors": [], "request_id": request_id, "timed_out": False, "terminal": None,
-                        "bad_frames": 0, "status_events": [], "timing": timing(None)}
+                return unfinished(r.status_code, r.read()[:400].decode("utf-8", "replace"), request_id)
             event = None
-            for line in sse_lines(r.iter_bytes()):
-                if max_seconds is not None and time.perf_counter() - started > max_seconds:
-                    timed_out = True
-                    break
-                if line.startswith("event:"):
-                    event = line[6:].strip()
-                    continue
-                if not line.startswith("data:"):
-                    continue
-                if first_event is None:
-                    first_event = time.perf_counter() - started
-                try:
-                    data = json.loads(line[5:].strip() or "{}")
-                except json.JSONDecodeError:
-                    bad_frames += 1
-                    continue
-                if event == "token":
-                    if first_token is None:
-                        first_token = time.perf_counter() - started
-                    if first_answer is None and str(data.get("text", "")).strip():
-                        first_answer = time.perf_counter() - started
-                    tokens.append(str(data.get("text", "")))
-                elif event == "reasoning":
-                    reasoning.append(str(data.get("text", "")))
-                elif event == "step":
-                    sid = int(data.get("id", 0) or 0)
-                    steps[sid] = {**steps.get(sid, {}), **data}
-                elif event == "meta":
-                    meta = {**meta, **data} if isinstance(data, dict) else meta
-                elif event == "status":
-                    status_events.append(str(data.get("text", "")) if isinstance(data, dict) else str(data))
-                elif event == "error":
-                    errors.append(data)
-                    terminal = "error"
-                elif event == "done":
-                    terminal = terminal or "done"
+            try:
+                for line in sse_lines(r.iter_bytes()):
+                    if cancel is not None and cancel.is_set():
+                        cancelled = True
+                        break
+                    if max_seconds is not None and time.perf_counter() - started > max_seconds:
+                        timed_out = True
+                        break
+                    if line.startswith("event:"):
+                        event = line[6:].strip()
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    if first_event is None:
+                        first_event = time.perf_counter() - started
+                    try:
+                        data = json.loads(line[5:].strip() or "{}")
+                    except json.JSONDecodeError:
+                        bad_frames += 1
+                        continue
+                    if not isinstance(data, dict):  # every orchestrator frame carries an object
+                        bad_frames += 1
+                        continue
+                    if event == "token":
+                        if first_token is None:
+                            first_token = time.perf_counter() - started
+                        if first_answer is None and str(data.get("text", "")).strip():
+                            first_answer = time.perf_counter() - started
+                        tokens.append(str(data.get("text", "")))
+                    elif event == "reasoning":
+                        reasoning.append(str(data.get("text", "")))
+                    elif event == "step":
+                        sid = int(data.get("id", 0) or 0)
+                        steps[sid] = {**steps.get(sid, {}), **data}
+                    elif event == "meta":
+                        meta = {**meta, **data}
+                    elif event == "status":
+                        status_events.append(str(data.get("text", "")))
+                    elif event == "error":
+                        errors.append(data)
+                        terminal = "error"
+                    elif event == "done":
+                        terminal = terminal or "done"
+            except httpx.ReadTimeout:
+                if cancel is not None and cancel.is_set():
+                    cancelled = True
+                elif max_seconds is not None and time.perf_counter() - started >= max_seconds:
+                    timed_out = True  # the read timeout was the time left: a cut, not a dead pipe
+                else:
+                    raise
         total = time.perf_counter() - started
-        if terminal is None and not timed_out:
+        if terminal is None and not timed_out and not cancelled:
             errors.append({"error": "stream ended without done"})
         return {"http": 200, "answer": "".join(tokens), "meta": meta, "steps": steps, "errors": errors,
                 "reasoning_events": len(reasoning), "reasoning_chars": sum(len(x) for x in reasoning),
                 "seconds": round(total, 1),
                 "ttft": round(first_token, 2) if first_token is not None else None,
-                "request_id": request_id, "timed_out": timed_out, "terminal": terminal,
+                "request_id": request_id, "timed_out": timed_out, "cancelled": cancelled, "terminal": terminal,
                 "bad_frames": bad_frames, "status_events": status_events,
-                "timing": timing(total if terminal == "done" and not timed_out else None)}
+                "timing": timing(total if terminal == "done" and not timed_out and not cancelled else None)}
 
     def trace(self, trace_id: str) -> Optional[dict]:
         if not trace_id:
