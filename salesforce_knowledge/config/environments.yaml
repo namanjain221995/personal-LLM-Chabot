@@ -1,0 +1,16 @@
+# Environment identity only. NO credentials: tokens, secrets and keys stay in
+# the process environment and never reach this file, the database, a manifest,
+# an export or a log.
+
+default: production
+
+environments:
+  dev9:
+    label: "Developer sandbox 9"
+    api_version: v61.0
+  preprod:
+    label: "Pre-production sandbox"
+    api_version: v61.0
+  production:
+    label: "Production"
+    api_version: v61.0

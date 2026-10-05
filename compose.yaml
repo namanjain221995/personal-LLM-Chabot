@@ -213,6 +213,23 @@ services:
       SF_LOGIN_URL: ${SF_LOGIN_URL:-}
       SF_API_VERSION: ${SF_API_VERSION:-v61.0}
       SF_LIVE_ENABLED: ${SF_LIVE_ENABLED:-true}
+      # --- new Salesforce pipeline (steps 4-5) ------------------------------
+      # Additive. BRAIN_ENABLED stays true and the existing sf_intel path is
+      # untouched; nothing below runs until a caller builds a
+      # pipeline.SalesforcePipeline.
+      SALESFORCE_KNOWLEDGE_ROOT: /app/salesforce_knowledge
+      SALESFORCE_ENVIRONMENT: ${SALESFORCE_ENVIRONMENT:-production}
+      # Cutover switch. OFF ships first: /chat keeps its current behaviour
+      # until the new path is verified through real requests, then this
+      # default flips and the flag goes away.
+      SFK_PIPELINE_ENABLED: ${SFK_PIPELINE_ENABLED:-false}
+      # The shared trace store. Same file the knowledge service writes.
+      SFK_TRACE_DB: ${SFK_TRACE_DB:-/data/traces/db/traces.sqlite}
+      SFK_TRACE_EXPORT_DIR: ${SFK_TRACE_EXPORT_DIR:-/data/traces/exports}
+      SFK_TRACING: ${SFK_TRACING:-true}
+      # src/ and the bundle's graphrag are mounted rather than baked into the
+      # image, so a change to either takes effect on restart, not on a rebuild.
+      PYTHONPATH: /app:/app/sfsrc:/app/vendor
       SF_LIGHTNING_BASE_URL: ${SF_LIGHTNING_BASE_URL:-https://techsara.lightning.force.com}
       SF_PRIVATE_KEY_FILE: /data/sf_jwt_key.pem
       SF_PRIVATE_KEY_B64: ${SF_PRIVATE_KEY_B64:-}
@@ -343,6 +360,19 @@ services:
       # on file change, so dropping a new pack into brain/packs/ takes effect
       # on the next question — no rebuild, no restart.
       - ./brain/packs:/data/brain:ro
+      # New Salesforce pipeline, steps 3-5: runtime schema, schema linking,
+      # record query. Read-only — the mirror refresh is an offline script run
+      # on the host, never by a request.
+      - ./src:/app/sfsrc:ro
+      # Steps 1-2 (extraction, routing) and the trace store live in the
+      # knowledge bundle. Mounted, not copied: a repository-root build context
+      # would pull the 105 MB metadata mirror and its live credentials into an
+      # image layer.
+      - ./brain/Salesforce-Org-Data-main/src/graphrag:/app/vendor/graphrag:ro
+      # WRITABLE: the runtime schema records object usage counts, which is what
+      # promotes a hot object into the cache.
+      - ./salesforce_knowledge:/app/salesforce_knowledge
+      - knowledge-traces:/data/traces
       - reports:/reports
       - hf-cache:/root/.cache/huggingface
     ports:
@@ -385,6 +415,87 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    logging: *default-logging
+
+  # --------------------------------------------------------------------------
+  # Knowledge service — steps 1-3 of the new Salesforce pipeline.
+  #
+  # ADDITIVE. It does NOT change the orchestrator and does NOT turn off
+  # brain/packs — BRAIN_ENABLED stays true and sf_intel.py keeps calling
+  # brain.matched_packs(). Both paths run in parallel until the evaluation
+  # dataset shows the new one is better; BRAIN_ENABLED=false is then a
+  # one-line switch with a one-line rollback.
+  # --------------------------------------------------------------------------
+  knowledge-service:
+    image: sf-local-ai-knowledge-service:portable
+    build:
+      context: ./knowledge-service
+    environment:
+      # SFK_* (SalesForce Knowledge), NOT KNOWLEDGE_* : that namespace is
+      # already the orchestrator's document-RAG settings, and KNOWLEDGE_RERANK
+      # defaults to TRUE there against FALSE here. One .env line meant for the
+      # schema reranker would have silently disabled the document reranker.
+      # The old names are still read as a fallback, so an existing .env keeps
+      # working; SFK_* wins when both are set.
+      SFK_BUNDLE_DIR: /data/knowledge
+      # Reached by service name on the inference network, same as the
+      # orchestrator reaches them.
+      EMBED_BASE_URL: http://vllm-embed:30003/v1
+      # vllm-reranker is defined in the dgx-spark overlay, not this file.
+      # Blank on a profile without it; rerank then degrades to hybrid rather
+      # than failing the request.
+      RERANK_BASE_URL: ${SFK_RERANK_URL:-}
+      # Semantic search is GIL-bound in pure Python (~117 ms of CPU per query,
+      # serialised across threads). Fine for chat and for the evaluation
+      # runner; if concurrent load grows, add numpy to
+      # knowledge-service/requirements.txt — its matmul releases the GIL and
+      # takes the scan to ~1 ms.
+      SFK_SEMANTIC: ${SFK_SEMANTIC:-true}
+      # Off by default: measured 2026-09-24 the cross-encoder both rescued a
+      # rank-12 answer and promoted an unrelated field to rank 1. Turn on once
+      # the 78-case dataset has scored it.
+      SFK_RERANK: ${SFK_RERANK:-false}
+      # Step 1: the model that reads the question into structured intent.
+      # Blank disables it and the lexical path runs alone.
+      EXTRACT_BASE_URL: ${SFK_EXTRACT_URL:-http://vllm-router:30002/v1}
+      EXTRACT_MODEL: ${SFK_EXTRACT_MODEL:-Qwen/Qwen3-VL-8B-Instruct-FP8}
+      SFK_EXTRACT: ${SFK_EXTRACT:-true}
+      # The shared trace store, separate from the orchestrator's query_traces
+      # in PostgreSQL: those two describe different pipelines, and mixing them
+      # makes "did the new architecture do better?" unanswerable. The
+      # orchestrator appends steps 4-5 to this same file.
+      SFK_TRACING: ${SFK_TRACING:-true}
+      # observability/tracing's layout, inside the shared volume. The previous
+      # path stays readable (observability.config.candidate_databases), so no
+      # historical trace is orphaned by the move and nothing is deleted.
+      SFK_TRACE_DB: ${SFK_TRACE_DB:-/data/traces/db/traces.sqlite}
+      SFK_TRACE_EXPORT_DIR: ${SFK_TRACE_EXPORT_DIR:-/data/traces/exports}
+    volumes:
+      # The bundle is DATA: 85 MB, read-only, rebuilt offline from the mirror.
+      # A new version is a mount change, not an image rebuild.
+      - ./brain/knowledge/v1:/data/knowledge:ro
+      # graphrag is mounted rather than baked in, for the same reason it is in
+      # the orchestrator: a repository-root build context would pull the
+      # metadata mirror and its live credentials into an image layer.
+      - ./brain/Salesforce-Org-Data-main/src/graphrag:/app/vendor/graphrag:ro
+      - knowledge-traces:/data/traces
+    ports:
+      # Loopback by default, same variable the orchestrator binds with.
+      - "${TECHSARA_BIND_ADDRESS:-127.0.0.1}:${SFK_SERVICE_PORT:-8006}:8006"
+    networks:
+      - application
+      - inference
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      # Asks "is this process serving?", not "is every artifact present?" —
+      # /health reports a degraded bundle in its body and still returns 200,
+      # so an operator sees which file is missing instead of a crash loop.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8006/health -o /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     logging: *default-logging
 
   sync-worker:
@@ -670,5 +781,14 @@ volumes:
     name: sf-local-ai_pgadmin
   hf-cache:
     name: sf-local-ai_hf-cache
+  # Traces for the new Salesforce pipeline, WRITTEN BY TWO SERVICES: the
+  # knowledge service owns steps 1-3, the orchestrator owns steps 4-5, and both
+  # append to one SQLite file so a question reads as one row instead of two
+  # halves nothing joins. SQLite in WAL mode takes concurrent readers and a
+  # serialised writer, which is what this is -- one row per question, not a
+  # write path under load. Deliberately NOT inside `data`: traces are the
+  # evidence the new architecture is judged on and must outlive it.
+  knowledge-traces:
+    name: sf-local-ai_knowledge-traces
   v1gateway_spool:
     name: sf-local-ai_v1gateway_spool

@@ -1,0 +1,186 @@
+# Capability evaluation set for the semantic-IR path (step 8).
+# Each group names the capability and the expected shape of the answer.
+# Run:  scripts/ask.sh --file scripts/capability_questions.txt
+# Lines starting with # are skipped.
+
+# == COUNT (expected: one COUNT(*), no LIMIT)
+How many marketing records are there?
+How many applications do we have?
+How many background checks exist?
+How many internal interviews are there?
+How many employee leaves have been recorded?
+How many recruiters are there?
+How many job submissions exist?
+How many job requirements are open?
+
+# == COUNT WITH FILTERS (expected: WHERE with bound values)
+How many interviews are Cancelled?
+How many interviews have status No Show?
+How many job submissions received an offer?
+How many employee leaves are unpaid?
+How many employee leaves are half day?
+How many recruiters are active for mock interviews?
+How many background checks have been assigned to QA?
+How many applications achieved their target?
+How many internal interviews have a resume?
+How many interviews are Rescheduled or Cancelled?
+How many interviews are not Completed?
+
+# == AGGREGATES (expected: AVG/SUM/MIN/MAX over numeric fields)
+What is the average candidate rate on job submissions?
+What is the total number of applications across all application records?
+What is the highest human total score on internal interviews?
+What is the lowest AI total score on internal interviews?
+What is the average number of openings on job requirements?
+What is the sum of estimated margin on job requirements?
+What is the maximum daily interview hours for recruiters?
+What is the average combined score of internal interviews?
+
+# == DISTINCT COUNT (expected: COUNT(DISTINCT ...))
+How many unique candidates have interviews?
+How many distinct recruiters handled interviews this month?
+How many unique candidates have job submissions?
+How many different recruiters have marketing records?
+
+# == GROUPED (expected: GROUP BY, all groups, no truncation note)
+Break down interviews by interview outcome.
+Show marketing records by status.
+Count job submissions by submission status.
+Break down employee leaves by leave type.
+Show internal interviews by final decision.
+Count background checks by background check status.
+Break down applications by application update status.
+Show interviews by interview status for this month.
+
+# == RANKING (expected: ORDER BY measure DESC, exact LIMIT N)
+Which 5 recruiters have the most marketing records?
+Top 3 recruiters by number of internal interviews.
+Which 10 candidates have the most interviews?
+Which recruiter has handled the most interviews this year?
+Which 5 recruiters have the most applications?
+Top 5 candidates by number of job submissions.
+
+# == TEMPORAL (expected: single normalized range on the right date field)
+How many interviews were created today?
+How many interviews were created yesterday?
+How many interviews were created this week?
+How many interviews were created last week?
+How many interviews were created last month?
+How many interviews were created in the last 30 days?
+How many interviews were created in Q2 2026?
+How many interviews were created in May 2026?
+How many interviews were created in 2025?
+How many applications were submitted in the last 7 days?
+How many marketing records have an actual joining date this year?
+How many employee leaves start next month?
+How many interviews were created before 2026-01-01?
+How many interviews were created since 2026-08-01?
+How many interviews were created between 2026-06-01 and 2026-06-30?
+
+# == TREND (expected: date_trunc grain, ordered buckets)
+Show the weekly trend of interviews created in the last 8 weeks.
+Show the monthly trend of applications this year.
+Show the quarterly trend of interviews in 2026.
+Show monthly marketing records created during the last 12 months.
+How has the number of internal interviews changed month over month this year?
+
+# == COMPARISON (expected: one count per segment + difference, change %)
+Compare interviews created this week with last week.
+Compare Completed interviews with Cancelled interviews.
+Compare applications this month with last month.
+Compare internal interviews in Q1 2026 with Q2 2026.
+Compare interviews created in May 2026 with June 2026.
+
+# == PERCENTAGE / RATIO (expected: numerator + denominator counts, computed %)
+What percentage of interviews were Cancelled?
+What percentage of interviews resulted in Offer Received?
+What percentage of job submissions received an offer?
+What percentage of employee leaves are unpaid?
+What percentage of applications achieved their target?
+What percentage of recruiters are active for interview support?
+What is the ratio of Completed to Cancelled interviews?
+
+# == EXISTS / NOT EXISTS (expected: EXISTS subquery or null lookup)
+Which candidates do not have any job submissions?
+Which recruiters have no interviews?
+Which recruiters have at least one marketing record?
+Are there any interviews with status Loop Round?
+Does any job submission have an offer received?
+Which candidates have both interviews and job submissions?
+Which job requirements have no job submissions?
+
+# == RELATIONSHIP / MULTI-HOP (expected: verified parent path, filter on owning entity)
+Show interviews handled by recruiter Nabila Basha.
+How many interviews did recruiter Harsh Makwana handle this month?
+Which candidate is linked to job submission JS-00014?
+Which job requirement does job submission JS-00014 belong to?
+Who is the account manager of the job requirement for job submission JS-00014?
+Show the client account for each job requirement.
+List job submissions with their candidate name and submission status.
+Show interviews with their recruiter name for today.
+
+# == FIELD-TO-FIELD / NULL / BOOLEAN / SET (expected: operand model)
+Which interviews have no recruiter assigned?
+Which interviews have an outcome filled in?
+Which employee leaves have an end date before their start date?
+Which interviews have status in Scheduled, Rescheduled?
+Which recruiters are not active for interview support?
+Which job submissions have interview requested set to true?
+
+# == RECORD LOOKUP / LATEST (expected: ordering + limit 1)
+What is the latest interview?
+What is the most recent marketing record?
+Show the earliest application.
+What is the latest job submission for any candidate?
+Show details of background check BCN-00028.
+
+# == LISTING (expected: records with total count when truncated)
+List all job requirements.
+Show all background checks with status.
+List interviews scheduled for today.
+Show employee leaves pending approval.
+List recruiters active for mock interviews.
+
+# == SCHEMA (expected: runtime schema facts, no record query)
+Which fields are on the Job Submission object?
+What are the picklist values for job submission status?
+What is the data type of the client bill rate field?
+Which object stores background checks?
+Which field on interview links to the recruiter?
+Which objects reference the Recruiter object?
+What record types does Account have?
+Is Interview_Outcome__c a standard or custom field?
+How are job submissions related to job requirements?
+Describe the Employee Leave object.
+Which fields are required on Job_Submission__c?
+What does the Marketing object look like?
+
+# == MIXED SCHEMA + RECORDS (expected: schema facts + counts in one answer)
+Which field stores submission status and how many job submissions are Submitted?
+What values can leave type take and how many leaves of each type exist?
+Which field holds the interview outcome and what percentage are Offer Received?
+
+# == OPERATIONAL (expected: raw._sync_meta facts, honest about what is not recorded)
+When was Job_Submission__c last synchronized?
+When did the last sync run?
+Which objects were synchronised most recently?
+How fresh is the interview data?
+Did the last sync fail?
+
+# == HISTORY (expected: __History rows or honest unavailable)
+Who changed the status of interview INT-0001?
+Show the field history of job submission JS-00014.
+What changes were made to interviews today?
+Show the history of the Background Check object.
+
+# == METADATA / UNSUPPORTED (expected: honest UNSUPPORTED, no invented answer)
+Which flows run when an interview is created?
+What validation rules exist on Job_Submission__c?
+Which Apex triggers fire on Account?
+What are the common themes in interview feedback comments?
+Predict how many interviews we will have next month.
+What does "ghosted" mean in our process?
+
+# == CONVERSATIONAL (expected: route NONE, not answered by this pipeline)
+Hello, how are you?
+Thanks for the help!

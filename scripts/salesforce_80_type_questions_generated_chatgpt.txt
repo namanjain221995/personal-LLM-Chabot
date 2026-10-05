@@ -1,0 +1,80 @@
+How many interviews do we have in Salesforce?
+List all background check records created this month.
+Show me the details of interview INT-00083.
+What is the interview outcome of interview I-002950?
+Is employee Jayesh Prajapati active for mock interviews?
+What is the current status of background check BCN-00028?
+How many interviews have an outcome of Offer Received?
+Show all interviews scheduled in September 2026.
+How many job submissions were created in the last 30 days?
+Show job requirements with a client bill rate greater than 100.
+What is the average client bill rate across all job requirements?
+Break down interviews by interview status.
+Which 5 recruiters have handled the most interviews?
+Compare the number of interviews created this month with last month.
+Show the monthly trend of interviews created during the last six months.
+What percentage of interviews have a Completed status?
+What percentage of job submissions resulted in an interview request?
+Does candidate John Smith have any interviews?
+Which candidates do not have any interview records?
+Which interviews do not have an interview outcome?
+Are there candidates with duplicate email addresses?
+Which interviews have an end time earlier than their start time?
+Who is the candidate associated with background check BCN-00028?
+Which recruiter manages the job requirement associated with job submission JS-00014?
+Show all interviews related to candidate John Smith.
+Which job requirement does job submission JS-00014 belong to?
+Which active candidates have an upcoming interview?
+Who last changed the status of interview I-002950, and when?
+Show the timeline of status and outcome changes for interview I-002950.
+What were the most recent updates made to candidate John Smith?
+Summarize all available information for background check BCN-00028.
+Give me an overview of all interviews for candidate John Smith.
+What are the most common concerns mentioned in interview feedback?
+Find all records related to the email jayesh.prajapati@techsarasolutions.com.
+Which Salesforce object stores internal interview records?
+Which field on Interview stores the interview outcome?
+What is the datatype of Interview__c.Date_of_Interview__c?
+What are all valid values for Interview__c.Interview_Status__c?
+How is Interview__c related to Account?
+What record types are available on the Account object?
+Which fields are required on Interview__c?
+Is CreatedDate a standard Salesforce field or a custom field?
+Which fields on Interview__c are rarely populated?
+Which flows run when an Interview__c record is updated?
+Which automations update Job_Submission__c.Submission_Status__c?
+What validation rules exist on Interview__c?
+What conditions must be met before an interview can move to the next round?
+Does Job_Requirement__c have any approval process configured?
+Which assignment rule determines who receives a newly created Lead?
+Which permission sets provide edit access to Interview__c?
+Why can a specific user not see interview I-002950?
+What profile and role are assigned to employee Jayesh Prajapati?
+How many Salesforce user licenses are currently unused?
+Which page layout is assigned to the Interview__c record type?
+Which Lightning record page is active for Interview__c?
+Why is the Create Interview action not visible on this record page?
+How many Salesforce API requests remain for the current daily limit?
+Which scheduled or batch Apex jobs failed today?
+When was Interview__c data last synchronized to DuckDB?
+What was the most recent Salesforce data synchronization failure?
+Which recruiters have an unusually high number of assigned interviews compared with others?
+Which active candidates have not been updated in more than 60 days?
+How many interviews has each recruiter handled this month?
+What is the average number of days required to complete a background check?
+Break down active candidates by current visa status.
+Compare interview completion rates for AI/ML and Backend interview rounds.
+Show candidates who are active, resume ready, and do not have an upcoming interview.
+Show interviews that are Completed or Cancelled but do not have a Ghosted outcome.
+How many unique candidates had at least one interview this month?
+What is the latest interview scheduled for candidate John Smith?
+What interview round comes after the Second round in our process?
+Which recruiters are marked active for both interview support and mock interviews?
+Based on an existing Salesforce prediction score, which open leads have the highest conversion probability?
+Why is candidate John Smith considered inactive based on the current record data?
+Why does Salesforce prevent this Interview__c record from being saved?
+What does 'Active Candidate' mean in our Salesforce org?
+Which field stores interview status, and how many records currently have the value Completed?
+Which record types exist on Account, and how many records use each record type?
+Why are some active candidates missing from the upcoming interview list?
+For the completed interviews you just showed, break them down by recruiter.

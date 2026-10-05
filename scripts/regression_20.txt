@@ -1,0 +1,20 @@
+How many interviews do we have?
+How many interviews have an outcome of Offer Received?
+What is the average client bill rate across all job requirements?
+Break down interviews by interview status.
+Which 5 recruiters have handled the most interviews?
+Compare the number of interviews created this month with last month.
+Show the monthly trend of interviews created during the last six months.
+What percentage of interviews have Completed status?
+Does candidate John Smith have any interviews?
+Which candidates do not have any interviews?
+Which interviews have an end time earlier than their start time?
+Who is the candidate associated with background check BCN-00028?
+Which recruiter manages the job requirement associated with job submission JS-00014?
+Show all interviews related to candidate John Smith.
+How many unique candidates had interviews this month?
+What is the latest interview for candidate John Smith?
+Which fields are required on Interview__c?
+What are valid values for Interview__c.Interview_Status__c?
+Which field stores interview outcome and how many records have Offer Received?
+When was Interview__c last synchronized to DuckDB?

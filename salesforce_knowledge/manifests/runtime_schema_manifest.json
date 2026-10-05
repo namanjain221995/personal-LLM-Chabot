@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "environment": "preprod",
+  "generated_at": "2026-09-29T14:24:01.169595+00:00",
+  "source": "mirror",
+  "object_count": 419,
+  "field_count": 7586,
+  "relationship_count": 236,
+  "child_relationship_count": 236,
+  "picklist_value_count": 2827,
+  "record_type_count": 25,
+  "object_alias_count": 488,
+  "field_alias_count": 8953,
+  "database": "salesforce_runtime_schema.db",
+  "refresh_status": "success"
+}

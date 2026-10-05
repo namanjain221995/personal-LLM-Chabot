@@ -27,6 +27,10 @@ COMPONENT_VERSION = "knowledge-bundle-v1"
 
 # Stage names follow the existing SCREAMING_CASE convention in
 # query_trace_events (REQUEST_RECEIVED, INTENT_CLASSIFIED, ...).
+INTENT_EXTRACTED = "INTENT_EXTRACTED"
+ROUTE_DECIDED = "ROUTE_DECIDED"
+SCHEMA_SEARCHED = "SCHEMA_SEARCHED"
+SCHEMA_RETRIEVED = "SCHEMA_RETRIEVED"
 ENTITY_RESOLVED = "ENTITY_RESOLVED"
 SCHEMA_DISCOVERED = "SCHEMA_DISCOVERED"
 CLARIFICATION_REQUESTED = "CLARIFICATION_REQUESTED"
@@ -67,6 +71,116 @@ class TraceEvent:
             "duration_ms": self.duration_ms,
             "component_version": self.component_version,
         }
+
+
+def intent_extracted(extraction: Any, question: str) -> TraceEvent:
+    """What the model read the question as, before anything was grounded.
+
+    Recorded separately from ENTITY_RESOLVED so the two are independently
+    scorable: a wrong answer caused by misreading the question is a different
+    failure from one caused by mapping a correctly-read concept to the wrong
+    component, and the old single METADATA_RETRIEVED event could tell neither.
+    """
+    if extraction is None:
+        return TraceEvent(
+            stage=INTENT_EXTRACTED, status="skipped",
+            component="graphrag.extract.extract",
+            details={"reason": "no extraction; fell back to the lexical path"})
+    return TraceEvent(
+        stage=INTENT_EXTRACTED, status="success",
+        component="graphrag.extract.extract",
+        duration_ms=extraction.duration_ms,
+        details={
+            "request_type": extraction.request_type,
+            "intent": extraction.intent,
+            "action": extraction.action,
+            "business_entities": extraction.business_entities,
+            "filters": extraction.filters,
+            "requested_attributes": extraction.requested_attributes,
+            "metadata_types": extraction.metadata_types,
+            "decoding_mode": extraction.mode,
+            "completion_tokens": extraction.completion_tokens,
+        })
+
+
+def route_decided(route: Any, extraction: Any) -> TraceEvent:
+    """Which of the eight paths the question took, and the flags that chose it.
+
+    The three booleans travel with the route because the route alone cannot be
+    argued with: NONE could mean the question needed nothing, or that the model
+    failed to set a flag. Recording both makes a wrong route traceable to
+    whichever stage actually produced it.
+    """
+    flags = {
+        "requires_schema_discovery": getattr(extraction, "requires_schema_discovery", None),
+        "requires_record_query": getattr(extraction, "requires_record_query", None),
+        "requires_metadata_context": getattr(extraction, "requires_metadata_context", None),
+    } if extraction is not None else {}
+    return TraceEvent(
+        stage=ROUTE_DECIDED, status="success",
+        component="graphrag.routing.derive_route",
+        details={"route": getattr(route, "value", str(route)), "flags": flags})
+
+
+def schema_searched(query: str, objects: list[Any], fields: list[Any],
+                    duration_ms: int) -> TraceEvent:
+    """Candidates the runtime schema catalog returned, with how each matched.
+
+    `matched_by` is the useful column: an exact API-name hit and an FTS guess
+    are both "found", and only one of them is evidence.
+    """
+    def rows(items: list[Any], key: str) -> list[dict[str, Any]]:
+        out = []
+        for index, item in enumerate(items):
+            name = item.get(key, "")
+            if key == "api_name" and item.get("object_api_name"):
+                name = f"{item['object_api_name']}.{name}"
+            out.append({"name": name, "rank": index + 1,
+                        "score": item.get("score"),
+                        "matched_by": item.get("matched_by")})
+        return out
+
+    return TraceEvent(
+        stage=SCHEMA_SEARCHED,
+        status="success" if (objects or fields) else "info",
+        component="salesforce.runtime_schema.service.search",
+        duration_ms=duration_ms,
+        details={"query": query,
+                 "objects": rows(objects, "api_name"),
+                 "fields": rows(fields, "api_name")})
+
+
+def schema_retrieved(object_api_name: str, detail: Any,
+                     duration_ms: int) -> TraceEvent:
+    """Detailed schema for one object, and which cache level served it.
+
+    `served_from` says whether the answer came from memory or from SQLite,
+    which is the only way to tell a hot-cache miss from a slow query after
+    the fact.
+    """
+    if detail is None:
+        return TraceEvent(
+            stage=SCHEMA_RETRIEVED, status="failed",
+            component="salesforce.runtime_schema.service.get_object_schema",
+            duration_ms=duration_ms,
+            details={"object": object_api_name,
+                     "reason": "no such object in the runtime schema"})
+    return TraceEvent(
+        stage=SCHEMA_RETRIEVED, status="success",
+        component="salesforce.runtime_schema.service.get_object_schema",
+        duration_ms=duration_ms,
+        details={
+            "object": object_api_name,
+            "served_from": detail.get("served_from"),
+            "field_count": len(detail.get("fields") or []),
+            "relationship_count": len(detail.get("relationships") or []),
+            "child_relationship_count": len(detail.get("child_relationships") or []),
+            "picklist_field_count": len(detail.get("picklists") or {}),
+            "record_type_count": len(detail.get("record_types") or []),
+            # The mirror cannot supply these; a planner reading the trace should
+            # know the gap is the source's, not a retrieval failure.
+            "source": (detail.get("object") or {}).get("source"),
+        })
 
 
 def entity_resolved(resolutions: list[Any], duration_ms: int) -> TraceEvent:

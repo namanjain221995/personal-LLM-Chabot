@@ -5816,7 +5816,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and "(Clarified:" not in text
             ):
                 from .core.sf_intel.models import ClarificationResponse
-                from .engines import sf_intel
+                from .engines import sf_intel, sfk_bridge
 
                 answer_to_pending = None
                 malformed = False
@@ -5867,17 +5867,42 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                                 else:
                                     await emit(event, data)
                     # --- AS3 intent-capability END ---
-                    sf_outcome = await sf_intel.run(
-                        text,
-                        history,
-                        _as3_sf_emit,
-                        conversation_id=conv_key,
-                        effort=request.effort,
-                        model_choice=request.model,
-                        clarification_response=answer_to_pending,
-                        source_enabled=True,
-                        use_planner=settings.salesforce_intelligence_enabled,
-                    )
+                    # --- NEW SALESFORCE PIPELINE (cutover) BEGIN ---
+                    # The new pipeline gets the question FIRST, so no old
+                    # intent classifier, planner, SQL writer or live-SOQL
+                    # fallback runs for a request it serves. It returns None
+                    # when the question is not its to answer -- a
+                    # conversational turn, a concept it could not ground, a
+                    # stage this deployment cannot provide -- and the engine
+                    # below then runs exactly as it always has.
+                    #
+                    # EXACTLY ONE OF THE TWO RUNS. Never both.
+                    #
+                    # Skipped when the AS3 buffer is active: that means this
+                    # turn carries a file signal and wants an artifact, which
+                    # the new pipeline cannot make.
+                    sf_outcome = None
+                    if _as3_sf_buffer is None:
+                        sf_outcome = await sfk_bridge.try_answer(
+                            text,
+                            emit=_as3_sf_emit,
+                            request=request,
+                            clarification_response=answer_to_pending,
+                            query_trace=query_trace,
+                        )
+                    if sf_outcome is None:
+                        sf_outcome = await sf_intel.run(
+                            text,
+                            history,
+                            _as3_sf_emit,
+                            conversation_id=conv_key,
+                            effort=request.effort,
+                            model_choice=request.model,
+                            clarification_response=answer_to_pending,
+                            source_enabled=True,
+                            use_planner=settings.salesforce_intelligence_enabled,
+                        )
+                    # --- NEW SALESFORCE PIPELINE (cutover) END ---
                     # --- AS3 intent-capability BEGIN ---
                     if _as3_sf_buffer is not None:
                         _as3_meta = next((d for e, d in _as3_sf_buffer if e == "meta"), {}) or {}

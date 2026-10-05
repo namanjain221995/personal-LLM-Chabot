@@ -1,0 +1,289 @@
+# Runtime schema subsystem configuration.
+#
+# Environment-specific values (org ids, instance URLs) live in
+# environments.yaml, never here, so this file is safe to read in any context.
+
+schema:
+  version: "1.0"
+
+  storage:
+    type: sqlite
+    # One database per environment. Isolation beats a discriminator column:
+    # a dev refresh can never half-overwrite preprod, and a bad refresh is
+    # thrown away by deleting one file.
+    path_template: "runtime_schema/db/{environment}/salesforce_runtime_schema.db"
+
+  source:
+    # mirror   -> the Salesforce DX metadata mirror on disk. Works offline and
+    #             needs no org credentials, but 15 columns stay NULL because
+    #             they are runtime properties Salesforce computes per org and
+    #             per user, and never appear in a metadata retrieve.
+    # describe -> the live org, via the existing SalesforceClient. Fills those
+    #             columns in place and flips each row's `source`.
+    fetcher: mirror
+    mirror_path: "brain/Salesforce-Org-Data-main/Prod Org Data/force-app/main/default"
+    # Hand-reviewed business vocabulary, the same file the discovery lexicon
+    # reads. Loaded as manual aliases on every full refresh, each entry
+    # verified against the schema being built.
+    business_knowledge: "brain/lexicon/curated.yaml"
+
+  search:
+    fts_enabled: true
+    vector_enabled: false
+
+  cache:
+    enabled: true
+    hot_objects:
+      mode: hybrid
+
+      # Pinned objects load in full at startup and are never auto-demoted.
+      pinned:
+        - Account
+        - Interview__c
+        - Internal_Interview__c
+        - Recruiter__c
+        - Session__c
+
+      auto_promotion:
+        enabled: true
+        min_access_count: 20
+        window_hours: 24
+        max_hot_objects: 75
+
+  refresh:
+    mode: manual
+
+  exports:
+    enabled: true
+
+  snapshots:
+    enabled: true
+    keep: 5
+
+# ---------------------------------------------------------------------------
+# Schema linking: business concepts -> verified Salesforce identifiers.
+# ---------------------------------------------------------------------------
+schema_linking:
+  candidate_limits:
+    objects: 10
+    fields: 10
+    relationships: 5
+
+  # Deterministic retrieval scores. Not produced by a model, and gapped so an
+  # exact API-name match cannot be outranked by any number of FTS hits.
+  weights:
+    exact_api: 1.0
+    exact_label: 0.95
+    manual_alias: 0.95
+    auto_alias: 0.80
+    fts: 0.65
+    relationship: 0.55
+    picklist_value: 0.90
+    data_type: 0.60
+    name_token: 0.45
+    description: 0.40
+
+  confidence:
+    accept_small_model: 0.85
+    fallback_to_main_model: 0.60
+
+  relationship_traversal:
+    max_depth: 2
+    max_related_objects_per_step: 10
+
+  models:
+    # Both tiers default to the main model, measured 2026-09-25 on the
+    # identical extraction task:
+    #
+    #   35B json_object   intent 11/12   roles 12/12   p50 2,024 ms
+    #   8B  json_object   intent  9/12   roles  0/12   p50 5,396 ms
+    #
+    # The 35B is faster AND more accurate here -- its A3B activates a fraction
+    # of its parameters per token and runs tensor-parallel across both nodes.
+    # The escalation path is built and configurable regardless: point `primary`
+    # at a smaller model the day a text-only one is deployed, and §30's metrics
+    # will answer whether it is sufficient with numbers instead of assumption.
+    # A ROLE, not a URL: resolved in src/model_roles.py, so the linker always
+    # reaches the same main deployment as extraction and the answer.
+    primary:
+      role: main
+    fallback:
+      role: main
+    timeout_seconds: 60
+    # (see `semantic` and `temporal` below the models block)
+    # The batched semantic call returns every decision for a question at
+    # once (objects, filter fields, attributes, the date field), so it needs
+    # more room than one per-item selection did.
+    max_tokens: 900
+
+  semantic:
+    # Retrieval's top candidate is accepted WITHOUT a model call when its
+    # evidence is a fact (exact API name, exact label, hand-reviewed business
+    # alias) and it leads the next candidate by at least this much -- or when a
+    # filter value is a picklist value on exactly one field.
+    fast_path_margin: 0.25
+
+  temporal:
+    # The date field a period applies to when the question names none:
+    # "background checks in May 2026". A platform field every object has.
+    default_date_field: CreatedDate
+
+# ---------------------------------------------------------------------------
+# Record queries. Salesforce defines what data MEANS; DuckDB holds the records.
+# No Salesforce call happens at user-query time.
+# ---------------------------------------------------------------------------
+record_query:
+  duckdb:
+    # The existing replicated warehouse, kept current by sync-worker on a
+    # ~30 minute cycle. `read` is a separate file from the write copy, which
+    # is how a query never sees a half-finished refresh.
+    #
+    # `path` is the fallback; `paths` overrides it per environment, so a dev
+    # run can never read production records by inheriting a default.
+    path: "/data/warehouse.read.duckdb"
+    paths:
+      production: "/data/warehouse.read.duckdb"
+      preprod: "/data/warehouse.read.duckdb"
+      dev9: "/data/warehouse.read.duckdb"
+    # `main` holds typed VIEWS (TIMESTAMP, DATE, BOOLEAN); `raw` holds the
+    # BASE TABLES where every column is VARCHAR. Querying `main` means a date
+    # filter compares dates rather than strings.
+    schema: "main"
+    read_only: true
+
+  result:
+    default_limit: 100
+    max_limit: 1000
+    max_response_bytes: 2000000
+
+  joins:
+    # A missing related record should not delete the primary row from the
+    # answer: "interviews with their candidate's email" must still list an
+    # interview whose candidate link is blank.
+    default_type: "LEFT"
+
+  freshness:
+    # Measured 2026-09-25 from sync-worker logs: cycle_done every 37-39
+    # minutes (a ~32-minute pass over 1,014 objects, then a 5-minute sleep).
+    # The snapshot this layer reads is republished once per cycle, so a
+    # healthy replica is anywhere from 0 to ~39 minutes old.
+    #   warning = two missed cycles, so an ordinary gap between syncs never
+    #             reads as stale -- at 45 it did, on a healthy sync.
+    #   reject  = unchanged; only used when reject_when_stale is true.
+    expected_sync_minutes: 40
+    warning_after_minutes: 80
+    reject_after_minutes: 180
+    # false -> answer anyway and flag it. A stale answer with a visible
+    # warning beats no answer, until the org says otherwise.
+    reject_when_stale: false
+
+# ---------------------------------------------------------------------------
+# Step 6: result interpretation and grounded answer generation.
+#
+# Every successful query result is explained by the MAIN model. There is no
+# template path for "simple" answers -- a count and a record list go through
+# the same model, because a system with two answer paths has two voices and
+# only one of them is ever evaluated.
+#
+# The endpoint and the model name are NOT set here. They come from
+# OPENAI_BASE_URL and MAIN_MODEL, the same variables the orchestrator already
+# reads, so one deployment has one main model.
+# ---------------------------------------------------------------------------
+answer_generation:
+  model_role: main
+
+  # Factual consistency over phrasing variety. The answer repeats verified
+  # values; there is nothing for sampling to improve.
+  temperature: 0.0
+  # Up to max_rows_to_model detail lines, one per record. At 900 a 50-row
+  # listing was cut off mid-JSON (finish_reason=length) and every list answer
+  # fell back to the plain renderer. Measured 2026-09-29. The model stops when
+  # it is done, so a larger ceiling costs nothing on short answers.
+  max_tokens: 3000
+  timeout_seconds: 120
+
+  # The main model is a reasoning model. Left on, it spends the whole budget
+  # thinking and returns no content at all.
+  enable_thinking: false
+
+  # Two different limits, and they mean different things. The database cut
+  # rows because the query had a limit; this cuts rows because the prompt has
+  # a budget. An answer that confuses them tells a user more records may exist
+  # when none do.
+  max_rows_to_model: 50
+  max_context_characters: 30000
+
+  # One retry, with the unsupported claims named. Not two: a model that cannot
+  # ground an answer twice will not ground it on the third attempt, and the
+  # deterministic fallback is already correct.
+  max_regenerations: 1
+
+  freshness:
+    # The model is ALWAYS told the real age and that the data is a
+    # synchronised copy. This only decides whether it is asked to say so.
+    show_when_fresh: false
+    show_when_warning: true
+    show_when_critical: true
+
+# ---------------------------------------------------------------------------
+# Tracing. Operational data about how a request ran, kept out of
+# salesforce_knowledge/ because that holds what the org IS, not what one
+# request DID.
+#
+# The canonical store stays SQLite. It has two writers by design — the
+# knowledge service owns steps 1-3, the orchestrator owns steps 4-6 — plus
+# readers that must not wait. DuckDB takes an exclusive file lock that
+# excludes a second writer AND a second reader, measured, so it is produced
+# FROM this store rather than replacing it: analytical SQL without giving up
+# the concurrency the write path needs.
+#
+# KNOWLEDGE_TRACE_DB / TRACE_DB override the path; the running containers
+# already set the first, so the move needs no compose change.
+# ---------------------------------------------------------------------------
+observability:
+  tracing:
+    enabled: true
+    database:
+      path: observability/tracing/db/traces.sqlite
+    exports:
+      directory: observability/tracing/exports
+      duckdb: observability/tracing/exports/traces.duckdb
+
+# ---------------------------------------------------------------------------
+# Model roles and which stage uses which (step 7, 2026-09-29).
+#
+# Semantic judgement goes to the main model; deterministic stages stay code.
+# Measured on the identical extraction task, the 35B beat the 8B on every axis:
+#   35B  intent 11/12  roles 12/12  p50 2,024 ms
+#   8B   intent  9/12  roles  0/12  p50 5,396 ms
+#
+# Endpoints and model names are normally NOT set here: `main` resolves from
+# OPENAI_BASE_URL / MAIN_MODEL, the variables the orchestrator already uses,
+# so one deployment has one main model. Set `endpoint`/`name` only to pin a
+# role for an environment that has no such variables.
+# ---------------------------------------------------------------------------
+models:
+  main: {}
+  embedding: {}
+  optional_small: {}      # the 8B: experiments and evaluation only
+
+pipeline:
+  intent:
+    model_role: main
+  routing:
+    model_role: main      # sources + capabilities, returned with the intent
+  discovery:
+    model_role: main      # chooses each entity's object from candidate IDs
+  discovery_rerank:
+    model_role: main      # step-7 stage path only
+  linking:
+    mode: llm_assisted    # llm_assisted | offline (offline: step-7 path only)
+    model_role: main
+  planning:
+    model_role: main      # writes the logical plan from verified bindings
+  record_query:
+    model_role: null      # plan compiler, SQL builder, validator, DuckDB
+  interpretation:
+    model_role: main      # returned with the answer
+  answer:
+    model_role: main

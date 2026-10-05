@@ -24,6 +24,7 @@ import json
 import re
 import sqlite3
 import threading
+import weakref
 import time
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
@@ -266,7 +267,7 @@ class Bundle:
         self._vectors: list[tuple[str, tuple[float, ...]]] | None = None
         self._vectors_lock = threading.Lock()
         self._local = threading.local()
-        self._connections: list[sqlite3.Connection] = []
+        self._connections: list[tuple[Any, sqlite3.Connection]] = []  # (weakref to owner thread, connection)
         self._connections_lock = threading.Lock()
         self.db  # open one now, so a broken bundle fails here, not mid-request
 
@@ -281,7 +282,23 @@ class Bundle:
             connection.execute("ATTACH DATABASE ? AS graph",
                                (str(self.base / "graph.sqlite"),))
         with self._connections_lock:
-            self._connections.append(connection)
+            # One connection per thread, owned by that thread. When a new
+            # thread connects, connections whose thread has ENDED are closed:
+            # a pool that replaces its workers otherwise leaks one handle per
+            # retired thread per component -- 4 per question, found live when
+            # a 500-question run hit 'Too many open files' at question 145.
+            alive = []
+            for owner, held in self._connections:
+                thread = owner()
+                if thread is not None and thread.is_alive():
+                    alive.append((owner, held))
+                    continue
+                try:
+                    held.close()
+                except Exception:                    # noqa: BLE001
+                    pass
+            alive.append((weakref.ref(threading.current_thread()), connection))
+            self._connections = alive
         return connection
 
     @property
@@ -294,7 +311,7 @@ class Bundle:
 
     def close(self) -> None:
         with self._connections_lock:
-            for connection in self._connections:
+            for _owner, connection in self._connections:
                 try:
                     connection.close()
                 except sqlite3.Error:
@@ -566,12 +583,39 @@ class Bundle:
         return row[0] if row else None
 
     # -- discover_schema --------------------------------------------------
+    @staticmethod
+    def _extracted_phrases(extraction: Any) -> list[tuple[str, int]]:
+        """The concepts an extraction named, as phrases to resolve.
+
+        Replaces the n-gram sweep of the raw sentence. The sweep had no way to
+        tell subject from furniture -- every 4-gram was a candidate, which is
+        how "recipe for chocolate cake" reached a platform field. Here only
+        what the model called an entity, a filter concept or a requested
+        attribute is looked up.
+        """
+        phrases: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        for name in extraction.entity_names:
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                phrases.append((key, len(key.split())))
+        for group, field in (("filters", "concept"),
+                             ("requested_attributes", "attribute")):
+            for item in getattr(extraction, group, []):
+                value = str(item.get(field) or "").strip().lower()
+                if value and value not in seen:
+                    seen.add(value)
+                    phrases.append((value, len(value.split())))
+        return phrases
+
     def discover_schema(self, query: str, limit: int = 10,
                         choices: dict[str, str] | None = None,
                         semantic: bool = False,
                         endpoint: str | None = None,
                         rerank: bool = False,
-                        rerank_endpoint: str | None = None) -> Discovery:
+                        rerank_endpoint: str | None = None,
+                        extraction: Any = None) -> Discovery:
         """Rank the components a question is probably about.
 
         Longest phrases win: once "mock interview" matches, its words are not
@@ -590,8 +634,14 @@ class Bundle:
         # accidental earlier phrase win: "is interview" matching IsInterview__c
         # swallowed the word "interview" before "interview outcome" was ever
         # tried, and the better match never surfaced.
+        # Extraction narrows WHAT to look up; it never narrows what the
+        # semantic pass sees, which still reads the whole question. A concept
+        # the model missed can therefore still be recovered by similarity.
+        candidates_to_resolve = (self._extracted_phrases(extraction)
+                                 if extraction is not None else self._ngrams(query))
+
         by_size: dict[int, list[tuple[str, Resolution]]] = {}
-        for phrase, size in self._ngrams(query):
+        for phrase, size in candidates_to_resolve:
             resolution = self.resolve(phrase, size, choices)
             if resolution.status != "unresolved":
                 by_size.setdefault(size, []).append((phrase, resolution))
@@ -667,6 +717,7 @@ class Bundle:
                 source=f"parent of {candidate.component_id}")
 
         resolve_ms = int((time.perf_counter() - started) * 1000)
+        found.trace.append(tracing.intent_extracted(extraction, query))
         found.trace.append(tracing.entity_resolved(found.resolutions, resolve_ms))
 
         ranked = sorted(best_by_component.values(), key=lambda c: (-c.score, c.component_id))

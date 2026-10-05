@@ -25,17 +25,49 @@ from pydantic import BaseModel, Field
 
 from graphrag import tracing
 from graphrag.clarify import ClarifyError, apply as apply_choice, clarify, questions_for
+from graphrag.extract import DEFAULT_MODEL as EXTRACT_MODEL_DEFAULT, extract
 from graphrag.resolver import Bundle, ResolverError
+from graphrag.trace_store import TraceStore
 
 log = logging.getLogger("knowledge-service")
 
-BUNDLE_DIR = os.environ.get("KNOWLEDGE_BUNDLE_DIR", "/data/knowledge")
+
+def _env(name: str, default: str = "") -> str:
+    """Read SFK_<name>, falling back to the deprecated KNOWLEDGE_<name>.
+
+    KNOWLEDGE_* collided with the orchestrator's own document-RAG settings --
+    KNOWLEDGE_RERANK in particular, which defaults to TRUE there and FALSE
+    here. Somebody turning the schema reranker off in .env would have silently
+    turned the document reranker off too, in a feature they were not touching.
+    The old names still work so an existing deployment does not break on this
+    rename; SFK_* wins when both are set.
+    """
+    return os.environ.get(f"SFK_{name}") or os.environ.get(
+        f"KNOWLEDGE_{name}") or default
+
+
+def _flag(name: str, default: bool) -> bool:
+    return _env(name, "true" if default else "false").strip().lower() == "true"
+
+
+BUNDLE_DIR = _env("BUNDLE_DIR", "/data/knowledge")
 EMBED_BASE_URL = os.environ.get("EMBED_BASE_URL", "")
 RERANK_BASE_URL = os.environ.get("RERANK_BASE_URL", "")
-SEMANTIC_DEFAULT = os.environ.get("KNOWLEDGE_SEMANTIC", "true").lower() == "true"
-RERANK_DEFAULT = os.environ.get("KNOWLEDGE_RERANK", "false").lower() == "true"
+SEMANTIC_DEFAULT = _flag("SEMANTIC", True)
+RERANK_DEFAULT = _flag("RERANK", False)
 
-_state: dict[str, Any] = {"bundle": None, "error": None}
+# Step 1: the model that reads the question. Blank endpoint disables
+# extraction entirely and the lexical path runs alone.
+EXTRACT_BASE_URL = os.environ.get("EXTRACT_BASE_URL", "")
+EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL", EXTRACT_MODEL_DEFAULT)
+EXTRACT_DEFAULT = _flag("EXTRACT", True)
+
+# Traces live beside the bundle but in their OWN file: the bundle is read-only
+# and rebuilt from the mirror, traces are append-only and must survive that.
+TRACE_DB = _env("TRACE_DB", "/data/traces/db/traces.sqlite")
+TRACE_ENABLED = _flag("TRACING", True)
+
+_state: dict[str, Any] = {"bundle": None, "error": None, "traces": None}
 
 
 @asynccontextmanager
@@ -51,13 +83,36 @@ async def lifespan(_app: FastAPI):
         # see WHICH artifact is missing from /health instead of a crash loop.
         _state["error"] = str(exc)
         log.error("knowledge bundle unavailable: %s", exc)
+    if TRACE_ENABLED:
+        try:
+            _state["traces"] = TraceStore(TRACE_DB)
+            log.info("trace store open at %s", TRACE_DB)
+        except Exception as exc:
+            # Losing traces must not lose answers.
+            log.error("trace store unavailable (%s); serving without it", exc)
     yield
-    bundle = _state.get("bundle")
-    if bundle is not None:
-        bundle.close()
+    for key in ("bundle", "traces"):
+        obj = _state.get(key)
+        if obj is not None:
+            obj.close()
 
 
 app = FastAPI(title="Salesforce knowledge service", version="1", lifespan=lifespan)
+
+
+def _versions() -> dict[str, Any]:
+    """Bundle identity, stored with every trace so a run is reproducible."""
+    bundle = _state.get("bundle")
+    if bundle is None:
+        return {}
+    out: dict[str, Any] = {"extraction_model": EXTRACT_MODEL if EXTRACT_BASE_URL else None}
+    try:
+        for key, value in bundle.db.execute("SELECT key, value FROM manifest"):
+            if key in ("built_at", "catalog_version"):
+                out[f"catalog_{key}"] = value
+    except Exception:
+        pass
+    return out
 
 
 def _bundle() -> Bundle:
@@ -72,6 +127,9 @@ class DiscoverRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=50)
     semantic: bool | None = None
     rerank: bool | None = None
+    extract: bool | None = None
+    # Set by the evaluation runner so a trace can be joined to its golden case.
+    test_case_id: str | None = Field(default=None, max_length=64)
     # Terms the user already disambiguated, so the same question is not asked
     # twice in one conversation: {"placed": "field:Interview__c.Interview_Outcome__c"}
     choices: dict[str, str] = Field(default_factory=dict)
@@ -101,7 +159,39 @@ def health() -> dict[str, Any]:
         "graph": bundle.has_graph,
         "semantic_default": SEMANTIC_DEFAULT,
         "rerank_default": RERANK_DEFAULT,
+        "extraction": {"enabled": bool(EXTRACT_BASE_URL) and EXTRACT_DEFAULT,
+                       "model": EXTRACT_MODEL if EXTRACT_BASE_URL else None,
+                       "endpoint": EXTRACT_BASE_URL or None},
+        "tracing": {"enabled": _state.get("traces") is not None, "db": TRACE_DB},
     }
+
+
+@app.get("/traces")
+def traces(limit: int = 20) -> dict[str, Any]:
+    """Recent traces, newest first."""
+    store = _state.get("traces")
+    if store is None:
+        raise HTTPException(status_code=503, detail="tracing is disabled")
+    return {"traces": store.recent(limit)}
+
+
+@app.get("/traces/stats")
+def trace_stats() -> dict[str, Any]:
+    store = _state.get("traces")
+    if store is None:
+        raise HTTPException(status_code=503, detail="tracing is disabled")
+    return store.stats()
+
+
+@app.get("/traces/{trace_id}")
+def trace_detail(trace_id: str) -> dict[str, Any]:
+    store = _state.get("traces")
+    if store is None:
+        raise HTTPException(status_code=503, detail="tracing is disabled")
+    found = store.get(trace_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail=f"no trace {trace_id}")
+    return found
 
 
 @app.get("/manifest")
@@ -124,9 +214,35 @@ def manifest() -> dict[str, Any]:
 def discover(request: DiscoverRequest) -> dict[str, Any]:
     """Rank the components a question is about, and say when it must ask."""
     bundle = _bundle()
+    store = _state.get("traces")
     started = time.perf_counter()
     semantic = SEMANTIC_DEFAULT if request.semantic is None else request.semantic
     rerank = RERANK_DEFAULT if request.rerank is None else request.rerank
+    want_extract = EXTRACT_DEFAULT if request.extract is None else request.extract
+
+    trace_id = None
+    if store is not None:
+        try:
+            trace_id = store.begin(request.query,
+                                   test_case_id=request.test_case_id,
+                                   versions=_versions())
+        except Exception:
+            log.warning("could not open a trace", exc_info=True)
+
+    # Step 1 -- read the question. Optional by construction: a model that is
+    # down, slow or confused costs precision, never an answer.
+    extraction = None
+    if want_extract and EXTRACT_BASE_URL:
+        extraction = extract(request.query, endpoint=EXTRACT_BASE_URL,
+                             model=EXTRACT_MODEL)
+    if store is not None and trace_id:
+        try:
+            store.record_extraction(trace_id, extraction,
+                                    model=EXTRACT_MODEL if EXTRACT_BASE_URL else "",
+                                    endpoint=EXTRACT_BASE_URL)
+        except Exception:
+            log.warning("could not record extraction", exc_info=True)
+
     try:
         result = bundle.discover_schema(
             request.query, request.limit,
@@ -134,18 +250,30 @@ def discover(request: DiscoverRequest) -> dict[str, Any]:
             semantic=semantic and bundle.has_vectors,
             endpoint=EMBED_BASE_URL or None,
             rerank=rerank,
-            rerank_endpoint=RERANK_BASE_URL or None)
+            rerank_endpoint=RERANK_BASE_URL or None,
+            extraction=extraction)
     except ResolverError as exc:
+        if store is not None and trace_id:
+            store.finish(trace_id, status="error")
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     payload = result.as_dict()
-    # Rendered questions travel with the result: a caller that has to ask
-    # should not need a second round trip to find out how to phrase it.
     questions = questions_for(bundle, result)
     payload["questions"] = [q.as_dict() for q in questions]
-    payload["trace"] = payload.get("trace", []) + [
-        tracing.clarification_requested(q).as_dict() for q in questions]
+    events = list(result.trace) + [tracing.clarification_requested(q) for q in questions]
+    payload["trace"] = [e.as_dict() for e in events]
     payload["took_ms"] = int((time.perf_counter() - started) * 1000)
+
+    if store is not None and trace_id:
+        try:
+            store.add_events(trace_id, events)
+            store.finish(trace_id, status="ok", discovery=result,
+                         total_duration_ms=payload["took_ms"],
+                         signals={"semantic": semantic, "rerank": rerank,
+                                  "extract": bool(extraction)})
+        except Exception:
+            log.warning("could not persist trace %s", trace_id, exc_info=True)
+        payload["trace_id"] = trace_id
     return payload
 
 
