@@ -1,5 +1,6 @@
-"""Documents at ChatGPT scale: 512 MB files, five per message, chunked over
-the tunnel.
+"""Documents at ChatGPT scale: no size or count limit in the app since
+2026-10-03 (512 MB files and five per message before; docs/chat-media/LIMITS.md),
+chunked over the tunnel, never read into memory whole.
 
 WHY (owner request 2026-09-02). The chat attach path capped documents at
 25 MB because a PDF travelled as base64 INSIDE the chat JSON — a limit set by
@@ -248,13 +249,50 @@ def test_a_swept_reference_is_one_clear_sentence():
     assert "gone.pdf" in err and "re-attach" in err
 
 
-def test_more_than_five_documents_is_refused():
+def test_only_the_technical_ceiling_refuses_documents():
+    """No limit in the app since 2026-10-03 (docs/chat-media/LIMITS.md):
+    1,000 references is the only count refused."""
     from app.main import _resolve_document_refs
     import asyncio
 
-    refs = [{"upload_id": "a" * 32, "name": f"d{i}.pdf"} for i in range(6)]
+    refs = [{"upload_id": "a" * 32, "name": f"d{i}.pdf"} for i in range(1000)]
     docs, _images, err = asyncio.run(_resolve_document_refs(_Req(pdf_uploads=refs), "c"))
-    assert docs == [] and "at most 5" in err
+    assert docs == [] and err == "A message can carry at most 999 documents."
+
+
+def test_twenty_documents_in_one_message_are_all_read(monkeypatch):
+    """docs/chat-media/LIMITS.md (2026-10-03): 20 documents per message, every
+    one resolved and merged into the one question, sharing ONE context
+    budget (the excerpt is not twenty budgets long)."""
+    import asyncio
+
+    from app.engines import document as eng
+    from app.main import _resolve_document_refs
+
+    ids = [_stored_document("conv-20", f"facts of file {i}".encode(), f"f{i:02d}.txt") for i in range(20)]
+    refs = [{"upload_id": u, "name": f"f{i:02d}.txt"} for i, u in enumerate(ids)]
+    docs, images, err = asyncio.run(_resolve_document_refs(_Req(pdf_uploads=refs), "conv-20"))
+    assert err is None and images == []
+    assert [name for name, _ in docs] == [f"f{i:02d}.txt" for i in range(20)]
+
+    seen = {}
+
+    async def fake_stream(messages, **kw):
+        seen["messages"] = messages
+        yield ("token", "ok")
+
+    async def emit(kind, payload):
+        pass
+
+    monkeypatch.setattr(eng.llm, "stream_chat_events", fake_stream)
+    monkeypatch.setattr("app.db.save_document", lambda *a, **k: None)
+    assert asyncio.run(eng.run_pdf_engine_multi("compare them", docs, [], emit)) == "ok"
+    user = seen["messages"][-1]["content"]
+    text = " ".join(p.get("text", "") for p in user if p.get("type") == "text")
+    assert "20 documents were uploaded and ALL were read" in text
+    assert "===== Document 20: f19.txt =====" in text
+    excerpt = text.split("Document text (most relevant sections):", 1)[1]
+    assert len(excerpt) <= eng.DOC_CONTEXT_CHARS + 200
 
 
 def test_inline_pdf_still_rides_along():
@@ -534,6 +572,9 @@ def test_a_swept_document_is_still_an_honest_410(alice, conv):
     )
     upload_id = up_resp.json()["upload_id"]
     _shutil.rmtree(os.path.join(up.upload_root(conv, upload_id), "_original"))
+    # And its lasting copy (2026-10-02, docs/chat-media/CONTRACT.md §9), which
+    # otherwise outlives the sweep: nothing left on disk is an honest 410.
+    _shutil.rmtree(os.path.dirname(up.lasting_path(conv, upload_id)))
     assert alice.get(f"/uploads/{conv}/{upload_id}/file").status_code == 410
 
 
@@ -548,3 +589,230 @@ def test_dataset_downloads_are_unchanged(alice, conv):
     got = alice.get(f"/uploads/{conv}/{upload_id}/file")
     assert got.status_code == 200
     assert got.content == b"a,b\n1,2\n"
+
+
+# ── no limit (docs/chat-media/LIMITS.md, 2026-10-03) ─────────────────────────
+
+
+def _capture_engine(monkeypatch):
+    from app.engines import document as eng
+
+    seen: dict = {"saved": {}, "tokens": []}
+
+    async def fake_stream(messages, **kw):
+        seen["messages"] = messages
+        yield ("token", "ok")
+
+    monkeypatch.setattr(eng.llm, "stream_chat_events", fake_stream)
+    monkeypatch.setattr(
+        "app.db.save_document", lambda conv, name, text, total: seen["saved"].__setitem__(name, text)
+    )
+    return seen
+
+
+def _prompt_text(seen) -> str:
+    return " ".join(p.get("text", "") for p in seen["messages"][-1]["content"] if p.get("type") == "text")
+
+
+def test_fifty_documents_share_one_budget_not_fifty(monkeypatch):
+    """50 documents in one message: all resolved and read, the excerpt is the
+    one DOC_CONTEXT_CHARS, and the text they keep is one turn budget shared
+    (each keeps its share, the header and a closing line say so)."""
+    import asyncio
+
+    from app.engines import document as eng
+    from app.main import _resolve_document_refs
+
+    monkeypatch.setattr(eng, "DOC_TURN_TEXT_CHARS", 50 * 10_000)
+    body = ("fact " * 4_000).encode()  # 20,000 characters each
+    ids = [_stored_document("conv-50", body + f" file {i}".encode(), f"f{i:02d}.txt") for i in range(50)]
+    refs = [{"upload_id": u, "name": f"f{i:02d}.txt"} for i, u in enumerate(ids)]
+    docs, images, err = asyncio.run(_resolve_document_refs(_Req(pdf_uploads=refs), "conv-50"))
+    assert err is None and images == [] and len(docs) == 50
+
+    seen = _capture_engine(monkeypatch)
+    sent = []
+
+    async def emit(kind, payload):
+        sent.append((kind, payload))
+
+    answer = asyncio.run(eng.run_pdf_engine_multi("compare them", docs, [], emit, conversation_id="conv-50"))
+    text = _prompt_text(seen)
+    assert "50 documents were uploaded and ALL were read (some only in part" in text
+    assert "  50. f49.txt — only its first 10,000 characters were read" in text
+    excerpt = text.split("Document text (most relevant sections):", 1)[1]
+    assert len(excerpt) <= eng.DOC_CONTEXT_CHARS + 200
+    assert len(seen["saved"]) == 50 and all(len(t) <= 10_000 for t in seen["saved"].values())
+    assert "only its first 10,000 characters were read" in answer
+    assert answer.startswith("ok") and "_Read in part" in answer
+
+
+def test_a_document_over_512_mb_is_read_without_reading_it_whole(monkeypatch, tmp_path):
+    """A 600 MB document (a SPARSE file: nothing real is written) resolves to
+    a file the engine reads from disk within its text budget; memory stays
+    within a few MB and the answer says what part was read."""
+    import asyncio
+    import tracemalloc
+
+    from app.engines import document as eng
+    from app.main import _resolve_document_refs
+
+    upload_id = _stored_document("conv-big", ("word " * 4_000).encode(), "huge.txt")
+    path = os.path.join(up.upload_root("conv-big", upload_id), "_original", "huge.txt")
+    with open(path, "r+b") as fh:
+        fh.truncate(600 * 1024 * 1024)
+    assert os.path.getsize(path) == 600 * 1024 * 1024
+
+    seen = _capture_engine(monkeypatch)
+
+    async def emit(kind, payload):
+        pass
+
+    async def run():
+        docs, _images, err = await _resolve_document_refs(
+            _Req(pdf_uploads=[{"upload_id": upload_id, "name": "huge.txt"}]), "conv-big"
+        )
+        assert err is None and len(docs) == 1 and isinstance(docs[0], eng.DocFile)
+        return await eng.run_pdf_engine_multi("summarise", docs, [], emit, conversation_id="conv-big")
+
+    tracemalloc.start()
+    try:
+        answer = asyncio.run(run())
+        _now, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 64 * 1024 * 1024, f"peak {peak:,} bytes: the file was read whole"
+    assert len(seen["saved"]["huge.txt"]) == eng.DOC_MAX_CHARS
+    assert "only its first 400,000 characters were read (600 MB file)" in _prompt_text(seen)
+    assert "_Read in part — **huge.txt**: only its first 400,000 characters were read" in answer
+
+
+def test_the_whole_read_budget_is_per_turn_and_spent_in_order(monkeypatch):
+    """Under DOC_WHOLE_READ_BYTES documents resolve exactly as before
+    (name, base64); the first one past it becomes a file read from disk."""
+    import asyncio
+
+    from app.engines import document as eng
+    from app.main import _resolve_document_refs
+
+    monkeypatch.setattr(eng, "DOC_WHOLE_READ_BYTES", 10)
+    a = _stored_document("conv-wb", b"12345678", "a.txt")
+    b = _stored_document("conv-wb", b"abcdefgh", "b.txt")
+    docs, _images, err = asyncio.run(_resolve_document_refs(
+        _Req(pdf_uploads=[{"upload_id": a, "name": "a.txt"}, {"upload_id": b, "name": "b.txt"}]), "conv-wb"
+    ))
+    assert err is None
+    assert docs[0] == ("a.txt", base64.b64encode(b"12345678").decode())
+    assert isinstance(docs[1], eng.DocFile) and docs[1].name == "b.txt"
+
+
+def test_a_docx_on_disk_is_streamed_and_stops_at_its_budget(tmp_path):
+    import asyncio
+    import io
+    import zipfile
+
+    from app.core.docx import extract_docx_text
+    from app.engines import document as eng
+
+    w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    paras = "".join(f"<w:p><w:r><w:t>Paragraph {i}</w:t></w:r></w:p>" for i in range(5000))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", f"<w:document {w}><w:body>{paras}</w:body></w:document>")
+    path = tmp_path / "long.docx"
+    path.write_bytes(buf.getvalue())
+    doc, err = asyncio.run(eng.extract_document_file("long.docx", str(path), max_chars=1_000))
+    assert err is None and doc.full_text == extract_docx_text(buf.getvalue(), max_chars=1_000)
+    assert doc.note.startswith("only its first 1,000 characters were read")
+    whole, err = asyncio.run(eng.extract_document_file("long.docx", str(path)))
+    assert whole.note == "" and whole.full_text == extract_docx_text(buf.getvalue())
+
+
+def test_a_pdf_on_disk_is_opened_by_path_and_page_bounded(tmp_path, monkeypatch):
+    import asyncio
+
+    pdfium = pytest.importorskip("pypdfium2")
+    from app.engines import document as eng
+
+    pdf = pdfium.PdfDocument.new()
+    for _ in range(5):
+        pdf.new_page(200, 200)
+    path = tmp_path / "scan.pdf"
+    pdf.save(str(path))
+    pdf.close()
+    monkeypatch.setattr(eng, "DOC_MAX_PAGES", 2)
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    doc, err = asyncio.run(eng.extract_document_file("scan.pdf", str(path), effort="fast"))
+    assert err is None and doc.total == 5
+    # A scan has no text to reach the character budget with: the page
+    # budget bounds it, and the note says how many pages were looked at.
+    assert doc.note == "only the first 2 of its 5 pages were read (" + f"{os.path.getsize(path):,} bytes file)"
+
+
+def test_many_documents_are_read_off_the_event_loop_and_rendered_once(monkeypatch):
+    """QA 2026-10-03: a turn's documents were extracted ON the event loop
+    (PDFium, the DOCX reader, the base64 round trips), so 50 PDFs stalled
+    every other person's stream for 6 s at once and 999 for about two
+    minutes, past the SSE heartbeat and Cloudflare's cut. Every such step now
+    runs in a worker thread, from the resolver through the engine. And only
+    the first PDF is rendered: the others' renders were ~80% of reading a
+    PDF and were thrown away (page images come from the first PDF only)."""
+    import asyncio
+    import io
+    import threading
+
+    from docx import Document
+    from weasyprint import HTML
+
+    from app.core import docx as docx_module
+    from app.engines import document as eng
+    from app.main import _resolve_document_refs
+
+    body = "".join(
+        f"<h2>Section {p}</h2><p>{'Quarterly revenue grew in every region. ' * 20}</p>"
+        "<p style='page-break-after: always'></p>"
+        for p in range(3)
+    )
+    pdf = HTML(string=f"<html><body>{body}</body></html>").write_pdf()
+    word = Document()
+    word.add_paragraph("The board approved the budget.")
+    buf = io.BytesIO()
+    word.save(buf)
+    ids = [_stored_document("conv-loop", pdf, f"report-{i:02d}.pdf") for i in range(12)]
+    ids.append(_stored_document("conv-loop", buf.getvalue(), "minutes.docx"))
+    refs = [{"upload_id": u, "name": "x"} for u in ids]
+
+    calls: list = []
+
+    def watched(fn, name):
+        def run(*args, **kwargs):
+            calls.append((name, threading.current_thread() is threading.main_thread()))
+            return fn(*args, **kwargs)
+        return run
+
+    for name in ("extract_pdf_pages", "render_pdf", "render_pdf_pages"):
+        monkeypatch.setattr(eng, name, watched(getattr(eng, name), name))
+    for name in ("is_docx", "extract_docx_text"):
+        monkeypatch.setattr(docx_module, name, watched(getattr(docx_module, name), name))
+    for name in ("b64encode", "b64decode"):
+        monkeypatch.setattr(base64, name, watched(getattr(base64, name), name))
+    monkeypatch.setattr(settings, "ocr_enabled", False)
+    seen = _capture_engine(monkeypatch)
+
+    async def emit(kind, payload):
+        pass
+
+    async def turn():
+        docs, _images, err = await _resolve_document_refs(_Req(pdf_uploads=refs), "conv-loop")
+        assert err is None and len(docs) == 13
+        return await eng.run_pdf_engine_multi("summarise", docs, [], emit, effort="think")
+
+    assert asyncio.run(turn()).startswith("ok")
+    on_the_loop = sorted({name for name, main in calls if main})
+    assert on_the_loop == [], f"run on the event loop: {on_the_loop}"
+    names = [name for name, _ in calls]
+    assert names.count("extract_pdf_pages") == 12 and names.count("extract_docx_text") == 1
+    assert names.count("render_pdf") == 1  # the first PDF only
+    assert "13 documents were uploaded and ALL were read" in _prompt_text(seen)
+    pictures = [p for p in seen["messages"][-1]["content"] if p.get("type") == "image_url"]
+    assert len(pictures) == eng.LAYOUT_PAGES

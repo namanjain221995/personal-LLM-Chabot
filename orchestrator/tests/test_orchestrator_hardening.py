@@ -228,6 +228,7 @@ def test_the_body_cap_is_one_mebibyte_everywhere_for_a_caller_without_a_session(
         ("POST", "/uploads"),
         ("POST", "/uploads/chunked/init"),
         ("PUT", "/uploads/chunked/abc/0123/part/0"),
+        ("POST", "/chat-media/abc"),
         ("PUT", "/admin/access"),
         ("POST", "/admin/api/developers/projects"),
     ):
@@ -242,7 +243,9 @@ def test_only_the_routes_that_carry_large_bodies_get_a_larger_cap_once_signed_in
     MAX_PROXY_BODY_BYTES, the microphone is ASR_MAX_UPLOAD_BYTES, a single-shot
     upload is what `_stream_to_disk` keeps (UPLOAD_MAX_MB, for EVERY purpose —
     the old `max(upload, video)` ceiling was 20x anything the route accepted),
-    and a chunked part is `_PART_CAP`."""
+    a chunked part is `_PART_CAP`, and a chat-media upload (V44) is the
+    browser's batch budget (48 MiB of pictures, any number of them since
+    2026-10-03) plus framing, the Next proxy's own 64 MiB."""
     monkeypatch.delenv("MAX_REQUEST_BODY_BYTES", raising=False)
     monkeypatch.delenv("CHAT_MAX_REQUEST_BODY_BYTES", raising=False)
     cap = app_main.body_cap_for
@@ -252,8 +255,21 @@ def test_only_the_routes_that_carry_large_bodies_get_a_larger_cap_once_signed_in
     assert cap("POST", "/history/conversations/c1/messages").signed_in == 32 * MIB
     assert cap("POST", "/audio/transcribe").signed_in == max(MIB, settings.asr_max_upload_bytes)
     assert cap("POST", "/uploads").signed_in == settings.upload_max_mb * MIB + MIB
-    assert cap("POST", "/uploads").signed_in < uploads_module._cap_total("video")
+    # A video may be as large as any upload since 2026-10-03 (VIDEO_MAX_UPLOAD_MB
+    # unset follows UPLOAD_MAX_MB, docs/chat-media/LIMITS.md); the single-shot
+    # cap is still the upload size plus framing, never a separate video size.
+    if "VIDEO_MAX_UPLOAD_MB" not in os.environ:
+        assert uploads_module._cap_total("video") == uploads_module._cap_total("document")
     assert cap("PUT", "/uploads/chunked/c1/u1/part/3").signed_in == uploads_module._PART_CAP
+    assert cap("POST", "/chat-media/c1").signed_in == 64 * MIB
+    # One batch of the browser's (docs/chat-media/LIMITS.md) always fits, and
+    # the budget stays well under Cloudflare's 100 MB request wall.
+    from app import chat_media
+
+    assert chat_media.BATCH_BUDGET_BYTES == 48 * MIB
+    assert chat_media.BATCH_BUDGET_BYTES + app_main._MULTIPART_FRAMING_BYTES <= cap("POST", "/chat-media/c1").signed_in
+    assert chat_media.BATCH_BUDGET_BYTES < cap("POST", "/chat").signed_in
+    assert chat_media.BATCH_BUDGET_BYTES < 100_000_000
     # Everything else stays at the default even when signed in — including the
     # wrong VERB on a large-body path, and the chunked init, which is a form of
     # a few short fields.
@@ -264,6 +280,9 @@ def test_only_the_routes_that_carry_large_bodies_get_a_larger_cap_once_signed_in
         ("POST", "/history/conversations"),
         ("PUT", "/history/conversations/c1"),
         ("POST", "/auth/login"),
+        # Only the upload carries pictures: the reads and a nested path do not.
+        ("GET", "/chat-media/c1"),
+        ("POST", "/chat-media/c1/att-00000001"),
     ):
         assert cap(method, path).signed_in == MIB, (method, path)
     # And the upload ceiling tracks the setting rather than freezing a number.
@@ -1312,7 +1331,14 @@ def test_every_list_in_the_large_body_models_stops_at_its_first_bad_element():
                 assert any(
                     isinstance(meta, FailFast) and meta.fail_fast for meta in field.metadata
                 ), f"{model.__name__}.{name} is a list without fail_fast"
-    assert {"ChatRequest.messages", "ChatRequest.images", "MessagesReplaceIn.messages"} <= set(checked)
+    assert {
+        "ChatRequest.messages",
+        "ChatRequest.images",
+        # V44 chat media: the ids of the inline pictures and the stored ones.
+        "ChatRequest.image_ids",
+        "ChatRequest.image_refs",
+        "MessagesReplaceIn.messages",
+    } <= set(checked)
 
 
 def test_the_bounded_reader_keeps_fastapis_strict_json_content_type_rule(alice):

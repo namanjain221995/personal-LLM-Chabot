@@ -140,6 +140,16 @@ export const STATUS_LABEL: Record<RecordingStatus, string> = {
 };
 
 /**
+ * What a delete confirmation adds for a recording still being made or
+ * transcribed: DELETE /audio/sessions/{id} stops it first and erases what was
+ * saved so far. My files uses it (it dropped the warning once, QA
+ * 2026-09-30); the Recordings page's deleteConfirmBody carries the same
+ * words, and tests/my-files-page.test.tsx fails if the two ever differ.
+ */
+export const IN_PROGRESS_DELETE_NOTE =
+  'It is still in progress: deleting it stops it and removes what was saved so far.';
+
+/**
  * True when retention has already removed this recording's audio and
  * transcript. The list keeps such a row as a tombstone. The server says so
  * with `kept: false`; before it did, `delete_after` was the only sign, and it
@@ -287,6 +297,86 @@ export async function loadTranscript(
     return { kind: 'none', message: `${state.error.detail} The audio is kept.` };
   }
   return { kind: 'none', message: noTextNote(state.status, state.outcome) };
+}
+
+/* ------------------------------------------------------- playback errors */
+
+/**
+ * Why a player could not play a recording. An <audio> element says only
+ * THAT it failed, never why, and since 2026-09-30 a finished recording's audio
+ * may live on the voice archive server (orchestrator/app/voice_archive.py),
+ * which can be down for a while with nothing lost. So the page asks the
+ * server once, for one byte, and names the real cause:
+ *   format               the server served audio, so this browser cannot play it
+ *   archive_unavailable  503: the archive server is not answering
+ *   archive_busy         503: every connection to it is carrying a recording
+ *   audio_missing        410: the archive server has no copy
+ *   deleted              410/404: the audio is gone
+ *   unknown              the probe itself failed
+ */
+export type PlaybackProblem =
+  | 'format'
+  | 'archive_unavailable'
+  | 'archive_busy'
+  | 'audio_missing'
+  | 'deleted'
+  | 'unknown';
+
+export const PLAYBACK_MESSAGES: Record<PlaybackProblem, string> = {
+  format:
+    "This browser can't play this recording's format. Download it and open it in another player.",
+  archive_unavailable:
+    "This recording is kept on the archive server, which isn't answering right now. Nothing is lost; try again in a few minutes.",
+  archive_busy:
+    'Many recordings are playing from the archive server right now. Nothing is lost; try again in a moment.',
+  audio_missing:
+    "This recording's audio could not be found on the archive server. Its transcript is still here.",
+  deleted: "This recording's audio is no longer on the server.",
+  unknown:
+    "This recording couldn't be played here. This browser may not play its format, or its audio is no longer on the server. Try downloading it.",
+};
+
+/** One byte of the recording, to learn why a player failed. Never throws. */
+export async function diagnosePlayback(
+  fetchImpl: typeof fetch,
+  id: string,
+  signal?: AbortSignal,
+): Promise<PlaybackProblem> {
+  let response: Response;
+  try {
+    response = await fetchImpl(recordingAudioUrl(id), {
+      method: 'GET',
+      headers: { range: 'bytes=0-0' },
+      cache: 'no-store',
+      signal,
+    });
+  } catch {
+    return 'unknown';
+  }
+  if (response.status === 200 || response.status === 206) {
+    // The server can serve it: whatever failed was the browser's decoder.
+    // Stop reading in case a 200 carries the whole file.
+    try {
+      await response.body?.cancel();
+    } catch {
+      // nothing to release
+    }
+    return 'format';
+  }
+  let reason: string | null = null;
+  try {
+    const body = (await response.json()) as unknown;
+    if (typeof body === 'object' && body !== null && typeof (body as { reason?: unknown }).reason === 'string') {
+      reason = (body as { reason: string }).reason;
+    }
+  } catch {
+    reason = null;
+  }
+  if (response.status === 503 && reason === 'archive_unavailable') return 'archive_unavailable';
+  if (response.status === 503 && reason === 'archive_busy') return 'archive_busy';
+  if (response.status === 410 && reason === 'audio_missing') return 'audio_missing';
+  if (response.status === 410 || response.status === 404) return 'deleted';
+  return 'unknown';
 }
 
 export type DeleteResult = { kind: 'deleted' } | { kind: 'not_deleted'; message: string };

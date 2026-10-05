@@ -267,6 +267,18 @@ services:
       ASR_MAX_UPLOAD_BYTES: ${ASR_MAX_UPLOAD_BYTES:-33554432}
       ASR_MAX_CONCURRENT: ${ASR_MAX_CONCURRENT:-2}
       ASR_RATE_PER_MIN: ${ASR_RATE_PER_MIN:-20}
+      # The voice archive (app/voice_archive.py, 2026-09-30): finished
+      # recordings' audio moves to the store on the worker's disk. Passed
+      # EXPLICITLY for the reason ASR_* are: scripts/voice-store.sh writes the
+      # address and the pinned certificate into .env. Off by default; the
+      # owner turns VOICE_ARCHIVE_ENABLED on after `voice-store.sh verify`.
+      # VOICE_ARCHIVE_TOKEN IS DELIBERATELY NOT LISTED: it lives in
+      # .runtime/secrets.env and arrives through `env_file`, and a blank
+      # `environment:` entry here would override it on a recreate whose
+      # interpolation lacks the secrets layer (API_KEY_PEPPER's reason below).
+      VOICE_ARCHIVE_ENABLED: ${VOICE_ARCHIVE_ENABLED:-false}
+      VOICE_ARCHIVE_URL: ${VOICE_ARCHIVE_URL:-}
+      VOICE_ARCHIVE_TLS_CERT_B64: ${VOICE_ARCHIVE_TLS_CERT_B64:-}
       # Document OCR. OCR_BASE_URL IS LISTED HERE ON PURPOSE, even though
       # `env_file` carries the generated one: scripts/ocr.sh can move the
       # engine to the worker and records where in .env (OCR_REMOTE_BASE_URL),

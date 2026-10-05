@@ -291,7 +291,8 @@ SAMPLE_RATE = 16000
 
 
 async def extract_audio(
-    path: str, out_wav: str, *, timeout_s: float, threads: int = 2
+    path: str, out_wav: str, *, timeout_s: float, threads: int = 2,
+    limit_s: Optional[float] = None,
 ) -> int:
     """Decode the audio track to 16 kHz mono 16-bit PCM WAV at `out_wav`.
 
@@ -304,6 +305,9 @@ async def extract_audio(
     Nothing is enhanced: no normalisation, no denoise. The honest thing to
     transcribe is what was recorded (the dictation engine reached the same
     conclusion by measurement).
+
+    `limit_s` decodes only the first that many seconds (the analysis window
+    of a recording longer than VIDEO_MAX_DURATION_S).
     """
     os.makedirs(os.path.dirname(out_wav) or ".", exist_ok=True)
     tmp = out_wav + ".part"
@@ -312,6 +316,7 @@ async def extract_audio(
             "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
             "-threads", str(max(1, threads)),
             "-i", path,
+            *_limit_args(limit_s),
             "-vn", "-sn", "-dn",
             "-ac", "1", "-ar", str(SAMPLE_RATE),
             "-c:a", "pcm_s16le", "-f", "wav",
@@ -325,6 +330,13 @@ async def extract_audio(
     # 44-byte canonical header; ffmpeg writes a WAV with a LIST chunk too, so
     # the sample count is derived from the data size on read (see pcm.py).
     return max(0, (size - 44) // 2)
+
+
+def _limit_args(limit_s: Optional[float]) -> List[str]:
+    """ffmpeg's output duration option for an analysis window, or none."""
+    if limit_s is None or float(limit_s) <= 0:
+        return []
+    return ["-t", f"{float(limit_s):.3f}"]
 
 
 # ------------------------------------------------------------------ frames --
@@ -343,6 +355,7 @@ async def extract_frames(
     timeout_s: float,
     threads: int = 2,
     jpeg_quality: int = 3,
+    limit_s: Optional[float] = None,
 ) -> List[FrameFile]:
     """Write the frames worth looking at, with their timestamps.
 
@@ -387,6 +400,7 @@ async def extract_frames(
         argv += ["-skip_frame", "nokey"]
     argv += [
         "-i", path,
+        *_limit_args(limit_s),
         "-an", "-sn", "-dn",
         "-vf", f"{select},{scale},showinfo",
         "-fps_mode", "vfr",

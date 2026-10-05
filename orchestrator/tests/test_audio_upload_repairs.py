@@ -403,7 +403,10 @@ def test_a_bin_source_is_probed_by_its_bytes_and_never_demuxed_as_hls(monkeypatc
 # --------------------------------------------------- "recording" wording --
 
 
-def test_the_duration_limit_calls_an_audio_file_a_recording(monkeypatch, tmp_path):
+def test_the_duration_window_calls_an_audio_file_a_recording(monkeypatch, tmp_path):
+    """Since 2026-10-03 a file over VIDEO_MAX_DURATION_S is analysed over
+    that window, not refused (docs/chat-media/LIMITS.md); the sentence still
+    calls an audio file a recording."""
     from app.video import media, pipeline
 
     monkeypatch.setattr(settings, "video_data_dir", str(tmp_path / "video"))
@@ -421,8 +424,8 @@ def test_the_duration_limit_calls_an_audio_file_a_recording(monkeypatch, tmp_pat
         monkeypatch.setattr(media, "probe", fake(has_video))
         ctx = pipeline._Ctx(row={"id": 1}, content_hash="8" * 64, source="x")
         result = asyncio.run(pipeline._stage_probe(ctx, _progress()))
-        assert result.status == "failed"
-        assert result.detail.startswith(word), result.detail
+        assert result.status == "done"
+        assert result.detail.startswith(f"{word}; its first 1:00 is analysed"), result.detail
 
 
 @pytest.mark.parametrize("name,word", [("memo.m4a", "recording"), ("standup.mp4", "video")])

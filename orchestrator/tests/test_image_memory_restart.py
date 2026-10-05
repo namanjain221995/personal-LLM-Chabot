@@ -61,7 +61,9 @@ def engines(monkeypatch):
     """
     seen: dict = {"vision": [], "routes": []}
 
-    async def fake_vision(message, images, history, emit, *, effort="think", max_tokens=None, conversation_id=None):
+    async def fake_vision(
+        message, images, history, emit, *, effort="think", max_tokens=None, conversation_id=None, total_pictures=0
+    ):
         seen["vision"].append({"message": message, "images": list(images)})
         text = ANSWER1 if message == TURN1 else "vision answer"
         await emit("token", {"text": text})
@@ -329,7 +331,8 @@ def test_a_picture_over_the_durable_budget_still_writes_its_row(as_user, monkeyp
     # Not a picture PIL can open, so no smaller copy can be made either.
     image_memory.remember("big-conv", ["x" * 5000], question=TURN1, answer=ANSWER1, user_id=int(alice["id"]))
     row = db.get_conversation_image(int(alice["id"]), "big-conv")
-    assert row is not None and row["images"] == []
+    # One slot for the turn's one picture, empty: the budget kept none.
+    assert row is not None and row["images"] == [""]
     assert TURN1.lower() in row["context"]
 
 

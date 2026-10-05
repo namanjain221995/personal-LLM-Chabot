@@ -84,6 +84,9 @@ class FakeSessions {
   pageSize = 20;
   /** 'hold': each DELETE waits here until the test releases it. */
   held = new Map<string, () => void>();
+  /** What GET .../audio answers (the player's probe after an error). */
+  audioBehaviour: 'ok' | 'archive_unavailable' | 'audio_missing' | 'network' = 'ok';
+  audioRanges: (string | null)[] = [];
 
   constructor(rows: Row[]) {
     this.rows = rows;
@@ -119,6 +122,35 @@ class FakeSessions {
         }),
         next_before: more ? page[page.length - 1]!.created_at : null,
       });
+    }
+    const audio = url.pathname.match(/^\/api\/audio\/sessions\/([0-9a-f]{32})\/audio$/);
+    if (audio && method === 'GET') {
+      // Read as sent: jsdom's Headers drops `range` (a browser sends it).
+      const sent = (init?.headers ?? {}) as Record<string, string>;
+      this.audioRanges.push(
+        Object.entries(sent).find(([name]) => name.toLowerCase() === 'range')?.[1] ?? null,
+      );
+      switch (this.audioBehaviour) {
+        case 'network':
+          throw new TypeError('Failed to fetch');
+        case 'archive_unavailable':
+          return json(
+            {
+              detail:
+                "This recording is kept on the archive server, which isn't answering right now. Nothing is lost; try again in a few minutes.",
+              reason: 'archive_unavailable',
+              retry_after_s: 30,
+            },
+            503,
+          );
+        case 'audio_missing':
+          return json({ detail: 'missing', reason: 'audio_missing' }, 410);
+        default:
+          return new Response(new Uint8Array([82]), {
+            status: 206,
+            headers: { 'content-type': 'audio/webm', 'content-range': 'bytes 0-0/12150000' },
+          });
+      }
     }
     const match = url.pathname.match(/^\/api\/audio\/sessions\/([0-9a-f]{32})$/);
     if (match && method === 'GET') {
@@ -293,6 +325,48 @@ describe('playing', () => {
     }
     // Rendering the list fetched the list and nothing else: no audio bytes.
     expect(fake.calls.map((c) => c.url)).toEqual(['/api/audio/sessions?limit=20']);
+  });
+
+  it('says why a player failed: the archive server is down, the audio is missing, or the format', async () => {
+    const fake = new FakeSessions([row(1)]);
+    await renderPage(fake);
+    const player = itemFor(1).querySelector('audio')!;
+
+    fake.audioBehaviour = 'archive_unavailable';
+    fireEvent.error(player);
+    await waitFor(() =>
+      expect(within(itemFor(1)).getByRole('alert').textContent).toBe(
+        "This recording is kept on the archive server, which isn't answering right now. Nothing is lost; try again in a few minutes.",
+      ),
+    );
+    expect(fake.audioRanges).toEqual(['bytes=0-0']);
+
+    fake.audioBehaviour = 'audio_missing';
+    fireEvent.error(player);
+    await waitFor(() =>
+      expect(within(itemFor(1)).getByRole('alert').textContent).toContain(
+        'could not be found on the archive server',
+      ),
+    );
+
+    fake.audioBehaviour = 'ok';
+    fireEvent.error(player);
+    await waitFor(() =>
+      expect(within(itemFor(1)).getByRole('alert').textContent).toContain(
+        "This browser can't play this recording's format",
+      ),
+    );
+
+    fake.audioBehaviour = 'network';
+    fireEvent.error(player);
+    await waitFor(() =>
+      expect(within(itemFor(1)).getByRole('alert').textContent).toContain(
+        "This recording couldn't be played here.",
+      ),
+    );
+    // Pressing Play again clears the message.
+    fireEvent.play(player);
+    await waitFor(() => expect(within(itemFor(1)).queryByRole('alert')).toBeNull());
   });
 
   it('shows no player for a recording retention has already removed, but still lets it be deleted', async () => {

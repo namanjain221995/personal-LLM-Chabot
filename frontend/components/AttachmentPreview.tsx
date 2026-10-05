@@ -21,6 +21,13 @@
  * The portal, the z-index, the panel chrome and the Escape handling follow
  * SettingsDialog, which is the app's established modal recipe — this adds no
  * new visual language of its own.
+ *
+ * 2026-10-02 (chat media, CONTRACT §10): a video or audio file now PLAYS
+ * here, from the server, by URL — the browser's own <video>/<audio> with
+ * `controlsList="nodownload"`, so the one native control that would save the
+ * file is not offered either. And a file whose bytes are gone still shows
+ * what the server kept of it (a document's text, a spreadsheet's summary),
+ * saying plainly that the file itself is not there.
  */
 
 import {
@@ -33,6 +40,7 @@ import { createPortal } from 'react-dom';
 import {
   fileBadgeFor,
   MAX_TEXT_PREVIEW_BYTES,
+  previewKindFor,
   previewMimeFor,
   readBlobText,
   type ResolvedAttachment,
@@ -60,10 +68,31 @@ import { IconX } from './icons';
  * A loader is optional at every call site. Without one (a row rendered with no
  * conversation behind it — previews, tests) the honest "no preview" card is
  * exactly what it always was.
+ *
+ * 2026-10-02: a loader is also the FALLBACK for a file that does render from
+ * bytes (a PDF, a text file) once those bytes turn out to be gone. It runs
+ * only then — the dialog never asks for the text of a PDF it can show.
  */
 export interface ServerPreviewLoaders {
-  loadWorkbook?: (signal: AbortSignal) => Promise<WorkbookPreview | null>;
-  loadDocumentText?: (signal: AbortSignal) => Promise<DocumentText | null>;
+  loadWorkbook?: (signal: AbortSignal) => Promise<Kept<WorkbookPreview>>;
+  loadDocumentText?: (signal: AbortSignal) => Promise<Kept<DocumentText>>;
+}
+
+/**
+ * What a server-backed loader found (2026-10-02).
+ *
+ * `value` is what the dialog draws, null when the server kept nothing usable.
+ * `expired` is the server's own word that the file's BYTES are gone (its
+ * upload listing says `expired`). It used to be answered by returning null,
+ * which left the dialog with nothing to go on but "no bytes in this tab", so
+ * a swept workbook said "This file is no longer available in this browser
+ * session" — about a file no browser session had anything to do with. The
+ * flag lets the dialog say what happened: over the summary the server kept,
+ * or instead of a preview when it kept nothing.
+ */
+export interface Kept<T> {
+  value: T | null;
+  expired?: boolean;
 }
 
 export function AttachmentPreview({
@@ -82,6 +111,8 @@ export function AttachmentPreview({
   const [failed, setFailed] = useState(false);
   const [workbook, setWorkbook] = useState<WorkbookPreview | null>(null);
   const [docText, setDocText] = useState<DocumentText | null>(null);
+  /** A loader reported the file's bytes swept (`Kept.expired`). */
+  const [keptExpired, setKeptExpired] = useState(false);
   /** Only while a server-backed preview is in flight. */
   const [loading, setLoading] = useState(false);
 
@@ -156,7 +187,9 @@ export function AttachmentPreview({
   useEffect(() => {
     // `unavailable` counts: after a reload there are no bytes to classify, and
     // a workbook profile or a document's text is exactly what still exists.
-    if (kind !== 'none' && kind !== 'unavailable') return;
+    // So does `expired` (2026-10-02): the server swept a PDF's bytes and kept
+    // the text the chat read from it, which is worth more than a sentence.
+    if (kind !== 'none' && kind !== 'unavailable' && kind !== 'expired') return;
     if (!wantsWorkbook && !wantsDocText) return;
     const controller = new AbortController();
     let alive = true;
@@ -166,10 +199,14 @@ export function AttachmentPreview({
         const { loadWorkbook: wb, loadDocumentText: dt } = loaders.current;
         if (wb) {
           const found = await wb(controller.signal);
-          if (alive) setWorkbook(found);
+          if (!alive) return;
+          setWorkbook(found.value);
+          setKeptExpired(Boolean(found.expired));
         } else if (dt) {
           const found = await dt(controller.signal);
-          if (alive) setDocText(found);
+          if (!alive) return;
+          setDocText(found.value);
+          setKeptExpired(Boolean(found.expired));
         }
       } finally {
         if (alive) setLoading(false);
@@ -235,6 +272,7 @@ export function AttachmentPreview({
             failed={failed}
             workbook={workbook}
             docText={docText}
+            keptExpired={keptExpired}
             loading={loading}
           />
         </div>
@@ -245,6 +283,33 @@ export function AttachmentPreview({
 }
 
 const NOTE = 'text-sm leading-relaxed text-muted';
+/** The line over what the server kept, when it stands in for the file. */
+const KEPT_NOTE = 'mb-3 text-xs leading-relaxed text-muted';
+
+/**
+ * 2026-10-02: the sentence over a document's text or a spreadsheet's summary
+ * when it is shown INSTEAD of the file, or null when it is simply the
+ * preview (a .docx always reads as its text; that is not a fallback).
+ *
+ * "Expired" only when the server said so — a 410 for the bytes, or a loader's
+ * `expired`. A PDF whose bytes merely could not be fetched (no upload id, a
+ * 404, offline) is not called expired: that would be a guess.
+ */
+function keptNote(
+  source: ResolvedAttachment,
+  keptExpired: boolean,
+  what: 'text' | 'summary',
+): string | null {
+  const kept =
+    what === 'text' ? 'This is the text the chat read from it.' : 'This is the summary the chat made of it.';
+  if (source.kind === 'expired' || keptExpired) {
+    return `The file itself has expired and is no longer stored. ${kept}`;
+  }
+  if (source.kind === 'unavailable' && previewKindFor(source.name, source.mime) !== 'none') {
+    return `The file itself can’t be opened here. ${kept}`;
+  }
+  return null;
+}
 
 function PreviewBody({
   source,
@@ -254,6 +319,7 @@ function PreviewBody({
   failed,
   workbook,
   docText,
+  keptExpired,
   loading,
 }: {
   source: ResolvedAttachment;
@@ -263,6 +329,7 @@ function PreviewBody({
   failed: boolean;
   workbook: WorkbookPreview | null;
   docText: DocumentText | null;
+  keptExpired: boolean;
   loading: boolean;
 }) {
   const { kind, name } = source;
@@ -273,13 +340,29 @@ function PreviewBody({
     return <p className={NOTE}>Unable to preview this file.</p>;
   }
 
+  // 2026-10-02: a player streams from the server by URL, so it is decided
+  // before anything about bytes (it never has any).
+  if ((kind === 'video' || kind === 'audio') && source.url) {
+    return <MediaPlayer kind={kind} url={source.url} name={name} />;
+  }
+
   // 4C: a server-backed preview outranks "no bytes" — the profile and the
   // extracted text are database rows, and they outlive the file itself.
   if (loading) return <p className={NOTE}>Loading preview…</p>;
-  if (workbook) return <WorkbookView workbook={workbook} />;
-  if (docText) {
+  if (workbook) {
+    const note = keptNote(source, keptExpired, 'summary');
     return (
       <>
+        {note && <p className={KEPT_NOTE}>{note}</p>}
+        <WorkbookView workbook={workbook} />
+      </>
+    );
+  }
+  if (docText) {
+    const note = keptNote(source, keptExpired, 'text');
+    return (
+      <>
+        {note && <p className={KEPT_NOTE}>{note}</p>}
         {docText.truncated && (
           <p className="mb-2 text-xs text-faint">
             Preview truncated — showing the beginning of the document.
@@ -308,9 +391,13 @@ function PreviewBody({
 
   if (kind === 'loading') return <p className={NOTE}>Loading preview…</p>;
 
-  if (kind === 'expired') {
+  if (kind === 'expired' || keptExpired) {
     // Distinct from `unavailable` on purpose: the server HAD this file and its
     // workspace TTL swept it, which is a fact the user can act on.
+    //
+    // `keptExpired` (2026-10-02): a swept workbook whose stored summary could
+    // not be drawn. It used to fall through to `unavailable` below and blame
+    // "this browser session" for what the server's sweep did.
     return (
       <p className={NOTE}>
         This upload has expired and is no longer stored. Attach the file again
@@ -326,6 +413,13 @@ function PreviewBody({
         to preview it.
       </p>
     );
+  }
+
+  if (kind === 'missing') {
+    // 2026-10-02: a stored photo whose route answered 404/410. Not "expired"
+    // (photos are kept for the life of the chat) and not "this browser
+    // session" (the server is where it was looked for).
+    return <p className={NOTE}>This photo is no longer stored on the server.</p>;
   }
 
   if (kind === 'image') {
@@ -385,6 +479,93 @@ function PreviewBody({
     <p className={NOTE}>
       Preview is not available for this file type.
     </p>
+  );
+}
+
+/* ---------------------------------------------------------- the players */
+
+/** Why a player could not play, once the server has been asked. */
+type PlayerProblem = 'checking' | 'expired' | 'not_found' | 'unreachable' | 'format';
+
+/**
+ * A sent video or audio file, played from the server (2026-10-02).
+ *
+ * `src` is the streaming proxy's URL and nothing is fetched by this
+ * component: the browser's player asks for byte ranges as it needs them.
+ * `preload="metadata"` makes opening the dialog cost the file's header (the
+ * duration and the first frame), never the file; playing and seeking fetch
+ * what they reach. `playsInline` keeps an iPhone from leaping to full screen
+ * on the first tap. `controlsList="nodownload"` removes Chrome's "Download"
+ * from the player's menu, the one way this dialog could otherwise save a file
+ * (NEW-09A).
+ *
+ * A media element reports a failure without its cause: a swept file, a 404
+ * and a codec this browser lacks all arrive as the same `error` event. So on
+ * error the server is asked once, for a single byte, and the answer picks the
+ * sentence. Only then — a playing file costs no extra request.
+ */
+function MediaPlayer({ kind, url, name }: { kind: 'video' | 'audio'; url: string; name: string }) {
+  const [problem, setProblem] = useState<PlayerProblem | null>(null);
+  const probe = useRef<AbortController | null>(null);
+  useEffect(() => () => probe.current?.abort(), []);
+
+  async function explain() {
+    if (problem) return;
+    setProblem('checking');
+    const controller = new AbortController();
+    probe.current = controller;
+    try {
+      const res = await fetch(url, {
+        headers: { range: 'bytes=0-0' },
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+      // One byte at most, but read nothing: the status is the whole answer.
+      void res.body?.cancel().catch(() => undefined);
+      if (controller.signal.aborted) return;
+      if (res.status === 410) setProblem('expired');
+      else if (res.status === 404) setProblem('not_found');
+      else if (!res.ok) setProblem('unreachable');
+      else setProblem('format');
+    } catch {
+      if (!controller.signal.aborted) setProblem('unreachable');
+    }
+  }
+
+  if (problem && problem !== 'checking') {
+    const sentence = {
+      expired:
+        'This upload has expired and is no longer stored. Attach the file again to play it.',
+      not_found: 'This file is no longer on the server.',
+      unreachable:
+        'The file couldn’t be loaded from the server. Check your connection and try again.',
+      format: `This browser can’t play ${fileBadgeFor(name)} files.`,
+    }[problem];
+    return <p className={NOTE}>{sentence}</p>;
+  }
+
+  const label = `${kind === 'video' ? 'Video' : 'Audio'}: ${name}`;
+  return kind === 'video' ? (
+    <video
+      controls
+      playsInline
+      preload="metadata"
+      controlsList="nodownload"
+      src={url}
+      aria-label={label}
+      onError={() => void explain()}
+      className="mx-auto block max-h-[65dvh] w-full rounded-ts bg-black"
+    />
+  ) : (
+    <audio
+      controls
+      preload="metadata"
+      controlsList="nodownload"
+      src={url}
+      aria-label={label}
+      onError={() => void explain()}
+      className="block w-full"
+    />
   );
 }
 

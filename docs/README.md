@@ -23,12 +23,14 @@ source.
 | Two-node DGX Spark cluster (`CLUSTER_MODE=dual`): topology, generated config, scripts, benchmarks, limitations | [`CLUSTER.md`](CLUSTER.md) |
 | **The main model's availability** (2026-09-12): what to do when an alert fires, the engine controller and worker sentinel, the orchestrator's breaker, request continuity and admission lanes, the 2026-09-11 incident, the ADR, the SLOs, the engine candidate | [`availability/`](availability/README.md) — start with [`RUNBOOK.md`](availability/RUNBOOK.md) |
 | Move the OCR engine to the worker (`scripts/ocr.sh`), the hand-over, and how to go back | [`ocr-on-the-worker.md`](ocr-on-the-worker.md) |
+| Stored recordings' audio on the worker's disk (the voice archive, `scripts/voice-store.sh`): design, measurements, deploy, runbook, rollback | [`voice-archive.md`](voice-archive.md) |
 | The 2026-09 engine crashes (MTP spec-decode on the Qwen GDN layer): root cause, remediation, measurements, rollback | [`ISSUE/`](ISSUE/) |
 | Current files and entrypoints | [`00-INVENTORY.md`](00-INVENTORY.md) |
 | Launcher plus application request flows | [`01-codebase/CRITICAL-PATHS.md`](01-codebase/CRITICAL-PATHS.md) |
 | Base Compose and runtime overlays | [`01-codebase/infra-docker-compose.md`](01-codebase/infra-docker-compose.md) |
 | Test entrypoints and current verification boundary | [`01-codebase/test-map.md`](01-codebase/test-map.md) |
 | Current application data stores | [`01-codebase/data-model.md`](01-codebase/data-model.md) |
+| **My files** (2026-09-30): the page listing everything a person uploaded, what of each file is really stored, its routes, security, cost and metrics | [`MY-FILES.md`](MY-FILES.md) |
 | Salesforce clarification, query-plan safety, context budgeting | [`06-agent-design/SALESFORCE-INTELLIGENCE-MODE.md`](06-agent-design/SALESFORCE-INTELLIGENCE-MODE.md) |
 | The knowledge "brain": forensic audit, RAG/memory/search audit, ADR-0001 (one evidence pipeline, scopes, reranker, index policy), eval and benchmarks | [`07-brain/`](07-brain/) |
 

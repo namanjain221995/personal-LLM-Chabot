@@ -343,6 +343,34 @@ SPECULATIVE_EMBED_WASTE_REASONS = frozenset(
     {"refetch_empty", "load_failed", "cancelled"}
 )
 
+#: app/myfiles.py: the two reads (GET /files/mine and /files/mine/summary)
+#: and how each ended. A malformed query is `bad_request`, not a failure.
+MYFILES_VIEWS = frozenset({"list", "summary"})
+MYFILES_RESULTS = frozenset({"ok", "bad_request", "error"})
+
+#: app/chat_media.py (V44, 2026-10-02; docs/chat-media/CONTRACT.md §11).
+#: Literal here so this module imports nothing; tests/test_chat_media_api.py
+#: pins chat_media's own tuples to these sets.
+#:   source  who sent the picture: /chat inline bytes, the upload route, or
+#:           a browser backfilling a photo it still holds from before V44;
+#:   result  how one write ended. `duplicate` is the idempotent retry (the
+#:           first write won); unsupported / too_large / no_space are
+#:           refusals, `error` is the server's own failure; `unlinked` is a
+#:           /chat picture sent with no ids and no send intent to name it by
+#:           (docs/chat-media/STORE-ALWAYS.md), so it was not stored.
+CHAT_MEDIA_SOURCES = frozenset({"chat", "upload", "backfill"})
+CHAT_MEDIA_WRITE_RESULTS = frozenset(
+    {"stored", "duplicate", "unsupported", "too_large", "no_space", "error", "unlinked"}
+)
+#: A read of the bytes route: which rendition, and how it ended. `missing` is
+#: a row whose file is gone (410), `not_found` everything that is not yours.
+CHAT_MEDIA_SIZES = frozenset({"thumb", "full"})
+CHAT_MEDIA_READ_RESULTS = frozenset({"ok", "not_modified", "not_found", "missing"})
+#: The lasting copy of a document or dataset original (CONTRACT §9, the files
+#: track): made, skipped under the free-space floor, or failed.
+CHAT_FILES_PURPOSES = frozenset({"document", "dataset"})
+CHAT_FILES_RESULTS = frozenset({"stored", "no_space", "error"})
+
 _ROUTE_EFFORT = {"route": set(CHAT_ROUTES), "effort": set(CHAT_EFFORTS)}
 
 #: metric -> {label name: closed value set}. Only these label NAMES survive.
@@ -379,6 +407,26 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
         "plan": set(DECIDE_PLANS),
         "outcome": set(STEP_OUTCOMES),
     },
+    # My files (app/myfiles.py, 2026-09-30): which read, and how it ended.
+    # Never a file name, a user or a query — those are the person's content.
+    "myfiles_list_seconds": {"view": set(MYFILES_VIEWS)},
+    "myfiles_list_total": {"view": set(MYFILES_VIEWS), "result": set(MYFILES_RESULTS)},
+    # Chat media (app/chat_media.py, 2026-10-02). Never a user, a chat, an
+    # attachment id or a file name: those are the person's.
+    "chat_media_writes_total": {
+        "source": set(CHAT_MEDIA_SOURCES), "result": set(CHAT_MEDIA_WRITE_RESULTS),
+    },
+    "chat_media_reads_total": {"size": set(CHAT_MEDIA_SIZES), "result": set(CHAT_MEDIA_READ_RESULTS)},
+    "chat_media_write_seconds": {"source": set(CHAT_MEDIA_SOURCES)},
+    # Deleting a chat removes its bytes at once, best effort; a failure is
+    # counted here and the reaper finishes the job. `store` is which root.
+    "chat_media_erase_total": {"store": {"media", "files"}, "result": {"ok", "error"}},
+    # What the reaper removed: a row whose chat or account is gone, or a
+    # directory no row names (both only past CHAT_MEDIA_ORPHAN_GRACE_H).
+    "chat_media_reaped_total": {"kind": {"row", "dir"}},
+    "chat_files_lasting_total": {
+        "purpose": set(CHAT_FILES_PURPOSES), "result": set(CHAT_FILES_RESULTS),
+    },
     # Engine first token to the SSE write that carries it — the part of the
     # 105 -> 88 tok/s relay loss that is time, not throughput.
     "relay_overhead_seconds": dict(_ROUTE_EFFORT),
@@ -393,6 +441,25 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
         "category": set(FAST_LANE_CATEGORIES),
         "veto": set(FAST_LANE_VETOES),
     },
+    # The voice archive (app/voice_archive.py, 2026-09-30). Literal here so
+    # this module imports nothing; tests/test_voice_archive.py pins these to
+    # voice_archive.ERROR_REASONS / PROXY_RESULTS / RESTORE_RESULTS /
+    # RECONCILE_RESULTS. No id, user or path is ever a label.
+    "voice_archive_errors_total": {"reason": {
+        "unreachable", "timeout", "tls", "auth", "storage_full", "busy", "conflict",
+        "remote_sha_mismatch", "missing", "http_4xx", "http_5xx",
+        "local_missing", "local_size_mismatch", "local_sha_mismatch", "local_unreadable", "remote_missing",
+    }},
+    "voice_archive_proxy_total": {"result": {
+        "ok", "partial", "not_satisfiable", "bad_request", "busy", "unavailable", "missing",
+    }},
+    "voice_archive_restored_total": {"result": {
+        "restored", "held", "unavailable", "missing", "mismatch", "no_space", "deleted",
+    }},
+    "voice_archive_reconcile_total": {"result": {
+        "orphan_quarantined", "orphan_waiting", "other_owner", "unowned",
+        "deleted_row_purged", "repaired", "remote_missing", "foreign",
+    }},
 }
 _ALLOWED_BY_METRIC.update(_LABELS_BY_METRIC)
 

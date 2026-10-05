@@ -80,6 +80,15 @@ describe('the page policy', () => {
     }
   });
 
+  it("lets the chat's players stream same-origin media, and never from a blob: URL (2026-10-02)", () => {
+    // No media-src: media falls back to default-src 'self', which admits the
+    // uploads file route a <video>/<audio> streams from, and refuses blob:
+    // (a player handed an object URL would have fetched the whole file).
+    expect(policy.has('media-src')).toBe(false);
+    expect(policy.get('default-src')).toEqual(["'self'"]);
+    expect(policy.get('default-src')).not.toContain('blob:');
+  });
+
   it('does not upgrade insecure requests: the in-network http path must keep working', () => {
     expect(policy.has('upgrade-insecure-requests')).toBe(false);
   });

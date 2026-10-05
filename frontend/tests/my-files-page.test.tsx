@@ -1,0 +1,746 @@
+// @vitest-environment jsdom
+/**
+ * The "My files" page (2026-09-30): a person finds everything they uploaded,
+ * across every chat, and sees honestly what is still stored.
+ *
+ * Driven against a fake of the routes as the proxies serve them —
+ * /api/files/mine and /summary (orchestrator/app/myfiles.py shapes), the
+ * recording DELETE (/api/audio/sessions/{id}), and the preview reads the page
+ * reuses (/api/uploads/{conv}/document, /api/uploads/{conv},
+ * /api/uploads/{conv}/{upload}/file). The page URL is a reactive stand-in for
+ * Next's router, so a filter change really does travel through the URL.
+ */
+import { act, cleanup, configure, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import type { ComponentProps, ReactNode } from 'react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { MyFilesPage } from '@/components/myfiles/MyFilesPage';
+import { deleteConfirmBody } from '@/components/recordings/RecordingItem';
+import { formatWhen } from '@/lib/format';
+import { IN_PROGRESS_DELETE_NOTE, type Recording } from '@/lib/recordings';
+
+const nav = vi.hoisted(() => {
+  const listeners = new Set<() => void>();
+  const state = { search: new URLSearchParams() };
+  const set = (query: string) => {
+    state.search = new URLSearchParams(query);
+    listeners.forEach((listener) => listener());
+  };
+  return {
+    state,
+    listeners,
+    set,
+    replace: vi.fn((href: string) => set(href.includes('?') ? href.slice(href.indexOf('?') + 1) : '')),
+  };
+});
+
+vi.mock('next/navigation', async () => {
+  const React = await import('react');
+  const subscribe = (listener: () => void) => {
+    nav.listeners.add(listener);
+    return () => {
+      nav.listeners.delete(listener);
+    };
+  };
+  const snapshot = () => nav.state.search;
+  return {
+    usePathname: () => '/files',
+    useRouter: () => ({ replace: nav.replace, push: vi.fn() }),
+    useSearchParams: () => React.useSyncExternalStore(subscribe, snapshot, snapshot),
+  };
+});
+
+vi.mock('next/link', () => ({
+  __esModule: true,
+  default: (props: ComponentProps<'a'> & { children?: ReactNode }) => {
+    const { children, ...rest } = props;
+    return <a {...rest}>{children}</a>;
+  },
+}));
+
+// A whole page render with effects and a debounce; the default 1 s budget is
+// about a loaded CI runner, not about anything asserted here.
+configure({ asyncUtilTimeout: 5000 });
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+beforeEach(() => {
+  nav.set('');
+  nav.replace.mockClear();
+  HTMLMediaElement.prototype.play = HTMLMediaElement.prototype.play ?? (async () => undefined);
+});
+
+/* ------------------------------------------------------------ the fake */
+
+const hex = (n: number) => n.toString(16).padStart(32, '0');
+
+interface Row {
+  id: string;
+  source: 'upload' | 'text' | 'recording' | 'media';
+  kind: 'document' | 'dataset' | 'image' | 'video' | 'audio' | 'recording';
+  name: string;
+  bytes: number | null;
+  created_at: string;
+  conversation: { id: string; title: string } | null;
+  availability: 'available' | 'text_only' | 'summary_only' | 'processing' | 'expired';
+  media: { status: string | null; duration_ms: number | null; has_transcript?: boolean } | null;
+  can: { download: boolean; preview: 'text' | 'summary' | 'audio' | 'image' | null; delete: boolean };
+  /** A stored chat picture's id (docs/chat-media/NOTES.md, fe-files). */
+  attachment_id?: string;
+  text_name?: string;
+}
+
+function at(hoursAgo: number): string {
+  return new Date(Date.UTC(2026, 8, 30, 10, 0, 0) - hoursAgo * 3_600_000).toISOString().replace('Z', '+00:00');
+}
+
+function upload(n: number, over: Partial<Row> = {}): Row {
+  return {
+    id: `upload:${hex(n)}`,
+    source: 'upload',
+    kind: 'document',
+    name: `file-${n}.pdf`,
+    bytes: 1000 + n,
+    created_at: at(n),
+    conversation: { id: 'conv-1', title: 'Quarterly planning' },
+    availability: 'available',
+    media: null,
+    can: { download: true, preview: null, delete: false },
+    ...over,
+  };
+}
+
+function recording(n: number, over: Partial<Row> = {}): Row {
+  return {
+    id: `recording:${hex(1000 + n)}`,
+    source: 'recording',
+    kind: 'recording',
+    name: 'Voice recording',
+    bytes: 50_000 + n,
+    created_at: at(n),
+    conversation: null,
+    availability: 'available',
+    media: { status: 'done', duration_ms: 61_000, has_transcript: true },
+    can: { download: true, preview: 'audio', delete: true },
+    ...over,
+  };
+}
+
+const RETENTION = {
+  upload_hours: 24,
+  recording_days: 0,
+  video_kept_with_chat: true,
+  video_grace_hours: 72,
+  pictures: 'browser_only',
+  picture_memory_hours: 2,
+};
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+}
+
+function abortError(): Error {
+  return Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+}
+
+class FakeFiles {
+  rows: Row[];
+  retention: Record<string, unknown> = RETENTION;
+  calls: { method: string; url: URL; signal: AbortSignal | undefined }[] = [];
+  listRefusal: { status: number; body: unknown } | null = null;
+  /** List requests whose q is here wait until the test releases them. */
+  holdQuery: string | null = null;
+  held: Array<() => void> = [];
+  /** Extra rows served on the second page, to prove the page de-duplicates. */
+  overlapOnSecondPage = false;
+  fileStatus = 200;
+  /** An orchestrator with picture rows counts them; an older one does not. */
+  knowsPictures = false;
+  pictureStatus = 200;
+
+  constructor(rows: Row[]) {
+    this.rows = rows;
+  }
+
+  private matching(url: URL): Row[] {
+    const q = (url.searchParams.get('q') ?? '').toLowerCase();
+    const kinds = (url.searchParams.get('kind') ?? '').split(',').filter(Boolean);
+    return this.rows
+      .filter((r) => !kinds.length || kinds.includes(r.kind))
+      .filter(
+        (r) =>
+          !q || r.name.toLowerCase().includes(q) || (r.conversation?.title ?? '').toLowerCase().includes(q),
+      )
+      .sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+  }
+
+  fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const url = new URL(String(input), 'http://app.test');
+    const signal = init?.signal ?? undefined;
+    this.calls.push({ method, url, signal });
+    if (signal?.aborted) throw abortError();
+
+    if (url.pathname === '/api/files/mine' && method === 'GET') {
+      if (this.holdQuery !== null && url.searchParams.get('q') === this.holdQuery) {
+        await new Promise<void>((resolve, reject) => {
+          this.held.push(resolve);
+          signal?.addEventListener('abort', () => reject(abortError()));
+        });
+      }
+      if (this.listRefusal) return json(this.listRefusal.body, this.listRefusal.status);
+      const all = this.matching(url);
+      const start = Number(url.searchParams.get('cursor') ?? '0');
+      const limit = Number(url.searchParams.get('limit') ?? '50');
+      let page = all.slice(start, start + limit);
+      if (this.overlapOnSecondPage && start > 0) page = [all[start - 1]!, ...page];
+      const next = start + limit < all.length ? String(start + limit) : null;
+      return json({ items: page, next_cursor: next, retention: this.retention });
+    }
+    if (url.pathname === '/api/files/mine/summary' && method === 'GET') {
+      const all = this.matching(new URL(`http://app.test/?q=${encodeURIComponent(url.searchParams.get('q') ?? '')}`));
+      const kinds: Record<string, { count: number; bytes: number }> = {};
+      const counted = ['document', 'dataset', 'video', 'audio', 'recording'];
+      if (this.knowsPictures) counted.push('image');
+      for (const kind of counted) {
+        const of = all.filter((r) => r.kind === kind);
+        kinds[kind] = { count: of.length, bytes: of.reduce((n, r) => n + (r.bytes ?? 0), 0) };
+      }
+      return json({
+        kinds,
+        total: { count: all.length, bytes: all.reduce((n, r) => n + (r.bytes ?? 0), 0) },
+        retention: this.retention,
+      });
+    }
+    const recordingMatch = url.pathname.match(/^\/api\/audio\/sessions\/([0-9a-f]{32})$/);
+    if (recordingMatch && method === 'DELETE') {
+      this.rows = this.rows.filter((r) => r.id !== `recording:${recordingMatch[1]}`);
+      return new Response(null, { status: 204 });
+    }
+    const documentMatch = url.pathname.match(/^\/api\/uploads\/([^/]+)\/document$/);
+    if (documentMatch && method === 'GET') {
+      return json({ filename: url.searchParams.get('name'), text: 'The text the chat read.', truncated: false });
+    }
+    const listMatch = url.pathname.match(/^\/api\/uploads\/([^/]+)$/);
+    if (listMatch && method === 'GET') {
+      return json({
+        uploads: this.rows
+          .filter((r) => r.source === 'upload')
+          .map((r) => ({
+            id: r.id.slice('upload:'.length),
+            filename: r.name,
+            status: 'expired',
+            profile: [
+              {
+                file: r.name,
+                kind: 'table',
+                rows: 995,
+                columns: [{ name: 'region' }, { name: 'amount' }],
+                sample_rows: [{ region: 'north', amount: 10 }],
+              },
+            ],
+          })),
+      });
+    }
+    const pictureMatch = url.pathname.match(/^\/api\/chat-media\/([^/]+)\/([A-Za-z0-9_-]+)$/);
+    if (pictureMatch && method === 'GET') {
+      if (this.pictureStatus !== 200) return json({ code: 'not_found' }, this.pictureStatus);
+      // Bytes, not a jsdom Blob: undici's Response cannot read jsdom's Blob.
+      return new Response(new Uint8Array([0xff, 0xd8, 0xff]), {
+        status: 200,
+        headers: { 'content-type': 'image/jpeg' },
+      });
+    }
+    const fileMatch = url.pathname.match(/^\/api\/uploads\/([^/]+)\/([0-9a-f]{32})\/file$/);
+    if (fileMatch && method === 'GET') {
+      if (this.fileStatus === 410) return json({ message: 'this upload has expired' }, 410);
+      return new Response(new Blob(['%PDF-1.4 bytes'], { type: 'application/pdf' }), { status: 200 });
+    }
+    return json({ detail: `unexpected ${method} ${url.pathname}` }, 500);
+  });
+
+  asFetch(): typeof fetch {
+    return this.fetch as unknown as typeof fetch;
+  }
+
+  listCalls(): URL[] {
+    return this.calls.filter((c) => c.method === 'GET' && c.url.pathname === '/api/files/mine').map((c) => c.url);
+  }
+}
+
+async function renderPage(fake: FakeFiles) {
+  // The preview loaders (lib/previewData, lib/attachments) use the global fetch.
+  vi.stubGlobal('fetch', fake.fetch);
+  render(<MyFilesPage fetchFn={fake.asFetch()} />);
+  await waitFor(() => expect(screen.queryByText('Loading your files…')).toBeNull());
+}
+
+function list(): HTMLElement {
+  return screen.getByRole('list', { name: 'Your files' });
+}
+
+function items(): HTMLElement[] {
+  const found = screen.queryByRole('list', { name: 'Your files' });
+  return found ? within(found).getAllByRole('listitem') : [];
+}
+
+function rowFor(name: string): HTMLElement {
+  return within(list()).getByRole('heading', { name }).closest('li')!;
+}
+
+/* ------------------------------------------------------------- tests */
+
+describe('the list', () => {
+  it('shows a busy skeleton, then every file with its kind, size, time, chat and state', async () => {
+    const fake = new FakeFiles([
+      upload(1, { name: 'Q3 report.pdf', bytes: 2_400_000 }),
+      upload(2, {
+        id: 'text:42',
+        source: 'text',
+        name: 'old-contract.docx',
+        bytes: null,
+        availability: 'text_only',
+        can: { download: false, preview: 'text', delete: false },
+      }),
+      upload(3, {
+        kind: 'dataset',
+        name: 'bundle.zip',
+        availability: 'summary_only',
+        can: { download: false, preview: 'summary', delete: false },
+      }),
+      recording(4),
+    ]);
+    vi.stubGlobal('fetch', fake.fetch);
+    render(<MyFilesPage fetchFn={fake.asFetch()} />);
+    expect(document.querySelector('[aria-busy="true"]')).not.toBeNull();
+    await waitFor(() => expect(screen.queryByText('Loading your files…')).toBeNull());
+
+    expect(items()).toHaveLength(4);
+    const report = rowFor('Q3 report.pdf');
+    expect(within(report).getByText('Document')).toBeTruthy();
+    expect(within(report).getByText('2.3 MB')).toBeTruthy();
+    expect(within(report).getByText(formatWhen(at(1)))).toBeTruthy();
+    expect(within(report).getByText('Stored')).toBeTruthy();
+    const chat = within(report).getByRole('link', { name: /Quarterly planning/ });
+    expect(chat.getAttribute('href')).toBe('/?c=conv-1');
+
+    expect(within(rowFor('old-contract.docx')).getByText('Text only')).toBeTruthy();
+    expect(within(rowFor('bundle.zip')).getByText('Summary only')).toBeTruthy();
+    const voice = rowFor('Voice recording');
+    expect(within(voice).getByRole('link', { name: /Recordings/ }).getAttribute('href')).toBe('/recordings');
+    expect(within(voice).getByText('1:01')).toBeTruthy();
+  });
+
+  it('announces how many files there are', async () => {
+    const fake = new FakeFiles([upload(1), upload(2), recording(3)]);
+    await renderPage(fake);
+    await waitFor(() => expect(screen.getByRole('status').textContent).toMatch(/3 files/));
+  });
+
+  it('first run: says what will appear here, and that pictures are not stored', async () => {
+    await renderPage(new FakeFiles([]));
+    expect(screen.getByRole('heading', { name: 'No files yet' })).toBeTruthy();
+    expect(screen.getAllByText(/Pictures stay only in the browser you sent them from/).length).toBeGreaterThan(0);
+    expect(screen.queryByRole('button', { name: 'Clear filters' })).toBeNull();
+  });
+
+  it('filtered to nothing: offers to clear the filters', async () => {
+    nav.set('kind=video&q=zzz');
+    const fake = new FakeFiles([upload(1)]);
+    await renderPage(fake);
+    expect(screen.getByRole('heading', { name: 'No files match these filters' })).toBeTruthy();
+    const clear = screen.getAllByRole('button', { name: 'Clear filters' })[0]!;
+    fireEvent.click(clear);
+    await waitFor(() => expect(items()).toHaveLength(1));
+    expect(nav.replace).toHaveBeenLastCalledWith('/files', { scroll: false });
+  });
+
+  it('a failed load says why and retries', async () => {
+    const fake = new FakeFiles([upload(1)]);
+    fake.listRefusal = { status: 500, body: { detail: 'database unavailable', reason: 'error' } };
+    await renderPage(fake);
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toMatch(/Your files couldn't be loaded/);
+    fake.listRefusal = null;
+    fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(items()).toHaveLength(1));
+  });
+
+  it('signed out: offers Sign in instead of Retry', async () => {
+    const fake = new FakeFiles([upload(1)]);
+    fake.listRefusal = { status: 401, body: { detail: 'Not signed in.' } };
+    await renderPage(fake);
+    const alert = screen.getByRole('alert');
+    expect(within(alert).getByRole('link', { name: 'Sign in' }).getAttribute('href')).toBe('/login');
+    expect(within(alert).queryByRole('button', { name: 'Retry' })).toBeNull();
+  });
+
+  it('loads older files without repeating one', async () => {
+    const rows = Array.from({ length: 60 }, (_, n) => upload(n + 1));
+    const fake = new FakeFiles(rows);
+    fake.overlapOnSecondPage = true;
+    await renderPage(fake);
+    expect(items()).toHaveLength(50);
+    fireEvent.click(screen.getByRole('button', { name: 'Show older files' }));
+    await waitFor(() => expect(items()).toHaveLength(60));
+    const ids = items().map((li) => li.getAttribute('aria-labelledby'));
+    expect(new Set(ids).size).toBe(60);
+    expect(screen.queryByRole('button', { name: 'Show older files' })).toBeNull();
+  });
+});
+
+describe('filters', () => {
+  it('shows each type with its count and filters through the URL', async () => {
+    const fake = new FakeFiles([upload(1), upload(2), upload(3, { kind: 'dataset', name: 'sales.csv' }), recording(4)]);
+    await renderPage(fake);
+    const group = screen.getByRole('group', { name: 'Type' });
+    await waitFor(() => expect(within(group).getByRole('radio', { name: /Documents.*2/ })).toBeTruthy());
+    expect(within(group).getByRole('radio', { name: /All.*4/ })).toHaveProperty('checked', true);
+    fireEvent.click(within(group).getByRole('radio', { name: /Voice recordings/ }));
+    expect(nav.replace).toHaveBeenLastCalledWith('/files?kind=recording', { scroll: false });
+    await waitFor(() => expect(items()).toHaveLength(1));
+    expect(fake.listCalls().at(-1)!.searchParams.get('kind')).toBe('recording');
+  });
+
+  it('a second search cancels the first, so the results never arrive out of order', async () => {
+    const fake = new FakeFiles([
+      upload(1, { name: 'budget.xlsx', kind: 'dataset' }),
+      upload(2, { name: 'budget q3.pdf' }),
+      upload(3, { name: 'unrelated.pdf', conversation: { id: 'conv-2', title: 'Other' } }),
+    ]);
+    fake.holdQuery = 'budget';
+    await renderPage(fake);
+    const search = screen.getByRole('searchbox', { name: 'Search files and chats' });
+    fireEvent.change(search, { target: { value: 'budget' } });
+    await waitFor(() => expect(fake.held).toHaveLength(1));
+    fireEvent.change(search, { target: { value: 'budget q3' } });
+    await waitFor(() => expect(fake.listCalls().some((u) => u.searchParams.get('q') === 'budget q3')).toBe(true));
+    const first = fake.calls.find((c) => c.url.searchParams.get('q') === 'budget');
+    expect(first!.signal!.aborted).toBe(true);
+    act(() => fake.held.forEach((release) => release()));
+    await waitFor(() => expect(items().map((li) => within(li).getByRole('heading').textContent)).toEqual(['budget q3.pdf']));
+    expect(nav.state.search.get('q')).toBe('budget q3');
+  });
+
+  it('collapses behind a Filters button that says whether it is open', async () => {
+    await renderPage(new FakeFiles([upload(1)]));
+    const toggle = screen.getByRole('button', { name: 'Filters' });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    const panel = document.getElementById(toggle.getAttribute('aria-controls')!);
+    expect(panel).not.toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+  });
+});
+
+describe('each row', () => {
+  it('downloads through the streaming routes, with the file name in the link', async () => {
+    const fake = new FakeFiles([upload(1, { name: 'Q3 report.pdf' }), recording(2)]);
+    await renderPage(fake);
+    const download = within(rowFor('Q3 report.pdf')).getByRole('link', { name: 'Download Q3 report.pdf' });
+    expect(download.getAttribute('href')).toBe(`/api/uploads/conv-1/${hex(1)}/file`);
+    expect(download.hasAttribute('download')).toBe(true);
+    const voice = within(rowFor('Voice recording')).getByRole('link', { name: /^Download the voice recording from/ });
+    expect(voice.getAttribute('href')).toBe(`/api/audio/sessions/${hex(1002)}/audio`);
+    expect(voice.hasAttribute('download')).toBe(true);
+    const player = rowFor('Voice recording').querySelector('audio')!;
+    expect(player.getAttribute('preload')).toBe('none');
+  });
+
+  it('chat files have no delete; they say what deleting the chat does', async () => {
+    await renderPage(new FakeFiles([upload(1, { name: 'Q3 report.pdf' })]));
+    const row = rowFor('Q3 report.pdf');
+    expect(within(row).queryByRole('button', { name: /Delete/ })).toBeNull();
+    // Not "to remove it": the stored copy outlives the chat until the server's
+    // clean-up (QA 2026-09-30), which the retention paragraph says once.
+    expect(within(row).getByText('Deleting its chat removes it from this list.')).toBeTruthy();
+    expect(screen.getByText(/the server erases their stored copies later/)).toBeTruthy();
+  });
+
+  it('says a recording is in Recordings "with its transcript" only when the transcript has words', async () => {
+    await renderPage(
+      new FakeFiles([
+        recording(1),
+        // Done, but it heard no speech (outcome no_speech): the Recordings
+        // page says "No speech was detected", so there is no transcript to
+        // promise (QA 2026-10-01).
+        recording(2, { media: { status: 'done', duration_ms: 61_000, has_transcript: false } }),
+        recording(3, { media: { status: 'failed', duration_ms: 61_000, has_transcript: false } }),
+        recording(4, {
+          availability: 'processing',
+          media: { status: 'finishing', duration_ms: null, has_transcript: false },
+          can: { download: false, preview: null, delete: true },
+        }),
+        // An older server that sends no flag promises nothing.
+        recording(5, { media: { status: 'done', duration_ms: 61_000 } }),
+      ]),
+    );
+    const links = items().map((li) => within(li).getByRole('link', { name: /Recordings/ }));
+    expect(links.map((a) => a.textContent)).toEqual([
+      'Also in Recordings, with its transcript',
+      'Also in Recordings',
+      'Also in Recordings',
+      'Also in Recordings',
+      'Also in Recordings',
+    ]);
+    expect(links.every((a) => a.getAttribute('href') === '/recordings')).toBe(true);
+  });
+
+  it('previews a text-only document from the text the chat read', async () => {
+    const fake = new FakeFiles([
+      upload(1, {
+        id: 'text:42',
+        source: 'text',
+        name: 'old-contract.docx',
+        bytes: null,
+        availability: 'text_only',
+        can: { download: false, preview: 'text', delete: false },
+      }),
+    ]);
+    await renderPage(fake);
+    fireEvent.click(within(rowFor('old-contract.docx')).getByRole('button', { name: 'Preview old-contract.docx' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Preview of old-contract.docx' });
+    await waitFor(() => expect(within(dialog).getByText('The text the chat read.')).toBeTruthy());
+    const read = fake.calls.find((c) => c.url.pathname === '/api/uploads/conv-1/document');
+    expect(read!.url.searchParams.get('name')).toBe('old-contract.docx');
+    expect(within(rowFor('old-contract.docx')).queryByRole('link', { name: /^Download/ })).toBeNull();
+  });
+
+  it('previews a spreadsheet summary after its bytes are gone', async () => {
+    const fake = new FakeFiles([
+      upload(1, {
+        kind: 'dataset',
+        name: 'sales.csv',
+        availability: 'summary_only',
+        can: { download: false, preview: 'summary', delete: false },
+      }),
+    ]);
+    await renderPage(fake);
+    fireEvent.click(within(rowFor('sales.csv')).getByRole('button', { name: 'Preview sales.csv' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Preview of sales.csv' });
+    await waitFor(() => expect(within(dialog).getByText('north')).toBeTruthy());
+    expect(within(dialog).getByText(/Showing 1 preview row of 995 rows/)).toBeTruthy();
+  });
+
+  it('a file that expired while the page was open turns into Removed when previewed', async () => {
+    const fake = new FakeFiles([upload(1, { name: 'Q3 report.pdf' })]);
+    fake.fileStatus = 410;
+    await renderPage(fake);
+    const row = rowFor('Q3 report.pdf');
+    fireEvent.click(within(row).getByRole('button', { name: 'Preview Q3 report.pdf' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Preview of Q3 report.pdf' });
+    await waitFor(() => expect(within(dialog).getByText(/has expired and is no longer stored/)).toBeTruthy());
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close preview' }));
+    await waitFor(() => expect(within(rowFor('Q3 report.pdf')).getByText('Removed')).toBeTruthy());
+    expect(within(rowFor('Q3 report.pdf')).queryByRole('link', { name: /^Download/ })).toBeNull();
+  });
+
+  it('the retention sentence is the server’s', async () => {
+    const fake = new FakeFiles([upload(1)]);
+    fake.retention = { ...RETENTION, upload_hours: 36 };
+    await renderPage(fake);
+    expect(
+      screen.getByText(/Files you attach to a chat are kept for 36 hours, then removed the next time the server clears out old files;/),
+    ).toBeTruthy();
+    expect(screen.getByText(/Pictures stay only in the browser you sent them from/)).toBeTruthy();
+  });
+});
+
+describe('deleting a recording', () => {
+  it('confirms, deletes, announces it and moves focus to the next row', async () => {
+    const fake = new FakeFiles([recording(1), recording(2), recording(3), upload(4, { name: 'Q3 report.pdf' })]);
+    await renderPage(fake);
+    const second = items()[1]!;
+    const when = formatWhen(at(2));
+    fireEvent.click(within(second).getByRole('button', { name: `Delete the voice recording from ${when}` }));
+    const dialog = screen.getByRole('alertdialog', { name: 'Delete this recording?' });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete recording' }));
+    await waitFor(() => expect(items()).toHaveLength(3));
+    expect(fake.calls.some((c) => c.method === 'DELETE' && c.url.pathname === `/api/audio/sessions/${hex(1002)}`)).toBe(
+      true,
+    );
+    const third = items()[1]!;
+    await waitFor(() => expect(document.activeElement).toBe(within(third).getByRole('heading')));
+    expect(screen.getByRole('status').textContent).toBe(`Deleted the voice recording from ${when}.`);
+  });
+
+  it('warns that deleting a recording still in progress stops it, as the Recordings page does', async () => {
+    // The DELETE stops a live recording and erases what was saved so far
+    // (QA 2026-09-30: the row went to 'cancelled' with its audio deleted).
+    const live = recording(1, {
+      availability: 'processing',
+      media: { status: 'recording', duration_ms: null },
+      can: { download: false, preview: null, delete: true },
+    });
+    await renderPage(new FakeFiles([live, recording(2)]));
+    const warning = 'It is still in progress: deleting it stops it and removes what was saved so far.';
+
+    fireEvent.click(within(items()[0]!).getByRole('button', { name: /^Delete the voice recording from/ }));
+    let dialog = screen.getByRole('alertdialog', { name: 'Delete this recording?' });
+    expect(within(dialog).getByText(/will be deleted from the server/).textContent).toContain(
+      `will be deleted from the server. ${warning} This can't be undone.`,
+    );
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+
+    // A finished recording's confirmation does not claim it is still running.
+    fireEvent.click(within(items()[1]!).getByRole('button', { name: /^Delete the voice recording from/ }));
+    dialog = screen.getByRole('alertdialog', { name: 'Delete this recording?' });
+    expect(dialog.textContent).not.toContain('still in progress');
+  });
+
+  it('says it in the very words the Recordings page uses', () => {
+    // My files reads the shared constant; the Recordings page still spells
+    // the sentence out, so this is what keeps the two pages from drifting.
+    expect(IN_PROGRESS_DELETE_NOTE).toBe(
+      'It is still in progress: deleting it stops it and removes what was saved so far.',
+    );
+    for (const status of ['recording', 'finishing'] as const) {
+      const live: Recording = {
+        id: hex(7),
+        createdAt: at(1),
+        status,
+        outcome: null,
+        audioMs: 0,
+        bytes: 4096,
+        mimeType: 'audio/webm',
+        deleteAfter: null,
+        kept: true,
+        preview: null,
+      };
+      expect(deleteConfirmBody(live)).toContain(` ${IN_PROGRESS_DELETE_NOTE} `);
+    }
+  });
+});
+
+/* ---------------------------------------------------------- pictures */
+
+/**
+ * 2026-10-02 (docs/chat-media/CONTRACT.md §9): photos sent in a chat are kept
+ * on the server and listed here, as kind `image`, with their thumbnail.
+ */
+describe('stored chat pictures', () => {
+  const ATT = 'img-leaf-0001';
+
+  function picture(n: number, over: Partial<Row> = {}): Row {
+    return {
+      id: `media:${hex(5000 + n)}`,
+      source: 'media',
+      kind: 'image',
+      name: `leaf-${n}.jpg`,
+      bytes: 400_000 + n,
+      created_at: at(n),
+      conversation: { id: 'conv-1', title: 'Leaf health' },
+      availability: 'available',
+      media: null,
+      can: { download: true, preview: 'image', delete: false },
+      attachment_id: ATT,
+      ...over,
+    };
+  }
+
+  let objectUrls: string[] = [];
+  beforeEach(() => {
+    objectUrls = [];
+    // jsdom has no object URLs; the dialog mints one for the full picture.
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: (blob: Blob) => {
+        const url = `blob:mock/${blob.type}/${objectUrls.length}`;
+        objectUrls.push(url);
+        return url;
+      },
+    });
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: () => undefined });
+  });
+
+  it('shows its thumbnail lazily, opens the full picture, and downloads from the picture route', async () => {
+    const fake = new FakeFiles([picture(1)]);
+    fake.knowsPictures = true;
+    await renderPage(fake);
+    const row = rowFor('leaf-1.jpg');
+    expect(within(row).getByText('Picture')).toBeTruthy();
+    expect(within(row).getByText('Stored')).toBeTruthy();
+    const thumb = row.querySelector('img')!;
+    expect(thumb.getAttribute('src')).toBe(`/api/chat-media/conv-1/${ATT}?size=thumb`);
+    expect(thumb.getAttribute('loading')).toBe('lazy');
+    expect(thumb.getAttribute('decoding')).toBe('async');
+    // The thumbnail is decorative: the row's heading names the picture.
+    expect(thumb.getAttribute('alt')).toBe('');
+    // Rendering fetched nothing (the browser loads the <img> itself).
+    expect(fake.calls.some((c) => c.url.pathname.startsWith('/api/chat-media/'))).toBe(false);
+
+    const download = within(row).getByRole('link', { name: 'Download leaf-1.jpg' });
+    expect(download.getAttribute('href')).toBe(`/api/chat-media/conv-1/${ATT}?size=full`);
+    expect(download.hasAttribute('download')).toBe(true);
+
+    fireEvent.click(within(row).getByRole('button', { name: 'Preview leaf-1.jpg' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Preview of leaf-1.jpg' });
+    await waitFor(() => expect(dialog.querySelector('img')).not.toBeNull());
+    expect(dialog.querySelector('img')!.getAttribute('src')).toBe(objectUrls[0]);
+    const read = fake.calls.find((c) => c.url.pathname === `/api/chat-media/conv-1/${ATT}`);
+    expect(read!.url.searchParams.get('size')).toBe('full');
+  });
+
+  it('a picture the server no longer has says so, and its row turns into Removed', async () => {
+    const fake = new FakeFiles([picture(1)]);
+    fake.pictureStatus = 410;
+    await renderPage(fake);
+    fireEvent.click(within(rowFor('leaf-1.jpg')).getByRole('button', { name: 'Preview leaf-1.jpg' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Preview of leaf-1.jpg' });
+    await waitFor(() => expect(within(dialog).getByText(/no longer stored on the server/)).toBeTruthy());
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close preview' }));
+    await waitFor(() => expect(within(rowFor('leaf-1.jpg')).getByText('Removed')).toBeTruthy());
+    expect(within(rowFor('leaf-1.jpg')).queryByRole('link', { name: /^Download/ })).toBeNull();
+    expect(within(rowFor('leaf-1.jpg')).getByText('This picture is no longer stored.')).toBeTruthy();
+    // ...and it no longer asks for a thumbnail that is not there.
+    expect(rowFor('leaf-1.jpg').querySelector('img')).toBeNull();
+  });
+
+  it('offers a Pictures type only once the server counts pictures', async () => {
+    const old = new FakeFiles([upload(1)]);
+    await renderPage(old);
+    let group = screen.getByRole('group', { name: 'Type' });
+    await waitFor(() => expect(within(group).getByRole('radio', { name: /Documents.*1/ })).toBeTruthy());
+    expect(within(group).queryByRole('radio', { name: /Pictures/ })).toBeNull();
+    cleanup();
+
+    const now = new FakeFiles([upload(1), picture(2), picture(3)]);
+    now.knowsPictures = true;
+    await renderPage(now);
+    group = screen.getByRole('group', { name: 'Type' });
+    await waitFor(() => expect(within(group).getByRole('radio', { name: /Pictures.*2/ })).toBeTruthy());
+    fireEvent.click(within(group).getByRole('radio', { name: /Pictures/ }));
+    expect(nav.replace).toHaveBeenLastCalledWith('/files?kind=image', { scroll: false });
+    await waitFor(() => expect(items()).toHaveLength(2));
+    expect(now.listCalls().at(-1)!.searchParams.get('kind')).toBe('image');
+  });
+
+  it('a server that keeps pictures: the page lists them, and stops saying they stay in the browser', async () => {
+    const fake = new FakeFiles([]);
+    fake.retention = { ...RETENTION, pictures: 'kept_with_chat' };
+    await renderPage(fake);
+    expect(
+      screen.getByText(/Documents, pictures, spreadsheets, videos and audio files you attach to a chat appear here/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Pictures stay only in the browser you sent them from/)).toBeNull();
+    expect(screen.getByText(/Pictures stay while their chat exists\./)).toBeTruthy();
+  });
+});
+
+describe('a file swept while the page was open', () => {
+  it('shows the text the chat kept, under the expired line, instead of stopping at the sentence', async () => {
+    const fake = new FakeFiles([
+      upload(1, { name: 'Q3 report.pdf', can: { download: true, preview: 'text', delete: false }, text_name: 'Q3 report.pdf' }),
+    ]);
+    fake.fileStatus = 410;
+    await renderPage(fake);
+    fireEvent.click(within(rowFor('Q3 report.pdf')).getByRole('button', { name: 'Preview Q3 report.pdf' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Preview of Q3 report.pdf' });
+    await waitFor(() => expect(within(dialog).getByText('The text the chat read.')).toBeTruthy());
+    expect(within(dialog).getByText(/The file itself has expired and is no longer stored/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close preview' }));
+    await waitFor(() => expect(within(rowFor('Q3 report.pdf')).getByText('Text only')).toBeTruthy());
+  });
+});

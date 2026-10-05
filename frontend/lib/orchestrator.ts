@@ -35,8 +35,21 @@ export interface ChatRequestBody {
   deep_research?: boolean;
   /** 2026-08-06: Live Salesforce toggle — query the org, not the copy. */
   sf_live?: boolean;
-  /** 2026-08-05: all attached images (max 5); `image` stays the first one. */
+  /** 2026-08-05: all attached images (max MAX_IMAGES); `image` stays the first one. */
   images?: string[];
+  /**
+   * 2026-10-02 (chat media, docs/chat-media/CONTRACT.md §5): the attachment
+   * id of each inline image, index for index with `images` (or `[0]` with the
+   * single `image`). The orchestrator stores every photo it is sent under
+   * these, so the turn's `meta.images` resolves on any device.
+   */
+  image_ids?: string[];
+  /**
+   * 2026-10-02: photos the orchestrator ALREADY stores for this conversation,
+   * sent by attachment id instead of bytes (a regenerate, edit or retry on a
+   * device that never held them).
+   */
+  image_refs?: string[];
   /**
    * NEW-14: the turn being sent has an uploaded dataset (.csv/.xlsx/.zip/…).
    *
@@ -126,6 +139,10 @@ export interface OrchestratorChatRequest {
   sf_live?: boolean;
   /** 2026-08-05: all attached images; image_base64 remains the first. */
   images?: string[];
+  /** Chat media: the stored id of each inline image — see ChatRequestBody. */
+  image_ids?: string[];
+  /** Chat media: stored photos sent by reference — see ChatRequestBody. */
+  image_refs?: string[];
   /** Salesforce Intelligence Mode: answer to a pending clarifying question. */
   clarification?: Record<string, unknown>;
   /** The browser's send intent — see ChatRequestBody.intent_id. */
@@ -138,6 +155,51 @@ export interface OrchestratorChatRequest {
 
 /** An artifact id as the orchestrator issues them: 32 lowercase hex. */
 const ARTIFACT_ID_RE = /^[a-f0-9]{32}$/;
+
+/** A client-minted attachment id (docs/chat-media/CONTRACT.md §3). */
+const ATTACHMENT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+/**
+ * Photos per message, inline and referenced together. There is NO product
+ * limit (owner, 2026-10-03, docs/chat-media/LIMITS.md: "no limit, users can
+ * upload unlimited"; it was 5, then briefly 20). 999 is a technical ceiling,
+ * not a rule anyone is told about below it: vLLM's per-prompt image maximum,
+ * which the orchestrator's MAX_IMAGES (main.py) validates against too.
+ */
+export const MAX_IMAGES = 999;
+
+/**
+ * Documents, datasets, archives, videos and audio per message: no product
+ * limit either (2026-10-03, LIMITS.md). The same 999 technical ceiling bounds
+ * the composer's list and the orchestrator's `pdf_uploads` / `video_uploads`
+ * validation.
+ */
+export const MAX_DOCUMENTS = 999;
+
+/**
+ * The most base64 one /chat body may carry inline, 48 MiB (2026-10-03,
+ * docs/chat-media/LIMITS.md). Cloudflare refuses a request body over 100 MB,
+ * and a hundred shrunk photos weigh about that much as base64, more when the
+ * browser could not shrink them. Over this, the photos are stored first
+ * (POST /api/chat-media, in batches of at most this many file bytes) and the
+ * turn names them in `image_refs`; at or under it nothing changes and the
+ * bytes ride inline as before. The one inline document counts towards it,
+ * but only photos ever move.
+ */
+export const INLINE_IMAGE_BUDGET_BYTES = 48 * 1024 * 1024;
+
+/**
+ * A list of attachment ids as it may be forwarded: an array of 1..MAX_IMAGES
+ * well-formed ids, or null. All or nothing — dropping one bad id would shift
+ * every id after it onto the wrong photo, so a list with one is not sent.
+ */
+export function forwardableAttachmentIds(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_IMAGES) {
+    return null;
+  }
+  return value.every((id) => typeof id === 'string' && ATTACHMENT_ID_RE.test(id))
+    ? (value as string[])
+    : null;
+}
 
 /**
  * `answer_branch` as it may be forwarded: exactly `{self, parent?}`, both
@@ -236,13 +298,17 @@ export function toOrchestratorChatRequest(
   // see currentUserContent. `.trim()` lives in there so whitespace cannot
   // masquerade as a question and rob an attachment of its fallback.
   const text = currentUserContent(body);
-  // 2026-08-05: `images` (max 5) wins over the single `image` spelling.
+  // 2026-08-05: `images` (max MAX_IMAGES) wins over the single `image` spelling.
   const images = body.images?.length
     ? body.images
     : body.image
       ? [body.image]
       : [];
   const image = images[0] ?? null;
+  // Chat media: stored ids for the inline images (only when they pair with
+  // them exactly), and stored photos named instead of sent.
+  const imageIds = forwardableAttachmentIds(body.image_ids);
+  const imageRefs = forwardableAttachmentIds(body.image_refs);
   const pdf = body.pdf ?? null;
   const pdfUploads = body.pdf_uploads?.length ? body.pdf_uploads : null;
   const videoUploads = body.video_uploads?.length ? body.video_uploads : null;
@@ -251,7 +317,9 @@ export function toOrchestratorChatRequest(
   // inside this request outranks the one that only left a reference behind.
   const message =
     text ||
-    (image
+    // A photo sent by reference is still a photo: a wordless resend from
+    // another device asks the same thing its first send did.
+    (image || imageRefs
       ? IMAGE_ONLY_PROMPT
       : pdf || pdfUploads
         ? PDF_ONLY_PROMPT
@@ -278,6 +346,10 @@ export function toOrchestratorChatRequest(
     // Only sent when there genuinely are several — single-image requests
     // keep producing the exact v1 key set.
     ...(images.length > 1 ? { images } : {}),
+    // Chat media: only when present and well-formed, so every other request
+    // keeps its exact key set and a malformed id never reaches the 422.
+    ...(imageIds && imageIds.length === images.length ? { image_ids: imageIds } : {}),
+    ...(imageRefs ? { image_refs: imageRefs } : {}),
     // V2 §1 fields: include only when the client sent them so v1-shaped
     // requests keep producing the exact v1 key set.
     ...(body.conversation_id !== undefined

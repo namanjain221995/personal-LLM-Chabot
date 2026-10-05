@@ -183,6 +183,17 @@ class ComposeFileBindTests(unittest.TestCase):
         self.assertIn('WHISPER_BIND: "${WHISPER_BIND:?', text)
         self.assertNotIn("192.168.9.68}", text)
 
+    def test_the_voice_archive_store_refuses_to_start_without_an_explicit_bind_or_a_token(self) -> None:
+        # The worker's store (scripts/voice-store.sh): a required bind, a
+        # required token file, host networking with no port publish.
+        text = (REPO_ROOT / "compose" / "compose.voice-store.yaml").read_text(encoding="utf-8")
+        self.assertIn('VOICE_STORE_BIND: "${VOICE_STORE_BIND:?', text)
+        self.assertIn("required: true", text)
+        self.assertIn("network_mode: host", text)
+        self.assertNotIn("ports:", text)
+        server = (REPO_ROOT / "compose" / "voice-store" / "server.py").read_text(encoding="utf-8")
+        self.assertIn('if bind in ("0.0.0.0", "::", "[::]", "*"):', server)
+
     def test_the_env_example_warns_that_the_main_model_port_8000_is_unauthenticated_too(self) -> None:
         text = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
         paragraph = text[: text.index("#TECHSARA_MODEL_BIND_ADDRESS=127.0.0.1")]

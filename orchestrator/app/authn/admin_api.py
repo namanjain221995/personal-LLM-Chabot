@@ -1184,7 +1184,7 @@ async def download_member_upload(
 
     from fastapi.responses import FileResponse
 
-    from ..uploads import upload_root
+    from ..uploads import kept_original, upload_root
 
     await _inspectable_member(principal, user_id)
 
@@ -1206,7 +1206,14 @@ async def download_member_upload(
         os.path.basename(upload["filename"]),
     )
     if not os.path.isfile(path):
-        raise HTTPException(status_code=404, detail="The file has expired.")
+        # The member's own download's fallback (uploads.download_upload): the
+        # lasting copy, then a video's analysis store. Ownership was derived
+        # above from the upload row, and both stores are looked up by that
+        # row's (conversation, upload) pair.
+        stored = await kept_original(upload["conversation_id"], upload_id, upload.get("notes"))
+        if stored is None:
+            raise HTTPException(status_code=404, detail="The file has expired.")
+        path = str(stored)
     await db.run_in_thread(
         audit,
         principal,
@@ -1219,6 +1226,55 @@ async def download_member_upload(
     )
     media_type = mimetypes.guess_type(upload["filename"])[0] or "application/octet-stream"
     return FileResponse(path, filename=upload["filename"], media_type=media_type)
+
+
+@router.get("/members/{user_id}/chat-media/{conversation_id}/{attachment_id}")
+async def member_chat_media(
+    user_id: int,
+    conversation_id: str,
+    attachment_id: str,
+    request: Request,
+    size: str = Query("full", pattern="^(thumb|full)$"),
+    principal: Principal = Depends(require_capability(Cap.WORKSPACE_CONTENT_READ)),
+):
+    """A picture a member sent in a chat (V44, app/chat_media.py), for the
+    audited conversation viewer. Audited per picture, like the upload
+    download above.
+
+    Served INLINE, unlike that download, and on purpose: the upload rail keeps
+    whatever was sent (an SVG or an HTML file served inline would attack the
+    admin reading it), while this store holds only rasters verified by magic
+    bytes and a decode, served with nosniff and a sandbox CSP — the same
+    response as the member's own route. Ownership is the member's own rule
+    (chat_media.lookup): the row is theirs, and the chat is theirs or has no
+    row yet; anything else is 404, as is a member this admin may not inspect.
+    """
+    from .. import chat_media
+
+    await _inspectable_member(principal, user_id)
+    row = await db.run_in_thread(chat_media.lookup, user_id, conversation_id, attachment_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such picture.")
+    response = await chat_media.media_response(row, size, request.headers.get("if-none-match"))
+    # Audited when the picture was actually shown: its bytes, or the 304 that
+    # confirms the copy the admin's browser already holds. A 410 shows
+    # nothing, as the upload download's "expired" 404 shows nothing.
+    if response.status_code in (200, 304):
+        await db.run_in_thread(
+            audit,
+            principal,
+            request,
+            "admin_viewed_chat_media",
+            target_user_id=user_id,
+            resource_type="chat_media",
+            resource_id=row["media_id"],
+            meta={"conversation_id": conversation_id, "size": size},
+        )
+    # Never the member route's year-long immutable caching: a picture the
+    # admin's browser kept would be shown again with no request, so with no
+    # audit row. The recordings rail's rule (audio_api.py).
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 @router.get("/members/{user_id}/reports/{filename}")

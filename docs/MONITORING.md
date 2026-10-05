@@ -603,6 +603,7 @@ protocol at all:
 | `lancedb_web` | vector index over pages the search/crawler stored |
 | `parquet_landing` | the sync worker's landing zone |
 | `reports`, `workspaces`, `brain` | generated documents, clones, knowledge packs |
+| `video`, `voice` | video analyses; stored dictation (V42), which falls to transcripts plus the last day's recordings once the voice archive moves finished audio to the worker |
 
 `data-stores-exporter` walks the volume **read-only** and publishes
 `techsara_store_size_bytes`, `techsara_store_files`,
@@ -888,6 +889,42 @@ dashboard aggregates by label rather than by a hardcoded node list.
 
 ---
 
+## My files (orchestrator `/metrics`, 2026-09-30)
+
+| metric | labels | what it answers |
+|---|---|---|
+| `myfiles_list_seconds` | view = list / summary | time to answer one `/files/mine` or `/files/mine/summary` request |
+| `myfiles_list_total` | view, result = ok / bad_request / error | how often the page is used, and whether it fails |
+
+When the `view="list"` p95 passes 50 ms, add the `uploads.user_id` index
+described in [`MY-FILES.md`](MY-FILES.md#cost). Labels never carry a file
+name, a search or a user.
+
+---
+
+## Chat media (orchestrator `/metrics`, 2026-10-02)
+
+Pictures sent in a chat are stored under `CHAT_MEDIA_DIR` for the life of the
+chat (V44, [`chat-media/README.md`](chat-media/README.md)). All closed label
+sets (`metrics._LABELS_BY_METRIC`); no label carries a user, a chat, an
+attachment id or a file name.
+
+| metric | labels | what it answers |
+|---|---|---|
+| `chat_media_writes_total` | source = chat / upload / backfill, result = stored / duplicate / unsupported / too_large / no_space / error / unlinked | pictures written, and why some were not (`chat` is `/chat`'s background store, which never fails a turn; `unlinked` is a `/chat` picture with no ids and no send intent to name it by, so not stored) |
+| `chat_media_write_seconds` | source | verify + durable write of one picture |
+| `chat_media_reads_total` | size = thumb / full, result = ok / not_modified / not_found / missing | byte reads, the admin route included; `missing` is a 410, a row whose file is gone |
+| `chat_media_erase_total` | store = media / files, result = ok / error | bytes removed at once when a chat is deleted; an error is finished by the reaper |
+| `chat_media_reaped_total` | kind = row / dir | orphans the reaper removed (past `CHAT_MEDIA_ORPHAN_GRACE_H`) |
+| `chat_files_lasting_total` | purpose = document / dataset, result = stored / no_space / error | lasting copies of document and dataset originals under `CHAT_FILES_DIR` (CONTRACT §9) |
+
+Worth an alert: any `chat_media_reads_total{result="missing"}` (a file
+vanished under a live row); `chat_media_writes_total{result=~"no_space|error"}`
+rising; `chat_media_erase_total{result="error"}`. `/data/chat-media` is on the
+head's root NVMe and is not in `scripts/backup-knowledge.sh`.
+
+---
+
 ## Knowledge pipeline metrics (orchestrator `/metrics`, ADR-0001 D12)
 
 All emitted by the orchestrator's own registry (`app/metrics.py`); labels in
@@ -912,6 +949,33 @@ braces. Histograms use the registry's fixed buckets.
 Alerting suggestions: `rerank_canary_ok == 0` for 10 min; rate of
 `knowledge_degraded_total` > 5% of `chat_route_total`; `chat_ttft_seconds`
 p95 for route=chat, effort=fast above 3 s.
+
+## The voice archive (orchestrator `/metrics`, 2026-09-30)
+
+Stored recordings' audio moves to a store on the worker
+([`voice-archive.md`](voice-archive.md)). **There is no scrape job for the
+store**: the orchestrator's mover relays the store's `/health` as
+`voice_archive_store_*`, so Prometheus needs neither the worker's port nor its
+pinned certificate. The series exist only in a process that has run a pass
+(`VOICE_ARCHIVE_ENABLED` and the store configured); with the archive off the
+rules in `rules/voice-archive.yml` are inert.
+
+| metric | labels | what it answers |
+|---|---|---|
+| `voice_archive_backlog_sessions`, `voice_archive_backlog_bytes`, `voice_archive_overdue_sessions`, `voice_archive_overdue_oldest_seconds` | — | finished recordings still only on the head, and how late the oldest is |
+| `voice_archive_copied_sessions`, `voice_archive_archived_sessions`, `voice_archive_archived_bytes` | — | where the audio is |
+| `voice_archive_purge_pending`, `voice_archive_remote_missing` | — | deleted recordings still on the store (a privacy lag); archived recordings the store lost |
+| `voice_archive_store_up`, `voice_archive_store_free_bytes`, `voice_archive_store_min_free_bytes`, `voice_archive_store_objects`, `voice_archive_store_bytes`, `voice_archive_store_scrub_mismatches` | — | the store's own `/health` |
+| `voice_archive_errors_total` | reason (16 closed values) | why a copy or a store call failed |
+| `voice_archive_proxy_total` | result = ok / partial / not_satisfiable / bad_request / busy / unavailable / missing | playback of archived recordings |
+| `voice_archive_restored_total` | result = restored / held / unavailable / missing / mismatch / no_space / deleted | recordings brought back for a retranscription or a continuation |
+| `voice_archive_reconcile_total` | result = orphan_quarantined / orphan_waiting / other_owner / unowned / deleted_row_purged / repaired / remote_missing / foreign | the daily reconcile; it never deletes a recording because a row is missing (docs/voice-archive.md, "Who owns a recording") |
+| `voice_archive_copied_total`, `voice_archive_released_total`, `voice_archive_purged_total`, `voice_archive_last_pass_timestamp_seconds`, `voice_archive_enabled` | — | the mover's progress |
+
+Rules (no mail): `VoiceArchiveStoreDown`, `VoiceArchiveBacklogOverdue`,
+`VoiceArchiveCopiesMissing`, `VoiceArchivePurgeStuck`,
+`VoiceArchiveStoreLowSpace`, `VoiceArchiveScrubMismatch`,
+`VoiceArchivePassStalled`; promtool tests in `tests/voice_archive.yml`.
 
 ---
 

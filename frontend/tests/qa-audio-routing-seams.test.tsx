@@ -284,27 +284,27 @@ describe('audio in batches, at the caps and behind the gate', () => {
     for (const c of audioChips) expect(c.parentElement!.textContent).toContain('AUDIO');
   });
 
-  it('six audio files stop at the five-document cap, exactly like six videos', async () => {
+  it('21 audio files are all kept, exactly like 21 videos', async () => {
     // Compared with video rather than with the toast: at 4810da0
     // appendDocument decided `refused` inside a setState updater that React
     // ran after the check, so the toast never showed for ANY streamed kind.
-    // The repair round fixed that; audio-attachment.test.tsx ("the
-    // five-document cap says so") pins the toast. What audio must do here is
-    // what video does.
+    // The repair round fixed that; audio-attachment.test.tsx pins the
+    // ceiling's toast. What audio must do here is what video does. There is
+    // no cap since 2026-10-03 (LIMITS.md, was 5), so all 21 stay.
     const input = renderComposer();
-    const audio = Array.from({ length: 6 }, (_, i) => media(`part-${i}.mp3`, 'audio/mpeg'));
+    const audio = Array.from({ length: 21 }, (_, i) => media(`part-${i}.mp3`, 'audio/mpeg'));
     await act(async () => {
       fireEvent.change(input, { target: { files: audio } });
     });
     const audioCount = screen.getAllByLabelText(/Remove attachment part-/).length;
     cleanup();
     const input2 = renderComposer();
-    const video = Array.from({ length: 6 }, (_, i) => media(`clip-${i}.mp4`, 'video/mp4'));
+    const video = Array.from({ length: 21 }, (_, i) => media(`clip-${i}.mp4`, 'video/mp4'));
     await act(async () => {
       fireEvent.change(input2, { target: { files: video } });
     });
     const videoCount = screen.getAllByLabelText(/Remove attachment clip-/).length;
-    expect(audioCount).toBe(5);
+    expect(audioCount).toBe(21);
     expect(audioCount).toBe(videoCount);
   });
 

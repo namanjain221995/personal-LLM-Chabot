@@ -701,24 +701,23 @@ describe('CASE H2 — an inner handler that swallows the event', () => {
 });
 
 describe('CASE I — multiple file items', () => {
-  it('runs every file through the shared pipeline and keeps the limits', async () => {
-    // NEW10A-21
-    const six = Array.from({ length: 6 }, (_, i) => png(`p${i}.png`));
+  it('runs every file through the shared pipeline, with no count limit', async () => {
+    // NEW10A-21. No limit since 2026-10-03 (LIMITS.md, was 5): a drop of 25
+    // photos keeps all 25, and nothing is said about a number.
+    const many = Array.from({ length: 25 }, (_, i) => png(`p${i}.png`));
     renderApp();
 
     dropOn(
       dropZone(),
       makeDataTransfer({
         types: ['Files'],
-        files: six,
-        items: six.map((f) => ({ kind: 'file' as const, file: f })),
+        files: many,
+        items: many.map((f) => ({ kind: 'file' as const, file: f })),
       }),
     );
 
-    await waitFor(() => expect(chips().length).toBe(5));
-    expect(
-      screen.getByText(/You can attach up to 5 images — 1 file was left out\./),
-    ).toBeTruthy();
+    await waitFor(() => expect(chips().length).toBe(25));
+    expect(screen.queryByText(/left out|can carry|up to \d+/)).toBeNull();
   });
 
   it('accepts a formerly-unsupported dropped file onto the document rail', async () => {
@@ -758,8 +757,12 @@ describe('CASE I — multiple file items', () => {
       }),
     );
 
+    // jsdom cannot shrink a photo, so it is sent as it is and keeps the
+    // 10 MB rule, said in words that name why (2026-10-03, LIMITS.md).
     expect(
-      await screen.findByText(/huge\.png is 11\.0 MB — the limit is 10 MB\./),
+      await screen.findByText(
+        /huge\.png is 11\.0 MB and this browser couldn’t make it smaller\. A photo sent as it is can be at most 10 MB\./,
+      ),
     ).toBeTruthy();
   });
 });
@@ -899,7 +902,8 @@ describe('the shared pipeline and application state', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
 
     await waitFor(() => expect(stored.length).toBeGreaterThan(0));
-    expect(attachmentFile(stored[0].id, 0)?.name).toBe('drop.png');
+    // A photo is held in the photos' own index space (RC-3a, 2026-10-02).
+    expect(attachmentFile(stored[0].id, 0, 'image')?.name).toBe('drop.png');
   });
 
   it('is the only drop region, and never the sidebar', () => {

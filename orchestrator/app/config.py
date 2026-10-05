@@ -484,6 +484,38 @@ class Settings:
         # after an outage.
         self.voice_session_create_per_min: int = max(1, _int("VOICE_SESSION_CREATE_PER_MIN", 10))
         self.voice_part_per_min: int = max(1, _int("VOICE_PART_PER_MIN", 120))
+        # -- The voice archive (2026-09-30, app/voice_archive.py) -----------
+        # FINISHED recordings' source files move to a store on the worker's
+        # disk (compose/voice-store, scripts/voice-store.sh); recording,
+        # transcripts and the list stay here. The store's address and pinned
+        # certificate come from scripts/voice-store.sh (.env); its token from
+        # .runtime/secrets.env through env_file, never `environment:`.
+        # URL and token alone let this process READ the archive (playback,
+        # restore, deletes); VOICE_ARCHIVE_ENABLED also starts the mover.
+        self.voice_archive_enabled: bool = _bool("VOICE_ARCHIVE_ENABLED", False)
+        self.voice_archive_url: str = os.environ.get("VOICE_ARCHIVE_URL", "").strip()
+        self.voice_archive_token: str = os.environ.get("VOICE_ARCHIVE_TOKEN", "").strip()
+        # The store's self-signed certificate (PEM, base64), pinned: an
+        # https:// URL is refused without it.
+        self.voice_archive_tls_cert_b64: str = os.environ.get("VOICE_ARCHIVE_TLS_CERT_B64", "").strip()
+        # How long a finished recording stays on the head before it moves
+        # (0 = at the next pass). A day keeps a just-finished dictation's
+        # "Try again" and playback local.
+        self.voice_archive_after_s: float = max(0.0, _float("VOICE_ARCHIVE_AFTER_S", 86400.0))
+        self.voice_archive_interval_s: float = max(5.0, _float("VOICE_ARCHIVE_INTERVAL_S", 60.0))
+        self.voice_archive_batch: int = max(1, _int("VOICE_ARCHIVE_BATCH", 20))
+        # Copy and read-back pace. 20 MiB/s is 17% of the 1 GbE management
+        # LAN the whisper hop and the tunnel share: ping went 0.275 -> 0.413 ms
+        # average at it, 0.968 ms uncapped (measured 2026-09-30).
+        self.voice_archive_rate_bytes_per_s: int = max(
+            1024 * 1024, _int("VOICE_ARCHIVE_RATE_BYTES_PER_S", 20 * 1024 * 1024)
+        )
+        # A recording brought back for a retranscription (or a continuation)
+        # stays on the head at least this long before it may move again.
+        self.voice_archive_hold_s: float = max(60.0, _float("VOICE_ARCHIVE_HOLD_S", 6 * 3600.0))
+        # A continuation whose earlier recording is archived waits this long
+        # for the archive to answer before it decodes alone.
+        self.voice_archive_restore_wait_s: float = max(0.0, _float("VOICE_ARCHIVE_RESTORE_WAIT_S", 86400.0))
 
         # -- Video understanding (2026-09-09) ----------------------------------
         #
@@ -506,7 +538,12 @@ class Settings:
         # alone is an hour of speech-engine time on a GPU the chat model
         # shares.
         self.video_max_duration_s: int = _int("VIDEO_MAX_DURATION_S", 4 * 3600)
-        self.video_max_upload_mb: int = _int("VIDEO_MAX_UPLOAD_MB", 4096)
+        # A video or audio file may be as large as any upload: unset, this
+        # FOLLOWS UPLOAD_MAX_MB (no app limit since 2026-10-03,
+        # docs/chat-media/LIMITS.md; 4096 before). VIDEO_MAX_DURATION_S is
+        # the analysis window, not a refusal: a longer file is kept whole and
+        # its first window is analysed (video/pipeline.py).
+        self.video_max_upload_mb: int = _int("VIDEO_MAX_UPLOAD_MB", _int("UPLOAD_MAX_MB", 200))
         # ONE JOB AT A TIME. A saturated speech engine on either node takes
         # the chat model from 71 to 24 tok/s (measured 2026-09-08); two
         # videos at once would double that. Raise only on a deployment where
@@ -1653,6 +1690,34 @@ class Settings:
         self.workspace_ttl_hours: int = _int("WORKSPACE_TTL_HOURS", 24)
         self.workspace_quota_gb: int = _int("WORKSPACE_QUOTA_GB", 20)
         self.repo_final_chunks: int = _int("REPO_FINAL_CHUNKS", 12)
+
+        # --- Chat media (V44, 2026-10-02; docs/chat-media/CONTRACT.md) ---
+        # Every upload is kept for the life of its chat and shows on every
+        # device (owner, 2026-10-02). Pictures sent in a chat live under
+        # CHAT_MEDIA_DIR/<user>/<conversation>/<media_id>/ (app/chat_media.py);
+        # the lasting copy of a document or dataset original lives under
+        # CHAT_FILES_DIR/<conversation>/<upload_id>/ (app/uploads.py). Both on
+        # the /data volume beside /data/video and deliberately NOT under
+        # WORKSPACE_DIR: its 24 h sweep and 20 GB quota would delete them, and
+        # exempting them there would let them evict everything else early.
+        self.chat_media_dir: str = os.environ.get("CHAT_MEDIA_DIR", "/data/chat-media")
+        self.chat_files_dir: str = os.environ.get("CHAT_FILES_DIR", "/data/chat-files")
+        # New bytes are refused (507 on the upload route; skipped and counted
+        # on /chat, which never fails for it) when the filesystem holding them
+        # has less than this free. 250 GiB is the project's floor for the
+        # head's root NVMe (VOICE_MIN_FREE_BYTES, PUBLIC_API_FILES_MIN_FREE_GIB):
+        # the OS, /var/lib/docker and production Postgres share it. There is no
+        # per-person quota beyond this (owner default, 2026-10-02).
+        self.chat_media_min_free_gib: float = max(0.0, _float("CHAT_MEDIA_MIN_FREE_GIB", 250.0))
+        # The reaper (directories and rows whose chat or account is gone) runs
+        # at most this often per process. Hourly: a deleted chat's bytes are
+        # removed at once by the delete route; this is the backstop.
+        self.chat_media_reap_interval_s: float = max(60.0, _float("CHAT_MEDIA_REAP_INTERVAL_S", 3600.0))
+        # How old an orphan must be before the reaper removes it. /chat stores
+        # a picture BEFORE the browser's first history push creates the chat's
+        # row, so a picture with no chat row is normal for the first moments
+        # of a new chat; a day is far past any push.
+        self.chat_media_orphan_grace_h: float = max(1.0, _float("CHAT_MEDIA_ORPHAN_GRACE_H", 24.0))
 
         # --- Charts (§8) ---
         # explicit — a chart appears only when the user asked for one, in

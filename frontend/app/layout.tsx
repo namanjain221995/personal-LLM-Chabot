@@ -12,6 +12,8 @@ import '@fontsource/jetbrains-mono/500.css';
 
 import './globals.css';
 import { Providers } from '@/components/Providers';
+import { BUILD_META_NAME } from '@/lib/buildCheck';
+import { serverBuildId } from '@/lib/buildId';
 
 const APP_NAME = process.env.NEXT_PUBLIC_APP_NAME ?? 'TechSara AI';
 
@@ -44,10 +46,15 @@ const themeInit = `(function(){var t='dark';try{var s=localStorage.getItem('tech
  */
 export default async function RootLayout({ children }: { children: ReactNode }) {
   const nonce = (await headers()).get('x-nonce') ?? undefined;
+  // The build that served this page (STORE-ALWAYS §3): the chat page
+  // compares it with GET /api/version and reloads after a deploy. Rendered
+  // per request like everything here, so it is always the serving build.
+  const build = serverBuildId();
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
         <script nonce={nonce} dangerouslySetInnerHTML={{ __html: themeInit }} />
+        {build ? <meta name={BUILD_META_NAME} content={build} /> : null}
       </head>
       <body>
         <Providers>{children}</Providers>

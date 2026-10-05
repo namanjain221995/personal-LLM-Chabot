@@ -2992,6 +2992,152 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_voice_sessions_one_continuation
 """
 
 
+# V43 WAS EDITED IN PLACE before release: the fix round of 2026-09-30 added
+# voice_archive_owner and changed idx_voice_sessions_archive_purge's
+# predicate after a draft of V43 had run on a few TEST databases, and the
+# dropped meeting-transcripts branches (feat/realtime-voice-r2) numbered a
+# different migration 43. No production database ran either (production was
+# at V42 on 2026-10-01), and the runner keeps no checksum, so a database that
+# did says "V43" and lacks the owner table. `_refuse_another_v43` stops
+# start-up on one and says what to do (docs/voice-archive.md, "A database
+# that ran another V43").
+_MIGRATION_V43 = """
+-- V43 (2026-09-30): THE VOICE ARCHIVE -- where a finished recording's audio
+-- lives (app/voice_archive.py). Additive and idempotent: columns with
+-- constant defaults (metadata only, PostgreSQL 11+), one CHECK, three
+-- partial indexes, one one-row table, no backfill. Every existing row is
+-- 'local', which is true.
+--
+-- WHY. /data/voice is on the head's root NVMe with the OS, /var/lib/docker
+-- and production Postgres, one copy (owner, 2026-09-30: "improve the storage
+-- of that audio" -> "Move to worker's big disk"). source.<ext> is 99.3% of a
+-- recording's bytes, so only that file moves, to the store on the worker
+-- (compose/voice-store), and only once the recording is finished. The small
+-- files (transcript, parts, plan, results) stay here, so the list, previews
+-- and transcripts never wait for the worker.
+--
+-- archive_state:
+--   local     only the head has the audio (every recording until it moves);
+--   copied    the store holds a copy verified by reading it back, AND the
+--             head file still exists (just copied, held, or brought back);
+--   archived  the store holds the only copy; head_released_at says when the
+--             head file went. A restore takes it back to 'copied'.
+-- head_hold_until keeps a copied recording on the head (a retranscription or
+-- a continuation brought it back). archive_attempts/archive_next_at/
+-- archive_error are the mover's backoff; archive_error is a reason code,
+-- never a message. remote_purged_at: the store's copy of a DELETED recording
+-- is gone too (audio_deleted_at alone says only that the head's is).
+--
+-- LOCKING, as V36: lock_timeout 3 s for this transaction, and init_schema
+-- retries lock_not_available instead of hanging behind a parked session.
+SET LOCAL lock_timeout = '3s';
+ALTER TABLE voice_sessions
+    ADD COLUMN IF NOT EXISTS archive_state    text        NOT NULL DEFAULT 'local',
+    ADD COLUMN IF NOT EXISTS archived_at      timestamptz,
+    ADD COLUMN IF NOT EXISTS head_released_at timestamptz,
+    ADD COLUMN IF NOT EXISTS head_hold_until  timestamptz,
+    ADD COLUMN IF NOT EXISTS archive_attempts integer     NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS archive_next_at  timestamptz,
+    ADD COLUMN IF NOT EXISTS archive_error    text,
+    ADD COLUMN IF NOT EXISTS remote_purged_at timestamptz;
+ALTER TABLE voice_sessions DROP CONSTRAINT IF EXISTS voice_sessions_archive_state;
+ALTER TABLE voice_sessions ADD CONSTRAINT voice_sessions_archive_state
+    CHECK (archive_state IN ('local', 'copied', 'archived'));
+
+-- The mover's claim: finished recordings whose audio is still only here.
+CREATE INDEX IF NOT EXISTS idx_voice_sessions_archive_due
+    ON voice_sessions (finished_at)
+    WHERE archive_state = 'local' AND audio_deleted_at IS NULL AND status IN ('done', 'failed');
+-- Copies whose head file has not been released yet.
+CREATE INDEX IF NOT EXISTS idx_voice_sessions_archive_copied
+    ON voice_sessions (head_hold_until) WHERE archive_state = 'copied';
+-- Deleted recordings whose store copy is not known to be gone. Keyed on the
+-- DELETE, not on archive_state: a verified copy can sit behind a 'local' row
+-- (deleted or retranscribed while it was copied, or a mover killed between
+-- its upload and its UPDATE), and the store's DELETE is idempotent.
+CREATE INDEX IF NOT EXISTS idx_voice_sessions_archive_purge
+    ON voice_sessions (audio_deleted_at)
+    WHERE audio_deleted_at IS NOT NULL AND remote_purged_at IS NULL;
+
+-- WHICH DEPLOYMENT THIS IS, to the store (fix round 2026-09-30). Every object
+-- the store keeps is tagged with the owner below (X-Archive-Owner), and the
+-- store deletes or sets aside an object for its owner only. The owner lives
+-- in THIS DATABASE, made once by app/voice_archive.py (32 random hex
+-- characters), so any other orchestrator -- an e2e stack, a candidate, a
+-- developer's -- is another owner even when it is given this deployment's
+-- store URL, token and certificate: the reconcile of a database that lacks
+-- this deployment's rows can no longer touch this deployment's recordings.
+-- One row, never changed: a new owner would make every stored recording
+-- another deployment's (nothing lost, but none of them deletable).
+CREATE TABLE IF NOT EXISTS voice_archive_owner (
+    id         smallint    PRIMARY KEY CONSTRAINT voice_archive_owner_singleton CHECK (id = 1),
+    owner      text        NOT NULL CONSTRAINT voice_archive_owner_hex CHECK (owner ~ '^[0-9a-f]{32}$'),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+"""
+
+
+_MIGRATION_V44 = """
+-- V44 (2026-10-02): CHAT MEDIA -- every picture sent in a chat, kept for the
+-- life of the chat (app/chat_media.py, docs/chat-media/CONTRACT.md).
+-- Additive and idempotent: one new table and one index, no backfill.
+--
+-- WHY. A photo sent from a phone showed on the phone and nowhere else: the
+-- only lasting copy was the sending browser's IndexedDB. The bytes reached
+-- this server inline in the /chat body, the request snapshot strips them, and
+-- the V41 row above keeps the latest picture for two hours for the MODEL's
+-- follow-ups, never for display. Production chat 4ab7ac45 had a vision answer
+-- and 0 uploads rows, 0 conversation_images rows, 0 bytes anywhere.
+--
+-- WHAT LIVES WHERE. The bytes are FILES under CHAT_MEDIA_DIR/<user_id>/
+-- <conversation_id>/<media_id>/ (full.<ext> and, for a large picture,
+-- thumb.webp), outside WORKSPACE_DIR so the 24 h sweep and the 20 GB quota
+-- never touch them. This row is the index: who owns the picture, which chat
+-- and which composer attachment it is, and what the bytes are. Not bytea: a
+-- 10 MiB photo in a row is a 10 MiB tuple every list read drags through
+-- shared buffers.
+--
+-- ATTACHMENT_ID IS THE CLIENT'S NAME FOR IT. The composer mints one when a
+-- picture is chosen and writes it into the user message's `meta.images`, so a
+-- second device finds the bytes from the message alone. The server never
+-- writes that reference itself: the history PUT replaces meta whole, last
+-- writer wins, and a reference the server added would be erased by the next
+-- push. UNIQUE (user_id, conversation_id, attachment_id) makes every store
+-- idempotent: a retried send or a second backfilling tab finds the row the
+-- first one wrote, and the FIRST write wins, so a media URL never changes
+-- content (which is what makes `immutable` caching safe). media_id is
+-- server-minted (uuid4().hex) and names the directory; nothing a client sends
+-- ever becomes a path.
+--
+-- SCOPE. Every read carries the viewer, as V41 does: `chat`'s conversation key
+-- is whatever the client sent, so the conversation id alone is not an
+-- identity. The users FK cascades, so a deleted ACCOUNT takes its rows with
+-- it (the reaper then removes the directories). `_SIDE_TABLES` clears the rows
+-- of a deleted CHAT; that loop matches on the conversation id alone, so a
+-- colliding client-chosen id can drop a different account's rows early --
+-- only an account that stored pictures under an id nobody owned yet, which the
+-- deleter then claimed. Early, never disclosed.
+CREATE TABLE IF NOT EXISTS chat_media (
+    media_id        text        PRIMARY KEY,
+    user_id         integer     NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    conversation_id text        NOT NULL,
+    attachment_id   text        NOT NULL,
+    sha256          text        NOT NULL,
+    mime            text        NOT NULL,
+    bytes           bigint      NOT NULL,
+    width           integer,
+    height          integer,
+    has_thumb       boolean     NOT NULL DEFAULT false,
+    source          text        NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT chat_media_owner_attachment UNIQUE (user_id, conversation_id, attachment_id),
+    CONSTRAINT chat_media_source CHECK (source IN ('chat','upload','backfill'))
+);
+-- Chat deletion (_SIDE_TABLES) and the follow-up fallback's existence check.
+CREATE INDEX IF NOT EXISTS chat_media_conversation ON chat_media (conversation_id);
+"""
+
+
 _MIGRATIONS: tuple = (
     (1, _MIGRATION_V1),
     (2, _MIGRATION_V2),
@@ -3035,6 +3181,8 @@ _MIGRATIONS: tuple = (
     (40, _MIGRATION_V40),
     (41, _MIGRATION_V41),
     (42, _MIGRATION_V42),
+    (43, _MIGRATION_V43),
+    (44, _MIGRATION_V44),
 )
 
 #: The version `init_schema` brings a database up to. Exported so callers (and
@@ -3524,6 +3672,49 @@ def _apply_migrations() -> None:
                 con.execute(
                     "INSERT INTO schema_migrations (version) VALUES (%s)", (version,)
                 )
+            if 43 in applied:
+                _refuse_another_v43(con)
+
+
+#: Start-up's answer to a database whose V43 is not this one (the note above
+#: _MIGRATION_V43), and the SQL it names: with V43 no longer recorded, the
+#: next start-up runs this V43 in full (it is idempotent), and the purge
+#: index, dropped first, comes back with the released predicate.
+V43_REPAIR = (
+    "DROP INDEX IF EXISTS idx_voice_sessions_archive_purge; DELETE FROM schema_migrations WHERE version = 43;"
+)
+V43_MISMATCH_ERROR = (
+    "This database records migration V43 but has no voice_archive_owner table, so its V43 is not "
+    "the one this code carries: {which} The migration runner keeps no checksum, so it cannot see "
+    "that. No production database ran such a V43 (production was at V42 on 2026-10-01). The "
+    "orchestrator does not start on this database, because what needs this V43's table or columns "
+    "would fail. If it is a test database, drop it and let it be created again. To keep it, run the following "
+    f"in it and start again; this code's V43 then runs in full: {V43_REPAIR} "
+    "See docs/voice-archive.md, \"A database that ran another V43\"."
+)
+_V43_DRAFT = (
+    "it ran a draft of the voice archive's V43 (branch feat/voice-archive before 2026-10-01; V43 was "
+    "edited in place before release)."
+)
+_V43_OTHER_BRANCH = (
+    "voice_sessions has no archive_state column, so it ran another branch's migration numbered 43 "
+    "(the meeting-transcripts branches, feat/realtime-voice-r2, used 43 too)."
+)
+
+
+def _refuse_another_v43(con: Any) -> None:
+    """Raise V43_MISMATCH_ERROR when V43 was applied BEFORE this start-up and
+    this V43's owner table is missing (a database that runs V43 now runs all
+    of it)."""
+    row = con.execute(
+        """SELECT to_regclass('voice_archive_owner') IS NOT NULL AS owner_table,
+                  EXISTS (SELECT 1 FROM information_schema.columns
+                          WHERE table_schema = current_schema() AND table_name = 'voice_sessions'
+                            AND column_name = 'archive_state') AS archive_columns"""
+    ).fetchone()
+    if not row["owner_table"]:
+        which = _V43_DRAFT if row["archive_columns"] else _V43_OTHER_BRANCH
+        raise RuntimeError(V43_MISMATCH_ERROR.format(which=which))
 
 
 def schema_version() -> int:
@@ -3817,6 +4008,10 @@ _SIDE_TABLES = (
     # never anyone's picture disclosed, and early is the safe direction for a
     # cache — image_memory.forget stays the scoped delete.
     "conversation_images",
+    # V44: the pictures sent in this conversation. Rows only: the bytes are
+    # files, removed after this transaction by history.py (best effort) and
+    # by chat_media's reaper (the backstop), never inside a transaction.
+    "chat_media",
     # V31 artifacts, artifact_versions and artifact_jobs are DELIBERATELY
     # absent, for the reason report_files is: they are the person's
     # deliverables, addressed by id from GET /artifacts without their

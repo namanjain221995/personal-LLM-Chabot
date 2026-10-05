@@ -82,7 +82,13 @@ transformers>=4.51
 weasyprint==70.0
 pypdfium2>=4.30
 pillow>=12.3.0
-trafilatura>=1.12
+# Pinned 2026-10-02: trafilatura 2.3.0 and htmldate 1.11.0 were published that day,
+# and unpinned installs picked them up in CI. They reorder extracted text (tables,
+# the augmentation pass), which moved 19 retrieval and extraction goldens. These
+# are the versions the production image runs. Move both pins deliberately, together
+# with the extraction and retrieval golden suites.
+trafilatura==2.2.0
+htmldate==1.10.0
 # Video understanding (2026-09-09). Voice-activity detection cuts a recording
 # into transcription windows at pauses. `webrtcvad-wheels` is the maintained
 # build of Google's detector WITH manylinux wheels for aarch64 and cp311/cp312

@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
+from . import chat_media as _chat_media
 from . import context, db, llm
 from .auth import UserRow, require_user, router as auth_router
 from .audio_api import router as audio_router
@@ -175,6 +176,13 @@ async def lifespan(_app: FastAPI):
     sweep_task = asyncio.get_running_loop().create_task(
         _upload_session_sweep_loop(), name="upload-session-sweep"
     )
+    # Chat media (V44, app/chat_media.py): rows and directories whose chat or
+    # account is gone, past CHAT_MEDIA_ORPHAN_GRACE_H, at most once per
+    # CHAT_MEDIA_REAP_INTERVAL_S. A deleted chat's bytes go at once from the
+    # delete route; this is the backstop for the ones that did not.
+    chat_media_reap_task = asyncio.get_running_loop().create_task(
+        _chat_media.reap_loop(), name="chat-media-reap"
+    )
     # Video understanding (2026-09-09): requeue analyses a restart cut off
     # and drain the queue behind the app. Their stage files are on disk, so
     # a resume costs only the stage that was interrupted. Since V29 the
@@ -221,6 +229,14 @@ async def lifespan(_app: FastAPI):
         from . import dictation as _dictation
 
         _dictation.RUNNER.ensure_maintenance()
+    # The voice archive (app/voice_archive.py, 2026-09-30): finished
+    # recordings' audio moves to the store on the worker's disk. Its own
+    # thread and loop; off unless VOICE_ARCHIVE_ENABLED and the store's URL
+    # and token are set. Independent of ASR: recordings already stored keep
+    # moving (and stay playable) whether or not dictation is on.
+    from . import voice_archive as _voice_archive
+
+    _voice_archive.start()
     # The developer platform (CONTRACT-3). Two pieces of wiring, both here
     # because both need the pool open and the schema applied.
     _configure_api_key_pepper()
@@ -299,6 +315,7 @@ async def lifespan(_app: FastAPI):
                 interrupted_requests,
             )
         sweep_task.cancel()
+        chat_media_reap_task.cancel()
         api_prune_task.cancel()
         # Before the pool closes: a job releases its blob (and an assembly its
         # lease) to `queued` on the way out, so the next process resumes at
@@ -311,6 +328,10 @@ async def lifespan(_app: FastAPI):
         from . import dictation as _dictation_stop
 
         _dictation_stop.RUNNER.stop_maintenance()
+        # Before the pool closes, like the voice maintenance above; and the
+        # request loop's pooled client to the archive store with it.
+        _voice_archive.stop()
+        await _voice_archive.close_client()
         await web_worker.stop()
         await continuity.stop()
         await engine_state.stop()
@@ -771,8 +792,9 @@ _DEFAULT_MAX_BODY_BYTES = _MIB
 
 #: POST /chat, for a signed-in caller: 128 MiB.
 #:
-#: /chat carries its attachments INLINE as base64 — images (`images`, up to
-#: MAX_IMAGES), a small PDF (`pdf`) — which is why
+#: /chat carries its attachments INLINE as base64 — images (`images`, at most
+#: `chat_media.BATCH_BUDGET_BYTES` of them inline; more go by `image_refs`), a
+#: small PDF (`pdf`) — which is why
 #: `frontend/app/api/chat/route.ts` sets MAX_CHAT_BODY_BYTES to exactly this
 #: number. Base64 costs a third on top of the bytes, so 128 MiB of body is
 #: ~96 MiB of attachment; anything larger already streams to `/uploads` and
@@ -795,6 +817,16 @@ _MULTIPART_FRAMING_BYTES = _MIB
 
 _HISTORY_MESSAGES_PATH_RE = _re.compile(r"^/history/conversations/[^/]+/messages$")
 _CHUNKED_PART_PATH_RE = _re.compile(r"^/uploads/chunked/[^/]+/[^/]+/part/[^/]+$")
+
+#: POST /chat-media/{conversation}, for a signed-in caller: 64 MiB (V44,
+#: docs/chat-media/CONTRACT.md §4.1). Since 2026-10-03 there is no count
+#: limit (`chat_media.MAX_FILES` is the 999 ceiling): the browser batches a
+#: turn's pictures so each POST holds at most `chat_media.BATCH_BUDGET_BYTES`
+#: (48 MiB) of picture bytes (docs/chat-media/LIMITS.md); that plus the
+#: multipart framing of 999 parts and their ids fits here, and is what bounds
+#: the request. The Next proxy caps the same route at the same number.
+_CHAT_MEDIA_MAX_BODY_BYTES = 64 * _MIB
+_CHAT_MEDIA_UPLOAD_PATH_RE = _re.compile(r"^/chat-media/[^/]+$")
 
 
 class BodyCap:
@@ -945,6 +977,8 @@ def body_cap_for(method: str, path: str) -> BodyCap:
         return BodyCap("audio", default, _audio_max_body_bytes())
     if method == "POST" and path == "/uploads":
         return BodyCap("upload", default, _single_shot_upload_max_body_bytes())
+    if method == "POST" and _CHAT_MEDIA_UPLOAD_PATH_RE.match(path):
+        return BodyCap("chat-media", default, _CHAT_MEDIA_MAX_BODY_BYTES)
     if method == "PUT" and _CHUNKED_PART_PATH_RE.match(path):
         return BodyCap("upload-part", default, _chunked_part_max_body_bytes())
     if method == "PUT" and _CONSOLE_FILE_PART_PATH_RE.match(path):
@@ -1641,6 +1675,13 @@ app.include_router(auth_router)
 app.include_router(history_router)
 
 app.include_router(uploads_router)
+# My files (2026-09-30): the caller's own uploads across every chat, read-only.
+from .myfiles import router as myfiles_router  # noqa: E402
+
+app.include_router(myfiles_router)
+# Chat media (V44, 2026-10-02): every picture sent in a chat, stored for the
+# life of the chat and readable on any device (app/chat_media.py).
+app.include_router(_chat_media.router)
 # Speech to text for the composer. Its own router because it is the only
 # route that takes audio, and the only one gated on Feature.VOICE_INPUT.
 app.include_router(audio_router)
@@ -2582,10 +2623,18 @@ class ChatMessage(BaseModel):
     content: str = ""
 
 
-# Composer multi-upload cap (2026-08-05): base64 images ride in the JSON chat
-# body, so five 10 MB uploads ≈ 67 MB of payload — a deliberate ceiling, not
-# an arbitrary one.
-MAX_IMAGES = 5
+# Pictures per message, inline and `image_refs` together. 5 since the
+# composer's multi-upload (2026-08-05), 20 for a few hours, and since
+# 2026-10-03 NO limit in the app (the owner's decision,
+# docs/chat-media/LIMITS.md): 999 is only the technical ceiling a request is
+# validated against, vLLM's per-prompt image maximum, and no message mentions
+# it below that. The body does not bound it: the browser sends a turn's
+# pictures inline only while they fit a 48 MiB budget and otherwise uploads
+# them to /chat-media first and sends `image_refs`. What the MODEL reads is
+# fitted to its window by engines/vision.py (`fit_images`): smaller before
+# fewer, and the answer says when not every picture was read.
+# chat_media.MAX_FILES is the per-upload twin.
+MAX_IMAGES = 999
 
 
 class ChatRequest(BaseModel):
@@ -2608,6 +2657,19 @@ class ChatRequest(BaseModel):
     # 2026-08-05: up to MAX_IMAGES images in one turn (composer multi-upload).
     # `image`/`image_base64` remain the single-image back-compat spelling.
     images: Optional[List[str]] = Field(default=None, fail_fast=True)
+    # V44 chat media (2026-10-02, docs/chat-media/CONTRACT.md §5). The
+    # composer's attachment ids of the inline images, index i <-> images[i]
+    # (or [0] <-> the single spelling): the server stores every inline picture
+    # under its id behind the turn (app/chat_media.py), so the chat shows it on
+    # any device. Absent, or a count that does not match: the server names the
+    # pictures from `intent_id` (`ix-<intent>-<index>`), or stores nothing
+    # without one. Never a 4xx.
+    image_ids: Optional[List[str]] = Field(default=None, fail_fast=True)
+    # Ids of pictures ALREADY stored for this viewer and chat, sent INSTEAD of
+    # bytes: a regenerate, edit or retry on a device that never held them. The
+    # server loads them before routing and treats them exactly as inline
+    # images; one it cannot load is a 422 image_ref_missing before the stream.
+    image_refs: Optional[List[str]] = Field(default=None, fail_fast=True)
     # --- V2 optional fields (defaults preserve v1 behavior) ---
     conversation_id: Optional[str] = None
     mode: Literal["salesforce", "assistant"] = "salesforce"
@@ -2629,8 +2691,9 @@ class ChatRequest(BaseModel):
     pdf_filename: Optional[str] = None
     # 2026-09-02: LARGE documents stream to /uploads (purpose=document) first
     # and the chat request carries REFERENCES — 512 MB of base64 through a
-    # JSON body would kill the browser tab and both servers. Up to five per
-    # message: [{"upload_id": "<32 hex>", "name": "contract.pdf"}, ...].
+    # JSON body would kill the browser tab and both servers. Up to
+    # `_MAX_DOC_REFS` (the 999 ceiling; no limit in the app) per message:
+    # [{"upload_id": "<32 hex>", "name": "contract.pdf"}, ...].
     # Small documents may still ride inline in `pdf` exactly as before.
     pdf_uploads: Optional[List[dict]] = Field(default=None, fail_fast=True)
     # 2026-09-09: videos ALWAYS stream to /uploads (purpose=video) first —
@@ -2684,6 +2747,21 @@ class ChatRequest(BaseModel):
     def _valid_intent_id(cls, value: Optional[str]) -> Optional[str]:
         if value is not None and not _INTENT_ID_RE.fullmatch(value):
             raise ValueError("intent_id must be 1-64 characters of [A-Za-z0-9_-]")
+        return value
+
+    @field_validator("image_ids", "image_refs")
+    @classmethod
+    def _valid_attachment_ids(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        # The composer's attachment ids name rows, never paths, but they are
+        # still client input: the stored shape, and no more of them than a
+        # turn may carry pictures.
+        if value is None:
+            return None
+        if len(value) > MAX_IMAGES:
+            raise ValueError(f"at most {MAX_IMAGES} image ids per message")
+        for item in value:
+            if not _chat_media.ATTACHMENT_ID_RE.fullmatch(item or ""):
+                raise ValueError("image ids must be 8-64 characters of [A-Za-z0-9_-]")
         return value
 
     @field_validator("answer_branch")
@@ -2767,11 +2845,14 @@ class ChatRequest(BaseModel):
 
     @model_validator(mode="after")
     def _require_input(self) -> "ChatRequest":
-        if len(self.images_data) > MAX_IMAGES:
+        # Stored pictures sent by reference count against the same ceiling as
+        # inline ones: they become inline images before routing (V44).
+        if len(self.images_data) + len(self.image_refs or []) > MAX_IMAGES:
             raise ValueError(f"at most {MAX_IMAGES} images per message")
         if (
             not self.text
             and not self.image_data
+            and not self.image_refs
             and not self.pdf_data
             and not self.video_uploads
             # Answering a clarification by clicking "Skip" carries no text of
@@ -2785,10 +2866,13 @@ class ChatRequest(BaseModel):
 
 
 
-#: How a message may reference streamed documents: at most five. One of them
-#: may be an ARCHIVE, whose members then count against the engine's own,
-#: larger cap — five zips of twelve files each is a report, not a question.
-_MAX_DOC_REFS = 5
+#: How a message may reference streamed documents: no limit in the app since
+#: 2026-10-03 (5 before, docs/chat-media/LIMITS.md); 999 is the technical
+#: ceiling a request is validated against. Every document shares ONE context
+#: budget (engines/document.DOC_CONTEXT_CHARS) and one text budget
+#: (DOC_TURN_TEXT_CHARS): a thousand documents are not a thousand budgets, and
+#: none is read into memory whole past `_DOC_WHOLE_READ_BYTES`.
+_MAX_DOC_REFS = 999
 
 #: Archive members read as documents / attached as images. Extensions the
 #: expander trusts as text-bearing; everything else is sniffed, and true
@@ -2807,7 +2891,9 @@ _MAX_ARCHIVE_IMAGES = 4
 _MAX_ARCHIVE_IMAGE_BYTES = 10 * 1024 * 1024
 
 
-def _expand_archive(root: str, path: str, name: str) -> tuple[list, list, str]:
+def _expand_archive(
+    root: str, path: str, name: str, whole_budget: Optional[list] = None
+) -> tuple[list, list, str]:
     """Open an uploaded archive the way ChatGPT would: every member listed,
     text-bearing members read as documents, images attached as images.
 
@@ -2816,11 +2902,16 @@ def _expand_archive(root: str, path: str, name: str) -> tuple[list, list, str]:
     caps, traversal guards, nested archives listed but never opened — and is
     cached in the upload's `extracted/` directory so a follow-up question
     does not pay for it twice.
+
+    `whole_budget` is the turn's remaining [bytes] of documents read into
+    memory whole (engines/document.DOC_WHOLE_READ_BYTES), spent here; a
+    member past it is handed over as a `DocFile`, read from disk later
+    within its text budget.
     """
     import base64 as _b64
 
     from .core import archive
-    from .engines.document import MAX_DOCS
+    from .engines.document import MAX_DOCS, DocFile
 
     extract_dir = os.path.join(root, "extracted")
     skipped: list[tuple[str, str]] = []
@@ -2854,16 +2945,45 @@ def _expand_archive(root: str, path: str, name: str) -> tuple[list, list, str]:
                 )
             lines.append(f"  - {rel} ({size:,} bytes) — attached as an image")
         elif (ext in _TEXTY_EXTS or ext in (".docx",)) and len(docs) < MAX_DOCS - 1:
-            with open(full, "rb") as fh:
-                docs.append(
-                    (f"{name}/{rel}", _b64.b64encode(fh.read()).decode("ascii"))
-                )
-            lines.append(f"  - {rel} ({size:,} bytes) — read in full")
+            if whole_budget is not None and size > whole_budget[0]:
+                docs.append(DocFile(f"{name}/{rel}", full))
+            else:
+                if whole_budget is not None:
+                    whole_budget[0] -= size
+                with open(full, "rb") as fh:
+                    docs.append(
+                        (f"{name}/{rel}", _b64.b64encode(fh.read()).decode("ascii"))
+                    )
+            lines.append(f"  - {rel} ({size:,} bytes) — read")
         else:
             lines.append(f"  - {rel} ({size:,} bytes) — listed only")
     for member, why in skipped[:20]:
         lines.append(f"  - {member} — skipped: {why}")
     return docs, images, "\n".join(lines)
+
+
+async def _kept_document(conversation_id: str, upload_id: str) -> Optional[tuple[str, str]]:
+    """(name, path) of an upload's lasting copy when THIS conversation's
+    uploads row names it and the copy is on disk, else None."""
+    from . import uploads
+
+    rows = await db.run_in_thread(db.get_uploads, conversation_id)
+    row = next((u for u in rows if u["id"] == upload_id), None)
+    if row is None:
+        return None
+    kept = await asyncio.to_thread(uploads.lasting_file, conversation_id, upload_id)
+    if kept is None:
+        return None
+    return os.path.basename(str(row.get("filename") or "")) or "document", str(kept)
+
+
+def _file_base64(path: str) -> str:
+    """A document read whole, as base64: up to DOC_WHOLE_READ_BYTES a turn,
+    so in a worker thread, never on the loop every stream shares."""
+    import base64 as _b64
+
+    with open(path, "rb") as fh:
+        return _b64.b64encode(fh.read()).decode("ascii")
 
 
 async def _resolve_document_refs(
@@ -2884,11 +3004,22 @@ async def _resolve_document_refs(
     from .core import archive
     from .uploads import upload_root
 
+    from .engines.document import DOC_WHOLE_READ_BYTES, DocFile, doc_text_budget
+
     refs = list(request.pdf_uploads or [])
     if len(refs) > _MAX_DOC_REFS:
         return [], [], f"A message can carry at most {_MAX_DOC_REFS} documents."
     docs: list = []
     images: list = []
+    # HEAD MEMORY (docs/chat-media/LIMITS.md, 2026-10-03). A message may
+    # carry any number of documents of any size, so this turn reads at most
+    # DOC_WHOLE_READ_BYTES of them into memory whole — every ordinary turn,
+    # unchanged — and hands the rest over as files the engine reads from disk
+    # within the turn's one text budget. A cached extraction keeps only its
+    # share of that budget, and page renders only for the first.
+    whole_budget = [DOC_WHOLE_READ_BYTES]
+    share = doc_text_budget(len(refs) + (1 if request.pdf_data else 0))
+    renders_kept = False
     for ref in refs:
         upload_id = str((ref or {}).get("upload_id", ""))
         if not _re.fullmatch(r"[0-9a-f]{32}", upload_id) or not conversation_id:
@@ -2899,28 +3030,38 @@ async def _resolve_document_refs(
             files = [e for e in os.scandir(original) if e.is_file()]
         except OSError:
             files = []
-        if len(files) != 1:
-            name = str((ref or {}).get("name") or "an attached document")
-            return [], [], (
-                f"{name} is no longer available on the server "
-                "(uploads are swept after their TTL) — please re-attach it."
-            )
-        entry = files[0]
-        lower = entry.name.lower()
+        if len(files) == 1:
+            entry_name, entry_path = files[0].name, files[0].path
+        else:
+            # The workspace TTL swept `_original`. A document's LASTING copy
+            # (CHAT_FILES_DIR, docs/chat-media/CONTRACT.md §9) is kept for the
+            # life of the chat and the file route serves it, so a regenerate,
+            # edit or retry of an older turn reads it too. Scoped by this
+            # conversation's uploads row; the row's name decides the type,
+            # since the copy itself is named `original`.
+            kept = await _kept_document(conversation_id, upload_id)
+            if kept is None:
+                name = str((ref or {}).get("name") or "an attached document")
+                return [], [], (
+                    f"{name} is no longer available on the server "
+                    "(uploads are swept after their TTL) — please re-attach it."
+                )
+            entry_name, entry_path = kept
+        lower = entry_name.lower()
         is_archive = lower.endswith((".zip", ".tar", ".tar.gz", ".tgz")) or \
-            archive.is_zip_container(entry.path)
+            archive.is_zip_container(entry_path)
         if is_archive and not lower.endswith((".docx", ".xlsx")):
             # .docx/.xlsx ARE zip containers; sniffing alone would unzip a
             # Word file into its XML skeleton. The extension decides those.
             try:
                 more_docs, more_images, manifest = await asyncio.to_thread(
-                    _expand_archive, root, entry.path, entry.name
+                    _expand_archive, root, entry_path, entry_name, whole_budget
                 )
             except archive.ArchiveError as exc:
-                return [], [], f"{entry.name} could not be opened: {exc}"
+                return [], [], f"{entry_name} could not be opened: {exc}"
             docs.append(
                 (
-                    f"{entry.name} (archive contents)",
+                    f"{entry_name} (archive contents)",
                     _b64.b64encode(manifest.encode("utf-8")).decode("ascii"),
                 )
             )
@@ -2937,18 +3078,26 @@ async def _resolve_document_refs(
                 cached = await asyncio.to_thread(
                     load_document_cache,
                     root,
-                    entry.name,
+                    entry_name,
                     effort=request.effort,
                     question=request.text or "",
                 )
             except Exception:  # noqa: BLE001 — the cache is an accelerator
                 cached = None
             if cached is not None:
+                cached = cached.trimmed(share, keep_images=not renders_kept)
+                renders_kept = renders_kept or bool(cached.images)
                 docs.append(cached)
                 continue
-            with open(entry.path, "rb") as fh:
-                raw = fh.read()
-            docs.append((entry.name, _b64.b64encode(raw).decode("ascii")))
+            try:
+                size = os.path.getsize(entry_path)
+            except OSError:
+                size = 0
+            if size > whole_budget[0]:
+                docs.append(DocFile(entry_name, entry_path))
+                continue
+            whole_budget[0] -= size
+            docs.append((entry_name, await asyncio.to_thread(_file_base64, entry_path)))
     if request.pdf_data:
         docs.append((request.pdf_filename, request.pdf_data))
     return docs, images, None
@@ -3133,7 +3282,13 @@ def _carries_a_file_to_read(
     return bool(_NAMES_AN_UPLOAD_RE.search(text))
 
 
-_MAX_VIDEO_REFS = 3
+#: Videos (and audio) a message may reference: no limit in the app since
+#: 2026-10-03 (3 before, docs/chat-media/LIMITS.md); 999 is the technical
+#: ceiling a request is validated against. Each analysis is a detached job
+#: started at upload time, so this bounds the turn's lookups, not the work:
+#: the engine shares one pinned budget and one frame budget across them
+#: (engines/video.py).
+_MAX_VIDEO_REFS = 999
 
 
 async def _resolve_video_refs(
@@ -3314,12 +3469,29 @@ def _request_snapshot(request: "ChatRequest") -> tuple[dict, bool]:
     bytes live on disk under ids that survive a restart. Inline bytes are
     not kept, so a turn that carried them can only be retried from the
     browser, which sends them again (see the known-intent path in /chat).
+
+    V44's `image_ids` and `image_refs` are ids, never bytes, and are kept like
+    the upload references: a turn that sent only `image_refs` stays resumable,
+    because /chat loads the stored pictures again from the ids. Taken BEFORE
+    /chat turns those refs into inline `images`, so their bytes never reach
+    the snapshot.
     """
     body = request.model_dump(exclude_none=True)
     had_inline = bool(request.images_data or request.pdf_data)
     for name in _INLINE_BYTE_FIELDS:
         body.pop(name, None)
     return body, not had_inline
+
+
+def _inline_images_for_store(request: "ChatRequest") -> List[str]:
+    """The inline pictures `image_ids` indexes (V44, CONTRACT §5): `images`
+    exactly as sent, so index i still means images[i], or the single
+    back-compat spelling as a one-element list. Read before /chat puts any
+    pictures loaded from `image_refs` into `images`: those are stored already."""
+    if any(i and i.strip() for i in (request.images or [])):
+        return list(request.images or [])
+    single = request.image_base64 or request.image
+    return [single] if single else []
 
 
 #: Generations between their compare-and-swap on the request row and their
@@ -3868,6 +4040,10 @@ async def _upload_session_sweep_loop() -> None:
             swept = await asyncio.to_thread(uploads.sweep_expired_upload_sessions)
             if swept:
                 logging.getLogger(__name__).info("swept %d expired upload session(s)", swept)
+            # The lasting-copy reaper (docs/chat-media/CONTRACT.md §8-9) rides
+            # this timer and never an upload request; it throttles itself to
+            # CHAT_MEDIA_REAP_INTERVAL_S and never raises.
+            await asyncio.to_thread(uploads.maybe_reap_lasting_files)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -4006,8 +4182,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     # its own (`_require_input` permits that), and without the gate the
     # placeholder became the request — so answering a clarifying question by
     # skipping it sent "Analyze the attached image." to the Salesforce planner
-    # as the thing the user wanted to know.
-    text = request.text or ("Analyze the attached image." if request.image_data else "")
+    # as the thing the user wanted to know. Stored pictures sent by reference
+    # (V44 `image_refs`) are images too; they load into `images` only later.
+    text = request.text or (
+        "Analyze the attached image." if (request.image_data or request.image_refs) else ""
+    )
 
     def meta_extras(route: Optional[str]) -> dict:
         """V2 §2: meta gains mode / model (served model id) / effort — merged
@@ -4118,10 +4297,13 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         or request.video_uploads
         or request.image_data
         or request.images_data
+        or request.image_refs
     ):
         # The upload routes refuse first (that is where files actually land);
         # this covers inline base64 and a tab left open since access changed.
         # The BACKING fields are cleared — pdf_data/images_data are computed.
+        # Stored pictures by reference (V44) are attachments too: an account
+        # that may not attach may not have one read back into a turn either.
         attachment_blocked = True
         request.pdf = None
         request.pdf_filename = None
@@ -4130,6 +4312,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         request.images = None
         request.image = None
         request.image_base64 = None
+        request.image_ids = None
+        request.image_refs = None
     video_blocked = False
     if request.video_uploads and not feature_access.allowed(
         principal.features, feature_access.Feature.VIDEO_ANALYSIS
@@ -4168,7 +4352,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # First message of a NEW conversation: claim the id for this user
             # before any side-table row is written under it, closing the
             # pre-seeding hole (nobody else can later create-and-inherit it).
-            if not _CONVERSATION_ID_RE.match(request.conversation_id):
+            if not _CONVERSATION_ID_RE.fullmatch(request.conversation_id):
                 raise HTTPException(status_code=422, detail="invalid conversation id")
             title = (request.text or "New chat").strip()[:80] or "New chat"
             try:
@@ -4182,6 +4366,33 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             )
         if conv_owner != viewer:
             raise HTTPException(status_code=404, detail="conversation not found")
+
+    # CHAT MEDIA (V44, app/chat_media.py, docs/chat-media/CONTRACT.md §5).
+    # Here, at intake, and not in the vision branch: a picture rides a
+    # document turn, an artifact turn and a plain vision turn alike, and every
+    # one of them must show on the person's other devices. After the feature
+    # gate (a blocked account's pictures are already cleared) and after the
+    # ownership check (nothing is stored or read under a chat that is not the
+    # viewer's; a bare call's `u<id>-…` key is never a chat).
+    #
+    # 1. Stored pictures sent BY REFERENCE are loaded first, before anything
+    #    durable happens: one that cannot be loaded is a 422 the browser turns
+    #    into "attach it again", and it must arrive before a stream or a
+    #    `chat_requests` row exists. They then ARE inline images, ahead of any
+    #    the same turn carries, so every engine below sees one list.
+    inline_images = _inline_images_for_store(request)
+    if request.image_refs:
+        loaded, missing = await _chat_media.load_refs(
+            viewer, request.conversation_id, request.image_refs
+        )
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "image_ref_missing", "missing": missing},
+            )
+        request.images = loaded + list(request.images_data)
+    # 2. This turn's inline pictures are stored once the send intent is
+    #    known to be this chat's (below, after the V29 409).
 
     # DURABLE INTENT (V29). Record the send before anything runs, so the
     # request survives the process that accepted it (RC-3). A KNOWN intent
@@ -4232,6 +4443,22 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             raise HTTPException(
                 status_code=409, detail="intent_id belongs to another conversation"
             )
+    # CHAT MEDIA, 2 (see 1 above). This turn's inline pictures are stored
+    # BEHIND the turn: a background task, all file work in a worker thread,
+    # nothing awaited here, so the first token waits on none of it. A failure
+    # is logged and counted (chat_media_writes_total), never a chat error.
+    # Pictures sent with no ids that fit them (a page loaded before V44) are
+    # named after the browser's send intent: `request.intent_id`, never the
+    # one minted above for a client that sent none
+    # (docs/chat-media/STORE-ALWAYS.md). After the 409 just above: a send
+    # under another chat's intent has no message to show them on. Before the
+    # attach / replay / retry paths below: a retry of the same send stores
+    # again (a `duplicate`, or a lost file healed).
+    _chat_media.schedule_inline_store(
+        viewer, request.conversation_id, inline_images, request.image_ids,
+        intent_id=request.intent_id, by_reference=bool(request.image_refs),
+    )
+    if row is None:
         live = _live_generation_for(known["generation_id"])
         if live is not None:
             # accepted/running and still in this process: the same stream,
@@ -5609,10 +5836,20 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # pays it once, on the first turn after a deploy. Never on the
             # fast lane (it must add nothing to a greeting's latency), and
             # never on a turn that carries its own images, which replace
-            # whatever was remembered anyway.
+            # whatever was remembered anyway. The path the browser sent rides
+            # along: the V44 store fallback takes only a picture on it, never
+            # one on a branch the person edited away.
             image_followup = image_memory.Followup()
             if conv_key and not lane.entered and not request.images_data:
-                await image_memory.hydrate(conv_key, viewer)
+                await image_memory.hydrate(
+                    conv_key,
+                    viewer,
+                    visible=(
+                        [(m.role, m.content) for m in request.messages]
+                        if request.messages is not None
+                        else None
+                    ),
+                )
             if (
                 request.text
                 and not request.images_data
@@ -6503,6 +6740,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     emit,
                     effort=request.effort,
                     conversation_id=conv_key,
+                    # The memory keeps a turn's first pictures that fit its
+                    # budget: the answer says how many of how many it saw.
+                    total_pictures=image_followup.total,
                 )
             elif image_followup.unavailable:
                 # This turn IS about the picture, and the picture is not

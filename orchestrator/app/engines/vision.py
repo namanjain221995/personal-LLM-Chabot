@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -164,7 +165,7 @@ def build_user_content(
     message: str, images: "str | Sequence[str]"
 ) -> List[dict]:
     """OpenAI multimodal content parts: text + one image_url per image
-    (2026-08-05: the composer sends up to 5). A bare string is accepted for
+    (2026-08-05; any number since 2026-10-03, fitted by `fit_images`). A bare string is accepted for
     the single-image callers that predate the list form."""
     imgs = [images] if isinstance(images, str) else list(images)
     return [
@@ -182,6 +183,226 @@ def build_user_content(
             for i in imgs
         ),
     ]
+
+
+# --- many pictures in one turn (2026-10-03) --------------------------------
+#
+# A message may carry any number of pictures (docs/chat-media/LIMITS.md; 999
+# is only vLLM's per-prompt ceiling). The model reads them in ONE prompt, so
+# code sizes them, never the model: at the size they arrived while they fit
+# the turn's budget, then all of them smaller (896 px on the long edge is ~590
+# tokens for a 4:3 photo, 640 px ~300, 448 px ~160) rather than fewer, and only
+# when even the smallest size cannot hold them all, the first ones that fit,
+# with a sentence that says how many were read.
+#
+# THE BUDGET is not the whole 1M window. Measured 2026-10-03 on the main
+# model (one other request running): twenty 1600x1200 photos were 38,063
+# prompt tokens and 22.1 s to the first token; forty fitted to 896 px were
+# 23,623 (this module estimated 23,680) and 17.9 s, so ~1,300-1,700 image
+# tokens a second. And vLLM's processor turns every picture into float32
+# patches in the HEAD's memory before the engine sees it (1,536 values per
+# 16x16 patch, four patches a token: ~24 KB a token, held by the API server
+# and again by the engine core), and head memory is off limits. 65,536 image
+# tokens is ~40-50 s of prefill and ~1.6 GB of patches per copy: 34 photos at
+# 1600 px, 110 at 896, 215 at 640, 414 at 448 (4:3). The whole window would be
+# minutes and tens of GB. VISION_IMAGE_TOKEN_BUDGET overrides it; it is never
+# more than the window minus the answer's reserve.
+_IMAGE_TOKEN_BUDGET = 65_536
+#: What the answer may need besides the pictures: the Max allowance (32,768)
+#: and its answer (8,000), the system prompt and the question, rounded up.
+_IMAGE_ANSWER_RESERVE = 65_536
+#: Long edges tried, largest first, when the pictures do not fit as they are.
+FIT_EDGES = (896, 640, 448)
+#: JPEG quality of a fitted copy: a model reads it, a person never sees it.
+_FIT_QUALITY = 85
+#: Pixels decoded to make a fitted copy (image_memory's ceilings): a stored
+#: picture is at most 16 MP (chat_media.MAX_STORE_PIXELS), an inline one is
+#: not verified before it reaches here.
+_FIT_MAX_PIXELS = 40_000_000
+_FIT_MAX_JPEG_PIXELS = 89_478_485
+
+
+def image_token_budget(reserved_tokens: int = 0) -> int:
+    """Image tokens this turn's pictures may take (see `_IMAGE_TOKEN_BUDGET`)."""
+    from .. import context
+
+    window = context.known_window(settings.openai_base_url)
+    # A small window keeps a quarter for the answer (fit_request's own rule).
+    reserve = min(_IMAGE_ANSWER_RESERVE, window // 4)
+    room = window - int(settings.context_safety_margin) - reserve - int(reserved_tokens)
+    budget = int(_env_number("VISION_IMAGE_TOKEN_BUDGET", _IMAGE_TOKEN_BUDGET)) - int(reserved_tokens)
+    return max(0, min(budget, room))
+
+
+def _at_edge(dims: Optional[tuple], edge: int) -> Optional[tuple]:
+    """The size a picture of `dims` has once its long edge is at most `edge`."""
+    if not dims:
+        return None
+    w, h = dims
+    if max(w, h) <= edge:
+        return dims
+    scale = edge / max(w, h)
+    return max(1, round(w * scale)), max(1, round(h * scale))
+
+
+def shrink_picture(payload: bytes, edge: int) -> Optional[str]:
+    """A JPEG data URL of the picture with its long edge at most `edge`, or
+    None when it cannot be decoded (or is over the decode ceiling). Blocking."""
+    import base64
+    import io
+
+    try:
+        from PIL import Image, ImageOps
+
+        with Image.open(io.BytesIO(payload)) as im:
+            jpeg = (im.format or "").upper() in ("JPEG", "MPO")
+            if im.width * im.height > (_FIT_MAX_JPEG_PIXELS if jpeg else _FIT_MAX_PIXELS):
+                return None
+            im.draft("RGB", (edge, edge))
+            frame = ImageOps.exif_transpose(im)
+            if frame.mode in ("RGBA", "LA", "PA") or (frame.mode == "P" and "transparency" in frame.info):
+                flat = Image.new("RGB", frame.size, "white")
+                flat.paste(frame.convert("RGBA"), mask=frame.convert("RGBA").split()[-1])
+                frame = flat
+            elif frame.mode in ("I;16", "I;16B", "I;16L", "I;16N", "I"):
+                # 16-bit greyscale: a straight convert clips every value over
+                # 255 to white (chat_media._thumbnail has the same rule).
+                frame = frame.convert("I").point(lambda v: v * (1 / 256)).convert("RGB")
+            elif frame.mode != "RGB":
+                frame = frame.convert("RGB")
+            frame.thumbnail((edge, edge), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            frame.save(buf, format="JPEG", quality=_FIT_QUALITY)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as exc:  # noqa: BLE001 — a picture that will not shrink is left out, never a failed turn
+        log.debug("picture not shrunk: %s", type(exc).__name__)
+        return None
+
+
+def _payload(url: str) -> bytes:
+    import base64
+
+    return base64.b64decode(url.split(",", 1)[-1] if url.startswith("data:") else url, validate=False)
+
+
+@dataclass(frozen=True)
+class FittedImages:
+    """What one model call carries of a turn's pictures."""
+
+    images: List[str]
+    total: int
+    edge: Optional[int] = None  # the long edge they were sent at, when shrunk
+    unreadable: int = 0  # pictures that needed shrinking and would not decode
+    #: The pictures are an EARLIER message's (a follow-up), and `total`
+    #: counts that message: image_memory keeps only its first ones that fit.
+    earlier: bool = False
+
+    @property
+    def dropped(self) -> int:
+        return self.total - len(self.images)
+
+    @property
+    def did_not_fit(self) -> int:
+        return self.dropped - self.unreadable
+
+    def model_note(self) -> str:
+        """A line for the model: what it is looking at."""
+        if self.dropped and self.earlier:
+            return (
+                f"\n\n(This question is about the {self.total} pictures of an earlier message. The app "
+                f"sent {len(self.images)} of them"
+                + (f" at {self.edge} px on the long edge" if self.edge else "")
+                + ": the others are not attached to this question. Answer only about the pictures "
+                "you can see and do not guess about the others.)"
+            )
+        if self.dropped:
+            return (
+                f"\n\n(The app sent {len(self.images)} of the {self.total} attached pictures"
+                + (f" at {self.edge} px on the long edge" if self.edge else "")
+                + ": the rest did not fit in one question or could not be opened. Answer only "
+                "about the pictures you can see and do not guess about the others.)"
+            )
+        if self.edge:
+            return (
+                f"\n\n(The app sent all {self.total} pictures at {self.edge} px on the long edge so "
+                "they fit in one question; very small print may not be legible at that size - say "
+                "so rather than guess.)"
+            )
+        return ""
+
+    def person_note(self) -> str:
+        """The sentence the person reads when not every picture was read:
+        counted here, never left to the model."""
+        if not self.dropped:
+            return ""
+        read = len(self.images)
+        if self.earlier:
+            return (
+                f"\n\n_I could see {read} of the {self.total} pictures from that message here; "
+                "send the others again to ask about them._"
+            )
+        if not self.unreadable:
+            return (
+                f"\n\n_I read the first {read} of the {self.total} pictures in this message; the "
+                f"other {self.did_not_fit} did not fit in one question. Send them in another message "
+                "to ask about them._"
+            )
+        tail = (
+            f", and the last {self.did_not_fit} did not fit in one question (send them in another "
+            "message to ask about them)"
+            if self.did_not_fit
+            else ""
+        )
+        return (
+            f"\n\n_I read {read} of the {self.total} pictures in this message: {self.unreadable} "
+            f"could not be opened as a picture{tail}._"
+        )
+
+
+def fit_images(images: Sequence[str], budget: int) -> FittedImages:
+    """The pictures one model call can carry within `budget` image tokens:
+    every one as it is when that fits, else every one at the largest of
+    FIT_EDGES that fits, else the first ones that fit at the smallest edge.
+    Blocking (it decodes); call it in a worker thread."""
+    from .. import context
+
+    imgs = [to_data_url(i) for i in images]
+    dims = [context.image_part_dimensions({"image_url": {"url": u}}) for u in imgs]
+    if sum(context.image_tokens_for(d) for d in dims) <= budget:
+        return FittedImages(imgs, len(imgs))
+    edge = next(
+        (e for e in FIT_EDGES if sum(context.image_tokens_for(_at_edge(d, e) or (e, e)) for d in dims) <= budget),
+        FIT_EDGES[-1],
+    )
+    kept: List[str] = []
+    used = 0
+    unreadable = 0
+    for url, d in zip(imgs, dims):
+        target = _at_edge(d, edge)
+        small = url if (d and target == d) else shrink_picture(_payload(url), edge)
+        if small is None:
+            unreadable += 1  # it would not decode here: named as not opened
+            continue
+        cost = context.image_tokens_for(context.image_part_dimensions({"image_url": {"url": small}}))
+        if used + cost > budget:
+            break
+        used += cost
+        kept.append(small)
+    return FittedImages(kept, len(imgs), edge, unreadable)
+
+
+async def fit_for_model(images: Sequence[str], *, reserved_tokens: int = 0) -> FittedImages:
+    """`fit_images` in a worker thread, against this turn's budget. Not the
+    chat-media decode pool: this turn's own pictures are being stored there
+    (chat_media.schedule_inline_store), and the first token must not queue
+    behind them. Its decodes run one at a time, which bounds its memory."""
+    imgs = list(images)
+    fitted = await asyncio.to_thread(fit_images, imgs, image_token_budget(reserved_tokens))
+    if not fitted.images and imgs:
+        # Nothing could be fitted (no budget, or no picture would decode):
+        # the first picture as it is, which is what this route always sent.
+        return FittedImages([to_data_url(imgs[0])], len(imgs))
+    return fitted
 
 
 def extract_json_block(text: str) -> Optional[dict]:
@@ -485,6 +706,10 @@ _TABLE_SYSTEM = (
     "Separate two tables with a blank line. Output only the tables; if there is "
     "no table or list of numbers, output NONE."
 )
+#: The table pre-pass is a second prefill of every picture under a 30 s
+#: deadline: it was measured on single photos, and over a message's former
+#: maximum of five it would spend the deadline prefilling and give nothing.
+_TABLE_PASS_MAX_IMAGES = 5
 #: Pipe rows, not JSON: measured on the stock-count photo, the model's
 #: pretty-printed JSON took 18.8-19.5 s for eight rows (and came back in a
 #: shape of its own choosing), which no Fast turn can afford.
@@ -846,6 +1071,7 @@ async def run_vision_engine(
     effort: str = DEFAULT_EFFORT,
     max_tokens: Optional[int] = None,
     conversation_id: Optional[str] = None,
+    total_pictures: int = 0,
 ) -> str:
     """Answer about attached image(s) at the effort the caller asked for.
 
@@ -860,13 +1086,24 @@ async def run_vision_engine(
     whose images the sidecar cannot read inside its deadline stops paying
     that deadline on every later turn. Nothing else reads it, and a caller
     that has no conversation (the bare API, graph.py) may leave it None.
+
+    `total_pictures` is a follow-up's: how many pictures the remembered
+    message carried, when image_memory kept only its first ones. The notes
+    then say how many of THAT message's pictures the model saw.
     """
     imgs = [images] if isinstance(images, str) else list(images or [])
     if not imgs:
         raise ValueError("the vision engine requires an attached image")
 
     level = llm.normalize_effort(effort)
+    # Any number of pictures, fitted to what one call can read (above).
+    fitted = await fit_for_model(imgs)
+    if total_pictures > fitted.total:
+        fitted = dataclasses.replace(fitted, total=total_pictures, earlier=True)
+    imgs = fitted.images
     user_content = build_user_content(message + extraction_hint(message), imgs)
+    if fitted.model_note():
+        user_content.append({"type": "text", "text": fitted.model_note()})
 
     # Is the picture legible at all? Measured from the pixels, in
     # milliseconds, before anything is sent (engines/image_quality.py). The
@@ -924,7 +1161,7 @@ async def run_vision_engine(
 
     # B25c: "which is the largest / worst ...?" is answered with the
     # comparison already done in code (see `_read_tables`).
-    if asks_for_a_superlative(message):
+    if asks_for_a_superlative(message) and len(imgs) <= _TABLE_PASS_MAX_IMAGES:
         computed = await _read_tables(imgs, emit)
         if computed:
             user_content.append({"type": "text", "text": computed})
@@ -997,6 +1234,9 @@ async def run_vision_engine(
             await emit("token", {"text": tail})
     if guard.completions:
         log.warning("vision answer filled in a digit it had marked unreadable (%d)", guard.completions)
+    if fitted.person_note():
+        parts.append(fitted.person_note())
+        await emit("token", {"text": fitted.person_note()})
     answer = "".join(parts)
 
     # §10: the single final meta carries only contract keys. The structured

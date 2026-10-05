@@ -275,6 +275,18 @@ ffmpeg competes with the parent process for the terminal's stdin.
 - Failed attempts are recorded too — an error rate computed only from
   successes is not an error rate.
 
+**Stored dictation is different, and says so.** Everything above is the
+one-shot `POST /audio/transcribe`. A recording made through
+`/audio/sessions` (V42, `orchestrator/app/dictation.py`) is KEPT: its audio
+and transcript are private files under `VOICE_DATA_DIR/<user>/<session>/`
+(folders 0700, files 0600), listed on the Recordings page, until the person
+deletes them or `VOICE_RETENTION_DAYS` (0 = keep) removes them. Since
+2026-09-30 a finished recording's audio can move to the voice archive on the
+worker's disk (off until `VOICE_ARCHIVE_ENABLED=true`); the transcript stays
+on the head, and a delete removes both copies.
+[`voice-archive.md`](voice-archive.md) has where it goes, how it is protected
+and what happens when the worker is down.
+
 ---
 
 ## Access control

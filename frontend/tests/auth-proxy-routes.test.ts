@@ -172,6 +172,38 @@ describe('/api/auth/logout — the clearing cookie must come back', () => {
       (calls[0].init?.headers as Record<string, string>).cookie,
     ).toBe('ts_session=abc123');
   });
+
+  // 2026-10-02 (chat media): stored photos are cached `private, immutable`
+  // for a year and served from disk with no request — so no session check.
+  // Logout wipes IndexedDB for the next person at a shared keyboard; the
+  // HTTP cache needs the browser's own wipe.
+  it('tells the browser to empty its HTTP cache, keeping every cookie it relays', async () => {
+    vi.stubGlobal('fetch', async () => {
+      const headers = new Headers({ 'content-type': 'application/json' });
+      headers.append('set-cookie', 'ts_session=; Path=/; Max-Age=0; HttpOnly');
+      headers.append('set-cookie', 'ts_csrf=; Path=/; Max-Age=0');
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers });
+    });
+    const { POST } = await logoutRoute();
+    const res = await POST(
+      new Request('http://localhost:3001/api/auth/logout', { method: 'POST' }),
+    );
+    expect(res.headers.get('clear-site-data')).toBe('"cache"');
+    expect(res.headers.getSetCookie()).toHaveLength(2);
+    await expect(res.json()).resolves.toEqual({ ok: true });
+  });
+
+  it('says so even when the orchestrator cannot be reached', async () => {
+    vi.stubGlobal('fetch', async () => {
+      throw new TypeError('fetch failed');
+    });
+    const { POST } = await logoutRoute();
+    const res = await POST(
+      new Request('http://localhost:3001/api/auth/logout', { method: 'POST' }),
+    );
+    expect(res.status).toBe(502);
+    expect(res.headers.get('clear-site-data')).toBe('"cache"');
+  });
 });
 
 describe('/api/auth/invitations/[token]', () => {
@@ -271,6 +303,7 @@ describe('MOCK_MODE exercises the same session flow', () => {
     );
     expect(res.status).toBe(200);
     expect(res.headers.get('set-cookie')).toContain('Max-Age=0');
+    expect(res.headers.get('clear-site-data')).toBe('"cache"');
     await expect(res.json()).resolves.toEqual({ ok: true });
   });
 });

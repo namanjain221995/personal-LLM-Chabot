@@ -16,6 +16,7 @@ import { describe, expect, it, vi, afterEach } from 'vitest';
 import {
   CHUNK_PART_BYTES,
   CHUNK_THRESHOLD_BYTES,
+  MAX_PARALLEL_HASHES,
   UploadError,
   uploadDocumentFile,
   type UploadProgress,
@@ -229,6 +230,60 @@ describe('uploadDocumentFile · every part carries its hash', () => {
     await uploadDocumentFile(fakeFile(CHUNK_THRESHOLD_BYTES + 1), 'conv-3');
     expect(headers.length).toBeGreaterThan(0);
     expect(headers[0]).toBeUndefined();
+  });
+});
+
+describe('uploadDocumentFile · any number of big files at once (2026-10-03)', () => {
+  it('reads at most MAX_PARALLEL_HASHES parts at a time across every upload', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => okJson({ upload_id: 'f'.repeat(32), filename: 'big.pdf' })),
+    );
+    let open = 0;
+    let peak = 0;
+    const release: Array<() => void> = [];
+    vi.stubGlobal('crypto', {
+      subtle: {
+        digest: async () => {
+          open += 1;
+          peak = Math.max(peak, open);
+          await new Promise<void>((resolve) => release.push(resolve));
+          open -= 1;
+          return new ArrayBuffer(32);
+        },
+      },
+    });
+    // Six files of two parts each, all started together: twelve hashes.
+    const all = Promise.all(
+      Array.from({ length: 6 }, (_, i) =>
+        uploadDocumentFile(fakeFile(CHUNK_THRESHOLD_BYTES + 1, `f${i}.pdf`), 'conv-3'),
+      ),
+    );
+    for (let done = 0; done < 12; done += 1) {
+      await vi.waitFor(() => expect(release.length).toBeGreaterThan(0));
+      expect(open).toBeLessThanOrEqual(MAX_PARALLEL_HASHES);
+      release.shift()!();
+    }
+    expect(await all).toHaveLength(6);
+    expect(peak).toBe(MAX_PARALLEL_HASHES);
+  });
+
+  it('carries a big dataset too, and hands back how many tables it held', async () => {
+    const purposes: unknown[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init: RequestInit) => {
+        if (String(url).endsWith('/init')) purposes.push((init.body as FormData).get('purpose'));
+        return okJson({ upload_id: 'a'.repeat(32), filename: 'events.csv', files: 3 });
+      }),
+    );
+    const ref = await uploadDocumentFile(
+      fakeFile(CHUNK_THRESHOLD_BYTES + 1, 'events.csv'),
+      'conv-3',
+      'dataset',
+    );
+    expect(purposes).toEqual(['dataset']);
+    expect(ref.files).toBe(3);
   });
 });
 

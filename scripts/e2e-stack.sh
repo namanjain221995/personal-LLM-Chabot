@@ -189,12 +189,21 @@ up() {
   # VIDEO_ANALYSIS_ENABLED are all `_bool(..., False)` at config.py:223, :951
   # and :325). test_the_enabled_flags_are_really_matched runs the regex.
   ENV_ALLOWLIST="OPENAI_BASE_URL|OPENAI_API_KEY|ROUTER_BASE_URL|AGENT_BASE_URL|VISION_BASE_URL|EMBED_BASE_URL|RERANK_BASE_URL|OCR_BASE_URL|ASR_BASE_URL|ASR_BASE_URLS|MAIN_MODEL|LLM_MODEL|ROUTER_MODEL|AGENT_MODEL|VISION_MODEL|EMBED_MODEL|OCR_MODEL|ASR_MODEL|ASR_BACKEND|ASR_LANGUAGE|ASR_TIMEOUT_S|RERANK_MODEL|RERANKER_MODEL|RERANK_BACKEND|[A-Z0-9_]+_ENABLED"
+  # NEVER INHERITED, although they match `*_ENABLED` (2026-09-30). The voice
+  # archive's mover: given production's store settings through
+  # E2E_EXTRA_ENV_FILE (the natural way to test the archive end to end), a
+  # stack that inherited it would move ITS test recordings onto production's
+  # store. Its own database makes it another owner there, so it can no longer
+  # delete production's recordings (docs/voice-archive.md, "Who owns a
+  # recording"), but it has no business writing there unless someone decided
+  # so: set it in E2E_EXTRA_ENV_FILE for that.
+  ENV_NEVER_INHERITED="VOICE_ARCHIVE_ENABLED"
   # An empty match is a hard error rather than an empty file: `grep` exiting 1
   # under `set -o pipefail` would otherwise take the whole script down with no
   # explanation, and a silently empty engine contract would start a stack that
   # points at nothing.
   if ! docker inspect "$PROD_ORCH" --format '{{range .Config.Env}}{{println .}}{{end}}' \
-       | grep -E "^($ENV_ALLOWLIST)=" >> "$ROOT/.runtime/e2e.env"; then
+       | grep -E "^($ENV_ALLOWLIST)=" | grep -vE "^($ENV_NEVER_INHERITED)=" >> "$ROOT/.runtime/e2e.env"; then
     die "could not read the engine contract from $PROD_ORCH (is it running?)"
   fi
   # Generated FRESH for this stack, never inherited: a QA stack signing its

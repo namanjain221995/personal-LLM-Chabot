@@ -532,6 +532,31 @@ class TheLiveFixesInTheBoxStackScript(unittest.TestCase):
                 f"the allowlist copies {secret} out of production",
             )
 
+    def test_the_voice_archive_mover_is_never_inherited_from_production(self):
+        # VOICE_ARCHIVE_ENABLED matches `*_ENABLED`, so a stack given
+        # production's store settings (E2E_EXTRA_ENV_FILE) inherited a running
+        # mover: its test recordings went to production's store, and until the
+        # store learned owners (2026-09-30) its reconcile deleted production's
+        # only copies. Run the two patterns the way the pipeline does.
+        values = {}
+        for line in self.text.splitlines():
+            stripped = line.strip()
+            for name in ("ENV_ALLOWLIST", "ENV_NEVER_INHERITED"):
+                if stripped.startswith(f"{name}="):
+                    values[name] = stripped[len(name) + 1 :].strip('"')
+        self.assertEqual(set(values), {"ENV_ALLOWLIST", "ENV_NEVER_INHERITED"}, values)
+        allowed = re.compile(f"^({values['ENV_ALLOWLIST']})=")
+        never = re.compile(f"^({values['ENV_NEVER_INHERITED']})=")
+
+        def inherited(line: str) -> bool:
+            return bool(allowed.search(line)) and not never.search(line)
+
+        self.assertFalse(inherited("VOICE_ARCHIVE_ENABLED=true"))
+        for name in ("ASR_ENABLED", "SEARCH_ENABLED", "VIDEO_ANALYSIS_ENABLED", "VOICE_SESSIONS_ENABLED"):
+            self.assertTrue(inherited(f"{name}=true"), name)
+        window = self.text.split("Config.Env", 1)[1][:400]
+        self.assertIn('grep -vE "^($ENV_NEVER_INHERITED)="', window, "the pipeline no longer applies the exclusion")
+
     def test_the_extra_env_file_cannot_abort_up_silently(self):
         # `grep` exits 1 when nothing matches, and under `set -euo pipefail` that
         # ended up() mid-function with no message at all -- measured: rc 1, the

@@ -637,7 +637,9 @@ export const VOICE_MESSAGES = {
         ? `Transcript ${t} behind — the speech engine is busy with other recordings`
         : waitingOn === 'engine_unavailable'
           ? `Transcript ${t} behind — the speech service is unavailable right now; your audio is saved and will be transcribed when it is back`
-          : `Transcript ${t} behind`,
+          : waitingOn === 'archive'
+            ? `Transcript ${t} behind — the earlier part of this recording is on the archive server, which isn’t answering right now; nothing is lost`
+            : `Transcript ${t} behind`,
   finishingTail: (t: string) => `Finishing the last ${t} of audio…`,
   finishing: 'Finishing the transcript…',
   notProgressive: 'This browser’s recording can only be transcribed once you stop. It is being saved as you talk.',
@@ -736,7 +738,10 @@ export type SessionOutcome =
   | 'no_words'
   | 'engine_unavailable'
   | 'undecodable';
-export type WaitingOn = 'none' | 'chat' | 'engine' | 'engine_unavailable';
+// 'archive': a continuation waits for the recording it continues, whose audio
+// is on the voice archive server and is not answering (orchestrator
+// app/dictation.py _Live._bring_back, 2026-09-30).
+export type WaitingOn = 'none' | 'chat' | 'engine' | 'engine_unavailable' | 'archive';
 export type EndedBy = 'person' | 'recorder_error' | 'lost_parts' | 'page_hidden';
 
 export interface SessionConfig {
@@ -861,7 +866,9 @@ export function parseSessionState(body: unknown): SessionState | null {
     transcribedMs: num(b.transcribed_ms),
     backlogMs: num(b.backlog_ms),
     waitingOn:
-      waiting === 'chat' || waiting === 'engine' || waiting === 'engine_unavailable' ? waiting : 'none',
+      waiting === 'chat' || waiting === 'engine' || waiting === 'engine_unavailable' || waiting === 'archive'
+        ? waiting
+        : 'none',
     progressive: b.progressive !== false,
     cursor: num(b.cursor),
     segments,

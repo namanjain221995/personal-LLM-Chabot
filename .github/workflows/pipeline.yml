@@ -182,7 +182,7 @@ jobs:
         run: |
           python -m pip install -q ruff==0.14.0
           python .github/workflows/scripts/ruff_gate.py \
-            orchestrator sync-worker launcher scripts .github/workflows/scripts
+            orchestrator sync-worker launcher scripts .github/workflows/scripts compose/voice-store
 
       - name: Shell scripts parse
         run: |
@@ -692,6 +692,30 @@ jobs:
           for mod in ("weasyprint", "pypdfium2", "docx", "pptx", "openpyxl", "matplotlib"):
               importlib.import_module(mod)
           print("every renderer library imports in CI")
+          PY
+      # The voice archive store's own suite (compose/voice-store/tests): the
+      # worker-side object store, in-process, over a temporary directory. No
+      # database, no network, under a second, on the libraries installed
+      # above (starlette, httpx). Not part of the sharded suite, so it runs in
+      # shard 1 only, AFTER the shard's own pytest step (test_ci_shards.py
+      # reads the first `-m pytest` step as the shard run). The floor counts
+      # tests that EXECUTED, as unittest_gate.py does, so a module that stops
+      # being collected is red, not quietly green.
+      - name: The voice archive store's tests (compose/voice-store)
+        if: matrix.shard == 1
+        run: |
+          set -euo pipefail
+          python -m pytest compose/voice-store/tests -q -rs -p no:cacheprovider \
+            --junitxml="$RUNNER_TEMP/voice-store-junit.xml"
+          python - "$RUNNER_TEMP/voice-store-junit.xml" 33 <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+          ran = sum(int(s.get("tests", 0)) - int(s.get("skipped", 0)) for s in suites)
+          floor = int(sys.argv[2])
+          print(f"compose/voice-store: {ran} tests executed (floor {floor})")
+          sys.exit(0 if ran >= floor else 1)
           PY
 
   sync-worker:
@@ -1255,6 +1279,7 @@ jobs:
           python .github/workflows/scripts/arm64_gate.py \
             orchestrator/Dockerfile orchestrator/Dockerfile.cpu \
             sync-worker/Dockerfile frontend/Dockerfile \
+            compose/voice-store/Dockerfile \
             --skip-base nvcr.io/
 
       - name: Record what these images are

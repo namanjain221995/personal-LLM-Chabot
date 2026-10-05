@@ -86,12 +86,26 @@ def _duck():
         "SET autoinstall_known_extensions=false",
         "SET autoload_known_extensions=false",
         "SET disabled_filesystems='HTTPFileSystem,S3FileSystem'",
+        # A dataset of ANY size may be profiled (no upload limit since
+        # 2026-10-03, docs/chat-media/LIMITS.md), and DuckDB's default is 80%
+        # of the machine's memory: on the head node, which is off limits.
+        # It streams the file and spills what does not fit to disk instead.
+        f"SET memory_limit='{_DUCK_MEMORY}'",
+        f"SET temp_directory='{_duck_spill_dir()}'",
     ):
         try:
             con.execute(pragma)
         except Exception:
             pass
     return con
+
+
+#: DuckDB's memory ceiling per profile (PROFILE_DUCKDB_MEMORY overrides).
+_DUCK_MEMORY = (os.environ.get("PROFILE_DUCKDB_MEMORY") or "2GB").strip().replace("'", "")
+
+
+def _duck_spill_dir() -> str:
+    return os.path.join(tempfile.gettempdir(), "duckdb-profile-spill").replace("'", "")
 
 
 #: Rows the CSV type sniffer reads. Types are GUESSED from these rows only.

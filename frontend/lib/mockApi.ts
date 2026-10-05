@@ -454,3 +454,113 @@ export function handleMockMemory(
   memoryByUser.set(user, []);
   return json(200, { deleted: facts.length });
 }
+
+/* -------------------------------------------------------------- my files */
+
+/**
+ * GET /files/mine and /files/mine/summary in MOCK_MODE (2026-09-30), in the
+ * shapes orchestrator/app/myfiles.py answers with, so the page is demo-able
+ * without an orchestrator: one of each kind and each availability. Filtering
+ * and sorting are applied; paging is not (the fixture is one page).
+ */
+const MOCK_RETENTION = {
+  upload_hours: 24,
+  recording_days: 0,
+  video_kept_with_chat: true,
+  video_grace_hours: 72,
+  pictures: 'browser_only',
+  picture_memory_hours: 2,
+};
+
+const mockChat = { id: 'mock-conv-1', title: 'Quarterly planning' };
+
+function mockFile(
+  n: number,
+  source: 'upload' | 'text' | 'recording',
+  kind: string,
+  name: string,
+  bytes: number | null,
+  hoursAgo: number,
+  availability: string,
+  extra: {
+    preview?: string | null;
+    media?: { status: string; duration_ms: number; has_transcript?: boolean };
+  } = {},
+) {
+  const id = n.toString(16).padStart(32, '0');
+  return {
+    id: `${source}:${source === 'text' ? String(n) : id}`,
+    source,
+    kind,
+    name,
+    bytes,
+    created_at: new Date(Date.UTC(2026, 8, 30, 9, 0) - hoursAgo * 3_600_000).toISOString(),
+    conversation: source === 'recording' ? null : mockChat,
+    availability,
+    media: extra.media ?? null,
+    can: {
+      download: availability === 'available',
+      preview: extra.preview ?? null,
+      delete: source === 'recording',
+    },
+    text_name: extra.preview === 'text' ? name : null,
+  };
+}
+
+const MOCK_FILES = [
+  mockFile(1, 'upload', 'document', 'Q3 planning.pdf', 2_411_000, 1, 'available'),
+  mockFile(2, 'recording', 'recording', 'Voice recording', 734_000, 3, 'available', {
+    preview: 'audio',
+    media: { status: 'done', duration_ms: 61_000, has_transcript: true },
+  }),
+  mockFile(3, 'upload', 'dataset', 'sales-2026.csv', 184_320, 20, 'available', { preview: 'summary' }),
+  mockFile(4, 'upload', 'video', 'stand-up.mp4', 48_234_000, 30, 'available', {
+    media: { status: 'done', duration_ms: 312_000 },
+  }),
+  mockFile(5, 'upload', 'audio', 'client call.m4a', 7_900_000, 50, 'available', {
+    media: { status: 'done', duration_ms: 1_845_000 },
+  }),
+  mockFile(6, 'upload', 'dataset', 'customer-export.zip', 12_800_000, 70, 'summary_only', { preview: 'summary' }),
+  mockFile(7, 'text', 'document', 'contract-draft.docx', null, 90, 'text_only', { preview: 'text' }),
+];
+
+function mockMatches(url: URL) {
+  const q = (url.searchParams.get('q') ?? '').trim().toLowerCase();
+  const kinds = (url.searchParams.get('kind') ?? '').split(',').filter(Boolean);
+  const since = Date.parse(url.searchParams.get('since') ?? '');
+  const until = Date.parse(url.searchParams.get('until') ?? '');
+  const min = Number(url.searchParams.get('min_bytes') ?? NaN);
+  const max = Number(url.searchParams.get('max_bytes') ?? NaN);
+  return MOCK_FILES.filter((f) => !kinds.length || kinds.includes(f.kind))
+    .filter((f) => !q || f.name.toLowerCase().includes(q) || (f.conversation?.title ?? '').toLowerCase().includes(q))
+    .filter((f) => Number.isNaN(since) || Date.parse(f.created_at) >= since)
+    .filter((f) => Number.isNaN(until) || Date.parse(f.created_at) < until)
+    .filter((f) => Number.isNaN(min) || (f.bytes !== null && f.bytes >= min))
+    .filter((f) => Number.isNaN(max) || (f.bytes !== null && f.bytes < max));
+}
+
+export function handleMockFiles(req: Request, view: 'list' | 'summary'): Response {
+  if (!hasMockSession(req)) return json(401, { detail: 'Not signed in.' });
+  const url = new URL(req.url);
+  const found = mockMatches(url);
+  if (view === 'summary') {
+    const kinds: Record<string, { count: number; bytes: number }> = {};
+    for (const kind of ['document', 'dataset', 'video', 'audio', 'recording']) {
+      const of = found.filter((f) => f.kind === kind);
+      kinds[kind] = { count: of.length, bytes: of.reduce((n, f) => n + (f.bytes ?? 0), 0) };
+    }
+    return json(200, {
+      kinds,
+      total: { count: found.length, bytes: found.reduce((n, f) => n + (f.bytes ?? 0), 0) },
+      retention: MOCK_RETENTION,
+    });
+  }
+  const sort = url.searchParams.get('sort') ?? 'newest';
+  const sorted = [...found].sort((a, b) => {
+    if (sort === 'oldest') return a.created_at.localeCompare(b.created_at);
+    if (sort === 'largest') return (b.bytes ?? -1) - (a.bytes ?? -1);
+    if (sort === 'name') return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+    return b.created_at.localeCompare(a.created_at);
+  });
+  return json(200, { items: sorted, next_cursor: null, retention: MOCK_RETENTION });
+}

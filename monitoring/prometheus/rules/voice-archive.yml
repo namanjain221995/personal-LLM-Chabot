@@ -1,0 +1,124 @@
+# The voice archive (orchestrator/app/voice_archive.py, 2026-09-30): finished
+# recordings' audio moves from the head's disk to the store on the worker
+# (compose/voice-store). Every series here comes from the ORCHESTRATOR's
+# /metrics (job orchestrator): the mover publishes its own backlog and errors
+# and relays the store's /health (free space, objects, scrub), so there is no
+# scrape job for the store and no TLS configuration in Prometheus.
+#
+# The series exist only in a process that has run a pass (VOICE_ARCHIVE_ENABLED
+# and the store configured); with the archive off every rule here is inert.
+# No rule turns a missing series into a value.
+#
+# RULES ONLY, NO MAIL: Prometheus has no Alertmanager and the owner wants no
+# alert mail; these show on the Prometheus alerts page and the dashboards.
+# Runbook: docs/voice-archive.md. Unit tests: monitoring/prometheus/tests/voice_archive.yml.
+
+groups:
+  - name: voice-archive-recording
+    rules:
+      # Failures by reason over an hour, for the dashboards.
+      - record: reason:voice_archive_errors:increase1h
+        expr: sum by (reason) (increase(voice_archive_errors_total[1h]))
+
+  - name: voice-archive
+    rules:
+      # The store has not answered ready for 15 minutes while the mover runs.
+      # Recording and transcripts are unaffected; playback of recordings that
+      # already moved answers 503 archive_unavailable, and the backlog waits
+      # on the head.
+      - alert: VoiceArchiveStoreDown
+        expr: max by (instance) (voice_archive_store_up) == 0 and on (instance) max by (instance) (voice_archive_enabled) == 1
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "The voice archive store on the worker has not answered for 15 minutes"
+          description: >-
+            Moved recordings cannot be played or retranscribed until it is
+            back; nothing is lost and new recordings keep working.
+            `scripts/voice-store.sh status` shows the container and /health.
+          runbook: docs/voice-archive.md#when-the-store-is-down
+
+      # A finished recording is still only on the head six hours after its
+      # grace period: the mover is failing (voice_archive_errors_total says
+      # why) or the store is full.
+      - alert: VoiceArchiveBacklogOverdue
+        expr: max by (instance) (voice_archive_overdue_oldest_seconds) > 21600
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "A finished recording has waited {{ $value | humanizeDuration }} past its grace to move"
+          description: >-
+            The head keeps it, so nothing is lost, but the head's disk is
+            carrying it. `docker exec sf-local-ai-orchestrator-1 python -m
+            app.voice_archive status` shows the counts; archive_error on the
+            row names the reason.
+          runbook: docs/voice-archive.md#when-recordings-stop-moving
+
+      # The reconcile found archived recordings that the store no longer
+      # has. With one copy, that audio is gone.
+      - alert: VoiceArchiveCopiesMissing
+        expr: max by (instance) (voice_archive_remote_missing) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} archived recording(s) are missing from the voice archive store"
+          description: >-
+            Rows with archive_error = 'remote_missing'. Check the worker's disk
+            and ~/techsara-data/voice before anything else writes there.
+          runbook: docs/voice-archive.md#when-the-store-lost-a-recording
+
+      # Deleted recordings whose copy is still on the worker: a privacy lag,
+      # usually the store being down.
+      - alert: VoiceArchivePurgeStuck
+        expr: max by (instance) (voice_archive_purge_pending) > 0
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} deleted recording(s) still have a copy on the voice archive store"
+          description: >-
+            The person's delete took effect at once; the worker's copy goes on
+            the next pass that reaches the store.
+          runbook: docs/voice-archive.md#when-the-store-is-down
+
+      # The worker's disk is within 10% of the store's floor: the store will
+      # soon refuse uploads (507) and the backlog will grow on the head.
+      - alert: VoiceArchiveStoreLowSpace
+        expr: >-
+          max by (instance) (voice_archive_store_free_bytes)
+            < 1.1 * max by (instance) (voice_archive_store_min_free_bytes)
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "The voice archive's disk on the worker is near its free-space floor"
+          description: >-
+            `ssh worker df -h /` and `du -sh ~/techsara-data/voice` show
+            where the space went.
+          runbook: docs/voice-archive.md#when-the-worker-disk-fills
+
+      # The weekly scrub re-hashed a stored recording and its bytes no longer
+      # match: the one copy is damaged.
+      - alert: VoiceArchiveScrubMismatch
+        expr: max by (instance) (voice_archive_store_scrub_mismatches) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "The voice archive scrub found {{ $value }} damaged recording(s)"
+          description: >-
+            The store logs which ones (`scripts/voice-store.sh logs`). With one
+            copy it cannot repair them.
+          runbook: docs/voice-archive.md#when-the-store-lost-a-recording
+
+      # The mover's loop has not finished a pass for 15 minutes (it runs
+      # every minute).
+      - alert: VoiceArchivePassStalled
+        expr: >-
+          (time() - max by (instance) (voice_archive_last_pass_timestamp_seconds)) > 900
+            and on (instance) max by (instance) (voice_archive_enabled) == 1
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "The voice archive's mover has not completed a pass for {{ $value | humanizeDuration }}"
+          description: >-
+            The orchestrator log names the failure ("voice archive pass
+            failed").
+          runbook: docs/voice-archive.md#when-recordings-stop-moving

@@ -1,0 +1,635 @@
+// @vitest-environment jsdom
+/**
+ * A photo the server stored by itself shows on every device
+ * (docs/chat-media/STORE-ALWAYS.md §2, 2026-10-03).
+ *
+ * Production, 01:59 IST: the owner's phone tab predated the deploy, so its
+ * old JavaScript sent the invoice photo with no `image_ids` and wrote no
+ * `meta.images`. The server now stores such a photo under
+ * `ix-<intent_id>-<index>`; the turn carries that intent. These pin the
+ * browser's half: find those ids in the chat's list (one read per chat per
+ * page load, never per turn), show them like any stored photo, write
+ * `meta.images` once so the next load needs no list, and say "not stored"
+ * only when the list holds nothing for the turn. And (QA 2026-10-03) a
+ * regenerate, retry or edit of such a turn sends the photos by reference and
+ * keeps them on the turn, even before the backfill has written them.
+ *
+ * Everything is REAL except the network: the real ChatApp, the real history
+ * store (blob engine over an in-memory Storage that outlives a "reload"), the
+ * real history API client, and a small server that moves `updated_at` on
+ * every write and refuses a stale PUT, as the orchestrator does.
+ *
+ * Fixture ids are low-entropy on purpose (gitleaks, memory note "gitleaks
+ * trips on fabricated UUID fixtures").
+ */
+
+import { act, cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+/* ---------------------------------------------------------- the server */
+
+interface Row {
+  id: number;
+  role: string;
+  content: string;
+  meta: Record<string, unknown> | null;
+}
+
+interface ServerConversation {
+  title: string;
+  rows: Row[];
+  version: number;
+}
+
+interface MediaItem {
+  attachment_id: string;
+  mime?: string;
+  width?: number;
+  height?: number;
+}
+
+const server = new Map<string, ServerConversation>();
+let nextRowId = 1;
+/** Every request, as `METHOD path`. */
+let requests: string[] = [];
+/** Every PUT body's messages. */
+let puts: Array<Array<{ role: string; content: string; meta?: Record<string, unknown> }>> = [];
+/** GET /api/chat-media/{conv}: the items, or null for a 502. */
+let mediaItems: MediaItem[] | null = [];
+/** Refuse the next N PUTs as "conversation changed" (another writer moved it). */
+let movePuts = 0;
+/** Every POST /api/chat body. */
+let chatPosts: Array<Record<string, unknown>> = [];
+const REGEN_ANSWER = 'Again: the invoice totals 4,250 rupees.';
+
+const stamp = (c: ServerConversation) =>
+  new Date(Date.UTC(2026, 9, 3, 0, 0, c.version)).toISOString();
+
+function addRows(id: string, rows: Omit<Row, 'id'>[]) {
+  const c = server.get(id)!;
+  for (const r of rows) c.rows.push({ ...r, id: nextRowId++ });
+  c.version += 1;
+}
+
+/* ------------------------------------------------------- the real store */
+
+vi.mock('@/lib/history', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/history')>();
+  const data = new Map<string, string>();
+  let store: ReturnType<typeof actual.createServerHistoryStore> | null = null;
+  return {
+    ...actual,
+    getHistoryStore: () => {
+      if (!store) {
+        store = actual.createServerHistoryStore({
+          storage: {
+            getItem: (k) => data.get(k) ?? null,
+            setItem: (k, v) => void data.set(k, v),
+            removeItem: (k) => void data.delete(k),
+          },
+        });
+      }
+      return store;
+    },
+    __reloadForTest: () => {
+      store = null;
+    },
+    __wipeForTest: () => {
+      store = null;
+      data.clear();
+    },
+  };
+});
+vi.mock('@/lib/auth', () => ({
+  fetchMe: async () => ({ ok: true, username: 'tester', user: null, features: {} }),
+  userScopeKey: () => 'tester',
+  redirectToLogin: () => undefined,
+  handleSessionEnd: async () => undefined,
+  isAccessEnded: () => false,
+}));
+vi.mock('@/lib/salesforceApi', () => ({
+  fetchSalesforceContext: async () => ({ options: [], pending: null }),
+  cancelClarification: async () => undefined,
+  shouldShowStarter: () => false,
+}));
+vi.mock('@/lib/compact', () => ({
+  isCompacting: () => false,
+  requestCompact: async () => null,
+}));
+
+const history = (await import('@/lib/history')) as typeof import('@/lib/history') & {
+  __reloadForTest: () => void;
+  __wipeForTest: () => void;
+};
+const { ChatApp } = await import('@/components/ChatApp');
+const { Providers } = await import('@/components/Providers');
+const { renderApp } = await import('./_wireHarness');
+const { streamingIds } = await import('@/lib/streams');
+
+/* ------------------------------------------------------------ the wire */
+
+type Reply = { ok: boolean; status: number; json?: unknown };
+const ok = (json: unknown, status = 200): Reply => ({ ok: true, status, json });
+const refuse = (status: number, json: unknown): Reply => ({ ok: false, status, json });
+
+function handleHistory(method: string, path: string, body: unknown): Reply {
+  const parts = path.split('?')[0].split('/').filter(Boolean).map(decodeURIComponent);
+  if (parts.length === 0) {
+    if (method === 'GET') {
+      if (path.includes('archived=true')) return ok([]);
+      return ok(
+        [...server.entries()].map(([id, c]) => ({ id, title: c.title, updated_at: stamp(c) })),
+      );
+    }
+    return ok({});
+  }
+  const id = parts[0];
+  const c = server.get(id);
+  if (!c) return refuse(404, { detail: 'not found' });
+  if (parts.length === 1) {
+    if (method === 'GET') {
+      return ok({ id, title: c.title, messages: c.rows, updated_at: stamp(c) });
+    }
+    return ok({ id });
+  }
+  const sub = parts[1];
+  if (sub === 'title') return ok({ title: c.title, generated: false });
+  if (sub === 'messages' && method === 'PUT') {
+    const { messages, expected_updated_at } = body as {
+      messages: { role: string; content: string; meta?: Record<string, unknown> }[];
+      expected_updated_at?: string;
+    };
+    puts.push(messages);
+    if (movePuts > 0) {
+      movePuts -= 1;
+      c.version += 1; // another writer moved it
+      return refuse(409, { detail: 'conversation changed', updated_at: stamp(c) });
+    }
+    if (expected_updated_at !== undefined && expected_updated_at !== stamp(c)) {
+      return refuse(409, { detail: 'conversation changed', updated_at: stamp(c) });
+    }
+    if (messages.length < c.rows.length) {
+      return refuse(409, { detail: 'refusing to shrink conversation' });
+    }
+    c.rows = messages.map((m) => ({
+      id: nextRowId++,
+      role: m.role,
+      content: m.content,
+      meta: m.meta ?? null,
+    }));
+    c.version += 1;
+    return ok({ id, count: c.rows.length });
+  }
+  return ok({});
+}
+
+function installFetch() {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      const method = (init?.method ?? 'GET').toUpperCase();
+      requests.push(`${method} ${u}`);
+      if (u === '/api/chat' && method === 'POST') {
+        chatPosts.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>);
+        const enc = new TextEncoder();
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(enc.encode(`event: token\ndata: ${JSON.stringify({ text: REGEN_ANSWER })}\n\n`));
+            c.enqueue(enc.encode('event: done\ndata: {}\n\n'));
+            c.close();
+          },
+        });
+        return { ok: true, status: 200, body, json: async () => ({}) };
+      }
+      let r: Reply;
+      if (u === '/api/chat/active') r = ok({ active: [] });
+      else if (u.startsWith('/api/chat/')) r = refuse(404, { detail: 'not found' });
+      else if (u.startsWith('/api/chat-media/') && method === 'GET') {
+        r = mediaItems === null ? refuse(502, { code: 'unreachable' }) : ok({ items: mediaItems });
+      } else if (u.startsWith('/api/chat-media/')) r = refuse(404, { detail: 'not found' });
+      else if (u.startsWith('/api/history/conversations')) {
+        const body =
+          typeof init?.body === 'string' ? (JSON.parse(init.body) as unknown) : undefined;
+        r = handleHistory(method, u.slice('/api/history/conversations'.length), body);
+      } else r = ok({});
+      return { ok: r.ok, status: r.status, json: async () => r.json ?? {} };
+    }),
+  );
+}
+
+/* ---------------------------------------------------------- the helpers */
+
+const CONV = 'conv-invoice';
+/** newIntentId's shape (32 hex), low-entropy for the secret scanner. */
+const INTENT = 'ab12'.repeat(8);
+const OTHER_INTENT = 'cd34'.repeat(8);
+const QUESTION = 'What is the total on this invoice?';
+const ANSWER = 'The invoice totals 4,250 rupees.';
+
+const IX = (i: number) => `ix-${INTENT}-${i}`;
+
+/** The owner's turn as the OLD page saved it: an intent, no meta.images. */
+function seedOldPageTurn() {
+  server.set(CONV, { title: 'Invoice', rows: [], version: 1 });
+  addRows(CONV, [
+    { role: 'user', content: QUESTION, meta: { intent: { id: INTENT, state: 'completed' } } },
+    { role: 'assistant', content: ANSWER, meta: { route: 'vision', intent_id: INTENT } },
+  ]);
+}
+
+/** Two photos, listed oldest first but deliberately out of index order, plus noise. */
+function storedTwoPhotos() {
+  mediaItems = [
+    { attachment_id: IX(1), mime: 'image/png', width: 800, height: 800 },
+    { attachment_id: `ix-${OTHER_INTENT}-0`, mime: 'image/jpeg', width: 10, height: 10 },
+    { attachment_id: IX(0), mime: 'image/jpeg', width: 1600, height: 1200 },
+    { attachment_id: 'img-phone-0001', mime: 'image/jpeg', width: 640, height: 480 },
+  ];
+}
+
+async function settle(rounds = 10) {
+  for (let i = 0; i < rounds; i += 1) {
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+}
+
+async function openApp(text = ANSWER) {
+  window.history.replaceState(null, '', `/?c=${CONV}`);
+  renderApp(ChatApp, Providers);
+  await screen.findByText(text, undefined, { timeout: 4000 });
+  await settle();
+}
+
+/** Run the backfill's idle tick and every push it causes to completion. */
+async function drain() {
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 20));
+  });
+  await act(async () => {
+    await history.getHistoryStore().flush();
+  });
+  await settle();
+}
+
+async function reload(text = ANSWER) {
+  cleanup();
+  history.__reloadForTest();
+  requests = [];
+  puts = [];
+  await openApp(text);
+}
+
+const listReads = () => requests.filter((r) => r === `GET /api/chat-media/${CONV}`).length;
+const thumbs = () =>
+  [...document.querySelectorAll('img[data-testid="stored-image"]')].map((n) =>
+    n.getAttribute('src'),
+  );
+const thumbFor = (i: number) => `/api/chat-media/${CONV}/${IX(i)}?size=thumb`;
+const serverUserMeta = () => server.get(CONV)!.rows.find((r) => r.role === 'user')!.meta;
+
+beforeEach(() => {
+  server.clear();
+  nextRowId = 1;
+  requests = [];
+  puts = [];
+  mediaItems = [];
+  movePuts = 0;
+  chatPosts = [];
+  history.__wipeForTest();
+  vi.stubGlobal('matchMedia', (query: string) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+    addListener: () => undefined,
+    removeListener: () => undefined,
+    dispatchEvent: () => false,
+  }));
+  // Idle time arrives at once in a test.
+  vi.stubGlobal('requestIdleCallback', (cb: () => void) => setTimeout(cb, 0));
+  Element.prototype.scrollTo = Element.prototype.scrollTo ?? (() => undefined);
+  installFetch();
+  window.localStorage.clear();
+});
+
+afterEach(async () => {
+  await waitFor(() => expect(streamingIds()).toEqual([]), { timeout: 4000 });
+  await act(async () => {
+    await history.getHistoryStore().flush();
+  });
+  await settle(2);
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+/* ============================================================ the tests */
+
+describe('a second device opens a chat whose photo an old page sent', () => {
+  it('shows the ix- photos in send order, then writes meta.images ONCE', async () => {
+    seedOldPageTurn();
+    storedTwoPhotos();
+    await openApp();
+
+    await waitFor(() => expect(thumbs()).toEqual([thumbFor(0), thumbFor(1)]), { timeout: 4000 });
+    // The box is reserved from the listed size, like any meta.images thumb.
+    const first = document.querySelector('img[data-testid="stored-image"]')!;
+    expect(first.getAttribute('width')).toBe('1600');
+    expect(first.getAttribute('height')).toBe('1200');
+    expect(screen.queryByTestId('legacy-photo-note')).toBeNull();
+
+    // One read of the list for the whole chat, one PUT carrying the refs.
+    await waitFor(() => expect(puts).toHaveLength(1), { timeout: 4000 });
+    await drain();
+    expect(listReads()).toBe(1);
+    expect(puts).toHaveLength(1);
+    expect(serverUserMeta()?.images).toEqual([
+      { attachment_id: IX(0), mime: 'image/jpeg', width: 1600, height: 1200 },
+      { attachment_id: IX(1), mime: 'image/png', width: 800, height: 800 },
+    ]);
+    // The intent is kept as it was.
+    expect((serverUserMeta()?.intent as { id: string }).id).toBe(INTENT);
+
+    // The next load needs no list: the reference is on the turn now.
+    await reload();
+    await drain();
+    expect(thumbs()).toEqual([thumbFor(0), thumbFor(1)]);
+    expect(listReads()).toBe(0);
+    expect(puts).toHaveLength(0);
+  });
+
+  it('re-applies the reference once when its PUT is refused as stale (409)', async () => {
+    seedOldPageTurn();
+    storedTwoPhotos();
+    movePuts = 1;
+    await openApp();
+    await waitFor(() => expect(thumbs()).toHaveLength(2), { timeout: 4000 });
+    await waitFor(() => expect((serverUserMeta()?.images as unknown[] | undefined)?.length).toBe(2), {
+      timeout: 4000,
+    });
+    await drain();
+    expect(puts.length).toBeGreaterThanOrEqual(2);
+    expect(puts.length).toBeLessThanOrEqual(3);
+    expect((serverUserMeta()?.images as unknown[]).length).toBe(2);
+    expect(listReads()).toBe(1);
+  });
+
+  it('says "not stored" only when the list holds nothing for the turn', async () => {
+    seedOldPageTurn();
+    mediaItems = [{ attachment_id: `ix-${OTHER_INTENT}-0`, mime: 'image/png' }];
+    await openApp();
+    expect(await screen.findByTestId('legacy-photo-note', undefined, { timeout: 4000 })).toBeTruthy();
+    expect(thumbs()).toEqual([]);
+    await drain();
+    // Nothing to write.
+    expect(puts).toHaveLength(0);
+  });
+
+  it('says nothing while the list cannot be read, and shows nothing it does not know', async () => {
+    seedOldPageTurn();
+    mediaItems = null;
+    await openApp();
+    await waitFor(() => expect(listReads()).toBeGreaterThanOrEqual(1), { timeout: 4000 });
+    await drain();
+    expect(screen.queryByTestId('legacy-photo-note')).toBeNull();
+    expect(thumbs()).toEqual([]);
+    expect(puts).toHaveLength(0);
+  });
+
+  it('a chat open here picks up another device’s old-page photo turn on return', async () => {
+    server.set(CONV, { title: 'Invoice', rows: [], version: 1 });
+    addRows(CONV, [
+      { role: 'user', content: 'Hello there.', meta: { intent: { id: OTHER_INTENT, state: 'completed' } } },
+      { role: 'assistant', content: 'Hello! How can I help?', meta: { route: 'chat' } },
+    ]);
+    mediaItems = [];
+    await openApp('Hello! How can I help?');
+    await drain();
+    expect(listReads()).toBe(1);
+
+    // The phone's old page sends the photo; the server stores it as ix-.
+    addRows(CONV, [
+      { role: 'user', content: QUESTION, meta: { intent: { id: INTENT, state: 'completed' } } },
+      { role: 'assistant', content: ANSWER, meta: { route: 'vision', intent_id: INTENT } },
+    ]);
+    mediaItems = [{ attachment_id: IX(0), mime: 'image/jpeg', width: 1600, height: 1200 }];
+
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await screen.findByText(ANSWER, undefined, { timeout: 4000 });
+    await waitFor(() => expect(thumbs()).toEqual([thumbFor(0)]), { timeout: 4000 });
+    expect(screen.queryByTestId('legacy-photo-note')).toBeNull();
+    // The list is read again because the chat moved, not per turn.
+    expect(listReads()).toBe(2);
+    const photoTurn = () => server.get(CONV)!.rows.find((r) => r.content === QUESTION)!;
+    await waitFor(() => expect(photoTurn().meta?.images).toBeTruthy(), { timeout: 4000 });
+    await drain();
+    expect(serverUserMeta()).toEqual({ intent: { id: OTHER_INTENT, state: 'completed' } });
+    expect(photoTurn().meta?.images).toEqual([
+      { attachment_id: IX(0), mime: 'image/jpeg', width: 1600, height: 1200 },
+    ]);
+  });
+
+  it('never asks per turn: ten text turns with intents cost one list read', async () => {
+    server.set(CONV, { title: 'Long', rows: [], version: 1 });
+    for (let i = 0; i < 10; i += 1) {
+      const intent = `${i}`.repeat(32);
+      addRows(CONV, [
+        { role: 'user', content: `question ${i}`, meta: { intent: { id: intent, state: 'completed' } } },
+        { role: 'assistant', content: `answer ${i}`, meta: { route: 'chat', intent_id: intent } },
+      ]);
+    }
+    await openApp('answer 9');
+    await waitFor(() => expect(listReads()).toBe(1), { timeout: 4000 });
+    await drain();
+    expect(listReads()).toBe(1);
+    expect(puts).toHaveLength(0);
+  });
+});
+
+/* ======================= a turn the no-limits release sent by reference */
+
+describe('a turn sent by reference over the inline budget (no limits)', () => {
+  // docs/chat-media/LIMITS.md: such a send stores its photos under the
+  // composer's ids first and writes them into `meta.images`, like any send.
+  const REF = (i: number) => `img-ref-${String(i).padStart(4, '0')}`;
+  const photo = (attachment_id: string) => ({
+    attachment_id,
+    mime: 'image/png',
+    width: 800,
+    height: 600,
+  });
+
+  it('shows its own references once: no list read, no ix- lookup, no "not stored" line', async () => {
+    server.set(CONV, { title: 'Receipts', rows: [], version: 1 });
+    addRows(CONV, [
+      {
+        role: 'user',
+        content: QUESTION,
+        meta: {
+          intent: { id: INTENT, state: 'completed' },
+          images: Array.from({ length: 6 }, (_, i) => photo(REF(i))),
+        },
+      },
+      { role: 'assistant', content: ANSWER, meta: { route: 'vision', intent_id: INTENT } },
+    ]);
+    // The server ALSO holds ix- rows under the same intent (a send whose ids
+    // did not fit its pictures): the turn's own references still decide.
+    mediaItems = [
+      ...Array.from({ length: 6 }, (_, i) => photo(REF(i))),
+      ...Array.from({ length: 6 }, (_, i) => photo(IX(i))),
+    ];
+    await openApp();
+    await drain();
+    expect(thumbs()).toEqual(
+      Array.from({ length: 6 }, (_, i) => `/api/chat-media/${CONV}/${REF(i)}?size=thumb`),
+    );
+    expect(screen.queryByTestId('legacy-photo-note')).toBeNull();
+    expect(listReads()).toBe(0);
+    expect(puts).toHaveLength(0);
+  });
+});
+
+describe('a resend of a turn whose photos the server stored by itself (QA 2026-10-03)', () => {
+  async function tryAgain() {
+    const buttons = await screen.findAllByRole('button', { name: /Try again/i });
+    await act(async () => {
+      fireEvent.click(buttons[buttons.length - 1]);
+    });
+  }
+
+  async function answered() {
+    await screen.findByText(REGEN_ANSWER, undefined, { timeout: 4000 });
+    await waitFor(() => expect(streamingIds()).toEqual([]), { timeout: 4000 });
+    await drain();
+  }
+
+  const refsOf = (meta: Record<string, unknown> | null | undefined) =>
+    (meta?.images as Array<{ attachment_id: string }> | undefined)?.map((i) => i.attachment_id);
+
+  it('"Try again" before the references are written sends the photos by reference and keeps them', async () => {
+    seedOldPageTurn();
+    storedTwoPhotos();
+    // The backfill's idle tick never comes (a busy phone): the regenerate is
+    // the first thing to need the references.
+    vi.stubGlobal('requestIdleCallback', () => 0);
+    await openApp();
+    await waitFor(() => expect(thumbs()).toEqual([thumbFor(0), thumbFor(1)]), { timeout: 4000 });
+    expect(puts).toHaveLength(0);
+
+    await tryAgain();
+    await answered();
+
+    expect(chatPosts).toHaveLength(1);
+    expect(chatPosts[0].image_refs).toEqual([IX(0), IX(1)]);
+    expect(chatPosts[0]).not.toHaveProperty('image');
+    // A new answer is a new send: the turn's intent moves on...
+    const sentIntent = chatPosts[0].intent_id;
+    expect(sentIntent).not.toBe(INTENT);
+    expect((serverUserMeta()?.intent as { id: string }).id).toBe(sentIntent);
+    // ...and the photos stay on it, here and for every other device.
+    expect(thumbs()).toEqual([thumbFor(0), thumbFor(1)]);
+    expect(serverUserMeta()?.images).toEqual([
+      { attachment_id: IX(0), mime: 'image/jpeg', width: 1600, height: 1200 },
+      { attachment_id: IX(1), mime: 'image/png', width: 800, height: 800 },
+    ]);
+    // The page's one read of the list served the regenerate too.
+    expect(listReads()).toBe(1);
+  });
+
+  it('"Try again" while the list cannot be read changes nothing; once it answers, the photos go', async () => {
+    seedOldPageTurn();
+    mediaItems = null;
+    await openApp();
+    await waitFor(() => expect(listReads()).toBeGreaterThanOrEqual(1), { timeout: 4000 });
+    await drain();
+
+    await tryAgain();
+    expect(
+      await screen.findByText('The server could not be reached. Check the connection and retry.'),
+    ).toBeTruthy();
+    await drain();
+    expect(chatPosts).toHaveLength(0);
+    // Not re-keyed: the turn's intent still finds its photos.
+    expect(serverUserMeta()).toEqual({ intent: { id: INTENT, state: 'completed' } });
+
+    storedTwoPhotos();
+    await tryAgain();
+    await answered();
+    expect(chatPosts).toHaveLength(1);
+    expect(chatPosts[0].image_refs).toEqual([IX(0), IX(1)]);
+    expect(thumbs()).toEqual([thumbFor(0), thumbFor(1)]);
+    expect(refsOf(serverUserMeta())).toEqual([IX(0), IX(1)]);
+  });
+
+  it('an edit before the references are written inherits the photos and sends them by reference', async () => {
+    seedOldPageTurn();
+    storedTwoPhotos();
+    vi.stubGlobal('requestIdleCallback', () => 0);
+    await openApp();
+    await waitFor(() => expect(thumbs()).toEqual([thumbFor(0), thumbFor(1)]), { timeout: 4000 });
+
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('button', { name: 'Edit message' }));
+    });
+    const editor = screen.getByRole('textbox', { name: 'Edit your message' });
+    await act(async () => {
+      fireEvent.change(editor, { target: { value: 'What is the tax on this invoice?' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    });
+    await answered();
+
+    expect(chatPosts).toHaveLength(1);
+    expect(chatPosts[0].image_refs).toEqual([IX(0), IX(1)]);
+    // The new version shows the photos; both versions carry the references,
+    // and the original keeps its own intent.
+    expect(thumbs()).toEqual([thumbFor(0), thumbFor(1)]);
+    const users = server.get(CONV)!.rows.filter((r) => r.role === 'user');
+    expect(users.map((r) => refsOf(r.meta))).toEqual([
+      [IX(0), IX(1)],
+      [IX(0), IX(1)],
+    ]);
+    expect((users[0].meta?.intent as { id: string }).id).toBe(INTENT);
+  });
+
+  it('a text turn regenerates exactly as before: no references, no second read', async () => {
+    server.set(CONV, { title: 'Hello', rows: [], version: 1 });
+    addRows(CONV, [
+      { role: 'user', content: 'Hello there.', meta: { intent: { id: OTHER_INTENT, state: 'completed' } } },
+      { role: 'assistant', content: 'Hello! How can I help?', meta: { route: 'chat', intent_id: OTHER_INTENT } },
+    ]);
+    mediaItems = [];
+    await openApp('Hello! How can I help?');
+    await drain();
+
+    await tryAgain();
+    await answered();
+    expect(chatPosts).toHaveLength(1);
+    expect(chatPosts[0]).not.toHaveProperty('image_refs');
+    expect(listReads()).toBe(1);
+    expect(serverUserMeta()?.images).toBeUndefined();
+  });
+
+  it('a text turn regenerates as before while the list cannot be read', async () => {
+    // Only a turn answered from a photo waits for the list: "Try again" on
+    // anything else is not tied to the photo list's health.
+    server.set(CONV, { title: 'Hello', rows: [], version: 1 });
+    addRows(CONV, [
+      { role: 'user', content: 'Hello there.', meta: { intent: { id: OTHER_INTENT, state: 'completed' } } },
+      { role: 'assistant', content: 'Hello! How can I help?', meta: { route: 'chat', intent_id: OTHER_INTENT } },
+    ]);
+    mediaItems = null;
+    await openApp('Hello! How can I help?');
+    await drain();
+
+    await tryAgain();
+    await answered();
+    expect(chatPosts).toHaveLength(1);
+    expect(chatPosts[0]).not.toHaveProperty('image_refs');
+    expect(screen.queryByText('The server could not be reached. Check the connection and retry.')).toBeNull();
+  });
+});
