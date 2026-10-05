@@ -976,12 +976,6 @@ async def check_dependencies() -> dict:
     }
     checks["duckdb"] = results[required_count]
     checks["app_db"] = results[required_count + 1]
-    # The new Salesforce pipeline, reported but never probed: it holds no
-    # network connection of its own and asking it to build here would make a
-    # health check open SQLite and DuckDB. "disabled" is the normal answer
-    # while the cutover flag is off, and an operator wondering why the new path
-    # is quiet reads it here instead of in the logs.
-    checks["salesforce_pipeline"] = _salesforce_pipeline_check()
     # The engine-availability view (2026-09-12) rides on the main model's
     # entry — see engine_availability for why there and why it cannot move
     # `status`. `seen` maps the URL to the name it was probed under, so a
@@ -1107,4 +1101,11 @@ async def check_dependencies() -> dict:
         "web_index": web_index_result,
         "work": work_result,
         "artifacts": artifacts_result,
+        # The new Salesforce pipeline is additive like `web_index`: reported,
+        # never probed, and never part of `status`. It holds no network
+        # connection of its own, and asking it to build here would make a
+        # health check open SQLite and DuckDB. "disabled" is the normal answer
+        # while the cutover flag is off; inside `checks` it made every healthy
+        # deployment report "degraded".
+        "salesforce_pipeline": _salesforce_pipeline_check(),
     }
