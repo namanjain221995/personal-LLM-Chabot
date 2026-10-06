@@ -27,6 +27,16 @@
       # rank-12 answer and promoted an unrelated field to rank 1. Turn on once
       # the 78-case dataset has scored it.
       KNOWLEDGE_RERANK: ${KNOWLEDGE_RERANK:-false}
+      # Step 1: the model that reads the question into structured intent.
+      # Blank disables it and the lexical path runs alone.
+      EXTRACT_BASE_URL: ${KNOWLEDGE_EXTRACT_URL:-http://vllm-router:30002/v1}
+      EXTRACT_MODEL: ${KNOWLEDGE_EXTRACT_MODEL:-Qwen/Qwen3-VL-8B-Instruct-FP8}
+      KNOWLEDGE_EXTRACT: ${KNOWLEDGE_EXTRACT:-true}
+      # Its own trace store, separate from the orchestrator's query_traces in
+      # PostgreSQL: the two describe different pipelines, and mixing them makes
+      # "did the new architecture do better?" unanswerable.
+      KNOWLEDGE_TRACING: ${KNOWLEDGE_TRACING:-true}
+      KNOWLEDGE_TRACE_DB: /data/traces/knowledge_traces.sqlite
     volumes:
       # The bundle is DATA: 85 MB, read-only, rebuilt offline from the mirror.
       # A new version is a mount change, not an image rebuild.
@@ -35,6 +45,9 @@
       # would need a build context at the repository root (403 MB), which would
       # pull the metadata mirror and its live credentials into an image layer.
       - ./brain/Salesforce-Org-Data-main/src/graphrag:/app/vendor/graphrag:ro
+      # WRITABLE, and a named volume rather than a bind: traces are append-only
+      # and must outlive every bundle rebuild.
+      - knowledge-traces:/data/traces
     ports:
       # Loopback only. Nothing outside this host needs it, and it has no auth
       # of its own — it answers questions about schema, not about records.
@@ -49,3 +62,8 @@
       timeout: 10s
       retries: 3
       start_period: 30s
+
+# Add alongside the other named volumes at the top of docker-compose.yml:
+#
+# volumes:
+#   knowledge-traces:

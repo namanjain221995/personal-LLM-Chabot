@@ -1,0 +1,38 @@
+# One question per line. Lines starting with # are ignored.
+# counts
+How many interviews do we have in our org?
+How many internal interviews do we have?
+How many employees do we have?
+How many applications do we have?
+How many companies do we have?
+# picklist filters
+How many interviews are scheduled?
+How many interviews were cancelled?
+How many interviews were no shows?
+How many interviews got rejected?
+How many interviews moved to the next round?
+How many candidates are placed?
+How many candidates are on hold?
+Show candidates with status paused
+# ambiguous business words
+How many interviews resulted in an offer?
+How many interviews are in reference check?
+List candidates who got an offer
+Show active candidates
+How many interviews ended with the candidate ghosting?
+# yes/no fields on employees
+Which employees are available to take mock interviews?
+Which employees are available to provide support?
+Which employees are on break?
+Is Jayesh Prajapati available to provide support?
+# one named record
+What is Jayesh Prajapati's email?
+What is Jayesh Prajapati's designation?
+# dates
+How many interviews were created last month?
+How many internal interviews are scheduled for tomorrow?
+List applications created in September 2026
+Which employees joined in 2025?
+# should decline
+Hello, what can you do?
+How many widgets did we sell?

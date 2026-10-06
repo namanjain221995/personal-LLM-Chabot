@@ -94,3 +94,65 @@ terms:
     note: >-
       Confirm that "mock interview" means Internal_Interview__c and not a
       subset of it distinguished by Interview_Type__c.
+
+  # ------------------------------------------------ stated 2026-09-29 (step 7)
+  # Stated by the product owner in the step-7 pipeline specification. Each
+  # target was checked against the runtime schema before being added.
+  candidates:
+    target: object:Account
+    confidence: high
+    source: step-7 specification, 2026-09-29 — "candidate -> Account"
+  background check:
+    target: object:Background_Check__c
+    confidence: high
+    source: catalog — Background_Check__c.label == "Background Check"
+
+  # Interview__c has TWO picklists that both list "Offer Received":
+  # Interview_Status__c and Interview_Outcome__c. Picklist evidence alone
+  # therefore cannot decide, and the business meaning has to be stated.
+  offer status:
+    target: field:Interview__c.Interview_Outcome__c
+    confidence: high
+    source: step-7 specification, 2026-09-29 — "offer status -> Interview_Outcome__c"
+    note: >-
+      Offers and other results of an interview are recorded in
+      Interview_Outcome__c. Interview_Status__c also lists "Offer Received";
+      for questions about offers, outcomes or results, use Interview_Outcome__c.
+  interview outcome:
+    target: field:Interview__c.Interview_Outcome__c
+    confidence: high
+    source: catalog — label "Interview Outcome"
+  interview result:
+    target: field:Interview__c.Interview_Outcome__c
+    confidence: high
+    source: step-7 specification, 2026-09-29
+  completed interview status:
+    target: field:Interview__c.Interview_Status__c
+    confidence: high
+    source: step-7 specification, 2026-09-29 — "completed interview status -> Interview_Status__c"
+    note: >-
+      Scheduling state of an interview (Scheduled, Completed, Rescheduled,
+      Cancelled, No Show) lives in Interview_Status__c.
+
+  support availability:
+    target: field:Recruiter__c.Active_For_Interview_Support__c
+    confidence: high
+    source: step-7 specification, 2026-09-29 — "support availability -> Active_For_Interview_Support__c"
+    note: >-
+      A checkbox. "Available to provide (interview) support" means
+      Active_For_Interview_Support__c = true.
+  available to provide support:
+    target: field:Recruiter__c.Active_For_Interview_Support__c
+    confidence: high
+    source: step-7 specification, 2026-09-29
+  mock interview availability:
+    target: field:Recruiter__c.Active_For_Mock_Interview__c
+    confidence: high
+    source: step-7 specification, 2026-09-29
+    note: >-
+      A checkbox. "Available to take mock interviews" means
+      Active_For_Mock_Interview__c = true.
+  available to take mock interviews:
+    target: field:Recruiter__c.Active_For_Mock_Interview__c
+    confidence: high
+    source: step-7 specification, 2026-09-29

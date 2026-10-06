@@ -1,0 +1,603 @@
+# 500 questions about the 50 custom objects with the most fields that have records in the warehouse.
+# Generated from the runtime schema and the warehouse's own values.
+# One question per line; lines starting with # are skipped.
+
+# Interview (Interview__c) - 257 fields, 10843 records
+How many interviews do we have?
+How many interviews have advanced to next round Yes?
+How many interviews have cap hit checked?
+How many interviews were created last month?
+What is the ai assignment confidence of interview I-000000?
+How many interviews have their ai suggestions expiry in 2026?
+Break down interviews by advanced to next round.
+List all interviews.
+Show interviews where approve stage is Ready.
+How many interviews have follow-up active checked?
+
+# Onboarding (Onboarding__c) - 153 fields, 993 records
+How many onboardings do we have?
+How many onboardings have candidate time zone UTC (Coordinated Universal Time)?
+How many onboardings have account information collected checked?
+How many onboardings were created last month?
+What is the ats score of onboarding OB-0040?
+How many onboardings have their date of arrival in 2026?
+Break down onboardings by candidate time zone.
+List all onboardings.
+Show onboardings where degree 2 is Masters.
+How many onboardings have active cpt checked?
+
+# Invoice (Invoice__c) - 92 fields, 90 records
+How many invoices do we have?
+How many invoices have dispute status None?
+How many invoices have auto send email checked?
+How many invoices were created last month?
+What is the ach amount of invoice 1107?
+How many invoices have their cancelled date in 2026?
+Break down invoices by dispute status.
+List all invoices.
+Show invoices where frequency is Monthly.
+How many invoices have card surcharge applied (4%) checked?
+
+# Internal Interview (Internal_Interview__c) - 76 fields, 491 records
+How many internal interviews do we have?
+How many internal interviews have employement type Full Time?
+Which internal interviews have resume?
+How many internal interviews were created last month?
+What is the ai assignment confidence of internal interview INT-00083?
+How many internal interviews have their scheduled date in 2026?
+Break down internal interviews by employement type.
+List all internal interviews.
+Show internal interviews where human decision is Pass.
+Which internal interviews are final week mock?
+
+# Session (Session__c) - 71 fields, 555 records
+How many sessions do we have?
+How many sessions have purpose Internal Interview?
+How many sessions have same person throughout checked?
+How many sessions were created last month?
+What is the approx time of session SES-001406?
+How many sessions have their actual end in 2026?
+Break down sessions by purpose.
+List all sessions.
+Show sessions where selected time zone end time is 12:00 PM.
+List sessions created in September 2026.
+
+# Employee (Recruiter__c) - 53 fields, 293 records
+How many employees do we have?
+How many employees have designation Customer success Executive?
+How many employees have active for interview support checked?
+How many employees were created last month?
+What is the buffer minutes before/after of employee Ankit Karmhe?
+How many employees have their compass state last saved (utc) in 2026?
+Break down employees by designation.
+List all employees.
+Show employees where employment status is Active Employee.
+How many employees have active for mock interview checked?
+
+# AI Assignment Logs (AI_Assignment_Logs__c) - 44 fields, 13 records
+How many ai assignment logs do we have?
+How many ai assignment logs have reassignment reason picklist values Previous round extended for current Interview Support Person?
+How many ai assignment logs were created last month?
+What is the compass r scheduler run status code of ai assignment logs AI-00857?
+How many ai assignment logs have their compass r scheduler run on in 2026?
+Break down ai assignment logs by reassignment reason picklist values.
+List all ai assignment logs.
+List ai assignment logs created in September 2026.
+Show the compass r scheduler run status code of all ai assignment logs.
+List ai assignment logs with their candidate interview change.
+
+# Background Check (Background_Check__c) - 42 fields, 47 records
+How many background checks do we have?
+How many background checks have ach authorization status Pending?
+How many background checks have accept this record from queue checked?
+How many background checks were created last month?
+What is the company name of background check BCN-00028?
+How many background checks have their ach authorization signed date in 2026?
+Break down background checks by ach authorization status.
+List all background checks.
+Show background checks where background check status is Payment Verification Pending.
+How many background checks have before background check checked?
+
+# Employee Leave (Employee_Leave__c) - 41 fields, 18 records
+How many employee leaves do we have?
+How many employee leaves have end time 12:00 AM?
+How many employee leaves have attachment required checked?
+How many employee leaves were created last month?
+What is the leave event id of employee leave A-0128?
+How many employee leaves have their end datetime in 2026?
+Break down employee leaves by end time.
+List all employee leaves.
+Show employee leaves where from session is Second Half.
+Which employee leaves are full day?
+
+# Payment (Payment__c) - 39 fields, 167 records
+How many payments do we have?
+How many payments have deposit status Pending?
+How many payments have refund receipt created checked?
+How many payments were created last month?
+What is the amount paid of payment Payment-009?
+How many payments have their deposit date in 2026?
+Break down payments by deposit status.
+List all payments.
+Show payments where issue status is Pending Finance.
+List payments created in September 2026.
+
+# Job Requirement (Job_Requirement__c) - 38 fields, 3 records
+How many job requirements do we have?
+How many job requirements have employment type W2 Contract?
+Which job requirements have client side?
+How many job requirements were created last month?
+What is the client bill rate of job requirement JR-00005?
+How many job requirements have their last notification sent in 2026?
+Break down job requirements by employment type.
+List all job requirements.
+Show job requirements where job status is Open.
+Which job requirements have prospect side?
+
+# Pre Enrolment Request (Pre_Enrolment_Request__c) - 29 fields, 355 records
+How many pre enrolment requests do we have?
+How many pre enrolment requests have criminal record declaration I do NOT have any criminal record?
+How many pre enrolment requests have acknowledgement declaration checked?
+How many pre enrolment requests were created last month?
+What is the candidate email snapshot of pre enrolment request PRENR-0333?
+How many pre enrolment requests have their expiration datetime in 2026?
+Break down pre enrolment requests by criminal record declaration.
+List all pre enrolment requests.
+Show pre enrolment requests where current visa status is OPT.
+How many pre enrolment requests have position type c2c checked?
+
+# Program Version (Program_Version__c) - 28 fields, 11 records
+How many program versions do we have?
+How many program versions have booking mode Fixed Schedule?
+How many program versions have include mock interview checked?
+How many program versions were created last month?
+What is the duration (days) of program version Non-Technical 1-1 Training - V1?
+How many program versions have their effective from in 2026?
+Break down program versions by booking mode.
+List all program versions.
+Show program versions where booking owner is Trainer Books.
+How many program versions have mock blocks progress checked?
+
+# Job Submission (Job_Submission__c) - 28 fields, 10 records
+How many job submissions do we have?
+How many job submissions have rate type Hourly?
+How many job submissions have interview requested checked?
+How many job submissions were created last month?
+What is the applicant email of job submission JS-00014?
+How many job submissions have their client submission date/time in 2026?
+Break down job submissions by rate type.
+List all job submissions.
+Show job submissions where submission source is Website Applicant.
+How many job submissions have offer received checked?
+
+# Candidate Training (Candidate_Training__c) - 22 fields, 434 records
+How many candidate trainings do we have?
+How many candidate trainings have candidate time zone end time 11:30 AM?
+How many candidate trainings were created last month?
+What is the candidate email of candidate training Spiderman Marvel - Techinal 1-1 Training - V1?
+How many candidate trainings have their drop date in 2026?
+Break down candidate trainings by candidate time zone end time.
+List all candidate trainings.
+Show candidate trainings where candidate time zone start time is 02:30 PM.
+List candidate trainings created in September 2026.
+Show the candidate email of all candidate trainings.
+
+# Deliverable (Deliverable__c) - 21 fields, 3254 records
+How many deliverables do we have?
+How many deliverables have status Approved?
+How many deliverables have approval required checked?
+How many deliverables were created last month?
+What is the ai latest score of deliverable Test Deliverbale?
+How many deliverables have their approved at in 2026?
+Break down deliverables by status.
+List all deliverables.
+How many deliverables have extension requested checked?
+List deliverables created in September 2026.
+
+# Background Check Employment (Background_Check_Employment__c) - 21 fields, 10 records
+How many background check employment do we have?
+How many background check employment have verification status Verified?
+How many background check employment have employer confirmed checked?
+How many background check employment were created last month?
+What is the employer name of background check employment BGC-00000?
+How many background check employment have their end date in 2026?
+Break down background check employment by verification status.
+List all background check employment.
+How many background check employment have current employer checked?
+List background check employment created in September 2026.
+
+# Zoom Recording Access Log (Zoom_Recording_Access_Log__c) - 19 fields, 61 records
+How many zoom recording access logs do we have?
+How many zoom recording access logs have event type Portal_Access?
+How many zoom recording access logs were created last month?
+What is the file key of zoom recording access log LOG-0010613?
+How many zoom recording access logs have their event timestamp in 2026?
+Break down zoom recording access logs by event type.
+List all zoom recording access logs.
+Show zoom recording access logs where source object is session.
+List zoom recording access logs created in September 2026.
+Show the file key of all zoom recording access logs.
+
+# Marketing (Marketing__c) - 18 fields, 2906 records
+How many marketing do we have?
+How many marketing have marketing type Full time?
+How many marketing have assign to lead checked?
+How many marketing were created last month?
+What is the effective recruiter name of marketing Rahil Mushtaq -USC-?
+How many marketing have their actual joining date in 2026?
+Break down marketing by marketing type.
+List all marketing.
+Show marketing where status is Closed.
+How many marketing have initial call completed checked?
+
+# Application (Application__c) - 18 fields, 13859 records
+How many applications do we have?
+How many applications have application update status Not Submitted?
+How many applications have target achieved checked?
+How many applications were created last month?
+What is the applicable target of application A-00024?
+How many applications have their application update submitted at in 2026?
+Break down applications by application update status.
+List all applications.
+List applications created in September 2026.
+Show the applicable target of all applications.
+
+# Candidate Training Step (CandidateTrainingStep__c) - 16 fields, 1465 records
+How many candidate training steps do we have?
+How many candidate training steps have status Not Started?
+How many candidate training steps were created last month?
+What is the assigned trainer name of candidate training step Day 1 - HR+ Niche Core Readiness?
+How many candidate training steps have their completed in 2026?
+Break down candidate training steps by status.
+List all candidate training steps.
+List candidate training steps created in September 2026.
+Show the assigned trainer name of all candidate training steps.
+List candidate training steps with their assigned trainer user.
+
+# Step Template (StepTemplate__c) - 14 fields, 52 records
+How many step templates do we have?
+Which step templates are required?
+How many step templates were created last month?
+What is the expected duration min of step template ST-0004?
+List all step templates.
+How many step templates have triggers mock checked?
+List step templates created in September 2026.
+Show the expected duration min of all step templates.
+List step templates with their program version.
+How many step templates were created this year?
+
+# Session Window (Session_Window__c) - 13 fields, 3 records
+How many session windows do we have?
+How many session windows have status Completed?
+How many session windows were created last month?
+What is the booked count of session window SW-0003?
+How many session windows have their activate from in 2026?
+Break down session windows by status.
+List all session windows.
+Show session windows where time zone is ET (Eastern Time).
+List session windows created in September 2026.
+Show the booked count of all session windows.
+
+# Education History (Education_History__c) - 12 fields, 9 records
+How many education histories do we have?
+How many education histories have degree type Bachelor's?
+How many education histories were created last month?
+What is the cgpa / score of education history EDU-0321?
+How many education histories have their end date in 2026?
+Break down education histories by degree type.
+List all education histories.
+Show education histories where institute country is India.
+List education histories created in September 2026.
+Show the cgpa / score of all education histories.
+
+# Session Attendee (Session_Attendee__c) - 11 fields, 1138 records
+How many session attendees do we have?
+How many session attendees were created last month?
+What is the candidate tz end time of session attendee SA-0224?
+How many session attendees have their scheduled date in 2026?
+List all session attendees.
+List session attendees created in September 2026.
+Show the candidate tz end time of all session attendees.
+List session attendees with their candidate training step.
+How many session attendees were created this year?
+How many session attendees were created in 2025?
+
+# Section (Section__c) - 11 fields, 6 records
+How many sections do we have?
+How many sections have domain type Tech?
+Which sections are active?
+How many sections were created last month?
+What is the estimated time(in minutes) of section Day 01 Machine Learning Fundamentals?
+Break down sections by domain type.
+List all sections.
+Show sections where question source type is Standard.
+List sections created in September 2026.
+Show the estimated time(in minutes) of all sections.
+
+# Question Bank (Question_Bank__c) - 11 fields, 620 records
+How many question banks do we have?
+How many question banks have difficulty level Medium?
+Which question banks are active?
+How many question banks were created last month?
+What is the question hash of question bank QB-00515?
+Break down question banks by difficulty level.
+List all question banks.
+List question banks created in September 2026.
+Show the question hash of all question banks.
+List question banks with their interview type (deprecated - do not use).
+
+# Internal Interview Question Log (Internal_Interview_Question_Log__c) - 11 fields, 413 records
+How many internal interview question logs do we have?
+How many internal interview question logs have question source used Standard?
+How many internal interview question logs were created last month?
+What is the sequence of internal interview question log IIQL-00584?
+Break down internal interview question logs by question source used.
+List all internal interview question logs.
+List internal interview question logs created in September 2026.
+Show the sequence of all internal interview question logs.
+List internal interview question logs with their internal interview section log.
+How many internal interview question logs have question source used AI Resume Based?
+
+# Resume Creation (Resume__c) - 10 fields, 25 records
+How many resume creations do we have?
+How many resume creations have resume status Uploaded?
+Which resume creations are active?
+How many resume creations were created last month?
+Show the details of resume creation RES-00065.
+How many resume creations have their approval date in 2026?
+Break down resume creations by resume status.
+List all resume creations.
+List resume creations created in September 2026.
+List resume creations with their approved by.
+
+# Availability (Availability__c) - 10 fields, 1519 records
+How many availabilites do we have?
+How many availabilites have time zone ET (Eastern Time)?
+How many availabilites were created last month?
+What is the date est of availability A-0004?
+How many availabilites have their end datetime in 2026?
+Break down availabilites by time zone.
+List all availabilites.
+List availabilites created in September 2026.
+Show the date est of all availabilites.
+List availabilites with their candidate.
+
+# Step Deliverable Definition (Step_Deliverable_Definition__c) - 8 fields, 1 records
+How many step deliverable definitions do we have?
+How many step deliverable definitions have type Video_URL?
+Which step deliverable definitions are required?
+How many step deliverable definitions were created last month?
+What is the days to complete of step deliverable definition SDD-0189?
+Break down step deliverable definitions by type.
+List all step deliverable definitions.
+List step deliverable definitions created in September 2026.
+Show the days to complete of all step deliverable definitions.
+List step deliverable definitions with their step template.
+
+# Recurring Break Series (Recurring_Break_Series__c) - 8 fields, 2 records
+How many recurring break series do we have?
+How many recurring break series have time zone ET (Eastern Time)?
+How many recurring break series were created last month?
+What is the description of recurring break series RBS-0000?
+How many recurring break series have their end date in 2026?
+Break down recurring break series by time zone.
+List all recurring break series.
+List recurring break series created in September 2026.
+Show the description of all recurring break series.
+How many recurring break series were created this year?
+
+# Onboarding Token (Onboarding_Token__c) - 8 fields, 12 records
+How many onboarding tokens do we have?
+How many onboarding tokens have onboarding form status Expired?
+How many onboarding tokens have used checked?
+How many onboarding tokens were created last month?
+What is the onboarding form link of onboarding token OTN-0744?
+How many onboarding tokens have their expires at in 2026?
+Break down onboarding tokens by onboarding form status.
+List all onboarding tokens.
+List onboarding tokens created in September 2026.
+Show the onboarding form link of all onboarding tokens.
+
+# Internal Interview Section Log (Internal_Interview_Section_Log__c) - 7 fields, 100 records
+How many internal interview section logs do we have?
+How many internal interview section logs have question source used Standard?
+How many internal interview section logs were created last month?
+What is the section score of internal interview section log IISL-00155?
+Break down internal interview section logs by question source used.
+List all internal interview section logs.
+List internal interview section logs created in September 2026.
+Show the section score of all internal interview section logs.
+List internal interview section logs with their internal interview.
+How many internal interview section logs have question source used AI Resume Based?
+
+# Deliverable Result (Deliverable_Result__c) - 7 fields, 2532 records
+How many deliverable results do we have?
+How many deliverable results have result status Fail?
+How many deliverable results were created last month?
+What is the ai score of deliverable result DR-000004?
+How many deliverable results have their submitted at in 2026?
+Break down deliverable results by result status.
+List all deliverable results.
+List deliverable results created in September 2026.
+Show the ai score of all deliverable results.
+List deliverable results with their deliverable.
+
+# Candidate Portal Session (Candidate_Portal_Session__c) - 7 fields, 18 records
+How many candidate portal sessions do we have?
+Which candidate portal sessions are active?
+How many candidate portal sessions were created last month?
+What is the ip address of candidate portal session CSN-00313?
+How many candidate portal sessions have their created at in 2026?
+List all candidate portal sessions.
+List candidate portal sessions created in September 2026.
+Show the ip address of all candidate portal sessions.
+List candidate portal sessions with their candidate credential.
+How many candidate portal sessions were created this year?
+
+# Candidate Portal Credential (Candidate_Portal_Credential__c) - 7 fields, 10 records
+How many candidate portal credentials do we have?
+Which candidate portal credentials are active?
+How many candidate portal credentials were created last month?
+What is the failed login count of candidate portal credential CCN-00080?
+How many candidate portal credentials have their last login at in 2026?
+List all candidate portal credentials.
+List candidate portal credentials created in September 2026.
+Show the failed login count of all candidate portal credentials.
+List candidate portal credentials with their candidate.
+How many candidate portal credentials were created this year?
+
+# Zoom Recording Department (Zoom_Recording_Department__c) - 6 fields, 19 records
+How many zoom recording departments do we have?
+Which zoom recording departments are active?
+How many zoom recording departments were created last month?
+What is the department code of zoom recording department Accountant?
+List all zoom recording departments.
+List zoom recording departments created in September 2026.
+Show the department code of all zoom recording departments.
+How many zoom recording departments were created this year?
+How many zoom recording departments were created in 2025?
+List zoom recording departments created this month.
+
+# Interview Evaluation (Interview_Evaluation__c) - 6 fields, 17 records
+How many interview evaluations do we have?
+How many interview evaluations have decision Pass?
+How many interview evaluations were created last month?
+What is the total score of interview evaluation IEQ-00019?
+Break down interview evaluations by decision.
+List all interview evaluations.
+Show interview evaluations where evaluation type is Human.
+List interview evaluations created in September 2026.
+Show the total score of all interview evaluations.
+List interview evaluations with their internal interview.
+
+# Organizational Unit (Department__c) - 6 fields, 14 records
+How many organizational units do we have?
+How many organizational units were created last month?
+What is the slack channel id of organizational unit Sales?
+List all organizational units.
+List organizational units created in September 2026.
+Show the slack channel id of all organizational units.
+List organizational units with their department.
+How many organizational units were created this year?
+How many organizational units were created in 2025?
+List organizational units created this month.
+
+# Application Benchmark (Application_Benchmark__c) - 6 fields, 17 records
+How many application benchmarks do we have?
+How many application benchmarks have niche AI ML Engineer?
+How many application benchmarks have active checked?
+How many application benchmarks were created last month?
+What is the minimum daily applications of application benchmark AB-000003?
+Break down application benchmarks by niche.
+List all application benchmarks.
+List application benchmarks created in September 2026.
+Show the minimum daily applications of all application benchmarks.
+List application benchmarks with their benchmark set by.
+
+# Template Section (Template_Section__c) - 4 fields, 5 records
+How many template sections do we have?
+Which template sections are active?
+How many template sections were created last month?
+What is the sequence of template section TEMP-00007?
+List all template sections.
+List template sections created in September 2026.
+Show the sequence of all template sections.
+List template sections with their section.
+How many template sections were created this year?
+How many template sections were created in 2025?
+
+# Template Section Question (Template_Section_Question__c) - 4 fields, 4 records
+How many template section questions do we have?
+Which template section questions are active?
+How many template section questions were created last month?
+What is the sequence of template section question TSQ-00012?
+List all template section questions.
+List template section questions created in September 2026.
+Show the sequence of all template section questions.
+List template section questions with their question.
+How many template section questions were created this year?
+How many template section questions were created in 2025?
+
+# Section Evaluation (Section_Evaluation__c) - 4 fields, 6 records
+How many section evaluations do we have?
+How many section evaluations were created last month?
+What is the score of section evaluation ES-0093?
+List all section evaluations.
+List section evaluations created in September 2026.
+Show the score of all section evaluations.
+List section evaluations with their evaluation.
+How many section evaluations were created this year?
+How many section evaluations were created in 2025?
+List section evaluations created this month.
+
+# Question Follow Up (Question_Follow_Up__c) - 4 fields, 125 records
+How many question follow ups do we have?
+How many question follow ups were created last month?
+What is the sequence of question follow up QFU-00000?
+List all question follow ups.
+List question follow ups created in September 2026.
+Show the sequence of all question follow ups.
+List question follow ups with their question.
+How many question follow ups were created this year?
+How many question follow ups were created in 2025?
+List question follow ups created this month.
+
+# Program (Program__c) - 4 fields, 11 records
+How many programs do we have?
+How many programs have lifecycle status Draft?
+How many programs have auto-create sessions checked?
+How many programs were created last month?
+What is the program name of program Technical 1-1 Training?
+Break down programs by lifecycle status.
+List all programs.
+Show programs where session type is Group Session.
+List programs created in September 2026.
+Show the program name of all programs.
+
+# Interview Type (Interview_Type__c) - 4 fields, 8 records
+How many interview types do we have?
+Which interview types are active?
+How many interview types were created last month?
+What is the interview type name of interview type Advanced AI/ML Training - V1 - Week 1?
+List all interview types.
+How many interview types have requires hired niche checked?
+List interview types created in September 2026.
+Show the interview type name of all interview types.
+List interview types with their program version.
+How many interview types were created this year?
+
+# Company (Company__c) - 4 fields, 8102 records
+How many companies do we have?
+How many companies have tier FAANG / Top Product?
+How many companies were created last month?
+What is the interview difficulty of company GALAXY EDUCATION?
+Break down companies by tier.
+List all companies.
+List companies created in September 2026.
+Show the interview difficulty of all companies.
+How many companies have tier Product Company?
+How many companies were created this year?
+
+# Cohort (Cohort__c) - 4 fields, 18 records
+How many cohorts do we have?
+How many cohorts were created last month?
+What is the cohort name of cohort Slot 11?
+How many cohorts have their end date in 2026?
+List all cohorts.
+List cohorts created in September 2026.
+Show the cohort name of all cohorts.
+List cohorts with their lead_trainer.
+How many cohorts were created this year?
+How many cohorts were created in 2025?
+
+# Template (Template__c) - 3 fields, 1 records
+How many templates do we have?
+Which templates are active?
+How many templates were created last month?
+What is the template name of template product manager template?
+List all templates.
+List templates created in September 2026.
+Show the template name of all templates.
+List templates with their interview type.
+How many templates were created this year?
+How many templates were created in 2025?

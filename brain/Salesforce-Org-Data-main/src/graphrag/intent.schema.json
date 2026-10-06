@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Salesforce question intent, stage 1",
+  "description": "Business-level reading of a question. Deliberately contains NO Salesforce API names: the model names concepts in the user's words, and the lexicon grounds them to components afterwards. Keeping those apart is what makes each stage separately measurable.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "request_type",
+    "intent",
+    "action",
+    "business_entities"
+  ],
+  "properties": {
+    "request_type": {
+      "type": "string",
+      "enum": [
+        "DATA",
+        "METADATA",
+        "MIXED"
+      ]
+    },
+    "intent": {
+      "type": "string",
+      "enum": [
+        "record_count",
+        "record_list",
+        "grouped_record_count",
+        "grouped_sum",
+        "cross_object_record_list",
+        "field_metadata_lookup",
+        "metadata_explanation",
+        "metadata_object_count",
+        "relationship_explanation",
+        "business_rule_explanation",
+        "automation_explanation",
+        "clarification_required",
+        "refuse_sensitive_data",
+        "provenance_disclosure",
+        "correct_invalid_entity",
+        "correct_misleading_relationship"
+      ]
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "retrieve",
+        "search",
+        "count",
+        "aggregate",
+        "compare",
+        "explain",
+        "inspect",
+        "diagnose"
+      ]
+    },
+    "business_entities": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "role"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 60
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "primary_entity",
+              "related_entity",
+              "context_entity",
+              "actor",
+              "target_entity"
+            ]
+          }
+        }
+      }
+    },
+    "filters": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "concept",
+          "operator",
+          "value"
+        ],
+        "properties": {
+          "concept": {
+            "type": "string",
+            "maxLength": 60
+          },
+          "operator": {
+            "type": "string",
+            "enum": [
+              "equals",
+              "not_equals",
+              "greater_than",
+              "less_than",
+              "contains",
+              "in",
+              "is_null",
+              "is_not_null",
+              "before",
+              "after",
+              "between"
+            ]
+          },
+          "value": {
+            "type": [
+              "string",
+              "number",
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "requested_attributes": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "entity",
+          "attribute"
+        ],
+        "properties": {
+          "entity": {
+            "type": "string",
+            "maxLength": 60
+          },
+          "attribute": {
+            "type": "string",
+            "maxLength": 60
+          }
+        }
+      }
+    },
+    "metadata_types": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "string",
+        "enum": [
+          "CustomObject",
+          "CustomField",
+          "RecordType",
+          "ValidationRule",
+          "Flow",
+          "Profile",
+          "PermissionSet",
+          "PermissionSetGroup",
+          "Layout",
+          "FlexiPage",
+          "ApexClass",
+          "ApexTrigger",
+          "CustomMetadataType"
+        ]
+      }
+    },
+    "requires_schema_discovery": {
+      "type": "boolean"
+    },
+    "requires_record_query": {
+      "type": "boolean"
+    },
+    "requires_metadata_context": {
+      "type": "boolean"
+    },
+    "temporal": {
+      "description": "A date or period the question restricts to, as the user said it. Resolved to a date range by code, never by the model.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "expression"
+      ],
+      "properties": {
+        "expression": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "concept": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 60
+        }
+      }
+    },
+    "return_mode": {
+      "description": "What shape the answer takes. Scope words (all, list, show, records, details) land here, never in requested_attributes.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "records",
+        "count",
+        "aggregate",
+        "single_record",
+        "exists",
+        null
+      ]
+    }
+  }
+}

@@ -936,6 +936,26 @@ async def _dependency_probe_uncached() -> Tuple[List[Tuple[str, str]], Dict[str,
     return vllm_targets, seen, list(results)
 
 
+def _salesforce_pipeline_check() -> dict:
+    """Never raises: an unimportable bridge must not fail the health endpoint."""
+    try:
+        from .engines import sfk_bridge
+    except Exception as exc:                            # noqa: BLE001
+        return {"status": "degraded",
+                "detail": f"bridge unavailable: {type(exc).__name__}: {exc}"}
+    state = sfk_bridge.state()
+    if not state["enabled"]:
+        return {"status": "disabled",
+                "detail": "SFK_PIPELINE_ENABLED is off; the existing engine "
+                          "answers Salesforce questions",
+                **state}
+    if state["built"] and not state["available"]:
+        return {"status": "degraded",
+                "detail": state["error"] or "pipeline could not be built",
+                **state}
+    return {"status": "ok", **state}
+
+
 async def check_dependencies() -> dict:
     """Probe every §8 dependency concurrently.
 
@@ -1081,4 +1101,11 @@ async def check_dependencies() -> dict:
         "web_index": web_index_result,
         "work": work_result,
         "artifacts": artifacts_result,
+        # The new Salesforce pipeline is additive like `web_index`: reported,
+        # never probed, and never part of `status`. It holds no network
+        # connection of its own, and asking it to build here would make a
+        # health check open SQLite and DuckDB. "disabled" is the normal answer
+        # while the cutover flag is off; inside `checks` it made every healthy
+        # deployment report "degraded".
+        "salesforce_pipeline": _salesforce_pipeline_check(),
     }

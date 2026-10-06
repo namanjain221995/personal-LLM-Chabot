@@ -179,3 +179,23 @@ benchmarks/asr/corpus/*.aac
 # swallowed a source directory of the same name.
 # ---------------------------------------------------------------------------
 /.ci-reports/
+
+# Runtime schema store: generated from the metadata mirror by
+# scripts/refresh_runtime_schema.py, rebuilt in ~25 s.
+salesforce_knowledge/runtime_schema/db/
+salesforce_knowledge/runtime_schema/snapshots/
+salesforce_knowledge/runtime_schema/exports/
+salesforce_knowledge/runtime_schema/logs/
+salesforce_knowledge/runtime_schema/cache/
+
+# Trace data is operational, generated and append-only. The directories are
+# tracked (.gitkeep) so the layout is part of the repository; what lands in
+# them is not.
+observability/tracing/db/
+observability/tracing/exports/
+observability/tracing/logs/
+observability/tracing/snapshots/
+!observability/tracing/*/.gitkeep
+
+# Output of scripts/ask.sh --file: generated test runs, never committed.
+ask_results/

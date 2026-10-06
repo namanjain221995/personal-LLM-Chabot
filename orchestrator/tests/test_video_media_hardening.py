@@ -149,6 +149,15 @@ def test_a_fatal_clip_cancels_its_siblings_instead_of_leaving_them_decoding(monk
     async def engine(audio, *, filename, content_type, **kwargs):
         state["started"] += 1
         if filename.startswith("w0000"):
+            # Fail only once a sibling is inside the engine. Raising at once
+            # raced the sibling's own clip preparation (a thread hop before
+            # the engine call): on a loaded CI runner the sibling was
+            # cancelled before it ever reached the engine, and the assertion
+            # below saw nothing to count — the behaviour under test was fine.
+            for _ in range(200):
+                if state["started"] >= 2:
+                    break
+                await asyncio.sleep(0.01)
             raise RuntimeError("the engine client is broken")
         try:
             await asyncio.sleep(30)  # a real clip: minutes of decoding
