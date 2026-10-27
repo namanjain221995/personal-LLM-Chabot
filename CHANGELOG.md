@@ -1,5 +1,27 @@
 # Changelog
 
+## `/v1` JSON mode: `response_format` and `text.format` constrain the answer to JSON (2026-10-27)
+
+A tenant moving from the raw vLLM port to the public API found that
+`/v1/chat/completions` refused the two fields its client always sends,
+`response_format` and `chat_template_kwargs`, and that without JSON mode the
+model sometimes kept writing on very long transcripts until it hit the output
+cap. The engine already supports constrained decoding (the orchestrator's own
+`llm.json_completion` uses it), so `/v1` now exposes it:
+
+- `POST /v1/chat/completions` accepts `response_format` — `{"type": "json_object"}`
+  or `{"type": "json_schema", "json_schema": {"name", "schema", "strict"?, "description"?}}`
+  — and `POST /v1/responses` accepts the same as `text.format`. Both reach the
+  engine as its `response_format`, so the answer is valid JSON (matching the
+  schema), not prose that usually parses. `techsara-35b` only: any other model
+  is a `400`, never an unconstrained answer. Schemas are capped at 64 KiB.
+- `chat_template_kwargs` is accepted only as `{"enable_thinking": false}`, which
+  every `/v1` generation already runs with; `true` and any other key are `400`.
+- A JSON-mode run interrupted mid-answer is not continued (the grammar would
+  start a second document): it fails with the retry-safe `model_unavailable`.
+- Every other request, and every chat-app call, sends the engine exactly what
+  it did before. `tests/test_publicapi_json_mode.py` pins all of the above.
+
 ## The model becomes something other programs can call: a keyed `/v1` API with quotas, streaming, background responses and signed webhooks — and the audit's security fixes that had to come first (2026-09-13)
 
 Until this release the only way to use the main model was to sign in and type.

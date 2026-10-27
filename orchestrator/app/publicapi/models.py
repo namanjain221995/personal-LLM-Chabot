@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import re
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Union
 
@@ -262,6 +263,65 @@ class InputImagePart(_Strict):
 ContentPart = Annotated[Union[InputTextPart, InputImagePart], Field(discriminator="type")]
 
 
+#: JSON mode (2026-10-27): a schema is compiled into a decoding grammar by
+#: the engine for every request that carries it, so its size is bounded here
+#: rather than left to whatever the 20 MiB body allows.
+MAX_JSON_SCHEMA_BYTES = 64 * 1024
+_SCHEMA_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class TextFormat(_Strict):
+    """`text.format` — the shape the answer must take (OpenAI's Responses
+    spelling; `/v1/chat/completions`' `response_format` is translated into it).
+
+    `json_object` and `json_schema` are HONOURED, not hinted: the engine
+    constrains decoding, so the answer cannot be anything but JSON (or JSON
+    matching the schema). Only `techsara-35b` takes them; the planner refuses
+    them for any other model instead of answering unconstrained.
+    """
+
+    type: Literal["text", "json_object", "json_schema"]
+    name: Optional[str] = None
+    #: `schema` is a BaseModel attribute in pydantic, hence the alias.
+    json_schema: Optional[Dict[str, Any]] = Field(default=None, alias="schema")
+    strict: Optional[StrictBool] = None
+    description: Optional[str] = Field(default=None, max_length=1024)
+
+    @model_validator(mode="after")
+    def _fields_match_the_type(self) -> "TextFormat":
+        if self.type != "json_schema":
+            if any(v is not None for v in (self.name, self.json_schema, self.strict, self.description)):
+                raise ValueError("name, schema, strict and description apply only to type json_schema")
+            return self
+        if self.name is None or not _SCHEMA_NAME_RE.match(self.name):
+            raise ValueError("json_schema needs a name of 1-64 letters, digits, underscores or dashes")
+        if self.json_schema is None:
+            raise ValueError("json_schema needs a schema object")
+        if len(json.dumps(self.json_schema, separators=(",", ":")).encode("utf-8")) > MAX_JSON_SCHEMA_BYTES:
+            raise ValueError(f"the schema may be at most {MAX_JSON_SCHEMA_BYTES} bytes")
+        return self
+
+    def engine_response_format(self) -> Optional[Dict[str, Any]]:
+        """This format as the engine's chat-completions `response_format`;
+        None for `text`, which is the engine's default."""
+        if self.type == "text":
+            return None
+        if self.type == "json_object":
+            return {"type": "json_object"}
+        spec: Dict[str, Any] = {"name": self.name, "schema": self.json_schema}
+        if self.strict is not None:
+            spec["strict"] = self.strict
+        if self.description is not None:
+            spec["description"] = self.description
+        return {"type": "json_schema", "json_schema": spec}
+
+
+class TextConfig(_Strict):
+    """`text` — today only its `format`."""
+
+    format: Optional[TextFormat] = None
+
+
 class InputMessage(_Strict):
     """One turn of the conversation the caller supplies.
 
@@ -346,6 +406,8 @@ class ResponsesRequest(_Strict):
     max_output_tokens: Optional[int] = Field(default=None, ge=1)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     metadata: Dict[str, str] = Field(default_factory=dict)
+    #: JSON mode (2026-10-27), `text.format` — see `TextFormat`.
+    text: Optional[TextConfig] = None
 
     @field_validator("model")
     @classmethod
@@ -430,6 +492,12 @@ class ResponsesRequest(_Strict):
         if isinstance(self.input, str):
             return 0
         return sum(message.image_count() for message in self.input)
+
+    def response_format(self) -> Optional[Dict[str, Any]]:
+        """The engine `response_format` this request asks for, or None."""
+        if self.text is None or self.text.format is None:
+            return None
+        return self.text.format.engine_response_format()
 
     def has_text(self) -> bool:
         """Did the caller send any text at all — instructions included?"""

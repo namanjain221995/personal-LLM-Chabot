@@ -315,6 +315,7 @@ Request body (`models.ResponsesRequest`, `extra="forbid"`, strings stripped):
 | `max_output_tokens` | int, optional | ≥ 1; the ceiling is the smaller of the model's and the project's `max_output_tokens`; an explicit value over it is refused, not clamped; absent → `min(8192, ceiling)` | 400 `param: max_output_tokens` |
 | `temperature` | number, optional | 0.0–2.0; absent → 0.2 | 400 |
 | `metadata` | object of string → string | ≤ 16 keys, key 1–64 chars, value ≤ 512 chars | 400 |
+| `text` | `{format: {type, name?, schema?, strict?, description?}}`, optional | JSON mode (2026-10-27): `type` `text` / `json_object` / `json_schema` (`name` + `schema` ≤ 64 KiB required); sent as the engine's `response_format`; `techsara-35b` only; never continued after an interrupt | 400 `param: text.format` |
 
 Any other field — `top_p`, `tools`, `n`, `seed`, `workspace_id`, … — is a 400
 naming the field. The body is never echoed in an error.
@@ -405,6 +406,8 @@ Accepted fields, and nothing else (any other top-level field is
 | `max_tokens` | `max_output_tokens` |
 | `temperature` | `temperature` |
 | `stream_options` | only `include_usage` is accepted |
+| `response_format` | `text.format` (`json_schema`'s nested object flattened); refusals name `response_format` |
+| `chat_template_kwargs` | nothing: accepted only as `{"enable_thinking": false}`, which every request already runs with |
 
 There is no `background` on this endpoint.
 

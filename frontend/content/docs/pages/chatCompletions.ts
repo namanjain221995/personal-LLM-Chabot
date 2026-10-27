@@ -197,14 +197,62 @@ const LATER_THE_FIELDS_THIS_ENDPOINT_ACCEPTS = `
 | \`max_completion_tokens\` | Optional. The newer spelling of the same thing. Send one or the other; both at once is a \`400\`. |
 | \`temperature\` | Optional, \`0.0\`–\`2.0\`. |
 | \`stream_options\` | Optional, and only \`{"include_usage": true}\`. |
+| \`response_format\` | Optional. JSON mode, \`${MODEL_ID}\` only: \`{"type": "json_object"}\` or \`{"type": "json_schema", "json_schema": {…}}\`. \`{"type": "text"}\` is the default. See [JSON mode](#json-mode). |
+| \`chat_template_kwargs\` | Optional, and only \`{"enable_thinking": false}\` — which is how this API always runs. \`true\`, or any other key, is a \`400\`. |
 
 That is the complete list. **Any other field is a \`400\`** —
 \`"Unsupported field: top_p."\`, with the field in \`param\`. The same goes
-for an unknown key inside \`stream_options\`.
+for an unknown key inside \`stream_options\`, \`response_format\` or
+\`chat_template_kwargs\`.
 
 There is no \`background\` here: background work is a
 [Responses](/docs/background) feature, and this endpoint has no shape to
 express it.
+`;
+const LATER_JSON_MODE = `
+## JSON mode
+
+With \`response_format\`, the engine **constrains decoding**: the answer is
+valid JSON, not prose that usually parses. Only \`${MODEL_ID}\` takes it; on
+any other model the request is a \`400\` naming \`response_format\`, never an
+unconstrained answer.
+
+* \`{"type": "json_object"}\` — any JSON object. Say in the prompt what it
+  should contain.
+* \`{"type": "json_schema", "json_schema": {"name": "…", "schema": {…},
+  "strict": true}}\` — JSON that matches \`schema\`. \`name\` is 1–64 letters,
+  digits, \`_\` or \`-\`; the schema is at most 64 KiB; \`description\` is
+  optional.
+
+~~~bash
+curl ${API_BASE_URL}/chat/completions \\
+  -H "Authorization: Bearer $TECHSARA_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "${MODEL_ID}",
+    "messages": [{"role": "user", "content": "Name one city and its country."}],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "place",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {"city": {"type": "string"}, "country": {"type": "string"}},
+          "required": ["city", "country"]
+        }
+      }
+    }
+  }'
+~~~
+
+The answer is still text in \`choices[0].message.content\`: parse it. A
+\`finish_reason\` of \`length\` means the output limit cut the document short,
+so it will not parse — raise \`max_tokens\`. A JSON-mode request that is
+interrupted (a restart, an engine recovery) is not resumed mid-document: it
+fails with the retry-safe \`model_unavailable\`, and a retry starts it again.
+On [the Responses API](/docs/responses) the same switch is
+\`text.format\`.
 `;
 const LATER_THE_RESPONSE = `
 ## The response
@@ -254,7 +302,7 @@ instead of chunks; like \`: ping\`, every conforming SSE parser drops them.
 /** The page before (`noTimeout: false`) or after the no-timeout release. */
 export function chatCompletionsPage({ noTimeout }: { noTimeout: boolean }): DocPage {
   const sections = noTimeout
-    ? [INTRO, S_WHY_IT_EXISTS, LATER_THE_FIELDS_THIS_ENDPOINT_ACCEPTS, S_WHAT_IS_DIFFERENT_AND_WILL_BE_DIFFERENT, S_A_REQUEST, LATER_THE_RESPONSE, S_STREAMING, LATER_IDEMPOTENCY, S_MIGRATING]
+    ? [INTRO, S_WHY_IT_EXISTS, LATER_THE_FIELDS_THIS_ENDPOINT_ACCEPTS, S_WHAT_IS_DIFFERENT_AND_WILL_BE_DIFFERENT, S_A_REQUEST, LATER_THE_RESPONSE, LATER_JSON_MODE, S_STREAMING, LATER_IDEMPOTENCY, S_MIGRATING]
     : [INTRO, S_WHY_IT_EXISTS, S_THE_FIELDS_THIS_ENDPOINT_ACCEPTS, S_WHAT_IS_DIFFERENT_AND_WILL_BE_DIFFERENT, S_A_REQUEST, S_THE_RESPONSE, S_STREAMING, S_IDEMPOTENCY, S_MIGRATING];
   return {
     slug: 'chat-completions',

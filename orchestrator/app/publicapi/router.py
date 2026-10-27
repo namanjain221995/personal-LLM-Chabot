@@ -3691,7 +3691,72 @@ _CHAT_FIELDS = (
     "max_completion_tokens",
     "temperature",
     "stream_options",
+    # 2026-10-27: JSON mode, and the one `chat_template_kwargs` value this
+    # API already applies, thinking off — both HONOURED, not dropped.
+    "response_format",
+    "chat_template_kwargs",
 )
+
+_JSON_SCHEMA_FIELDS = ("name", "schema", "strict", "description")
+
+
+def _chat_response_format(value: Any) -> Dict[str, Any]:
+    """Chat's `response_format` → the Responses `text.format` it means.
+
+    `json_schema`'s nested object is flattened, which is the only difference
+    between the two spellings; the values are validated once, by
+    `models.TextFormat`.
+    """
+    if not isinstance(value, Mapping):
+        raise errors.invalid_request("response_format must be an object.", param="response_format")
+    kind = value.get("type")
+    allowed = ("type", "json_schema") if kind == "json_schema" else ("type",)
+    unknown = sorted(key for key in value if key not in allowed)
+    if kind not in ("text", "json_object", "json_schema"):
+        raise errors.invalid_request(
+            "response_format.type must be text, json_object or json_schema.",
+            param="response_format.type",
+        )
+    if unknown:
+        raise errors.invalid_request(
+            f"Unsupported field in response_format: {unknown[0]}.", param="response_format"
+        )
+    if kind != "json_schema":
+        return {"type": kind}
+    spec = value.get("json_schema")
+    if not isinstance(spec, Mapping):
+        raise errors.invalid_request(
+            "response_format.json_schema must be an object.", param="response_format.json_schema"
+        )
+    extra = sorted(key for key in spec if key not in _JSON_SCHEMA_FIELDS)
+    if extra:
+        raise errors.invalid_request(
+            f"Unsupported field in response_format.json_schema: {extra[0]}.",
+            param="response_format.json_schema",
+        )
+    return {"type": "json_schema", **spec}
+
+
+def _check_chat_template_kwargs(value: Any) -> None:
+    """`chat_template_kwargs` is accepted only as `{"enable_thinking": false}`:
+    /v1 always runs with thinking off (`streaming.PUBLIC_EFFORT`), so that
+    value is what the engine is sent anyway. Anything else would be a knob
+    this API does not turn, which CONTRACT §8 says is a 400."""
+    if not isinstance(value, Mapping):
+        raise errors.invalid_request(
+            "chat_template_kwargs must be an object.", param="chat_template_kwargs"
+        )
+    unknown = sorted(key for key in value if key != "enable_thinking")
+    if unknown:
+        raise errors.invalid_request(
+            f"Unsupported field in chat_template_kwargs: {unknown[0]}.",
+            param="chat_template_kwargs",
+        )
+    if "enable_thinking" in value and value["enable_thinking"] is not False:
+        raise errors.invalid_request(
+            "This API runs with thinking off; enable_thinking must be false.",
+            param="chat_template_kwargs.enable_thinking",
+        )
 
 
 def _chat_content(content: Any, where: str) -> Any:
@@ -3801,7 +3866,19 @@ def _from_chat_completions(payload: Any) -> Tuple[models.ResponsesRequest, bool]
         body["max_output_tokens"] = ceiling
     if payload.get("temperature") is not None:
         body["temperature"] = payload["temperature"]
-    return models.parse_responses_request(body), bool(options.get("include_usage", False))
+    if payload.get("chat_template_kwargs") is not None:
+        _check_chat_template_kwargs(payload["chat_template_kwargs"])
+    if payload.get("response_format") is not None:
+        body["text"] = {"format": _chat_response_format(payload["response_format"])}
+    try:
+        parsed = models.parse_responses_request(body)
+    except errors.ApiError as refusal:
+        # The validator speaks the Responses dialect; a chat caller sent
+        # `response_format`, so that is the field the 400 names.
+        if (refusal.param or "").startswith("text"):
+            raise errors.invalid_request(refusal.message, param="response_format") from None
+        raise
+    return parsed, bool(options.get("include_usage", False))
 
 
 # ------------------------------------------------------- app-level wiring --
