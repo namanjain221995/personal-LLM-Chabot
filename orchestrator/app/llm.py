@@ -1462,10 +1462,14 @@ async def stream_chat_events(
     on_dispatch: Optional[Callable[[], None]] = None,
     admission_run_id: Optional[str] = None,
     answer_plan: Optional[Any] = None,
+    response_format: Optional[dict] = None,
 ) -> AsyncIterator[Tuple[str, str]]:
     """Streaming completion from the selected model, yielding (kind, delta)
     pairs: ("reasoning", <delta.reasoning_content>) for vLLM thinking deltas
     and ("token", <delta.content>) for answer text (V2-DESIGN §3a).
+
+    `response_format` (/v1 JSON mode, 2026-10-27): sent to the engine as is,
+    which constrains decoding to it. None — every chat caller — sends no key.
 
     THE NO-TIMEOUT KEYWORDS (2026-09-13, the /v1 no-timeout design, revision
     2). Every one defaults to exactly what chat has always had, so a chat
@@ -1604,6 +1608,8 @@ async def stream_chat_events(
         max_tokens=budget,
         stream=True,
     )
+    if response_format is not None:
+        request["response_format"] = response_format
     # A positive per-call clock on the shared transport keeps THE TRANSPORT
     # INVARIANT with a per-request read timeout when it outlasts
     # LLM_REQUEST_TIMEOUT (PR #65). No clock, or a caller-chosen read timeout

@@ -153,6 +153,8 @@ class GenerationPlan:
     yield_to_chat: bool
     explicit_max_output_tokens: bool
     image_count: int
+    #: JSON mode (2026-10-27): the engine's `response_format`, or None.
+    response_format: Optional[Dict[str, Any]] = None
 
     @property
     def engine(self) -> str:
@@ -330,6 +332,15 @@ def plan_generation(
     if model.engine == registry.ENGINE_MAIN and not _TRANSPORT_CHECKED:
         transport_timeout_is_sufficient()
 
+    response_format = request_model.response_format()
+    if response_format is not None and model.engine != registry.ENGINE_MAIN:
+        # Refused, not answered unconstrained (CONTRACT §8): a caller who
+        # asked for JSON must never get prose it has to discover is prose.
+        raise errors.invalid_request(
+            f"The model `{model.id}` does not support JSON mode.",
+            param="response_format" if endpoint == registry.ENDPOINT_CHAT_COMPLETIONS else "text.format",
+        )
+
     pending = bool(files is not None and files.pending)
     file_images = 0 if files is None or pending else max(0, int(files.images))
     images = request_model.image_count() + file_images
@@ -469,6 +480,7 @@ def plan_generation(
         yield_to_chat=yield_to_chat,
         explicit_max_output_tokens=explicit,
         image_count=int(images),
+        response_format=response_format,
     )
 
 

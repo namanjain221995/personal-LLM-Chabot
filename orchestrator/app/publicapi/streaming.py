@@ -181,6 +181,9 @@ class GenerationSpec:
     #: an estimated clamp caused (`Generation._window_retry_tokens`).
     estimated_input_tokens: Optional[int] = None
     bounded_input_tokens: Optional[int] = None
+    #: JSON mode (2026-10-27): the engine's `response_format`, or None. A
+    #: stored spec from before this field loads with None.
+    response_format: Optional[Dict[str, Any]] = None
 
     @property
     def planned(self) -> int:
@@ -213,6 +216,7 @@ def spec_from_plan(
         yield_to_chat=plan.yield_to_chat,
         estimated_input_tokens=plan.estimated_input_tokens,
         bounded_input_tokens=plan.bounded_input_tokens,
+        response_format=plan.response_format,
     )
 
 
@@ -504,9 +508,15 @@ class Generation:
             if self.admission_run_id and "admission_run_id" in accepted:
                 kwargs["admission_run_id"] = self.admission_run_id
             if self.continue_final_message:
-                if "continue_final_message" not in accepted:
+                # JSON mode cannot be continued: the engine's grammar would
+                # start a new document after the partial one already sent.
+                if "continue_final_message" not in accepted or spec.response_format is not None:
                     raise ContinuationUnsupported()
                 kwargs["continue_final_message"] = True
+            if spec.response_format is not None:
+                # Only when asked, so every other /v1 call is sent exactly
+                # what it was before JSON mode existed.
+                kwargs["response_format"] = spec.response_format
             return llm.stream_chat_events(self.messages, **kwargs)
         resolved = engines.target(spec.engine)
         if resolved is None:

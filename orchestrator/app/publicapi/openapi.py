@@ -1126,6 +1126,18 @@ def _schemas() -> Dict[str, Any]:
                     "additionalProperties": {"type": "string", "maxLength": 512},
                     "description": "At most 16 string keys of 64 characters.",
                 },
+                "text": {
+                    "type": ["object", "null"],
+                    "additionalProperties": False,
+                    "description": (
+                        "JSON mode, `techsara-35b` only (any other model is a 400). "
+                        "`format.type` `json_object` or `json_schema` constrains "
+                        "decoding, so the answer is valid JSON (matching `schema`). "
+                        "A JSON-mode response is not resumed after an interruption: "
+                        "it fails with the retry-safe `model_unavailable`."
+                    ),
+                    "properties": {"format": {"$ref": "#/components/schemas/TextFormat"}},
+                },
             },
             "example": {
                 "model": model,
@@ -1262,6 +1274,57 @@ def _schemas() -> Dict[str, Any]:
                     "additionalProperties": False,
                     "properties": {"include_usage": {"type": "boolean"}},
                 },
+                "response_format": {
+                    "type": ["object", "null"],
+                    "additionalProperties": False,
+                    "description": (
+                        "JSON mode, as `text.format` on /v1/responses: `json_object`, or "
+                        "`json_schema` with the schema in a nested `json_schema` object."
+                    ),
+                    "required": ["type"],
+                    "properties": {
+                        "type": {"type": "string", "enum": ["text", "json_object", "json_schema"]},
+                        "json_schema": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["name", "schema"],
+                            "properties": {
+                                "name": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+                                "schema": {"type": "object"},
+                                "strict": {"type": "boolean"},
+                                "description": {"type": "string", "maxLength": 1024},
+                            },
+                        },
+                    },
+                },
+                "chat_template_kwargs": {
+                    "type": ["object", "null"],
+                    "additionalProperties": False,
+                    "description": (
+                        "Accepted only as `{\"enable_thinking\": false}`, which is how "
+                        "this API always runs; `true` or any other key is a 400."
+                    ),
+                    "properties": {"enable_thinking": {"type": "boolean", "enum": [False]}},
+                },
+            },
+        },
+        "TextFormat": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["type"],
+            "properties": {
+                "type": {"type": "string", "enum": ["text", "json_object", "json_schema"]},
+                "name": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                    "description": "Required with `json_schema`; not allowed otherwise.",
+                },
+                "schema": {
+                    "type": "object",
+                    "description": "Required with `json_schema`: a JSON Schema of at most 64 KiB.",
+                },
+                "strict": {"type": "boolean"},
+                "description": {"type": "string", "maxLength": 1024},
             },
         },
         "ChatCompletion": {

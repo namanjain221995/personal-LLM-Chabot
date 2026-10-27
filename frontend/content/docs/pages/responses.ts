@@ -115,8 +115,9 @@ const S_A_PARAMETER_WE_CANNOT_HONOUR_IS_REJECTED = `
 
 This is the rule most likely to surprise you, and it is deliberate. Unknown
 and unsupported fields — \`top_p\`, \`n\`, \`seed\`, \`logit_bias\`, \`tools\`,
-\`tool_choice\`, \`response_format\` and the rest — produce a \`400\` naming
-the field, rather than an answer that ignored the knob you were relying on.
+\`tool_choice\` and the rest — produce a \`400\` naming the field, rather than
+an answer that ignored the knob you were relying on. (JSON output is
+\`text.format\`, below — honoured, not hinted.)
 
 ~~~json
 {
@@ -286,6 +287,7 @@ const LATER_THE_FIELDS = `
 | \`stream\` | boolean | Default \`false\`. See [streaming](/docs/streaming). |
 | \`background\` | boolean | Default \`false\`. See [background responses](/docs/background). May be combined with \`stream\`. |
 | \`store\` | boolean | Default \`true\`: while the request runs it is written down, so it survives a restart of the service and a broken stream can be [resumed](/docs/timeouts#resuming-a-stream). \`false\` keeps nothing, and the request is then cancelled when its client disconnects and cannot be resumed. |
+| \`text\` | object | Optional. JSON mode, \`${MODEL_ID}\` only: \`{"format": {"type": "json_object"}}\`, or \`{"format": {"type": "json_schema", "name": "…", "schema": {…}, "strict": true}}\`. Decoding is constrained, so the answer is valid JSON (matching \`schema\`); the schema is at most 64 KiB. Any other model is a \`400\`. A JSON-mode response is not resumed after an interruption: it fails with the retry-safe \`model_unavailable\`. Details on [Chat Completions](/docs/chat-completions#json-mode). |
 | \`max_output_tokens\` | integer | Optional, at least 1, at most the model's ceiling — 1,000,000 on \`${MODEL_ID}\`. Clamped to what your prompt leaves in the window; see below. |
 | \`temperature\` | number | Optional, \`0.0\` to \`2.0\`. Defaults to \`0.2\`, which is what the chat application asks for — except on \`${OCR_MODEL_ID}\`, where it defaults to \`0.0\`. |
 | \`metadata\` | object of strings | Optional. At most 16 keys; keys ≤ 64 characters, values ≤ 512 characters; strings only. |

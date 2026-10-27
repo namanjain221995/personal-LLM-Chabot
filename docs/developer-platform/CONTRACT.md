@@ -320,6 +320,7 @@ Validation, all enforced server-side:
 | `metadata` | ≤ 16 keys, key ≤ 64 chars, value ≤ 512 chars, strings only | 400 |
 | `stream` + `background` | any combination (§14); both true streams the job's events | — |
 | `store` | boolean, default `true`; `false` opts the request out of the durable log (§10, §14): cancelled on disconnect and on a restart, never resumable | 400 when not a boolean; 400 `param: store` with `background: true` |
+| `text` | optional `{"format": {…}}` — JSON mode (2026-10-27). `format.type` `text` (the default), `json_object`, or `json_schema` with `name` (`^[A-Za-z0-9_-]{1,64}$`), `schema` (an object, ≤ 64 KiB serialised), optional `strict` and `description` (≤ 1,024 chars). Sent to the engine as its `response_format`, which **constrains decoding**; `techsara-35b` only. A JSON-mode run is never continued after an interrupt (§10): it fails with the retry-safe `model_unavailable` | 400 `param: text.format`; 400 for any other model |
 
 **Why only `data:` URLs.** vLLM fetches a remote image URL server-side and no
 `--allowed-media-domains` is set, so an `http(s)` URL reaching an engine would
@@ -344,9 +345,16 @@ anyone's conversation history.
 ### 8.2 `POST /v1/chat/completions`
 
 Accepted top-level fields, and nothing else: `model`, `messages`, `stream`,
-`store`, `max_tokens`, `max_completion_tokens`, `temperature`, `stream_options`
+`store`, `max_tokens`, `max_completion_tokens`, `temperature`, `response_format`,
+`chat_template_kwargs`, `stream_options`
 (only `include_usage`). `store` has the meaning of §8.1. `max_completion_tokens` is an alias of `max_tokens`; sending
-both is `400`. A message's `content` is a string or, on a `user` message, a list
+both is `400`. `response_format` (2026-10-27) is §8.1's `text.format` in the
+chat spelling: `{"type": "json_object"}`, or `{"type": "json_schema",
+"json_schema": {"name", "schema", "strict"?, "description"?}}`, refusals naming
+`response_format`. `chat_template_kwargs` is accepted only as
+`{"enable_thinking": false}`, which every `/v1` generation already runs with;
+`true` is `400 param: chat_template_kwargs.enable_thinking` and any other key
+is `400`. A message's `content` is a string or, on a `user` message, a list
 of `{"type": "text", "text"}` and
 `{"type": "image_url", "image_url": {"url": "data:…", "detail": "auto"}}` parts,
 under exactly the image rules of §8.1. There is no `background`.
