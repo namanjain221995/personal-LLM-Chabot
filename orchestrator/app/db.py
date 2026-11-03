@@ -4645,6 +4645,14 @@ def mark_web_pages_indexed(page_ids: List[int], chunk_version: int = 0) -> None:
     bump_web_corpus_generation()
 
 
+def requeue_web_pages_indexed_since(when: datetime) -> int:
+    """Put pages stamped at or after `when` back on the index queue."""
+    with connection() as con:
+        return con.execute(
+            "UPDATE web_pages SET indexed_at = NULL WHERE indexed_at >= %s", (when,)
+        ).rowcount
+
+
 # ---------------------------------------------------------------------------
 # V9: site crawls
 # ---------------------------------------------------------------------------
