@@ -42,6 +42,7 @@ import os
 import re
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Set
 
 from . import db, llm, metrics
@@ -455,6 +456,68 @@ def _open(create_dim: Optional[int] = None):
     return conn, table, metadata
 
 
+def _repair_crash_damage() -> bool:
+    """Drop empty manifests at the tip of the table's version history.
+
+    Lance does not fsync its commits, so a power cut seconds after a write can
+    leave the newest manifests zero bytes long. Every open then fails with
+    `Invalid range 0..0 for object of size 0 bytes` until they are gone
+    (2026-10-29: five days of failed passes and empty recall). An empty
+    manifest holds nothing, and the newest non-empty one below it is the last
+    version that reached the disk, so removing the empty ones rolls back to it.
+
+    A page stamped after that version may have lost its vectors with the
+    commit, so it goes back on the queue; redoing a page that survived is free.
+    Returns False, touching nothing, for any other kind of damage.
+    """
+    directory = lancedb_web_dir()
+    versions = os.path.join(directory, f"{TABLE}.lance", "_versions")
+    with write_lock(directory, wait_s=20.0):
+        try:
+            # Lance's V2 names count down from u64::MAX: lowest name, newest.
+            names = sorted(
+                n for n in os.listdir(versions) if re.fullmatch(r"\d{20}\.manifest", n)
+            )
+        except OSError:
+            return False
+        empty: List[str] = []
+        survivor = None
+        for name in names:
+            path = os.path.join(versions, name)
+            if os.path.getsize(path):
+                survivor = path
+                break
+            empty.append(path)
+        if not empty or survivor is None:
+            return False
+        last_durable = datetime.fromtimestamp(os.path.getmtime(survivor), timezone.utc)
+        # Requeue first: if this dies here, the manifests are still there and
+        # the next pass repeats both steps.
+        requeued = db.requeue_web_pages_indexed_since(last_durable)
+        for path in empty:
+            os.remove(path)
+    metrics.inc(
+        "web_index_crash_repairs_total",
+        "times the web index rolled back past empty manifests left by a crash",
+    )
+    log.warning(
+        "web index: removed %d empty manifest(s) left by a crash; rolled back to %s, "
+        "%d page(s) requeued",
+        len(empty), os.path.basename(survivor), requeued,
+    )
+    return True
+
+
+def _open_or_repair() -> None:
+    """Prove the table opens, repairing crash damage if that is what stops it."""
+    try:
+        _open()
+    except RuntimeError:
+        if not _repair_crash_damage():
+            raise
+        _open()
+
+
 def _within(child: str, parent: str) -> bool:
     """True when `child` IS `parent` or lives underneath it."""
     child_abs = os.path.abspath(child).rstrip("/")
@@ -625,6 +688,9 @@ async def index_pending(
                     db.mark_web_pages_indexed, page_ids, CHUNKER_VERSION
                 )
                 return 0
+            # Before the GPU work: embedding first made a broken table cost a
+            # full pass of vectors, thrown away, every cycle (2026-10-29).
+            await asyncio.to_thread(_open_or_repair)
             vectors = await _embed_batched(texts)
             rows = [
                 {**meta, "vector": list(vec)}
@@ -655,6 +721,11 @@ async def index_pending(
             )
             return len(rows)
         except Exception:  # noqa: BLE001 — background enhancement, never fatal
+            metrics.inc(
+                "web_index_failures_total",
+                "web index passes or recalls that failed",
+                path="index",
+            )
             log.warning("web indexing failed; will retry next pass", exc_info=True)
             return 0
 
@@ -941,8 +1012,13 @@ async def retrieve(
         metrics.inc("knowledge_degraded_total", reason="embed_" + ("busy" if "busy" in str(exc) else "error"))
         log.debug("web recall: embedding unavailable (%s)", exc)
         return []
-    except Exception:  # noqa: BLE001
-        log.debug("web recall unavailable", exc_info=True)
+    except Exception as exc:  # noqa: BLE001
+        metrics.inc(
+            "web_index_failures_total",
+            "web index passes or recalls that failed",
+            path="recall",
+        )
+        log.warning("web recall unavailable: %s", exc)
         return []
 
 
