@@ -1,0 +1,1470 @@
+# promtool unit tests for monitoring/prometheus/rules/fleet.yml. Every alert has
+# a case that fires; the ones that could plausibly fire on normal behaviour also
+# have one that must not.
+#
+#   IMG=$(grep -o 'prom/prometheus@sha256:[0-9a-f]*' compose/compose.monitoring.yaml | head -1)
+#   docker run --rm -v "$PWD/monitoring/prometheus:/p:ro" --entrypoint promtool "$IMG" \
+#     test rules /p/tests/fleet.yml
+
+rule_files:
+  - ../rules/fleet.yml
+
+evaluation_interval: 1m
+
+group_eval_order:
+  - fleet-recording
+
+tests:
+  # ==================================================== recording rules
+  - interval: 1m
+    name: "fleet health is 0 when nothing fires"
+    input_series:
+      - series: 'node_load1{instance="192.168.9.68:9100",job="node",node="spark-2",role="worker"}'
+        values: '1x10'
+    promql_expr_test:
+      - expr: fleet:health:code
+        eval_time: 5m
+        exp_samples:
+          - labels: 'fleet:health:code'
+            value: 0
+
+  - interval: 1m
+    name: "an info alert does not change fleet health"
+    input_series:
+      - series: 'ALERTS{alertname="SparkRebooted",alertstate="firing",severity="info"}'
+        values: '1x10'
+    promql_expr_test:
+      - expr: fleet:health:code
+        eval_time: 5m
+        exp_samples:
+          - labels: 'fleet:health:code'
+            value: 0
+
+  - interval: 1m
+    name: "a warning makes fleet health 1, a critical makes it 2"
+    input_series:
+      - series: 'ALERTS{alertname="NodeSwapNearlyExhausted",alertstate="firing",severity="warning"}'
+        values: '1x20'
+      - series: 'ALERTS{alertname="GpuXidError",alertstate="firing",severity="critical"}'
+        values: '_x10 1x10'
+    promql_expr_test:
+      - expr: fleet:health:code
+        eval_time: 5m
+        exp_samples:
+          - labels: 'fleet:health:code'
+            value: 1
+      - expr: fleet:health:code
+        eval_time: 15m
+        exp_samples:
+          - labels: 'fleet:health:code'
+            value: 2
+
+  - interval: 1m
+    name: "a pending alert does not change fleet health"
+    input_series:
+      - series: 'ALERTS{alertname="GpuXidError",alertstate="pending",severity="critical"}'
+        values: '1x10'
+    promql_expr_test:
+      - expr: fleet:health:code
+        eval_time: 5m
+        exp_samples:
+          - labels: 'fleet:health:code'
+            value: 0
+
+  - interval: 1m
+    name: "fleet counts follow however many Sparks exist"
+    input_series:
+      - series: 'up{instance="a",job="node",node="spark-1",role="head"}'
+        values: '1x10'
+      - series: 'up{instance="b",job="node",node="spark-2",role="worker"}'
+        values: '1x10'
+      - series: 'up{instance="c",job="node",node="spark-3",role="member"}'
+        values: '0x10'
+    promql_expr_test:
+      - expr: fleet:sparks:total
+        eval_time: 5m
+        exp_samples:
+          - labels: 'fleet:sparks:total'
+            value: 3
+      - expr: fleet:sparks:up
+        eval_time: 5m
+        exp_samples:
+          - labels: 'fleet:sparks:up'
+            value: 2
+
+  - interval: 1m
+    name: "a node with no swap configured reads 0, not NaN"
+    input_series:
+      - series: 'node_memory_SwapTotal_bytes{instance="a",job="node",node="spark-3",role="member"}'
+        values: '0x10'
+      - series: 'node_memory_SwapFree_bytes{instance="a",job="node",node="spark-3",role="member"}'
+        values: '0x10'
+    promql_expr_test:
+      - expr: node:swap_used_percent:current
+        eval_time: 5m
+        exp_samples:
+          - labels: 'node:swap_used_percent:current{instance="a",job="node",node="spark-3",role="member"}'
+            value: 0
+
+  - interval: 1m
+    name: "kernel fault total leaves out link changes and application crashes"
+    input_series:
+      - series: 'spark_kernel_events_total{instance="a",job="node",node="spark-2",role="worker",kind="link_down"}'
+        values: '0+1x90'
+      - series: 'spark_kernel_events_total{instance="a",job="node",node="spark-2",role="worker",kind="segfault"}'
+        values: '0+1x90'
+      - series: 'spark_kernel_events_total{instance="a",job="node",node="spark-2",role="worker",kind="pcie_aer"}'
+        values: '0x30 1x60'
+    promql_expr_test:
+      - expr: round(node:kernel_faults:increase1h)
+        eval_time: 50m
+        exp_samples:
+          - labels: '{node="spark-2"}'
+            value: 1
+
+  # ======================================================== alerts
+  - interval: 1m
+    name: "a Spark that booted five minutes ago says so"
+    input_series:
+      - series: "node_boot_time_seconds{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: SparkRebooted
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "info"
+            exp_annotations:
+              description: "Compare spark_nvme_unsafe_shutdowns_total: if it rose, this was a power cut or a hard reset, not a clean reboot. A worker reboot also wedges the head's engine until the controller recovers it."
+              summary: "spark-2 booted 5m 0s ago"
+
+  - interval: 1m
+    name: "and stops saying so after fifteen minutes"
+    input_series:
+      - series: "node_boot_time_seconds{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SparkRebooted
+        exp_alerts: []
+
+  - interval: 1m
+    name: "an unsafe shutdown means a power cut or hard reset"
+    input_series:
+      - series: "spark_nvme_unsafe_shutdowns_total{device=\"nvme0\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '5x10 6x50'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SparkUncleanShutdown
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              device: "nvme0"
+            exp_annotations:
+              description: "The drive counted a shutdown it was not warned about. Databases on this Spark went through crash recovery; check the web index, which a power cut has corrupted before (2026-10-29)."
+              summary: "spark-2 lost power or was hard-reset"
+
+  - interval: 1m
+    name: "a steady power-loss count is history, not news"
+    input_series:
+      - series: "spark_nvme_unsafe_shutdowns_total{device=\"nvme0\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '28x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SparkUncleanShutdown
+        exp_alerts: []
+
+  - interval: 1m
+    name: "all tasks stalled on memory a fifth of the time"
+    input_series:
+      - series: "node_pressure_memory_stalled_seconds_total{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+12x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SparkMemoryStalling
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+            exp_annotations:
+              description: "All tasks were blocked waiting for memory. On a unified-memory machine this delays the model directly, even when the free figure still looks fine."
+              summary: "spark-2 stalled on memory 20% of the time"
+
+  - interval: 1m
+    name: "the head baseline of 3 percent does not fire"
+    input_series:
+      - series: "node_pressure_memory_stalled_seconds_total{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+1.8x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SparkMemoryStalling
+        exp_alerts: []
+
+  - interval: 1m
+    name: "all tasks stalled on disk"
+    input_series:
+      - series: "node_pressure_io_stalled_seconds_total{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+24x60'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: SparkIoStalling
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+            exp_annotations:
+              summary: "spark-2 stalled on disk 40% of the time"
+
+  - interval: 1m
+    name: "swapping far above the usual pressure"
+    input_series:
+      - series: "node_vmstat_pswpin{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+600000x60'
+      - series: "node_vmstat_pswpout{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: SparkSwapThrashing
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+            exp_annotations:
+              description: "Sustained swap traffic slows everything on the node and wears the NVMe. Find the consumer on the Spark dashboard, Memory row."
+              summary: "spark-2 swapping 10000 pages/s"
+
+  - interval: 1m
+    name: "the head baseline of 3000 pages per second does not fire"
+    input_series:
+      - series: "node_vmstat_pswpin{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+90000x60'
+      - series: "node_vmstat_pswpout{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+90000x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: SparkSwapThrashing
+        exp_alerts: []
+
+  - interval: 1m
+    name: "a filesystem goes read-only"
+    input_series:
+      - series: "node_filesystem_readonly{device=\"/dev/nvme0n1p2\",fstype=\"ext4\",mountpoint=\"/\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x3 1x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: SparkFilesystemReadOnly
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "critical"
+              device: "/dev/nvme0n1p2"
+              fstype: "ext4"
+              mountpoint: "/"
+            exp_annotations:
+              description: "The kernel does this after a filesystem error. Every write on this mount now fails."
+              summary: "/ on spark-2 went read-only"
+
+  - interval: 1m
+    name: "a read-only EFI partition is normal"
+    input_series:
+      - series: "node_filesystem_readonly{device=\"/dev/nvme0n1p1\",fstype=\"vfat\",mountpoint=\"/boot/efi\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SparkFilesystemReadOnly
+        exp_alerts: []
+
+  - interval: 1m
+    name: "inodes running out"
+    input_series:
+      - series: "node_filesystem_files_free{device=\"/dev/nvme0n1p2\",fstype=\"ext4\",mountpoint=\"/\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '5x60'
+      - series: "node_filesystem_files{device=\"/dev/nvme0n1p2\",fstype=\"ext4\",mountpoint=\"/\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '100x60'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: SparkInodesLow
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              device: "/dev/nvme0n1p2"
+              fstype: "ext4"
+              mountpoint: "/"
+            exp_annotations:
+              summary: "/ on spark-2 has 5% of its inodes left"
+
+  - interval: 1m
+    name: "the disk is on course to fill within a week"
+    input_series:
+      - series: "node_filesystem_avail_bytes{device=\"/dev/nvme0n1p2\",fstype=\"ext4\",mountpoint=\"/\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1000000000000-1000000000x200'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: SparkDiskWillFillWithinAWeek
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              device: "/dev/nvme0n1p2"
+              fstype: "ext4"
+              mountpoint: "/"
+            exp_annotations:
+              summary: "spark-2 root filesystem fills within a week at the current rate"
+
+  - interval: 1m
+    name: "a flat disk never fires"
+    input_series:
+      - series: "node_filesystem_avail_bytes{device=\"/dev/nvme0n1p2\",fstype=\"ext4\",mountpoint=\"/\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1000000000000x200'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: SparkDiskWillFillWithinAWeek
+        exp_alerts: []
+
+  - interval: 1m
+    name: "the clock stops being synchronised"
+    input_series:
+      - series: "node_timex_sync_status{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1x3 0x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: SparkClockNotSynced
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+            exp_annotations:
+              summary: "spark-2 clock is not synchronised"
+
+  - interval: 1m
+    name: "the clock is far off"
+    input_series:
+      - series: "node_timex_offset_seconds{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0.2x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SparkClockOffset
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+            exp_annotations:
+              summary: "spark-2 clock is off by 200ms"
+
+  - interval: 1m
+    name: "the worker usual swing of 54 ms does not fire"
+    input_series:
+      - series: "node_timex_offset_seconds{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0.054x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SparkClockOffset
+        exp_alerts: []
+
+  - interval: 1m
+    name: "a link keeps flapping"
+    input_series:
+      - series: "node_network_carrier_changes_total{device=\"enP7s7\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SparkLinkFlapping
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              device: "enP7s7"
+            exp_annotations:
+              description: "A clean reboot of a peer is two changes. More means a cable, a port or a switch."
+              summary: "enP7s7 on spark-2 is flapping"
+
+  - interval: 1m
+    name: "one peer reboot is two carrier changes and does not fire"
+    input_series:
+      - series: "node_network_carrier_changes_total{device=\"enp1s0f1np1\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x5 2x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SparkLinkFlapping
+        exp_alerts: []
+
+  - interval: 1m
+    name: "a NIC reports errors"
+    input_series:
+      - series: "node_network_receive_errs_total{device=\"enP7s7\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+120x30'
+      - series: "node_network_transmit_errs_total{device=\"enP7s7\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SparkNicErrors
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              device: "enP7s7"
+            exp_annotations:
+              summary: "enP7s7 on spark-2: 2.0 errors/s"
+
+  - interval: 1m
+    name: "a tenth of TCP segments are retransmitted"
+    input_series:
+      - series: "node_netstat_Tcp_RetransSegs{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+1200x40'
+      - series: "node_netstat_Tcp_OutSegs{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+12000x40'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: SparkTcpRetransmitsHigh
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+            exp_annotations:
+              summary: "spark-2 retransmits 10% of TCP segments"
+
+  - interval: 1m
+    name: "retransmits on an idle machine mean nothing"
+    input_series:
+      - series: "node_netstat_Tcp_RetransSegs{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+6x40'
+      - series: "node_netstat_Tcp_OutSegs{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: SparkTcpRetransmitsHigh
+        exp_alerts: []
+
+  - interval: 1m
+    name: "connection tracking is nearly full"
+    input_series:
+      - series: "node_nf_conntrack_entries{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '90x30'
+      - series: "node_nf_conntrack_entries_limit{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '100x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SparkConntrackNearlyFull
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+            exp_annotations:
+              description: "At the limit the kernel drops new connections, Docker's included."
+              summary: "spark-2 connection tracking table 90% full"
+
+  - interval: 1m
+    name: "file descriptors are nearly used up"
+    input_series:
+      - series: "node_filefd_allocated{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '90x30'
+      - series: "node_filefd_maximum{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '100x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SparkFileDescriptorsHigh
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+            exp_annotations:
+              summary: "spark-2 used 90% of its file descriptors"
+
+  - interval: 1m
+    name: "a failed service is named in the alert"
+    input_series:
+      - series: "node_systemd_unit_state{name=\"ssh.service\",state=\"failed\",type=\"notify\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SystemdUnitFailed
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              name: "ssh.service"
+              state: "failed"
+              type: "notify"
+            exp_annotations:
+              description: "On that machine: systemctl status ssh.service"
+              summary: "ssh.service failed on spark-2"
+
+  - interval: 1m
+    name: "a service that has not failed does not fire"
+    input_series:
+      - series: "node_systemd_unit_state{name=\"ssh.service\",state=\"failed\",type=\"notify\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SystemdUnitFailed
+        exp_alerts: []
+
+  - interval: 1m
+    name: "docker stopped"
+    input_series:
+      - series: "node_systemd_unit_state{name=\"docker.service\",state=\"active\",type=\"notify\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CoreServiceNotActive
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "critical"
+              name: "docker.service"
+              state: "active"
+              type: "notify"
+            exp_annotations:
+              summary: "docker.service is not active on spark-2"
+
+  - interval: 1m
+    name: "the host guard stopped"
+    input_series:
+      - series: "node_systemd_unit_state{name=\"techsara-host-guard.service\",state=\"active\",type=\"oneshot\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: HostGuardNotActive
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              name: "techsara-host-guard.service"
+              state: "active"
+              type: "oneshot"
+            exp_annotations:
+              description: "scripts/host-guard.sh verify --role <role>, as root on that machine."
+              summary: "The host packet filter is not active on spark-2"
+
+  - interval: 1m
+    name: "a new Spark has no host guard"
+    input_series:
+      - series: "spark_node_info{dgx_os=\"7.2.3\",hostname=\"spark-abcd\",product=\"DGX Spark\",serial=\"1\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1x100'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: HostGuardNotInstalled
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              dgx_os: "7.2.3"
+              hostname: "spark-abcd"
+              product: "DGX Spark"
+              serial: "1"
+            exp_annotations:
+              description: "Its exporters are readable from the office LAN. See docs/MONITORING.md, Adding a Spark."
+              summary: "spark-2 has no host packet filter"
+
+  - interval: 1m
+    name: "a Spark with the unit is not reported as missing it"
+    input_series:
+      - series: "spark_node_info{dgx_os=\"7.2.3\",hostname=\"spark-476e\",product=\"DGX Spark\",serial=\"1\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1x100'
+      - series: "node_systemd_unit_state{name=\"techsara-host-guard.service\",state=\"active\",type=\"oneshot\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1x100'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: HostGuardNotInstalled
+        exp_alerts: []
+
+  - interval: 1m
+    name: "the kernel reports gpu_xid"
+    input_series:
+      - series: "spark_kernel_events_total{kind=\"gpu_xid\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x5 1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: GpuXidError
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "critical"
+              kind: "gpu_xid"
+            exp_annotations:
+              description: "The GPU driver reported a fault. spark_gpu_xid_total has the code. These often precede a wedged or dead model rank."
+              summary: "NVIDIA Xid error on spark-2"
+
+  - interval: 1m
+    name: "the kernel reports gpu_fallen_off"
+    input_series:
+      - series: "spark_kernel_events_total{kind=\"gpu_fallen_off\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x5 1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: GpuFallenOffBus
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "critical"
+              kind: "gpu_fallen_off"
+            exp_annotations:
+              description: "Only a reboot brings it back."
+              summary: "The GPU fell off the bus on spark-2"
+
+  - interval: 1m
+    name: "the kernel reports oom_kill"
+    input_series:
+      - series: "spark_kernel_events_total{kind=\"oom_kill\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x5 1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KernelOomKill
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              kind: "oom_kill"
+            exp_annotations:
+              description: "spark_container_oom_kills_total says which container, when it was one."
+              summary: "The kernel OOM killer ran on spark-2"
+
+  - interval: 1m
+    name: "the kernel reports nvme_error"
+    input_series:
+      - series: "spark_kernel_events_total{kind=\"nvme_error\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x5 1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KernelStorageError
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "critical"
+              kind: "nvme_error"
+            exp_annotations:
+              summary: "Kernel nvme_error on spark-2"
+
+  - interval: 1m
+    name: "the kernel reports pcie_aer"
+    input_series:
+      - series: "spark_kernel_events_total{kind=\"pcie_aer\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x5 1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KernelHardwareError
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              kind: "pcie_aer"
+            exp_annotations:
+              summary: "Kernel pcie_aer on spark-2"
+
+  - interval: 1m
+    name: "the kernel reports hung_task"
+    input_series:
+      - series: "spark_kernel_events_total{kind=\"hung_task\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x5 1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KernelTaskStuck
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              kind: "hung_task"
+            exp_annotations:
+              description: "A task or a CPU stopped making progress, usually waiting on a device or driver."
+              summary: "Kernel hung_task on spark-2"
+
+  - interval: 1m
+    name: "the kernel reports roce_error"
+    input_series:
+      - series: "spark_kernel_events_total{kind=\"roce_error\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x5 1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: RoceDriverError
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              kind: "roce_error"
+            exp_annotations:
+              summary: "RoCE driver error on spark-2"
+
+  - interval: 1m
+    name: "kernel events already counted at boot are not news"
+    input_series:
+      - series: "spark_kernel_events_total{kind=\"gpu_xid\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '3x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GpuXidError
+        exp_alerts: []
+
+  - interval: 1m
+    name: "a link going down on a peer reboot is not a hardware error"
+    input_series:
+      - series: "spark_kernel_events_total{kind=\"link_down\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x5 1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KernelHardwareError
+        exp_alerts: []
+
+  - interval: 1m
+    name: "the NIC keeps retransmitting"
+    input_series:
+      - series: "spark_roce_hw_counter_total{counter=\"roce_adp_retrans\",device=\"rocep1s0f1\",port=\"1\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+600x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: RoceRetransmitting
+        exp_alerts:
+          - exp_labels:
+              severity: "warning"
+              node: "spark-2"
+              device: "rocep1s0f1"
+            exp_annotations:
+              summary: "rocep1s0f1 on spark-2: 10.0 retransmit events/s"
+
+  - interval: 1m
+    name: "a healthy fabric has flat counters"
+    input_series:
+      - series: "spark_roce_hw_counter_total{counter=\"roce_adp_retrans\",device=\"rocep1s0f1\",port=\"1\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: RoceRetransmitting
+        exp_alerts: []
+
+  - interval: 1m
+    name: "RDMA gave up retrying"
+    input_series:
+      - series: "spark_roce_hw_counter_total{counter=\"req_transport_retries_exceeded\",device=\"rocep1s0f1\",port=\"1\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x5 3x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: RoceTransportGaveUp
+        exp_alerts:
+          - exp_labels:
+              severity: "warning"
+              node: "spark-2"
+              device: "rocep1s0f1"
+            exp_annotations:
+              summary: "RDMA retries exhausted on rocep1s0f1, spark-2"
+
+  - interval: 1m
+    name: "the drive raises a critical warning"
+    input_series:
+      - series: "spark_nvme_critical_warning{device=\"nvme0\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: NvmeCriticalWarning
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "critical"
+              device: "nvme0"
+            exp_annotations:
+              description: "Bits, low to high: spare, temperature, reliability, read-only, backup power."
+              summary: "nvme0 on spark-2 raised a critical warning (1)"
+
+  - interval: 1m
+    name: "media errors appear"
+    input_series:
+      - series: "spark_nvme_media_errors_total{device=\"nvme0\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x5 2x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: NvmeMediaErrors
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "critical"
+              device: "nvme0"
+            exp_annotations:
+              summary: "nvme0 on spark-2 reported unrecovered media errors"
+
+  - interval: 1m
+    name: "the drive is near its rated life"
+    input_series:
+      - series: "spark_nvme_percentage_used_ratio{device=\"nvme0\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0.85x100'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: NvmeWearHigh
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              device: "nvme0"
+            exp_annotations:
+              summary: "nvme0 on spark-2 used 85% of its rated life"
+
+  - interval: 1m
+    name: "spare capacity is low"
+    input_series:
+      - series: "spark_nvme_available_spare_ratio{device=\"nvme0\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0.12x100'
+      - series: "spark_nvme_available_spare_threshold_ratio{device=\"nvme0\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0.10x100'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: NvmeSpareLow
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              device: "nvme0"
+            exp_annotations:
+              summary: "nvme0 on spark-2 is down to 12% spare"
+
+  - interval: 1m
+    name: "a full spare pool does not fire"
+    input_series:
+      - series: "spark_nvme_available_spare_ratio{device=\"nvme0\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1x100'
+      - series: "spark_nvme_available_spare_threshold_ratio{device=\"nvme0\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0.10x100'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: NvmeSpareLow
+        exp_alerts: []
+
+  - interval: 1m
+    name: "the drive runs hot"
+    input_series:
+      - series: "spark_nvme_temperature_celsius{device=\"nvme0\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '80x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: NvmeTemperatureHigh
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              device: "nvme0"
+            exp_annotations:
+              summary: "nvme0 on spark-2 at 80 \u00b0C"
+
+  - interval: 1m
+    name: "the health log cannot be read"
+    input_series:
+      - series: "spark_nvme_read_success{device=\"nvme0\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: NvmeHealthUnreadable
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              device: "nvme0"
+            exp_annotations:
+              summary: "The health log of nvme0 on spark-2 cannot be read"
+
+  - interval: 1m
+    name: "a container fails its health check"
+    input_series:
+      - series: "spark_container_health_status{container=\"stagevote-db-1\",project=\"stagevote\",service=\"db\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ContainerUnhealthy
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              container: "stagevote-db-1"
+              project: "stagevote"
+              service: "db"
+            exp_annotations:
+              summary: "stagevote-db-1 on spark-2 fails its health check"
+
+  - interval: 1m
+    name: "a container still starting is not unhealthy"
+    input_series:
+      - series: "spark_container_health_status{container=\"stagevote-db-1\",project=\"stagevote\",service=\"db\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '2x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ContainerUnhealthy
+        exp_alerts: []
+
+  - interval: 1m
+    name: "a container that should run is stopped"
+    input_series:
+      - series: "spark_container_expected_running{container=\"stagevote-db-1\",project=\"stagevote\",service=\"db\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1x30'
+      - series: "spark_container_running{container=\"stagevote-db-1\",project=\"stagevote\",service=\"db\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ContainerShouldBeRunning
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              container: "stagevote-db-1"
+              project: "stagevote"
+              service: "db"
+            exp_annotations:
+              summary: "stagevote-db-1 on spark-2 should be running and is not"
+
+  - interval: 1m
+    name: "a leftover nobody expects to run is fine"
+    input_series:
+      - series: "spark_container_expected_running{container=\"stagevote-db-1\",project=\"stagevote\",service=\"db\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+      - series: "spark_container_running{container=\"stagevote-db-1\",project=\"stagevote\",service=\"db\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ContainerShouldBeRunning
+        exp_alerts: []
+
+  - interval: 1m
+    name: "the OOM killer reaches into a container"
+    input_series:
+      - series: "spark_container_oom_kills_total{container=\"stagevote-db-1\",project=\"stagevote\",service=\"db\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x5 1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ContainerOomKilled
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              container: "stagevote-db-1"
+              project: "stagevote"
+              service: "db"
+            exp_annotations:
+              summary: "The OOM killer took a process in stagevote-db-1 on spark-2"
+
+  - interval: 1m
+    name: "a container keeps restarting"
+    input_series:
+      - series: "spark_container_started_timestamp_seconds{container=\"stagevote-db-1\",project=\"stagevote\",service=\"db\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: ContainerRestartLoop
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              container: "stagevote-db-1"
+              project: "stagevote"
+              service: "db"
+            exp_annotations:
+              summary: "stagevote-db-1 on spark-2 restarted repeatedly"
+
+  - interval: 1m
+    name: "one deploy restart is not a loop"
+    input_series:
+      - series: "spark_container_started_timestamp_seconds{container=\"stagevote-db-1\",project=\"stagevote\",service=\"db\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '100x10 900x30'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: ContainerRestartLoop
+        exp_alerts: []
+
+  - interval: 1m
+    name: "a database stops answering"
+    input_series:
+      - series: "spark_db_up{container=\"interview-postgres-1\",engine=\"postgres\",project=\"interview\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1x3 0x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: DatabaseDown
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              container: "interview-postgres-1"
+              engine: "postgres"
+              project: "interview"
+            exp_annotations:
+              summary: "postgres interview-postgres-1 on spark-2 is not answering"
+
+  - interval: 1m
+    name: "connections near the limit"
+    input_series:
+      - series: "spark_db_connections{container=\"interview-postgres-1\",engine=\"postgres\",project=\"interview\",state=\"active\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '40x30'
+      - series: "spark_db_connections{container=\"interview-postgres-1\",engine=\"postgres\",project=\"interview\",state=\"idle\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '50x30'
+      - series: "spark_db_connections_max{container=\"interview-postgres-1\",engine=\"postgres\",project=\"interview\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '100x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: DatabaseConnectionsNearLimit
+        exp_alerts:
+          - exp_labels:
+              severity: "warning"
+              node: "spark-2"
+              container: "interview-postgres-1"
+              engine: "postgres"
+              project: "interview"
+            exp_annotations:
+              summary: "interview-postgres-1 on spark-2 at 90% of its connections"
+
+  - interval: 1m
+    name: "connections with no known limit do not fire"
+    input_series:
+      - series: "spark_db_connections{container=\"interview-postgres-1\",engine=\"postgres\",project=\"interview\",state=\"active\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '90x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: DatabaseConnectionsNearLimit
+        exp_alerts: []
+
+  - interval: 1m
+    name: "a transaction stays open"
+    input_series:
+      - series: "spark_db_longest_transaction_seconds{container=\"interview-postgres-1\",engine=\"postgres\",project=\"interview\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '3600x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: DatabaseLongTransaction
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              container: "interview-postgres-1"
+              engine: "postgres"
+              project: "interview"
+            exp_annotations:
+              summary: "interview-postgres-1 on spark-2 has a transaction open for 1h 0m 0s"
+
+  - interval: 1m
+    name: "sessions pile up on locks"
+    input_series:
+      - series: "spark_db_lock_waits{container=\"interview-postgres-1\",engine=\"postgres\",project=\"interview\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '9x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: DatabaseLockWaits
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              container: "interview-postgres-1"
+              engine: "postgres"
+              project: "interview"
+            exp_annotations:
+              summary: "9 sessions waiting on locks in interview-postgres-1 on spark-2"
+
+  - interval: 1m
+    name: "statistics cannot be read"
+    input_series:
+      - series: "spark_db_stats_error{container=\"interview-postgres-1\",engine=\"postgres\",project=\"interview\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: DatabaseStatisticsFailing
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              container: "interview-postgres-1"
+              engine: "postgres"
+              project: "interview"
+            exp_annotations:
+              description: "The engine answers but the login or the query fails, so its detailed panels are empty."
+              summary: "Statistics for interview-postgres-1 on spark-2 cannot be read"
+
+  - interval: 1m
+    name: "redis evicts keys"
+    input_series:
+      - series: "spark_db_evicted_keys_total{container=\"interview-redis-1\",engine=\"redis\",project=\"interview\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+60x40'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: RedisEvictingKeys
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              container: "interview-redis-1"
+              engine: "redis"
+              project: "interview"
+            exp_annotations:
+              description: "It has hit its memory limit and is dropping data to stay under it."
+              summary: "interview-redis-1 on spark-2 is evicting keys"
+
+  - interval: 1m
+    name: "a new Spark waits for an SSH key"
+    input_series:
+      - series: "spark_fleet_member{instance=\"host.docker.internal:9100\",job=\"node\",node=\"spark-1\",role=\"head\",address=\"192.168.9.70\",hostname=\"spark-abcd\",state=\"needs_ssh_key\"}"
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SparkWaitingForEnrolment
+        exp_alerts:
+          - exp_labels:
+              instance: "host.docker.internal:9100"
+              job: "node"
+              node: "spark-1"
+              role: "head"
+              severity: "info"
+              address: "192.168.9.70"
+              hostname: "spark-abcd"
+              state: "needs_ssh_key"
+            exp_annotations:
+              description: "On the head: ./scripts/monitoring.sh fleet list"
+              summary: "spark-abcd (192.168.9.70) is on the LAN but not monitored: needs_ssh_key"
+
+  - interval: 1m
+    name: "a Spark being scraped is not waiting"
+    input_series:
+      - series: "spark_fleet_member{instance=\"host.docker.internal:9100\",job=\"node\",node=\"spark-1\",role=\"head\",address=\"192.168.9.68\",hostname=\"spark-476e\",state=\"scraping\"}"
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SparkWaitingForEnrolment
+        exp_alerts: []
+
+  - interval: 1m
+    name: "discovery stopped running"
+    input_series:
+      - series: "spark_fleet_last_discovery_timestamp_seconds{instance=\"host.docker.internal:9100\",job=\"node\",node=\"spark-1\",role=\"head\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: FleetDiscoveryStopped
+        exp_alerts:
+          - exp_labels:
+              instance: "host.docker.internal:9100"
+              job: "node"
+              node: "spark-1"
+              role: "head"
+              severity: "warning"
+            exp_annotations:
+              description: "On the head: systemctl --user status techsara-fleet.timer"
+              summary: "Spark discovery has not run for 20m 0s"
+
+  - interval: 1m
+    name: "a member has no scrape target"
+    input_series:
+      - series: "spark_fleet_member{instance=\"host.docker.internal:9100\",job=\"node\",node=\"spark-1\",role=\"head\",address=\"192.168.9.70\",hostname=\"spark-abcd\",member=\"spark-3\",state=\"scraping\"}"
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FleetMemberNotScraped
+        exp_alerts:
+          - exp_labels:
+              instance: "host.docker.internal:9100"
+              job: "node"
+              node: "spark-3"
+              role: "head"
+              severity: "warning"
+              address: "192.168.9.70"
+              hostname: "spark-abcd"
+              member: "spark-3"
+              state: "scraping"
+            exp_annotations:
+              summary: "spark-3 is in the registry but Prometheus has no target for it"
+
+  - interval: 1m
+    name: "a member with a target is fine"
+    input_series:
+      - series: "spark_fleet_member{instance=\"host.docker.internal:9100\",job=\"node\",node=\"spark-1\",role=\"head\",address=\"192.168.9.70\",hostname=\"spark-abcd\",member=\"spark-3\",state=\"scraping\"}"
+        values: '1x30'
+      - series: "up{instance=\"192.168.9.70:9100\",job=\"node\",node=\"spark-3\",role=\"member\"}"
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FleetMemberNotScraped
+        exp_alerts: []
+
+  - interval: 1m
+    name: "the probe stopped writing"
+    input_series:
+      - series: "spark_probe_last_run_timestamp_seconds{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SparkProbeStale
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+            exp_annotations:
+              description: "Container and database panels for this Spark are out of date."
+              summary: "spark-probe on spark-2 last wrote 15m 0s ago"
+
+  - interval: 1m
+    name: "host metrics with no probe data"
+    input_series:
+      - series: "up{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SparkProbeMissing
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+            exp_annotations:
+              description: "On the head: ./scripts/monitoring.sh fleet enroll spark-2"
+              summary: "spark-2 reports host metrics but no spark-probe data"
+
+  - interval: 1m
+    name: "a Spark with probe data is fine"
+    input_series:
+      - series: "up{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1x30'
+      - series: "spark_probe_last_run_timestamp_seconds{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: SparkProbeMissing
+        exp_alerts: []
+
+  - interval: 1m
+    name: "one collector keeps failing"
+    input_series:
+      - series: "spark_probe_collector_success{collector=\"kernel\",instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SparkProbeCollectorFailing
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+              collector: "kernel"
+            exp_annotations:
+              description: "docker logs on that machine say why. Its panels are empty, which does not mean zero."
+              summary: "spark-probe collector kernel fails on spark-2"
+
+  - interval: 1m
+    name: "spark-local stopped writing"
+    input_series:
+      - series: "spark_local_last_run_timestamp_seconds{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: SparkLocalStale
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+            exp_annotations:
+              description: "Health verdicts and NVMe readings for this Spark are out of date."
+              summary: "spark-local on spark-2 last wrote 15m 0s ago"
+
+  - interval: 1m
+    name: "the Docker daemon stops answering"
+    input_series:
+      - series: "spark_docker_up{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: DockerNotAnswering
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "critical"
+            exp_annotations:
+              summary: "The Docker daemon on spark-2 is not answering"
+
+  - interval: 1m
+    name: "a textfile cannot be parsed"
+    input_series:
+      - series: "node_textfile_scrape_error{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: TextfileUnreadable
+        exp_alerts:
+          - exp_labels:
+              instance: "192.168.9.68:9100"
+              job: "node"
+              node: "spark-2"
+              role: "worker"
+              severity: "warning"
+            exp_annotations:
+              summary: "node-exporter on spark-2 cannot parse a textfile"
+
+  - interval: 1m
+    name: "another target goes down"
+    input_series:
+      - series: "up{instance=\"blackbox-exporter:9115\",job=\"blackbox-http\",service=\"searxng\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MonitoringTargetDown
+        exp_alerts:
+          - exp_labels:
+              severity: "warning"
+              instance: "blackbox-exporter:9115"
+              job: "blackbox-http"
+              service: "searxng"
+            exp_annotations:
+              summary: "Scrape target blackbox-http blackbox-exporter:9115 is down"
+
+  - interval: 1m
+    name: "a node target has its own alert"
+    input_series:
+      - series: "up{instance=\"192.168.9.68:9100\",job=\"node\",node=\"spark-2\",role=\"worker\"}"
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MonitoringTargetDown
+        exp_alerts: []
+
+  - interval: 1m
+    name: "a target exceeds its sample limit"
+    input_series:
+      - series: "prometheus_target_scrapes_exceeded_sample_limit_total{instance=\"localhost:9090\",job=\"prometheus\",node=\"spark-1\",role=\"head\"}"
+        values: '0x5 1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ScrapeSampleLimitHit
+        exp_alerts:
+          - exp_labels:
+              severity: "warning"
+              instance: "localhost:9090"
+              job: "prometheus"
+              node: "spark-1"
+              role: "head"
+            exp_annotations:
+              description: "Status > Targets in Prometheus shows which. The limit protects the head's memory."
+              summary: "A target exceeded its sample limit and lost a scrape"

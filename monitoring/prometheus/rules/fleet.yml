@@ -1,0 +1,525 @@
+# The whole fleet: one set of rules for however many Sparks exist.
+#
+# Nothing here names a node. Every rule groups by the `node` label, so a Spark
+# that fifteen seconds ago did not exist is covered the moment it is scraped.
+# The series come from node-exporter, its textfile collector (spark-probe and
+# spark-local, monitoring/exporters/spark-probe/) and scripts/lib/fleet.py.
+#
+# Tests: monitoring/prometheus/tests/fleet.yml. There is no notifier by the
+# owner's decision (2026-09-15), so these reach people through the Grafana
+# Command Center and Prometheus' /alerts page.
+#
+# SEVERITY. critical: something is failing now or will lose data. warning: needs
+# a look today. info: a fact worth seeing, such as a reboot. fleet:health:code
+# ignores info.
+
+groups:
+  - name: fleet-recording
+    interval: 15s
+    rules:
+      # The one number at the top of the Command Center: 0 nominal, 1 warnings
+      # firing, 2 critical firing. Zero is honest here because no alert firing
+      # is a real answer; if Prometheus itself is gone this has no sample at
+      # all and the tile says so.
+      - record: fleet:health:code
+        expr: >-
+          (2 * (count(ALERTS{alertstate="firing",severity="critical"}) > bool 0))
+          or (1 * (count(ALERTS{alertstate="firing",severity="warning"}) > bool 0))
+          or vector(0)
+
+      - record: fleet:sparks:total
+        expr: count(up{job="node"})
+      - record: fleet:sparks:up
+        expr: sum(up{job="node"})
+
+      - record: fleet:containers:running
+        expr: sum(spark_containers{status="running"})
+      - record: fleet:containers:unhealthy
+        expr: count(spark_container_health_status == 0) or vector(0)
+      - record: node:containers:unhealthy
+        expr: count by (node) (spark_container_health_status == 0)
+
+      - record: fleet:databases:total
+        expr: count(spark_db_up)
+      - record: fleet:databases:up
+        expr: sum(spark_db_up)
+
+      - record: node:swap_used_bytes:current
+        expr: node_memory_SwapTotal_bytes - node_memory_SwapFree_bytes
+      - record: node:swap_used_percent:current
+        expr: >-
+          100 * (node_memory_SwapTotal_bytes - node_memory_SwapFree_bytes)
+          / node_memory_SwapTotal_bytes > 0
+          or (node_memory_SwapTotal_bytes * 0)
+
+      - record: node:swap_pages_per_second:rate5m
+        expr: rate(node_vmstat_pswpin[5m]) + rate(node_vmstat_pswpout[5m])
+
+      - record: node:disk_used_percent:root
+        expr: >-
+          100 * (1 - node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}
+          / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"})
+
+      - record: node:uptime_seconds:current
+        expr: time() - node_boot_time_seconds
+
+      - record: node:kernel_faults:increase1h
+        expr: >-
+          sum by (node) (increase(spark_kernel_events_total{kind!~"link_down|segfault"}[1h]))
+
+  - name: fleet-nodes
+    rules:
+      - alert: SparkRebooted
+        expr: time() - node_boot_time_seconds < 900
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $labels.node }} booted {{ $value | humanizeDuration }} ago"
+          description: >-
+            Compare spark_nvme_unsafe_shutdowns_total: if it rose, this was a
+            power cut or a hard reset, not a clean reboot. A worker reboot also
+            wedges the head's engine until the controller recovers it.
+
+      - alert: SparkUncleanShutdown
+        expr: increase(spark_nvme_unsafe_shutdowns_total[1h]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} lost power or was hard-reset"
+          description: >-
+            The drive counted a shutdown it was not warned about. Databases on
+            this Spark went through crash recovery; check the web index, which
+            a power cut has corrupted before (2026-10-29).
+
+      - alert: SparkMemoryStalling
+        # PSI "full": every runnable task on the machine waiting on memory at
+        # once. Baseline on 2026-11-05 was 3 % on the head and 0 % on the worker.
+        expr: rate(node_pressure_memory_stalled_seconds_total[5m]) > 0.10
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} stalled on memory {{ $value | humanizePercentage }} of the time"
+          description: >-
+            All tasks were blocked waiting for memory. On a unified-memory
+            machine this delays the model directly, even when the free figure
+            still looks fine.
+
+      - alert: SparkIoStalling
+        expr: rate(node_pressure_io_stalled_seconds_total[5m]) > 0.25
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} stalled on disk {{ $value | humanizePercentage }} of the time"
+
+      - alert: SparkSwapThrashing
+        # Pages in plus out. The head sat at about 3,000 pages/s on 2026-11-05,
+        # so this means something well beyond its usual pressure.
+        expr: node:swap_pages_per_second:rate5m > 8000
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} swapping {{ $value | printf \"%.0f\" }} pages/s"
+          description: >-
+            Sustained swap traffic slows everything on the node and wears the
+            NVMe. Find the consumer on the Spark dashboard, Memory row.
+
+      - alert: SparkFilesystemReadOnly
+        expr: node_filesystem_readonly{fstype=~"ext4|xfs|btrfs"} == 1
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.mountpoint }} on {{ $labels.node }} went read-only"
+          description: The kernel does this after a filesystem error. Every write on this mount now fails.
+
+      - alert: SparkInodesLow
+        expr: node_filesystem_files_free{fstype=~"ext4|xfs"} / node_filesystem_files{fstype=~"ext4|xfs"} < 0.10
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.mountpoint }} on {{ $labels.node }} has {{ $value | humanizePercentage }} of its inodes left"
+
+      - alert: SparkDiskWillFillWithinAWeek
+        expr: >-
+          predict_linear(node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}[6h], 7 * 86400) < 0
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} root filesystem fills within a week at the current rate"
+
+      - alert: SparkClockNotSynced
+        expr: node_timex_sync_status == 0
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} clock is not synchronised"
+
+      - alert: SparkClockOffset
+        # The worker's offset has swung between -36 and +54 ms, which is enough
+        # to fail timing-sensitive tests; this is the level that breaks more.
+        expr: abs(node_timex_offset_seconds) > 0.1
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} clock is off by {{ $value | humanizeDuration }}"
+
+      - alert: SparkLinkFlapping
+        expr: increase(node_network_carrier_changes_total{device=~"en.*"}[15m]) > 4
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.device }} on {{ $labels.node }} is flapping"
+          description: A clean reboot of a peer is two changes. More means a cable, a port or a switch.
+
+      - alert: SparkNicErrors
+        expr: >-
+          rate(node_network_receive_errs_total{device=~"en.*"}[5m])
+          + rate(node_network_transmit_errs_total{device=~"en.*"}[5m]) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.device }} on {{ $labels.node }}: {{ $value | printf \"%.1f\" }} errors/s"
+
+      - alert: SparkTcpRetransmitsHigh
+        expr: >-
+          rate(node_netstat_Tcp_RetransSegs[5m]) / clamp_min(rate(node_netstat_Tcp_OutSegs[5m]), 1) > 0.05
+          and rate(node_netstat_Tcp_OutSegs[5m]) > 100
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} retransmits {{ $value | humanizePercentage }} of TCP segments"
+
+      - alert: SparkConntrackNearlyFull
+        expr: node_nf_conntrack_entries / node_nf_conntrack_entries_limit > 0.85
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} connection tracking table {{ $value | humanizePercentage }} full"
+          description: At the limit the kernel drops new connections, Docker's included.
+
+      - alert: SparkFileDescriptorsHigh
+        expr: node_filefd_allocated / node_filefd_maximum > 0.80
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} used {{ $value | humanizePercentage }} of its file descriptors"
+
+      - alert: SystemdUnitFailed
+        expr: node_systemd_unit_state{state="failed"} == 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.name }} failed on {{ $labels.node }}"
+          description: "On that machine: systemctl status {{ $labels.name }}"
+
+      - alert: CoreServiceNotActive
+        expr: >-
+          node_systemd_unit_state{name=~"docker.service|containerd.service|nvidia-persistenced.service",state="active"} == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.name }} is not active on {{ $labels.node }}"
+
+      - alert: HostGuardNotActive
+        # On a Spark where the unit exists, it stopped. Its model and exporter
+        # ports then answer the whole office LAN.
+        expr: node_systemd_unit_state{name="techsara-host-guard.service",state="active"} == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "The host packet filter is not active on {{ $labels.node }}"
+          description: "scripts/host-guard.sh verify --role <role>, as root on that machine."
+
+      - alert: HostGuardNotInstalled
+        # A newly enrolled Spark: installing the filter needs its sudo password,
+        # so enrolment cannot do it, and its exporters answer the LAN until then.
+        expr: >-
+          spark_node_info unless on (node)
+          node_systemd_unit_state{name="techsara-host-guard.service"}
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} has no host packet filter"
+          description: "Its exporters are readable from the office LAN. See docs/MONITORING.md, Adding a Spark."
+
+  - name: fleet-kernel
+    rules:
+      - alert: GpuXidError
+        expr: increase(spark_kernel_events_total{kind="gpu_xid"}[15m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "NVIDIA Xid error on {{ $labels.node }}"
+          description: >-
+            The GPU driver reported a fault. spark_gpu_xid_total has the code.
+            These often precede a wedged or dead model rank.
+
+      - alert: GpuFallenOffBus
+        expr: increase(spark_kernel_events_total{kind="gpu_fallen_off"}[15m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "The GPU fell off the bus on {{ $labels.node }}"
+          description: Only a reboot brings it back.
+
+      - alert: KernelOomKill
+        expr: increase(spark_kernel_events_total{kind="oom_kill"}[15m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "The kernel OOM killer ran on {{ $labels.node }}"
+          description: "spark_container_oom_kills_total says which container, when it was one."
+
+      - alert: KernelStorageError
+        expr: increase(spark_kernel_events_total{kind=~"nvme_error|disk_error|fs_error"}[15m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Kernel {{ $labels.kind }} on {{ $labels.node }}"
+
+      - alert: KernelHardwareError
+        expr: increase(spark_kernel_events_total{kind=~"machine_check|pcie_aer|thermal"}[15m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "Kernel {{ $labels.kind }} on {{ $labels.node }}"
+
+      - alert: KernelTaskStuck
+        expr: increase(spark_kernel_events_total{kind=~"hung_task|lockup"}[15m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "Kernel {{ $labels.kind }} on {{ $labels.node }}"
+          description: A task or a CPU stopped making progress, usually waiting on a device or driver.
+
+      - alert: RoceDriverError
+        expr: increase(spark_kernel_events_total{kind="roce_error"}[15m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "RoCE driver error on {{ $labels.node }}"
+
+  - name: fleet-roce
+    rules:
+      - alert: RoceRetransmitting
+        # Zero on a healthy fabric (checked 2026-11-05). These rise before
+        # throughput falls and before node_infiniband errors do.
+        expr: >-
+          sum by (node, device) (rate(spark_roce_hw_counter_total{counter=~"roce_adp_retrans|local_ack_timeout_err|out_of_sequence|packet_seq_err|rnr_nak_retry_err|implied_nak_seq_err"}[5m])) > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.device }} on {{ $labels.node }}: {{ $value | printf \"%.1f\" }} retransmit events/s"
+
+      - alert: RoceTransportGaveUp
+        # Fires once when a peer dies mid-transfer, which is also what a worker
+        # reboot looks like, so read it next to SparkRebooted.
+        expr: >-
+          sum by (node, device) (increase(spark_roce_hw_counter_total{counter=~"req_transport_retries_exceeded|req_rnr_retries_exceeded"}[10m])) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "RDMA retries exhausted on {{ $labels.device }}, {{ $labels.node }}"
+
+  - name: fleet-nvme
+    rules:
+      - alert: NvmeCriticalWarning
+        expr: spark_nvme_critical_warning != 0
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.device }} on {{ $labels.node }} raised a critical warning ({{ $value }})"
+          description: "Bits, low to high: spare, temperature, reliability, read-only, backup power."
+
+      - alert: NvmeMediaErrors
+        expr: increase(spark_nvme_media_errors_total[1h]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.device }} on {{ $labels.node }} reported unrecovered media errors"
+
+      - alert: NvmeWearHigh
+        expr: spark_nvme_percentage_used_ratio >= 0.80
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.device }} on {{ $labels.node }} used {{ $value | humanizePercentage }} of its rated life"
+
+      - alert: NvmeSpareLow
+        expr: spark_nvme_available_spare_ratio <= 1.5 * spark_nvme_available_spare_threshold_ratio
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.device }} on {{ $labels.node }} is down to {{ $value | humanizePercentage }} spare"
+
+      - alert: NvmeTemperatureHigh
+        expr: spark_nvme_temperature_celsius > 75
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.device }} on {{ $labels.node }} at {{ $value }} °C"
+
+      - alert: NvmeHealthUnreadable
+        expr: spark_nvme_read_success == 0
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "The health log of {{ $labels.device }} on {{ $labels.node }} cannot be read"
+
+  - name: fleet-containers
+    rules:
+      - alert: ContainerRestartLoop
+        expr: changes(spark_container_started_timestamp_seconds[30m]) > 3
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.container }} on {{ $labels.node }} restarted repeatedly"
+
+      - alert: ContainerUnhealthy
+        expr: spark_container_health_status == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.container }} on {{ $labels.node }} fails its health check"
+
+      - alert: ContainerShouldBeRunning
+        expr: >-
+          spark_container_expected_running == 1
+          and on (node, container) spark_container_running == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.container }} on {{ $labels.node }} should be running and is not"
+
+      - alert: ContainerOomKilled
+        expr: increase(spark_container_oom_kills_total[15m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "The OOM killer took a process in {{ $labels.container }} on {{ $labels.node }}"
+
+  - name: fleet-databases
+    rules:
+      - alert: DatabaseDown
+        # The engine did not answer in its own protocol. TechSara's own database
+        # also has the critical PostgresDown.
+        expr: spark_db_up == 0
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.engine }} {{ $labels.container }} on {{ $labels.node }} is not answering"
+
+      - alert: DatabaseConnectionsNearLimit
+        expr: >-
+          sum by (node, container, engine, project) (spark_db_connections)
+          / on (node, container, engine, project) spark_db_connections_max > 0.85
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.container }} on {{ $labels.node }} at {{ $value | humanizePercentage }} of its connections"
+
+      - alert: DatabaseLongTransaction
+        # A transaction open this long stops vacuum and holds its locks.
+        expr: spark_db_longest_transaction_seconds > 1800
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.container }} on {{ $labels.node }} has a transaction open for {{ $value | humanizeDuration }}"
+
+      - alert: DatabaseLockWaits
+        expr: spark_db_lock_waits > 5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} sessions waiting on locks in {{ $labels.container }} on {{ $labels.node }}"
+
+      - alert: DatabaseStatisticsFailing
+        expr: spark_db_stats_error == 1
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Statistics for {{ $labels.container }} on {{ $labels.node }} cannot be read"
+          description: The engine answers but the login or the query fails, so its detailed panels are empty.
+
+      - alert: RedisEvictingKeys
+        expr: rate(spark_db_evicted_keys_total[5m]) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.container }} on {{ $labels.node }} is evicting keys"
+          description: It has hit its memory limit and is dropping data to stay under it.
+
+  - name: fleet-membership
+    rules:
+      - alert: SparkWaitingForEnrolment
+        expr: spark_fleet_member{state=~"discovered|needs_ssh_key|enrolling|enroll_failed|not_a_dgx_spark"} == 1
+        for: 10m
+        labels: { severity: info }
+        annotations:
+          summary: "{{ $labels.hostname }} ({{ $labels.address }}) is on the LAN but not monitored: {{ $labels.state }}"
+          description: "On the head: ./scripts/monitoring.sh fleet list"
+
+      - alert: FleetDiscoveryStopped
+        expr: time() - spark_fleet_last_discovery_timestamp_seconds > 600
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Spark discovery has not run for {{ $value | humanizeDuration }}"
+          description: "On the head: systemctl --user status techsara-fleet.timer"
+
+      - alert: FleetMemberNotScraped
+        expr: >-
+          label_replace(spark_fleet_member{state="scraping"}, "node", "$1", "member", "(.+)") == 1
+          unless on (node) up{job="node"}
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} is in the registry but Prometheus has no target for it"
+
+  - name: monitoring-health
+    rules:
+      - alert: SparkProbeStale
+        expr: time() - spark_probe_last_run_timestamp_seconds > 120
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "spark-probe on {{ $labels.node }} last wrote {{ $value | humanizeDuration }} ago"
+          description: Container and database panels for this Spark are out of date.
+
+      - alert: SparkProbeMissing
+        expr: up{job="node"} == 1 unless on (node) spark_probe_last_run_timestamp_seconds
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.node }} reports host metrics but no spark-probe data"
+          description: "On the head: ./scripts/monitoring.sh fleet enroll {{ $labels.node }}"
+
+      - alert: SparkProbeCollectorFailing
+        expr: spark_probe_collector_success == 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "spark-probe collector {{ $labels.collector }} fails on {{ $labels.node }}"
+          description: "docker logs on that machine say why. Its panels are empty, which does not mean zero."
+
+      - alert: SparkLocalStale
+        expr: time() - spark_local_last_run_timestamp_seconds > 120
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "spark-local on {{ $labels.node }} last wrote {{ $value | humanizeDuration }} ago"
+          description: Health verdicts and NVMe readings for this Spark are out of date.
+
+      - alert: DockerNotAnswering
+        expr: spark_docker_up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "The Docker daemon on {{ $labels.node }} is not answering"
+
+      - alert: TextfileUnreadable
+        expr: node_textfile_scrape_error == 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "node-exporter on {{ $labels.node }} cannot parse a textfile"
+
+      - alert: MonitoringTargetDown
+        # The jobs with their own alerts are left out: this is everything else.
+        expr: up{job!~"node|dgx-gpu|vllm-main|engine-controller"} == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Scrape target {{ $labels.job }} {{ $labels.instance }} is down"
+
+      - alert: ScrapeSampleLimitHit
+        expr: increase(prometheus_target_scrapes_exceeded_sample_limit_total[15m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "A target exceeded its sample limit and lost a scrape"
+          description: "Status > Targets in Prometheus shows which. The limit protects the head's memory."

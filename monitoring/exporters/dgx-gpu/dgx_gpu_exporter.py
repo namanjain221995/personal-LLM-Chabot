@@ -67,6 +67,11 @@ SMI_TIMEOUT_S = float(os.environ.get("DGX_GPU_EXPORTER_TIMEOUT", "8"))
 #: Cached so several scrapers (or a human curling the endpoint) cannot
 #: multiply the nvidia-smi load on a machine that is serving an LLM.
 CACHE_TTL_S = float(os.environ.get("DGX_GPU_EXPORTER_CACHE_TTL", "1.5"))
+#: The per-process busy share costs one more nvidia-smi call (80 ms measured), so
+#: it runs on its own slower clock rather than on every 5 s scrape.
+PMON_TTL_S = float(os.environ.get("DGX_GPU_EXPORTER_PMON_TTL", "15"))
+#: Driver version and the like do not change while the machine is up.
+INFO_TTL_S = float(os.environ.get("DGX_GPU_EXPORTER_INFO_TTL", "300"))
 
 log = logging.getLogger("dgx-gpu-exporter")
 
@@ -170,12 +175,61 @@ def query_processes() -> list[dict]:
     return procs
 
 
+def parse_pmon(text: str) -> dict[str, float]:
+    """`nvidia-smi pmon -s u`: per-process SM busy share, added up by name.
+
+    This is the reading that tells a model rank apart from a remote-desktop
+    session. A process the driver has no sample for prints `-`, which is left out
+    rather than counted as zero. Grouped by name because PIDs come and go.
+    """
+    columns: list[str] = []
+    busy: dict[str, float] = {}
+    for line in text.splitlines():
+        if line.startswith("#"):
+            if not columns and "pid" in line:
+                columns = line.lstrip("#").split()
+            continue
+        fields = line.split()
+        if not columns or "sm" not in columns or "command" not in columns or len(fields) < len(columns):
+            continue
+        raw = fields[columns.index("sm")]
+        if raw == "-":
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        # The command is the last column and may contain spaces.
+        name = " ".join(fields[columns.index("command"):])
+        busy[name] = busy.get(name, 0.0) + value
+    return busy
+
+
+def query_pmon() -> dict[str, float]:
+    return parse_pmon(_run(["nvidia-smi", "pmon", "-c", "1", "-s", "u"]))
+
+
+def query_info() -> list[list[str]]:
+    """A separate call on purpose: if a driver rejects one of these field names,
+    nvidia-smi fails the whole query, and that must not take dgx_gpu_up with it."""
+    out = _run([
+        "nvidia-smi",
+        "--query-gpu=index,driver_version,vbios_version,pcie.link.gen.current,pcie.link.width.current,persistence_mode",
+        "--format=csv,noheader,nounits",
+    ])
+    return [[p.strip() for p in line.split(",")] for line in out.strip().splitlines()]
+
+
 class Collector:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._body = ""
         self._at = 0.0
         self._errors = 0
+        self._pmon: dict[str, float] | None = None
+        self._pmon_at = float("-inf")
+        self._info: list[list[str]] | None = None
+        self._info_at = float("-inf")
 
     def render(self) -> str:
         with self._lock:
@@ -307,6 +361,38 @@ class Collector:
             head("dgx_gpu_compute_processes", "gauge",
                  "Number of processes holding a CUDA context.")
             lines.append(f"dgx_gpu_compute_processes {len(procs)}")
+
+            # --- Slower readings; neither may ever fail the scrape ----------
+            now = time.monotonic()
+            if now - self._pmon_at >= PMON_TTL_S:
+                self._pmon_at = now
+                try:
+                    self._pmon = query_pmon()
+                except Exception:  # noqa: BLE001 — the device metrics stand on their own
+                    log.debug("pmon failed", exc_info=True)
+                    self._pmon = None
+            if now - self._info_at >= INFO_TTL_S:
+                self._info_at = now
+                try:
+                    self._info = query_info()
+                except Exception:  # noqa: BLE001 — the device metrics stand on their own
+                    log.debug("info query failed", exc_info=True)
+                    self._info = None
+            if self._pmon is not None:
+                head("dgx_gpu_process_utilization_percent", "gauge",
+                     ("SM busy share of the processes with this name. The worker rank spins while "
+                      "it waits, so this says who holds the GPU, not how much work gets done."))
+                for name, value in sorted(self._pmon.items()):
+                    escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+                    lines.append(f'dgx_gpu_process_utilization_percent{{process="{escaped}"}} {value}')
+            if self._info:
+                head("dgx_gpu_info", "gauge", "Driver and firmware of this GPU.")
+                for row in self._info:
+                    if len(row) == 6:
+                        lines.append(
+                            f'dgx_gpu_info{{gpu="{row[0]}",driver="{row[1]}",vbios="{row[2]}",'
+                            f'pcie_gen="{row[3]}",pcie_width="{row[4]}",persistence="{row[5]}"}} 1'
+                        )
 
         head("dgx_gpu_scrape_duration_seconds", "gauge",
              "Wall time this exporter spent collecting the sample.")
