@@ -9,13 +9,16 @@ had rebooted, that the head had 80 % of its swap in use, or how worn the SSDs we
 - **New Sparks join by themselves.** `scripts/lib/fleet.py` finds them over mDNS on the
   management LAN, once a minute from a systemd user timer. If this head's SSH key is
   accepted their exporters start with no further action; if not, they show as
-  `needs_ssh_key` with the one command that fixes it. A Spark that dies stays listed as
-  DOWN, and its name survives a DHCP move. Installing the host packet filter on a third
-  Spark is still a manual step, and `HostGuardNotInstalled` says so.
+  `needs_ssh_key` with the one command that fixes it. mDNS is only a hint: nothing becomes
+  a target without proof over SSH, and an enrolled Spark's address only changes when that
+  machine itself confirms it. A Spark that dies stays listed as DOWN, and its name survives
+  a DHCP move. Installing the host packet filter on a third Spark is still a manual step,
+  and `HostGuardNotInstalled` says so.
 - **Every dashboard is built from labels.** `monitoring/grafana/generate_dashboards.py`
   writes nine of them, with a new home page, one page for everything about a Spark, and
   new pages for hosts side by side, databases, alerts with availability, and monitoring
-  itself. Old addresses keep working. A test fails if the committed JSON is stale.
+  itself. Old addresses keep working, and every page from before is one click from Home,
+  under "Old pages". A test fails if the committed JSON is stale.
 - **`spark-probe`, on every Spark, replaces cAdvisor.** It reads Docker's state files and
   the cgroup tree and opens no port. Containers on Spark 2 are visible for the first
   time, and the Docker socket is off the network: only `spark-local` holds it, with no

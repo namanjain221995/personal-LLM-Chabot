@@ -27,9 +27,9 @@ they do not hold is the health verdict, so that comes from spark_local.py, which
 has the socket and no network.
 
 WHAT IT DOES WITH CREDENTIALS. Liveness, version, connection counts (from
-PostgreSQL's process titles) and data size need no database login at all. A
-login is only used for the projects named in SPARK_PROBE_DEEP_DB_PROJECTS, by
-default only this platform's own stack. For any other project the password is
+PostgreSQL's process titles) and data size (measured by spark_local.py) need no
+database login at all. A login is only used for the projects named in
+SPARK_PROBE_DEEP_DB_PROJECTS, by default only this platform's own stack. For any other project the password is
 discarded while the container's configuration is parsed, so it is never held.
 No password, environment value or query text is ever logged or exported.
 
@@ -54,7 +54,6 @@ import os
 import re
 import secrets
 import socket
-import stat as stat_module
 import struct
 import threading
 import time
@@ -68,6 +67,8 @@ def _env(name: str, default: str) -> str:
 
 
 TEXTFILE = _env("SPARK_PROBE_TEXTFILE", "/textfile/spark_probe.prom")
+#: For spark-local, which has the capability to measure them.
+DB_VOLUMES_FILE = _env("SPARK_PROBE_DB_VOLUMES_FILE", "/textfile/.db_volumes.json")
 INTERVAL_S = float(_env("SPARK_PROBE_INTERVAL", "15"))
 DOCKER_ROOT = _env("SPARK_PROBE_DOCKER_ROOT", "/host/docker")
 CGROUP_ROOT = _env("SPARK_PROBE_CGROUP_ROOT", "/host/cgroup")
@@ -85,13 +86,21 @@ DB_DIAL_TIMEOUT_S = float(_env("SPARK_PROBE_DB_TIMEOUT", "2"))
 DEEP_INTERVAL_S = float(_env("SPARK_PROBE_DEEP_INTERVAL", "30"))
 #: pg_database_size walks every file of a database, so it runs far less often.
 SIZE_QUERY_INTERVAL_S = float(_env("SPARK_PROBE_SIZE_QUERY_INTERVAL", "300"))
-DATA_WALK_INTERVAL_S = float(_env("SPARK_PROBE_DATA_WALK_INTERVAL", "300"))
-DATA_WALK_BUDGET_S = float(_env("SPARK_PROBE_DATA_WALK_BUDGET", "20"))
+#: What one database may send or take in a whole conversation. It is someone else's
+#: program, and it must not be able to stall this cycle or fill this memory.
+MAX_REPLY_BYTES = 1 << 20
+DEEP_DEADLINE_S = float(_env("SPARK_PROBE_DEEP_DEADLINE", "8"))
+#: The server chooses SCRAM's iteration count. PostgreSQL's default is 4096; a hostile
+#: value would otherwise burn minutes of CPU here.
+MAX_SCRAM_ITERATIONS = 100_000
 
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
 # --------------------------------------------------------------- exposition --
+
+
+MAX_LABEL_CHARS = 256
 
 
 class Exposition:
@@ -115,7 +124,9 @@ class Exposition:
         if not math.isfinite(number):
             return
         family = self._families.setdefault(name, (metric_type, help_text, {}))
-        family[2][tuple(sorted((k, str(v)) for k, v in labels.items()))] = number
+        # Names and labels come from containers and databases. Prometheus refuses a
+        # whole scrape over its label limit, so one long value must not cost the rest.
+        family[2][tuple(sorted((k, str(v)[:MAX_LABEL_CHARS]) for k, v in labels.items()))] = number
 
     def gauge(self, name: str, help_text: str, value, **labels) -> None:
         self.add(name, "gauge", help_text, value, **labels)
@@ -267,6 +278,15 @@ def detect_engine(image: str) -> tuple[str, int, str] | None:
     return None
 
 
+_SAFE_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~:-]{0,39}")
+_SAFE_NAME = re.compile(r"[\w.$-]{1,63}")
+
+
+def safe_version(value: object) -> str:
+    """A version string a database reported about itself. Not trusted to be one."""
+    return value if isinstance(value, str) and _SAFE_VERSION.fullmatch(value) else "unknown"
+
+
 def deep_login_allowed(project: str, allowed: str = "") -> bool:
     names = {p.strip() for p in (allowed or DEEP_DB_PROJECTS).split(",") if p.strip()}
     return "*" in names or (project or "standalone") in names
@@ -315,8 +335,7 @@ def _version_from(env: dict[str, str], image: str) -> str:
     return "unknown"
 
 
-def parse_container(cid: str, config: dict, hostconfig: dict, volumes_root: str,
-                    allowed: str = "") -> Container:
+def parse_container(cid: str, config: dict, hostconfig: dict, allowed: str = "") -> Container:
     c = Container()
     state = config.get("State") or {}
     cfg = config.get("Config") or {}
@@ -355,15 +374,15 @@ def parse_container(cid: str, config: dict, hostconfig: dict, volumes_root: str,
         if c.published:
             break
 
-    # Only named volumes can be measured: they live under the Docker root the
-    # probe has mounted. A bind mount elsewhere stays unmeasured, not zero.
+    # Named volumes only, and only their names: spark-local measures them. A bind
+    # mount elsewhere stays unmeasured, not zero.
     c.volumes = []
     for mount in (config.get("MountPoints") or {}).values():
         if not isinstance(mount, dict):
             continue
         name = mount.get("Name")
         if name and (mount.get("Type") or "volume") == "volume":
-            c.volumes.append(os.path.join(volumes_root, name, "_data"))
+            c.volumes.append(name)
 
     detected = detect_engine(c.image)
     c.engine, c.engine_port, c.engine_how = detected if detected else ("", 0, "")
@@ -394,7 +413,6 @@ class DockerState:
 
     def __init__(self, root: str = DOCKER_ROOT, allowed: str = "") -> None:
         self.containers_dir = os.path.join(root, "containers")
-        self.volumes_root = os.path.join(root, "volumes")
         self.allowed = allowed
         self._cache: dict[str, tuple[tuple[int, int], Container]] = {}
 
@@ -420,7 +438,7 @@ class DockerState:
                     config = json.load(handle)
                 with open(host_path, encoding="utf-8") as handle:
                     hostconfig = json.load(handle)
-                container = parse_container(cid, config, hostconfig, self.volumes_root, self.allowed)
+                container = parse_container(cid, config, hostconfig, self.allowed)
             except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
                 log.debug("skipping container %s: %s", cid[:12], type(exc).__name__)
                 continue
@@ -665,59 +683,112 @@ class DbError(Exception):
     pass
 
 
-def _recv_exact(sock: socket.socket, count: int) -> bytes:
-    data = b""
-    while len(data) < count:
-        chunk = sock.recv(count - len(data))
+class Wire:
+    """A socket with one deadline and one byte budget for the whole conversation.
+
+    A socket timeout alone restarts on every byte, so a server sending one byte a
+    second holds a read for ever. Everything a database says goes through here.
+    """
+
+    def __init__(self, host: str, port: int, timeout: float) -> None:
+        self.deadline = time.monotonic() + timeout
+        self.left = MAX_REPLY_BYTES
+        self.buffer = b""
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+
+    def __enter__(self) -> "Wire":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def _arm(self) -> None:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise DbError("took too long")
+        self.sock.settimeout(remaining)
+
+    def send(self, data: bytes) -> None:
+        self._arm()
+        self.sock.sendall(data)
+
+    def _fill(self, want: int = 65536) -> None:
+        self._arm()
+        chunk = self.sock.recv(min(want, 65536))
         if not chunk:
             raise DbError("connection closed")
-        data += chunk
-    return data
+        self.left -= len(chunk)
+        if self.left < 0:
+            raise DbError("reply too large")
+        self.buffer += chunk
+
+    def exact(self, count: int) -> bytes:
+        if count < 0 or count > MAX_REPLY_BYTES:
+            raise DbError("reply too large")
+        while len(self.buffer) < count:
+            self._fill(max(count - len(self.buffer), 4096))
+        out, self.buffer = self.buffer[:count], self.buffer[count:]
+        return out
+
+    def line(self, limit: int = 65536) -> bytes:
+        while b"\n" not in self.buffer:
+            if len(self.buffer) > limit:
+                raise DbError("line too long")
+            self._fill()
+        out, _, self.buffer = self.buffer.partition(b"\n")
+        return out + b"\n"
+
+    def some(self, count: int) -> bytes:
+        if not self.buffer:
+            self._fill(count)
+        out, self.buffer = self.buffer[:count], self.buffer[count:]
+        return out
 
 
 def ping_postgres(host: str, port: int, timeout: float) -> None:
     """An SSLRequest is answered before any login and is logged by nothing:
     PostgreSQL deliberately stays silent when a client hangs up after it."""
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        sock.sendall(struct.pack("!II", 8, 80877103))
-        if _recv_exact(sock, 1) not in (b"S", b"N"):
+    with Wire(host, port, timeout) as wire:
+        wire.send(struct.pack("!II", 8, 80877103))
+        if wire.exact(1) not in (b"S", b"N"):
             raise DbError("not postgres")
 
 
 def ping_redis(host: str, port: int, timeout: float) -> None:
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        sock.sendall(b"PING\r\n")
+    with Wire(host, port, timeout) as wire:
+        wire.send(b"PING\r\n")
         # NOAUTH and DENIED are answers too: the server is up and is Redis.
-        if sock.recv(64)[:1] not in (b"+", b"-"):
+        if wire.some(64)[:1] not in (b"+", b"-"):
             raise DbError("not redis")
 
 
 def ping_mysql(host: str, port: int, timeout: float) -> str:
     """The server speaks first, version included."""
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        header = _recv_exact(sock, 4)
-        length = int.from_bytes(header[:3], "little")
-        packet = _recv_exact(sock, min(length, 256))
-        if packet[0] == 0xFF:
+    with Wire(host, port, timeout) as wire:
+        length = int.from_bytes(wire.exact(4)[:3], "little")
+        packet = wire.exact(min(length, 256))
+        if not packet or packet[0] == 0xFF:
             return ""  # "too many connections" and friends: alive, version unknown
         return packet[1:].split(b"\0", 1)[0].decode("ascii", "replace")
 
 
 def ping_http(host: str, port: int, path: str, timeout: float) -> None:
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        sock.sendall(f"GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: spark-probe\r\n\r\n".encode())
-        first = sock.recv(64).decode("ascii", "replace")
+    with Wire(host, port, timeout) as wire:
+        wire.send(f"GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: spark-probe\r\n\r\n".encode())
+        first = wire.some(64).decode("ascii", "replace")
     parts = first.split()
     if len(parts) < 2 or not parts[1].isdigit() or int(parts[1]) >= 500:
         raise DbError("http error")
 
 
 def ping_tcp(host: str, port: int, timeout: float) -> None:
-    with socket.create_connection((host, port), timeout=timeout):
+    with Wire(host, port, timeout):
         pass
 
 
@@ -738,20 +809,25 @@ def ping_engine(how: str, host: str, port: int, timeout: float) -> str:
 class MiniPg:
     """Just enough of the PostgreSQL protocol to read statistics.
 
-    Simple queries over the startup + trust/cleartext/md5/SCRAM-SHA-256 path,
-    read only, with a short statement timeout. The session is opened on the
-    `postgres` maintenance database so that it can never block a DROP DATABASE
-    or a CREATE DATABASE ... TEMPLATE of an application or test database.
+    Simple queries over the startup + trust/SCRAM-SHA-256 path, read only, with a short
+    statement timeout. The session is opened on the `postgres` maintenance database so
+    that it can never block a DROP DATABASE or a CREATE DATABASE ... TEMPLATE of an
+    application or test database.
+
+    THE PASSWORD NEVER CROSSES THE WIRE. Cleartext and md5 are refused rather than
+    answered: a neighbour on the same Docker bridge could spoof the server's address and
+    simply ask. SCRAM proves the password without sending it, and the server has to
+    prove it knew it too: AuthenticationOk without a valid server signature is refused.
     """
 
-    def __init__(self, host: str, port: int, user: str, password: str, database: str, timeout: float = 3.0) -> None:
+    def __init__(self, host: str, port: int, user: str, password: str, database: str,
+                 timeout: float = DEEP_DEADLINE_S) -> None:
         self.user, self.password = user, password
-        self.sock = socket.create_connection((host, port), timeout=timeout)
-        self.sock.settimeout(timeout)
+        self.wire = Wire(host, port, timeout)
         try:
             self._startup(database)
         except Exception:
-            self.close()
+            self.wire.close()
             raise
 
     def __enter__(self) -> "MiniPg":
@@ -762,24 +838,26 @@ class MiniPg:
 
     def close(self) -> None:
         try:
-            self.sock.sendall(b"X\x00\x00\x00\x04")
-        except OSError:
+            self.wire.send(b"X\x00\x00\x00\x04")
+        except (OSError, DbError):
             pass
-        self.sock.close()
+        self.wire.close()
 
     def _read(self) -> tuple[bytes, bytes]:
-        kind = _recv_exact(self.sock, 1)
-        length = struct.unpack("!I", _recv_exact(self.sock, 4))[0]
-        return kind, _recv_exact(self.sock, length - 4)
+        kind = self.wire.exact(1)
+        length = struct.unpack("!I", self.wire.exact(4))[0]
+        if length < 4:
+            raise DbError("bad message length")
+        return kind, self.wire.exact(length - 4)
 
     def _send(self, kind: bytes, payload: bytes) -> None:
-        self.sock.sendall(kind + struct.pack("!I", len(payload) + 4) + payload)
+        self.wire.send(kind + struct.pack("!I", len(payload) + 4) + payload)
 
     @staticmethod
     def _error(payload: bytes) -> DbError:
         # Severity and SQLSTATE only: a message can quote user or query text.
         fields = {f[:1]: f[1:] for f in payload.split(b"\0") if f}
-        return DbError(f"{fields.get(b'S', b'').decode()} {fields.get(b'C', b'').decode()}".strip())
+        return DbError(f"{fields.get(b'S', b'')[:16].decode('ascii', 'replace')} {fields.get(b'C', b'')[:8].decode('ascii', 'replace')}".strip())
 
     def _startup(self, database: str) -> None:
         params = {
@@ -793,8 +871,9 @@ class MiniPg:
         for key, value in params.items():
             body += key.encode() + b"\0" + value.encode() + b"\0"
         body += b"\0"
-        self.sock.sendall(struct.pack("!I", len(body) + 4) + body)
+        self.wire.send(struct.pack("!I", len(body) + 4) + body)
         nonce = client_first_bare = salted = auth_message = None
+        sasl_started = server_proved = False
         while True:
             kind, payload = self._read()
             if kind == b"E":
@@ -805,26 +884,30 @@ class MiniPg:
                 continue
             code = struct.unpack("!I", payload[:4])[0]
             if code == 0:
+                if sasl_started and not server_proved:
+                    raise DbError("server skipped its SCRAM proof")
                 continue
-            if code == 3:
-                self._send(b"p", self.password.encode() + b"\0")
-            elif code == 5:
-                inner = hashlib.md5(self.password.encode() + self.user.encode()).hexdigest()  # noqa: S324 - the protocol's hash
-                outer = hashlib.md5(inner.encode() + payload[4:8]).hexdigest()  # noqa: S324
-                self._send(b"p", b"md5" + outer.encode() + b"\0")
-            elif code == 10:
+            if code in (3, 5):
+                raise DbError("refusing to send a password over the wire")
+            if code == 10:
                 if b"SCRAM-SHA-256\0" not in payload[4:]:
                     raise DbError("no supported SASL mechanism")
+                sasl_started = True
                 nonce = base64.b64encode(secrets.token_bytes(18)).decode()
                 client_first_bare = f"n=,r={nonce}"
                 first = f"n,,{client_first_bare}".encode()
                 self._send(b"p", b"SCRAM-SHA-256\0" + struct.pack("!I", len(first)) + first)
             elif code == 11:
+                if not sasl_started:
+                    raise DbError("SCRAM out of order")
                 server_first = payload[4:].decode()
                 attrs = dict(item.split("=", 1) for item in server_first.split(","))
                 if not attrs["r"].startswith(nonce):
                     raise DbError("SCRAM nonce mismatch")
-                salted = hashlib.pbkdf2_hmac("sha256", self.password.encode(), base64.b64decode(attrs["s"]), int(attrs["i"]))
+                iterations = int(attrs["i"])
+                if not 1 <= iterations <= MAX_SCRAM_ITERATIONS:
+                    raise DbError("SCRAM iteration count out of range")
+                salted = hashlib.pbkdf2_hmac("sha256", self.password.encode(), base64.b64decode(attrs["s"]), iterations)
                 client_key = hmac.digest(salted, b"Client Key", "sha256")
                 without_proof = f"c=biws,r={attrs['r']}"
                 auth_message = f"{client_first_bare},{server_first},{without_proof}".encode()
@@ -832,10 +915,13 @@ class MiniPg:
                 proof = bytes(a ^ b for a, b in zip(client_key, signature))
                 self._send(b"p", f"{without_proof},p={base64.b64encode(proof).decode()}".encode())
             elif code == 12:
+                if salted is None:
+                    raise DbError("SCRAM out of order")
                 attrs = dict(item.split("=", 1) for item in payload[4:].decode().split(","))
                 expected = hmac.digest(hmac.digest(salted, b"Server Key", "sha256"), auth_message, "sha256")
                 if base64.b64decode(attrs.get("v", "")) != expected:
                     raise DbError("SCRAM server signature mismatch")
+                server_proved = True
             else:
                 raise DbError(f"unsupported authentication {code}")
 
@@ -865,28 +951,24 @@ class MiniPg:
                 return rows
 
 
-def redis_call(sock: socket.socket, reader, *args: str):
+def redis_call(wire: Wire, *args: str):
     command = f"*{len(args)}\r\n" + "".join(f"${len(a.encode())}\r\n{a}\r\n" for a in args)
-    sock.sendall(command.encode())
-    line = reader.readline()
-    if not line:
-        raise DbError("connection closed")
+    wire.send(command.encode())
+    line = wire.line()
     if line[:1] == b"-":
-        raise DbError(line[1:].split(b" ", 1)[0].decode("ascii", "replace"))
+        raise DbError(line[1:].split(b" ", 1)[0][:32].decode("ascii", "replace"))
     if line[:1] == b"$":
         size = int(line[1:])
-        return b"" if size < 0 else reader.read(size + 2)[:-2]
+        return b"" if size < 0 else wire.exact(size + 2)[:-2]
     return line[1:].rstrip()
 
 
 def redis_info(host: str, port: int, password: str | None, timeout: float) -> dict[str, str]:
     """INFO, logging in only when the probe was allowed the password."""
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        reader = sock.makefile("rb")
+    with Wire(host, port, timeout) as wire:
         if password:
-            redis_call(sock, reader, "AUTH", password)
-        raw = redis_call(sock, reader, "INFO")
+            redis_call(wire, "AUTH", password)
+        raw = redis_call(wire, "INFO")
     info: dict[str, str] = {}
     for line in raw.decode("utf-8", "replace").splitlines():
         if ":" in line and not line.startswith("#"):
@@ -975,98 +1057,25 @@ def dial_target(c: Container, proc: str = PROC_ROOT) -> tuple[str, int] | None:
     return host, port
 
 
-def directory_size(path: str, deadline: float) -> int | None:
-    """Disk blocks used, not apparent size. None when the walk ran out of time,
-    because a partial total would look like a database that shrank."""
-    total = 0
-    stack = [path]
-    while stack:
-        if time.monotonic() > deadline:
-            return None
-        current = stack.pop()
-        try:
-            with os.scandir(current) as entries:
-                for entry in entries:
-                    try:
-                        info = entry.stat(follow_symlinks=False)
-                    except OSError:
-                        continue
-                    total += info.st_blocks * 512
-                    if stat_module.S_ISDIR(info.st_mode):
-                        stack.append(entry.path)
-        except OSError:
-            continue
-    return total
-
-
-class DbSizes(threading.Thread):
-    """Walks database volumes in the background: it must never delay a cycle."""
-
-    daemon = True
-
-    def __init__(self) -> None:
-        super().__init__(name="db-sizes")
-        self._lock = threading.Lock()
-        self._targets: dict[str, list[str]] = {}
-        self._sizes: dict[str, int] = {}
-
-    def set_targets(self, targets: dict[str, list[str]]) -> None:
-        with self._lock:
-            self._targets = targets
-
-    def size_of(self, name: str) -> int | None:
-        with self._lock:
-            return self._sizes.get(name)
-
-    def walk_once(self) -> None:
-        with self._lock:
-            targets = dict(self._targets)
-        fresh: dict[str, int] = {}
-        for name, paths in targets.items():
-            deadline = time.monotonic() + DATA_WALK_BUDGET_S
-            total = 0
-            for path in paths:
-                size = directory_size(path, deadline)
-                if size is None:
-                    total = -1
-                    break
-                total += size
-            if total >= 0:
-                fresh[name] = total
-        with self._lock:
-            # A walk that timed out keeps its last good value rather than vanish.
-            self._sizes = {**{k: v for k, v in self._sizes.items() if k in targets}, **fresh}
-
-    def run(self) -> None:
-        # The first cycle names the volumes a moment after this thread starts.
-        # Without this wait, sizes stay blank for the first whole interval.
-        for _ in range(60):
-            with self._lock:
-                if self._targets:
-                    break
-            time.sleep(1)
-        while True:
-            try:
-                self.walk_once()
-            except Exception:  # noqa: BLE001 - a sizing thread must never die
-                log.warning("database size walk failed", exc_info=True)
-            time.sleep(DATA_WALK_INTERVAL_S)
-
-
 class DatabaseCollector:
-    def __init__(self, cgroup_root: str = CGROUP_ROOT, proc: str = PROC_ROOT) -> None:
+    def __init__(self, cgroup_root: str = CGROUP_ROOT, proc: str = PROC_ROOT, volumes_file: str | None = DB_VOLUMES_FILE) -> None:
         self.cgroup_root = cgroup_root
         self.proc = proc
-        self.sizes = DbSizes()
+        self.volumes_file = volumes_file
         self._deep: dict[str, tuple[float, dict]] = {}
         self._db_sizes: dict[str, tuple[float, list]] = {}
         self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="db")
 
-    def start(self) -> None:
-        self.sizes.start()
-
     # --- one instance -------------------------------------------------------
     def _probe_one(self, c: Container) -> dict:
+        """Nothing a database says may take the other databases' rows with it."""
+        try:
+            return self._probe(c)
+        except Exception as exc:  # noqa: BLE001 - it is someone else's program talking
+            log.info("probe of %s failed: %s", c.name, type(exc).__name__)
+            return {"container": c, "up": 0}
+
+    def _probe(self, c: Container) -> dict:
         result: dict = {"container": c, "up": 0}
         target = dial_target(c, self.proc)
         if c.running and target:
@@ -1104,8 +1113,8 @@ class DatabaseCollector:
                 session = MiniPg(target[0], target[1], user, password, c.login.get("POSTGRES_DB") or user)
             with session as pg:
                 deep = self._postgres_read(pg, c, now)
-        except (OSError, DbError, ValueError, IndexError, KeyError) as exc:
-            log.info("deep stats failed for %s: %s", c.name, type(exc).__name__ if isinstance(exc, OSError) else exc)
+        except Exception as exc:  # noqa: BLE001 - a malformed reply is an error, not a crash
+            log.info("deep stats failed for %s: %s", c.name, exc if isinstance(exc, DbError) else type(exc).__name__)
             self._deep.pop(c.id, None)
             return {"error": 1}
         self._deep[c.id] = (now, deep)
@@ -1131,7 +1140,7 @@ class DatabaseCollector:
             " FROM pg_stat_activity WHERE backend_type='client backend' AND pid<>pg_backend_pid()"
         )[0]
         deep: dict = {
-            "version": re.match(r"\S+", settings[0]).group(0),
+            "version": safe_version(settings[0].split()[0]),
             "max_connections": float(settings[1]),
             "uptime": float(settings[2]),
             "in_recovery": settings[3] == "t",
@@ -1166,7 +1175,7 @@ class DatabaseCollector:
             return {"info": redis_info(target[0], target[1], password, DB_DIAL_TIMEOUT_S)}
         except DbError:
             return None  # NOAUTH without an allowed password: liveness only
-        except (OSError, ValueError, IndexError):
+        except Exception:  # noqa: BLE001 - a malformed reply is an error, not a crash
             return {"error": 1}
 
     # --- the whole node -----------------------------------------------------
@@ -1180,7 +1189,7 @@ class DatabaseCollector:
                 instances.append(c)
             else:
                 stopped[c.engine] = stopped.get(c.engine, 0) + 1
-        self.sizes.set_targets({c.name: c.volumes for c in instances if c.volumes})
+        self._publish_volumes(instances)
         results = list(self._pool.map(self._probe_one, instances + native))
         for engine, count in stopped.items():
             exp.gauge("spark_db_stopped_instances",
@@ -1189,13 +1198,23 @@ class DatabaseCollector:
         for result in results:
             self._emit(exp, result)
 
+    def _publish_volumes(self, instances: list[Container]) -> None:
+        """For spark-local, which has the capability to walk them. Names only."""
+        if not self.volumes_file:
+            return
+        write_atomically(self.volumes_file, json.dumps([
+            {"container": c.name, "engine": c.engine, "project": c.project or "standalone", "volumes": c.volumes}
+            for c in instances if c.volumes
+        ]))
+
     def _emit(self, exp: Exposition, result: dict) -> None:
         c: Container = result["container"]
         deep = result.get("deep") or {}
         ident = {"container": c.name, "engine": c.engine, "project": c.project or ("host" if c.id.startswith("native") else "standalone")}
-        version = deep.get("version") or result.get("version") or c.version or "unknown"
+        reported = deep.get("version") or result.get("version")
+        version = safe_version(reported) if reported else (c.version or "unknown")
         if c.engine == "redis" and deep.get("info", {}).get("redis_version"):
-            version = deep["info"]["redis_version"]
+            version = safe_version(deep["info"]["redis_version"])
         level = "login" if deep and "error" not in deep and c.engine == "postgres" else (
             "info" if deep and "error" not in deep else "liveness")
         exp.gauge("spark_db_info",
@@ -1207,7 +1226,6 @@ class DatabaseCollector:
             exp.gauge("spark_db_stats_error", "1 when a statistics read failed this cycle.", 1, **ident)
         else:
             exp.gauge("spark_db_stats_error", "1 when a statistics read failed this cycle.", 0, **ident)
-        exp.gauge("spark_db_data_bytes", "Disk used by the database's named volumes.", self.sizes.size_of(c.name), **ident)
         titles = result.get("titles")
         if titles is not None:
             for state, count in titles.items():
@@ -1237,9 +1255,10 @@ class DatabaseCollector:
         exp.gauge("spark_db_replicas", "Streaming replicas attached.", deep.get("replicas"), **ident)
         exp.gauge("spark_db_replica_lag_bytes", "Largest replay lag of an attached replica.", deep.get("replica_lag_bytes"), **ident)
         exp.gauge("spark_db_replica_lag_seconds", "Replay lag when this server is itself a replica.", deep.get("replica_lag_seconds"), **ident)
-        for row in deep.get("databases") or []:
-            exp.gauge("spark_db_size_bytes", "Size of one database inside the instance (the 20 largest).",
-                      float(row[1]), datname=row[0], **ident)
+        for row in (deep.get("databases") or [])[:20]:
+            if len(row) == 2 and row[0] and _SAFE_NAME.fullmatch(row[0]):
+                exp.gauge("spark_db_size_bytes", "Size of one database inside the instance (the 20 largest).",
+                          float(row[1]), datname=row[0], **ident)
 
     @staticmethod
     def _emit_redis(exp: Exposition, ident: dict, info: dict) -> None:
@@ -1292,28 +1311,34 @@ def native_instances(rows: list[tuple[int, int, str, int, int]], proc: str = PRO
 # ------------------------------------------------------------- kernel events --
 
 #: The kernel's own words for hardware and resource trouble. These are the
-#: failures that kill a long-running model and that no metric reports.
+#: failures that kill a long-running model and that no metric reports. Anchored where
+#: the kernel's wording allows it, because some lines quote a name anyone can choose.
 KERNEL_PATTERNS = {
-    "gpu_xid": re.compile(r"NVRM: Xid"),
-    "gpu_fallen_off": re.compile(r"NVRM: .*(fallen off the bus|GPU at PCI.*has fallen)"),
-    "oom_kill": re.compile(r"Out of memory: Killed process|Memory cgroup out of memory|oom-kill:constraint"),
-    "hung_task": re.compile(r"blocked for more than \d+ seconds"),
-    "lockup": re.compile(r"soft lockup|hard LOCKUP|rcu.*(stall|self-detected)"),
+    "gpu_xid": re.compile(r"^NVRM: Xid"),
+    "gpu_fallen_off": re.compile(r"^NVRM: .*(fallen off the bus|GPU at PCI.*has fallen)"),
+    "oom_kill": re.compile(r"^Out of memory: Killed process|^Memory cgroup out of memory|^oom-kill:constraint"),
+    "hung_task": re.compile(r"^INFO: task .* blocked for more than \d+ seconds"),
+    "lockup": re.compile(r"soft lockup|hard LOCKUP|^rcu: .*(stall|self-detected)"),
     "machine_check": re.compile(r"Hardware Error|\bmce:|\bEDAC\b.*(error|CE|UE)|\bRAS:|SError Interrupt|arm-smmu.*(fault|Unhandled)"),
     # "AER: enabled with IRQ n" is every boot, not an error.
     "pcie_aer": re.compile(r"AER: (Corrected|Uncorrected|Multiple|Correctable|Fatal|Non-Fatal)|PCIe Bus Error"),
-    "nvme_error": re.compile(r"nvme nvme\d+:.*(timeout|reset|Abort|I/O \d+.*error)|nvme\d+.*I/O .*error"),
-    "disk_error": re.compile(r"I/O error, dev |Buffer I/O error|critical medium error"),
-    "fs_error": re.compile(r"EXT4-fs error|EXT4-fs warning.*(error|abort)|Remounting filesystem read-only|JBD2:.*(error|abort)"),
-    "roce_error": re.compile(r"mlx5_core.*(fatal|syndrome|health|FW fatal|error|failed)|mlx5_ib.*(error|failed)"),
-    "link_down": re.compile(r"(mlx5_core|igc|igb|e1000e|r8169|aqc|atlantic).*(Link down|link down|Link is Down)"),
-    "thermal": re.compile(r"(critical temperature|temperature above threshold|thermal.*(critical|shutdown)|clock throttled)"),
+    "nvme_error": re.compile(r"^nvme nvme\d+:.*(timeout|reset|Abort|I/O \d+.*error)|^nvme\d+.*I/O .*error"),
+    "disk_error": re.compile(r"^(blk_update_request: )?I/O error, dev |^Buffer I/O error|critical medium error"),
+    "fs_error": re.compile(r"^EXT4-fs error|^EXT4-fs warning.*(error|abort)|Remounting filesystem read-only|^JBD2:.*(error|abort)"),
+    "roce_error": re.compile(r"^mlx5_core.*(fatal|syndrome|health|FW fatal|error|failed)|^mlx5_ib.*(error|failed)"),
+    "link_down": re.compile(r"^(mlx5_core|igc|igb|e1000e|r8169|aqc|atlantic).*(Link down|link down|Link is Down)"),
+    "thermal": re.compile(r"(critical temperature|temperature above threshold|^thermal.*(critical|shutdown)|clock throttled)"),
     "segfault": re.compile(r"segfault at |general protection (fault|ip)"),
 }
-_XID = re.compile(r"NVRM: Xid \([^)]*\):\s*(\d+)")
+#: These lines start with, or carry, a process's own name: a program called
+#: "NVRM: Xid (a):7" must not be able to report a GPU fault by crashing.
+_QUOTES_A_PROCESS_NAME = re.compile(r"segfault at |general protection (fault|ip)|^Out of memory: Killed process|^oom-kill:constraint")
+_XID = re.compile(r"^NVRM: Xid \([^)]*\):\s*(\d+)")
 
 
 def classify_kernel_message(message: str) -> list[str]:
+    if _QUOTES_A_PROCESS_NAME.search(message):
+        return ["segfault"] if KERNEL_PATTERNS["segfault"].search(message) else ["oom_kill"]
     return [kind for kind, pattern in KERNEL_PATTERNS.items() if pattern.search(message)]
 
 
@@ -1481,7 +1506,6 @@ class Probe:
 
     def start_background(self) -> None:
         self.kernel.start()
-        self.databases.start()
 
     def cycle(self) -> str:
         exp = Exposition()

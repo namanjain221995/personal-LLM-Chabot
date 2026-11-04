@@ -6,7 +6,8 @@
     "dgx-spark",
     "developer-api",
     "files",
-    "v1-gateway"
+    "v1-gateway",
+    "old-pages"
   ],
   "timezone": "browser",
   "schemaVersion": 39,
@@ -5064,6 +5065,20 @@
       "tooltip": ""
     },
     {
+      "title": "Old pages",
+      "type": "dashboards",
+      "url": "",
+      "icon": "external link",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": true,
+      "tags": [
+        "old-pages"
+      ],
+      "tooltip": ""
+    },
+    {
       "title": "Spark",
       "type": "link",
       "url": "/d/spark-node",
@@ -5151,6 +5166,30 @@
       "title": "Engine",
       "type": "link",
       "url": "/d/dgx-vllm-performance",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Developer API",
+      "type": "link",
+      "url": "/d/dgx-developer-api",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Files",
+      "type": "link",
+      "url": "/d/dgx-files-gateway",
       "icon": "dashboard",
       "targetBlank": false,
       "keepTime": true,

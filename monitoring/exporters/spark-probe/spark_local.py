@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""spark-local: the two readings that need root-equivalent access.
+"""spark-local: the readings that need root-equivalent access.
 
   * NVMe SMART health. The drive's own record of wear, media errors and power
     loss. node-exporter reports the model and the temperature but none of this,
@@ -13,12 +13,18 @@
     went healthy, measured 2026-11-05), so spark-probe cannot get them there and
     the only other source is the API.
 
-WHY THIS IS A SEPARATE CONTAINER WITH NO NETWORK. CAP_SYS_ADMIN and the Docker
-socket are each as good as root. So the process holding them has no network
-interface at all: nothing can reach it, and all it can affect is the file it
-writes. spark-probe, which does use the network to probe databases, gets
-neither. cAdvisor, which this replaces, held the same socket while serving HTTP.
-Only GET requests are ever sent.
+  * Database sizes. Walking a database's volume means reading directories owned
+    by the database's own user, which takes CAP_DAC_READ_SEARCH. spark-probe says
+    which volumes belong to which database; only names are taken from it, and the
+    walk stays inside the volumes mount and follows no symlink.
+
+WHY THIS IS A SEPARATE CONTAINER WITH NO NETWORK. Each of those privileges is as
+good as root: CAP_SYS_ADMIN, the Docker socket, and CAP_DAC_READ_SEARCH (which, under
+Docker's default seccomp profile, also unlocks open_by_handle_at). So the process
+holding them has no network interface at all: nothing can reach it, and all it can
+affect is the files it writes. spark-probe, which talks to databases, gets none of
+them. cAdvisor, which this replaces, held the same socket while serving HTTP. Only
+GET requests are ever sent.
 
 The log page layout is the NVMe base specification's "SMART / Health
 Information" (log identifier 02h). Data units are thousands of 512-byte blocks.
@@ -35,6 +41,8 @@ import logging
 import os
 import re
 import socket
+import stat as stat_module
+import threading
 import time
 
 log = logging.getLogger("spark-local")
@@ -44,6 +52,12 @@ HEALTH_TEXTFILE = os.environ.get("SPARK_LOCAL_HEALTH_TEXTFILE", "/textfile/spark
 NVME_INTERVAL_S = float(os.environ.get("SPARK_LOCAL_NVME_INTERVAL", "300"))
 HEALTH_INTERVAL_S = float(os.environ.get("SPARK_LOCAL_HEALTH_INTERVAL", "15"))
 DOCKER_SOCKET = os.environ.get("SPARK_LOCAL_DOCKER_SOCKET", "/var/run/docker.sock")
+DB_SIZE_TEXTFILE = os.environ.get("SPARK_LOCAL_DB_SIZE_TEXTFILE", "/textfile/spark_db_size.prom")
+#: Written by spark-probe beside the .prom files; node-exporter ignores other names.
+DB_VOLUMES_FILE = os.environ.get("SPARK_LOCAL_DB_VOLUMES_FILE", "/textfile/.db_volumes.json")
+VOLUMES_ROOT = os.environ.get("SPARK_LOCAL_VOLUMES_ROOT", "/host/docker/volumes")
+DB_SIZE_INTERVAL_S = float(os.environ.get("SPARK_LOCAL_DB_SIZE_INTERVAL", "300"))
+DB_SIZE_BUDGET_S = float(os.environ.get("SPARK_LOCAL_DB_SIZE_BUDGET", "20"))
 #: _IOWR('N', 0x41, struct nvme_admin_cmd)
 NVME_IOCTL_ADMIN_CMD = 0xC0484E41
 ADMIN_GET_LOG_PAGE = 0x02
@@ -266,9 +280,109 @@ def health_cycle(info: dict | None) -> None:
     write_atomically(HEALTH_TEXTFILE, render_health(containers, info))
 
 
+# ------------------------------------------------------------- database sizes --
+
+_VOLUME_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")
+_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+
+
+def directory_size(path: str, deadline: float) -> int | None:
+    """Disk blocks used, not apparent size. None when the walk ran out of time,
+    because a partial total would look like a database that shrank."""
+    total = 0
+    stack = [path]
+    while stack:
+        if time.monotonic() > deadline:
+            return None
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    total += info.st_blocks * 512
+                    if stat_module.S_ISDIR(info.st_mode):
+                        stack.append(entry.path)
+        except OSError:
+            continue
+    return total
+
+
+def read_volume_list(path: str = DB_VOLUMES_FILE) -> list[tuple[dict[str, str], list[str]]]:
+    """spark-probe's list. It talks to the outside and this process does not, so nothing
+    in it is trusted: labels and names must match closed patterns or the entry is dropped."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = handle.read(4 << 20)
+        doc = json.loads(raw)
+    except (OSError, ValueError):
+        return []
+    out: list[tuple[dict[str, str], list[str]]] = []
+    for item in doc if isinstance(doc, list) else []:
+        if not isinstance(item, dict):
+            continue
+        labels = {key: item.get(key) for key in ("container", "engine", "project")}
+        volumes = item.get("volumes")
+        if not all(isinstance(v, str) and _LABEL.fullmatch(v) for v in labels.values()) or not isinstance(volumes, list):
+            continue
+        names = [v for v in volumes if isinstance(v, str) and _VOLUME_NAME.fullmatch(v) and ".." not in v]
+        if names:
+            out.append((labels, names))
+    return out[:256]
+
+
+def render_db_sizes(sizes: list[tuple[dict[str, str], int]]) -> str:
+    lines = ["# HELP spark_db_data_bytes Disk used by the database's named volumes.", "# TYPE spark_db_data_bytes gauge"]
+    for labels, size in sizes:
+        body = ",".join(f'{key}="{labels[key]}"' for key in sorted(labels))
+        lines.append(f"spark_db_data_bytes{{{body}}} {size}")
+    return "\n".join(lines) + "\n"
+
+
+def db_size_pass(root: str = VOLUMES_ROOT, list_path: str = DB_VOLUMES_FILE, last: dict | None = None) -> dict:
+    """A walk that times out keeps its last good value instead of vanishing."""
+    last = last if last is not None else {}
+    fresh: dict = {}
+    for labels, names in read_volume_list(list_path):
+        key = labels["container"]
+        deadline = time.monotonic() + DB_SIZE_BUDGET_S
+        total = 0
+        for name in names:
+            size = directory_size(os.path.join(root, name, "_data"), deadline)
+            if size is None:
+                total = None
+                break
+            total += size
+        if total is not None:
+            fresh[key] = (labels, total)
+        elif key in last:
+            fresh[key] = last[key]
+    return fresh
+
+
+def db_size_loop() -> None:
+    last: dict = {}
+    # The probe writes its list a moment after both containers start.
+    for _ in range(60):
+        if os.path.exists(DB_VOLUMES_FILE):
+            break
+        time.sleep(1)
+    while True:
+        try:
+            last = db_size_pass(last=last)
+            write_atomically(DB_SIZE_TEXTFILE, render_db_sizes(list(last.values())))
+        except Exception:  # noqa: BLE001 - sizing must never take the health file with it
+            log.exception("database size pass failed")
+        time.sleep(DB_SIZE_INTERVAL_S)
+
+
 def main() -> int:
     logging.basicConfig(level="INFO", format="%(asctime)s %(levelname)s %(name)s %(message)s")
     once = os.environ.get("SPARK_LOCAL_ONCE") == "1"
+    if not once:
+        threading.Thread(target=db_size_loop, name="db-sizes", daemon=True).start()
     next_nvme = next_info = 0.0
     info: dict | None = None
     while True:

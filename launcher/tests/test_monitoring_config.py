@@ -337,6 +337,12 @@ class PrometheusConfigTests(unittest.TestCase):
         self.assertIn('node_systemd_unit_state;active;', section)
         self.assertIn("techsara-.*", section)
 
+    def test_a_scrape_is_bounded_in_size_and_labels_too(self):
+        for job in ("job_name: dgx-gpu", "job_name: node"):
+            section = _uncommented(self.prom).split(job, 1)[1].split("job_name:", 1)[0]
+            for limit in ("body_size_limit:", "label_limit:", "label_name_length_limit:", "label_value_length_limit:", "target_limit:", "follow_redirects: false"):
+                self.assertIn(limit, section, f"{job}: {limit}")
+
     def test_there_is_still_no_notifier(self):
         # The owner decided against alert mail on 2026-09-15.
         self.assertNotIn("alerting:", _uncommented(self.prom))
@@ -574,16 +580,19 @@ class SparkProbeDeploymentTests(unittest.TestCase):
         for services in self.services():
             svc = services["spark-local"]
             self.assertEqual(svc.get("network_mode"), "none")
-            self.assertEqual(svc.get("cap_add"), ["SYS_ADMIN"])
+            self.assertEqual(sorted(svc.get("cap_add")), ["DAC_READ_SEARCH", "SYS_ADMIN"])
 
     @unittest.skipUnless(HAVE_COMPOSE, "docker compose unavailable")
     def test_the_container_on_the_network_has_neither_the_socket_nor_sys_admin(self):
         for services in self.services():
             svc = services["spark-probe"]
-            self.assertEqual(sorted(svc.get("cap_add")), ["DAC_READ_SEARCH", "SYSLOG"])
+            # Not DAC_READ_SEARCH: under Docker's default seccomp profile that also unlocks
+            # open_by_handle_at, which reads any file on the host. Security review, 2026-11-05.
+            self.assertEqual(svc.get("cap_add"), ["SYSLOG"])
             self.assertEqual(svc.get("network_mode"), "host")
             sources = [v.get("source", "") for v in svc.get("volumes", [])]
             self.assertFalse([s for s in sources if "docker.sock" in s], "spark-probe must not hold the Docker socket")
+            self.assertFalse([s for s in sources if s.endswith("/volumes")], "spark-probe must not read database volumes")
 
     @unittest.skipUnless(HAVE_COMPOSE, "docker compose unavailable")
     def test_only_spark_local_holds_the_docker_socket(self):
@@ -631,6 +640,14 @@ class SparkProbeDeploymentTests(unittest.TestCase):
     def test_logging_in_to_other_projects_databases_is_opt_in(self):
         for services in self.services():
             self.assertEqual(services["spark-probe"]["environment"]["SPARK_PROBE_DEEP_DB_PROJECTS"], "sf-local-ai")
+
+    def test_the_images_that_hold_privileges_are_pinned(self):
+        # The other Python containers run on the floating tag; these two hold more.
+        for overlay in (HEAD_OVERLAY, WORKER_OVERLAY):
+            text = _uncommented(overlay.read_text())
+            for name in ("spark-probe:", "spark-local:"):
+                image = text.split(f"  {name}", 1)[1].split("image:", 1)[1].split("\n", 1)[0].strip()
+                self.assertIn("@sha256:", image, name)
 
     def test_the_kernel_log_is_only_read(self):
         for overlay in (HEAD_OVERLAY, WORKER_OVERLAY):

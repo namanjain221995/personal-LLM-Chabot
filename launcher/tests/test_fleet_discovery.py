@@ -60,19 +60,29 @@ class FleetCase(unittest.TestCase):
         self.doc = self.fleet.load_registry()
         self.fleet.seed(self.doc, DUAL)
 
-    def discover(self, found, answers=lambda _a: False, ok=(True, "ok"), enrolled=True, cfg=None):
+    def discover(self, found, answers=lambda _a: False, ok=(True, "ok"), enrolled=True, cfg=None, moved=False):
         self.spark_checks = []
         self.enrolled = []
+        self.move_checks = []
 
-        def check(target, _cfg):
-            self.spark_checks.append(target)
+        def check(member, _cfg):
+            self.spark_checks.append(member["address"])
             return ok
 
         def enrol(member, _cfg):
             self.enrolled.append(member["address"])
             return enrolled
 
-        self.fleet.discover(self.doc, {**DUAL, **(cfg or {})}, found, answers=answers, spark_check=check, enroll_fn=enrol)
+        def move(member, candidate, _cfg):
+            self.move_checks.append(candidate)
+            return moved
+
+        self.fleet.discover(self.doc, {**DUAL, **(cfg or {})}, found, answers=answers, proof=check,
+                            move_proof=move, enroll_fn=enrol, identify=lambda _member, _cfg: "spark-476e")
+
+    def rewind_retry(self):
+        for member in self.doc["members"].values():
+            member.pop("enroll_attempt", None)
 
     def targets(self, name="sparks-node.json"):
         self.fleet.render(self.doc)
@@ -97,7 +107,7 @@ class MdnsParsingTests(FleetCase):
     def test_avahi_being_missing_is_not_a_crash(self):
         def missing(*_a, **_k):
             raise FileNotFoundError
-        self.assertEqual(self.fleet.browse_mdns("enP7s7", PATTERN, run=missing), {})
+        self.assertEqual(self.fleet.browse_mdns("enP7s7", PATTERN, None, run=missing), {})
 
 
 class SeedTests(FleetCase):
@@ -125,13 +135,7 @@ class SeedTests(FleetCase):
 class NewSparkTests(FleetCase):
     NEW = {"spark-476e": "192.168.9.68", "spark-abcd": "192.168.9.70"}
 
-    def test_exporters_already_answering_join_within_one_pass(self):
-        self.discover(self.NEW, answers=lambda _a: True)
-        member = self.doc["members"]["spark-3"]
-        self.assertEqual((member["hostname"], member["address"], member["state"]), ("spark-abcd", "192.168.9.70", "scraping"))
-        self.assertIn({"targets": ["192.168.9.70:9100"], "labels": {"node": "spark-3", "role": "member"}}, self.targets())
-
-    def test_no_exporters_but_a_trusted_key_enrols_automatically(self):
+    def test_a_spark_that_proves_itself_joins(self):
         self.discover(self.NEW, answers=lambda a: a == "192.168.9.68")
         self.assertEqual(self.enrolled, ["192.168.9.70"])
         self.assertEqual(self.doc["members"]["spark-3"]["state"], "enrolling")
@@ -140,7 +144,17 @@ class NewSparkTests(FleetCase):
         # The next pass finds the exporters.
         self.discover(self.NEW, answers=lambda _a: True)
         self.assertEqual(self.doc["members"]["spark-3"]["state"], "scraping")
-        self.assertTrue([g for g in self.targets() if g["labels"]["node"] == "spark-3"])
+        self.assertIn({"targets": ["192.168.9.70:9100"], "labels": {"node": "spark-3", "role": "member"}}, self.targets())
+
+    def test_open_ports_alone_never_make_a_target(self):
+        # Security review, 2026-11-05: `spark-beef` with 9100 and 9835 open became a
+        # permanent target with no SSH at all, even with auto-enrolment off.
+        for cfg in ({}, {"MONITORING_FLEET_AUTO_ENROLL": "false"}):
+            self.doc = self.fleet.load_registry()
+            self.fleet.seed(self.doc, DUAL)
+            self.discover(self.NEW, answers=lambda _a: True, ok=(False, "ssh_refused"), cfg=cfg)
+            self.assertFalse(self.doc["members"]["spark-3"].get("ever_scraped"))
+            self.assertFalse([g for g in self.targets() if g["labels"]["node"] == "spark-3"], cfg)
 
     def test_no_key_says_exactly_that_and_starts_nothing(self):
         self.discover(self.NEW, answers=lambda a: a == "192.168.9.68", ok=(False, "ssh_refused"))
@@ -153,6 +167,11 @@ class NewSparkTests(FleetCase):
         self.discover(self.NEW, answers=lambda a: a == "192.168.9.68", ok=(False, "not_a_dgx_spark"))
         self.assertEqual(self.enrolled, [])
         self.assertEqual(self.doc["members"]["spark-3"]["state"], "not_a_dgx_spark")
+
+    def test_a_server_that_accepts_any_key_is_refused(self):
+        self.discover(self.NEW, answers=lambda a: a == "192.168.9.68", ok=(False, "accepts_any_key"))
+        self.assertEqual(self.enrolled, [])
+        self.assertEqual(self.doc["members"]["spark-3"]["state"], "refused")
 
     def test_automatic_enrolment_can_be_turned_off(self):
         self.discover(self.NEW, answers=lambda a: a == "192.168.9.68", cfg={"MONITORING_FLEET_AUTO_ENROLL": "false"})
@@ -178,19 +197,28 @@ class NewSparkTests(FleetCase):
         members = {"spark-1": {}, "spark-2": {}, "spark-4": {}}
         self.assertEqual(self.fleet.next_name(members), "spark-3")
 
+    def test_a_flood_of_made_up_names_is_bounded(self):
+        flood = {f"spark-{i:04x}": f"192.168.9.{i % 200 + 10}" for i in range(100)}
+        self.discover(flood, ok=(False, "ssh_refused"))
+        self.assertLessEqual(len(self.doc["members"]), self.fleet.MAX_MEMBERS)
+        self.assertLessEqual(len(self.spark_checks), self.fleet.MAX_ENROLL_ATTEMPTS_PER_PASS)
+
 
 class StayingVisibleTests(FleetCase):
     ALL = {"spark-476e": "192.168.9.68", "spark-abcd": "192.168.9.70"}
 
     def join(self):
+        self.discover(self.ALL, answers=lambda a: a == "192.168.9.68")
         self.discover(self.ALL, answers=lambda _a: True)
+        self.assertTrue(self.doc["members"]["spark-3"]["ever_scraped"])
+        self.rewind_retry()
 
     def test_a_spark_that_dies_stays_a_target(self):
         # It must read as DOWN everywhere, not vanish from every panel.
         self.join()
         self.discover({}, answers=lambda _a: False)
         self.assertEqual(self.doc["members"]["spark-3"]["state"], "down")
-        self.assertEqual(self.spark_checks, [])  # nothing to enrol into
+        self.assertEqual(self.enrolled, [])  # nothing to enrol into
         self.assertTrue([g for g in self.targets() if g["labels"]["node"] == "spark-3"])
 
     def test_exporters_down_on_a_visible_spark_are_repaired(self):
@@ -198,19 +226,44 @@ class StayingVisibleTests(FleetCase):
         self.discover(self.ALL, answers=lambda a: a == "192.168.9.68")
         self.assertEqual(self.enrolled, ["192.168.9.70"])
 
-    def test_a_dhcp_move_updates_one_field_and_rebinds_the_exporters(self):
+    def test_advertising_an_enrolled_name_changes_nothing(self):
+        # Security review, 2026-11-05: this took over node=spark-2 and re-enrolled the
+        # real worker with the attacker's address as its bind.
+        self.join()
+        attack = {"spark-476e": "192.168.9.66", "spark-abcd": "192.168.9.70"}
+        self.discover(attack, answers=lambda _a: True, moved=False)
+        self.assertEqual(self.doc["members"]["spark-2"]["address"], "192.168.9.68")
+        self.assertEqual(self.move_checks, ["192.168.9.66"])
+        self.assertEqual(self.enrolled, [])
+        self.assertIn({"targets": ["192.168.9.68:9100"], "labels": {"node": "spark-2", "role": "worker"}}, self.targets())
+
+    def test_a_real_dhcp_move_is_confirmed_by_the_machine_itself(self):
         # 2026-11-01: the worker moved 9.68 -> 9.3 and every exporter crash-looped.
         self.join()
-        self.discover({"spark-476e": "192.168.9.3", "spark-abcd": "192.168.9.70"}, answers=lambda _a: True)
+        self.discover({"spark-476e": "192.168.9.3", "spark-abcd": "192.168.9.70"}, answers=lambda _a: True, moved=True)
         self.assertEqual(self.doc["members"]["spark-2"]["address"], "192.168.9.3")
         self.assertEqual(self.enrolled, ["192.168.9.3"])
         self.assertIn({"targets": ["192.168.9.3:9100"], "labels": {"node": "spark-2", "role": "worker"}}, self.targets())
 
-    def test_a_seeded_worker_learns_its_hostname_instead_of_becoming_a_new_spark(self):
+    def test_a_refused_move_is_not_retried_every_minute(self):
+        self.join()
+        attack = {"spark-476e": "192.168.9.66"}
+        self.discover(attack, answers=lambda _a: True)
+        self.assertEqual(len(self.move_checks), 1)
+        self.discover(attack, answers=lambda _a: True)
+        self.assertEqual(self.move_checks, [])
+
+    def test_the_seeded_worker_keeps_its_place_whatever_mdns_says(self):
         self.assertEqual(self.doc["members"]["spark-2"]["hostname"], "")
         self.discover({"spark-476e": "192.168.9.68"}, answers=lambda _a: True)
-        self.assertEqual(self.doc["members"]["spark-2"]["hostname"], "spark-476e")
         self.assertEqual(sorted(self.doc["members"]), ["spark-1", "spark-2"])
+        self.assertEqual(self.doc["members"]["spark-2"]["hostname"], "spark-476e")
+        self.assertEqual(self.doc["members"]["spark-2"]["address"], "192.168.9.68")
+
+    def test_a_claim_to_an_enrolled_address_under_another_name_is_ignored(self):
+        self.discover({"spark-dead": "192.168.9.68"}, answers=lambda _a: True)
+        self.assertEqual(sorted(self.doc["members"]), ["spark-1", "spark-2"])
+        self.assertEqual(self.doc["members"]["spark-2"]["hostname"], "spark-476e")
 
     def test_forgetting_a_spark_removes_it_and_keeps_it_out(self):
         self.join()
@@ -230,6 +283,13 @@ class StayingVisibleTests(FleetCase):
         again = self.fleet.load_registry()
         self.fleet.seed(again, DUAL)
         self.assertEqual(again["members"]["spark-3"]["hostname"], "spark-abcd")
+        self.assertTrue(again["members"]["spark-3"]["enrolled"])
+
+    def test_a_spark_enrolled_before_proof_was_required_stays_enrolled(self):
+        path = self.root / ".runtime" / "fleet" / "registry.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"members": {"spark-2": {"address": "192.168.9.68", "ever_scraped": True}}}))
+        self.assertTrue(self.fleet.load_registry()["members"]["spark-2"]["enrolled"])
 
     def test_a_corrupt_registry_does_not_stop_discovery(self):
         path = self.root / ".runtime" / "fleet" / "registry.json"
@@ -237,6 +297,29 @@ class StayingVisibleTests(FleetCase):
         path.write_text("{broken")
         doc = self.fleet.load_registry()
         self.assertEqual(doc["members"], {})
+
+
+class SubnetTests(FleetCase):
+    IP_OUTPUT = "2: enP7s7    inet 192.168.9.54/22 brd 192.168.11.255 scope global dynamic enP7s7\n"
+
+    def test_answers_from_outside_the_management_subnet_are_ignored(self):
+        network = self.fleet.management_network({"MONITORING_FLEET_SUBNET": "192.168.8.0/22"})
+        text = (r"=;enP7s7;IPv4;x;_ssh._tcp;local;spark-beef.local;10.0.0.5;22;" "\n"
+                r"=;enP7s7;IPv4;x;_ssh._tcp;local;spark-abcd.local;192.168.9.70;22;" "\n")
+        self.assertEqual(self.fleet.parse_avahi(text, "enP7s7", PATTERN, network), {"spark-abcd": "192.168.9.70"})
+
+    def test_the_subnet_comes_from_the_interface(self):
+        run = lambda *_a, **_k: mock.Mock(stdout=self.IP_OUTPUT)
+        self.assertEqual(str(self.fleet.management_network({}, run=run)), "192.168.8.0/22")
+
+    def test_an_unknown_subnet_trusts_nothing(self):
+        run = lambda *_a, **_k: mock.Mock(stdout="")
+        self.assertIsNone(self.fleet.management_network({}, run=run))
+        self.assertIsNone(self.fleet.management_network({"MONITORING_FLEET_SUBNET": "nonsense"}))
+
+    def test_addresses_nothing_should_bind_or_scrape(self):
+        for bad in ("0.0.0.0", "8.8.8.8", "224.0.0.251", "255.255.255.255"):
+            self.assertFalse(self.fleet.is_lan_address(bad), bad)
 
 
 class EnrolmentTests(FleetCase):
@@ -278,13 +361,63 @@ class EnrolmentTests(FleetCase):
         self.assertFalse(self.fleet.enroll({"address": "192.168.9.70"}, DUAL, run=run))
         self.assertEqual(len(recorded), 2)
 
+    def machine(self, stdout="spark-ok\nspark-abcd\n2: enP7s7 inet 192.168.9.70/22 brd\n", code=0, canary_code=255):
+        """A fake `run` that tells the throwaway-key login from the real one."""
+        def run(command, **_kwargs):
+            if command[0] == "ssh-keygen":
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if "IdentitiesOnly=yes" in command:
+                return mock.Mock(returncode=canary_code, stdout="", stderr="")
+            return mock.Mock(returncode=code, stdout=stdout, stderr="")
+        return run
+
+    def member(self):
+        return {"address": "192.168.9.70", "hostname": "spark-abcd"}
+
     def test_a_refused_key_is_told_apart_from_a_wrong_machine(self):
-        refused = lambda *_a, **_k: mock.Mock(returncode=255, stdout="", stderr="Permission denied")
-        self.assertEqual(self.fleet.is_a_spark("u@h", DUAL, run=refused), (False, "ssh_refused"))
-        other = lambda *_a, **_k: mock.Mock(returncode=1, stdout="", stderr="")
-        self.assertEqual(self.fleet.is_a_spark("u@h", DUAL, run=other), (False, "not_a_dgx_spark"))
-        good = lambda *_a, **_k: mock.Mock(returncode=0, stdout="spark-ok\n", stderr="")
-        self.assertEqual(self.fleet.is_a_spark("u@h", DUAL, run=good), (True, "ok"))
+        self.assertEqual(self.fleet.prove_new_spark(self.member(), DUAL, run=self.machine(code=255, stdout="")), (False, "ssh_refused"))
+        self.assertEqual(self.fleet.prove_new_spark(self.member(), DUAL, run=self.machine(code=1, stdout="")), (False, "not_a_dgx_spark"))
+        self.assertEqual(self.fleet.prove_new_spark(self.member(), DUAL, run=self.machine()), (True, "ok"))
+
+    def test_a_server_that_lets_a_throwaway_key_in_is_not_a_spark(self):
+        self.assertEqual(self.fleet.prove_new_spark(self.member(), DUAL, run=self.machine(canary_code=0)), (False, "accepts_any_key"))
+
+    def test_the_machine_must_say_the_same_name_mdns_did(self):
+        run = self.machine(stdout="spark-ok\nsomething-else\n")
+        self.assertEqual(self.fleet.prove_new_spark(self.member(), DUAL, run=run), (False, "hostname_mismatch"))
+
+    def test_a_move_needs_the_pinned_machine_to_hold_the_address(self):
+        member = {"address": "192.168.9.68", "hostname": "spark-476e", "ssh": "techsphere@10.100.184.2", "key_pinned": True}
+        holds = self.machine(stdout="spark-ok\nspark-476e\n2: enP7s7 inet 192.168.9.3/22 brd\n")
+        self.assertTrue(self.fleet.proves_move(member, "192.168.9.3", DUAL, run=holds))
+        # The real worker, asked over the rail, does not hold the attacker's address.
+        self.assertFalse(self.fleet.proves_move(member, "192.168.9.66", DUAL, run=holds))
+        other = self.machine(stdout="spark-ok\nspark-dead\n2: enP7s7 inet 192.168.9.3/22 brd\n")
+        self.assertFalse(self.fleet.proves_move(member, "192.168.9.3", DUAL, run=other))
+
+    def test_the_host_key_is_pinned_under_the_hostname_and_never_accepted_twice(self):
+        member = {"address": "192.168.9.70", "hostname": "spark-abcd"}
+        first = " ".join(self.fleet.ssh_identity_options(member, first=True))
+        later = " ".join(self.fleet.ssh_identity_options(member, first=False))
+        self.assertIn("HostKeyAlias=spark-abcd", first)
+        self.assertIn("StrictHostKeyChecking=accept-new", first)
+        self.assertIn("StrictHostKeyChecking=yes", later)
+        self.assertIn(str(self.fleet.KNOWN_HOSTS), later)
+
+    def test_a_move_check_never_takes_a_new_key_on_trust(self):
+        seen = []
+
+        def run(command, **_kwargs):
+            seen.append(command)
+            return mock.Mock(returncode=255, stdout="", stderr="")
+        self.fleet.proves_move({"address": "192.168.9.70", "hostname": "spark-abcd"}, "192.168.9.66", DUAL, run=run)
+        self.assertIn("StrictHostKeyChecking=yes", seen[0])
+        self.assertNotIn("StrictHostKeyChecking=accept-new", seen[0])
+
+    def test_enrolling_refuses_an_address_nothing_should_bind(self):
+        recorded, run = self.calls()
+        self.assertFalse(self.fleet.enroll({"address": "0.0.0.0"}, DUAL, run=run))
+        self.assertEqual(recorded, [])
 
     def test_ssh_never_prompts(self):
         # This runs from a timer: a password prompt would hang it for ever.
@@ -294,6 +427,7 @@ class EnrolmentTests(FleetCase):
         self.assertEqual(self.fleet.ssh_target(self.doc["members"]["spark-2"], DUAL), "techsphere@10.100.184.2")
         target = self.fleet.ssh_target({"address": "192.168.9.70"}, {"MONITORING_FLEET_SSH_USER": "ops"})
         self.assertEqual(target, "ops@192.168.9.70")
+        self.assertEqual(self.fleet.ssh_target({"address": "192.168.9.70"}, {"MONITORING_FLEET_SSH_USER": "ops"}, "192.168.9.3"), "ops@192.168.9.3")
 
     def test_settings_never_read_the_secrets_file(self):
         (self.root / ".runtime").mkdir(exist_ok=True)

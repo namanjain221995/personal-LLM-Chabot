@@ -265,12 +265,15 @@ services:
   # and host PID are for reading: a database on any Compose network can be
   # dialled, and /proc supplies network counters and PostgreSQL's process titles.
   #
-  # The capabilities are the whole of what it can do beyond an unprivileged
-  # process: DAC_READ_SEARCH to read state files and measure database volumes,
-  # SYSLOG to read the kernel log. Its volumes are read-only except the textfile
-  # tmpfs. See monitoring/exporters/spark-probe/spark_probe.py.
+  # SYSLOG, to read the kernel log, is its only capability. It runs as root only to
+  # read root-owned state files. It deliberately lacks DAC_READ_SEARCH: with Docker's
+  # default seccomp profile that also unlocks open_by_handle_at, which reads any file
+  # on the host's disk, and this is the container that talks to other programs.
+  # Measuring database volumes needs that capability, so spark-local does it. Its
+  # volumes are read-only except the textfile tmpfs.
+  # See monitoring/exporters/spark-probe/spark_probe.py.
   spark-probe:
-    image: python:3.12-slim
+    image: python@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
     profiles: [monitoring]
     command: ["python", "-u", "/app/spark_probe.py"]
     environment:
@@ -287,7 +290,6 @@ services:
     cap_drop:
       - ALL
     cap_add:
-      - DAC_READ_SEARCH
       - SYSLOG
     security_opt:
       - no-new-privileges:true
@@ -297,7 +299,6 @@ services:
       - ./monitoring/exporters/spark-probe/spark_probe.py:/app/spark_probe.py:ro
       - /etc/dgx-release:/host/dgx-release:ro
       - /var/lib/docker/containers:/host/docker/containers:ro
-      - /var/lib/docker/volumes:/host/docker/volumes:ro
       - /sys/fs/cgroup:/host/cgroup:ro
       # What fleet discovery knows, so a Spark waiting for enrolment is visible.
       - ./.runtime/fleet:/fleet:ro
@@ -314,14 +315,14 @@ services:
       start_period: 30s
     logging: *monitoring-logging
 
-  # --- NVMe wear and power-loss count; Docker health ------------------------
-  # Reading the drive's health log needs CAP_SYS_ADMIN and Docker's health
-  # verdicts need the socket; each is as good as root. So this container has NO
-  # NETWORK and a read-only root filesystem: nothing can reach it, and the files
-  # it writes are all it can affect. It only sends GET requests. cAdvisor held
-  # the same socket while serving HTTP (audit F057).
+  # --- NVMe wear and power-loss count; Docker health; database sizes --------
+  # Reading the drive's health log needs CAP_SYS_ADMIN, Docker's health verdicts
+  # need the socket, and walking database volumes needs DAC_READ_SEARCH; each is as
+  # good as root. So this container has NO NETWORK and a read-only root filesystem:
+  # nothing can reach it, and the files it writes are all it can affect. It only
+  # sends GET requests. cAdvisor held the same socket while serving HTTP (audit F057).
   spark-local:
-    image: python:3.12-slim
+    image: python@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
     profiles: [monitoring]
     command: ["python", "-u", "/app/spark_local.py"]
     environment:
@@ -332,6 +333,7 @@ services:
       - ALL
     cap_add:
       - SYS_ADMIN
+      - DAC_READ_SEARCH
     security_opt:
       - no-new-privileges:true
     devices:
@@ -340,6 +342,7 @@ services:
       - ./monitoring/exporters/spark-probe/spark_local.py:/app/spark_local.py:ro
       # Not ":ro": that would not stop it being used, only imply that it does.
       - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/host/docker/volumes:ro
       - spark-textfile:/textfile
     restart: unless-stopped
     # OOM order: see prometheus above (OPERATIONS.md section 14).

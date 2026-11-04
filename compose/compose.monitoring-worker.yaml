@@ -128,7 +128,7 @@ services:
   # copy in compose.monitoring.yaml; the two differ only in where the files come
   # from and the address of the GPU exporter.
   spark-probe:
-    image: python:3.12-slim
+    image: python@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
     command: ["python", "-u", "/app/spark_probe.py"]
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
@@ -140,7 +140,6 @@ services:
     cap_drop:
       - ALL
     cap_add:
-      - DAC_READ_SEARCH
       - SYSLOG
     security_opt:
       - no-new-privileges:true
@@ -150,7 +149,6 @@ services:
       - ./spark_probe.py:/app/spark_probe.py:ro
       - /etc/dgx-release:/host/dgx-release:ro
       - /var/lib/docker/containers:/host/docker/containers:ro
-      - /var/lib/docker/volumes:/host/docker/volumes:ro
       - /sys/fs/cgroup:/host/cgroup:ro
       - spark-textfile:/textfile
     restart: unless-stopped
@@ -165,10 +163,10 @@ services:
       start_period: 30s
     logging: *worker-logging
 
-  # NVMe wear, power-loss count, Docker health. Holds the socket and
+  # NVMe wear, power-loss count, Docker health, database sizes. Holds the socket and
   # CAP_SYS_ADMIN, so it has no network at all; see the head's copy.
   spark-local:
-    image: python:3.12-slim
+    image: python@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
     command: ["python", "-u", "/app/spark_local.py"]
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
@@ -178,6 +176,7 @@ services:
       - ALL
     cap_add:
       - SYS_ADMIN
+      - DAC_READ_SEARCH
     security_opt:
       - no-new-privileges:true
     devices:
@@ -186,6 +185,7 @@ services:
       - ./spark_local.py:/app/spark_local.py:ro
       # Not ":ro": that would not stop it being used, only imply that it does.
       - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/host/docker/volumes:ro
       - spark-textfile:/textfile
     restart: unless-stopped
     oom_score_adj: 600

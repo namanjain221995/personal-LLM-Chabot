@@ -62,16 +62,23 @@ NAV = [
     ("Home", "dgx-cluster-overview"), ("Spark", "spark-node"), ("GPU", "dgx-gpu-thermal-power"),
     ("Fabric", "dgx-interconnect"), ("Hosts", "fleet-hosts"), ("Containers", "dgx-host-containers"),
     ("Databases", "fleet-databases"), ("Postgres", "dgx-data-stores"), ("Engine", "dgx-vllm-performance"),
+    ("Developer API", "dgx-developer-api"), ("Files", "dgx-files-gateway"),
     ("Alerts", "fleet-alerts"), ("Monitoring", "fleet-monitoring"),
 ]
+#: Pages that are not generated carry this tag, and the dropdown lists them all: the
+#: pages people knew before the fleet pages, kept reachable right beside Home.
+OLD_PAGES_TAG = "old-pages"
 
 
 def nav_links() -> list[dict]:
-    return [
+    links = [
         {"title": title, "type": "link", "url": f"/d/{uid}", "icon": "dashboard", "targetBlank": False,
          "keepTime": True, "includeVars": False, "asDropdown": False, "tags": [], "tooltip": ""}
         for title, uid in NAV
     ]
+    links.insert(1, {"title": "Old pages", "type": "dashboards", "url": "", "icon": "external link", "targetBlank": False,
+                     "keepTime": True, "includeVars": False, "asDropdown": True, "tags": [OLD_PAGES_TAG], "tooltip": ""})
+    return links
 
 
 # ------------------------------------------------------------------ primitives --
@@ -1149,14 +1156,16 @@ BUILDERS = {
 
 
 def add_nav_to_handwritten(check: bool) -> list[str]:
-    """Pages that are not generated get the same navigation bar, and nothing else."""
+    """Pages that are not generated get the navigation bar and the tag, and nothing else."""
     stale = []
     for path in sorted(OUT.glob("*.json")):
         if path.name in BUILDERS:
             continue
         doc = json.loads(path.read_text(encoding="utf-8"))
-        if doc.get("links") != nav_links():
+        tags = doc.get("tags") or []
+        if doc.get("links") != nav_links() or OLD_PAGES_TAG not in tags:
             doc["links"] = nav_links()
+            doc["tags"] = [*tags, OLD_PAGES_TAG] if OLD_PAGES_TAG not in tags else tags
             if check:
                 stale.append(path.name)
             else:

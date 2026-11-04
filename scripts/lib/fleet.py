@@ -12,28 +12,40 @@
     fleet.py uninstall-timer
 
 HOW A NEW SPARK ARRIVES. Every DGX Spark advertises `spark-XXXX SSH` over mDNS
-out of the box, so plugging one into the management LAN is enough to be seen:
-no port scan, no address list. Then:
+out of the box, so plugging one into the management LAN is enough to be seen: no
+port scan, no address list. Then, if this host's SSH key is accepted, its exporters
+are copied over and started, and it joins the scrape targets. If not, it shows on
+the Monitoring page as `needs_ssh_key` with the one command that fixes it.
 
-  1. Its exporters answer: it joins the scrape targets within a minute, and every
-     dashboard grows by one Spark because every panel is built from labels.
-  2. Its exporters do not answer, but this host's SSH key is accepted: the
-     exporters are copied over and started, then 1 applies on the next pass.
-  3. Neither: it shows on the Fleet dashboard as `needs_ssh_key`, with the one
-     command that fixes it (`ssh-copy-id`). Nothing else needs to change.
+MDNS IS A HINT, NEVER AN AUTHORITY. Anyone on the office LAN can advertise any name.
+So nothing mDNS says, and no port that happens to answer, ever makes a machine a
+scrape target or moves an existing one:
 
-A SPARK NEVER SILENTLY DISAPPEARS. Once scraped, a Spark stays a target until
-someone runs `forget`. A machine that dies must read as DOWN; a target list that
-tracked what is currently visible would make it vanish from every panel instead,
-exactly when it matters most.
+  * A machine becomes a target only after SSH proves it: this host's key is accepted,
+    a throwaway key is refused (a server that accepts everything is not a Spark), it
+    has /etc/dgx-release and a GPU, and its own hostname matches.
+  * Its host key is pinned at that moment under its hostname, in this directory's own
+    known_hosts file, so every later connection must be the same machine at any address.
+  * An enrolled Spark's address only changes when that pinned machine itself says it
+    holds the new address. Advertising `spark-476e` from elsewhere changes nothing.
+
+A determined attacker on the LAN can still pass the first proof by telling the two
+keys apart, and appear as a NEW Spark. They get exporter code and a network map, which
+hold no secret, and a bounded cost to Prometheus (see the job limits in prometheus.yml).
+They cannot impersonate a Spark that is already enrolled. For a closed fleet, set
+MONITORING_FLEET_AUTO_ENROLL=false and use `fleet add`.
+
+A SPARK NEVER SILENTLY DISAPPEARS. Once scraped, a Spark stays a target until someone
+runs `forget`. A machine that dies must read as DOWN; a target list that tracked what
+is currently visible would make it vanish from every panel, when it matters most.
 
 NAMES ARE STABLE. `spark-N` is handed out once and tied to the hostname, not the
-address, so a DHCP move (2026-11-01, worker 192.168.9.68 -> 192.168.9.3) updates
-one field and every dashboard and alert keeps its history.
+address, so a DHCP move (2026-11-01, worker 192.168.9.68 -> 192.168.9.3) updates one
+field and every dashboard and alert keeps its history.
 
-MANAGEMENT LAN ONLY. Discovery only trusts answers on the management interface,
-and only the node's LAN address is ever written as a target. The RoCE addresses
-are never used: monitoring must not share the fabric it measures.
+MANAGEMENT LAN ONLY. Discovery only trusts answers on the management interface, from
+inside its subnet, and only a node's LAN address is ever written as a target. The RoCE
+addresses are never used: monitoring must not share the fabric it measures.
 
 No third-party packages: launcher tests run this on a bare interpreter.
 """
@@ -49,6 +61,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -57,6 +70,7 @@ RUNTIME = ROOT / ".runtime"
 FLEET_DIR = RUNTIME / "fleet"
 REGISTRY = FLEET_DIR / "registry.json"
 PUBLIC = FLEET_DIR / "fleet.json"
+KNOWN_HOSTS = FLEET_DIR / "known_hosts"
 TARGETS_DIR = RUNTIME / "prometheus"
 LOG_FILE = RUNTIME / "logs" / "fleet.log"
 UNIT_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
@@ -67,6 +81,9 @@ NODE_PORT = 9100
 GPU_PORT = 9835
 HEAD_NODE = "spark-1"
 ENROLL_RETRY_S = 600
+#: What a flood of made-up names can cost: bounded registry, bounded SSH per pass.
+MAX_MEMBERS = 32
+MAX_ENROLL_ATTEMPTS_PER_PASS = 4
 #: Copied to every Spark. None of them holds a secret.
 ENROLL_FILES = (
     "compose/compose.monitoring-worker.yaml",
@@ -75,7 +92,7 @@ ENROLL_FILES = (
     "monitoring/exporters/spark-probe/spark_local.py",
     "scripts/host-guard.sh",  # installing it needs that machine's sudo; see docs/MONITORING.md
 )
-SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new"]
+SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 
 
 def log(message: str) -> None:
@@ -114,17 +131,36 @@ def settings() -> dict[str, str]:
 
 
 def is_lan_address(value: str) -> bool:
-    """A usable management address: not loopback, a bridge or the RoCE subnets."""
+    """A private unicast address that is not loopback, a bridge or the RoCE subnets."""
     try:
         address = ipaddress.ip_address(value)
     except ValueError:
         return False
-    if address.version != 4 or address.is_loopback or address.is_link_local:
+    if (address.version != 4 or not address.is_private or address.is_loopback or address.is_link_local
+            or address.is_multicast or address.is_unspecified or address.is_reserved):
         return False
     for excluded in ("10.100.184.0/24", "10.100.185.0/24", "172.16.0.0/12"):
         if address in ipaddress.ip_network(excluded):
             return False
     return True
+
+
+def management_network(cfg: dict[str, str], run=subprocess.run):
+    """The subnet discovery trusts. None, and so nothing discovered, if it is unknown."""
+    configured = cfg.get("MONITORING_FLEET_SUBNET")
+    if configured:
+        try:
+            return ipaddress.ip_network(configured, strict=False)
+        except ValueError:
+            log(f"MONITORING_FLEET_SUBNET is not a network: {configured}")
+            return None
+    interface = cfg.get("MONITORING_FLEET_INTERFACE") or "enP7s7"
+    try:
+        proc = run(["ip", "-4", "-o", "addr", "show", "dev", interface], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"\binet (\d+\.\d+\.\d+\.\d+/\d+)", proc.stdout)
+    return ipaddress.ip_network(match.group(1), strict=False) if match else None
 
 
 # ------------------------------------------------------------------- registry --
@@ -137,6 +173,10 @@ def load_registry() -> dict:
         doc = {}
     doc.setdefault("members", {})
     doc.setdefault("ignored", [])
+    for member in doc["members"].values():
+        # A Spark scraped before enrolment needed proof was enrolled by a person.
+        if member.get("ever_scraped"):
+            member["enrolled"] = True
     return doc
 
 
@@ -163,13 +203,13 @@ def seed(doc: dict, cfg: dict[str, str]) -> None:
     members = doc["members"]
     head = members.setdefault(HEAD_NODE, {"role": "head", "first_seen": now})
     head.update(hostname=socket.gethostname(), address="host.docker.internal", state="scraping",
-                ever_scraped=True, last_seen=now)
+                ever_scraped=True, enrolled=True, last_seen=now)
     mode = cfg.get("TECHSARA_CLUSTER_MODE") or cfg.get("CLUSTER_MODE") or "single"
     worker_ip = cfg.get("CLUSTER_WORKER_MGMT_IP") or cfg.get("MONITORING_WORKER_BIND") or ""
     if mode == "dual" and is_lan_address(worker_ip) and "spark-2" not in members:
         members["spark-2"] = {
             "role": "worker", "first_seen": now, "address": worker_ip, "hostname": "",
-            "ssh": cfg.get("CLUSTER_WORKER_SSH") or "", "state": "scraping", "ever_scraped": True,
+            "ssh": cfg.get("CLUSTER_WORKER_SSH") or "", "state": "scraping", "ever_scraped": True, "enrolled": True,
         }
 
 
@@ -185,7 +225,8 @@ def render(doc: dict) -> bool:
     """Prometheus' file_sd targets. The head stays static in prometheus.yml."""
     node_groups, gpu_groups = [], []
     for name, member in sorted(doc["members"].items()):
-        if name == HEAD_NODE or not member.get("ever_scraped") or not member.get("address"):
+        # Enrolled means proven over SSH. mDNS and an open port alone never get here.
+        if name == HEAD_NODE or not member.get("enrolled") or not member.get("ever_scraped") or not member.get("address"):
             continue
         labels = {"node": name, "role": member.get("role") or "member"}
         node_groups.append({"targets": [f"{member['address']}:{NODE_PORT}"], "labels": labels})
@@ -206,7 +247,7 @@ def render(doc: dict) -> bool:
 # ------------------------------------------------------------------ discovery --
 
 
-def parse_avahi(text: str, interface: str, host_pattern: str) -> dict[str, str]:
+def parse_avahi(text: str, interface: str, host_pattern: str, network=None) -> dict[str, str]:
     """`avahi-browse -rtp` resolved lines: hostname -> LAN address."""
     pattern = re.compile(host_pattern)
     found: dict[str, str] = {}
@@ -215,19 +256,22 @@ def parse_avahi(text: str, interface: str, host_pattern: str) -> dict[str, str]:
         if len(fields) < 9 or fields[0] != "=" or fields[2] != "IPv4" or fields[1] != interface:
             continue
         host = fields[6].removesuffix(".local")
-        if pattern.fullmatch(host) and is_lan_address(fields[7]):
-            found[host] = fields[7]
+        if not pattern.fullmatch(host) or not is_lan_address(fields[7]):
+            continue
+        if network is not None and ipaddress.ip_address(fields[7]) not in network:
+            continue
+        found[host] = fields[7]
     return found
 
 
-def browse_mdns(interface: str, host_pattern: str, run=subprocess.run) -> dict[str, str]:
+def browse_mdns(interface: str, host_pattern: str, network=None, run=subprocess.run) -> dict[str, str]:
     try:
         proc = run(["avahi-browse", "-rtp", "--no-db-lookup", "_ssh._tcp"],
                    capture_output=True, text=True, timeout=12)
     except (OSError, subprocess.SubprocessError) as exc:
         log(f"mDNS browse unavailable: {type(exc).__name__}")
         return {}
-    return parse_avahi(proc.stdout, interface, host_pattern)
+    return parse_avahi(proc.stdout, interface, host_pattern, network)
 
 
 def port_open(address: str, port: int, timeout: float = 2.0) -> bool:
@@ -245,29 +289,86 @@ def exporters_answer(address: str) -> bool:
 # ------------------------------------------------------------------ enrolment --
 
 
-def ssh_target(member: dict, cfg: dict[str, str]) -> str:
+def ssh_target(member: dict, cfg: dict[str, str], address: str | None = None) -> str:
+    """The configured worker has a rail address; anyone else is reached at `address`."""
     if member.get("ssh"):
         return member["ssh"]
-    user = cfg.get("MONITORING_FLEET_SSH_USER") or os.environ.get("USER") or "techsphere"
-    return f"{user}@{member['address']}"
+    user = member.get("ssh_user") or cfg.get("MONITORING_FLEET_SSH_USER") or os.environ.get("USER") or "techsphere"
+    return f"{user}@{address or member['address']}"
 
 
-def ssh_base(cfg: dict[str, str]) -> list[str]:
-    return ["ssh", *SSH_OPTIONS, *shlex.split(cfg.get("CLUSTER_WORKER_SSH_OPTS") or "")]
+def ssh_identity_options(member: dict, *, first: bool) -> list[str]:
+    """Pin the host key under the machine's hostname, so it is checked at any address.
+
+    `first` is the one moment a new key is taken on trust, and only for a machine that
+    is not enrolled yet. After that a different key is a refusal.
+    """
+    alias = member.get("hostname") or member.get("address") or "unknown"
+    return ["-o", f"UserKnownHostsFile={KNOWN_HOSTS}", "-o", f"HostKeyAlias={alias}",
+            "-o", f"StrictHostKeyChecking={'accept-new' if first else 'yes'}"]
 
 
-def is_a_spark(target: str, cfg: dict[str, str], run=subprocess.run) -> tuple[bool, str]:
-    """Can this host log in, and is the far end a DGX with Docker and a GPU?"""
-    check = "test -f /etc/dgx-release && docker info --format ok >/dev/null && command -v nvidia-smi >/dev/null && echo spark-ok"
+def ssh_base(cfg: dict[str, str], member: dict, *, first: bool) -> list[str]:
+    return ["ssh", *SSH_OPTIONS, *ssh_identity_options(member, first=first), *shlex.split(cfg.get("CLUSTER_WORKER_SSH_OPTS") or "")]
+
+
+def accepts_anything(target: str, cfg: dict[str, str], run=subprocess.run) -> bool:
+    """A real sshd refuses a key nobody installed. One that lets it in is not a Spark."""
+    with tempfile.TemporaryDirectory(prefix="fleet-canary-") as tmp:
+        key = os.path.join(tmp, "key")
+        try:
+            made = run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], capture_output=True, text=True, timeout=20)
+            if made.returncode != 0:
+                return True  # cannot prove it refuses, so do not trust it
+            proc = run(["ssh", *SSH_OPTIONS, "-i", key, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
+                        "-o", "PreferredAuthentications=publickey", "-o", "UserKnownHostsFile=/dev/null",
+                        "-o", "StrictHostKeyChecking=no", *shlex.split(cfg.get("CLUSTER_WORKER_SSH_OPTS") or ""),
+                        target, "--", "true"], capture_output=True, text=True, timeout=40)
+        except (OSError, subprocess.SubprocessError):
+            return True
+    return proc.returncode == 0
+
+
+def read_machine(member: dict, target: str, cfg: dict[str, str], *, first: bool, run=subprocess.run) -> tuple[dict | None, str]:
+    """Ask the machine itself. Returns its facts, or None and why not."""
+    check = ("test -f /etc/dgx-release && docker info --format ok >/dev/null && command -v nvidia-smi >/dev/null "
+             "&& echo spark-ok && hostname && ip -4 -o addr show")
     try:
-        proc = run([*ssh_base(cfg), target, "--", check], capture_output=True, text=True, timeout=40)
+        proc = run([*ssh_base(cfg, member, first=first), target, "--", check], capture_output=True, text=True, timeout=40)
     except (OSError, subprocess.SubprocessError) as exc:
-        return False, type(exc).__name__
+        return None, type(exc).__name__
     if proc.returncode == 255:
-        return False, "ssh_refused"
-    if "spark-ok" not in proc.stdout:
-        return False, "not_a_dgx_spark"
+        return None, "ssh_refused"
+    lines = proc.stdout.splitlines()
+    if not lines or lines[0].strip() != "spark-ok" or len(lines) < 2:
+        return None, "not_a_dgx_spark"
+    return {"hostname": lines[1].strip(), "addresses": re.findall(r"\binet (\d+\.\d+\.\d+\.\d+)/", proc.stdout)}, "ok"
+
+
+def prove_new_spark(member: dict, cfg: dict[str, str], run=subprocess.run) -> tuple[bool, str]:
+    """Everything SSH can say about a machine that has not been enrolled yet."""
+    target = ssh_target(member, cfg)
+    facts, reason = read_machine(member, target, cfg, first=True, run=run)
+    if facts is None:
+        return False, reason
+    if accepts_anything(target, cfg, run=run):
+        return False, "accepts_any_key"
+    if member.get("hostname") and facts["hostname"] != member["hostname"]:
+        return False, "hostname_mismatch"
+    member["hostname"] = facts["hostname"]
     return True, "ok"
+
+
+def proves_move(member: dict, candidate: str, cfg: dict[str, str], run=subprocess.run) -> bool:
+    """An enrolled Spark moves only when the pinned machine says it holds the address.
+
+    The worker is asked over its rail address, which needs no LAN address at all. Any
+    other Spark is reached at the new address, where StrictHostKeyChecking=yes means
+    only the pinned machine can answer.
+    """
+    target = ssh_target(member, cfg, candidate)
+    facts, _reason = read_machine(member, target, cfg, first=False, run=run)
+    return bool(facts and facts["hostname"] == member.get("hostname") and candidate in facts["addresses"])
 
 
 def enroll(member: dict, cfg: dict[str, str], run=subprocess.run, recreate: bool = False) -> bool:
@@ -280,6 +381,10 @@ def enroll(member: dict, cfg: dict[str, str], run=subprocess.run, recreate: bool
     """
     target = ssh_target(member, cfg)
     bind = member["address"]
+    if not is_lan_address(bind):
+        log(f"enrol {member.get('hostname') or target}: refusing to bind {bind}")
+        return False
+    first = not member.get("key_pinned")
     login_projects = cfg.get("MONITORING_DB_LOGIN_PROJECTS", "sf-local-ai")
     remote = (
         f"cd {REMOTE_DIR} && MONITORING_WORKER_BIND={shlex.quote(bind)} "
@@ -288,12 +393,13 @@ def enroll(member: dict, cfg: dict[str, str], run=subprocess.run, recreate: bool
         + (" --force-recreate" if recreate else "")
     )
     files = [str(ROOT / item) for item in ENROLL_FILES]
-    scp = ["scp", "-q", *SSH_OPTIONS, *shlex.split(cfg.get("CLUSTER_WORKER_SSH_OPTS") or "")]
+    scp = ["scp", "-q", *SSH_OPTIONS, *ssh_identity_options(member, first=first), *shlex.split(cfg.get("CLUSTER_WORKER_SSH_OPTS") or "")]
+    ssh = ssh_base(cfg, member, first=first)
     try:
         for command, timeout in (
-            ([*ssh_base(cfg), target, "--", f"mkdir -p {REMOTE_DIR}"], 40),
+            ([*ssh, target, "--", f"mkdir -p {REMOTE_DIR}"], 40),
             ([*scp, *files, f"{target}:{REMOTE_DIR}/"], 60),
-            ([*ssh_base(cfg), target, "--", remote], 300),
+            ([*ssh, target, "--", remote], 300),
         ):
             proc = run(command, capture_output=True, text=True, timeout=timeout)
             if proc.returncode != 0:
@@ -302,6 +408,7 @@ def enroll(member: dict, cfg: dict[str, str], run=subprocess.run, recreate: bool
     except (OSError, subprocess.SubprocessError) as exc:
         log(f"enrol {member.get('hostname') or target}: {type(exc).__name__}")
         return False
+    member["key_pinned"] = True
     log(f"enrolled {member.get('hostname') or target}: exporters started, bind {bind}")
     return True
 
@@ -309,67 +416,105 @@ def enroll(member: dict, cfg: dict[str, str], run=subprocess.run, recreate: bool
 # ---------------------------------------------------------------------- passes --
 
 
-def merge_discovered(doc: dict, found: dict[str, str]) -> list[str]:
-    """Fold what mDNS saw into the registry. Returns members that need a re-enrol
-    because their address moved and their exporters bind the old one."""
+def merge_discovered(doc: dict, found: dict[str, str]) -> None:
+    """Fold what mDNS saw into the registry, as hints.
+
+    A new name becomes a candidate that is not scraped. A name that is already enrolled
+    keeps its address: a different one is only recorded for `discover` to check with the
+    machine itself.
+    """
     members = doc["members"]
     now = int(time.time())
-    moved: list[str] = []
     me = socket.gethostname()
     for host, address in sorted(found.items()):
         if host == me or host in doc["ignored"]:
             continue
         name = next((n for n, m in members.items() if m.get("hostname") == host), None)
         if name is None:
-            # A seeded worker has an address but no hostname until mDNS names it.
-            name = next((n for n, m in members.items() if m.get("address") == address and n != HEAD_NODE), None)
-        if name is None:
+            # This address belongs to an enrolled Spark, under another name or none yet.
+            # A claim to it is not a new machine, and only that machine can name itself.
+            if any(m.get("enrolled") and m.get("address") == address for m in members.values()):
+                continue
+            if len(members) >= MAX_MEMBERS:
+                log(f"ignoring {host}: the registry already holds {MAX_MEMBERS} Sparks")
+                continue
             name = next_name(members)
-            members[name] = {"role": "member", "first_seen": now, "state": "discovered", "ever_scraped": False}
-            log(f"new Spark on the LAN: {host} at {address}, named {name}")
+            members[name] = {"role": "member", "first_seen": now, "state": "discovered", "ever_scraped": False,
+                             "enrolled": False, "hostname": host, "address": address}
+            log(f"new Spark on the LAN: {host} at {address}, named {name}. Not scraped until proven.")
+            continue
         member = members[name]
-        member["hostname"] = host
         member["last_seen"] = now
-        previous = member.get("address")
-        if previous and previous != address:
-            log(f"{name} ({host}) moved from {previous} to {address}")
-            moved.append(name)
-        member["address"] = address
-    return moved
+        if member.get("enrolled"):
+            if member.get("address") != address:
+                member["candidate_address"] = address
+            else:
+                member.pop("candidate_address", None)
+        else:
+            member["address"] = address
+
+
+def identify_machine(member: dict, cfg: dict[str, str], run=subprocess.run) -> str | None:
+    """What the worker from .env calls itself. mDNS does not get to say."""
+    facts, _reason = read_machine(member, ssh_target(member, cfg), cfg, first=not member.get("key_pinned"), run=run)
+    return facts["hostname"] if facts else None
 
 
 def discover(doc: dict, cfg: dict[str, str], found: dict[str, str], *, answers=exporters_answer,
-             spark_check=is_a_spark, enroll_fn=enroll) -> None:
-    moved = merge_discovered(doc, found)
+             proof=prove_new_spark, move_proof=proves_move, enroll_fn=enroll, identify=identify_machine) -> None:
+    for name, member in doc["members"].items():
+        if name != HEAD_NODE and member.get("enrolled") and not member.get("hostname") and member.get("address"):
+            member["hostname"] = identify(member, cfg) or ""
+    merge_discovered(doc, found)
     auto = (cfg.get("MONITORING_FLEET_AUTO_ENROLL") or "true").lower() not in {"0", "false", "no"}
     now = int(time.time())
+    attempts = 0
     for name, member in doc["members"].items():
         if name == HEAD_NODE or not member.get("address"):
             continue
-        if answers(member["address"]) and name not in moved:
-            member.update(state="scraping", ever_scraped=True, last_seen=now)
-            member.pop("enroll_error", None)
-            continue
         visible = member.get("hostname") in found
-        member["state"] = "down" if member.get("ever_scraped") else "discovered"
-        if not (auto and visible):
-            continue  # powered off or off the LAN: nothing to enrol into
-        if now - member.get("enroll_attempt", 0) < ENROLL_RETRY_S and name not in moved:
-            member["state"] = member.get("enroll_state", member["state"])
+        due = now - member.get("enroll_attempt", 0) >= ENROLL_RETRY_S
+
+        if member.get("enrolled"):
+            candidate = member.get("candidate_address")
+            if candidate and auto and due:
+                member["enroll_attempt"] = now
+                if move_proof(member, candidate, cfg):
+                    log(f"{name} ({member.get('hostname')}) moved from {member['address']} to {candidate}")
+                    member["address"] = candidate
+                    member.pop("candidate_address", None)
+                    enroll_fn(member, cfg)
+                else:
+                    log(f"{name}: mDNS says {candidate}, but the machine does not. Ignoring it.")
+            if answers(member["address"]):
+                member.update(state="scraping", ever_scraped=True, last_seen=now)
+                member.pop("enroll_state", None)
+                continue
+            member["state"] = "down" if member.get("ever_scraped") else member.get("enroll_state", "enrolling")
+            # Same address, machine visible, exporters gone: repair them. Only a Spark
+            # still at its pinned address gets this; anything else is the check above.
+            if auto and visible and due and not candidate:
+                member["enroll_attempt"] = now
+                enroll_fn(member, cfg)
             continue
+
+        # Not enrolled: whatever answers on this address proves nothing.
+        member["state"] = member.get("enroll_state") or "discovered"
+        if not (auto and visible and due) or attempts >= MAX_ENROLL_ATTEMPTS_PER_PASS:
+            continue
+        attempts += 1
         member["enroll_attempt"] = now
-        target = ssh_target(member, cfg)
-        ok, reason = spark_check(target, cfg)
+        ok, reason = proof(member, cfg)
         if not ok:
-            member["enroll_state"] = "needs_ssh_key" if reason == "ssh_refused" else "not_a_dgx_spark"
+            member["enroll_state"] = {"ssh_refused": "needs_ssh_key"}.get(reason, "not_a_dgx_spark" if reason != "accepts_any_key" else "refused")
             member["state"] = member["enroll_state"]
-            if not member.get("ever_scraped"):
-                fix = f" Fix: ssh-copy-id {target}" if reason == "ssh_refused" else ""
-                log(f"{name} ({member.get('hostname')}) waits for enrolment: {reason}.{fix}")
+            fix = f" Fix: ssh-copy-id {ssh_target(member, cfg)}" if reason == "ssh_refused" else ""
+            log(f"{name} ({member.get('hostname')}) waits for enrolment: {reason}.{fix}")
             continue
         enrolled = enroll_fn(member, cfg)
         member["enroll_state"] = "enrolling" if enrolled else "enroll_failed"
         member["state"] = member["enroll_state"]
+        member["enrolled"] = bool(enrolled)
 
 
 def cmd_render(_args, doc, cfg) -> int:
@@ -383,7 +528,13 @@ def cmd_discover(_args, doc, cfg) -> int:
     seed(doc, cfg)
     interface = cfg.get("MONITORING_FLEET_INTERFACE") or "enP7s7"
     pattern = cfg.get("MONITORING_FLEET_HOST_REGEX") or r"spark-[0-9a-f]{4}"
-    discover(doc, cfg, browse_mdns(interface, pattern))
+    network = management_network(cfg)
+    if network is None:
+        log(f"cannot tell the management subnet from {interface}: not trusting any mDNS answer this pass")
+        found: dict[str, str] = {}
+    else:
+        found = browse_mdns(interface, pattern, network)
+    discover(doc, cfg, found)
     render(doc)
     save_registry(doc)
     return 0
@@ -418,16 +569,23 @@ def cmd_add(args, doc, cfg) -> int:
     member = doc["members"].setdefault(name, {"role": args.role or "member", "first_seen": int(time.time())})
     member["address"] = address
     if user:
-        member["ssh"] = f"{user}@{address}"
+        member["ssh_user"] = user
     if host in doc["ignored"]:
         doc["ignored"].remove(host)
-    ok, reason = is_a_spark(ssh_target(member, cfg), cfg)
+    # A person asked for this one, so the host name need not match what mDNS said, and
+    # a renamed machine can be added. The other checks still apply.
+    member.pop("hostname", None)
+    ok, reason = prove_new_spark(member, cfg)
     if not ok and not args.force:
-        print(f"refused: {reason}. If the key is the problem: ssh-copy-id {ssh_target(member, cfg)}", file=sys.stderr)
+        fix = f" If the key is the problem: ssh-copy-id {ssh_target(member, cfg)}" if reason == "ssh_refused" else ""
+        print(f"refused: {reason}.{fix}", file=sys.stderr)
+        doc["members"].pop(name)
         return 1
+    if not member.get("hostname"):
+        member["hostname"] = name
     if not enroll(member, cfg):
         return 1
-    member.update(state="enrolling", ever_scraped=True)
+    member.update(state="enrolling", enrolled=True)
     render(doc)
     save_registry(doc)
     print(f"{name} enrolled at {address}. It appears on the dashboards within a minute.")
@@ -457,9 +615,12 @@ def cmd_enroll(args, doc, cfg) -> int:
     if member is None or args.node == HEAD_NODE:
         print(f"not an enrollable node: {args.node}", file=sys.stderr)
         return 2
+    if not member.get("enrolled"):
+        print(f"{args.node} is not enrolled yet. Use: fleet add {ssh_target(member, cfg)}", file=sys.stderr)
+        return 2
     ok = enroll(member, cfg)
     if ok:
-        member.update(state="enrolling", ever_scraped=True)
+        member["state"] = "enrolling"
     render(doc)
     save_registry(doc)
     return 0 if ok else 1
@@ -470,7 +631,7 @@ def cmd_sync(_args, doc, cfg) -> int:
     seed(doc, cfg)
     failures = 0
     for name, member in sorted(doc["members"].items()):
-        if name == HEAD_NODE or not member.get("address"):
+        if name == HEAD_NODE or not member.get("address") or not member.get("enrolled"):
             continue
         if not enroll(member, cfg, recreate=True):
             failures += 1
@@ -534,8 +695,12 @@ def main(argv: list[str] | None = None) -> int:
 
     FLEET_DIR.mkdir(parents=True, exist_ok=True)
     with (FLEET_DIR / ".lock").open("w", encoding="utf-8") as lock:
-        # One pass at a time: the timer and an operator must not race on the file.
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        # One pass at a time: the timer and an operator must not race on the file. A
+        # timer pass that finds one running just stops; there is another in a minute.
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (fcntl.LOCK_NB if args.command == "discover" else 0))
+        except BlockingIOError:
+            return 0
         return args.fn(args, load_registry(), settings())
 
 

@@ -496,8 +496,9 @@ opens on the Command Center. A bar across the top of every page moves between th
 | **Postgres** | TechSara's own PostgreSQL in depth: tables, checkpoints, WAL, query timing from the orchestrator |
 | **Engine** | vLLM: throughput, TTFT/ITL percentiles, KV cache, preemptions |
 | **Alerts** | what is firing, what fired, and availability over 24 hours and 7 days |
+| **Developer API**, **Files** | their own subsystems |
 | **Monitoring** | fleet membership, every scrape target, what monitoring itself costs, hardware inventory |
-| Developer API, Files and v1-gateway | their own subsystems, reached from the Grafana menu |
+| **Old pages** (dropdown beside Home) | the eight pages from before the fleet pages, kept as they were. The old overview, GPU, Interconnect and Host pages are `classic-*.json`, not generated, and name two Sparks |
 
 **Most of these are generated.** `monitoring/grafana/generate_dashboards.py` writes
 them, so units, thresholds, colours and layout cannot drift apart, and a test fails
@@ -781,12 +782,17 @@ it.
 * **The other Sparks' exporters bind to their management IP only**, never `0.0.0.0` and
   never the RoCE addresses. They are read-only telemetry.
 * **`spark-local` is the one holder of the Docker socket, and it has no network.** It
-  also holds `CAP_SYS_ADMIN` for the NVMe log. Nothing else in the stack has either.
-* **`spark-probe` can read every container's state files and database volumes**
-  (`DAC_READ_SEARCH`) and the kernel log (`SYSLOG`), read-only, and opens no port. It
-  keeps only the environment values it needs from database containers and drops the rest
-  while parsing. Passwords survive parsing only for projects in
+  also holds `CAP_SYS_ADMIN` for the NVMe log and `CAP_DAC_READ_SEARCH` to walk database
+  volumes. Nothing else in the stack has any of them.
+* **`spark-probe` reads containers' state files and the kernel log** (`SYSLOG`, its only
+  capability), read-only, and opens no port. It deliberately lacks `DAC_READ_SEARCH`: under
+  Docker's default seccomp profile that also unlocks `open_by_handle_at`, which reads any
+  file on the host. It keeps only the environment values it needs from database containers
+  and drops the rest while parsing. Passwords survive parsing only for projects in
   `MONITORING_DB_LOGIN_PROJECTS`.
+* **Scrapes are bounded.** `sample_limit`, `body_size_limit` and the label limits on the
+  `node` and `dgx-gpu` jobs fail a scrape rather than grow the head's memory. None of them
+  stops a compromised enrolled Spark sending all-new series on every scrape.
 * **node-exporter runs with AppArmor off** so the systemd collector can use D-Bus (the
   default profile refuses it). In exchange it has no capabilities, a read-only root
   filesystem, and runs as `nobody`.
@@ -953,14 +959,16 @@ etcd, MinIO and Memcached. Exporters and admin tools named after one are not.
 | Version | the image's environment | none |
 | Connections by state | PostgreSQL's process titles (`postgres: user db host state`), read from `/proc` | none |
 | CPU, memory, swap, disk I/O, network | the container's cgroup | none |
-| Size on disk | blocks in its named volumes, walked every 5 minutes with a time limit | none |
+| Size on disk | blocks in its named volumes, walked every 5 minutes with a time limit, by `spark-local` | none |
 | Redis statistics | `INFO`, when the server has no password | none |
 | Transactions, cache hit, rows, deadlocks, temp files, WAL, replication, per-database size | read-only queries on the `postgres` maintenance database | **yes** |
 | Redis statistics with a password | `AUTH` then `INFO` | **yes** |
 
 **The login is opt-in per project.** `MONITORING_DB_LOGIN_PROJECTS` lists the Compose
 projects the probe may log in to, using the password in that container's own
-environment. The default is `sf-local-ai`, this platform's own stack. For any other
+environment. The password never crosses the wire: only SCRAM is spoken, cleartext and md5
+are refused, and the server must prove it knew the password too. A database that offers
+nothing else reads as a statistics error. The default is `sf-local-ai`, this platform's own stack. For any other
 project the password is discarded while the container's configuration is parsed, so
 it is never held in memory, and no credential, environment value or query text is
 ever logged or exported. Set it to `*` in `.env` and run `./scripts/monitoring.sh up`
@@ -971,6 +979,10 @@ The session is on the `postgres` database so it can never block a `DROP DATABASE
 or a `CREATE DATABASE ... TEMPLATE` of an application or test database. It is
 read-only with a short statement timeout, and it shows as `spark-probe` in
 `pg_stat_activity`.
+
+**A database is someone else's program.** Every conversation has one deadline and a 1 MiB
+budget, SCRAM's iteration count is capped, and one that misbehaves shows as down without
+costing the others their row.
 
 A stopped database nobody expects to run, such as an old test container, is a
 **leftover**: counted, and not an outage. One whose restart policy says it should be
@@ -991,13 +1003,16 @@ plus a corrupt index backup and an old warehouse copy nobody had cleaned up.
 | `spark_container_gpu_memory_bytes` | GPU exporter + each PID's cgroup | nvidia-smi only says "PID 10573 holds 25 GiB"; this says which service |
 | `spark_process_*{comm}` | `/proc` | top processes by CPU and memory, grouped by name so the label set stays small |
 
-## NVMe health and Docker health: `spark-local`
+## NVMe health, Docker health and database sizes: `spark-local`
 
-Reading a drive's health log needs `CAP_SYS_ADMIN` and Docker's health verdicts need
-the socket. Each is as good as root, so `spark-local` holds them and has **no network
-interface at all**: nothing can reach it, and the files it writes are all it can
-affect. It only sends GET requests. cAdvisor, which this replaces, held the same socket
-while serving HTTP.
+Reading a drive's health log needs `CAP_SYS_ADMIN`, Docker's health verdicts need the
+socket, and walking database volumes needs `CAP_DAC_READ_SEARCH`. Each is as good as root,
+so `spark-local` holds them and has **no network interface at all**: nothing can reach it,
+and the files it writes are all it can affect. It only sends GET requests. cAdvisor, which
+this replaces, held the same socket while serving HTTP.
+
+`spark-probe` tells it which volumes to measure, and it trusts nothing from that list:
+names must match a closed pattern and the walk stays inside the volumes mount.
 
 `spark_nvme_*` is the drive's own record: wear, spare capacity, media errors, bytes
 written, and `unsafe_shutdowns_total`, the only durable evidence of a power cut.
@@ -1038,11 +1053,17 @@ Three properties worth knowing:
 * **Names are stable.** `spark-N` is handed out once and tied to the hostname, so a
   DHCP move (2026-11-01, worker 9.68 to 9.3) updates one field, re-binds the exporters
   and keeps the history. The two existing Sparks keep `spark-1` and `spark-2`.
-* **What discovery trusts.** Only answers on `MONITORING_FLEET_INTERFACE` count, only
-  hostnames matching `MONITORING_FLEET_HOST_REGEX`, and enrolment refuses a machine
-  with no `/etc/dgx-release`. A rogue device could still claim the name; it would get
-  exporter code, which holds no secret, and `sample_limit` bounds what it could cost
-  Prometheus. Set `MONITORING_FLEET_AUTO_ENROLL=false` to require `fleet add` instead.
+* **mDNS is a hint, never an authority.** Anyone on the office LAN can advertise any
+  name, so nothing mDNS says, and no port that answers, makes a machine a target or moves
+  an existing one. A machine becomes a target only after SSH proves it: this head's key is
+  accepted, a throwaway key is refused, it has `/etc/dgx-release` and a GPU, and its own
+  hostname matches. Its host key is then pinned in `.runtime/fleet/known_hosts` under that
+  hostname. An enrolled Spark's address only changes when the pinned machine itself says
+  it holds the new address, so advertising `spark-476e` from elsewhere changes nothing.
+* **What is left.** An attacker on the LAN who tells the two keys apart can still appear as
+  a *new* Spark. They get exporter code and a network map, which hold no secret, at a cost
+  to Prometheus bounded by the job limits. They cannot impersonate an enrolled Spark. For a
+  closed fleet set `MONITORING_FLEET_AUTO_ENROLL=false` and use `fleet add`.
 
 A new Spark being monitored is not the same as it serving the model: the engine stays
 TP=2 on the two Sparks it was started with until `CLUSTER_*` says otherwise.
@@ -1155,7 +1176,7 @@ monitoring/
   blackbox/blackbox.yml                HTTP probe module
   exporters/dgx-gpu/dgx_gpu_exporter.py   the GB10 GPU exporter
   exporters/spark-probe/spark_probe.py containers, databases, kernel faults, RoCE counters
-  exporters/spark-probe/spark_local.py NVMe health and Docker health
+  exporters/spark-probe/spark_local.py NVMe health, Docker health and database sizes
   exporters/data-stores/data_stores_exporter.py  DuckDB/LanceDB/Parquet sizes
   engine-controller/                   the controller (head) and sentinel (worker); docs/availability/
 compose/compose.monitoring.yaml        Spark 1 stack (profile: monitoring)

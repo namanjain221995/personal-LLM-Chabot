@@ -4,7 +4,8 @@
   "description": "The public /v1 API on the shared engines: traffic, latency, streams and background jobs, capacity gates, output throughput, the usage ledger, node memory headroom, the engine wedge signature, speech to text and the upload rail. Panels on metrics that do not exist yet are marked [pending] or [proposed].",
   "tags": [
     "dgx-spark",
-    "developer-api"
+    "developer-api",
+    "old-pages"
   ],
   "timezone": "browser",
   "schemaVersion": 39,
@@ -3782,6 +3783,20 @@
       "tooltip": ""
     },
     {
+      "title": "Old pages",
+      "type": "dashboards",
+      "url": "",
+      "icon": "external link",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": true,
+      "tags": [
+        "old-pages"
+      ],
+      "tooltip": ""
+    },
+    {
       "title": "Spark",
       "type": "link",
       "url": "/d/spark-node",
@@ -3869,6 +3884,30 @@
       "title": "Engine",
       "type": "link",
       "url": "/d/dgx-vllm-performance",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Developer API",
+      "type": "link",
+      "url": "/d/dgx-developer-api",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Files",
+      "type": "link",
+      "url": "/d/dgx-files-gateway",
       "icon": "dashboard",
       "targetBlank": false,
       "keepTime": true,

@@ -148,7 +148,7 @@ class DetectionTests(unittest.TestCase):
 
 class ContainerParsingTests(unittest.TestCase):
     def parse(self, cfg=None, host=None, allowed="sf-local-ai"):
-        return probe.parse_container("a" * 64, cfg or config(), host or HOSTCONFIG, "/host/docker/volumes", allowed)
+        return probe.parse_container("a" * 64, cfg or config(), host or HOSTCONFIG, allowed)
 
     def test_another_projects_password_is_never_held(self):
         c = self.parse()
@@ -264,7 +264,7 @@ class ContainerMetricsTests(unittest.TestCase):
         return exp.render()
 
     def parse(self, cfg, host=None):
-        return probe.parse_container("a" * 64, cfg, host or HOSTCONFIG, "/v")
+        return probe.parse_container("a" * 64, cfg, host or HOSTCONFIG)
 
     def test_usage_comes_from_the_cgroup_in_base_units(self):
         text = self.collect(self.parse(config()))
@@ -361,6 +361,16 @@ class KernelTests(unittest.TestCase):
                         "watchdog: NMI not fully supported",
                         "watchdog: Hard watchdog permanently disabled"):
             self.assertEqual(probe.classify_kernel_message(message), [], message)
+
+    def test_a_process_cannot_report_a_fault_by_choosing_its_name(self):
+        # A crash line quotes the program's own name, up to 15 characters.
+        for message in ("NVRM: Xid (a):7[123]: segfault at 0 ip 0 sp 0 error 4",
+                        "EXT4-fs error[9]: segfault at 0 ip 0 sp 0 error 4",
+                        "Out of memory: Killed process 123 (NVRM: Xid (a):7)"):
+            self.assertNotIn("gpu_xid", probe.classify_kernel_message(message), message)
+            self.assertNotIn("fs_error", probe.classify_kernel_message(message), message)
+        self.assertEqual(probe.classify_kernel_message("NVRM: Xid (a):7[123]: segfault at 0 ip 0"), ["segfault"])
+        self.assertEqual(probe.classify_kernel_message("Out of memory: Killed process 123 (x)"), ["oom_kill"])
 
     def test_only_the_kernel_counts(self):
         events = probe.KernelEvents("/nonexistent")
@@ -564,7 +574,7 @@ class FakeRedis(threading.Thread):
 
 def db_container(image, port, *, project="sf-local-ai", env=None, allowed="sf-local-ai", cmd=None):
     cfg = config(image=image, project=project, env=env, cmd=cmd, networks={"app": {"IPAddress": "127.0.0.1"}}, mounts={})
-    c = probe.parse_container("d" * 64, cfg, HOSTCONFIG, "/v", allowed)
+    c = probe.parse_container("d" * 64, cfg, HOSTCONFIG, allowed)
     c.pid = 0  # nothing to read in /proc; dial the fake's port directly
     c.engine_port = port
     return c
@@ -576,7 +586,7 @@ class DatabaseCollectionTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
 
     def run_collect(self, *containers):
-        collector = probe.DatabaseCollector(self.tmp.name, self.tmp.name)
+        collector = probe.DatabaseCollector(self.tmp.name, self.tmp.name, volumes_file=None)
         exp = probe.Exposition()
         collector.collect(exp, list(containers), [])
         return exp.render()
@@ -663,21 +673,15 @@ class DatabaseCollectionTests(unittest.TestCase):
         self.assertNotIn(SECRET, text)
 
     def test_a_leftover_is_counted_not_alarmed_on(self):
-        c = probe.parse_container("e" * 64, config(running=False, manual=True), HOSTCONFIG, "/v")
+        c = probe.parse_container("e" * 64, config(running=False, manual=True), HOSTCONFIG)
         text = self.run_collect(c)
         self.assertIn('spark_db_stopped_instances{engine="postgres"} 1', text)
         self.assertNotIn("spark_db_up{", text)
 
     def test_a_stopped_database_that_should_run_is_down(self):
-        c = probe.parse_container("e" * 64, config(running=False), HOSTCONFIG, "/v")
+        c = probe.parse_container("e" * 64, config(running=False), HOSTCONFIG)
         text = self.run_collect(c)
         self.assertRegex(text, r"spark_db_up\{[^}]*\} 0")
-
-    def test_sizing_gives_up_rather_than_report_a_partial_total(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "f").write_bytes(b"x" * 8192)
-            self.assertGreater(probe.directory_size(tmp, time.monotonic() + 5), 0)
-            self.assertIsNone(probe.directory_size(tmp, time.monotonic() - 1))
 
     def test_a_custom_port_is_believed_only_when_the_default_is_not_listening(self):
         c = db_container("postgres:17", 5432)
@@ -690,6 +694,203 @@ class DatabaseCollectionTests(unittest.TestCase):
             self.assertEqual(probe.dial_target(c, proc)[1], 5432)
             (net / "tcp").write_text(header + "   0: 00000000:1F90 00000000:0000 0A\n")  # 8080
             self.assertEqual(probe.dial_target(c, proc)[1], 8080)
+
+
+class ScriptedServer(threading.Thread):
+    """Accepts one connection at a time and runs `script(conn)`."""
+
+    daemon = True
+
+    def __init__(self, script) -> None:
+        super().__init__()
+        self.script = script
+        self.server = socket.create_server(("127.0.0.1", 0))
+        self.port = self.server.getsockname()[1]
+        self.seen: list[bytes] = []
+
+    def run(self):
+        while True:
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    self.script(self, conn)
+                except OSError:
+                    pass
+
+
+def pg_auth(code: int, extra: bytes = b"") -> bytes:
+    body = struct.pack("!I", code) + extra
+    return b"R" + struct.pack("!I", len(body) + 4) + body
+
+
+def startup(conn) -> None:
+    length = struct.unpack("!I", conn.recv(4))[0]
+    while length - 4 > 0:
+        length -= len(conn.recv(length - 4))
+
+
+class HostileDatabaseTests(unittest.TestCase):
+    """It is someone else's program. It must not stall the cycle, fill memory or get a password."""
+
+    def serve(self, script):
+        server = ScriptedServer(script)
+        server.start()
+        self.addCleanup(server.server.close)
+        return server
+
+    def login(self, server, timeout=1.0):
+        return probe.MiniPg("127.0.0.1", server.port, "app", SECRET, "postgres", timeout=timeout)
+
+    def test_the_password_is_never_sent_in_clear(self):
+        def ask_for_cleartext(srv, conn):
+            startup(conn)
+            conn.sendall(pg_auth(3))
+            conn.settimeout(0.5)
+            try:
+                srv.seen.append(conn.recv(4096))
+            except OSError:
+                pass
+        server = self.serve(ask_for_cleartext)
+        with self.assertRaises(probe.DbError):
+            self.login(server)
+        self.assertFalse([chunk for chunk in server.seen if SECRET.encode() in chunk])
+
+    def test_md5_is_refused_too(self):
+        def ask_for_md5(srv, conn):
+            startup(conn)
+            conn.sendall(pg_auth(5, b"salt"))
+            conn.settimeout(0.5)
+            try:
+                srv.seen.append(conn.recv(4096))
+            except OSError:
+                pass
+        server = self.serve(ask_for_md5)
+        with self.assertRaises(probe.DbError):
+            self.login(server)
+        self.assertFalse([chunk for chunk in server.seen if b"md5" in chunk])
+
+    def test_a_server_that_skips_its_own_proof_is_refused(self):
+        def fake_ok(_srv, conn):
+            startup(conn)
+            conn.sendall(pg_auth(10, b"SCRAM-SHA-256\0\0"))
+            conn.recv(4096)
+            conn.sendall(pg_auth(0))
+            conn.sendall(b"Z\x00\x00\x00\x05I")
+        server = self.serve(fake_ok)
+        with self.assertRaisesRegex(probe.DbError, "proof"):
+            self.login(server)
+
+    def test_a_huge_iteration_count_is_refused_rather_than_computed(self):
+        def expensive(_srv, conn):
+            startup(conn)
+            conn.sendall(pg_auth(10, b"SCRAM-SHA-256\0\0"))
+            first = conn.recv(4096)
+            nonce = first.split(b"r=")[1].decode()
+            conn.sendall(pg_auth(11, f"r={nonce}x,s=c2FsdA==,i=2147483647".encode()))
+            conn.settimeout(0.5)
+            try:
+                conn.recv(4096)
+            except OSError:
+                pass
+        server = self.serve(expensive)
+        started = time.monotonic()
+        with self.assertRaisesRegex(probe.DbError, "iteration"):
+            self.login(server)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_a_server_dripping_one_byte_at_a_time_cannot_hold_a_read(self):
+        def drip(_srv, conn):
+            startup(conn)
+            for _ in range(60):
+                conn.sendall(b"N")
+                time.sleep(0.05)
+        server = self.serve(drip)
+        started = time.monotonic()
+        with self.assertRaises((probe.DbError, OSError)):
+            self.login(server, timeout=0.3)
+        self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_a_reply_past_the_budget_is_refused(self):
+        def flood(_srv, conn):
+            startup(conn)
+            conn.sendall(b"N" + struct.pack("!I", (1 << 31) - 1))
+            conn.settimeout(0.2)
+            try:
+                while True:
+                    conn.sendall(b"x" * 65536)
+            except OSError:
+                pass
+        server = self.serve(flood)
+        with self.assertRaisesRegex(probe.DbError, "too large"):
+            self.login(server)
+
+    def test_an_endless_redis_line_is_refused(self):
+        def flood(_srv, conn):
+            conn.recv(4096)
+            conn.settimeout(0.2)
+            try:
+                while True:
+                    conn.sendall(b"+" + b"x" * 65536)
+            except OSError:
+                pass
+        server = self.serve(flood)
+        with self.assertRaises(probe.DbError):
+            probe.redis_info("127.0.0.1", server.port, None, 1.0)
+
+    def test_one_broken_database_does_not_take_the_others_with_it(self):
+        # struct.error and friends used to escape the pool and blank every database.
+        good = FakeRedis(None)
+        good.start()
+        self.addCleanup(good.server.close)
+
+        def garbage(_srv, conn):
+            startup(conn)
+            conn.sendall(b"R\x00\x00\x00\x04")
+        bad = self.serve(garbage)
+        collector = probe.DatabaseCollector("/nonexistent", "/nonexistent", volumes_file=None)
+        original = collector._probe
+        calls = []
+
+        def explode(c):
+            calls.append(c.name)
+            if c.name == "boom":
+                raise struct.error("bad bytes")
+            return original(c)
+        collector._probe = explode
+        one = db_container("redis:8", good.port, project="other", env=[])
+        one.name = "fine"
+        two = db_container("postgres:17", bad.port)
+        two.name = "boom"
+        exp = probe.Exposition()
+        collector.collect(exp, [one, two], [])
+        text = exp.render()
+        self.assertRegex(text, r'spark_db_up\{container="fine"[^}]*\} 1')
+        self.assertRegex(text, r'spark_db_up\{container="boom"[^}]*\} 0')
+
+    def test_a_hostile_version_string_becomes_unknown(self):
+        self.assertEqual(probe.safe_version("8.8.3"), "8.8.3")
+        self.assertEqual(probe.safe_version("x" * 5000), "unknown")
+        self.assertEqual(probe.safe_version('1"} evil 1\n'), "unknown")
+        self.assertEqual(probe.safe_version(None), "unknown")
+
+    def test_a_label_cannot_grow_past_the_limit_prometheus_enforces(self):
+        exp = probe.Exposition()
+        exp.gauge("m", "help", 1, container="x" * 5000)
+        line = [l for l in exp.render().splitlines() if l.startswith("m{")][0]
+        self.assertLess(len(line), 400)
+
+    def test_volume_names_go_to_spark_local_with_nothing_else(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "v.json")
+            collector = probe.DatabaseCollector(tmp, tmp, volumes_file=path)
+            c = probe.parse_container("a" * 64, config(project="sf-local-ai"), HOSTCONFIG, "*")
+            collector._publish_volumes([c])
+            text = Path(path).read_text()
+        self.assertEqual(json.loads(text), [{"container": "db-1", "engine": "postgres", "project": "sf-local-ai", "volumes": ["stagevote_pgdata"]}])
+        self.assertNotIn(SECRET, text)
 
 
 class ProbeCycleTests(unittest.TestCase):
@@ -728,6 +929,11 @@ class SourceRulesTests(unittest.TestCase):
             self.assertNotIn(".listen(", src)
             self.assertNotIn("http.server", src)
             self.assertNotIn(".bind(", src)
+
+    def test_the_probe_has_no_way_to_read_volumes(self):
+        # With DAC_READ_SEARCH it could read any file on the host (open_by_handle_at).
+        self.assertNotIn("os.scandir", self.probe_src)
+        self.assertNotIn("/host/docker/volumes", self.probe_src)
 
     def test_the_probe_never_touches_the_docker_socket(self):
         self.assertNotIn("AF_UNIX", self.probe_src)
@@ -781,6 +987,68 @@ class SmartLogTests(unittest.TestCase):
         text = local.render({}, ["nvme0"])
         self.assertIn('spark_nvme_read_success{device="nvme0"} 0', text)
         self.assertNotIn('spark_nvme_unsafe_shutdowns_total{device="nvme0"}', text)
+
+
+class DatabaseSizeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name, "volumes")
+        data = self.root / "pgdata" / "_data"
+        data.mkdir(parents=True)
+        (data / "f").write_bytes(b"x" * 8192)
+        self.list_path = Path(self.tmp.name, "list.json")
+
+    def write(self, items):
+        self.list_path.write_text(json.dumps(items))
+
+    def test_sizes_are_measured_from_the_probes_list(self):
+        self.write([{"container": "db-1", "engine": "postgres", "project": "app", "volumes": ["pgdata"]}])
+        sizes = local.db_size_pass(str(self.root), str(self.list_path))
+        text = local.render_db_sizes(list(sizes.values()))
+        self.assertRegex(text, r'spark_db_data_bytes\{container="db-1",engine="postgres",project="app"\} \d+')
+        self.assertGreater(sizes["db-1"][1], 0)
+
+    def test_the_walk_cannot_be_pointed_outside_the_volumes(self):
+        # spark-probe talks to other programs; spark-local trusts nothing from it.
+        secret_dir = Path(self.tmp.name, "secret", "_data")
+        secret_dir.mkdir(parents=True)
+        for bad in ("../secret", "/etc", "a/b", "", ".."):
+            self.write([{"container": "x", "engine": "postgres", "project": "app", "volumes": [bad]}])
+            self.assertEqual(local.db_size_pass(str(self.root), str(self.list_path)), {}, bad)
+
+    def test_labels_from_the_list_must_be_plain_names(self):
+        self.write([{"container": 'x"} evil 1', "engine": "postgres", "project": "app", "volumes": ["pgdata"]}])
+        self.assertEqual(local.db_size_pass(str(self.root), str(self.list_path)), {})
+
+    def test_a_broken_or_missing_list_is_nothing_to_measure(self):
+        self.assertEqual(local.db_size_pass(str(self.root), str(self.list_path)), {})
+        self.list_path.write_text("{broken")
+        self.assertEqual(local.db_size_pass(str(self.root), str(self.list_path)), {})
+        self.list_path.write_text('{"not": "a list"}')
+        self.assertEqual(local.db_size_pass(str(self.root), str(self.list_path)), {})
+
+    def test_sizing_gives_up_rather_than_report_a_partial_total(self):
+        self.assertGreater(local.directory_size(str(self.root), time.monotonic() + 5), 0)
+        self.assertIsNone(local.directory_size(str(self.root), time.monotonic() - 1))
+
+    def test_symlinks_are_not_followed_out_of_a_volume(self):
+        outside = Path(self.tmp.name, "outside")
+        outside.mkdir()
+        (outside / "big").write_bytes(b"x" * (1 << 20))
+        (self.root / "pgdata" / "_data" / "link").symlink_to(outside)
+        size = local.directory_size(str(self.root / "pgdata"), time.monotonic() + 5)
+        self.assertLess(size, 1 << 20)
+
+    def test_a_walk_that_times_out_keeps_the_last_good_value(self):
+        self.write([{"container": "db-1", "engine": "postgres", "project": "app", "volumes": ["pgdata"]}])
+        good = local.db_size_pass(str(self.root), str(self.list_path))
+        original = local.DB_SIZE_BUDGET_S
+        local.DB_SIZE_BUDGET_S = -1
+        try:
+            self.assertEqual(local.db_size_pass(str(self.root), str(self.list_path), last=good), good)
+        finally:
+            local.DB_SIZE_BUDGET_S = original
 
 
 class HealthTests(unittest.TestCase):

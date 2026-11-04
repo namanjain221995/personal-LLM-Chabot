@@ -48,10 +48,17 @@ scrape_configs:
     file_sd_configs:
       - files: ["/etc/prometheus/targets/sparks-gpu.json"]
         refresh_interval: 30s
-    # Bounds what any one machine on the LAN can cost this Prometheus: a target
-    # over the limit fails its scrape, visibly, instead of growing the head's
-    # memory. Discovery trusts mDNS, so this is not only a theoretical guard.
+    # Bounds what a machine can cost this Prometheus: over a limit the scrape
+    # fails, visibly, instead of growing the head's memory. Only Sparks proven
+    # over SSH are targets, but a compromised one should still not reach the model
+    # through this. New series per scrape are not bounded by any of these.
     sample_limit: 2000
+    body_size_limit: 2MB
+    label_limit: 30
+    label_name_length_limit: 128
+    label_value_length_limit: 512
+    target_limit: 64
+    follow_redirects: false
 
   # --- Host telemetry, one target per physical Spark ---------------------
   # On a unified-memory machine these ARE the memory metrics that matter:
@@ -71,8 +78,14 @@ scrape_configs:
         refresh_interval: 30s
     # This job also carries spark-probe and spark-local (node-exporter's textfile
     # collector), so containers, databases and kernel events arrive here. The
-    # limit has the same purpose as on dgx-gpu.
+    # limits have the same purpose as on dgx-gpu.
     sample_limit: 20000
+    body_size_limit: 16MB
+    label_limit: 30
+    label_name_length_limit: 128
+    label_value_length_limit: 1024
+    target_limit: 64
+    follow_redirects: false
     metric_relabel_configs:
       # One per core, never plotted, and they cost as much as CPU time itself:
       # 240 series for governors, per-core softnet and scheduler counters, and

@@ -60,6 +60,21 @@ class GeneratedFilesTests(unittest.TestCase):
                           ("dgx-interconnect.json", "dgx-interconnect"), ("dgx-host-containers.json", "dgx-host-containers")):
             self.assertEqual(GENERATED[name]["uid"], uid)
 
+    def test_every_old_page_stays_reachable_beside_home(self):
+        # The owner asked for them at the top, next to Home, when the fleet pages replaced them.
+        links = generator.nav_links()
+        self.assertEqual(links[0]["title"], "Home")
+        self.assertEqual((links[1]["title"], links[1]["type"], links[1]["asDropdown"]), ("Old pages", "dashboards", True))
+        titles = set()
+        for path in DASHBOARDS.glob("*.json"):
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            if generator.OLD_PAGES_TAG in doc["tags"]:
+                titles.add(doc["uid"])
+        self.assertEqual(titles, {
+            "dgx-cluster-overview-classic", "dgx-gpu-thermal-power-classic", "dgx-interconnect-classic",
+            "dgx-host-containers-classic", "dgx-vllm-performance", "dgx-data-stores", "dgx-developer-api", "dgx-files-gateway",
+        })
+
     def test_every_page_has_the_same_navigation_and_it_leads_somewhere(self):
         uids = {json.loads(p.read_text(encoding="utf-8"))["uid"] for p in DASHBOARDS.glob("*.json")}
         for _title, uid in generator.NAV:
