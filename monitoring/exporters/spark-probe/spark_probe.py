@@ -1038,6 +1038,13 @@ class DbSizes(threading.Thread):
             self._sizes = {**{k: v for k, v in self._sizes.items() if k in targets}, **fresh}
 
     def run(self) -> None:
+        # The first cycle names the volumes a moment after this thread starts.
+        # Without this wait, sizes stay blank for the first whole interval.
+        for _ in range(60):
+            with self._lock:
+                if self._targets:
+                    break
+            time.sleep(1)
         while True:
             try:
                 self.walk_once()

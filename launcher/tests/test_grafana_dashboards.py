@@ -212,6 +212,19 @@ class EveryMetricExistsTests(unittest.TestCase):
             for name in set(re.findall(r"\b(?:fleet|cluster|node):[a-z0-9_:]+\b", text)):
                 self.assertIn(name, self.recorded, name)
 
+    def test_infiniband_counters_use_node_exporters_names(self):
+        # Two wrong names here left the RoCE error panels short of port errors, and
+        # only checking against a live Prometheus showed it. The names node-exporter
+        # 1.9.1 publishes, read from the live server on 2026-11-05:
+        known = {
+            "node_infiniband_port_data_received_bytes_total", "node_infiniband_port_data_transmitted_bytes_total",
+            "node_infiniband_port_errors_received_total", "node_infiniband_port_discards_transmitted_total",
+            "node_infiniband_symbol_error_total", "node_infiniband_state_id",
+        }
+        for text in self.all_text():
+            for name in set(re.findall(r"\bnode_infiniband_[a-z0-9_]+\b", text)):
+                self.assertIn(name, known, name)
+
     def test_no_panel_still_reads_cadvisor(self):
         for path in DASHBOARDS.glob("*.json"):
             self.assertNotIn('job=\\"cadvisor\\"', path.read_text(encoding="utf-8"), path.name)

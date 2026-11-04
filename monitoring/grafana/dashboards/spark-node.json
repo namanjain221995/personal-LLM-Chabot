@@ -7692,7 +7692,7 @@
             "uid": "dgx-prometheus"
           },
           "editorMode": "code",
-          "expr": "sum(rate(node_infiniband_port_receive_errors_total{node=\"$node\",device=~\"rocep1s0f1|roceP2p1s0f1\"}[$__rate_interval]) + rate(node_infiniband_port_transmit_discards_total{node=\"$node\",device=~\"rocep1s0f1|roceP2p1s0f1\"}[$__rate_interval]) + rate(node_infiniband_symbol_error_total{node=\"$node\",device=~\"rocep1s0f1|roceP2p1s0f1\"}[$__rate_interval]))",
+          "expr": "sum(rate(node_infiniband_port_errors_received_total{node=\"$node\",device=~\"rocep1s0f1|roceP2p1s0f1\"}[$__rate_interval]) + rate(node_infiniband_port_discards_transmitted_total{node=\"$node\",device=~\"rocep1s0f1|roceP2p1s0f1\"}[$__rate_interval]) + rate(node_infiniband_symbol_error_total{node=\"$node\",device=~\"rocep1s0f1|roceP2p1s0f1\"}[$__rate_interval]))",
           "range": true,
           "instant": false,
           "legendFormat": "port errors",
