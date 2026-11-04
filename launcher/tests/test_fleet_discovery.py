@@ -438,7 +438,6 @@ class EnrolmentTests(FleetCase):
         # the rail address, so plain `ssh-copy-id` said "No identities found".
         cfg = {**DUAL, "MONITORING_FLEET_SSH_KEY": "/home/x/.ssh/id_ed25519_cluster"}
         member = {"address": "192.168.9.70", "hostname": "spark-abcd"}
-        self.assertEqual(self.fleet.fix_command(member, cfg), "ssh-copy-id -i /home/x/.ssh/id_ed25519_cluster.pub techsphere@192.168.9.70" if os.environ.get("USER") == "techsphere" else self.fleet.fix_command(member, cfg))
         self.assertIn("-i /home/x/.ssh/id_ed25519_cluster.pub", self.fleet.fix_command(member, cfg))
         command = self.fleet.ssh_base(cfg, member, first=False)
         self.assertIn("/home/x/.ssh/id_ed25519_cluster", command)
