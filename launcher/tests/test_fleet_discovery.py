@@ -382,6 +382,20 @@ class EnrolmentTests(FleetCase):
     def test_a_server_that_lets_a_throwaway_key_in_is_not_a_spark(self):
         self.assertEqual(self.fleet.prove_new_spark(self.member(), DUAL, run=self.machine(canary_code=0)), (False, "accepts_any_key"))
 
+    def test_the_throwaway_key_is_the_only_one_offered(self):
+        # Found against the real worker: ~/.ssh/config added its IdentityFile, the real
+        # key logged in, and an honest sshd read as "accepts anything".
+        seen = []
+
+        def run(command, **_kwargs):
+            seen.append(command)
+            return mock.Mock(returncode=255 if command[0] == "ssh" else 0, stdout="", stderr="")
+        self.assertFalse(self.fleet.accepts_anything("u@h", run=run))
+        login = next(c for c in seen if c[0] == "ssh")
+        self.assertEqual(login[1:3], ["-F", "/dev/null"])
+        self.assertIn("IdentitiesOnly=yes", login)
+        self.assertIn("IdentityAgent=none", login)
+
     def test_the_machine_must_say_the_same_name_mdns_did(self):
         run = self.machine(stdout="spark-ok\nsomething-else\n")
         self.assertEqual(self.fleet.prove_new_spark(self.member(), DUAL, run=run), (False, "hostname_mismatch"))

@@ -312,7 +312,7 @@ def ssh_base(cfg: dict[str, str], member: dict, *, first: bool) -> list[str]:
     return ["ssh", *SSH_OPTIONS, *ssh_identity_options(member, first=first), *shlex.split(cfg.get("CLUSTER_WORKER_SSH_OPTS") or "")]
 
 
-def accepts_anything(target: str, cfg: dict[str, str], run=subprocess.run) -> bool:
+def accepts_anything(target: str, run=subprocess.run) -> bool:
     """A real sshd refuses a key nobody installed. One that lets it in is not a Spark."""
     with tempfile.TemporaryDirectory(prefix="fleet-canary-") as tmp:
         key = os.path.join(tmp, "key")
@@ -320,10 +320,11 @@ def accepts_anything(target: str, cfg: dict[str, str], run=subprocess.run) -> bo
             made = run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", key], capture_output=True, text=True, timeout=20)
             if made.returncode != 0:
                 return True  # cannot prove it refuses, so do not trust it
-            proc = run(["ssh", *SSH_OPTIONS, "-i", key, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
+            # `-F /dev/null`: an IdentityFile in the user's ssh config would be offered as
+            # well, and the real key logging in would read as "accepts anything".
+            proc = run(["ssh", "-F", "/dev/null", *SSH_OPTIONS, "-i", key, "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
                         "-o", "PreferredAuthentications=publickey", "-o", "UserKnownHostsFile=/dev/null",
-                        "-o", "StrictHostKeyChecking=no", *shlex.split(cfg.get("CLUSTER_WORKER_SSH_OPTS") or ""),
-                        target, "--", "true"], capture_output=True, text=True, timeout=40)
+                        "-o", "StrictHostKeyChecking=no", target, "--", "true"], capture_output=True, text=True, timeout=40)
         except (OSError, subprocess.SubprocessError):
             return True
     return proc.returncode == 0
@@ -351,7 +352,7 @@ def prove_new_spark(member: dict, cfg: dict[str, str], run=subprocess.run) -> tu
     facts, reason = read_machine(member, target, cfg, first=True, run=run)
     if facts is None:
         return False, reason
-    if accepts_anything(target, cfg, run=run):
+    if accepts_anything(target, run=run):
         return False, "accepts_any_key"
     if member.get("hostname") and facts["hostname"] != member["hostname"]:
         return False, "hostname_mismatch"
