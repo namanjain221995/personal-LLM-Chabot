@@ -1016,7 +1016,7 @@
       "id": 17,
       "type": "timeseries",
       "title": "Request rate / success / errors",
-      "description": "5xx/sec is a true zero only while the engine is counting requests at all: the error series does not exist until the first 5xx, so the zero is derived from the total request rate (0 \u00d7 total) and is absent, not 0, when vLLM is unreachable.",
+      "description": "5xx/sec is a true zero only while the engine is counting requests at all: the error series does not exist until the first 5xx, so the zero is derived from the total request rate (0 × total) and is absent, not 0, when vLLM is unreachable.",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
@@ -2652,6 +2652,140 @@
         },
         "overrides": []
       }
+    }
+  ],
+  "links": [
+    {
+      "title": "Home",
+      "type": "link",
+      "url": "/d/dgx-cluster-overview",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Spark",
+      "type": "link",
+      "url": "/d/spark-node",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "GPU",
+      "type": "link",
+      "url": "/d/dgx-gpu-thermal-power",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Fabric",
+      "type": "link",
+      "url": "/d/dgx-interconnect",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Hosts",
+      "type": "link",
+      "url": "/d/fleet-hosts",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Containers",
+      "type": "link",
+      "url": "/d/dgx-host-containers",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Databases",
+      "type": "link",
+      "url": "/d/fleet-databases",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Postgres",
+      "type": "link",
+      "url": "/d/dgx-data-stores",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Engine",
+      "type": "link",
+      "url": "/d/dgx-vllm-performance",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Alerts",
+      "type": "link",
+      "url": "/d/fleet-alerts",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Monitoring",
+      "type": "link",
+      "url": "/d/fleet-monitoring",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
     }
   ]
 }

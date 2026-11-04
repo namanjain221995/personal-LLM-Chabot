@@ -1,15 +1,17 @@
-# Monitoring exporters for Spark 2 (the worker).
+# Monitoring exporters for every Spark except the head: Spark 2 and any Spark
+# added later.
 #
-# This file does NOT run on Spark 1. It is rsync'd to the worker's
-# $HOME/.techsara-cluster/ and started there as its own Compose project
-# (sf-local-ai-monitoring), exactly the way compose.cluster-worker.yaml is
-# handled by scripts/cluster-worker.sh. See scripts/monitoring.sh.
+# This file does NOT run on Spark 1. scripts/lib/fleet.py copies it to each
+# Spark's $HOME/.techsara-cluster/ and starts it there as its own Compose
+# project (sf-local-ai-monitoring), exactly the way compose.cluster-worker.yaml
+# is handled by scripts/cluster-worker.sh.
 #
-# Spark 2 runs vLLM with `--headless --node-rank 1` and has no API server, so
-# there is nothing here to scrape for LLM metrics — the head's single endpoint
-# already reports the whole distributed engine. What Spark 2 uniquely has is
-# its OWN GPU and its OWN host, which is exactly what these two exporters
-# publish.
+# A Spark running a vLLM rank with `--headless --node-rank N` has no API server,
+# so there is nothing here to scrape for LLM metrics: the head's single endpoint
+# already reports the whole distributed engine. What each Spark uniquely has is
+# its OWN GPU, host, drive, containers and databases, which is what these
+# publish. Two ports: spark-probe and spark-local open none and leave files for
+# node-exporter's textfile collector.
 #
 # BINDING. Prometheus lives on Spark 1, so unlike the head's stack these ports
 # must be reachable off-box. They bind to the management IP only
@@ -32,22 +34,40 @@ services:
       - --web.listen-address=${MONITORING_WORKER_BIND:-127.0.0.1}:${NODE_EXPORTER_PORT:-9100}
       - --collector.netdev
       - --collector.netclass
+      # Docker's veths and bridges: see the same flags on the head.
+      - --collector.netdev.device-exclude=^(veth.*|br-.*|docker.*)$$
+      - --collector.netclass.ignored-devices=^(veth.*|br-.*|docker.*)$$
       - --no-collector.mdadm
       - --no-collector.nfs
       - --no-collector.nfsd
       - --no-collector.zfs
       - --no-collector.xfs
-      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+|snap/.+)($|/)
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+|snap/.+)($$|/)
+      - --collector.textfile.directory=/textfile
+      - --collector.processes
+      # See the same flags on the head.
+      - --collector.systemd
+      - --collector.systemd.unit-include=.+\.service
     # Host networking: node_exporter's netdev collector is namespace-scoped,
     # so on a bridge it would report eth0/lo and silently miss the RoCE links.
     # --web.listen-address below is what restricts exposure instead of a port
     # publish, since host networking bypasses Docker's port mapping.
     network_mode: host
     pid: host
+    # See the same block on the head: the systemd collector needs D-Bus, the
+    # default AppArmor profile refuses it, and this exporter needs no capability.
+    security_opt:
+      - apparmor:unconfined
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /:/host:ro,rslave
+      - /run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
+      - spark-textfile:/textfile:ro
     restart: unless-stopped
     # OOM ORDER: after this node's OCR (900) and speech (800) engines, before
     # every application process; the vLLM rank ranks near last (-450 recommended,
@@ -102,3 +122,86 @@ services:
               count: all
               capabilities: [gpu]
     logging: *worker-logging
+
+  # Containers, databases, kernel events, RoCE counters. Opens no port. The
+  # reasoning, the capabilities and the login switch are explained on the head's
+  # copy in compose.monitoring.yaml; the two differ only in where the files come
+  # from and the address of the GPU exporter.
+  spark-probe:
+    image: python:3.12-slim
+    command: ["python", "-u", "/app/spark_probe.py"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      SPARK_PROBE_GPU_URL: http://${MONITORING_WORKER_BIND:-127.0.0.1}:${DGX_GPU_EXPORTER_PORT:-9835}/metrics
+      SPARK_PROBE_DEEP_DB_PROJECTS: ${MONITORING_DB_LOGIN_PROJECTS:-sf-local-ai}
+    network_mode: host
+    pid: host
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_READ_SEARCH
+      - SYSLOG
+    security_opt:
+      - no-new-privileges:true
+    devices:
+      - /dev/kmsg:/dev/kmsg:r
+    volumes:
+      - ./spark_probe.py:/app/spark_probe.py:ro
+      - /etc/dgx-release:/host/dgx-release:ro
+      - /var/lib/docker/containers:/host/docker/containers:ro
+      - /var/lib/docker/volumes:/host/docker/volumes:ro
+      - /sys/fs/cgroup:/host/cgroup:ro
+      - spark-textfile:/textfile
+    restart: unless-stopped
+    # OOM order: see node-exporter above.
+    oom_score_adj: 600
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(time.time()-os.path.getmtime('/textfile/spark_probe.prom')>90)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *worker-logging
+
+  # NVMe wear, power-loss count, Docker health. Holds the socket and
+  # CAP_SYS_ADMIN, so it has no network at all; see the head's copy.
+  spark-local:
+    image: python:3.12-slim
+    command: ["python", "-u", "/app/spark_local.py"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    devices:
+      - /dev/nvme0:/dev/nvme0:r
+    volumes:
+      - ./spark_local.py:/app/spark_local.py:ro
+      # Not ":ro": that would not stop it being used, only imply that it does.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - spark-textfile:/textfile
+    restart: unless-stopped
+    oom_score_adj: 600
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(time.time()-os.path.getmtime('/textfile/spark_health.prom')>90)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *worker-logging
+
+volumes:
+  # In memory on purpose: rewritten every 15 s, nothing worth keeping.
+  spark-textfile:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=16m,mode=0755

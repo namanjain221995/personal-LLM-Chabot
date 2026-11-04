@@ -70,6 +70,70 @@ STORES = [
 ]
 
 
+#: Walked less often, and never on the scrape path: nobody has said how large
+#: these get, and a slow walk must not cost a scrape.
+AUTO_TTL_S = float(os.environ.get("DATA_STORES_AUTO_TTL", "300"))
+_AUTO_KINDS = {".duckdb": "duckdb", ".sqlite": "sqlite", ".sqlite3": "sqlite", ".db": "sqlite",
+               ".parquet": "parquet", ".lance": "lancedb"}
+
+
+def undeclared_stores(root: Path, declared: set[Path]) -> list[tuple[str, Path, str]]:
+    """Whatever else is at the top of the data volume.
+
+    The list above goes out of date whenever a feature adds a directory: on
+    2026-11-05 it was missing api-files, chat-files, chat-media and traces, plus a
+    corrupt index backup and an old warehouse copy nobody had cleaned up. So a new
+    store shows up as `undeclared/<name>` with no edit here. Lock files, WAL files
+    and hidden files are not stores.
+    """
+    found: list[tuple[str, Path, str]] = []
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return found
+    for path in entries:
+        name = path.name
+        if path in declared or name.startswith(".") or name.endswith((".wal", ".lock", ".tmp")):
+            continue
+        kind = _AUTO_KINDS.get(path.suffix.lower(), "other")
+        try:
+            if path.is_dir() and any(child.suffix == ".lance" for child in path.iterdir()):
+                kind = "lancedb"
+        except OSError:
+            continue
+        safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+        found.append((f"undeclared/{safe}", path, kind))
+    return found
+
+
+class UndeclaredStores(threading.Thread):
+    daemon = True
+
+    def __init__(self) -> None:
+        super().__init__(name="undeclared-stores")
+        self._lock = threading.Lock()
+        self._measured: list[tuple[str, str, dict]] = []
+
+    def snapshot(self) -> list[tuple[str, str, dict]]:
+        with self._lock:
+            return list(self._measured)
+
+    def run(self) -> None:
+        declared = {path for _label, path, _kind in STORES}
+        while True:
+            measured = []
+            for label, path, kind in undeclared_stores(ROOT, declared):
+                result = measure(path)
+                if result:
+                    measured.append((label, kind, result))
+            with self._lock:
+                self._measured = measured
+            time.sleep(AUTO_TTL_S)
+
+
+UNDECLARED = UndeclaredStores()
+
+
 def measure(path: Path) -> dict | None:
     """Size, file count and newest mtime for a file or directory tree."""
     try:
@@ -122,6 +186,12 @@ class Collector:
 
         measured = [(label, kind, measure(path)) for label, path, kind in STORES]
         present = [(l, k, m) for l, k, m in measured if m]
+        # Total stays the declared stores only, so that a directory appearing is
+        # not read as growth by DataVolumeGrowingFast.
+        total = sum(m["bytes"] for _l, _k, m in present)
+        undeclared = UNDECLARED.snapshot()
+        measured += undeclared
+        present += undeclared
 
         head("techsara_store_present", "gauge",
              "1 if this data store exists on disk, 0 if it is missing.")
@@ -157,8 +227,11 @@ class Collector:
             )
 
         head("techsara_store_total_bytes", "gauge",
-             "Sum of every measured store - what this platform's data costs on disk.")
-        lines.append(f'techsara_store_total_bytes {sum(m["bytes"] for _l, _k, m in present)}')
+             "Sum of the declared stores - what this platform's data costs on disk.")
+        lines.append(f'techsara_store_total_bytes {total}')
+        head("techsara_store_undeclared_bytes", "gauge",
+             "Sum of everything else found at the top of the data volume.")
+        lines.append(f'techsara_store_undeclared_bytes {sum(m["bytes"] for _l, _k, m in undeclared)}')
 
         head("techsara_data_stores_scrape_duration_seconds", "gauge",
              "Wall time spent walking the stores for this sample.")
@@ -208,6 +281,7 @@ def main() -> int:
     if missing:
         # Not an error: a fresh install has no warehouse until the first sync.
         log.info("not present yet: %s", ", ".join(missing))
+    UNDECLARED.start()
     server = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
     server.daemon_threads = True
     log.info("listening on %s:%d/metrics", LISTEN_HOST, LISTEN_PORT)

@@ -1,9 +1,13 @@
-# Monitoring — Grafana + Prometheus for the two-node DGX Spark cluster
+# Monitoring — Grafana + Prometheus for the DGX Spark fleet
 
-One browser tab that answers, live: *are both Sparks alive, how hot are they,
-how much power are they drawing together, is the distributed model actually
-distributed, how many requests are running, how many tokens/sec, and if
-throughput drops — why?*
+One browser tab that answers, live: *is the fleet healthy, what needs attention,
+is every Spark alive, how hot are they, how much power are they drawing, is the
+distributed model actually distributed, what is every container and every database
+doing, and if throughput drops — why?*
+
+**Built for any number of Sparks.** No dashboard, rule or scrape config names one:
+a new DGX Spark on the management LAN is found by itself and every page grows by
+one. See [Adding a Spark](#adding-a-spark).
 
 Everything runs locally. No Grafana Cloud, no SaaS, no paid API, no data
 leaving the machines.
@@ -13,9 +17,10 @@ leaving the machines.
 ## Quick start
 
 ```bash
-./scripts/monitoring.sh up        # start here + the two exporters on Spark 2
+./scripts/monitoring.sh up        # start here + the exporters on every Spark, turn discovery on
 ./scripts/monitoring.sh status    # containers + every Prometheus target
-./scripts/monitoring.sh verify    # prove BOTH Sparks are reporting
+./scripts/monitoring.sh verify    # prove EVERY Spark is reporting
+./scripts/monitoring.sh fleet     # which Sparks exist, and what state each is in
 ./scripts/monitoring.sh logs      # follow logs (add a service name to filter)
 ./scripts/monitoring.sh restart
 ./scripts/monitoring.sh stop      # stop, keep containers
@@ -48,17 +53,20 @@ never come up as `admin/admin` on a LAN with no firewall.
                                |
                           Grafana :3300          Spark 1  "spark-1"  head
                                |                 192.168.9.54
-                         Prometheus :9090
-                       /       |        \
-          node-exporter   dgx-gpu-      cadvisor + blackbox
-             :9100        exporter          (containers,
-                           :9835           app liveness)
+                         Prometheus :9090 <---- .runtime/prometheus/sparks-*.json
+                       /       |        \            ^
+          node-exporter   dgx-gpu-      blackbox      |  every minute
+             :9100        exporter    (app liveness)  |
+               ^           :9835                 scripts/lib/fleet.py
+               |                                 (systemd user timer, mDNS)
+        spark-probe, spark-local
+        (write files, open no port)
                                |
                                |  management LAN 192.168.9.0/22
                                v
-          node-exporter :9100     dgx-gpu-exporter :9835
-                                                        Spark 2  "spark-2"  worker
-                                                        192.168.9.68
+          node-exporter :9100     dgx-gpu-exporter :9835      Spark 2, Spark 3, ...
+                 ^                                            each identical
+          spark-probe, spark-local
 
           vLLM :8000 /metrics  <- ONE endpoint, whole distributed engine
           vLLM :8002/:8003/:8004/:8005  router / embed / OCR / reranker
@@ -79,9 +87,11 @@ traffic — monitoring must not compete with the thing it measures.
 |---|---|---|
 | Prometheus 3.1.0 | Spark 1 | scrape + store + rules |
 | Grafana 11.5.1 | Spark 1 | dashboards, provisioned from this repo |
-| node-exporter 1.9.1 | **both** | CPU, unified memory, disk, **RoCE/IB counters** |
-| `dgx-gpu-exporter` (custom) | **both** | GPU telemetry from `nvidia-smi` |
-| cAdvisor 0.52.1 | Spark 1 | per-container CPU/memory/restarts |
+| node-exporter 1.9.1 | **every Spark** | CPU, unified memory, disk, **RoCE/IB counters**, systemd units, and the files below |
+| `dgx-gpu-exporter` (custom) | **every Spark** | GPU telemetry from `nvidia-smi`, per-process busy share |
+| `spark-probe` (custom) | **every Spark** | containers, databases, kernel faults, RoCE hardware counters, top processes. **Opens no port** |
+| `spark-local` (custom) | **every Spark** | NVMe wear and power-loss count, Docker health. **Has no network at all** |
+| `fleet.py` (custom) | Spark 1, user timer | finds Sparks over mDNS, enrols them, writes Prometheus' targets |
 | blackbox-exporter 0.25.0 | Spark 1 | HTTP liveness for services with no `/metrics` |
 | postgres-exporter 0.16.0 | Spark 1 | PostgreSQL server statistics |
 | `data-stores-exporter` (custom) | Spark 1 | DuckDB / LanceDB / Parquet size + freshness |
@@ -97,11 +107,10 @@ and log aggregation would be a second storage system to run and bound.
 |---|---|---|---|
 | 3300 | Grafana | `MONITORING_BIND_ADDRESS` (loopback) | — |
 | 9090 | Prometheus | `MONITORING_BIND_ADDRESS` (loopback) | itself, 30 s |
-| 9100 | node-exporter | host network, both Sparks (Spark 2: management IP only) | `node`, 10 s |
-| 9835 | `dgx-gpu-exporter` | both Sparks (Spark 2: management IP only) | `dgx-gpu`, 5 s |
+| 9100 | node-exporter, carrying `spark-probe` and `spark-local` through its textfile collector | host network, every Spark (other than the head: management IP only) | `node`, 10 s |
+| 9835 | `dgx-gpu-exporter` | every Spark (other than the head: management IP only) | `dgx-gpu`, 5 s |
 | 9836 | `data-stores-exporter` | `application` network | `data-stores`, 30 s |
 | 9187 | postgres-exporter | `application` network | `postgres`, 15 s |
-| 8080 | cAdvisor | `application` network | `cadvisor`, 15 s |
 | 9115 | blackbox-exporter | `application` network | `blackbox-http`, 15 s |
 | 8000 | vLLM main engine `/metrics` | head, host network | `vllm-main`, 5 s |
 | 30002 / 30003 / 30005 / 30004 | router / embed / reranker / OCR `/metrics` | `application` network (OCR: wherever `scripts/ocr.sh` put it) | `vllm-aux`, 15 s |
@@ -473,22 +482,38 @@ simply never exists.
 ## Dashboards
 
 Provisioned from `monitoring/grafana/dashboards/` — no manual import. Grafana
-opens on the overview by default.
+opens on the Command Center. A bar across the top of every page moves between them.
 
 | Dashboard | For |
 |---|---|
-| **DGX Spark AI Cluster — Live Overview** | the always-on screen: the engine state and the signals behind it, combined power, max temp, tokens/sec, and a correlation strip (engine-state timeline first) on one time axis |
-| **GPU / Thermal / Power** | per-Spark GPU detail, combined power and energy, throttling |
-| **vLLM / LLM Performance** | throughput, TTFT/ITL percentiles, KV cache, prefix cache, preemptions |
-| **Interconnect / NCCL / RoCE** | per-rail RX/TX, port state, IB errors, management LAN shown separately |
-| **Host / Containers** | CPU, unified memory, swap, disk, per-container CPU/memory/restarts |
-| **Databases / Data Stores** | PostgreSQL statistics, plus size and freshness of every file-based store |
+| **Command Center** (home) | the always-on screen: one verdict, then the engine and the signals behind it, what needs attention, every Spark, a correlation strip on one time axis, every database |
+| **Spark** | everything about one machine: GPU, every core, unified memory, NVMe health, network, RoCE, every thermal sensor, its containers and databases, systemd, kernel faults |
+| **GPU** | the GB10 on every Spark: busy, by process, power, memory by owner, thermal, throttling, energy |
+| **Fabric** | the RoCE links: ports, per-rail throughput, retransmits and congestion from the NIC itself |
+| **Hosts** | the same reading from every Spark on one chart, to spot the one that behaves differently |
+| **Containers** | every container on every Spark: state, health, restarts, CPU, memory, swap, GPU memory, network, disk |
+| **Databases** | every database on every Spark, found automatically, plus the file-based stores |
+| **Postgres** | TechSara's own PostgreSQL in depth: tables, checkpoints, WAL, query timing from the orchestrator |
+| **Engine** | vLLM: throughput, TTFT/ITL percentiles, KV cache, preemptions |
+| **Alerts** | what is firing, what fired, and availability over 24 hours and 7 days |
+| **Monitoring** | fleet membership, every scrape target, what monitoring itself costs, hardware inventory |
+| Developer API, Files and v1-gateway | their own subsystems, reached from the Grafana menu |
 
-GPU, and Host dashboards have a **Spark** variable (`spark-1`, `spark-2`, All).
+**Most of these are generated.** `monitoring/grafana/generate_dashboards.py` writes
+them, so units, thresholds, colours and layout cannot drift apart, and a test fails
+if the committed JSON differs from what it would write. Change the generator and
+run it; do not edit the generated files or save from the Grafana UI
+(`allowUiUpdates: false` overwrites UI edits from disk).
 
-Dashboards are files in git, not Grafana database rows: `allowUiUpdates: false`
-means UI edits are overwritten from disk. To change one permanently, use
-*Save JSON to file* in Grafana and commit the result.
+The rules every panel follows:
+
+* **Colour means something.** Green, amber and red only mark states and limits. A
+  number that is neither, such as GPU busy or tokens per second, stays neutral.
+* **A Spark keeps its colour.** spark-1 is blue on every chart. The palette is
+  checked for colour-vision deficiency against the panel surface.
+* **Absent is not zero.** Missing data draws a gap, and a tile says what is missing.
+* **GPU busy is not load.** The worker rank spins at about 95 % while drawing about
+  34 W as it waits at a collective, so GPU power always sits next to it.
 
 ### Answering "why did tokens/sec drop?"
 
@@ -636,7 +661,7 @@ cheap, honest signals.
 |---|---|---|
 | `dgx-gpu`, `vllm-main`, `engine-controller` | **5 s** | the panels that must feel live; the engine state within one canary interval |
 | `node` | 10 s | host metrics move slowly |
-| `cadvisor`, `vllm-aux`, `blackbox` | 15 s | |
+| `vllm-aux`, `blackbox` | 15 s | |
 | `prometheus` (self) | 30 s | |
 
 One GPU scrape costs **63 ms** of `nvidia-smi` (41 ms + 21 ms), about **1.3 %
@@ -646,9 +671,16 @@ duty cycle** at 5 s. Measured end to end:
 * decode throughput **before** monitoring existed: **70.0 tok/s**
 * whole stack: **~2 % of one CPU core, 212 MB RAM** of 121.7 GB
 
-Cardinality is bounded on purpose: cAdvisor is filtered to ten whole-container
-metric families with `id`/`image`/`container_label_*` dropped, and Prometheus
-client `_created` gauges (64 useless series per vLLM scrape) are dropped.
+Cardinality is bounded on purpose. Docker's veths and bridges are not collected (they
+were half of everything node-exporter published), per-core governor, softnet and
+scheduler series are dropped, 360 unused `pg_settings_*` gauges are dropped, and
+Prometheus client `_created` gauges (64 useless series per vLLM scrape) are dropped.
+`sample_limit` on the `node` and `dgx-gpu` jobs bounds what any one machine can cost.
+
+Measured on 2026-11-05 replacing cAdvisor (77 MiB, 2.75 % of a core, on the head only):
+`spark-probe` holds about 21 MiB and `spark-local` about 13 MiB, on every Spark.
+`docker stats` can read over 100 MiB for the probe on the head: that is the kernel's
+reclaimable cache from walking database volumes, not the process's own memory.
 
 ---
 
@@ -658,7 +690,7 @@ Prometheus writes to the `sf-local-ai_prometheus` Docker volume with **two**
 limits, whichever is hit first:
 
 ```
---storage.tsdb.retention.time=15d      PROMETHEUS_RETENTION_TIME
+--storage.tsdb.retention.time=30d      PROMETHEUS_RETENTION_TIME
 --storage.tsdb.retention.size=20GB     PROMETHEUS_RETENTION_SIZE
 ```
 
@@ -744,12 +776,20 @@ it.
 * **Grafana requires a password to start** (`${GRAFANA_ADMIN_PASSWORD:?}`),
   generated into `.runtime/secrets.env` (0600, gitignored). Anonymous access
   and sign-up are off.
-* **Spark 2's exporters bind to its management IP only** (192.168.9.68), never
-  `0.0.0.0` and never the RoCE addresses. They are read-only telemetry.
-* **cAdvisor gets the Docker socket read-only** and nothing else — no
-  `privileged`. This is the one privilege in the stack, and it is what supplies
-  container *names*; without it every metric is the root cgroup. No other
-  service receives it.
+* **Grafana's own `/metrics` is off.** It needs no login by default, and this container
+  is on a public hostname: until 2026-11-05 anyone could read it through the tunnel.
+* **The other Sparks' exporters bind to their management IP only**, never `0.0.0.0` and
+  never the RoCE addresses. They are read-only telemetry.
+* **`spark-local` is the one holder of the Docker socket, and it has no network.** It
+  also holds `CAP_SYS_ADMIN` for the NVMe log. Nothing else in the stack has either.
+* **`spark-probe` can read every container's state files and database volumes**
+  (`DAC_READ_SEARCH`) and the kernel log (`SYSLOG`), read-only, and opens no port. It
+  keeps only the environment values it needs from database containers and drops the rest
+  while parsing. Passwords survive parsing only for projects in
+  `MONITORING_DB_LOGIN_PROJECTS`.
+* **node-exporter runs with AppArmor off** so the systemd collector can use D-Bus (the
+  default profile refuses it). In exchange it has no capabilities, a read-only root
+  filesystem, and runs as `nobody`.
 * `ufw` is **installed but disabled** on both nodes (`ENABLED=no`), and
   `iptables`/`nft` cannot be read without root. Exporter exposure is therefore
   controlled by bind address, not by a firewall. If you add one, allow
@@ -855,37 +895,157 @@ If **store** metrics are missing, check the volume mounts:
 docker exec sf-local-ai-data-stores-exporter-1 ls -la /data
 ```
 
-### Container panels empty
+### Container or database panels empty
 
-cAdvisor must be **≥ v0.52**. v0.49 speaks Docker API 1.41 while this daemon
-requires ≥ 1.44, so its Docker factory silently fails to register and every
-metric comes back as `id="/"` with no name. Check:
+The **Monitoring** page's Spark probe row says which collector failed. Then, on that
+Spark:
 
 ```bash
-docker logs sf-local-ai-cadvisor-1 | grep "docker container factory"
+docker logs --tail 20 sf-local-ai-spark-probe-1      # on a worker: sf-local-ai-monitoring-spark-probe-1
+docker exec sf-local-ai-node-exporter-1 ls -la /textfile   # the files should be seconds old
+curl -s http://127.0.0.1:9090/api/v1/query?query=node_textfile_scrape_error
+```
+
+A Spark reporting host metrics with no probe data raises `SparkProbeMissing`.
+`./scripts/monitoring.sh fleet enroll spark-N` repairs it.
+
+### A new Spark does not appear
+
+```bash
+./scripts/monitoring.sh fleet                  # its state, and the fix if it needs one
+systemctl --user status techsara-fleet.timer   # is discovery running?
+avahi-browse -rt _ssh._tcp | grep spark        # can this head see it?
+tail .runtime/logs/fleet.log
 ```
 
 ---
 
-## Adding a third Spark
+## Containers, databases and the kernel: `spark-probe`
 
-1. Copy `compose/compose.monitoring-worker.yaml` and the exporter to it (the
-   `up` command does this for the existing worker automatically).
-2. Start them there with `MONITORING_WORKER_BIND=<its management IP>`.
-3. Add two target entries to `monitoring/prometheus/prometheus.yml`:
+`monitoring/exporters/spark-probe/spark_probe.py`, on every Spark, writing one file
+every 15 s that node-exporter's textfile collector publishes. Standard library
+only. One cycle measured 59 ms on the worker and 84 ms on the head.
 
-```yaml
-      - targets: ["192.168.9.NN:9835"]
-        labels: { node: spark-3, role: worker }
-```
+**Why it opens no port.** It reads every container's configuration, so it should
+not also answer the network. With no listener it needs no host-guard change and
+nothing on the LAN can talk to it. It uses host networking and the host PID
+namespace to read: a database on any Compose network can be dialled, and `/proc`
+supplies per-container traffic and PostgreSQL's process titles.
 
-4. `./scripts/monitoring.sh restart` — not `/-/reload`: `prometheus.yml` is a
-   single-file bind mount, and an editor that writes-and-renames (or a `git
-   checkout`) replaces its inode, which a reload does not follow (see "The
-   rules, and how they are proven").
+**Why not the Docker socket.** A read-only bind of `docker.sock` is not read-only:
+it still lets anything inside create a privileged container (audit F057). Docker's
+state files give names, labels, state and restarts with no write path to the daemon.
+They do not hold a true health verdict: `config.v2.json` still said `starting` days
+after a container went healthy (measured 2026-11-05). That one reading comes from
+`spark-local`.
 
-Nothing else changes: the exporters are identical everywhere, and every
-dashboard aggregates by label rather than by a hardcoded node list.
+### Databases are detected, not configured
+
+Any running container whose image is a known engine is a database, and so is an
+engine installed directly on the host: PostgreSQL (with pgvector, TimescaleDB and
+others), Redis, Valkey, MySQL, MariaDB, MongoDB, ClickHouse, Elasticsearch,
+OpenSearch, Qdrant, Milvus, Weaviate, Chroma, InfluxDB, Neo4j, Cassandra, CouchDB,
+etcd, MinIO and Memcached. Exporters and admin tools named after one are not.
+
+| What | How | Login? |
+|---|---|---|
+| Up or down | a handshake in the engine's own protocol: an SSL request to PostgreSQL, PING to Redis, MySQL's greeting, an HTTP health path | none |
+| Version | the image's environment | none |
+| Connections by state | PostgreSQL's process titles (`postgres: user db host state`), read from `/proc` | none |
+| CPU, memory, swap, disk I/O, network | the container's cgroup | none |
+| Size on disk | blocks in its named volumes, walked every 5 minutes with a time limit | none |
+| Redis statistics | `INFO`, when the server has no password | none |
+| Transactions, cache hit, rows, deadlocks, temp files, WAL, replication, per-database size | read-only queries on the `postgres` maintenance database | **yes** |
+| Redis statistics with a password | `AUTH` then `INFO` | **yes** |
+
+**The login is opt-in per project.** `MONITORING_DB_LOGIN_PROJECTS` lists the Compose
+projects the probe may log in to, using the password in that container's own
+environment. The default is `sf-local-ai`, this platform's own stack. For any other
+project the password is discarded while the container's configuration is parsed, so
+it is never held in memory, and no credential, environment value or query text is
+ever logged or exported. Set it to `*` in `.env` and run `./scripts/monitoring.sh up`
+for full statistics everywhere; the Databases page's **Detail** column says what is
+known about each one.
+
+The session is on the `postgres` database so it can never block a `DROP DATABASE`
+or a `CREATE DATABASE ... TEMPLATE` of an application or test database. It is
+read-only with a short statement timeout, and it shows as `spark-probe` in
+`pg_stat_activity`.
+
+A stopped database nobody expects to run, such as an old test container, is a
+**leftover**: counted, and not an outage. One whose restart policy says it should be
+up and that nobody stopped by hand is **down**.
+
+**File-based stores** have no wire protocol. `data-stores-exporter` measures them from
+disk. Anything at the top of the data volume that its list does not name appears by
+itself as `undeclared/<name>`, so a new feature's directory cannot go unnoticed. On
+the day this was added that found `api-files`, `chat-files`, `chat-media` and `traces`,
+plus a corrupt index backup and an old warehouse copy nobody had cleaned up.
+
+### What else it reads
+
+| Series | From | Why |
+|---|---|---|
+| `spark_kernel_events_total{kind}`, `spark_gpu_xid_total{xid}` | `/dev/kmsg` | GPU Xid errors, OOM kills, PCIe AER, NVMe and filesystem errors, hung tasks and lockups. These kill a long-running model and no metric reports them |
+| `spark_roce_hw_counter_total{counter}` | `/sys/class/infiniband/.../hw_counters` | retransmits, congestion notifications and sequence errors, from the NIC. They rise before throughput falls, and node-exporter does not read them |
+| `spark_container_gpu_memory_bytes` | GPU exporter + each PID's cgroup | nvidia-smi only says "PID 10573 holds 25 GiB"; this says which service |
+| `spark_process_*{comm}` | `/proc` | top processes by CPU and memory, grouped by name so the label set stays small |
+
+## NVMe health and Docker health: `spark-local`
+
+Reading a drive's health log needs `CAP_SYS_ADMIN` and Docker's health verdicts need
+the socket. Each is as good as root, so `spark-local` holds them and has **no network
+interface at all**: nothing can reach it, and the files it writes are all it can
+affect. It only sends GET requests. cAdvisor, which this replaces, held the same socket
+while serving HTTP.
+
+`spark_nvme_*` is the drive's own record: wear, spare capacity, media errors, bytes
+written, and `unsafe_shutdowns_total`, the only durable evidence of a power cut.
+
+---
+
+## Adding a Spark
+
+Connect it to the management LAN and turn it on. Every DGX Spark advertises
+`spark-XXXX SSH` over mDNS out of the box, so the head sees it within a minute, with no
+port scan and no address list. Then:
+
+1. **If this head's SSH key is accepted**, its exporters are copied over and started,
+   and on the next pass it joins Prometheus. Nothing else to do.
+2. **If not**, it shows on the **Monitoring** page as `needs_ssh_key`, and in
+   `./scripts/monitoring.sh fleet`. Run the one command it prints, and step 1 happens
+   by itself:
+   ```bash
+   ssh-copy-id techsphere@<its address>
+   ```
+3. **Its packet filter still needs a person.** Installing it takes that machine's sudo
+   password, so enrolment cannot do it, and until then its exporters are readable from
+   the office LAN. `HostGuardNotInstalled` says so. `scripts/host-guard.sh` is copied to
+   `~/.techsara-cluster/` on enrolment, but its defaults are the two current Sparks'
+   addresses and the boot unit does not keep overrides yet, so this script needs
+   extending before a third Spark runs unattended.
+
+No scrape config, dashboard or rule changes: every panel is built from the `node` label.
+
+To add one mDNS cannot see (another subnet, a renamed host):
+`./scripts/monitoring.sh fleet add techsphere@192.168.x.y`.
+To retire one: `./scripts/monitoring.sh fleet forget spark-3`.
+
+Three properties worth knowing:
+
+* **A Spark never silently disappears.** Once scraped it stays a target until someone
+  runs `forget`. A machine that dies reads as DOWN; it does not vanish from every panel.
+* **Names are stable.** `spark-N` is handed out once and tied to the hostname, so a
+  DHCP move (2026-11-01, worker 9.68 to 9.3) updates one field, re-binds the exporters
+  and keeps the history. The two existing Sparks keep `spark-1` and `spark-2`.
+* **What discovery trusts.** Only answers on `MONITORING_FLEET_INTERFACE` count, only
+  hostnames matching `MONITORING_FLEET_HOST_REGEX`, and enrolment refuses a machine
+  with no `/etc/dgx-release`. A rogue device could still claim the name; it would get
+  exporter code, which holds no secret, and `sample_limit` bounds what it could cost
+  Prometheus. Set `MONITORING_FLEET_AUTO_ENROLL=false` to require `fleet add` instead.
+
+A new Spark being monitored is not the same as it serving the model: the engine stays
+TP=2 on the two Sparks it was started with until `CLUSTER_*` says otherwise.
 
 ---
 
@@ -986,17 +1146,24 @@ monitoring/
   prometheus/prometheus.yml            scrape config + topology labels
   prometheus/rules/recording.yml       cluster aggregates
   prometheus/rules/alerts.yml          alert rules
-  prometheus/tests/*.yml               promtool unit tests for the availability rules
+  prometheus/rules/fleet.yml           fleet recording rules and alerts, for any number of Sparks
+  prometheus/tests/*.yml               promtool unit tests
+  grafana/generate_dashboards.py       writes the fleet dashboards; edit this, not their JSON
   grafana/provisioning/datasources/    Prometheus datasource (uid dgx-prometheus)
   grafana/provisioning/dashboards/     dashboard provider
-  grafana/dashboards/*.json            the five dashboards
+  grafana/dashboards/*.json            every dashboard
   blackbox/blackbox.yml                HTTP probe module
   exporters/dgx-gpu/dgx_gpu_exporter.py   the GB10 GPU exporter
+  exporters/spark-probe/spark_probe.py containers, databases, kernel faults, RoCE counters
+  exporters/spark-probe/spark_local.py NVMe health and Docker health
   exporters/data-stores/data_stores_exporter.py  DuckDB/LanceDB/Parquet sizes
   engine-controller/                   the controller (head) and sentinel (worker); docs/availability/
 compose/compose.monitoring.yaml        Spark 1 stack (profile: monitoring)
-compose/compose.monitoring-worker.yaml Spark 2 exporters (own project)
-scripts/monitoring.sh                  up/down/status/logs/verify/url
+compose/compose.monitoring-worker.yaml every other Spark's exporters (own project)
+scripts/monitoring.sh                  up/down/status/logs/verify/url/fleet
+scripts/lib/fleet.py                   discovers Sparks, enrols them, writes Prometheus' targets
+.runtime/fleet/                        the registry (generated, never committed)
+.runtime/prometheus/sparks-*.json      Prometheus' target files (generated)
 ```
 
 ---
@@ -1013,8 +1180,12 @@ scripts/monitoring.sh                  up/down/status/logs/verify/url
   unlabelled and all report the same 104.8 °C critical trip. Named sensors that
   *are* trustworthy: NVMe composite and the four mlx5 ASICs.
 * **No per-rank vLLM metrics** — one engine, one endpoint, by design.
-* **Container metrics are Spark 1 only**; Spark 2 runs only the vLLM worker and
-  its two exporters.
+* **Database logins are off for other projects by default.** Their detailed statistics
+  are blank until `MONITORING_DB_LOGIN_PROJECTS` allows them; see above.
+* **Data size is only measured for named volumes.** A database on a bind mount outside
+  the Docker root has no `spark_db_data_bytes`.
+* **SSD powered-on time runs behind the calendar.** The NVMe specification lets the
+  drive leave out time in low-power states, so it read 252 hours on a year-old machine.
 * **No DuckDB/LanceDB row counts** — only size, file count and freshness. See
   the reasoning above.
 * **NCCL transport and rail health are inferred**, from netdev-vs-IB counter

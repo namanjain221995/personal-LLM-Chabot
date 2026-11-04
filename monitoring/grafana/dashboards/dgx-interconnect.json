@@ -1,17 +1,22 @@
 {
   "uid": "dgx-interconnect",
-  "title": "DGX Spark - Interconnect / NCCL / RoCE",
-  "description": "The ConnectX/RoCE fabric between the two Sparks, measured with IB counters.",
+  "title": "RoCE fabric",
+  "description": "The links carrying the model's tensor-parallel traffic between Sparks.",
   "tags": [
-    "dgx-spark"
+    "dgx-spark",
+    "fleet"
   ],
-  "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
-  "editable": true,
-  "refresh": "5s",
+  "editable": false,
+  "graphTooltip": 1,
+  "fiscalYearStartMonth": 0,
+  "liveNow": false,
+  "weekStart": "",
+  "timezone": "browser",
+  "refresh": "10s",
   "time": {
-    "from": "now-30m",
+    "from": "now-1h",
     "to": "now"
   },
   "timepicker": {
@@ -21,128 +26,1044 @@
       "30s",
       "1m",
       "5m",
-      "15m"
+      "15m",
+      "1h"
     ]
   },
   "templating": {
+    "list": [
+      {
+        "name": "node",
+        "label": "Spark",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "dgx-prometheus"
+        },
+        "refresh": 2,
+        "sort": 3,
+        "query": {
+          "query": "label_values(up{job=\"node\"}, node)",
+          "refId": "fleet-nodes"
+        },
+        "definition": "label_values(up{job=\"node\"}, node)",
+        "includeAll": true,
+        "multi": true,
+        "regex": "",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "allValue": ".*",
+        "hide": 0,
+        "options": [],
+        "skipUrlSync": false
+      }
+    ]
+  },
+  "annotations": {
     "list": []
   },
+  "links": [
+    {
+      "title": "Home",
+      "type": "link",
+      "url": "/d/dgx-cluster-overview",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Spark",
+      "type": "link",
+      "url": "/d/spark-node",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "GPU",
+      "type": "link",
+      "url": "/d/dgx-gpu-thermal-power",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Fabric",
+      "type": "link",
+      "url": "/d/dgx-interconnect",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Hosts",
+      "type": "link",
+      "url": "/d/fleet-hosts",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Containers",
+      "type": "link",
+      "url": "/d/dgx-host-containers",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Databases",
+      "type": "link",
+      "url": "/d/fleet-databases",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Postgres",
+      "type": "link",
+      "url": "/d/dgx-data-stores",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Engine",
+      "type": "link",
+      "url": "/d/dgx-vllm-performance",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Alerts",
+      "type": "link",
+      "url": "/d/fleet-alerts",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Monitoring",
+      "type": "link",
+      "url": "/d/fleet-monitoring",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    }
+  ],
   "panels": [
     {
       "type": "text",
-      "title": "What these links are, and why netdev would lie",
+      "title": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Every panel reads **InfiniBand and NIC counters**. RDMA traffic never touches the kernel network stack, so ordinary network counters read flat zero on a healthy fabric. Only `rocep1s0f1` and `roceP2p1s0f1` carry a link: the two PCIe rails of one 200 Gb/s QSFP port. A single rail tops out near 109 Gb/s by design, so there is no percent-of-capacity panel here.",
+        "code": {
+          "language": "plaintext",
+          "showLineNumbers": false,
+          "showMiniMap": false
+        }
+      },
+      "transparent": true,
+      "id": 1,
+      "gridPos": {
+        "h": 2,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "table",
+      "title": "Ports",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Node",
+            "desc": false
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "node",
+                "device",
+                "Value #A",
+                "Value #B",
+                "Value #C",
+                "Value #D",
+                "Value #E",
+                "Value #F"
+              ]
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {
+              "node": 0,
+              "device": 1,
+              "Value #A": 2,
+              "Value #B": 3,
+              "Value #C": 4,
+              "Value #D": 5,
+              "Value #E": 6,
+              "Value #F": 7
+            },
+            "renameByName": {
+              "node": "Node",
+              "device": "Port",
+              "Value #A": "State",
+              "Value #B": "Received",
+              "Value #C": "Sent",
+              "Value #D": "Retransmits/s",
+              "Value #E": "Congestion/s",
+              "Value #F": "Gave up 1h"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "filterable": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d8d9da",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "State"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#f2495c",
+                      "value": null
+                    },
+                    {
+                      "color": "#76b900",
+                      "value": 4
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "4": {
+                        "text": "ACTIVE",
+                        "color": "#76b900",
+                        "index": 0
+                      },
+                      "1": {
+                        "text": "DOWN",
+                        "color": "#f2495c",
+                        "index": 1
+                      },
+                      "2": {
+                        "text": "INIT",
+                        "color": "#fab219",
+                        "index": 2
+                      },
+                      "3": {
+                        "text": "ARMED",
+                        "color": "#fab219",
+                        "index": 3
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Received"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bps"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Sent"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bps"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Retransmits/s"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#76b900",
+                      "value": null
+                    },
+                    {
+                      "color": "#fab219",
+                      "value": 0.1
+                    },
+                    {
+                      "color": "#f2495c",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Congestion/s"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#76b900",
+                      "value": null
+                    },
+                    {
+                      "color": "#fab219",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Gave up 1h"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#76b900",
+                      "value": null
+                    },
+                    {
+                      "color": "#f2495c",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (node, device) (node_infiniband_state_id{node=~\"$node\",device=~\"rocep1s0f1|roceP2p1s0f1\"})",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "8 * max by (node, device) (rate(node_infiniband_port_data_received_bytes_total{node=~\"$node\",device=~\"rocep1s0f1|roceP2p1s0f1\"}[2m]))",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "8 * max by (node, device) (rate(node_infiniband_port_data_transmitted_bytes_total{node=~\"$node\",device=~\"rocep1s0f1|roceP2p1s0f1\"}[2m]))",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (node, device) (rate(spark_roce_hw_counter_total{node=~\"$node\",counter=~\"roce_adp_retrans|local_ack_timeout_err|out_of_sequence|packet_seq_err|implied_nak_seq_err|rnr_nak_retry_err\"}[5m]))",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (node, device) (rate(spark_roce_hw_counter_total{node=~\"$node\",counter=~\"np_cnp_sent|rp_cnp_handled\"}[5m]))",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (node, device) (increase(spark_roce_hw_counter_total{node=~\"$node\",counter=~\"req_transport_retries_exceeded|req_rnr_retries_exceeded\"}[1h]))",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "F"
+        }
+      ],
+      "id": 2,
       "gridPos": {
         "h": 6,
         "w": 24,
         "x": 0,
-        "y": 0
-      },
-      "options": {
-        "mode": "markdown",
-        "content": "\n`rocep1s0f1` (**RoCE rail 1**, via `enp1s0f1np1`, 10.100.184.0/24) and\n`roceP2p1s0f1` (**RoCE rail 2**, via `enP2p1s0f1np1`, 10.100.185.0/24) are the\nConnectX links carrying NCCL tensor-parallel traffic between Spark 1 and\nSpark 2. NCCL runs over **IB verbs** on both rails\n(`NET/IB : Using [0]rocep1s0f1:1/RoCE [1]roceP2p1s0f1:1/RoCE`).\n\nEvery panel here reads the **InfiniBand** counters. RDMA traffic never touches\nthe kernel network stack, so the ordinary netdev byte counters stay flat\nduring a generation \u2014 measured: IB +335 MB and +76 MB, netdev +170 kB and\n**exactly zero** over the same window. A netdev-based panel would show a dead\nfabric on a perfectly healthy one.\n\nThe `...f0` ports are DOWN by design on this hardware and are excluded.\n**Traffic here while a prompt generates is the proof that the model is\ngenuinely distributed.**\n"
+        "y": 2
       }
     },
     {
+      "id": 3,
       "type": "row",
-      "title": "Link state",
+      "title": "Every Spark",
+      "collapsed": false,
+      "panels": [],
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 6
-      },
-      "collapsed": false,
-      "panels": []
+        "y": 8
+      }
     },
     {
-      "type": "stat",
-      "title": "RoCE port state",
-      "description": "All four (two rails x two Sparks) should read ACTIVE in dual mode.",
+      "type": "timeseries",
+      "title": "Throughput",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
       },
-      "gridPos": {
-        "h": 4,
-        "w": 12,
-        "x": 0,
-        "y": 7
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "node_infiniband_state_id{device=~\"rocep1s0f1|roceP2p1s0f1\"}",
-          "refId": "A",
-          "editorMode": "code",
-          "legendFormat": "{{node}} {{device}}",
-          "instant": true,
-          "range": false
-        }
-      ],
       "options": {
-        "reduceOptions": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
           "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
+            "lastNotNull",
+            "max"
+          ]
         },
-        "orientation": "auto",
-        "textMode": "value_and_name",
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "auto"
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
-          "decimals": null,
-          "mappings": [
-            {
-              "options": {
-                "1": {
-                  "text": "DOWN"
-                },
-                "4": {
-                  "text": "ACTIVE"
-                }
-              },
-              "type": "value"
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisBorderShow": false,
+            "axisCenteredZero": true,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
             }
-          ],
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "#F43F5E",
+                "color": "#d8d9da",
                 "value": null
-              },
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-1( |$)/"
+            },
+            "properties": [
               {
-                "color": "#2DD4BF",
-                "value": 4
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-2( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-3( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-4( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-5( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-6( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#008300"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-7( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-8( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e66767"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ tx$/"
+            },
+            "properties": [
+              {
+                "id": "custom.transform",
+                "value": "negative-Y"
               }
             ]
           }
+        ]
+      },
+      "description": "Received above the line, sent below.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "node:roce_receive_bytes_per_second:sum{node=~\"$node\"}",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{node}} rx",
+          "refId": "A"
         },
-        "overrides": []
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "node:roce_transmit_bytes_per_second:sum{node=~\"$node\"}",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{node}} tx",
+          "refId": "B"
+        }
+      ],
+      "id": 4,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
       }
     },
     {
-      "type": "stat",
-      "title": "Cluster interconnect throughput",
-      "description": "",
+      "type": "timeseries",
+      "title": "Port temperature",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
       },
-      "gridPos": {
-        "h": 4,
-        "w": 12,
-        "x": 12,
-        "y": 7
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d8d9da",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-1( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-2( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-3( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-4( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-5( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-6( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#008300"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-7( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-8( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e66767"
+                }
+              }
+            ]
+          }
+        ]
       },
       "targets": [
         {
@@ -150,97 +1071,264 @@
             "type": "prometheus",
             "uid": "dgx-prometheus"
           },
-          "expr": "cluster:roce_transmit_bytes_per_second:sum",
-          "refId": "A",
           "editorMode": "code",
-          "legendFormat": "TX",
-          "instant": true,
-          "range": false
+          "expr": "max by (node) (node_hwmon_temp_celsius{node=~\"$node\",chip=~\"0000.*|0002.*\"})",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{node}}",
+          "refId": "A"
+        }
+      ],
+      "id": 5,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      }
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "$node",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "repeat": "node"
+    },
+    {
+      "type": "timeseries",
+      "title": "Throughput by rail",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisBorderShow": false,
+            "axisCenteredZero": true,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d8d9da",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/ tx$/"
+            },
+            "properties": [
+              {
+                "id": "custom.transform",
+                "value": "negative-Y"
+              }
+            ]
+          }
+        ]
+      },
+      "description": "From the InfiniBand counters. RDMA traffic never touches the kernel network stack, so netdev counters read flat zero on a healthy fabric. The split between rails is uneven by design.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "8 * rate(node_infiniband_port_data_received_bytes_total{node=\"$node\",device=~\"rocep1s0f1|roceP2p1s0f1\"}[$__rate_interval])",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{device}} rx",
+          "interval": "15s",
+          "refId": "A"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "dgx-prometheus"
           },
-          "expr": "cluster:roce_receive_bytes_per_second:sum",
-          "refId": "B",
           "editorMode": "code",
-          "legendFormat": "RX",
-          "instant": true,
-          "range": false
+          "expr": "8 * rate(node_infiniband_port_data_transmitted_bytes_total{node=\"$node\",device=~\"rocep1s0f1|roceP2p1s0f1\"}[$__rate_interval])",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{device}} tx",
+          "interval": "15s",
+          "refId": "B"
         }
       ],
+      "id": 7,
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 0,
+        "y": 18
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Retransmits and sequence errors",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
       "options": {
-        "reduceOptions": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
           "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
+            "lastNotNull",
+            "max"
+          ]
         },
-        "orientation": "auto",
-        "textMode": "value_and_name",
-        "colorMode": "none",
-        "graphMode": "area",
-        "justifyMode": "auto"
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "Bps",
-          "decimals": 1,
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "axisSoftMin": 0,
+            "axisSoftMax": 1
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d8d9da",
+                "value": null
+              }
+            ]
+          },
           "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#94A3B8",
-                "value": null
-              }
-            ]
-          }
+          "min": 0
         },
         "overrides": []
-      }
-    },
-    {
-      "type": "row",
-      "title": "Throughput per rail - the split is NOT even",
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 11
       },
-      "collapsed": false,
-      "panels": []
-    },
-    {
-      "type": "timeseries",
-      "title": "RX by rail",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dgx-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 12
-      },
+      "description": "From the NIC itself. Zero on a healthy fabric. These rise before throughput falls.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "dgx-prometheus"
           },
-          "expr": "rate(node_infiniband_port_data_received_bytes_total{device=~\"rocep1s0f1|roceP2p1s0f1\"}[1m])",
-          "refId": "A",
           "editorMode": "code",
-          "legendFormat": "{{node}} {{device}}",
-          "range": true
+          "expr": "sum by (counter) (rate(spark_roce_hw_counter_total{node=\"$node\",counter=~\"roce_adp_retrans|roce_adp_retrans_to|local_ack_timeout_err|out_of_sequence|packet_seq_err|implied_nak_seq_err|rnr_nak_retry_err|duplicate_request\"}[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{counter}}",
+          "interval": "30s",
+          "refId": "A"
         }
       ],
+      "id": 8,
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 6,
+        "y": 18
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Congestion",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
       "options": {
         "legend": {
           "displayMode": "table",
@@ -248,75 +1336,98 @@
           "showLegend": true,
           "calcs": [
             "lastNotNull",
-            "mean",
             "max"
           ]
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "desc"
+          "sort": "desc",
+          "hideZeros": false
         }
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "Bps",
-          "min": null,
-          "max": null,
-          "decimals": null,
+          "unit": "short",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
             },
-            "axisPlacement": "auto"
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "axisSoftMin": 0,
+            "axisSoftMax": 1
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
           },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "#94A3B8",
+                "color": "#d8d9da",
                 "value": null
               }
             ]
-          }
+          },
+          "mappings": [],
+          "min": 0
         },
         "overrides": []
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "TX by rail",
-      "description": "One measured generation ran 81.5% on rail 1 and 18.5% on rail 2, so watch both lines - a summed panel would hide a dead rail.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dgx-prometheus"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 12
-      },
+      "description": "Congestion notifications. On a direct cable between two Sparks these should stay at zero.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "dgx-prometheus"
           },
-          "expr": "rate(node_infiniband_port_data_transmitted_bytes_total{device=~\"rocep1s0f1|roceP2p1s0f1\"}[1m])",
-          "refId": "A",
           "editorMode": "code",
-          "legendFormat": "{{node}} {{device}}",
-          "range": true
+          "expr": "sum by (counter) (rate(spark_roce_hw_counter_total{node=\"$node\",counter=~\"np_cnp_sent|np_ecn_marked_roce_packets|rp_cnp_handled|rp_cnp_ignored|roce_slow_restart|roce_slow_restart_cnps\"}[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{counter}}",
+          "interval": "30s",
+          "refId": "A"
         }
       ],
+      "id": 9,
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 12,
+        "y": 18
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Errors",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
       "options": {
         "legend": {
           "displayMode": "table",
@@ -324,413 +1435,118 @@
           "showLegend": true,
           "calcs": [
             "lastNotNull",
-            "mean",
             "max"
           ]
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "desc"
+          "sort": "desc",
+          "hideZeros": false
         }
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "Bps",
-          "min": null,
-          "max": null,
-          "decimals": null,
+          "unit": "short",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
             },
-            "axisPlacement": "auto"
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "axisSoftMin": 0,
+            "axisSoftMax": 1
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
           },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "#94A3B8",
+                "color": "#d8d9da",
                 "value": null
               }
             ]
-          }
+          },
+          "mappings": [],
+          "min": 0
         },
-        "overrides": []
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Packets/sec",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dgx-prometheus"
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "port errors"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          }
+        ]
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 20
-      },
+      "description": "A peer dying also makes the transport counters move once.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "dgx-prometheus"
           },
-          "expr": "rate(node_infiniband_port_packets_received_total{device=~\"rocep1s0f1|roceP2p1s0f1\"}[1m])",
-          "refId": "A",
           "editorMode": "code",
-          "legendFormat": "{{node}} {{device}} RX",
-          "range": true
+          "expr": "sum by (counter) (rate(spark_roce_hw_counter_total{node=\"$node\",counter=~\"req_cqe_error|resp_cqe_error|req_transport_retries_exceeded|req_rnr_retries_exceeded|resp_local_length_error|req_remote_access_errors|resp_remote_access_errors|out_of_buffer|rx_icrc_encapsulated\"}[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{counter}}",
+          "interval": "30s",
+          "refId": "A"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "dgx-prometheus"
           },
-          "expr": "rate(node_infiniband_port_packets_transmitted_total{device=~\"rocep1s0f1|roceP2p1s0f1\"}[1m])",
-          "refId": "B",
           "editorMode": "code",
-          "legendFormat": "{{node}} {{device}} TX",
-          "range": true
+          "expr": "sum(rate(node_infiniband_port_receive_errors_total{node=\"$node\",device=~\"rocep1s0f1|roceP2p1s0f1\"}[$__rate_interval]) + rate(node_infiniband_port_transmit_discards_total{node=\"$node\",device=~\"rocep1s0f1|roceP2p1s0f1\"}[$__rate_interval]) + rate(node_infiniband_symbol_error_total{node=\"$node\",device=~\"rocep1s0f1|roceP2p1s0f1\"}[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "port errors",
+          "interval": "30s",
+          "refId": "B"
         }
       ],
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true,
-          "calcs": []
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "pps",
-          "min": null,
-          "max": null,
-          "decimals": null,
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "fillOpacity": 8,
-            "gradientMode": "opacity",
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "axisPlacement": "auto"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#94A3B8",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Combined cluster throughput",
-      "description": "NOTE: no utilisation-percent panel. The links advertise 200 Gb/s but this fabric measures ~13 Gb/s per direction (see docs/CLUSTER.md), so a percentage against line rate would read ~0% forever and mean nothing.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dgx-prometheus"
-      },
+      "id": 10,
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 20
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "cluster:roce_transmit_bytes_per_second:sum",
-          "refId": "A",
-          "editorMode": "code",
-          "legendFormat": "cluster TX",
-          "range": true
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "cluster:roce_receive_bytes_per_second:sum",
-          "refId": "B",
-          "editorMode": "code",
-          "legendFormat": "cluster RX",
-          "range": true
-        }
-      ],
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true,
-          "calcs": []
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "Bps",
-          "min": null,
-          "max": null,
-          "decimals": null,
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "fillOpacity": 8,
-            "gradientMode": "opacity",
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "axisPlacement": "auto"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#94A3B8",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      }
-    },
-    {
-      "type": "row",
-      "title": "Errors - a healthy fabric is flat at zero",
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 28
-      },
-      "collapsed": false,
-      "panels": []
-    },
-    {
-      "type": "timeseries",
-      "title": "IB errors and discards",
-      "description": "Every one of these reads zero on both nodes today.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dgx-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 29
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "rate(node_infiniband_port_errors_received_total{device=~\"rocep1s0f1|roceP2p1s0f1\"}[5m])",
-          "refId": "A",
-          "editorMode": "code",
-          "legendFormat": "{{node}} {{device}} rcv errors",
-          "range": true
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "rate(node_infiniband_port_discards_transmitted_total{device=~\"rocep1s0f1|roceP2p1s0f1\"}[5m])",
-          "refId": "B",
-          "editorMode": "code",
-          "legendFormat": "{{node}} {{device}} xmit discards",
-          "range": true
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "rate(node_infiniband_link_downed_total{device=~\"rocep1s0f1|roceP2p1s0f1\"}[5m])",
-          "refId": "C",
-          "editorMode": "code",
-          "legendFormat": "{{node}} {{device}} link downed",
-          "range": true
-        }
-      ],
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true,
-          "calcs": []
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "min": null,
-          "max": null,
-          "decimals": 3,
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "fillOpacity": 8,
-            "gradientMode": "opacity",
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "axisPlacement": "auto"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#94A3B8",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      }
-    },
-    {
-      "type": "row",
-      "title": "Management LAN - shown separately, never mixed in above",
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 37
-      },
-      "collapsed": false,
-      "panels": []
-    },
-    {
-      "type": "timeseries",
-      "title": "Management interface (enP7s7)",
-      "description": "Ordinary LAN traffic, including this monitoring stack's own scrapes. Kept off the RoCE panels on purpose.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dgx-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 38
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "rate(node_network_receive_bytes_total{device=\"enP7s7\"}[1m])",
-          "refId": "A",
-          "editorMode": "code",
-          "legendFormat": "{{node}} RX",
-          "range": true
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "rate(node_network_transmit_bytes_total{device=\"enP7s7\"}[1m])",
-          "refId": "B",
-          "editorMode": "code",
-          "legendFormat": "{{node}} TX",
-          "range": true
-        }
-      ],
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true,
-          "calcs": []
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "Bps",
-          "min": null,
-          "max": null,
-          "decimals": null,
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "fillOpacity": 8,
-            "gradientMode": "opacity",
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "axisPlacement": "auto"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#94A3B8",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
+        "h": 7,
+        "w": 6,
+        "x": 18,
+        "y": 18
       }
     }
   ]
