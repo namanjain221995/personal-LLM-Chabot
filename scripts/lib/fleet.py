@@ -297,6 +297,26 @@ def ssh_target(member: dict, cfg: dict[str, str], address: str | None = None) ->
     return f"{user}@{address or member['address']}"
 
 
+def ssh_key(cfg: dict[str, str]) -> str | None:
+    """The key to log in to a Spark with.
+
+    The head has one key, named for the cluster, and its ssh config only offers it to
+    the worker's rail address. Without this a new Spark on the LAN could never be
+    reached, and `ssh-copy-id` alone fails with "No identities found".
+    """
+    configured = cfg.get("MONITORING_FLEET_SSH_KEY")
+    if configured:
+        return configured
+    keys = sorted(str(p) for p in (Path.home() / ".ssh").glob("id_*") if p.suffix != ".pub")
+    return keys[0] if keys else None
+
+
+def fix_command(member: dict, cfg: dict[str, str]) -> str:
+    """The one command that lets this head log in to a new Spark."""
+    key = ssh_key(cfg)
+    return f"ssh-copy-id {'-i ' + shlex.quote(key + '.pub') + ' ' if key else ''}{ssh_target(member, cfg)}"
+
+
 def ssh_identity_options(member: dict, *, first: bool) -> list[str]:
     """Pin the host key under the machine's hostname, so it is checked at any address.
 
@@ -308,8 +328,13 @@ def ssh_identity_options(member: dict, *, first: bool) -> list[str]:
             "-o", f"StrictHostKeyChecking={'accept-new' if first else 'yes'}"]
 
 
+def key_options(cfg: dict[str, str]) -> list[str]:
+    key = ssh_key(cfg)
+    return ["-i", key] if key else []
+
+
 def ssh_base(cfg: dict[str, str], member: dict, *, first: bool) -> list[str]:
-    return ["ssh", *SSH_OPTIONS, *ssh_identity_options(member, first=first), *shlex.split(cfg.get("CLUSTER_WORKER_SSH_OPTS") or "")]
+    return ["ssh", *SSH_OPTIONS, *key_options(cfg), *ssh_identity_options(member, first=first), *shlex.split(cfg.get("CLUSTER_WORKER_SSH_OPTS") or "")]
 
 
 def accepts_anything(target: str, run=subprocess.run) -> bool:
@@ -394,7 +419,7 @@ def enroll(member: dict, cfg: dict[str, str], run=subprocess.run, recreate: bool
         + (" --force-recreate" if recreate else "")
     )
     files = [str(ROOT / item) for item in ENROLL_FILES]
-    scp = ["scp", "-q", *SSH_OPTIONS, *ssh_identity_options(member, first=first), *shlex.split(cfg.get("CLUSTER_WORKER_SSH_OPTS") or "")]
+    scp = ["scp", "-q", *SSH_OPTIONS, *key_options(cfg), *ssh_identity_options(member, first=first), *shlex.split(cfg.get("CLUSTER_WORKER_SSH_OPTS") or "")]
     ssh = ssh_base(cfg, member, first=first)
     try:
         for command, timeout in (
@@ -509,7 +534,7 @@ def discover(doc: dict, cfg: dict[str, str], found: dict[str, str], *, answers=e
         if not ok:
             member["enroll_state"] = {"ssh_refused": "needs_ssh_key"}.get(reason, "not_a_dgx_spark" if reason != "accepts_any_key" else "refused")
             member["state"] = member["enroll_state"]
-            fix = f" Fix: ssh-copy-id {ssh_target(member, cfg)}" if reason == "ssh_refused" else ""
+            fix = f" Fix: {fix_command(member, cfg)}" if reason == "ssh_refused" else ""
             log(f"{name} ({member.get('hostname')}) waits for enrolment: {reason}.{fix}")
             continue
         enrolled = enroll_fn(member, cfg)
@@ -548,7 +573,7 @@ def cmd_list(_args, doc, cfg) -> int:
         print(f"{name:<10}{member.get('hostname') or '-':<16}{member.get('address') or '-':<24}"
               f"{member.get('role') or '-':<9}{member.get('state') or '-'}")
         if member.get("state") == "needs_ssh_key":
-            print(f"          fix: ssh-copy-id {ssh_target(member, cfg)}")
+            print(f"          fix: {fix_command(member, cfg)}")
     if doc["ignored"]:
         print("ignored:", ", ".join(doc["ignored"]))
     return 0
@@ -578,7 +603,7 @@ def cmd_add(args, doc, cfg) -> int:
     member.pop("hostname", None)
     ok, reason = prove_new_spark(member, cfg)
     if not ok and not args.force:
-        fix = f" If the key is the problem: ssh-copy-id {ssh_target(member, cfg)}" if reason == "ssh_refused" else ""
+        fix = f" If the key is the problem: {fix_command(member, cfg)}" if reason == "ssh_refused" else ""
         print(f"refused: {reason}.{fix}", file=sys.stderr)
         doc["members"].pop(name)
         return 1

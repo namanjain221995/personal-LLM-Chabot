@@ -1031,7 +1031,7 @@ port scan and no address list. Then:
    `./scripts/monitoring.sh fleet`. Run the one command it prints, and step 1 happens
    by itself:
    ```bash
-   ssh-copy-id techsphere@<its address>
+   ssh-copy-id -i ~/.ssh/<this head's key>.pub techsphere@<its address>
    ```
 3. **Its packet filter still needs a person.** Installing it takes that machine's sudo
    password, so enrolment cannot do it, and until then its exporters are readable from

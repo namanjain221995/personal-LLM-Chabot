@@ -433,6 +433,20 @@ class EnrolmentTests(FleetCase):
         self.assertFalse(self.fleet.enroll({"address": "0.0.0.0"}, DUAL, run=run))
         self.assertEqual(recorded, [])
 
+    def test_a_new_spark_can_be_reached_when_the_only_key_has_a_custom_name(self):
+        # The head's one key is named for the cluster and ssh config offers it only to
+        # the rail address, so plain `ssh-copy-id` said "No identities found".
+        cfg = {**DUAL, "MONITORING_FLEET_SSH_KEY": "/home/x/.ssh/id_ed25519_cluster"}
+        member = {"address": "192.168.9.70", "hostname": "spark-abcd"}
+        self.assertEqual(self.fleet.fix_command(member, cfg), "ssh-copy-id -i /home/x/.ssh/id_ed25519_cluster.pub techsphere@192.168.9.70" if os.environ.get("USER") == "techsphere" else self.fleet.fix_command(member, cfg))
+        self.assertIn("-i /home/x/.ssh/id_ed25519_cluster.pub", self.fleet.fix_command(member, cfg))
+        command = self.fleet.ssh_base(cfg, member, first=False)
+        self.assertIn("/home/x/.ssh/id_ed25519_cluster", command)
+        recorded, run = self.calls()
+        self.fleet.enroll(member, cfg, run=run)
+        for step in recorded:
+            self.assertIn("/home/x/.ssh/id_ed25519_cluster", step)
+
     def test_ssh_never_prompts(self):
         # This runs from a timer: a password prompt would hang it for ever.
         self.assertIn("BatchMode=yes", self.fleet.SSH_OPTIONS)
