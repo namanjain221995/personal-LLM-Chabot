@@ -92,6 +92,8 @@ class Outcome:
     clarification: Optional[ClarificationRequest] = None
     #: Rides onto the final meta whoever emits it.
     meta_extras: Dict[str, Any] = field(default_factory=dict)
+    #: What the planner assumed on a hand-back. Not for the screen: see _meta_extras.
+    assumptions: List[str] = field(default_factory=list)
 
 
 class _Phases:
@@ -368,8 +370,10 @@ async def run(
         duplicate=duplicate,
         reading=reading,
         entity_candidates=candidates,
+        # Only a card can use it, and it is a warehouse read off the loop.
+        known_objects=await _known_objects() if decision.action == "ASK_CLARIFICATION" else None,
     )
-    sf_state.decision_slots(decision, intent)
+    sf_state.decision_slots(decision, intent, reading)
     assumptions.extend(decision.assumptions)
     await sf_state.save_intent(intent)
     await tracing.event(
@@ -413,7 +417,11 @@ async def run(
 
     if decision.action == "ANSWER_GENERAL":
         # Not a Salesforce question after all. Hand it back rather than
-        # answering it here — engines/chat.py already does this well.
+        # answering it here — engines/chat.py already does this well. The router
+        # can still send it to SQL, so what the planner concluded goes along.
+        from .sql import note_planner_handback
+
+        note_planner_handback(decision.assumptions, not_a_record_question=True)
         await sf_state.save_state(state)
         return Outcome(handled=False, resolved_text=resolved_text)
 
@@ -450,6 +458,9 @@ async def run(
                 decision.clarification_draft.options,
             )
         )
+        taken = planner.best_reading(decision.clarification_draft)
+        if taken is not None:
+            intent.resolved_slots.setdefault(decision.clarification_draft.slot, taken.reading())
 
     resolved_text = intent.resolved_text()
 
@@ -470,7 +481,7 @@ async def run(
             return outcome
 
     # No usable plan, or no live connection: the warehouse engine answers, with
-    # the RESOLVED request. Its own live fallback still applies.
+    # the RESOLVED request.
     #
     # The intent is COMPLETED here, not merely saved. Handing the request on is
     # still finishing it as far as this engine is concerned, and `complete_intent`
@@ -489,10 +500,16 @@ async def run(
         objects=[plan_model.object_api_name] if plan_model is not None else (),
         query_summary=intent.original_user_text[:200],
     )
+    # The writer never sees the plan, so a note that the thing asked about is not
+    # accessible goes along by itself.
+    from .sql import note_planner_handback
+
+    note_planner_handback(assumptions)
     return Outcome(
         handled=False,
         resolved_text=resolved_text,
-        meta_extras=_meta_extras(intent, assumptions, phase),
+        meta_extras=_meta_extras(phase),
+        assumptions=list(assumptions),
     )
 
 
@@ -571,6 +588,18 @@ def _live_available() -> bool:
     from ..core import salesforce
 
     return bool(settings.sf_live_enabled and salesforce.configured())
+
+
+async def _known_objects() -> Optional[List[str]]:
+    """The tables the synced copy holds, or None when it cannot be read."""
+    from .. import db
+    from ..core.schema_cache import schema_cache
+
+    try:
+        schema = await db.run_in_thread(schema_cache.get, settings.duckdb_path)
+    except Exception:  # noqa: BLE001 — no check is better than no card ever
+        return None
+    return [name for name in schema if not name.startswith("_")] or None
 
 
 #: Salesforce's own words for "your query is wrong" — as opposed to "I am
@@ -1080,15 +1109,12 @@ def _refusal(decision: AgentDecision) -> str:
     )
 
 
-def _meta_extras(
-    intent: PendingIntent, assumptions: Sequence[str], phase: _Phases
-) -> Dict[str, Any]:
+def _meta_extras(phase: _Phases) -> Dict[str, Any]:
+    # No assumptions and no scope here: this rides onto whichever engine answers,
+    # and what the planner assumed need not be what ran. "Assumed date range: this
+    # quarter" over a statement with no date filter is a false line on the screen.
+    # The engine that ran the statement says what it did (engines/sql.py).
     extras: Dict[str, Any] = {"salesforce_mode": "intelligence"}
-    if assumptions:
-        extras["assumptions"] = list(assumptions)
-    scope = _scope_line(intent)
-    if scope:
-        extras["salesforce_scope"] = scope
     if phase.last:
         extras["status"] = {**phase.last, "phase": "completed"}
     return extras

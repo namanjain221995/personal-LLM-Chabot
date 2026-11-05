@@ -78,6 +78,8 @@ Do NOT ask when the information:
   closed, and asking about one of them is the worst failure in this prompt,
 - can be obtained from the schema or a safe Salesforce search,
 - can be inferred safely and stated as an assumption,
+- is a period the request does not mention: no period means every date, and the
+  answer says so, so never ask for one and never fill date_range in yourself,
 - affects only presentation or wording.
 
 "HOW MANY X" USUALLY MEANS "COUNT THE X"

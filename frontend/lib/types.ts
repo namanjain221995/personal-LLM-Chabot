@@ -675,6 +675,8 @@ export interface Meta {
   salesforce_error?: string;
   /** Stated assumptions, when a detail was assumed rather than asked about. */
   assumptions?: string[];
+  /** The engine checked `assumptions` against the statement that ran. */
+  assumptions_applied?: boolean;
   /** Final phase snapshot, so a reopened chat shows how the answer was reached. */
   status?: import('./phases').PhaseStatus;
 }
@@ -687,6 +689,7 @@ export interface SalesforceSources {
   objects: string[];
   /** Records that MATCHED, which is not always how many were returned. */
   record_count?: number;
+  /** When the query ran, or for "synced" when the copy read was published. */
   query_timestamp?: string;
   freshness?: string;
   pages?: number;

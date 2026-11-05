@@ -34,7 +34,7 @@ APP = pathlib.Path(__file__).resolve().parents[1] / "app"
 #: Every module whose per-call httpx client now takes the shared context.
 SHARED_CONTEXT_SITES = [
     "health.py", "asr.py", "resilience.py", "search/brave.py", "search/tavily.py",
-    "search/searxng.py", "core/salesforce.py", "engine_state.py", "analytics/infra.py",
+    "search/searxng.py", "engine_state.py", "analytics/infra.py",
     "publicapi/liveness.py", "publicapi/engines.py",
 ]
 

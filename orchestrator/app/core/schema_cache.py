@@ -6,15 +6,40 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Dict, List, Sequence, Tuple
+from collections import Counter
+from typing import Collection, Dict, List, Sequence, Tuple
 
 #: How long a schema read waits for the sync worker's write lock. The worker
 #: is mid-cycle for a large part of every interval, so this is the difference
-#: between answering from the warehouse and falling through to live Salesforce.
+#: between answering from the warehouse and telling the user it is busy.
 #: Kept slightly above engines/sql.py's execution wait: the schema read happens
 #: first, and giving up here wastes the executor's patience too.
 LOCK_WAIT_SECONDS = 6.0
 LOCK_WAIT_STEP = 0.25
+
+#: What DuckDB says when a writer holds the file, verbatim:
+#:   IO Error: Could not set lock on file "...": Conflicting lock is held in ...
+#: Matched whole because a bare "lock" also fires on a damaged file, whose error
+#: ends "... stored checksum ... in block at location 12288". That answered
+#: "being refreshed" on every retry until the file was replaced.
+_LOCK_MESSAGES = ("could not set lock", "conflicting lock")
+
+
+def is_lock_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(message in text for message in _LOCK_MESSAGES)
+
+
+#: The line core/sf_intel/models.py `resolved_text` folds into a request. Its
+#: slot LABELS are machine words: "metric" pulled in *Metric setup tables and
+#: "record identity" pulled in DuplicateRecord*, SharingRecord* and
+#: IdentityResolution, which pushed real tables out of the capped slice.
+_CLARIFIED_LINE_RE = re.compile(r"\n\n\((?:Clarified|Assumed):[^\n]*")
+
+
+def own_words(text: str) -> str:
+    """The person's own wording, without any "(Clarified: ...)" or "(Assumed: ...)" line."""
+    return _CLARIFIED_LINE_RE.sub("", text or "")
 
 
 class SchemaCache:
@@ -86,7 +111,7 @@ class SchemaCache:
                 )
                 break
             except duckdb.Error as exc:
-                if "lock" not in str(exc).lower() or time.monotonic() >= deadline:
+                if not is_lock_error(exc) or time.monotonic() >= deadline:
                     raise
                 time.sleep(LOCK_WAIT_STEP)
         try:
@@ -109,6 +134,11 @@ def _schema_from_rows(rows) -> Dict[str, List[Tuple[str, str]]]:
     for table, column, dtype in rows:
         schema.setdefault(table, []).append((column, dtype))
     return schema
+
+
+def columns_on(con) -> Dict[str, List[Tuple[str, str]]]:
+    """The schema as this connection sees it. A failed read raises: nothing cached stands in."""
+    return _schema_from_rows(con.execute(_COLUMNS_SQL).fetchall())
 
 
 def format_schema(schema: Dict[str, List[Tuple[str, str]]]) -> str:
@@ -209,12 +239,52 @@ def _stem(word: str) -> str:
     return word
 
 
-def _table_tokens(table: str) -> set:
-    return {
+def _name_tokens(name: str) -> List[str]:
+    return [
         _stem(t.lower())
-        for t in re.split(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])", table)
+        for t in re.split(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])", name)
         if t
-    }
+    ]
+
+
+def _table_tokens(table: str) -> set:
+    return set(_name_tokens(table))
+
+
+def _edit_distance(left: str, right: str) -> int:
+    row = list(range(len(right) + 1))
+    for i, a in enumerate(left, 1):
+        previous, row[0] = row[0], i
+        for j, b in enumerate(right, 1):
+            previous, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, previous + (a != b))
+    return row[-1]
+
+
+def same_object(written: str, table: str, known_words: Collection[str] = ()) -> bool:
+    """Is `written` a misspelling of the real name `table`, and nothing more?
+
+    "Cases" is Case, "Internal_Interviews__c" is Internal_Interview__c and
+    "Intervew__c" is Interview__c. "Course__c" is not Program__c, and
+    "ContentDocumentLink" is not ContentDocument: a different object is never
+    close enough, however it reads.
+
+    Word by word, every word counted, so "Education_Histories__c" is no
+    Education_History__History. One word may be a typo: close to the real word, long
+    enough for that to mean something, and no word `known_words` holds, which are the
+    catalogue's own. "Action" in Internal_Interview_Action_Log__c is a word, and
+    Internal_Interview_Question_Log__c holds a different thing, not a misspelt one.
+    """
+    bare = [re.sub(r"__c$", "", name, flags=re.I) for name in (written, table)]
+    left, right = Counter(_name_tokens(bare[0])), Counter(_name_tokens(bare[1]))
+    if left == right:
+        return True
+    typo, real = list((left - right).elements()), list((right - left).elements())
+    return (
+        len(typo) == len(real) == 1
+        and len(typo[0]) >= 5
+        and typo[0] not in known_words
+        and _edit_distance(typo[0], real[0]) <= 2
+    )
 
 
 #: Per-record plumbing. Same list as core/sf_dictionary._SHADOW_SUFFIXES.
@@ -272,8 +342,11 @@ def relevant_schema(
     words (4-5 chars) must equal a whole name token — "this" must not light up
     Accoun[this]tory — while longer words also match as substrings of the
     collapsed name, so "permissionset" finds PermissionSet.
+
+    Ranked on the person's own words: see `_CLARIFIED_LINE_RE`. The line stays
+    in the text the SQL writer reads.
     """
-    words = {w for w in re.findall(r"[a-z0-9_]+", question.lower()) if len(w) >= 4}
+    words = {w for w in re.findall(r"[a-z0-9_]+", own_words(question).lower()) if len(w) >= 4}
 
     def named(table: str) -> bool:
         tokens = _table_tokens(table)

@@ -127,6 +127,11 @@ class UnsafeURLError(ValueError):
     """Raised when a URL is blocked before any bytes are fetched (SSRF guard)."""
 
 
+class OrgHostRefused(UnsafeURLError):
+    """The URL is the company's own Salesforce org. Owner's order, 2026-11-04: only
+    sync-worker reaches Salesforce, and that goes for an uncredentialed GET too."""
+
+
 class FetchError(RuntimeError):
     """Raised when a fetch fails for a benign reason (timeout, too big, status)."""
 
@@ -204,6 +209,58 @@ def resolve_public_ips(host: str) -> List[str]:
     return ips
 
 
+#: Where a Salesforce org serves anything: its app, files, Visualforce, and its
+#: Experience Cloud and Sites pages. The My Domain name is the first label of each.
+_SALESFORCE_ORG_DOMAINS = (
+    "salesforce.com",
+    "force.com",
+    "visualforce.com",
+    "documentforce.com",
+    "my.site.com",
+    "salesforce-sites.com",
+    "salesforce-experience.com",
+    "salesforce-communities.com",
+    "salesforce-scrt.com",
+)
+
+
+def _my_domain(host: str) -> str:
+    """`techsara--dev9.sandbox.my.salesforce.com` -> `techsara`."""
+    return host.split(".", 1)[0].split("--", 1)[0].lower()
+
+
+def is_org_host(url: str) -> bool:
+    """Is this URL on the company's own Salesforce org, sandboxes included?
+
+    Matched on the org's name and not on all of Salesforce: help.salesforce.com,
+    www.salesforce.com and other companies' public sites stay fetchable. The name
+    comes from SF_LIGHTNING_BASE_URL, which always has a value, and from
+    SF_LOGIN_URL when that is a My Domain. Its exact host is refused either way:
+    login.salesforce.com has no org's name in it, and "login" is not one.
+
+    Read as the dial reads it, httpx's raw_host: `techsara。my。salesforce。com` is no
+    host to urlparse and is exactly this org's to httpx. A URL it cannot parse is not
+    this function's to refuse, and the caller's own check says so.
+    """
+    from ..config import settings
+
+    try:
+        host = httpx.URL(url).raw_host.decode("ascii").lower().rstrip(".")
+    except (httpx.InvalidURL, UnicodeDecodeError):
+        return False
+    if not host:
+        return False
+    login = (urlparse(os.environ.get("SF_LOGIN_URL", "")).hostname or "").lower()
+    if login and host == login:
+        return True
+    names = {_my_domain(urlparse(settings.sf_lightning_base_url or "").hostname or "")}
+    if login.endswith(".my.salesforce.com"):
+        names.add(_my_domain(login))
+    return _my_domain(host) in names - {""} and any(
+        host.endswith(f".{domain}") for domain in _SALESFORCE_ORG_DOMAINS
+    )
+
+
 def _validate(url: str) -> Tuple[str, List[str]]:
     """Scheme + host checks, then DNS. Returns ``(pin_key, ips)``.
 
@@ -217,6 +274,10 @@ def _validate(url: str) -> Tuple[str, List[str]]:
         raise UnsafeURLError(f"scheme {parsed.scheme!r} is not allowed")
     if not parsed.hostname:
         raise UnsafeURLError("URL has no host")
+    # Before DNS, so a refused host is not even looked up, and here rather than in
+    # safe_fetch, so a short link that redirects to the org is refused at the hop.
+    if is_org_host(url):
+        raise OrgHostRefused("the company's Salesforce org is read through the synced copy only")
     try:
         pin_key = httpx.URL(url).raw_host.decode("ascii")
     except (httpx.InvalidURL, UnicodeDecodeError) as exc:

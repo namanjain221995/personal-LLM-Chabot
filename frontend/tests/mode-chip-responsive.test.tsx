@@ -9,7 +9,7 @@
  *
  * The label is hidden with `sr-only`, NOT `hidden`. Every icon in this app is
  * `aria-hidden` (components/icons.tsx), so the label IS each button's
- * accessible name — `display:none` would leave four nameless buttons on every
+ * accessible name — `display:none` would leave three nameless buttons on every
  * phone. `sr-only` is absolutely positioned, so it is not a flex item and
  * contributes neither width nor gap: real layout removal, with the accessible
  * name unchanged at every width. That is what these tests pin.
@@ -29,11 +29,6 @@ const MODES = [
     name: 'Salesforce',
     label: 'Salesforce',
     prefs: { salesforce: true, sfLive: false },
-  },
-  {
-    name: 'Live Salesforce',
-    label: 'Live Salesforce',
-    prefs: { salesforce: true, sfLive: true },
   },
   {
     name: 'Web search',
@@ -169,16 +164,6 @@ describe('mode pills · clicking × changes only that mode', () => {
     expect(after.deepResearch).toBe(before.deepResearch);
   });
 
-  it('Live Salesforce steps DOWN to synced rather than all the way off', () => {
-    mount({ salesforce: true, sfLive: true });
-    fireEvent.click(chip('Live Salesforce'));
-
-    expect(changed).toHaveLength(1);
-    // The documented one-×-per-level rule, unchanged by this work.
-    expect(changed[0].sfLive).toBe(false);
-    expect(changed[0].salesforce).toBe(true);
-  });
-
   it('Web search returns to auto and touches nothing else', () => {
     const before = mount({ salesforce: false, webSearch: 'on' });
     fireEvent.click(chip('Web search'));
@@ -233,10 +218,15 @@ describe('mode pills · several at once', () => {
     expect(changed[0].webSearch).toBe('on');
   });
 
-  it('Salesforce and Live Salesforce are never both shown — one pill per mode', () => {
+  it('Salesforce mode shows its one pill', () => {
+    mount({ salesforce: true, sfLive: false });
+    expect(screen.getByRole('button', { name: 'Salesforce' })).toBeTruthy();
+  });
+
+  it('there is no Live pill any more, even with sfLive set', () => {
+    // The old pill rendered only with sfLive true, so only this mount can catch it.
     mount({ salesforce: true, sfLive: true });
-    expect(screen.queryByRole('button', { name: 'Salesforce' })).toBeNull();
-    expect(screen.getByRole('button', { name: 'Live Salesforce' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Live Salesforce' })).toBeNull();
   });
 });
 

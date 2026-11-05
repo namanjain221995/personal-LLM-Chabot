@@ -1,31 +1,22 @@
-"""Live, read-only Salesforce access for questions the warehouse cannot answer.
+"""What is left of the live Salesforce client: nothing that can reach the org.
 
-The synced warehouse is fast and cheap but it is a SNAPSHOT: up to one sync
-interval stale, and limited to configured objects. When a question needs
-something newer than the last cycle, or an object nobody added, the honest
-options are "answer from stale data", "say I don't know", or "go and look".
-This module is the third one.
+WAREHOUSE ONLY (owner order 2026-11-04): every answer reads the synced DuckDB
+warehouse, and sync-worker is the one process that talks to Salesforce. This
+module has no HTTP client and no credentials, so no environment value, request
+field or missed caller can reopen the door. Every entry point refuses with
+SalesforceUnavailable, which the callers already handle.
 
-SAFETY. Model-generated SOQL reaches a PRODUCTION org here, so it is treated
-exactly like the DuckDB path:
-  - one SELECT, nothing else. No DML verbs exist in SOQL over REST, but a
-    semicolon-joined second statement or a subquery-shaped injection still
-    must not get through;
-  - a LIMIT is ALWAYS enforced, so a careless query cannot pull an org;
-  - the credentials belong to a read-only integration user, which is the real
-    boundary — everything here is defence in depth behind that.
+guard_soql stays so that a bad query is still rejected the same way:
+  - one SELECT, nothing else;
+  - a LIMIT is ALWAYS enforced.
 """
 from __future__ import annotations
 
-import hashlib
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
-
 from ..config import settings
-from .net import shared_ssl_context
 
 #: Hard ceiling on rows returned to a prompt, whatever the model asked for.
 MAX_ROWS = 200
@@ -56,7 +47,14 @@ def _rewrite_outside_literals(text: str, pattern: "re.Pattern", replacement: str
 
 
 class SalesforceUnavailable(RuntimeError):
-    """No credentials, or the org could not be reached."""
+    """Always raised: this process has no way to reach Salesforce."""
+
+
+#: Answers come from the synced warehouse only. sync-worker is the one process
+#: that talks to Salesforce. This module has no HTTP client on purpose.
+WAREHOUSE_ONLY = (
+    "Live Salesforce access is removed: answers come from the synced warehouse only."
+)
 
 
 class UnsafeSoql(ValueError):
@@ -64,11 +62,8 @@ class UnsafeSoql(ValueError):
 
 
 def configured() -> bool:
-    """True when live lookups are possible at all."""
-    return bool(
-        settings.sf_client_id and settings.sf_login_url
-        and (settings.sf_client_secret or settings.sf_private_key_b64)
-    )
+    """Always False, whatever the environment says."""
+    return False
 
 
 def _outer_select_clause(text: str) -> str:
@@ -181,115 +176,19 @@ def guard_soql(soql: str, *, max_rows: int = MAX_ROWS) -> str:
     return text
 
 
-class _Token:
-    """Cached access token. Salesforce tokens outlive a single request, and
-    re-authenticating per question would add a round trip to every answer."""
-
-    TTL = 25 * 60
-
-    def __init__(self) -> None:
-        self.value: Optional[str] = None
-        self.instance: Optional[str] = None
-        self.at: float = 0.0
-
-    def stale(self) -> bool:
-        return self.value is None or (time.monotonic() - self.at) > self.TTL
-
-
-_token = _Token()
-
-
-async def _authenticate() -> Tuple[str, str]:
-    if not configured():
-        raise SalesforceUnavailable("Salesforce credentials are not configured")
-    if not _token.stale() and _token.value and _token.instance:
-        return _token.value, _token.instance
-
-    if not settings.sf_client_secret:
-        # The JWT grant needs a signing key; that path lives in the sync
-        # worker. Live lookups simply stay off rather than duplicating it.
-        raise SalesforceUnavailable(
-            "live Salesforce lookups need SF_CLIENT_SECRET (client-credentials grant)"
-        )
-    async with httpx.AsyncClient(timeout=30.0, verify=shared_ssl_context()) as client:
-        resp = await client.post(
-            f"{settings.sf_login_url.rstrip('/')}/services/oauth2/token",
-            data={
-                "grant_type": "client_credentials",
-                "client_id": settings.sf_client_id,
-                "client_secret": settings.sf_client_secret,
-            },
-        )
-    if resp.status_code != 200:
-        # Never echo the body: it can contain the client id.
-        raise SalesforceUnavailable(
-            f"Salesforce refused the credentials (HTTP {resp.status_code})"
-        )
-    body = resp.json()
-    _token.value = body["access_token"]
-    _token.instance = body["instance_url"].rstrip("/")
-    _token.at = time.monotonic()
-    return _token.value, _token.instance
-
-
 async def run_soql(soql: str) -> Tuple[str, List[Dict[str, Any]]]:
-    """Run a guarded SOQL query live. → (query actually run, rows)."""
-    safe = guard_soql(soql)
-    token, instance = await _authenticate()
-    async with httpx.AsyncClient(timeout=settings.sf_live_timeout, verify=shared_ssl_context()) as client:
-        resp = await client.get(
-            f"{instance}/services/data/{settings.sf_api_version}/query",
-            params={"q": safe},
-            headers={"Authorization": f"Bearer {token}"},
-        )
-    if resp.status_code == 401:
-        _token.value = None  # expired underneath us — one retry
-        token, instance = await _authenticate()
-        async with httpx.AsyncClient(timeout=settings.sf_live_timeout, verify=shared_ssl_context()) as client:
-            resp = await client.get(
-                f"{instance}/services/data/{settings.sf_api_version}/query",
-                params={"q": safe},
-                headers={"Authorization": f"Bearer {token}"},
-            )
-    if resp.status_code != 200:
-        detail = ""
-        try:
-            payload = resp.json()
-            if isinstance(payload, list) and payload:
-                detail = f": {payload[0].get('message', '')[:200]}"
-        except Exception:
-            pass
-        raise SalesforceUnavailable(f"Salesforce rejected the query{detail}")
-
-    body = resp.json()
-    records = body.get("records", [])
-    rows = [_clean(r) for r in records][:MAX_ROWS]
-    # `SELECT COUNT() FROM X` answers via totalSize with EMPTY records —
-    # returning [] here made every live count question look like "no data".
-    # (COUNT(Field) comes back as a normal expr0 record and is unaffected.)
-    if not rows and re.search(r"^\s*SELECT\s+COUNT\(\)", safe, re.I):
-        total = body.get("totalSize")
-        if isinstance(total, int):
-            rows = [{"count": total}]
-    return safe, rows
+    """Refused. The guard still runs so a bad query fails the same way."""
+    guard_soql(soql)
+    raise SalesforceUnavailable(WAREHOUSE_ONLY)
 
 
 async def org_key() -> str:
-    """A stable identifier for the org+identity this process talks to.
+    """Refused: this process talks to no org, so there is no identity to key.
 
-    Every metadata cache in Salesforce Intelligence Mode is keyed on this. A
-    describe is a function of the ORG and of what the connected identity may
-    see, so a cache keyed on the object name alone would serve one org's field
-    list — or one permission set's — to another after a credential change. That
-    is a data-leak shape, not a staleness shape, so the key is not optional.
-
-    The instance URL plus the client id covers both: a different org has a
-    different instance, and a different connected app has a different client id.
-    Neither is a secret, and neither is logged by this module.
+    Every metadata cache in Salesforce Intelligence Mode is keyed on this, so
+    those caches stay empty.
     """
-    _token_value, instance = await _authenticate()
-    material = f"{instance}|{settings.sf_client_id}|{settings.sf_api_version}"
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+    raise SalesforceUnavailable(WAREHOUSE_ONLY)
 
 
 async def run_soql_page(soql: str, *, max_rows: int = MAX_ROWS) -> Dict[str, Any]:
@@ -357,31 +256,7 @@ async def search_records(
     for name in objects:
         if not re.match(r"^[A-Za-z][A-Za-z0-9_]*$", name or ""):
             raise UnsafeSoql(f"not a valid object name: {name!r}")
-    returning = []
-    for name in objects:
-        fields = [
-            f for f in fields_by_object.get(name, ["Id", "Name"])
-            if re.match(r"^[A-Za-z][A-Za-z0-9_.]*$", f or "")
-        ] or ["Id", "Name"]
-        returning.append(f"{name}({', '.join(fields[:8])} LIMIT {SEARCH_LIMIT})")
-    sosl = f"FIND {{{escape_sosl(term)}}} IN ALL FIELDS RETURNING {', '.join(returning)}"
-
-    token, instance = await _authenticate()
-    async with httpx.AsyncClient(timeout=settings.sf_live_timeout, verify=shared_ssl_context()) as client:
-        resp = await client.get(
-            f"{instance}/services/data/{settings.sf_api_version}/search",
-            params={"q": sosl},
-            headers={"Authorization": f"Bearer {token}"},
-        )
-    if resp.status_code != 200:
-        raise SalesforceUnavailable(
-            f"Salesforce rejected the search (HTTP {resp.status_code})"
-        )
-    grouped: Dict[str, List[Dict[str, Any]]] = {name: [] for name in objects}
-    for record in resp.json().get("searchRecords", []) or []:
-        kind = (record.get("attributes") or {}).get("type") or ""
-        grouped.setdefault(kind, []).append(_clean(record))
-    return grouped
+    raise SalesforceUnavailable(WAREHOUSE_ONLY)
 
 
 #: Per-object cap on search candidates. A clarification shows at most four
@@ -404,46 +279,11 @@ def escape_sosl(term: str) -> str:
 
 
 async def _query(soql: str) -> Dict[str, Any]:
-    """GET /query with one re-authentication retry. Returns the raw envelope."""
-    token, instance = await _authenticate()
-    async with httpx.AsyncClient(timeout=settings.sf_live_timeout, verify=shared_ssl_context()) as client:
-        resp = await client.get(
-            f"{instance}/services/data/{settings.sf_api_version}/query",
-            params={"q": soql},
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        if resp.status_code == 401:
-            _token.value = None  # expired underneath us — one retry
-            token, instance = await _authenticate()
-            resp = await client.get(
-                f"{instance}/services/data/{settings.sf_api_version}/query",
-                params={"q": soql},
-                headers={"Authorization": f"Bearer {token}"},
-            )
-    if resp.status_code != 200:
-        detail = ""
-        try:
-            payload = resp.json()
-            if isinstance(payload, list) and payload:
-                detail = f": {payload[0].get('message', '')[:200]}"
-        except Exception:
-            pass
-        raise SalesforceUnavailable(f"Salesforce rejected the query{detail}")
-    return resp.json()
+    raise SalesforceUnavailable(WAREHOUSE_ONLY)
 
 
 async def _get(path: str, params: Optional[dict] = None) -> Any:
-    """Authenticated GET against the REST API."""
-    token, instance = await _authenticate()
-    async with httpx.AsyncClient(timeout=settings.sf_live_timeout, verify=shared_ssl_context()) as client:
-        resp = await client.get(
-            f"{instance}{path}",
-            params=params or {},
-            headers={"Authorization": f"Bearer {token}"},
-        )
-    if resp.status_code != 200:
-        raise SalesforceUnavailable(f"Salesforce returned HTTP {resp.status_code}")
-    return resp.json()
+    raise SalesforceUnavailable(WAREHOUSE_ONLY)
 
 
 async def list_objects() -> List[Dict[str, Any]]:

@@ -153,11 +153,13 @@ async def write_soql(
 
 
 #: "How many objects?", "what fields does Interview__c have?", "list the API
-#: names" — questions about the SHAPE of the org rather than its records.
+#: names" — questions about the SHAPE of the org rather than its records. No bare
+#: "tables?": "show me a table of courses by status" asks for records, and would
+#: get the catalogue instead of "could not find". A column chart is no column.
 _SCHEMA_RE = re.compile(
-    r"\b(objects?|fields?|schema|metadata|api\s*names?|sobjects?)\b", re.I
+    r"\b(objects?|fields?|schema|metadata|api\s*names?|sobjects?|columns?(?!\s+(?:chart|graph)))\b", re.I
 )
-_COUNT_OR_LIST_RE = re.compile(r"\b(how many|list|show|what|which|all)\b", re.I)
+_COUNT_OR_LIST_RE = re.compile(r"\b(how many|list|show|what|which|all|describe)\b", re.I)
 
 _OBJECT_NAME_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]*__c|Account|Contact|Lead|Opportunity|Case|User)\b")
 

@@ -207,12 +207,14 @@ services:
       dockerfile: Dockerfile.cpu
     env_file: *runtime-env
     environment:
-      SF_CLIENT_ID: ${SF_CLIENT_ID:-}
-      SF_CLIENT_SECRET: ${SF_CLIENT_SECRET:-}
-      SF_USERNAME: ${SF_USERNAME:-}
+      # WAREHOUSE ONLY (owner order 2026-11-04). `environment:` OVERRIDES `env_file`,
+      # so these literal blanks keep Salesforce credentials out of this container
+      # whatever .env and secrets.env hold. Only sync-worker gets them.
+      SF_CLIENT_ID: ""
+      SF_CLIENT_SECRET: ""
+      SF_USERNAME: ""
       SF_LOGIN_URL: ${SF_LOGIN_URL:-}
       SF_API_VERSION: ${SF_API_VERSION:-v61.0}
-      SF_LIVE_ENABLED: ${SF_LIVE_ENABLED:-true}
       # --- new Salesforce pipeline (steps 4-5) ------------------------------
       # Additive. BRAIN_ENABLED stays true and the existing sf_intel path is
       # untouched; nothing below runs until a caller builds a
@@ -231,8 +233,8 @@ services:
       # image, so a change to either takes effect on restart, not on a rebuild.
       PYTHONPATH: /app:/app/sfsrc:/app/vendor
       SF_LIGHTNING_BASE_URL: ${SF_LIGHTNING_BASE_URL:-https://techsara.lightning.force.com}
-      SF_PRIVATE_KEY_FILE: /data/sf_jwt_key.pem
-      SF_PRIVATE_KEY_B64: ${SF_PRIVATE_KEY_B64:-}
+      SF_PRIVATE_KEY_FILE: ""
+      SF_PRIVATE_KEY_B64: ""
       APP_DATABASE_URL: postgresql://${POSTGRES_USER:-techsara}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-techsara}
       SESSION_SECRET: ${SESSION_SECRET:-}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}

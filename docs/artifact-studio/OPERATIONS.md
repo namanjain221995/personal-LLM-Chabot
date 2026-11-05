@@ -10,6 +10,7 @@
 | `ARTIFACT_MAX_OPEN_JOBS_PER_USER` | 3 | queued + running jobs one person may hold |
 | `ARTIFACT_LEASE_TTL_S` | 90 | a job whose heartbeat stops for this long is requeued — the lease check runs every 30 s (`pipeline.REQUEUE_INTERVAL_S`), so a job orphaned by a restart is back in the queue within TTL + 30 s; until 2026-09-12 it waited for the 30-minute sweep |
 | `ARTIFACT_STAGE_TIMEOUT_S` | 900 | any stage past this fails (compose is `max(this, LLM_RECOVERY_WINDOW_S + 60)`); a Think compose measured 252 s with thinking on for three calls |
+| `ARTIFACT_MODEL_CALL_TIMEOUT_S` | 600 | one model call inside a job, from the moment it is sent, so waiting for an engine reload is not spent from it. Past it the section is dropped with a warning, or a single-call document fails with a plain message. 0 turns it off |
 | `ARTIFACT_RENDER_TIMEOUT_S` / `ARTIFACT_RENDER_MEMORY_MB` | 180 / 2048 | the render subprocess's wall clock and address space |
 | `ARTIFACT_MIN_FREE_MB` | 512 | acceptance and render refuse below this much free space on the reports volume |
 | `ARTIFACT_USER_QUOTA_MB` | 2048 | per-person ceiling, measured on disk (files, preview copy, page-image cache) |

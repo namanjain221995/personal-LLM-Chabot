@@ -1446,7 +1446,12 @@ function MessageRowImpl({
             />
           )}
 
-          {message.meta?.salesforce_sources && (
+          {/* `assumptions_applied`: the engine checked these against the statement
+              that ran. An older answer's list is only what the planner assumed,
+              with no source line it was never shown, and reopening it must not
+              start claiming it now. */}
+          {(message.meta?.salesforce_sources ||
+            message.meta?.assumptions_applied) && (
             <SalesforceSourceLine
               sources={message.meta.salesforce_sources}
               scope={message.meta.salesforce_scope}

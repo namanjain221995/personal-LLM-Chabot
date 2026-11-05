@@ -102,19 +102,15 @@ def test_an_unknown_chart_trigger_mode_falls_back_to_explicit(monkeypatch):
         assert Settings().chart_trigger_mode == "explicit"
 
 
-def test_sf_live_enabled_off_means_off(monkeypatch):
-    """The old bespoke parse treated 'off' (and typos) as TRUE, silently
-    enabling live org lookups. It now uses the shared _bool helper."""
+def test_sf_live_enabled_is_off_whatever_the_environment_says(monkeypatch):
+    """Answers read the warehouse only: the variable is no longer read."""
     from app.config import Settings
 
-    for raw in ("off", "false", "0", "no", "nonsense"):
+    for raw in ("off", "false", "0", "no", "nonsense", "true", "1", "yes", "on"):
         monkeypatch.setenv("SF_LIVE_ENABLED", raw)
         assert Settings().sf_live_enabled is False, raw
-    for raw in ("true", "1", "yes", "on"):
-        monkeypatch.setenv("SF_LIVE_ENABLED", raw)
-        assert Settings().sf_live_enabled is True, raw
     monkeypatch.delenv("SF_LIVE_ENABLED", raising=False)
-    assert Settings().sf_live_enabled is True
+    assert Settings().sf_live_enabled is False
 
 
 def test_salesforce_environment_is_explicit_and_normalized(monkeypatch):

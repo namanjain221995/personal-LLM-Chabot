@@ -47,7 +47,7 @@ flowchart TB
     DISPATCH --> CHAT["chat"]
     DISPATCH --> SEARCH["search"]
     DISPATCH --> DR["deep_research"]
-    DISPATCH --> SF["Salesforce engines<br/>sql · rag · sf_intel · live_sf"]
+    DISPATCH --> SF["Salesforce engines<br/>sql · rag · sf_intel"]
     DISPATCH --> OTHER["vision · document · report<br/>url · repo · crawl · dataset · agent"]
 
     CHAT & SEARCH & DR & SF & OTHER --> LLM["vLLM · Qwen<br/>local GPU"]
@@ -616,7 +616,7 @@ flowchart TB
     SW --> LANCE[("LanceDB<br/>long-text chunks")]
     DUCK -->|"CHECKPOINT + atomic copy"| SNAP[("warehouse.read.duckdb<br/>the snapshot readers open")]
 
-    Q([Salesforce question]) --> INTEL["sf_intel<br/>plan · validate · compile"]
+    Q([Salesforce question]) --> INTEL["sf_intel<br/>resolve · clarify"]
     INTEL --> ASK{"ambiguous?"}
     ASK -->|yes| CLAR(["asks one clarifying question"])
     ASK -->|no| SQL["guarded SELECT<br/>one statement, no writes"]
@@ -624,16 +624,17 @@ flowchart TB
     SNAP --> ROWS["rows → deterministic<br/>Python summary"]
     ROWS --> ANSWER(["answer + table + chart + export"])
 
-    INTEL -.->|"warehouse can't answer,<br/>or Live toggle"| LIVE["live_sf<br/>model writes SOQL → guard → REST"]
-    LIVE --> SFORG
-
     classDef app fill:#7C3AED,color:#fff,stroke:none
     classDef data fill:#D97706,color:#fff,stroke:none
     classDef ext fill:#64748B,color:#fff,stroke:none
-    class SW,INTEL,SQL,ROWS,LIVE app
+    class SW,INTEL,SQL,ROWS app
     class PARQ,DUCK,LANCE,SNAP data
     class SFORG ext
 ```
+
+The arrow from the org ends at the sync worker: it is the one process that talks
+to Salesforce, and every answer reads the warehouse (owner order, 2026-11-04). A
+missing table or a busy warehouse gets one honest line, never a call to the org.
 
 The snapshot exists because DuckDB allows many readers **or** one writer. The
 sync worker writes to the live file and publishes an atomic copy; readers only

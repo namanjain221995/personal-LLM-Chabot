@@ -1,5 +1,11 @@
 # `orchestrator/app/core/` — module reference
 
+> **⚠ Superseded in part (2026-11-04).** Live Salesforce was removed: every answer
+> reads the warehouse, `core/salesforce.py` refuses every call and only the sync
+> worker talks to the org. Every description below of `fetch_live`, live SOQL, the
+> Live toggle, `sf_live` or `SF_LIVE_*` is a snapshot of the older code and has NOT
+> been re-derived. See [`README.md` §12](../../README.md#12-salesforce-sync-and-warehouse).
+
 The `core` package is the orchestrator's pure-logic layer: guards, parsers, profilers, renderers and
 protocol clients that the `engines/` layer composes. Its own package docstring states the contract —
 *"Pure modules: no network, no GPU, no heavy imports at module import time"* —
@@ -51,8 +57,14 @@ Two structural facts hold across the whole package and are not repeated in every
 ## sql_guard
 
 **Purpose** — Regex + hand-written character scanner that must reduce LLM-authored SQL to exactly one
-read-only `SELECT`/`WITH … SELECT` before DuckDB sees it. The only application-layer barrier between
-prompt-injected model output and the warehouse.
+read-only `SELECT`/`WITH … SELECT` before DuckDB sees it. The first application-layer barrier between
+prompt-injected model output and the warehouse. It also holds the one reader of a statement's quoting
+that every text rule shares (`mask_literals`, `outside_literals`). The second barrier is
+[`sql_tree.py`](../../orchestrator/app/core/sql_tree.py), which reads DuckDB's own parser tree in
+`engines/sql.py::_behind_the_mask`: one statement, allowed table functions, every table read, and what
+a statement does with a withheld column or a link. It refuses a shape it does not know, and every
+statement on a DuckDB outside the 1.5 line, and `tests/test_warehouse_statements.py` pins the tree labels
+it reads, because that JSON is internal to DuckDB.
 
 **Public surface**
 

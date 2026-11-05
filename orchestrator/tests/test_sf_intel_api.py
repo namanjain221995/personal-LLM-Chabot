@@ -60,9 +60,9 @@ def _ask(monkeypatch, question="Which period should I use for the pipeline?"):
     decision = AgentDecision(
         action="ASK_CLARIFICATION",
         normalized_intent="pipeline",
-        missing_critical_slots=["date_range"],
+        missing_critical_slots=["filter"],
         clarification_draft=ClarificationDraft(
-            slot="date_range",
+            slot="filter",
             question=question,
             options=[
                 ClarificationOption(id="m", label="This month", value="THIS_MONTH"),
@@ -120,7 +120,7 @@ def test_an_ambiguous_salesforce_request_streams_a_clarification(monkeypatch):
     meta = _meta(events)
     assert meta["route"] == "clarify"
     card = meta["clarification"]
-    assert card["slot"] == "date_range"
+    assert card["slot"] == "filter"
     assert [o["id"] for o in card["options"]] == ["m", "q", "y"]
     # The v1 keys the frontend has always merged in are still there.
     assert meta["mode"] == "salesforce"

@@ -1,5 +1,6 @@
 """GitHub repo analysis (Phase 3): URL detection, caps, chunking, indexing, search."""
 import os
+import subprocess
 
 import pytest
 
@@ -91,6 +92,36 @@ def test_clone_rejects_too_many_files(tmp_path, monkeypatch):
     with pytest.raises(RepoError, match="over the 3 limit"):
         repolib.shallow_clone(GithubRef("o", "r"), dest)
     assert not os.path.exists(dest)  # cleaned up on rejection
+
+
+@pytest.mark.parametrize("link_to", ["outside", "environ"])
+def test_a_link_in_a_repo_is_a_file_and_reads_nothing_it_points_at(tmp_path, monkeypatch, link_to):
+    """A member's question over a public repo returned what its symlink pointed at."""
+    def git(*args):
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+            cwd=origin, check=True, capture_output=True,
+        )
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("INVENTED-KEY-TEXT\n")
+    target = str(outside) if link_to == "outside" else "/proc/self/environ"
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git("init", "-q", "-b", "main")
+    (origin / "main.py").write_text("print('hello')\n")
+    os.symlink(target, origin / "notes.txt")
+    git("add", "-A")
+    git("commit", "-q", "-m", "x")
+    monkeypatch.setattr(repolib, "_github_repo_size_kb", lambda ref: None)
+    monkeypatch.setattr(GithubRef, "clone_url", property(lambda self: f"file://{origin}"))
+
+    dest = str(tmp_path / "clone")
+    repolib.shallow_clone(GithubRef("o", "r"), dest)
+
+    assert not os.path.islink(os.path.join(dest, "notes.txt"))
+    with open(os.path.join(dest, "notes.txt"), encoding="utf-8") as cloned:
+        assert cloned.read().strip() == target
 
 
 @pytest.fixture()

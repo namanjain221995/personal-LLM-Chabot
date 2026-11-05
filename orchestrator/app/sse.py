@@ -28,6 +28,7 @@ Every event ends with a blank line, per the SSE specification.
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Any, Mapping, Optional
 
@@ -47,11 +48,36 @@ ALL_EVENTS = ALLOWED_EVENTS + V2_EVENTS + PROGRESS_EVENTS + RESEARCH_EVENTS
 STEP_STATUSES = ("running", "done", "failed")
 
 
+def _without_non_finite(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        # The key too: json.dumps refuses a bare inf there, and that turn then stored nothing.
+        return {
+            key: _without_non_finite(item)
+            for key, item in value.items()
+            if not (isinstance(key, float) and not math.isfinite(key))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_without_non_finite(item) for item in value]
+    return value
+
+
+def strict_json(value: Any) -> str:
+    """json.dumps that only ever writes JSON: a bare NaN or Infinity makes a browser drop
+    the frame and jsonb refuse the row, so a table goes missing and an answer is not stored.
+    Nothing is walked unless something needs it, and a string saying "NaN" stays."""
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str, allow_nan=False)
+    except ValueError:
+        return json.dumps(_without_non_finite(value), ensure_ascii=False, default=str, allow_nan=False)
+
+
 def sse_event(event: str, data: Optional[Mapping[str, Any]] = None) -> str:
     """Format a single SSE frame. `event` must be one of ALL_EVENTS."""
     if event not in ALL_EVENTS:
         raise ValueError(f"unknown SSE event type: {event!r} (allowed: {ALL_EVENTS})")
-    payload = json.dumps(dict(data or {}), ensure_ascii=False, default=str)
+    payload = strict_json(dict(data or {}))
     return f"event: {event}\ndata: {payload}\n\n"
 
 

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import secrets
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from ... import db
 from .models import (
@@ -361,6 +361,16 @@ def answer_text(request: ClarificationRequest, response: ClarificationResponse) 
     return ", ".join(p for p in parts if p)
 
 
+def answer_label(request: ClarificationRequest, response: ClarificationResponse) -> str:
+    """The same answer in the words the person read on the card."""
+    if response.skipped:
+        return ""
+    by_id = {option.id: option for option in request.options}
+    chosen = [by_id[i].label for i in response.selected_option_ids if i in by_id]
+    typed = response.custom_text.strip()
+    return ", ".join(p for p in ([*chosen, typed] if typed else chosen) if p)
+
+
 async def apply_response(
     response: ClarificationResponse,
 ) -> Tuple[ClarificationRequest, PendingIntent, str, bool]:
@@ -430,6 +440,7 @@ async def apply_response(
             round_.answered = not effective.skipped
             round_.skipped = effective.skipped
             round_.answer = value
+            round_.answer_label = answer_label(request, effective)
     if value:
         intent.resolved_slots[request.slot] = value
     intent.missing_slots = [s for s in intent.missing_slots if s != request.slot]
@@ -495,16 +506,29 @@ async def complete_intent(
     await save_state(state)
 
 
-def decision_slots(decision: AgentDecision, intent: PendingIntent) -> None:
+def decision_slots(
+    decision: AgentDecision, intent: PendingIntent, reading: Any = None
+) -> None:
     """Fold a planner decision's resolved slots into the intent, in place.
 
     The intent wins on conflict: a slot the USER answered in a previous round is
     a fact, and a planner that re-derives it differently on the next turn must
     not silently overwrite what they said.
+
+    A period nobody gave stays out, given a `reading` to tell: with no date in the
+    request the answer covers every date and says so (planner.enforce_policy), and
+    a slot the planner filled in on its own would narrow that silently.
     """
     answered = {r.slot for r in intent.clarification_history if r.answered}
     for slot, value in decision.resolved_slots.items():
         if slot in answered:
+            continue
+        if (
+            slot == "date_range"
+            and reading is not None
+            and slot not in reading.satisfied
+            and slot not in intent.resolved_slots
+        ):
             continue
         intent.resolved_slots[slot] = value
     if decision.normalized_intent:

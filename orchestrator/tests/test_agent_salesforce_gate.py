@@ -62,35 +62,22 @@ def test_salesforce_on_still_allows_sql(monkeypatch):
     assert results[0]["meta"]["sql"] == "SELECT 1"
 
 
-def test_sf_live_enabled_off_blocks_the_agent_live_step(monkeypatch):
-    """SF_LIVE_ENABLED used to gate only the SQL engine's fallback; agent
-    'salesforce' steps called fetch_live directly and bypassed the flag."""
-    from app.config import settings as real_settings
+def test_a_salesforce_step_reads_the_warehouse(monkeypatch):
+    """It used to go to the org. A plan that still names it now reads the
+    warehouse like a sql step, whatever SF_LIVE_ENABLED once said."""
     import app.engines.live_sf as live_sf
+    import app.engines.sql as sqlmod
 
     def boom(*a, **k):
-        raise AssertionError("fetch_live called while SF_LIVE_ENABLED is off")
+        raise AssertionError("fetch_live called")
+
+    async def fake_sql(inp, **k):
+        return "SELECT 1", ["c"], [[1]]
 
     monkeypatch.setattr(live_sf, "fetch_live", boom)
-    monkeypatch.setattr(real_settings, "sf_live_enabled", False)
+    monkeypatch.setattr(sqlmod, "generate_and_run_sql", fake_sql)
 
     plan = AgentPlan(steps=[PlanStep(id=1, title="t", kind="salesforce", input="x")])
     results = asyncio.run(execute_steps(plan, [], Rec().emit, salesforce=True))
     assert results[0]["status"] == "done"
-    assert "disabled" in results[0]["output"].lower()
-
-
-def test_sf_live_enabled_on_runs_the_agent_live_step(monkeypatch):
-    from app.config import settings as real_settings
-    import app.engines.live_sf as live_sf
-
-    async def fake_live(question, history=()):
-        return "SELECT Id FROM Account", [{"Id": "001xx000003DGbY"}]
-
-    monkeypatch.setattr(live_sf, "fetch_live", fake_live)
-    monkeypatch.setattr(real_settings, "sf_live_enabled", True)
-
-    plan = AgentPlan(steps=[PlanStep(id=1, title="t", kind="salesforce", input="x")])
-    results = asyncio.run(execute_steps(plan, [], Rec().emit, salesforce=True))
-    assert results[0]["status"] == "done"
-    assert "001xx000003DGbY" in results[0]["output"]
+    assert results[0]["meta"]["sql"] == "SELECT 1"

@@ -142,7 +142,6 @@ describe('BADGE-06 · the selectable controls are all still there', () => {
       'Web search',
       'Deep research',
       'Salesforce',
-      'Live Salesforce',
     ]);
     // …and none of them is armed on a new chat.
     for (const item of items.filter((i) => i.checked !== undefined)) {
