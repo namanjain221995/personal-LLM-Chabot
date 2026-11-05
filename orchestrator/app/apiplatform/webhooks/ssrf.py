@@ -368,6 +368,10 @@ def validate_url(url: str) -> ValidatedTarget:
         raise UnsafeWebhookURL("the webhook URL cannot be parsed") from exc
     if not pin_key:
         raise UnsafeWebhookURL("the webhook URL has no host")
+    # Only sync-worker talks to the org, and a POST of signed event bodies is no
+    # exception. On the host as it will be dialled, and on every redirect hop.
+    if net.is_org_host(f"https://{pin_key}/"):
+        raise UnsafeWebhookURL("the company's Salesforce org is not a webhook target")
     addresses = _resolve(pin_key)
     for address in addresses:
         # EVERY address, not the first: a name that publishes one public and

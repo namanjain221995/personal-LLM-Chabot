@@ -3,11 +3,15 @@
 /**
  * Salesforce analytics — METADATA ONLY.
  *
- * How many CRM questions were asked, how they were served (from the synced
- * copy or live against the org), and how often they failed. Deliberately no
- * record content, no object names, no field names and no query text: reading
- * a member's Salesforce answers is a different capability with its own audit
+ * How many CRM questions were asked, how they were served (structured queries
+ * or dataset answers), and how often they failed. Deliberately no record
+ * content, no object names, no field names and no query text: reading a
+ * member's Salesforce answers is a different capability with its own audit
  * trail, and an operations dashboard is not the place to leak it.
+ *
+ * The API's `live` and `synced` totals are not drawn. No writer ever stored the
+ * value `live` counts, so it is always 0 and `synced` always equals `answers`,
+ * older answers that really read the org included.
  */
 
 import { AnalyticsChart } from '@/components/admin/analytics/AnalyticsChart';
@@ -56,21 +60,16 @@ export default function SalesforceAnalyticsPage() {
             bucket={data?.range.bucket ?? 'day'}
             height={230}
             ariaLabel="Salesforce answers over time"
-            series={[
-              { name: 'Answers', area: true, data: series.map((p) => p.answers) },
-              { name: 'Live against the org', data: series.map((p) => p.live) },
-            ]}
+            series={[{ name: 'Answers', area: true, data: series.map((p) => p.answers) }]}
           />
         </ChartFrame>
       </Section>
 
       <Section
         title="How the questions were served"
-        hint="The synced copy answers from the local warehouse; live mode queries the org directly."
+        hint="Answers come from the local warehouse; nothing queries the org now. Older answers may have read the org directly, and those were never counted separately."
       >
-        <StatRow columns={4}>
-          <Stat label="From the synced copy" value={compact(t?.synced ?? null)} />
-          <Stat label="Live against the org" value={compact(t?.live ?? null)} />
+        <StatRow columns={3}>
           <Stat label="Structured queries" value={compact(t?.sql_route ?? null)} />
           <Stat label="Dataset answers" value={compact(t?.dataset_route ?? null)} />
         </StatRow>

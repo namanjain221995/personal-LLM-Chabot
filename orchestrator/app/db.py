@@ -70,6 +70,7 @@ from psycopg_pool import ConnectionPool
 
 from . import db_metrics
 from .config import settings
+from .sse import strict_json
 
 # Driver-neutral aliases so callers never import psycopg. `history.py` and
 # `auth.py` catch db.IntegrityError; swapping drivers again would only touch
@@ -3798,7 +3799,7 @@ def _dumps_jsonb(obj: Any) -> str:
     `json.dumps` always escapes NUL as the six characters `\\u0000`, which jsonb
     rejects, so the escape is removed from the serialised form.
     """
-    text = json.dumps(obj, ensure_ascii=False, default=str)
+    text = strict_json(obj)
     return text.replace("\\u0000", "") if "\\u0000" in text else text
 
 

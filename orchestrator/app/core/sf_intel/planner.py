@@ -18,10 +18,11 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Collection, Dict, List, Optional, Sequence
 
 from ... import llm
 from ...config import settings
+from ..schema_cache import own_words
 from . import interpret
 from .interpret import Reading
 from .models import (
@@ -401,20 +402,139 @@ async def _repair(
 # ---------------------------------------------------------------------------
 
 def _answer_instead(
-    decision: AgentDecision, draft: ClarificationDraft, reason: str
+    decision: AgentDecision,
+    draft: ClarificationDraft,
+    reason: str,
+    *,
+    assumption: str = "",
+    taken: Optional[ClarificationOption] = None,
 ) -> AgentDecision:
-    """Turn a question we must not ask into an answer that says what it assumed."""
+    """Turn a question we must not ask into an answer that says what it assumed.
+
+    `taken` is the option the answer follows, and it goes into the slots. Stated
+    only as an assumption it reached no SQL writer, so the number could ignore it.
+    """
+    slots = dict(decision.resolved_slots)
+    if taken is not None:
+        slots.setdefault(draft.slot, taken.reading())
     return decision.model_copy(
         update={
             "action": "EXECUTE_SALESFORCE",
             "clarification_draft": None,
+            "resolved_slots": slots,
             "assumptions": [
                 *decision.assumptions,
-                _assumption_for(draft.slot, draft.options),
+                assumption or _assumption_for(draft.slot, draft.options),
             ],
             "internal_reason_code": reason,
         }
     )
+
+
+def best_reading(draft: ClarificationDraft) -> Optional[ClarificationOption]:
+    """The option an unasked question may stand on, if any.
+
+    The first option is the planner's own best guess. Not for a record, whose
+    options are invented names until a search says otherwise, and not for a period:
+    'Today' came first on a card about a plain count, and no date means every date.
+    """
+    if draft.slot in ("record_identity", "date_range") or not draft.options:
+        return None
+    return draft.options[0]
+
+
+#: Words on a card that say nothing about which reading it is.
+_CARD_NOISE = frozenset(
+    "a an and are as at be by do does for from how i in is it its me my of on or "
+    "only should show shall that the their them these this to us we what when "
+    "which who whom why will with would you your".split()
+)
+
+
+def _card_words(text: str) -> List[str]:
+    words = (w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in _CARD_NOISE and len(w) > 2)
+    return [w[:-1] if len(w) > 3 and w.endswith("s") else w for w in words]
+
+
+def _option_the_request_states(
+    draft: ClarificationDraft, reading: Optional[Reading]
+) -> Optional[ClarificationOption]:
+    """The one option the person already said, or None.
+
+    "How many internal interviews were created in September?" got a card asking
+    completed or created, and the click then overrode the word in the sentence.
+
+    Strict because a wrong pick here is a wrong number under a stated assumption:
+    the option's FIRST word of its own must be in the sentence, and no other option
+    may have any word of its own there. So "Approved Deliverables" does not win a
+    question that only says "deliverable submissions passed".
+    """
+    if reading is None or draft.slot == "record_identity":
+        return None
+    asked = set(_card_words(own_words(reading.text)))
+    labels = [_card_words(option.label) for option in draft.options]
+    found: Optional[ClarificationOption] = None
+    for index, option in enumerate(draft.options):
+        others = {w for other, words in enumerate(labels) if other != index for w in words}
+        own = [w for w in labels[index] if w not in others]
+        if not set(own) & asked:
+            continue
+        if found is not None or own[0] not in asked:
+            return None
+        found = option
+    return found
+
+
+#: A custom object's API name. Nothing else ends this way, so it is a name for sure.
+_CUSTOM_OBJECT_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9_]*__c\b")
+#: `ContentDocument`: shaped like a standard object, though "LinkedIn" is too.
+_API_SHAPED_RE = re.compile(r"\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b")
+#: What can follow an object's name in a sentence without extending that name.
+_NOT_A_NOUN = frozenset("was were has have had not did can all any each per".split())
+
+
+def _collapsed(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", re.sub(r"__c$", "", name, flags=re.I).lower())
+
+
+def _missing_object(
+    decision: AgentDecision,
+    draft: ClarificationDraft,
+    text: str,
+    known: Optional[Collection[str]],
+) -> Optional[Dict[str, Any]]:
+    """What the card asks about that the synced copy does not hold, if anything.
+
+    Stored runs asked a card first and only then found no such object. `certain`
+    means a real API name: the writer may then be told the thing is not here. The
+    other two are shapes, so they only cost the card: "LinkedIn" is no object, and
+    "content document links" is only probably ContentDocumentLink.
+    """
+    if not known:
+        return None
+    tables = {_collapsed(name) for name in known}
+    own = own_words(text)
+    named = [own, decision.resolved_slots.get("object", ""), draft.question]
+    named += [option.value for option in draft.options]
+    for name in _CUSTOM_OBJECT_RE.findall(" ".join(filter(None, named))):
+        if _collapsed(name) not in tables:
+            return {"name": name, "certain": True}
+    shaped = [draft.question, *(f"{o.label} {o.value}" for o in draft.options)]
+    for name in _API_SHAPED_RE.findall(" ".join(shaped)):
+        if not {_collapsed(name), _collapsed(name).removesuffix("s")} & tables:
+            return {"name": name, "certain": False}
+    words = re.findall(r"[a-z0-9]+", own.lower())
+    for first, second, third in zip(words, words[1:], words[2:]):
+        pair = first + second.removesuffix("s")
+        if (
+            pair in tables
+            and len(third) > 2
+            and third not in _CARD_NOISE
+            and third not in _NOT_A_NOUN
+            and pair + third.removesuffix("s") not in tables
+        ):
+            return {"name": f"{first} {second} {third}", "certain": False}
+    return None
 
 
 def _distinct_options(draft: ClarificationDraft) -> bool:
@@ -438,6 +558,7 @@ def enforce_policy(
     duplicate: bool = False,
     reading: Optional[Reading] = None,
     entity_candidates: Optional[Sequence[dict]] = None,
+    known_objects: Optional[Collection[str]] = None,
 ) -> AgentDecision:
     """Downgrade a decision the clarification policy will not allow.
 
@@ -457,6 +578,9 @@ def enforce_policy(
     single most damaging failure this feature has: asking "over what period?"
     about a request whose second word is "today". A model can be told not to do
     that, and mostly will not; a regex over the sentence means it CANNOT.
+
+    `known_objects` are the tables the synced copy holds: a card about something it
+    does not hold only delays "could not find".
     """
     if decision.action != "ASK_CLARIFICATION":
         return decision
@@ -466,17 +590,19 @@ def enforce_policy(
         return decision.model_copy(update={"action": "EXECUTE_SALESFORCE"})
 
     if duplicate:
-        return _answer_instead(decision, draft, "duplicate_submission")
+        return _answer_instead(decision, draft, "duplicate_submission", taken=best_reading(draft))
 
     if intent.rounds_used >= settings.salesforce_max_clarification_rounds:
-        return _answer_instead(decision, draft, "clarification_budget_spent")
+        return _answer_instead(
+            decision, draft, "clarification_budget_spent", taken=best_reading(draft)
+        )
 
     from .models import fingerprint
 
     if intent.already_asked(fingerprint(draft.slot, draft.question)) or (
         draft.slot in intent.asked_slots()
     ):
-        return _answer_instead(decision, draft, "question_already_asked")
+        return _answer_instead(decision, draft, "question_already_asked", taken=best_reading(draft))
 
     # The user already told us. Answering their own words back at them is the
     # behaviour that makes a clarifying assistant feel like a form to fill in.
@@ -484,6 +610,35 @@ def enforce_policy(
         return _answer_instead(decision, draft, "slot_already_resolved")
     if reading is not None and draft.slot in reading.satisfied:
         return _answer_instead(decision, draft, "answered_by_the_request")
+
+    missing = _missing_object(decision, draft, reading.text if reading else "", known_objects)
+    if missing is not None:
+        # In words the SQL writer takes as "not here" only when it is a real name.
+        return _answer_instead(
+            decision,
+            draft,
+            "object_not_synced",
+            assumption=(
+                f"{missing['name']} is not in the synced copy."
+                if missing["certain"]
+                else f"Asked no card about {missing['name']}: it matches no synced table."
+            ),
+        )
+
+    # 14 of 40 questions got a card, plain counts among them, with 'Today' as the
+    # first option. No period given means every date; the answer says so itself
+    # (engines/sql.py `_no_date_line`), from the statement that ran.
+    if reading is not None and draft.slot == "date_range":
+        return _answer_instead(
+            decision,
+            draft,
+            "no_period_given",
+            assumption="No date range was given, so this covers all dates.",
+        )
+
+    stated = _option_the_request_states(draft, reading)
+    if stated is not None:
+        return _answer_instead(decision, draft, "answered_by_the_request", taken=stated)
 
     # "Which record did you mean?" is the ONE question whose options are claims
     # about data. Asked "show mocks for John" with no live connection, the
@@ -500,7 +655,7 @@ def enforce_policy(
         # Fewer than two DISTINGUISHABLE options is not a choice. Rather than
         # showing a card that cannot be answered, answer and say what was
         # assumed.
-        return _answer_instead(decision, draft, "insufficient_options")
+        return _answer_instead(decision, draft, "insufficient_options", taken=best_reading(draft))
     return decision
 
 

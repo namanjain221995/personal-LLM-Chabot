@@ -8,6 +8,10 @@ points, because **this repository is not a bare chatbot** — two of the four
 phases are substantially built already, and building them again per the
 letter of the brief would regress working functionality.
 
+> **Corrected 2026-11-04.** Live Salesforce was removed: every answer reads the
+> warehouse and only the sync worker talks to the org. The lines below that named
+> the live path are corrected; the file:line citations are still 2026-08-19's.
+
 ---
 
 ## 1. Component map
@@ -43,7 +47,6 @@ flowchart LR
     UI --> PROXY --> CHAT --> ENG
     ENG --> VMAIN & VROUTER & VEMBED & VOCR
     ENG --> DUCK & LANCE & PG
-    ENG -->|live SOQL| SF
     BRAIN --> ENG
     UP --> WS
     SYNC --> SF
@@ -86,7 +89,7 @@ every mission commit lands on green.
 ## 2. Request lifecycle (`POST /chat`)
 
 1. Frontend `startStream` (streams.ts:349-383) POSTs
-   `{messages, session_id, conversation_id, mode, sf_live, model, effort,
+   `{messages, session_id, conversation_id, mode, model, effort,
    agent, web_search, image/images, pdf, clarification}` to `/api/chat`,
    proxied verbatim to the orchestrator (`ChatRequest`, main.py:224-260).
 2. Pre-route gates (main.py:478-871): auto-orchestration classifier
@@ -94,7 +97,7 @@ every mission commit lands on green.
    context injection, compaction, Salesforce Intelligence Mode
    (sf_intel.run — may clarify or resolve the request).
 3. Dispatch chain (main.py:873-991): document → vision → repo → url → agent →
-   search → dataset → assistant-chat → sf_live → LangGraph router graph
+   search → dataset → assistant-chat → LangGraph router graph
    (router.py picks sql | rag | vision | report | chat).
 4. Engines call vLLM through `app/llm.py` (OpenAI-compatible client);
    `stream_chat_events` yields `("reasoning", …)` / `("token", …)` pairs
@@ -178,9 +181,9 @@ agent.py:42-45 (per-effort budget dicts), chat.py:66-105 and llm.py:93-130
 
 Exists: a LangGraph PLAN → EXECUTE → SYNTHESIZE pipeline (agent.py:741-750)
 — one pydantic-validated plan (≤8 steps of kinds
-`sql|rag|llm|web|salesforce`), parallel execution (semaphore 3), synthesis;
+`sql|rag|llm|web`), parallel execution (semaphore 3), synthesis;
 `step` SSE events render in AgentTimeline. Salesforce is already first-class
-(sql/salesforce/rag step kinds hit the warehouse + live org). OpenAI
+(sql/rag step kinds read the warehouse). OpenAI
 `tool_calls` are used only by the sf_intel planner as a single forced call
 (planner.py:218-231); `llm.chat_with_tools` (llm.py:414-451) already parses
 tool_calls against the server-side `qwen3_xml` parser.

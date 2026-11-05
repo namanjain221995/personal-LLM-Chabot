@@ -2,6 +2,13 @@
 
 *Added 2026-08-11.*
 
+> **⚠ Superseded in part (2026-11-04).** Live Salesforce was removed: every answer
+> reads the warehouse and only the sync worker talks to the org. Resolving a
+> reference, the one clarifying question and resuming the request still work as
+> described here. The EXECUTE branch, the plan compiler, pagination and describes
+> below need the live connection and no longer run: the resolved request goes to
+> the warehouse SQL engine instead. Those sections are a snapshot of the older code.
+
 The Salesforce pill used to be a retrieval filter: "answer from my data" versus
 "answer from the model". It is now a context-aware agent that resolves a request
 against the conversation before it queries anything, asks **one** targeted
@@ -216,6 +223,19 @@ New `meta` keys, all additive: `clarification`, `salesforce_sources`,
 `salesforce_mode`. `meta.chart` is unchanged. The legacy `meta.clarify` is still
 emitted when the feature is off and still renders on every conversation
 persisted before this existed.
+
+Every answer now reads the warehouse, so the SQL and agent engines write these
+from the statement that ran. `salesforce_sources.source` is `synced`,
+`query_timestamp` is when the copy was published, `record_count` is absent for a
+result of figures, and the key is absent rather than empty when no object is
+known. `assumptions` holds only what the statement shows, and carries
+`assumptions_applied`, which is what tells it from an older answer's list of what
+the planner assumed: that older list stays off the screen. What the planner
+assumes on a hand-back reaches the writer instead, in the line below the question.
+
+The question reaches the writer with up to two lines below it. `(Clarified: ...)`
+is what the person chose on a card and binds the statement. `(Assumed: ...)` is a
+slot filled in for them, used only where the question leaves the point open.
 
 ### The processing indicator
 

@@ -278,7 +278,8 @@ def test_run_agent_engine_end_to_end_offline(monkeypatch):
 
     answer = asyncio.run(run_agent_engine("analyze", [], emit, effort="medium"))
 
-    assert answer == "Final answer."
+    assert answer.startswith("Final answer.")
+    assert answer.endswith("Source: the synced Salesforce copy, not a live query.")
     kinds = [e for e, _ in events]
     assert kinds.count("meta") == 1  # §10: exactly one meta
     assert kinds[-1] == "meta"  # after the token stream
@@ -302,7 +303,7 @@ def test_every_agent_prompt_carries_the_identity_rule():
     from app.engines.agent import _PLAN_SYSTEM, _STEP_LLM_SYSTEM, _SYNTH_SYSTEM
 
     # The planner must not plan a code-writing step for a data ask…
-    assert "MUST be a sql or salesforce step" in _PLAN_SYSTEM
+    assert "MUST be a sql step" in _PLAN_SYSTEM
     assert "executes queries itself" in _PLAN_SYSTEM
     # …an llm step that gets one anyway must not answer with runnable code…
     assert "NEVER answer a request for data" in _STEP_LLM_SYSTEM

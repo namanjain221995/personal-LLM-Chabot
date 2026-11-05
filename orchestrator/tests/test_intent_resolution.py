@@ -451,8 +451,8 @@ class TestContinuation:
         _no_engines(monkeypatch)
         _plan(
             monkeypatch,
-            _ask_about("metric", "Interviews or candidates?",
-                       options=("Count of interviews", "Count of candidates")),
+            _ask_about("metric", "Rounds or candidates?",
+                       options=("Count of rounds", "Count of candidates")),
         )
         original = "How many advanced mock interviews are scheduled today?"
         with TestClient(app) as client:
@@ -463,7 +463,7 @@ class TestContinuation:
             _plan(monkeypatch, AgentDecision(action="EXECUTE_SALESFORCE"), seen=seen)
             events = _post(
                 client,
-                "Count of interviews",
+                "Count of rounds",
                 clarification={
                     "clarification_id": card["clarification_id"],
                     "conversation_id": CONV,
@@ -481,7 +481,7 @@ class TestContinuation:
         assert seen, "the planner ran for the continuation"
         planned = seen[-1]["user_text"]
         assert "advanced mock interviews" in planned
-        assert "Count of interviews" in planned
+        assert "Count of rounds" in planned
         assert "(Clarified:" in planned
         # No second card, and nothing left pending.
         assert _card(events) is None

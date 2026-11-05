@@ -1,11 +1,10 @@
 """What this org MEANS, as opposed to what it is called.
 
 `sf_dictionary` answers "what is the API name for the thing the user said".
-That is necessary and not sufficient. A model can know `Interview__c` exists,
-know `Interview_Outcome__c` is a picklist, know `Ghosted` is one of its values
-— and still answer "how many interviews did we run" with 33,147 when the true
-answer is 26,904, because 5,566 of those rows are Initial Calls and 673 have no
-record type at all.
+That is necessary and not sufficient. A model can know `Account` exists, know
+`Candidate_Status__c` is a picklist, know `Active` is one of its values — and
+still answer "how many active candidates" nearly double, because recruiters are
+person accounts too and each carries a candidate status.
 
 The difference between those two numbers is not vocabulary. It is domain
 knowledge, and there is nowhere in the pipeline it can be derived from. So it
@@ -15,7 +14,7 @@ lives here, in three parts:
                     plausible query wrong. Small, and injected on every
                     data question.
   SQL_HARD_RULES  — DuckDB/warehouse mechanics appended to the SQL system
-                    prompt. Chiefly: EVERY column in the warehouse is VARCHAR.
+                    prompt. Chiefly: trust the types the schema shows.
   METRICS         — the semantic layer. Canonical definitions for the
                     business's real measures, injected only when a question
                     matches one, so that "ghosting rate" means the same thing
@@ -57,6 +56,31 @@ The five things almost every question is really about:
 Recruiter__c is labelled "Employees" and is the internal staff object — a
 trainer, interviewer or support person is a Recruiter__c, not a User."""
 
+#: Which record type an interview count keeps. Owner fact, default chosen
+#: 2026-11-05: this file used to say "filter to record type 'Interview'" while
+#: brain/packs/kb-external-interviews.yaml says "NEVER filter interviews by
+#: record-type NAME", both in one prompt, and the model obeyed this file. A
+#: genuine Completed/Final interview can be filed under 'Initial Call', and the
+#: hand-checked records_golden.json counts follow the pack. "" follows the pack.
+#: To go back to the old rule, set this one line to "Interview".
+INTERVIEW_COUNT_RECORD_TYPE = ""
+
+_INTERVIEW_SCOPE_RULE = (
+    f"""\
+- Interview__c mixes 'Interview' with 'Initial Call' (and a few 'B2B
+  Interviews'). Unless the question asks for initial calls, filter to record
+  type '{INTERVIEW_COUNT_RECORD_TYPE}'. Some rows have no record type — say so rather than
+  silently dropping or including them."""
+    if INTERVIEW_COUNT_RECORD_TYPE
+    else """\
+- Interview__c mixes 'Interview' with 'Initial Call' (and a few 'B2B
+  Interviews'). An interview count covers ALL of them, rows with no record type
+  included: NEVER filter interviews by record-type name (rt.Name = 'Interview').
+  A genuine Completed/Final interview can be filed under 'Initial Call', so that
+  filter silently drops it. Filter on the record type only when the question
+  itself asks for initial calls or B2B interviews."""
+)
+
 #: The traps. Each one is a query that looks right and returns a wrong number,
 #: so each is stated as the rule that prevents it.
 ORG_RULES = """\
@@ -69,10 +93,7 @@ Rules that decide whether the number is right:
   IsPersonAccount = 'true' nearly doubles the active-candidate count.
   The candidate filter is always:
     JOIN RecordType rt ON a.RecordTypeId = rt.Id WHERE rt.Name = 'Person Account'
-- Interview__c mixes 'Interview' with 'Initial Call' (and a few 'B2B
-  Interviews'). Unless the question asks for initial calls, filter to record
-  type 'Interview'. Some rows have no record type — say so rather than
-  silently dropping or including them.
+""" + _INTERVIEW_SCOPE_RULE + """
 - Interview_Outcome__c is empty on roughly half of all interviews (they are
   scheduled, cancelled or simply not dispositioned). Any rate computed from it
   must state its denominator: outcome-known interviews, not all interviews.
@@ -99,7 +120,10 @@ Rules that decide whether the number is right:
   Name ILIKE '%bodakuntla%' finds them. Match the most distinctive token,
   usually the surname:  WHERE a.Name ILIKE '%<surname>%'
   If that still finds nobody, say no candidate matches that name — never
-  report their records as absent, and never fall back to a text search."""
+  report their records as absent, and never fall back to a text search.
+- Who an employee reports to is Recruiter__c.Assigned_Sr_Recruiter__c, a lookup
+  back to Recruiter__c: join it and show that row's Name. Manager__c is filled
+  on only a few rows and is not the reports-to field."""
 
 #: The business runs on IST; the container clock is UTC, so between 18:30 and
 #: midnight IST `CURRENT_DATE` is YESTERDAY to the user. Asked for "today",
@@ -119,32 +143,57 @@ LIST_NOT_COUNT = """\
   identifying fields — the person's name, the status, the date — one row per
   record, and never a bare COUNT. Add a total alongside only when the question
   also asks how many.
-- BUT only the first 30 rows reach the stage that writes the answer. When a
+- Never add a LIMIT unless the question asks for a top N, a latest one or a
+  fixed number of rows. A LIMIT nobody asked for cuts the list, and the cut then
+  reads as the total.
+- BUT at most the first 120 rows reach the stage that writes the answer. When a
   question is about ONE person or ONE thing and the child records run to
   hundreds, do NOT return them raw — aggregate to one row per meaningful
   grouping (per enrolment, per status, per month) with counts. A profile query
-  that returns 227 rows gets summarised from the first 30 of them, which
+  that returns 227 rows gets summarised from the first 120 of them, which
   silently reports one enrolment's worth of history as if it were all of it."""
 
 #: Appended to the SQL system prompt. The casting rule is first because it is
 #: the only one on this list whose absence produces a WRONG ANSWER rather than
 #: an error, and it fires on the most common question shape there is.
+#:
+#: The warehouse's views are typed (sync-worker/syncworker/views.py), so "every
+#: column is VARCHAR" stopped being true and the schema's own types contradicted
+#: it. `Scheduled_Minutes__c != ''` on a BIGINT answers
+#:   Conversion Error: Could not convert string '' to INT64
+#: and that rule is what wrote it.
 SQL_HARD_RULES = """\
-- EVERY column in this warehouse is VARCHAR — amounts, dates, counts, all of
-  it. You MUST cast before any arithmetic, comparison or sort:
+- Trust the column types the schema shows. DATE, TIMESTAMP, BIGINT, DECIMAL and
+  BOOLEAN columns compare, sort and add up as they are, and they never hold '':
+  test them with IS NOT NULL, never with != ''.
+- A column the schema shows as VARCHAR is text, whatever it holds. You MUST cast
+  it before any arithmetic, comparison or sort:
     * numbers: TRY_CAST(col AS DOUBLE)
     * dates:   TRY_CAST(col AS DATE)      datetimes: TRY_CAST(col AS TIMESTAMP)
-  ORDER BY on an uncast amount sorts it as TEXT, so '999' beats '27000' and
+  ORDER BY on an uncast text amount sorts it as TEXT, so '999' beats '27000' and
   your "top 10 by value" is wrong without erroring. Always
-  ORDER BY TRY_CAST(col AS DOUBLE) DESC. Use TRY_CAST, never CAST: one
+  ORDER BY TRY_CAST(col AS DOUBLE) DESC on those. Use TRY_CAST, never CAST: one
   unparseable value would abort the whole query.
-- Aggregates need the same cast: SUM(TRY_CAST(Invoice_Amount__c AS DOUBLE)),
-  and round money to 2 decimals.
-- Salesforce checkbox columns land as the lowercase TEXT 'true' / 'false'.
-  Compare as text: WHERE IsPersonAccount = 'true'. Never = True, 1 or 'True'.
+- Aggregates over a text column need the same cast:
+  SUM(TRY_CAST(Invoice_Amount__c AS DOUBLE)), and round money to 2 decimals.
+- A checkbox the schema shows as BOOLEAN compares as WHERE IsPersonAccount = true.
+  One it shows as VARCHAR holds the lowercase TEXT 'true' / 'false'.
 - To group by month use
-  date_trunc('month', TRY_CAST(<date col> AS DATE)) and order by it, not by
-  a formatted string.
+  date_trunc('month', <date col>) and order by it, not by a formatted string.
+- DuckDB has NO TO_CHAR and NO TO_VARCHAR. To format a date write
+  strftime(<date col>, '%Y-%m').
+- != and NOT IN also drop every row where the column is NULL: Status__c != 'Paid'
+  silently loses the rows with no status. When those rows belong in the answer,
+  write Status__c IS DISTINCT FROM 'Paid'.
+- A GROUP BY keeps its blank bucket. On a VARCHAR column show it as
+  COALESCE(col, '(blank)'). On any other type, a date_trunc() included, a text
+  label fails as soon as one NULL row reaches it: label it
+  COALESCE(CAST(col AS VARCHAR), '(blank)') under a new alias, and write
+  GROUP BY col ORDER BY col, never GROUP BY 1 ORDER BY 1, because the label sorts
+  as text. For months: COALESCE(strftime(date_trunc('month', col), '%Y-%m'), '(blank)')
+  AS month ... GROUP BY date_trunc('month', col) ORDER BY date_trunc('month', col).
+  Do not filter it out with col IS NOT NULL unless the question asks for
+  filled-in values only.
 - A Salesforce lookup is OPTIONAL on almost every record. Use LEFT JOIN for any
   table you are adding only to show a name; an INNER JOIN silently deletes every
   row whose lookup is empty. Measured: "sessions for the interview readiness
@@ -158,6 +207,8 @@ SQL_HARD_RULES = """\
   which programme, slot or trainer it means. Common ones:
     Candidate__c / Client_Account__c  -> Account.Name
     Program__c                        -> Program__c.Name
+    Department__c                     -> Department__c.Name
+    Assigned_Sr_Recruiter__c          -> Recruiter__c.Name
     Program_Version__c                -> Program_Version__c.Name
     Cohort__c                         -> Cohort__c.Name   (the "Slot NNN")
     Interview_Type__c                 -> Interview_Type__c.Name
@@ -178,8 +229,8 @@ SQL_HARD_RULES = """\
 #: rather than mechanics — the query already ran, and the remaining ways to be
 #: wrong are all about what the answer claims.
 ANSWER_RULES = """\
-- State the population you counted whenever it is not obvious: interviews
-  excluding initial calls, candidates rather than all Accounts, outcome-known
+- State the population you counted whenever it is not obvious: which interview
+  record types a count covers, candidates rather than all Accounts, outcome-known
   interviews rather than all of them. A number without its population invites
   the reader to assume the wrong one.
 - Zero rows and no process are different answers. If a table is essentially
@@ -197,6 +248,9 @@ ANSWER_RULES = """\
 - Never repeat credentials or personal identifiers even when a row contains
   them — passwords, portal credentials, SSN digits, passport or bank numbers.
   Say the field exists and that you will not read it out.
+- A person's work e-mail, phone or Slack id is not one of those. When the
+  question asks for it by name and the row holds it, give it plainly, with no
+  refusal wording: never say you cannot display it and then print it.
 - If the question could mean two different objects (a client-facing interview
   or an internal assessment; a recruiter Account or a Recruiter__c employee),
   answer the more likely one and say which you used in one short clause.
@@ -219,12 +273,24 @@ METRICS: List[Dict[str, Any]] = [
         "aliases": ["interview", "interviews", "interview count", "interviews run",
                     "how many interviews", "interview volume"],
         "table": "Interview__c",
-        "definition": "Client-facing interviews, excluding initial calls.",
-        "sql": ("SELECT count(*) FROM Interview__c i JOIN RecordType rt "
-                "ON i.RecordTypeId = rt.Id WHERE rt.Name = 'Interview'"),
         "date_column": "Date_of_Interview__c",
         "chart": "line over month, bar when broken down by a category",
-        "caveat": "Excludes 'Initial Call' record types; state that you did.",
+        **(
+            {
+                "definition": "Client-facing interviews, excluding initial calls.",
+                "sql": ("SELECT count(*) FROM Interview__c i JOIN RecordType rt "
+                        "ON i.RecordTypeId = rt.Id "
+                        f"WHERE rt.Name = '{INTERVIEW_COUNT_RECORD_TYPE}'"),
+                "caveat": "Excludes 'Initial Call' record types; state that you did.",
+            }
+            if INTERVIEW_COUNT_RECORD_TYPE
+            else {
+                "definition": "Every Interview__c row, all record types.",
+                "sql": "SELECT count(*) FROM Interview__c",
+                "caveat": ("Covers every record type, initial calls included; "
+                           "state that it does."),
+            }
+        ),
     },
     {
         "name": "initial calls",
@@ -236,7 +302,10 @@ METRICS: List[Dict[str, Any]] = [
                 "ON i.RecordTypeId = rt.Id WHERE rt.Name = 'Initial Call'"),
         "date_column": "Date_of_Interview__c",
         "chart": "line over month",
-        "caveat": "Never add these to the interview count unless asked for both.",
+        "caveat": ("Never add these to the interview count unless asked for both."
+                   if INTERVIEW_COUNT_RECORD_TYPE
+                   else "These rows are inside the plain interview count; say so "
+                        "when both figures appear."),
     },
     {
         "name": "ghosting rate",
@@ -470,7 +539,7 @@ METRICS: List[Dict[str, Any]] = [
                    "SEVERAL (dropped, retrained, current) — this one has five — "
                    "so list them all and say which is current; reporting the "
                    "first is a wrong answer. Do NOT return the raw modules and "
-                   "deliverables: that is hundreds of rows, of which only 30 "
+                   "deliverables: that is hundreds of rows, of which only 120 "
                    "reach the answer, and the summary then describes one "
                    "enrolment as though it were the whole history. Drill into "
                    "day-by-day detail only if asked for a named enrolment."),
@@ -840,7 +909,7 @@ The definitions above are written as warehouse SQL. Over the live API:
 - There is no JOIN. Traverse the relationship instead: a lookup Foo__c is
   reached as Foo__r. So `JOIN Interview_Type__c it ON ii.Interview_Type__c =
   it.Id WHERE it.Name = 'OOT'` becomes `WHERE Interview_Type__r.Name = 'OOT'`,
-  and the record-type filters become RecordType.Name = 'Interview' or
+  and the record-type filters become RecordType.Name = 'Initial Call' or
   RecordType.Name = 'Person Account'.
 - Do NOT cast. TRY_CAST is warehouse-only; Salesforce returns real dates,
   numbers and booleans. Checkboxes are true/false unquoted.
@@ -1033,6 +1102,7 @@ TABLE_ALIASES: Dict[str, Sequence[str]] = {
     "host": ("Session__c", "Recruiter__c"),
     "hosted": ("Session__c", "Recruiter__c"),
     "employee": ("Recruiter__c",),
+    "department": ("Department__c",),
     "recruiter": ("Recruiter__c",),
     "supporter": ("Recruiter__c",),
     # The word the questions actually use. Every OTHER way of saying "a member
@@ -1085,11 +1155,14 @@ TABLE_ALIASES: Dict[str, Sequence[str]] = {
 }
 
 
-def tables_for(question: str) -> List[str]:
+def tables_for(question: str, packs: bool = True) -> List[str]:
     """Tables this question needs pinned into the schema prompt.
 
     Two sources: the tables a matched metric's own SQL joins, and the tables
-    the org's spoken vocabulary maps to.
+    the org's spoken vocabulary maps to. Then, unless `packs` is off, the tables
+    a triggered brain pack pins. Those are generous: one trigger word ("QMS
+    escalation rules" hits a pack on "escalation") pins Case, which is the right
+    grounding but no evidence that Case is what the person asked about.
     """
     seen: List[str] = []
 
@@ -1105,6 +1178,8 @@ def tables_for(question: str) -> List[str]:
         if _stem(word) in words:
             for name in tables:
                 add(name)
+    if not packs:
+        return seen
     from . import brain
 
     for name in brain.tables_for(question):

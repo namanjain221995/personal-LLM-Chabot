@@ -1,5 +1,11 @@
 # Security model
 
+> **⚠ Superseded in part (2026-11-04).** Live Salesforce was removed: every answer
+> reads the warehouse, `core/salesforce.py` refuses every call and only the sync
+> worker talks to the org. Every description below of `fetch_live`, live SOQL, the
+> Live toggle, `sf_live` or `SF_LIVE_*` is a snapshot of the older code and has NOT
+> been re-derived. See [`README.md` §12](../../README.md#12-salesforce-sync-and-warehouse).
+
 > **⚠ Superseded in part (2026-08-10).** The app-state layer described below was
 > `/data/app.sqlite3` (stdlib `sqlite3`). It is now PostgreSQL — see
 > [`data-model.md`](data-model.md) and the CHANGELOG entry
@@ -226,6 +232,18 @@ The comment at `engines/sql.py:119-122` shows this was deliberate and understood
 read_csv/read_blob/glob/httpfs table functions would otherwise let a guard-approved SELECT read
 arbitrary host files or reach the network. With this config DuckDB raises PermissionException for
 every such function."
+
+**Closed by the warehouse-only change (2026-11).** `guard_sql` now refuses `$` and `E'...'` outright,
+so the first construct that could put `_scan` out of step with DuckDB is seen before anything it could
+hide. `core/sql_tree.py` reads every statement with `json_serialize_sql` before it runs: exactly one
+statement, table functions only from a short allow-list, no `SHOW_REF` or `PIVOT` node, and table names
+for the credential mask from the tree rather than from a regex. The mask is built on the cursor that runs
+the statement, so its column list and the rows come from one file. Every table read is shadowed: a held
+column reads as a marker, and every other text column but `Id` reads with the by-value rules already
+applied, so no string function sees a secret inside a link or a note. A link or URL column can only be shown,
+counted or tested for being filled. Encoders, `BLOB`/`BIT` casts, server functions, `raw.` reads and any
+expression class the walker does not know are refused, and so is every statement on a DuckDB outside the
+1.5 line whose trees this reads. The text below records the state before.
 
 **Residual risk, stated precisely.** `SEC-07` is **not currently exploitable**. It is not a
 vulnerability today; it is a **single point of failure**. The whole safety argument for model-authored

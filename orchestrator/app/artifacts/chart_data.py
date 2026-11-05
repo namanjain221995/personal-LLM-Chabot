@@ -832,6 +832,8 @@ def compute(chart: CS.Chart, table: Any, *, deadline: Optional[float] = None) ->
     sentence to show instead of the chart."""
     if chart.data is None:
         raise ChartDataError("This chart has no data binding.")
+    if _table_attr(table, "partial", ""):
+        raise ChartDataError("This chart was left out: its table holds only part of the result, so its figures would be wrong.")
     b = chart.data
     t = chart.type
     roles, notes = _resolve_columns(b, table, t)

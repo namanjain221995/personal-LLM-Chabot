@@ -313,7 +313,7 @@ def test_the_request_fields_the_lane_reads_exist_on_the_real_chat_request():
     req = ChatRequest(message="hello", mode="assistant", effort="fast")
     for name in (
         "text", "effort", "mode", "pdf_data", "pdf_uploads", "video_uploads", "image_data",
-        "agent", "deep_research", "web_search", "sf_live", "clarification",
+        "agent", "deep_research", "web_search", "clarification",
     ):
         assert hasattr(req, name), name
     assert fast_lane.decide(req, text=req.text, history=[], now_year=2026).entered

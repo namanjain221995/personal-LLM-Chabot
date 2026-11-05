@@ -268,12 +268,13 @@ Two different questions, deliberately two different mechanisms:
 | **Feature** | may this account *use* — web search, Salesforce, file uploads? | `authn/features.py`, a property of the PERSON |
 
 An admin may want the whole workspace on the synced Salesforce copy but only
-two analysts allowed to query the live org, and that has nothing to do with
+two analysts allowed to search the web, and that has nothing to do with
 who can invite people.
 
-**The five tools**: photos/files/datasets, web search, deep research,
-Salesforce, live Salesforce. Deep research needs web search; live Salesforce
-needs Salesforce — a dependency that cannot dangle in either direction.
+**The tools**: photos/files/datasets, voice input, video understanding,
+documents/decks/workbooks, web search, deep research, Salesforce. Deep research
+needs web search; video understanding needs file uploads — a dependency that
+cannot dangle in either direction.
 
 **Resolution**, each layer overriding the one before:
 

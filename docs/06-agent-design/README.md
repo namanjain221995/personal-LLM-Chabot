@@ -66,9 +66,8 @@ A rule in the wrong layer is decoration.
 3. **Short.** A paragraph, optionally three or four bullets. A user who wants
    depth asks for a report.
 4. **Never name internals.** No "DuckDB", "warehouse", "vLLM", "the model",
-   "SOQL", "the prompt", "RecordTypeId". Say "the synced Salesforce copy" or
-   "live from Salesforce". Field names are fine when the user asked in field
-   terms.
+   "SOQL", "the prompt", "RecordTypeId". Say "the synced Salesforce copy". Field
+   names are fine when the user asked in field terms.
 5. **Never announce work in progress.** No "let me check", "querying now".
    The stream either has the answer or an honest failure.
 
@@ -231,8 +230,8 @@ shape but there are only a handful of records; §5.6 governs the answer.
 
 ### 4.7 Non-data routes
 
-- **Schema questions** ("what fields does Interview have?") → the live describe
-  path in `engines/sql.py`, not SQL.
+- **Schema questions** ("what fields does Interview have?") → the warehouse's
+  own catalogue in `engines/sql.py`, not SQL.
 - **Content questions** ("what did the client say in feedback?") → `rag`.
 - **Reports** → §7.
 - **Chat** → greetings and identity. Answer in one line, offer an example
@@ -300,12 +299,11 @@ silently, and never claim a value is invalid because the metadata omits it.
 **Required:** "that process isn't populated yet", not "the placement rate is
 50%". A rate over two rows is noise presented as fact.
 
-### 5.7 Synced vs live
-The warehouse lags up to 30 minutes. A "Live Salesforce" toggle bypasses it.
+### 5.7 Synced, never live
+The warehouse lags by one sync pass, and nothing bypasses it: Live Salesforce was
+removed on 2026-11-04.
 
 **Required:** name the source in every answer. Never call a synced figure live.
-When live fails, say so — never fall back silently to synced numbers while
-still claiming live.
 
 ### 5.8 Sample vs total
 The narrative stage sees 30 rows of up to 500.
@@ -508,7 +506,6 @@ into all three:
 | `engines/sql.py` | router says `sql` | `grounding_for()` + `SQL_HARD_RULES` + `ANSWER_RULES` |
 | `engines/report.py` | router says `report` | `report_template_for()` in the planner |
 | `engines/agent.py` | **agent toggle on — before the router** | `report_template_for()` in `make_plan`, and its `sql` steps reuse `engines/sql.py` |
-| `engines/live_sf.py` | warehouse locked, or Live toggle | `grounding_for(dialect="soql")` |
 
 **Implemented**
 
@@ -516,8 +513,7 @@ into all three:
   mechanics, L4 answer rules, domain rules, **2 report templates**.
 - `sf_dictionary` — org-schema.json loader, enrich-only merge, plural stemming,
   shadow/setup-object filtering.
-- `schema_cache` — lock wait, so a locked warehouse no longer diverts traffic
-  to live Salesforce.
+- `schema_cache` — lock wait, so a locked warehouse waits instead of failing.
 - `chart_decision` — "dashboard" and "graphical view" count as chart requests.
 - **988 tests passing.**
 

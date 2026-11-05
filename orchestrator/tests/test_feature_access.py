@@ -43,10 +43,7 @@ def test_layers_override_in_order():
 
 
 def test_a_dependency_cannot_dangle():
-    """Live Salesforce without Salesforce, or deep research without the web,
-    would be a toggle that cannot do anything."""
-    resolved = fa.resolve(role="member", workspace_defaults={"salesforce": False})
-    assert resolved["salesforce_live"] is False
+    """Deep research without the web would be a toggle that cannot do anything."""
     resolved = fa.resolve(role="member", member_overrides={"web_search": False})
     assert resolved["deep_research"] is False
 
@@ -58,6 +55,14 @@ def test_a_super_admin_cannot_be_locked_out():
         member_overrides={key: False for key in fa.IDS},
     )
     assert all(resolved.values())
+
+
+def test_the_live_salesforce_switch_stays_gone():
+    """The admin page draws its switches from this registry, with no filter of
+    its own, so a row here would be a switch that does nothing."""
+    assert "salesforce_live" not in fa.IDS
+    assert "salesforce_live" not in [spec["id"] for spec in fa.catalog()]
+    assert not hasattr(fa.Feature, "SALESFORCE_LIVE")
 
 
 def test_unknown_and_non_boolean_keys_are_dropped_not_stored():
@@ -78,11 +83,10 @@ def test_the_gate_downgrades_every_blocked_tool_and_names_them():
         mode="salesforce",
         web_search="on",
         deep_research=True,
-        sf_live=True,
     )
     assert gate.mode == "assistant"
     assert gate.web_search == "off"
-    assert gate.deep_research is False and gate.sf_live is False
+    assert gate.deep_research is False
     assert gate.changed
     notice = fa.blocked_notice(gate.blocked)
     assert "Salesforce" in notice and "Web search" in notice
@@ -95,22 +99,8 @@ def test_auto_search_is_blocked_too_not_just_a_forced_one():
         mode="assistant",
         web_search="auto",
         deep_research=False,
-        sf_live=False,
     )
     assert gate.web_search == "off" and gate.blocked
-
-
-def test_live_salesforce_alone_can_be_removed_leaving_the_synced_copy():
-    gate = fa.enforce_chat(
-        fa.resolve(role="member", workspace_defaults={"salesforce_live": False}),
-        mode="salesforce",
-        web_search="off",
-        deep_research=False,
-        sf_live=True,
-    )
-    assert gate.mode == "salesforce"  # the synced copy still works
-    assert gate.sf_live is False
-    assert gate.blocked == ("Live Salesforce",)
 
 
 def test_a_full_access_turn_is_untouched_and_says_nothing():
@@ -119,7 +109,6 @@ def test_a_full_access_turn_is_untouched_and_says_nothing():
         mode="salesforce",
         web_search="on",
         deep_research=True,
-        sf_live=True,
     )
     assert not gate.changed and fa.blocked_notice(gate.blocked) == ""
 
@@ -141,8 +130,6 @@ def test_admin_sets_workspace_defaults_and_a_member_override(login_client):
     resp = root.put("/admin/api/access", json={"features": {"salesforce": False}})
     assert resp.status_code == 200, resp.text
     assert resp.json()["resolved"]["salesforce"] is False
-    # The dependency follows the parent down.
-    assert resp.json()["resolved"]["salesforce_live"] is False
 
     member = root.get(f"/admin/api/members/{bid}/access").json()
     assert member["resolved"]["salesforce"] is False

@@ -8,6 +8,7 @@ LaTeX) in REPORTS_DIR → meta.report_files.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -20,13 +21,30 @@ from ..core.report_render import (ReportRenderError, run_pandoc_to_file,
                                   sanitise_for_render)
 from .. import llm
 from ..config import settings
+from ..continuity import LeaseLost, QueuedForRecovery
 from ..core.chart_pipeline import build_chart
 from ..core.charts_png import PNG_SUPPORTED, render_chart_png
 from ..core.citations import build_citations
 from ..core.exports import slugify
+from ..core.schema_cache import schema_cache
 from .rag import _answer_messages as rag_answer_messages
 from .rag import select_context
-from .sql import _ask_chart_model, generate_and_run_sql
+from .sql import (
+    _ask_chart_model,
+    _counted_line,
+    _left_out_line,
+    _limit_total,
+    _literal_misses,
+    _note_a_cut,
+    _note_an_empty_table,
+    _nothing_shown_line,
+    count_every_row,
+    deterministic_summary,
+    failure_reason,
+    generate_and_run_sql,
+    is_aggregate,
+    zero_rows_prefix,
+)
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
@@ -87,7 +105,7 @@ def _parse_plan(raw: str, fallback_title: str) -> dict:
     return {"title": title, "sections": sections[:MAX_SECTIONS]}
 
 
-def _markdown_table(columns: Sequence[str], rows: Sequence[Sequence], max_rows: int = 20) -> str:
+def _markdown_table(columns: Sequence[str], rows: Sequence[Sequence], max_rows: int = 20, total=None) -> str:
     if not columns:
         return "_No data._"
     header = "| " + " | ".join(str(c) for c in columns) + " |"
@@ -96,7 +114,12 @@ def _markdown_table(columns: Sequence[str], rows: Sequence[Sequence], max_rows: 
         "| " + " | ".join("" if v is None else str(v) for v in row) + " |"
         for row in rows[:max_rows]
     ]
-    note = f"\n\n_Showing first {max_rows} of {len(rows)} rows._" if len(rows) > max_rows else ""
+    shown = min(len(rows), max_rows)
+    if total == -1:
+        note = f"\n\n_Showing first {shown} rows of a larger result; the total could not be counted._"
+    else:
+        whole = len(rows) if total is None else total
+        note = f"\n\n_Showing first {shown} of {whole} rows._" if whole > shown else ""
     return "\n".join([header, divider, *body]) + note
 
 
@@ -126,17 +149,50 @@ async def _sql_section(
     sec: dict, index: int, tmp_dir: Path, request: str = ""
 ) -> List[str]:
     parts: List[str] = []
-    sql, columns, rows = await generate_and_run_sql(
+    result = await generate_and_run_sql(
         sec["instruction"],
-        fetch_cap=settings.sql_preview_row_cap + 1,
+        # The summary cap, as on the direct route: the figures cover what is fetched.
+        fetch_cap=settings.sql_summary_row_cap + 1,
         # Same reason as the agent route: a section instruction is the
         # PLANNER's wording, so the user's own nouns and names — which is what
         # the brain packs, the table aliases and the person lookup key on —
         # are absent by the time this SQL is written.
         grounding_question=request,
     )
+    sql, columns, rows = result
+    left_out = getattr(result, "left_out", None) or {}
+    # The section's own words: one "most" in the whole request says nothing about this cut.
+    total = await asyncio.to_thread(_limit_total, sql, rows, sec["instruction"])
+    if len(rows) > settings.sql_summary_row_cap:
+        rows = rows[: settings.sql_summary_row_cap]
+        total = await asyncio.to_thread(count_every_row, sql)
+    if rows and not columns:
+        # Held back is not empty, and rows of nothing only invite prose about them.
+        return [_nothing_shown_line(sql, rows, left_out, total), ""]
+    try:
+        schema = await asyncio.to_thread(schema_cache.get, settings.duckdb_path)
+    except Exception:  # noqa: BLE001 — the lines below can read the statement alone
+        schema = {}
+    computed = deterministic_summary(columns, rows, aggregated=is_aggregate(sql), statement=sql)
+    await asyncio.to_thread(_note_an_empty_table, computed, sql, schema)
+    if total is not None:
+        _note_a_cut(computed, sql, len(rows), total)
+    zero = zero_rows_prefix(computed).strip()
+    if zero:
+        zero = " ".join([zero, *await asyncio.to_thread(_literal_misses, sql, schema)])
+    counted = _counted_line(sql, schema)
     sample = json.dumps(
         {"columns": columns, "rows": [list(r) for r in rows[:30]]}, default=str
+    )
+    told = "\n".join(
+        line
+        for line in (
+            zero,
+            f"What the query read, exactly as it ran: {counted}" if counted else "",
+            "Computed figures (AUTHORITATIVE, calculated in code over every row fetched; quote these, "
+            f"never count the sample): {json.dumps(computed, default=str)[:3000]}",
+        )
+        if line
     )
     prose = await llm.chat_completion(
         [
@@ -147,12 +203,21 @@ async def _sql_section(
                     "result. Use only numbers present in the data."
                 ),
             },
-            {"role": "user", "content": f"Section: {sec['title']}\nResult: {sample}"},
+            {"role": "user", "content": f"Section: {sec['title']}\nResult: {sample}\n{told}"},
         ],
         temperature=0.2,
         max_tokens=3000,
     )
-    parts += [prose.strip(), "", _markdown_table(columns, rows), ""]
+    # Written here, as on the direct route: a report travels without its chat.
+    if zero:
+        parts += [zero, ""]
+    parts += [prose.strip(), ""]
+    if rows:
+        parts += [_markdown_table(columns, rows, total=total), ""]
+    if counted:
+        parts += [counted, ""]
+    if _left_out_line(left_out):
+        parts += [f"_{_left_out_line(left_out)}_", ""]
 
     if sec.get("chart") and columns and rows:
         parts += await _section_chart(sec, index, tmp_dir, columns, rows)
@@ -260,9 +325,12 @@ async def run_report_engine(message: str, history: Sequence[dict], emit: Emit) -
                     md_lines += await _sql_section(sec, index, tmp_dir, message)
                 else:
                     md_lines += await _rag_section(sec)
+            except (QueuedForRecovery, LeaseLost):
+                raise  # parked for the main model: no report is made of what did not run
             except Exception as exc:  # keep the report going; note the failure
-                section_errors.append(f"{sec['title']}: {exc}")
-                md_lines += [f"> Section could not be generated: {exc}", ""]
+                reason = failure_reason(exc)
+                section_errors.append(f"{sec['title']}: {reason}")
+                md_lines += [f"> Section could not be generated: {reason}", ""]
 
         md_path = tmp_dir / f"{base_name}.md"
         md_path.write_text("\n".join(md_lines), encoding="utf-8")

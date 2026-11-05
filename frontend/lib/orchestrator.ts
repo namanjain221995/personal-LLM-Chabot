@@ -33,7 +33,7 @@ export interface ChatRequestBody {
   /** Phase 1: web search mode. */
   web_search?: string;
   deep_research?: boolean;
-  /** 2026-08-06: Live Salesforce toggle — query the org, not the copy. */
+  /** Always false, and the server ignores it: Live Salesforce was removed. */
   sf_live?: boolean;
   /** 2026-08-05: all attached images (max MAX_IMAGES); `image` stays the first one. */
   images?: string[];

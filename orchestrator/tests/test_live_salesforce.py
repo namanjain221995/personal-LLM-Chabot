@@ -1,9 +1,9 @@
-"""Live, read-only Salesforce lookups — the guard and the merge.
+"""What is left of the live Salesforce path — the guard and the merge.
 
-The warehouse is a snapshot; this path goes and looks. That means
-model-generated SOQL reaching a PRODUCTION org, so the guard gets the same
-scrutiny as the DuckDB one, and the merge has to show a record found in both
-places exactly once.
+No call reaches the org any more (owner order 2026-11-04; the refusal itself is
+in test_warehouse_only.py). These helpers stay until the dead code is deleted,
+so the guard keeps the same scrutiny as the DuckDB one, and the merge has to
+show a record found in both places exactly once.
 """
 import pytest
 
@@ -141,20 +141,13 @@ def test_api_bookkeeping_is_stripped_from_live_rows():
 # ---------------------------------------------------------------------------
 
 
-def test_live_lookups_are_off_without_credentials(monkeypatch):
+def test_live_lookups_stay_off_whatever_the_credentials_say(monkeypatch):
     from app.config import settings
 
-    monkeypatch.setattr(settings, "sf_client_id", "")
+    monkeypatch.setattr(settings, "sf_client_id", "cid", raising=False)
+    monkeypatch.setattr(settings, "sf_login_url", "https://x.my.salesforce.com", raising=False)
+    monkeypatch.setattr(settings, "sf_client_secret", "shhh", raising=False)
     assert sf.configured() is False
-
-
-def test_live_lookups_are_on_with_the_client_credentials_grant(monkeypatch):
-    from app.config import settings
-
-    monkeypatch.setattr(settings, "sf_client_id", "cid")
-    monkeypatch.setattr(settings, "sf_login_url", "https://x.my.salesforce.com")
-    monkeypatch.setattr(settings, "sf_client_secret", "shhh")
-    assert sf.configured() is True
 
 
 # ---------------------------------------------------------------------------
@@ -172,13 +165,6 @@ def test_the_agent_can_plan_a_live_salesforce_step():
     assert plan.steps[0].kind == "salesforce"
 
 
-def test_the_planner_is_told_when_to_go_live():
-    from app.engines import agent
-
-    assert '"salesforce"' in agent._PLAN_SYSTEM
-    assert "stale" in agent._PLAN_SYSTEM
-
-
 def test_turning_salesforce_off_downgrades_a_live_step():
     """Assistant mode must not reach the org — the toggle is the boundary."""
     from app.engines import agent
@@ -186,39 +172,6 @@ def test_turning_salesforce_off_downgrades_a_live_step():
     plan = agent.AgentPlan(steps=[
         agent.PlanStep(id=1, title="s", kind="salesforce", input="x")])
     assert agent._coerce_no_salesforce(plan).steps[0].kind == "llm"
-
-
-def test_a_live_step_returns_rows_and_the_query_it_ran(monkeypatch):
-    import asyncio
-
-    from app.engines import agent, live_sf
-
-    async def fake_fetch(question, history=()):
-        return ("SELECT Id, Subject FROM Case LIMIT 200",
-                [{"Id": "500x", "Subject": "Printer on fire"}])
-
-    monkeypatch.setattr(live_sf, "fetch_live", fake_fetch)
-    step = agent.PlanStep(id=1, title="Live", kind="salesforce", input="today's cases")
-    output, detail, meta = asyncio.run(agent._run_step_impl(step, [], True))
-    assert "Printer on fire" in output
-    assert meta["sql"].startswith("SELECT Id, Subject FROM Case")
-    assert "1 live record" in detail
-
-
-def test_a_live_step_degrades_instead_of_failing_the_plan(monkeypatch):
-    """Salesforce being unreachable must not lose the rest of the plan."""
-    import asyncio
-
-    from app.core.salesforce import SalesforceUnavailable
-    from app.engines import agent, live_sf
-
-    async def boom(question, history=()):
-        raise SalesforceUnavailable("org unreachable")
-
-    monkeypatch.setattr(live_sf, "fetch_live", boom)
-    step = agent.PlanStep(id=1, title="Live", kind="salesforce", input="x")
-    output, detail, meta = asyncio.run(agent._run_step_impl(step, [], True))
-    assert "unavailable" in output.lower() and meta == {}
 
 
 # ---------------------------------------------------------------------------
@@ -309,42 +262,23 @@ def test_describe_object_rejects_an_injected_name():
         asyncio.run(sf.describe_object("Account/../../limits"))
 
 
-def test_the_sql_engine_routes_schema_questions_to_describe():
+def test_the_sql_engine_routes_schema_questions_to_the_warehouse_catalogue():
     import inspect
 
     from app.engines.sql import run_sql_engine
 
+    from app.engines.sql import asks_the_catalogue
+
     src = inspect.getsource(run_sql_engine)
-    assert "is_schema_question(message)" in src
-    assert "fetch_schema" in src
+    assert "asks_the_catalogue(message, reason.statement)" in src
+    assert "is_schema_question(own_words(message))" in inspect.getsource(asks_the_catalogue)
+    assert "asyncio.to_thread(_catalogue_line, message)" in src
+    assert "fetch_schema" not in src
 
 
 # ---------------------------------------------------------------------------
-# Asking for live data explicitly, and never lying about the source
+# Never lying about the source
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("q", [
-    "Check the live Salesforce org directly: does Dev Panchal exist?",
-    "give me the latest from salesforce right now",
-    "is that up to date in salesforce?",
-])
-def test_asking_for_live_data_is_honoured(q):
-    """The warehouse is the default for speed, but "check Salesforce directly"
-    is an instruction, not a hint."""
-    from app.engines.sql import wants_live_lookup
-
-    assert wants_live_lookup(q) is True
-
-
-@pytest.mark.parametrize("q", [
-    "how many opportunities are closed won",
-    "does Dev Panchal exist? yes or no",
-])
-def test_ordinary_questions_still_use_the_fast_local_copy(q):
-    from app.engines.sql import wants_live_lookup
-
-    assert wants_live_lookup(q) is False
 
 
 def test_the_warehouse_narrative_must_not_claim_to_be_live():
@@ -355,15 +289,6 @@ def test_the_warehouse_narrative_must_not_claim_to_be_live():
     system = _narrative_messages("q", ["Id"], [[1]], [])[0]["content"]
     assert "LOCAL SYNCED COPY" in system
     assert "Never say the result is live" in system
-
-
-def test_the_sql_engine_routes_an_explicit_live_request_away_from_duckdb():
-    import inspect
-
-    from app.engines.sql import run_sql_engine
-
-    src = inspect.getsource(run_sql_engine)
-    assert "wants_live_lookup(message)" in src
 
 
 def test_object_hint_reads_the_real_schema_cache(monkeypatch):
@@ -392,46 +317,6 @@ def test_object_hint_stays_quiet_when_the_warehouse_is_missing(monkeypatch):
 
     monkeypatch.setattr(mod.schema_cache, "get", boom)
     assert mod._object_hint() == ""
-
-
-def test_count_query_returns_totalsize_as_a_row(monkeypatch):
-    """SELECT COUNT() answers via totalSize with EMPTY records; run_soql used
-    to return [] and every live count question looked like 'no data'.
-    Found live 2026-08-06 against the production org."""
-    import asyncio
-
-    import httpx
-
-    from app.core import salesforce as sf
-
-    async def fake_auth():
-        return "tok", "https://example.my.salesforce.com"
-
-    class FakeResponse:
-        status_code = 200
-
-        @staticmethod
-        def json():
-            return {"totalSize": 138, "done": True, "records": []}
-
-    class FakeClient:
-        def __init__(self, *a, **k):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
-
-        async def get(self, *a, **k):
-            return FakeResponse()
-
-    monkeypatch.setattr(sf, "_authenticate", fake_auth)
-    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
-
-    soql, rows = asyncio.run(sf.run_soql("SELECT COUNT() FROM Account"))
-    assert rows == [{"count": 138}]
 
 
 def test_guard_never_adds_limit_to_a_non_grouped_aggregate():

@@ -15,8 +15,7 @@ export type ComposerMenuItemId =
   | 'files'
   | 'web-search'
   | 'deep-research'
-  | 'salesforce'
-  | 'sf-live';
+  | 'salesforce';
 
 export interface ComposerMenuItem {
   id: ComposerMenuItemId;
@@ -41,12 +40,11 @@ export const MENU_ITEM_FEATURE: Record<ComposerMenuItemId, string> = {
   'web-search': 'web_search',
   'deep-research': 'deep_research',
   salesforce: 'salesforce',
-  'sf-live': 'salesforce_live',
 };
 
 export interface ComposerMenuState {
   salesforce: boolean;
-  /** Live Salesforce sub-toggle (only shown while salesforce is on). */
+  /** Always false: Live Salesforce was removed (lib/prefs.ts). */
   sfLive: boolean;
   /** True when the user forced search on (prefs.webSearch === 'on'). */
   webSearchOn: boolean;
@@ -86,9 +84,6 @@ export function prefsForFeatures(
   let next = prefs;
   if (!featureOn(features, 'salesforce') && next.salesforce) {
     next = { ...next, salesforce: false, sfLive: false };
-  }
-  if (!featureOn(features, 'salesforce_live') && next.sfLive) {
-    next = { ...next, sfLive: false };
   }
   if (!featureOn(features, 'web_search') && next.webSearch === 'on') {
     next = { ...next, webSearch: 'auto' };
@@ -153,18 +148,6 @@ export function composerMenuItems(
       hint: 'Answer from your synced Salesforce data · turns web search off',
       checked: state.salesforce,
     },
-    {
-      id: 'sf-live',
-      label: 'Live Salesforce',
-      hint: state.salesforce
-        ? state.sfLive
-          ? 'Every answer queries Salesforce directly — freshest data, any object'
-          : 'Query Salesforce directly instead of the synced copy'
-        : // One click from any mode: this both enters Salesforce mode and
-          // goes live — the hint promises exactly that.
-          'Query your Salesforce org directly · turns Salesforce on',
-      checked: state.salesforce && state.sfLive,
-    },
   ];
   return rows.filter((row) =>
     featureOn(state.features, MENU_ITEM_FEATURE[row.id]),
@@ -210,8 +193,8 @@ export function activateComposerMenuItem(
     }
     case 'web-search':
       if (prefs.salesforce) {
-        // Mode switch, as the row's hint promised: leave Salesforce (and its
-        // live sub-toggle) and force the web on — one click, no dead ends.
+        // Mode switch, as the row's hint promised: leave Salesforce and force
+        // the web on — one click, no dead ends.
         return {
           kind: 'prefs',
           prefs: { ...prefs, salesforce: false, sfLive: false, webSearch: 'on' },
@@ -235,37 +218,11 @@ export function activateComposerMenuItem(
           // Research would be invisible AND un-runnable — the same trap the
           // forced-web reset below exists for.
           deepResearch: next ? false : prefs.deepResearch,
-          // Live Salesforce cannot outlive its parent toggle: a lingering
-          // true would silently go live the next time Salesforce turns on
-          // (the same trap sanitize() guards).
           sfLive: next ? prefs.sfLive : false,
           webSearch: next && prefs.webSearch === 'on' ? 'auto' : prefs.webSearch,
         },
       };
     }
-    case 'sf-live':
-      if (!prefs.salesforce) {
-        // One click from any mode: enter Salesforce mode AND go live. The
-        // forced web search drops with it — Salesforce mode never searches.
-        return {
-          kind: 'prefs',
-          prefs: {
-            ...prefs,
-            salesforce: true,
-            sfLive: true,
-            webSearch: prefs.webSearch === 'on' ? 'auto' : prefs.webSearch,
-            // Deep Research drops with the forced web search, and for the
-            // same reason: Salesforce mode never touches the web, so leaving
-            // it armed strands it behind a gate that can never run it — and
-            // its own menu row would then appear to no-op on the next click.
-            deepResearch: false,
-          },
-        };
-      }
-      return {
-        kind: 'prefs',
-        prefs: { ...prefs, sfLive: !prefs.sfLive },
-      };
     case 'files':
       return { kind: 'pick-files' };
   }
@@ -298,12 +255,6 @@ export function nextEnabledIndex(
  * web_search=="on", so "nothing leaves this machine" always holds there.
  */
 export function trustLine(prefs: ChatPrefs): string {
-  if (prefs.salesforce && prefs.sfLive) {
-    // Live queries DO leave this machine — they go to the user's own
-    // Salesforce org over the read-only API. Say so; "nothing leaves this
-    // machine" would be a lie with this toggle on.
-    return 'Answers come straight from your live Salesforce org (read-only) · no web search.';
-  }
   if (prefs.salesforce) {
     return 'Answers come from your synced Salesforce data · no web search · nothing leaves this machine.';
   }

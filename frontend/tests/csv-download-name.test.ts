@@ -6,7 +6,7 @@
  * file held the preview rather than the result the table was captioned with.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { csvFilenameFor, rowsToCsv } from '@/lib/csv';
 import type { Meta } from '@/lib/types';
 
@@ -58,6 +58,29 @@ describe('csvFilenameFor', () => {
   it('survives a timestamp it cannot parse', () => {
     const meta = at('not a date');
     expect(csvFilenameFor(meta)).toBe('interview.csv');
+  });
+
+  describe('a synced answer', () => {
+    afterEach(() => vi.useRealTimers());
+
+    const synced = (): Meta => ({
+      route: 'sql',
+      salesforce_sources: {
+        source: 'synced',
+        objects: ['Interview__c'],
+        query_timestamp: '2020-03-04T05:06:00+00:00',
+      } as Meta['salesforce_sources'],
+    });
+
+    it('is not stamped with the snapshot, which many questions share', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(2026, 10, 5, 14, 30));
+      const first = csvFilenameFor(synced());
+      vi.setSystemTime(new Date(2026, 10, 5, 14, 32));
+      const second = csvFilenameFor(synced());
+      expect(first).toBe('interview-2026-11-05-1430.csv');
+      expect(second).toBe('interview-2026-11-05-1432.csv');
+    });
   });
 
   it('always ends in .csv', () => {

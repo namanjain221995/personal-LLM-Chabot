@@ -179,7 +179,8 @@ def test_an_unsupported_request_says_so_instead_of_guessing(monkeypatch):
 
 # ── Asking ───────────────────────────────────────────────────────────────────
 
-def _ask_decision(slot="date_range", question="Which period should I use?"):
+def _ask_decision(slot="filter", question="Which period should I use?"):
+    # "filter": a date_range card is not shown at all when no period was given.
     return AgentDecision(
         action="ASK_CLARIFICATION",
         normalized_intent="pipeline",
@@ -360,7 +361,9 @@ def test_a_double_click_cannot_produce_a_NEW_question(monkeypatch):
     )
     assert "clarification" not in second.meta()
     assert "clarifying" not in second.phases()
-    assert outcome.meta_extras.get("assumptions"), "say what was assumed instead"
+    assert outcome.assumptions, "say what was assumed instead"
+    assert "(Assumed: status: This month (THIS_MONTH)" in outcome.resolved_text, "and the writer reads it"
+    assert "assumptions" not in outcome.meta_extras, "the screen states only what ran"
 
 
 def test_a_response_naming_a_clarification_we_never_issued_is_ignored(monkeypatch):
@@ -422,7 +425,7 @@ def test_the_same_question_is_downgraded_to_an_assumption_not_asked_again():
         root_user_message_id="m1",
         original_user_text="show my pipeline",
     )
-    decision = _ask_decision()
+    decision = _ask_decision(slot="date_range")
     from app.core.sf_intel.models import ClarificationRound, fingerprint
 
     intent.clarification_history.append(

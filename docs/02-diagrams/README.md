@@ -1,5 +1,10 @@
 # Diagram Suite — 24 diagrams
 
+> **⚠ Superseded in part (2026-11-04).** Live Salesforce was removed: every answer
+> reads the warehouse and only the sync worker talks to the org. Diagrams 01, 02, 03,
+> 09, 10, 15 and 20 still draw the live path (`live_sf`, live SOQL, `sf_live`). They
+> are snapshots of the older code and have not been redrawn.
+
 All 24 sources are in [`src/`](src/), rendered to SVG **and** PNG in [`render/`](render/).
 Every source passes `plantuml -checkonly`, and every diagram is **100% standalone** — you can paste any one of
 them into draw.io with no other file.

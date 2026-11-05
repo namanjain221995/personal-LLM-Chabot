@@ -85,11 +85,17 @@ def apply_export_cap(rows: Sequence, cap: int = EXPORT_ROW_CAP) -> Tuple[list, b
     return cap_rows(rows, cap)
 
 
+#: What XML cannot hold, the same as artifacts/spec.py. One such character anywhere
+#: cost the whole export and the answer with it. openpyxl's own pattern misses
+#: U+FFFE and U+FFFF, which then fail at save and leave a file that will not open.
+_XML_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+
+
 def _cell_value(value: object) -> object:
     """Coerce values openpyxl cannot store natively (dict/list/...) to str."""
-    if value is None or isinstance(value, (int, float, str, bool)):
+    if value is None or isinstance(value, (int, float, bool)):
         return value
-    return str(value)
+    return _XML_ILLEGAL.sub("", value if isinstance(value, str) else str(value))
 
 
 # Excel refuses a sheet name over 31 characters or containing []:*?/\\ .
@@ -107,7 +113,7 @@ def _write_sheet(ws, columns: Sequence[str], rows: Sequence[Sequence]) -> None:
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
 
-    ws.append([str(c) for c in columns])
+    ws.append([_cell_value(str(c)) for c in columns])
     bold = Font(bold=True)
     for cell in ws[1]:
         cell.font = bold
@@ -184,7 +190,11 @@ def export_xlsx(
     ws = wb.active
     ws.title = "Data"
     _write_sheet(ws, columns, rows)
-    wb.save(path)
+    try:
+        wb.save(path)
+    except Exception:
+        path.unlink(missing_ok=True)  # a part of a file opens as nothing
+        raise
     return path, truncated
 
 

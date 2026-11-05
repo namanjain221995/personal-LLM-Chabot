@@ -280,7 +280,7 @@ def test_the_answer_completes_when_the_chart_model_raises(warehouse, monkeypatch
         lambda emit: sql_engine.run_sql_engine("chart this", [], emit)
     )
     kinds = [e for e, _ in events]
-    assert answer == "Three stages."
+    assert answer.startswith("Three stages.")
     assert "token" in kinds
     assert kinds.count("meta") == 1
     meta = metas(events)[0]
