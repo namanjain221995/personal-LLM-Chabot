@@ -51,9 +51,15 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from typing import Any, Callable
 
 MODES = ("merged", "records", "knowledge")
+#: The follow-up rewrite (``agent/followup.py``) read the question as unclear: the page and the ask service say this.
+UNCLEAR_LINE = "I could not tell what this refers to. Please ask the full question, with the name or object."
+#: The follow-up rewrite failed (its model call raised): the typed words are not answered as a fragment.
+REWRITE_FAILED_LINE = ("The question could not be read together with the earlier questions this time. Please ask the "
+                       "full question.")
 REOPEN_RETRY_S = 60.0          # a failed open on the same file is tried again after this long
 TRANSCRIPT_MAX = 60_000        # characters of captured stdout kept for the admin panel
 #: the packages whose every module is imported at start-up (:func:`preload_package`)
@@ -66,6 +72,41 @@ NOT_WIRED: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------- answer text
+
+def read_as_line(rewritten: str) -> str:
+    """``Read as: <the rewritten question>``, for a person to catch a wrong reading. It shows text the model wrote, so
+    it gets the contact rule of an answer (the question does not ask: no address, no phone number) and stands in a code
+    span with no backtick and no format character: nothing in it links, which backslash escapes do not give (GFM links a
+    bare ``https:\\//`` after they are read). Shared by the page and the ask service."""
+    from sf_assistant.engine.contact import asks_for_contact, drop_contact_details
+
+    text = rewritten if asks_for_contact(rewritten) else drop_contact_details(rewritten)[0]
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf" and ch != "`")
+    return f"Read as: `{text}`"
+
+
+def _typed_may_run(question: str) -> bool:
+    """The typed question is complete on its own, so the page may answer it as typed when the follow-up rewrite failed
+    or reworded it: ``agent.followup``'s own rules, its strict one (``_stands_alone``) or its kinder one for the typed
+    text (``_complete`` and no fragment). Page only: the ask service keeps its refusal."""
+    from sf_assistant.agent.followup import _complete, _fragment, _stands_alone
+
+    try:
+        return bool(_stands_alone(question) or (_complete(question) and not _fragment(question)))
+    except Exception:  # noqa: BLE001 - when in doubt, the refusal as before
+        return False
+
+
+def turns_problem(turns: Any) -> str | None:
+    """What is wrong with the shape of ``recent_turns`` (a list of ``{role, content}`` strings), in fixed words; None
+    when nothing is. A role other than user or assistant and the sizes are no fault: ``agent/followup.py`` drops and
+    cuts them. Shared by the page (``POST /api/ask``) and the ask service."""
+    if not isinstance(turns, list) or not all(isinstance(t, dict) and set(t) == {"role", "content"}
+                                              and isinstance(t["role"], str) and isinstance(t["content"], str)
+                                              for t in turns):
+        return "recent_turns must be a list of {role, content}"
+    return None
+
 
 def is_source_line(line: str) -> bool:
     """A "Source: ..." line in any bullet or bold form (the same rule as sf_assistant.agent.checks._is_source_line)."""
@@ -527,6 +568,51 @@ class Pipeline:
             self._refresh_status()
             return self._shape(question, mode, row, stdout, session, retried, reopen, retry_s, failed_reopen)
 
+    def answer_followup(self, question: str, turns: Any, mode: str = "merged") -> dict:
+        """:meth:`answer` after the follow-up rewrite of the ask service (``agent.followup.rewrite``, the same rules):
+        with no usable earlier turn the typed question goes to :meth:`answer` unchanged and nothing else differs. A
+        rewritten question is answered and the answer starts with its Read-as line (:func:`read_as_line`); an unclear
+        one gets :data:`UNCLEAR_LINE` and a failed rewrite :data:`REWRITE_FAILED_LINE`, kind none, with no other model
+        call. A question complete on its own (:func:`_typed_may_run`) is answered as typed when the rewrite call failed
+        or the model reworded it (``standalone_changed``): only it could have come back (review of 2026-11-16: the page
+        refused complete questions on a busy model); ``log["rewrite"]["answered"]`` is then "typed". The model's own
+        UNCLEAR stays a refusal. ``log["rewrite"]`` says what the rewrite did (status, reason, ``seconds`` of the
+        rewrite call; the question used only when it changed)."""
+        from sf_assistant.agent.followup import FAILED, UNCLEAR, rewrite, usable_turns
+
+        if not usable_turns(turns):
+            return self.answer(question, mode)
+        t0 = time.perf_counter()
+        step = rewrite(question, turns, self.llm)
+        info = {"status": step.status, "reason": step.reason, "seconds": round(time.perf_counter() - t0, 2)}
+        if ((step.status == FAILED or (step.status == UNCLEAR and step.reason == "standalone_changed"))
+                and _typed_may_run(question)):
+            if step.error:
+                info["error"] = step.error
+            info["answered"] = "typed"
+            out = self.answer(question, mode)
+            out.setdefault("log", {})["rewrite"] = info
+            if isinstance(out.get("trace"), dict):
+                out["trace"]["rewrite"] = dict(info)
+            return out
+        if step.status in (FAILED, UNCLEAR):
+            if step.status == UNCLEAR and step.reply:
+                info["reply"] = step.reply
+            if step.error:
+                info["error"] = step.error
+            text = UNCLEAR_LINE if step.status == UNCLEAR else REWRITE_FAILED_LINE
+            return {"answer": text, "kind": "none", "source_line": None, "data_ts": None,
+                    "trace": {"mode": mode, "rewrite": dict(info), "queries": [], "timings": {}},
+                    "log": {"rewrite": info}}
+        out = self.answer(step.question, mode)
+        if step.question != question:
+            info["question_used"] = step.question
+            out["answer"] = read_as_line(step.question) + "\n\n" + str(out.get("answer") or "")
+        out.setdefault("log", {})["rewrite"] = info
+        if isinstance(out.get("trace"), dict):
+            out["trace"]["rewrite"] = dict(info)
+        return out
+
     def _records_off(self, question: str) -> dict:
         text = "Record data is not available right now. Ask again in a few minutes, or ask with records and knowledge."
         return {"answer": text, "kind": "none", "source_line": None, "data_ts": None,
@@ -578,7 +664,7 @@ class Pipeline:
         log = {"summary": {k: row.get(k) for k in ("answer", "records", "rq", "audit", "ktools", "rtools", "error",
                                                      "record_error")},
                "jsonl": jl, "retried_after_swap": retried, "status_line": self._status.get("status_line")}
-        if reopen:   # page seconds = reopen.s + retry_s + jsonl.seconds + failed_reopen.s + the hand-off (latency logging)
+        if reopen:   # page seconds = rewrite.seconds + reopen.s + retry_s + jsonl.seconds + failed_reopen.s + hand-off
             log["reopen"] = reopen
         if retry_s is not None:
             log["retry_s"] = retry_s

@@ -203,7 +203,8 @@ def print_outcome(o: Outcome, session, verbose: bool, max_rows: int = LIMITS.max
     elif rec.no_records:
         status_line = ("-- records: not needed for this question" if not rec.error else
                        f"-- records: no answer from the records ({rec.error})"
-                       + ("" if records_only else "; knowledge answer shown"))
+                       + ("" if records_only else "; the answer says the figures could not be computed"
+                          if kind == "none" else "; knowledge answer shown"))
     elif records_only:
         status_line = f"-- answer from the record agent only: {used} record {_quer(used)} ({rec.seconds:.1f} s)"
     elif m is not None and m.merged:

@@ -128,11 +128,17 @@ _COUNT_PAIRS = frozenset({("how", "many"), ("how", "much")})
 #: ask, "and Delta Person?" and "how many for Delta Person?" not
 _ASK_WORDS = frozenset("who whom what whats which kaun is are was were do does did".split())
 #: "that person", "those candidates", "the second one", "that status", "have that status", "of those joined", a last
-#: "it", or a first Hinglish "us" ("us recruiter ka email?"): never "this month", "candidates that joined", "for those
-#: who joined", "does it take", "show us the interviews"
+#: "it", a measure of the earlier question ("this placement rate", "that number", "this chart"), or a first Hinglish
+#: "us" ("us recruiter ka email?"): never "this month", "this year total", "candidates that joined", "for those who
+#: joined", "does it take", "show us the interviews"
+#: "this placement rate", "that number", "these charts": one word may stand between, but no period word
+_POINTED_MEASURE = (r"(?:that|this|those|these)\s+(?:(?!(?:day|week|month|quarter|year)s?(?![^\W_]))[^\W\d_]+\s+)?"
+                    r"(?:rate|ratio|percentage|percent|number|count|total|average|figure|metric|measure|trend|graph"
+                    r"|chart|plot|breakdown|data)s?(?![^\W_])")
 _POINTED_RE = re.compile(r"(?<![^\W_])(?:(?:that|this|those|these)\s+(?:person|people|one|ones|guy|man|woman|lady"
                          r"|recruiter|candidate|employee|client|company|account|record|interview|application|lead"
                          r"|contact|manager|trainer|member|job|status|stage|value|team|department)s?(?![^\W_])"
+                         r"|" + _POINTED_MEASURE +
                          r"|(?:first|second|third|fourth|fifth|last|other)\s+ones?(?![^\W_])"
                          r"|the\s+(?:former|latter)(?![^\W_])|(?:it|that|this|those|these)\W*$"
                          r"|(?:have|has|had|with|for|of|on|in|at|from|to|by)\s+(?:that|those|these)\s+"
@@ -179,6 +185,11 @@ _ALL_TIME_RE = re.compile(r"(?<![^\W_])(?:so\s+far|in\s+total|total|overall|all\
                           r"|currently|right\s+now|at\s+the\s+moment|as\s+of\s+(?:now|today)|ab\s+tak|abhi|kul"
                           r"|(?:by|per|each|every)\s+(?:day|week|month|quarter|year)"
                           r"|daily|weekly|monthly|quarterly|yearly)(?![^\W_])", re.IGNORECASE)
+#: typed words that take over the measure or the chart of the earlier question, and so its period: "this placement
+#: rate", "plot it", "chart this", "and the placement rate?" (a rate behind a lead; never "and his number?")
+_MEASURE_POINTED_RE = re.compile(r"(?<![^\W_])" + _POINTED_MEASURE, re.IGNORECASE)
+_CHART_WORDS = frozenset("plot plots chart charts graph graphs visualise visualize draw".split())
+_RATE_WORDS = frozenset("rate rates ratio ratios percentage percentages percent".split())
 #: a reply that counts or lists: it runs over whatever period it says, and over all time when it says none
 _COUNT_OR_LIST_RE = re.compile(r"(?<![^\W_])(?:how\s+(?:many|much)|kitn[aie]|count|list)(?![^\W_])", re.IGNORECASE)
 #: typed words that mean the very records of the earlier question, whatever the rewrite then asks of them
@@ -216,7 +227,7 @@ _TITLES = frozenset("mr mrs ms miss dr sir madam shri smt".split())
 _ROLE_WORDS = frozenset(_PERSON_FIELDS.split("|")) | frozenset("""candidate employee person user member client account
 contact lead head team department company staff admin director intern boss ceo cfo cto coo hr""".split())
 _RECORD_NOUNS = frozenset("""interview offer application job leave invoice call ticket report flow record opportunity
-task event case request batch meeting role position policy process""".split())
+task event case request batch meeting role position policy process placement""".split())
 _NOT_A_PERSON = (_NOT_A_NAME | _TITLES | _ROLE_WORDS | {f"{w}s" for w in _ROLE_WORDS | _RECORD_NOUNS} | _RECORD_NOUNS
                  | frozenset("""i people log logon logo mujhe hume humein status stage date joining notice period
 designation title type salary experience rating balance remark remarks detail skill skills reporting line direct senior
@@ -619,13 +630,19 @@ def _period_lost(question: str, reply: str, turns: list[dict]) -> bool:
     """A rewrite that goes on from the earlier question without its period: "and how many did she cancel?" after a
     question about last month, rewritten to "how many did Echo One cancel?". It would pass every other rule and answer
     with the count of all time. It goes on from that question when it counts or lists, or when what was typed means the
-    same records ("who approved them?") or only points ("same for Golf Vofir"). The earlier question is the last user
-    turn and the ``Read as:`` line of its answer, never the rest of the answer. A typed period, "so far" or "by month"
-    says otherwise, and a question about another subject is an echo, which never comes here. This costs one retype when
-    the period did not matter ("how many years has he been here?"), the price of no silently wrong number."""
+    same records ("who approved them?"), only points ("same for Golf Vofir"), or takes over its measure or its chart
+    ("this placement rate", "plot it", "and the placement rate?": :data:`_MEASURE_POINTED_RE`). The earlier question is
+    the last user turn and the ``Read as:`` line of its answer, never the rest of the answer. A typed period, "so far"
+    or "by month" says otherwise, and a question about another subject is an echo, which never comes here. This costs
+    one retype when the period did not matter ("how many years has he been here?"), the price of no silently wrong
+    number."""
     if _PERIOD_RE.search(question) or _ALL_TIME_RE.search(question):
         return False
-    if not (_COUNT_OR_LIST_RE.search(reply) or _SAME_RECORDS & set(_words(question)) or _no_topic(question)):
+    typed = _words(question)
+    takes_over = (bool(_MEASURE_POINTED_RE.search(question))
+                  or (bool(_CHART_WORDS & set(typed)) and _typed_pointer(question))
+                  or (bool(typed) and typed[0] in _FRAGMENT_LEADS and bool(_RATE_WORDS & set(typed))))
+    if not (_COUNT_OR_LIST_RE.search(reply) or _SAME_RECORDS & set(typed) or _no_topic(question) or takes_over):
         return False
     last_user = next((t["content"] for t in reversed(turns) if t["role"] == "user"), "")
     return not _periods(f"{last_user}\n{_lead(turns)[0]}") <= _periods(reply)
@@ -1007,8 +1024,14 @@ def _unbound(question: str, reply: str, turns: list[dict]) -> str:
     """Why ``reply`` may not stand for the typed ``question``, as a fixed word; "" when it may. The typed question and
     the user turns are trusted; an assistant turn holds record text, so at most one capitalised name of it may enter,
     as written in the lead of the last answer, and not when that lead holds several new names and nothing typed says
-    which."""
+    which. The service's own ``Read as:`` line of the last answer (:func:`_last_question`: it holds every typed word of
+    its user turn) is the question that ran, so its words but its capitalised ones count as typed by the user: "same for
+    2025" after "and the placement rate?", read as "what is the placement rate each month in 2026?", keeps "each
+    month". A name of that line still enters only as one name of the lead."""
     user = _user_text(turns)
+    ran, own_line = _last_question(turns)
+    if own_line:
+        user = f"{user}\n" + " ".join(w for w in _WORD_RE.findall(ran) if not w[:1].isupper())
     if any(unicodedata.category(ch) == "Cf" and ch not in question for ch in reply):
         return "format_char"
     have = {m.casefold() for m in _SCOPE_RE.findall(f"{question}\n{user}")}   # a typed "list" does not open "all"

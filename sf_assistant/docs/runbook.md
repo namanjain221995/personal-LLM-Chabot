@@ -138,6 +138,23 @@ one of this machine's) and add the firewall rules again for the new address.
   or a dropped connection does not lose it. Signing out drops a waiting question and the kept answer. A running
   question cannot be stopped; it ends and is logged.
 - At most 1000 characters per question.
+- **Follow-ups** (2026-11-16). The page sends its last two answered questions with their answers as `recent_turns`
+  (each cut to 1,500 characters, the oldest pair dropped while the request would pass 15,000 bytes). The worker then
+  runs `Pipeline.answer_followup`: the ask service's rewrite (`agent/followup.py`, the same rules), the answer to the
+  rewritten question with its `Read as:` line first, or the unclear line (`I could not tell what this refers to...`)
+  and no other model call. A question complete on its own is answered as typed when the rewrite call fails or the model
+  rewords it (`detail.rewrite.answered` = `typed`); the model's own UNCLEAR stays a refusal. With no earlier answer the
+  question goes to `Pipeline.answer` unchanged. A `recent_turns` of another shape gets 400. The web log's `ask` line
+  says how many turns came (`turns`) and its `detail.rewrite` what the rewrite did and how long its call took
+  (`seconds`).
+- **A failed record step says so** (2026-11-16). When the route call said RECORDS (or gave no reading because it
+  failed, and the record agent read records all the same) or a chart ask sent the question to the records, and the
+  record step failed or came back empty, the answer is `The figures for this question could not be computed this
+  time...` (kind `none`), never the knowledge answer in its place. The knowledge answer may follow, under `What the
+  knowledge files say (field meanings only, no record figures):` and without its own Source line, only when its first
+  paragraph names a custom object or custom field that a successful data call read (a `describe_fields` lookup or a
+  failed call does not count). A draft that the cleaners would cut to its Source line gets one more round first
+  (`RECORDS_FINAL_FORM_MESSAGE`), and an empty answer's raw text goes to the private log (`record_dropped_raw`).
 - **A timed-out question keeps running.** A Python thread cannot be stopped from outside, so after the 240 s
   timeout the question runs on until the pipeline returns, and it holds the lock until then. Each model call has its
   own timeout (120 s per attempt, up to 3 attempts), so it does end, but that can take several minutes. The admin
@@ -187,9 +204,10 @@ seconds from the start of the answer) and its seconds (`s`):
 
 The page also logs, on the ask that paid for them, `detail.reopen` = `{close_s, open_s, s}` when the records were
 reopened before it, `detail.retry_s` after a swap retry, and `detail.failed_reopen` = `{close_s, open_s, s}` when the
-reopen after a swap error failed; `records_reopened` and `records_open_failed` lines carry `close_seconds`. Page
-seconds = time in line (`queue_wait_s`, before) + `reopen.s` + `retry_s` + the answer's seconds + `failed_reopen.s` +
-the hand-off back to the page.
+reopen after a swap error failed; `records_reopened` and `records_open_failed` lines carry `close_seconds`. A question
+sent with earlier turns also logs `detail.rewrite.seconds`, the follow-up rewrite call. Page seconds = time in line
+(`queue_wait_s`, before) + `rewrite.seconds` + `reopen.s` + `retry_s` + the answer's seconds + `failed_reopen.s` + the
+hand-off back to the page.
 
 Read it with one command (no model call; it prints only numbers, stage and tool names, fixed words, UTC times and
 ticket numbers, so the output can be pasted):
@@ -1068,7 +1086,8 @@ With `SFA_CHARTS=on`, on the answer path:
   type and the title, draws one SVG in pure Python and checks it. A fault gives the `fault` line and leaves the answer
   whole. No timeline stage is added.
 - **The reason line.** An answer gets at most one, before the Source line, in the final text and not in `answer_body`.
-  The words are in `prompts/records_chart_words.md`. In order: `records_off`, `failed`, `no_data`, then the reason of
+  The words are in `prompts/records_chart_words.md`. In order: `records_off`, `failed`, `answer_failed` (the calls
+  worked, the record step gave no answer: pipeline.records_failed), `no_data`, then the reason of
   the last data result: `people`, `one_number`, `one_row`, `list`, `one_share`, `field_values`, `no_field_data` (a
   field the query filters on is blank on every record, so the data does not record this and no 0 is drawn), `all_zero`,
   `no_positive` (zeros beside nulls), `no_rows`, `no_rows_min` (no named group reaches the minimum asked for; a blank
@@ -1077,6 +1096,14 @@ With `SFA_CHARTS=on`, on the answer path:
   `top` ranking under a measure other than count has no named group: no record matches, or they all point to a record
   not in this copy, and the result cannot tell which), `no_values`, `too_many`, `hidden`, `same_labels`, `negative`,
   `dates`, `too_large` (also when a cut left no row), `fault`.
+- **A rate per period** (2026-11-16). `trend_records` with `part_filters` returns, per bucket, `part`, `base` and
+  `percent` (`value` = percent; a bucket with no base record has none, never 0%) and the window's `part_total`,
+  `base_total` and `percent_overall`, all in one call. Its chart is a line (or the bar asked for) of `Percent`, with the
+  part and base counts in the rows, the whole period in the subtitle and a note on the periods with no base record.
+  A question that asks for a rate, share or percentage (not a bill or pay rate) never gets counts over time drawn in
+  place of the rate (`trend_records` or `compare_records` with a count measure: `rate_counts`); a share by group (a
+  pie) and an average, sum, min or max of a field (a rate field among them) are drawn, and a single percentage keeps
+  its `one_share` line.
 
 What a chart holds:
 

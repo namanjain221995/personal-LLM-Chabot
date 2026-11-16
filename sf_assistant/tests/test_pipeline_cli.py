@@ -369,9 +369,14 @@ def test_a_failing_record_agent_after_a_records_route_shows_the_facts_block(fixt
     llm = Down([{"name": "count_records", "args": OFFER_ARGS}, RECORD_ANSWER], knowledge_answer=facts)
     out, row = _run(ask_cli, "How many interviews ended with an offer?", llm, RecordSession(fixture_tools, _cfg(), llm=llm))
     assert "merge" not in llm.roles and llm.roles.count("lean") == 2 and "knowledge" not in llm.roles
-    assert out.split("=" * 72 + "\n", 2)[2].startswith(facts + "\n")
-    assert "-- records: no answer from the records (RuntimeError: model down); knowledge answer shown" in out
-    assert row["answer"] == "knowledge" and row["records"] == "error" and row["jsonl"]["knowledge_mode"] == "lean"
+    # 2026-11-16: the failure is said plainly; the record step read no records, so the facts block does not follow
+    # (review of 2026-11-16: only the objects of good data calls keep a note)
+    from sf_assistant.pipeline import RECORDS_FAILED_ANSWER, RECORDS_FAILED_NOTE_LABEL
+    shown = out.split("=" * 72 + "\n", 2)[2]
+    assert shown.startswith(f"{RECORDS_FAILED_ANSWER}\n") and RECORDS_FAILED_NOTE_LABEL not in shown and facts not in shown
+    assert ("-- records: no answer from the records (RuntimeError: model down); the answer says the figures could "
+            "not be computed") in out
+    assert row["answer"] == "none" and row["records"] == "error" and row["jsonl"]["knowledge_mode"] == "lean"
     assert row["jsonl"]["record_error"] == "RuntimeError: model down"
 
 

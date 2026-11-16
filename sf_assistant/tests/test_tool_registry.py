@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
 
 import warehouse_fixture as F  # noqa: E402
+from prompt_changes import notebook_tools  # noqa: E402
 
 from sf_assistant.agent.lean import LeanRegistry  # noqa: E402
 from sf_assistant.knowledge.search import KnowledgeIndex  # noqa: E402
@@ -73,7 +74,11 @@ def test_knowledge_tool_lists_equal_the_notebook_registries(synthetic, fixture_k
 def test_record_tool_list_equals_the_notebook_registry(tmp_path):
     rt = F.open_fixture(tmp_path)
     try:
-        assert _lists(rt) == GOLDEN["records"]
+        # the notebook's lists with the one deliberate change (placement fixes, 2026-11-16) taken out
+        assert {"tools": [[k, type(v).__name__] for k, v in rt.tools.items()],
+                "list_tools_sha256": _h(notebook_tools(rt.list_tools())),
+                "openai_tools_sha256": _h(notebook_tools(rt.openai_tools()))} == GOLDEN["records"]
+        assert _lists(rt) != GOLDEN["records"]   # ...and that change is there
         assert R.record_tool_list() == rt.list_tools()
         assert R.openai_tool_list(R.RECORD_TOOLS) == rt.openai_tools()
         for name, tool in rt.tools.items():   # the registry's own objects, bound to this instance

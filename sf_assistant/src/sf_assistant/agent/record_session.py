@@ -518,7 +518,12 @@ class RecordSession:
         """
         reply = strip_reasoning(draft)
         if not reply:
-            return None
+            # a draft that is all reasoning would be shown as nothing: one more round for the answer (2026-11-16)
+            return RECORDS_FINAL_FORM_MESSAGE if str(draft or "").strip() else None
+        if not _is_no_records(reply) and not answer_text(drop_tool_talk(drop_working_sentences(reply))):
+            # the cleaners would leave nothing but the Source line ("empty record answer", page ticket 3 of
+            # 2026-11-16): ask for the final answer now, while rounds are left, instead of dropping the reply
+            return RECORDS_FINAL_FORM_MESSAGE
         if _is_no_records(reply):
             if triage is not None and (triage.people or triage.missing):
                 return RECORDS_PERSON_NO_RECORDS_MESSAGE.replace("<<PEOPLE>>", _quoted(triage.asked()))
@@ -1003,6 +1008,10 @@ class RecordSession:
                 blocks = {k: drop_contact_details(b, keep)[0] for k, b in blocks.items()}   # equal to their text in it
             unsupported = audit_numbers(answer, [facts_json(evidence, 10**9), question, status.line()]
                                         + (xt.sources if xt is not None else [])) if answer else []
+            raw_kept = str(r.answer or "") if empty else ""   # an empty answer's raw text, for the private log only
+            if raw_kept and not asks_for_contact(question):
+                raw_kept = drop_contact_details(raw_kept, result_numbers(
+                    getattr(e, "model_result", None) for e in evidence if getattr(e, "ok", False)))[0]
             timeline.add("stage", t_post, stage="post")
             return RecordAnswer(question=question, answer=answer, no_records=no_records, used_data=used_data,
                                 evidence=evidence, agent=r, error=error, unsupported_numbers=unsupported,
@@ -1013,7 +1022,7 @@ class RecordSession:
                                 code_tables=_tables.answer_counts(xt, answer, blocks, nudged[0], cut) if xt is not None
                                 else {},
                                 table_blocks={k: b for k, b in blocks.items() if _tables.holds(answer, b)},
-                                nudge_kinds=kinds)
+                                nudge_kinds=kinds, dropped_raw=raw_kept[:4000])
         except Exception as exc:  # noqa: BLE001 - the caller always gets an answer object
             try:
                 evidence = evidence or self.tools.evidence

@@ -449,9 +449,10 @@ def test_note_bound_and_empty_when_off(monkeypatch):
     assert charts.note_for("now plot that") == ""                       # bare
     assert not charts.drawable_ask("now plot that")
     assert charts.RECORDS_CHART_NOTE.startswith("\n\nThis question asks for a chart.")
-    assert len(charts.RECORDS_CHART_NOTE) == 471
+    assert len(charts.RECORDS_CHART_NOTE) == 610   # 471 before the rate clause of 2026-11-16
+    assert "a rate, share or percentage over time: trend_records with part_filters" in charts.RECORDS_CHART_NOTE
     assert charts.bare_line() == W["bare"] and charts.OVERRULE_REASON == W["overrule"]
-    assert len(W) == 73
+    assert len(W) == 81   # 73 + the rate words and answer_failed of 2026-11-16
 
 
 # ------------------------------------------------------------------------------------------------ reasons
@@ -2073,6 +2074,10 @@ def _all_shapes():
                                    notes=[PART_RUN.replace("2026-03", "2026-12")])),
         one("trend_records", trend(months([3 + i % 7 for i in range(120)]))),
         one("trend_records", trend(months([3, None, 5, 6, None, None, 8]), measure="avg", measure_field="Rate__c")),
+        # a rate per month (placement fixes, 2026-11-16): percent, with months that have no base record
+        one("trend_records", trend(months([12.5, None, 100.0, 0.0, 33.3, None, 7.1, 66.7, 50.0, 4.2]),
+                                   measure="percent", part_total=9, base_total=40, percent_overall=22.5)),
+        one("trend_records", trend(months([12.5, None, 100.0, 0.0, 33.3]), measure="percent"), None, "bar"),
         one("trend_records", trend([(f"week of 2026-{m:02d}-01", 3 * m) for m in range(1, 13)], grain="week"), None,
             "bar"),
         one("trend_records", trend(months([100000 + i * 5000 for i in range(30)])), None, "bar"),

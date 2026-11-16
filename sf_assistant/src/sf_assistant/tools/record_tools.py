@@ -53,7 +53,9 @@ from sf_assistant.tools.lookups import LookupsMixin
 from sf_assistant.tools.meta import MetaMixin
 from sf_assistant.tools.value_spots import ValueSpotsMixin
 # the spelling help's hint section (docs/resolver_integration.md (1)): the knowledge side's text and line format
-from sf_assistant.tools.knowledge_tools import corrected_text, question_spans, spelling_section
+from sf_assistant.engine.business_terms import is_not_the_term, not_the_term   # the owner's terms (2026-11-16)
+from sf_assistant.tools.knowledge_tools import (SpellingSpan, _metadata_targets, corrected_text, question_spans,
+                                               spelling_section)
 
 
 __all__ = ["RecordTools", "TOOL_ORDER"]
@@ -232,12 +234,17 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
         "Spelling (read by code ...)" lists each misspelt word or phrase with its spelling (``- 'accont' -> Account
         (object Account)``) or its did-you-means (``- 'persn' may mean: ...``). Person names are not listed there and
         stay as typed: the people lines cover them, for the people of the question as typed (:meth:`_question_spots`).
-        Off (``SFA_RESOLVER=off``: ``catalog.resolver`` None): exactly the mixin's hints."""
+        Off (``SFA_RESOLVER=off``: ``catalog.resolver`` None): exactly the mixin's hints. When the question (as typed
+        or corrected) names a business term, a spelling whose only metadata is a stored value that merely shares the
+        term's word (``engine.business_terms.NOT_THE_TERM``: 'placd' -> Account.Candidate_Status__c 'Placed') is not
+        listed (review of 2026-11-16)."""
         if self.catalog.resolver is None:
             return NamesMixin.object_hints(self, question, missing)
         spans = self._spelling_spans(question)
-        hints = NamesMixin.object_hints(self, corrected_text(question, spans), missing)
-        section = spelling_section(spans)
+        fixed = corrected_text(question, spans)
+        hints = NamesMixin.object_hints(self, fixed, missing)
+        other = not_the_term(question) | not_the_term(fixed)
+        section = spelling_section(self._without_other_reading(spans, other) if other else spans)
         if not section:
             return hints
         head = "[Hints from code, not from the user]"
@@ -245,6 +252,43 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
             return head + "\n" + section
         first, _, rest = hints.partition("\n")
         return first + "\n" + section + ("\n" + rest if rest else "")
+
+    def _without_other_reading(self, spans: list, other: Any) -> list:
+        """``spans`` with no spelling that names only a stored value of ``other`` (``engine.business_terms``
+        :func:`not_the_term`): such a did-you-mean option is dropped, a span left with none is dropped, and so is a
+        correction whose every target is such a value. The corrected text the hints search with is not changed."""
+        resolver = self.catalog.resolver
+
+        def only_other(targets: Any) -> bool:
+            targets = list(targets or ())
+            if not targets:
+                return False
+            for kind, target in targets:
+                if kind != "value" or "=" not in str(target):
+                    return False
+                place, value = str(target).split("=", 1)
+                obj, _, field = place.partition(".")
+                if not is_not_the_term(other, obj, field, value):
+                    return False
+            return True
+
+        def targets_of(text: str) -> tuple:
+            try:   # what the did-you-mean was kept for (knowledge_tools._hint_span, stored values included)
+                return _metadata_targets(resolver, text, True)
+            except Exception:  # noqa: BLE001 - the spelling help is optional
+                return ()
+
+        out = []
+        for s in spans:
+            if s.decision == "corrected":
+                if not only_other(s.targets):
+                    out.append(s)
+                continue
+            options = tuple(o for o in s.options if not only_other(targets_of(o)))
+            if options:
+                out.append(s if options == s.options else SpellingSpan(s.typed, s.start, s.end, s.decision, s.used,
+                                                                       options, s.targets))
+        return out
 
     def _question_spots(self, question: str) -> list[dict]:
         """:meth:`NamesMixin._question_spots`; the corrected form of the current question (what :meth:`object_hints`

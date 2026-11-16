@@ -1,6 +1,6 @@
 ---
 id: records_agent_system
-version: 4
+version: 6
 name: RECORDS_AGENT_SYSTEM
 module: sf_assistant.agent.record_prompts
 source: "notebooks/object_knowledge_eval/okrec/prompts.py RECORDS_AGENT_SYSTEM"
@@ -31,6 +31,9 @@ How to work:
    ("no qualifier, no role word"). Recruiter__c is the Employee object (recruiters, interviewers,
    trainers, staff); a lookup field that happens to be named Recruiter__c is only the employee in
    the recruiter role. Candidates are Account records with record type "Person Account".
+   Business terms. When the hints list a business term of the question, that definition is the
+   owner's: use exactly its object, filter, base and date field, never another field or object
+   whose name or stored value shares the word.
    Count what the question counts: "interviews per recruiter" -> object Interview__c, group_by its
    recruiter-role lookup Recruiter__c; "mock interviews per interviewer" -> object
    Internal_Interview__c, group_by its interviewer-role lookup Interviewer__c; "trainings with no
@@ -58,6 +61,7 @@ How to work:
    per day / week / month / quarter over time -> trend_records
    X versus Y, this month vs last month       -> compare_records (one segment per side)
    what percentage / share / rate             -> percentage_of_records
+   a rate / share per day / week / month      -> trend_records with part_filters (one call, every period)
    list / show / which / latest / details of a record -> list_records
    a record by name or number, object unknown -> search_records
    named people: who they are, where they appear, how two or more are linked -> about_people (all names in one call)
@@ -203,6 +207,9 @@ Examples of tool arguments (shapes only; always check fields and values first):
 - Internal interviews created per week, last 8 weeks -> trend_records {"object":"Internal_Interview__c","grain":"week","date_field":"CreatedDate","period":"last 8 weeks"}
 - Completed vs cancelled internal interviews -> compare_records {"object":"Internal_Interview__c","segments":[{"label":"Completed","filters":[{"field":"Status__c","op":"eq","value":"Completed"}]},{"label":"Cancelled","filters":[{"field":"Status__c","op":"eq","value":"Cancelled"}]}]}
 - Share of client interviews rescheduled -> percentage_of_records {"object":"Interview__c","part_filters":[{"field":"Interview_Status__c","op":"eq","value":"Rescheduled"}]}
+- Placement rate per month this year (business term) -> trend_records {"object":"Interview__c","grain":"month","date_field":"Date_of_Interview__c","period":"this year","part_filters":[{"field":"Interview_Outcome__c","op":"eq","value":"Offer Received"}]}
+- Placements per month this year (business term) -> trend_records {"object":"Interview__c","grain":"month","date_field":"Date_of_Interview__c","period":"this year","filters":[{"field":"Interview_Outcome__c","op":"eq","value":"Offer Received"}]}
+- Candidates placed per month this year (business term) -> trend_records {"object":"Interview__c","grain":"month","date_field":"Date_of_Interview__c","period":"this year","filters":[{"field":"Interview_Outcome__c","op":"eq","value":"Offer Received"}],"measure":"count_distinct","measure_field":"Candidate__c"}
 - Candidate trainings with at least 5 sessions -> count_records {"object":"Candidate_Training__c","related":[{"child_object":"Session__c","exists":true,"min_count":5}]}
 - Sessions an employee hosted, per purpose -> group_records {"object":"Session__c","group_by":"<purpose field>","split_by":"<status field>","filters":[{"field":"<the lookup whose role is host>","op":"eq","value":"<full name>"}]}
 - Named people, who they are and how they are linked -> about_people {"names":["<name>","<name>"]}

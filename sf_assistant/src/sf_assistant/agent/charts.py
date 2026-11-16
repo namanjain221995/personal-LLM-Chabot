@@ -81,7 +81,17 @@ _CHART_TOOLS = (*CHART_ARG_TOOLS, "count_records")
 _OTHER_WORDS = {"about_people": "people", "find_references": "people", "aggregate_records": "one_number",
                 "percentage_of_records": "one_share", "list_records": "list", "search_records": "list",
                 "get_field_values": "field_values", "get_field_history": "field_values"}
-_MEASURES = ("count", "count_distinct", "sum", "avg", "min", "max")
+_MEASURES = ("count", "count_distinct", "sum", "avg", "min", "max", "percent")
+#: A question that asks for a rate, share or percentage (placement fixes, 2026-11-16): counts over time are never
+#: drawn in place of a rate per period (:func:`_rate_results`). A "%" right after a digit ("100% done") and a money
+#: rate ("bill rate", "bill-rate") ask for no rate.
+_RATE_ASK = re.compile(r"\b(?:percent(?:age)?s?|share|ratio)\b|(?<![\d.])%"
+                       r"|(?<!\bbill[ -])(?<!\bbilling[ -])(?<!\bpay[ -])(?<!\bhourly[ -])(?<!\bdaily[ -])"
+                       r"(?<!\binterest[ -])(?<!\bexchange[ -])(?<!\btax[ -])(?<!\bsalary[ -])(?<!\bclient[ -])"
+                       r"(?<!\bvendor[ -])\brates?\b", re.I)
+#: The results a rate question never draws: counts over time (review of 2026-11-16: a share by group is drawn as a
+#: pie, and an average, sum, min or max of a field, a rate field among them, is drawn as asked).
+_RATE_REFUSED = (("trend_records", "compare_records"), ("count", "count_distinct"))
 _GRAINS = ("day", "week", "month", "quarter", "year")
 #: The caps of a chart: bars, line points, slices and series.
 MAX_BARS, MAX_POINTS, MAX_SLICES, MAX_SERIES = 30, 120, 8, 8
@@ -541,6 +551,7 @@ class _Row:
     source: Any   # the label as the result gives it: the partial notes name it so
     value: Any
     by: dict      # the split as the result gives it (raw names); {} without one
+    counts: dict = None   # a rate per period: its "part" and "base" as the result gives them; None otherwise
 
 
 #: A partial period, from the note words of ``RecordTools._trend_records``, which cover all three cases.
@@ -617,7 +628,8 @@ def _rows_of(tool: str, res: dict, args: dict, field: Any, clean: _Cleaner) -> l
     for i, it in enumerate(items):
         label = _compare_label(it, i + 1, clean) if tool == "compare_records" else clean(it.get(label_key))
         by = it.get("by")
-        rows.append(_Row(label, it.get(label_key), it.get("value"), by if isinstance(by, dict) else {}))
+        rows.append(_Row(label, it.get(label_key), it.get("value"), by if isinstance(by, dict) else {},
+                         {k: it.get(k) for k in ("part", "base") if k in it}))
     return rows
 
 
@@ -655,9 +667,11 @@ def _refused(tool: str, res: dict, rows: list[_Row]) -> str:
 
 
 def _unit(measure: str, res: dict, args: dict, obj: Any, labels: _Labels) -> str:
-    """The word of a row's value: ``Records`` only for count."""
+    """The word of a row's value: ``Records`` only for count, ``Percent`` for a rate per period."""
     if measure == "count":
         return _WORDS["records"]
+    if measure == "percent":
+        return _WORDS["percent"]
     field = res.get("measure_field")
     named = isinstance(field, str) and field.strip()
     word = labels(obj, field) if named else _field_word(obj, args.get("measure_field"), labels)
@@ -746,6 +760,13 @@ def _subtitle(tool: str, res: dict, args: dict, obj: Any, measure: str, rows: li
     words = _filter_words(blocks, obj, labels)
     if words:
         lines.append(_say("filtered", FIELDS=", ".join(words)))
+    if measure == "percent":   # a rate per period: what the part is, by field label, and the window's own numbers
+        part = _filter_words([{"filters": applied.get("part_filters") or []}], obj, labels)
+        lines.append(_say("rate_of", FIELDS=", ".join(part) or _WORDS["other_field"]))
+        whole = [res.get(k) for k in ("percent_overall", "part_total", "base_total")]
+        if all(_is_num(v) for v in whole):
+            lines.append(_say("rate_overall", COUNT=_fmt(whole[0]), SHOWN=_fmt(whole[1]), TOTAL=_fmt(whole[2])))
+        return lines
     total = None
     if tool == "group_records" and measure == "count" and "records_matched" not in res \
             and _number(args.get("min_value")) is None:
@@ -804,6 +825,10 @@ def _notes(tool: str, res: dict, args: dict, measure: str, rows: list[_Row], tod
             notes.append(_say("overlap", COUNT=_fmt(res["records_matched"])))
     if tool == "trend_records" and _is_num(res.get("records_without_date")) and res["records_without_date"] > 0:
         notes.append(_say("no_date", COUNT=_fmt(res["records_without_date"])))
+    if measure == "percent":
+        empty = [r.label for r in rows if r.value is None]
+        if empty:
+            notes.append(_say("no_base", LABELS=", ".join(empty)))
     partial: list[int] = []
     if tool == "trend_records":
         named_parts = {m.group(1) for m in (_PARTIAL_RE.match(n) for n in result_notes) if m}
@@ -948,11 +973,13 @@ def _item(tool: str, res: dict, args: dict, obj: Any, field: Any, measure: str, 
                 row[key] = _value(r.by[raw], clean)
         if stacked:
             row[total_key] = _value(r.value, clean)
+        for k, v in (r.counts or {}).items():   # a rate's own counts, beside its percent (never drawn)
+            row[_WORDS["rate_" + k]] = _value(v, clean)
         return row
 
     item = {"query_id": _query_id(res), "tool": tool, "chart": None, "data": [row_of(r, False) for r in rows],
             "truncated": truncated, "subtitle": subtitle, "notes": notes, "partial": partial, "reason": "",
-            "rows_in_answer": False, "alt": "", "_title": title}
+            "rows_in_answer": False, "alt": "", "_title": title, "_measure": measure}
     refused = _refused(tool, res, rows)
     if refused:
         item["reason"] = refused
@@ -997,7 +1024,7 @@ def _build(tool: Any, result: Any, arguments: Any, obj: Any, clean: _Cleaner, la
     args = {k: v for k, v in arguments.items() if v is not None and v != [] and v != {}
             and not (isinstance(v, str) and not v.strip())} if isinstance(arguments, dict) else {}
     measure = _enum(result.get("measure") or args.get("measure") or "count")
-    if measure not in _MEASURES:
+    if measure not in _MEASURES or (measure == "percent" and tool != "trend_records"):
         return [_no_chart(tool, result, "fault")]
     obj = result.get("object") or obj
     day = _day(today)
@@ -1020,6 +1047,24 @@ def _safe_build(tool: Any, result: Any, arguments: Any, obj: Any, clean: _Cleane
         return _build(tool, result, arguments, obj, clean, labels, asked, today)
     except Exception as exc:  # noqa: BLE001 - a fault in one result never costs the answer
         return [{**_no_chart(tool, result, "fault"), "_error": type(exc).__name__}]
+
+
+def _rate_results(results: list[list[dict]]) -> list[list[dict]]:
+    """The results of a question that asks for a rate: a chart of counts over time (trend_records or compare_records,
+    measure count or count_distinct: :data:`_RATE_REFUSED`) leaves them as its rows with the ``rate_counts`` reason,
+    so code never draws counts in place of the rate per period asked. A share by group (group_records, a pie) and a
+    measure of a field (avg, sum, min, max: "the average candidate rate") are drawn; a single percentage keeps its own
+    reason (``one_share``)."""
+    tools, measures = _RATE_REFUSED
+    out = []
+    for items in results:
+        kept = []
+        for i in items:
+            if i["chart"] and i.get("tool") in tools and i.get("_measure") in measures:
+                i = {**i, "chart": None, "reason": _WORDS["rate_counts"]}
+            kept.append(i)
+        out.append(kept)
+    return out
 
 
 def _pick(results: list[list[dict]]) -> list[dict]:
@@ -1628,13 +1673,16 @@ def _finish(item: dict, picture: str) -> dict:
 
 def _answer_word(kind: Any, rec: Any) -> str:
     """Why this answer can draw nothing whatever its results say, or "": records off, then only failed calls, then a
-    knowledge answer, no answer or nothing read."""
+    record step that failed after its calls (``pipeline.records_failed``: no answer to draw beside), then a knowledge
+    answer, no answer or nothing read."""
     if rec is None:
         return "records_off"
     data = [e for e in rec.evidence or [] if e.kind == "data" and e.tool != "get_sync_status"]
     done = [e for e in data if e.ok]
     if data and not done:
         return "failed"
+    if kind == "none" and done and getattr(rec, "error", None) and not getattr(rec, "routed_out", False):
+        return "answer_failed"
     if kind in ("knowledge", "none") or not done:
         return "no_data"
     return ""
@@ -1671,6 +1719,8 @@ def make(ask: Any, question: Any, final: Any, kind: Any, mode: Any, rec: Any, ca
         blocks = getattr(rec, "table_blocks", None) or {}
         items, lines = [], []
         error = next((i["_error"] for found in results for i in found if i.get("_error")), "")
+        if isinstance(question, str) and _RATE_ASK.search(question):
+            results = _rate_results(results)
         for item in _pick(results):
             done = _finish(item, "svg_b64")
             fault = done.pop("_error", "")   # always: no key of this module's leaves it with an item

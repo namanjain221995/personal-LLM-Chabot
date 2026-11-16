@@ -67,7 +67,6 @@ import stat
 import sys
 import threading
 import time
-import unicodedata
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
@@ -95,7 +94,7 @@ MAX_TURNS = 4                  # recent_turns: the last 2 turns
 MAX_TURN_CHARS = 2000
 MAX_REQUEST_ID = 200           # characters of request_id kept in the log, as the MCP audit log cuts its values
 
-UNCLEAR_LINE = "I could not tell what this refers to. Please ask the full question, with the name or object."
+UNCLEAR_LINE = pipeline_mod.UNCLEAR_LINE   # the page says the same (web/pipeline.py)
 REFUSED_LINE = "This field is blocked, so it cannot be shown here."
 REFUSED_PART_LINE = "One blocked field was left out."                 # after a record answer that has text
 NO_RECORD_DATA_LINE = "No record data was used for this answer."      # what the page shows under such an answer
@@ -171,16 +170,8 @@ def _body(shaped: dict) -> str:
     return "" if text == NO_ANSWER_PLACEHOLDER else text
 
 
-def _read_as_line(rewritten: str) -> str:
-    """``Read as: <the rewritten question>``, for a person to catch a wrong reading. It shows text the model wrote, so
-    it gets the contact rule of an answer (the question does not ask: no address, no phone number) and stands in a code
-    span with no backtick and no format character: nothing in it links, which backslash escapes do not give (GFM links a
-    bare ``https:\\//`` after they are read)."""
-    from sf_assistant.engine.contact import asks_for_contact, drop_contact_details
-
-    text = rewritten if asks_for_contact(rewritten) else drop_contact_details(rewritten)[0]
-    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf" and ch != "`")
-    return f"Read as: `{text}`"
+#: ``Read as: <the rewritten question>`` (web/pipeline.py, shared with the page).
+_read_as_line = pipeline_mod.read_as_line
 
 
 def _no_links_in_a_paragraph(text: str) -> str:
@@ -363,12 +354,7 @@ def _bad_arguments(arguments: Any) -> str | None:
         return "question must be a string"
     if not isinstance(arguments.get("request_id", ""), str):
         return "request_id must be a string"
-    turns = arguments.get("recent_turns", [])
-    if not isinstance(turns, list) or not all(isinstance(t, dict) and set(t) == {"role", "content"}
-                                              and isinstance(t["role"], str) and isinstance(t["content"], str)
-                                              for t in turns):
-        return "recent_turns must be a list of {role, content}"
-    return None
+    return pipeline_mod.turns_problem(arguments.get("recent_turns", []))   # the page checks them the same way
 
 
 def _tool_result(out: dict) -> types.CallToolResult:

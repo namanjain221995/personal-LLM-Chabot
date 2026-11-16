@@ -1108,7 +1108,7 @@ Aliases (names the model does not see; `call()` runs the visible tool): `find_re
 | 4 | `count_records` | `object` | `filters`, `any_of`, `date_field`, `period`, `related`, `count_distinct` | `RecordTools._count_records` |
 | 5 | `aggregate_records` | `object`, `op`, `field` | `filters`, `any_of`, `date_field`, `period`, `related` | `RecordTools._aggregate_records` |
 | 6 | `group_records` | `object`, `group_by` | `split_by`, `measure`, `measure_field`, `filters`, `any_of`, `date_field`, `period`, `related`, `top`, `order`, `min_value` | `RecordTools._group_records` |
-| 7 | `trend_records` | `object`, `grain`, `date_field`, `period` | `split_by`, `measure`, `measure_field`, `filters`, `any_of`, `related` | `RecordTools._trend_records` |
+| 7 | `trend_records` | `object`, `grain`, `date_field`, `period` | `split_by`, `measure`, `measure_field`, `filters`, `any_of`, `related`, `part_filters` | `RecordTools._trend_records` |
 | 8 | `compare_records` | `object`, `segments` | `date_field`, `measure`, `measure_field`, `filters`, `related` | `RecordTools._compare_records` |
 | 9 | `percentage_of_records` | `object`, `part_filters` | `base_filters`, `date_field`, `period`, `related` | `RecordTools._percentage_of_records` |
 | 10 | `list_records` | `object` | `fields`, `filters`, `any_of`, `date_field`, `period`, `related`, `order_by`, `order`, `limit` | `RecordTools._list_records` |
@@ -2023,7 +2023,7 @@ Input schema:
 ### `trend_records`
 
 ```text
-Counts (or another measure) per day/week/month/quarter/year over a time window, bucketed on the SAME date field the window uses. Empty buckets are filled with 0. Example: {"object":"Interview__c","grain":"month","date_field":"Date_of_Interview__c","period":"last 6 months"}
+Counts (or another measure) per day/week/month/quarter/year over a time window, bucketed on the SAME date field the window uses. Empty buckets are filled with 0. With part_filters: part, base and percent per bucket (a rate per period in one call); a bucket with no base records has part and base 0 and percent null (no rate, not 0%). Example: {"object":"Interview__c","grain":"month","date_field":"Date_of_Interview__c","period":"last 6 months"}
 ```
 
 Input schema:
@@ -2287,6 +2287,65 @@ Input schema:
         ],
         "additionalProperties": false
       }
+    },
+    "part_filters": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "eq",
+              "ne",
+              "in",
+              "not_in",
+              "contains",
+              "not_contains",
+              "starts_with",
+              "gt",
+              "gte",
+              "lt",
+              "lte",
+              "is_blank",
+              "is_not_blank"
+            ]
+          },
+          "value": {
+            "type": [
+              "string",
+              "number",
+              "boolean"
+            ]
+          },
+          "values": {
+            "type": "array",
+            "items": {
+              "type": [
+                "string",
+                "number",
+                "boolean"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 20
+          },
+          "other_field": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "field",
+          "op"
+        ],
+        "additionalProperties": false
+      },
+      "description": "What makes a record count as the part (filters are the base); count only."
     }
   },
   "required": [

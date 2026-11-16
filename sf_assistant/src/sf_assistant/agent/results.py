@@ -44,6 +44,9 @@ class RecordAnswer:
     code_tables: dict = field(default_factory=dict)
     table_blocks: dict[str, str] = field(default_factory=dict)   # marker -> its code-built rows as they stand in answer
     nudge_kinds: list[str] = field(default_factory=list)   # the prompt id of each draft-check message, in order
+    # the record agent's raw final text when its answer came back empty (the private log only, 2026-11-16: which
+    # cleaner left nothing but the Source line)
+    dropped_raw: str = ""
 
     @property
     def data_queries(self) -> int:

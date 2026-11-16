@@ -26,6 +26,7 @@ from typing import Any
 
 from sf_assistant.knowledge.store import split_api_name
 from sf_assistant.engine.catalog import OBJECT_NOTES, PERSON_OBJECTS, SYSTEM_LOOKUPS, FieldSpec, RecordError, norm_name
+from sf_assistant.engine.business_terms import is_not_the_term, not_the_term, term_lines   # the owner's terms
 from sf_assistant.engine.sql_guard import quote_ident
 from sf_assistant.engine.values import normalize
 from sf_assistant.engine.warehouse import WarehouseError
@@ -117,7 +118,12 @@ class NamesMixin:
             lines += self._people_hints(question, top, missing)
         except Exception:  # hints are optional: a failure leaves them out
             pass
-        vals = self.catalog.value_matches(question, top_objects=top, n=5)
+        terms = term_lines(question)   # a business term of the question: the owner's definition (engine.business_terms)
+        if terms:
+            lines += terms
+        other = not_the_term(question)   # stored values that only share a term's word are never hinted for it
+        vals = [v for v in self.catalog.value_matches(question, top_objects=top, n=5)
+                if not is_not_the_term(other, v[0], v[1], v[2])]
         value_lines = getattr(self, "value_hint_lines", None)   # the records the question names (tools.value_spots)
         if value_lines is not None:
             try:

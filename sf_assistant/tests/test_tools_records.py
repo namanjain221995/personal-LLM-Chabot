@@ -68,7 +68,8 @@ def test_registry_surface(tools):
     assert all(set(t) == {"name", "description", "inputSchema"} for t in mcp)
     oa = tools.openai_tools()
     assert all(t["type"] == "function" and set(t["function"]) == {"name", "description", "parameters"} for t in oa)
-    assert len(json.dumps(oa)) < 42_000  # the §9.1 fragments inlined in 14 schemas: about 41k characters
+    # the §9.1 fragments inlined in 14 schemas: about 41k characters, 42.6k with trend_records part_filters (2026-11-16)
+    assert len(json.dumps(oa)) < 43_000
     assert "$ref" not in json.dumps(oa)
 
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -454,6 +455,65 @@ def _last_triage(session: Any, text: str) -> Any:
         return None
 
 
+#: The answer of a record question whose record step failed or came back empty (placement fixes, 2026-11-16): said
+#: plainly, never a knowledge answer about something else in its place (:func:`choose_answer`).
+RECORDS_FAILED_ANSWER = ("The figures for this question could not be computed this time: the record step gave no "
+                         "usable answer. Please ask again, or ask for one part of it at a time.")
+#: The label of a knowledge answer kept after :data:`RECORDS_FAILED_ANSWER` (only one about the objects the record
+#: step read, :func:`_about_the_same`).
+RECORDS_FAILED_NOTE_LABEL = "What the knowledge files say (field meanings only, no record figures):"
+
+
+def _about_the_same(k_answer: str, rec: Any) -> bool:
+    """The knowledge answer is about what the record step read: the lead (first paragraph, Source lines left out) of
+    the knowledge answer names a custom object (``..__c``) or a custom field one of the record step's successful data
+    calls read (its object, its ``tables``, the fields of its ``fields_used``; a field by its name, or as
+    ``Object.Field`` of that object). Only successful data calls count (review of 2026-11-16: a ``describe_fields`` on
+    ``Onboarding__c`` before the ``Interview__c`` calls of page ticket 3 kept an onboarding answer), a standard object
+    such as Account is never matched in prose ("the candidate's Account"), and with no such call nothing is kept. A
+    knowledge answer about other objects only (page ticket 3 of 2026-11-16: ``Application__c`` after record calls on
+    ``Interview__c``) is no note about the question."""
+    from sf_assistant.agent.checks import _body_text
+
+    objects: set[str] = set()
+    fields: set[tuple[str, str]] = set()
+    for e in getattr(rec, "evidence", None) or []:
+        if not (getattr(e, "ok", False) and getattr(e, "kind", None) == "data"
+                and getattr(e, "tool", None) != "get_sync_status"):
+            continue
+        objects.update(str(o) for o in [getattr(e, "object", None), *(getattr(e, "tables", None) or [])] if o)
+        for pair in getattr(e, "fields_used", None) or []:
+            if isinstance(pair, (tuple, list)) and len(pair) == 2 and pair[0] and pair[1]:
+                fields.add((str(pair[0]), str(pair[1])))
+    lead = _body_text(k_answer).strip().split("\n\n", 1)[0]
+    if any(re.search(rf"(?<!\w){re.escape(o)}(?!\w)", lead) for o in objects if o.endswith("__c")):
+        return True
+    return any(re.search(rf"(?<![\w.]){re.escape(f)}(?!\w)|(?<!\w){re.escape(o)}\.{re.escape(f)}(?!\w)", lead)
+               for o, f in fields if f.endswith("__c"))
+
+
+def records_failed(rec: Any) -> bool:
+    """The record step of a question that needs record data failed or came back empty: ``rec.error`` is set and the
+    route call said RECORDS (``triage["route"]`` True), or gave no reading (None: the call failed or its reply was
+    unclear) while the record agent ran all the same and a data call of it read records (review of 2026-11-16), or a
+    chart ask sent it to the records (``overruled_by`` "chart"). A stored value's overrule (route False: the route
+    call judged a design question), a NO_RECORDS route and a route with no reading whose record agent read no
+    records keep the knowledge answer, as before."""
+    if rec is None or not getattr(rec, "error", None) or getattr(rec, "routed_out", False):
+        return False
+    if getattr(rec, "named_people", None):   # the people path says it in its own words ("could not be read")
+        return False
+    tri = getattr(rec, "triage", None) or {}
+    if tri.get("route") is True or tri.get("overruled_by") == "chart":
+        return True
+    # no reading of the route call (it failed or was unclear) and the record agent ran all the same: a failure once a
+    # data call of it read records (the question was a record question); with none, the knowledge answer as before (a
+    # design question whose record agent only failed its calls, or made none)
+    return bool(tri) and tri.get("route") is None and any(
+        getattr(e, "kind", None) == "data" and getattr(e, "ok", False) and getattr(e, "tool", None) != "get_sync_status"
+        for e in getattr(rec, "evidence", None) or [])
+
+
 def choose_answer(m: Any, rec: Any, not_found: str, k_answer: str, records_only: bool = False,
                   status: Any = None) -> tuple[str, str]:
     """``(final, kind)``: the answer :func:`answer` shows (evaluation fix 2, 2026-10-22), in this order: the merged
@@ -463,7 +523,9 @@ def choose_answer(m: Any, rec: Any, not_found: str, k_answer: str, records_only:
     result covers every named person of the question (``rec.named_people``, or a misspelt one's stored spelling,
     ``rec.named_spellings``; review of 2026-10-22: a result for one of two people is no answer about both, the
     knowledge answer with its warning is) and the question's names are stored
-    (the triage's ``people_data``); the code's not-found answer; the knowledge answer
+    (the triage's ``people_data``); the code's not-found answer; :data:`RECORDS_FAILED_ANSWER` (kind "none") when the
+    record step of a record question failed or came back empty (:func:`records_failed`; 2026-11-16: never the
+    knowledge answer in its place, which answered another question on the page); the knowledge answer
     (records-only: none). An answer with no text besides its Source line and the lines code writes around it
     (``agent.nudges.answer_text``) counts as none, so an empty answer is never shown: ``final`` is "" and ``kind``
     "none" when nothing is left. Records off (``rec`` None): the knowledge answer as before, and no record module is
@@ -485,7 +547,14 @@ def choose_answer(m: Any, rec: Any, not_found: str, k_answer: str, records_only:
             return with_source_line(people, rec.evidence, status), "records"
     if not_found:
         return not_found, "records"
-    if records_only or not answer_text(k_answer):
+    if records_only:
+        return "", "none"
+    if records_failed(rec):   # the knowledge answer never stands in for the figures; a note on the same thing may follow
+        if answer_text(k_answer) and _about_the_same(k_answer, rec):   # its own Source line is left out
+            from sf_assistant.agent.checks import _body_text
+            return f"{RECORDS_FAILED_ANSWER}\n\n{RECORDS_FAILED_NOTE_LABEL}\n{_body_text(k_answer).strip()}", "none"
+        return RECORDS_FAILED_ANSWER, "none"
+    if not answer_text(k_answer):
         return "", "none"
     return k_answer, "knowledge"
 
@@ -892,6 +961,8 @@ def result_row(o: Outcome, session=None) -> dict:
         row["jsonl"]["charts_error"] = o.charts_error
     if o.charts_talk:
         row["jsonl"]["charts_talk"] = True
+    if getattr(rec, "dropped_raw", ""):   # an empty record answer's raw text (2026-11-16): which cleaner emptied it
+        row["jsonl"]["record_dropped_raw"] = rec.dropped_raw
     if o.status_lines:   # Group B item 11: the code's status lines (the key is left out when there is none)
         row["jsonl"]["status_lines"] = list(o.status_lines)
     if o.spelling is not None:   # the spelling help (SFA_RESOLVER=on): the question's misspelt names, the code line

@@ -15,7 +15,8 @@ over the selected answers instead.
     python -m sf_assistant.evaluation timeline --stats                # every answer of the log
     python -m sf_assistant.evaluation timeline .private/runs/x.jsonl --slowest 3
 
-The page seconds of an answer are ``reopen`` (closing and opening the records after the read copy was replaced) +
+The page seconds of an answer are ``rewrite`` (the page's follow-up rewrite call, when earlier turns came with the
+question) + ``reopen`` (closing and opening the records after the read copy was replaced) +
 ``retry`` (a swap retry) + the answer's own seconds + ``failed reopen`` (a reopen after a swap error that failed) + the
 hand-off back to the page; the time waited in line comes before them. Model calls show tokens in and out; ``+N`` after the tokens in is the net prompt growth since the
 previous call of the same agent, shown only between calls that offer the same tools. A tool's ``~N tok`` is its
@@ -63,6 +64,7 @@ class Ask:
     retry_s: float | None
     jl: dict
     failed_reopen: dict | None = None
+    rewrite_s: float | None = None   # the page's follow-up rewrite call (detail.rewrite.seconds)
 
     @property
     def seconds(self) -> float:
@@ -95,9 +97,11 @@ def _ask(label: str, line: dict, jl: Any, status: str, page_s: Any, queue_s: Any
     num = lambda x: float(x) if isinstance(x, (int, float)) else None   # noqa: E731
     reopen = detail.get("reopen") if isinstance(detail.get("reopen"), dict) else None
     failed = detail.get("failed_reopen") if isinstance(detail.get("failed_reopen"), dict) else None
+    rewrite = detail.get("rewrite") if isinstance(detail.get("rewrite"), dict) else {}
     return Ask(label=label, when=_utc(tl.get("t0_utc")) or _utc(line.get("ts")), status=status,
                mode=line.get("mode") if isinstance(line.get("mode"), str) else None, page_s=num(page_s),
-               queue_s=num(queue_s), reopen=reopen, retry_s=num(detail.get("retry_s")), jl=jl, failed_reopen=failed)
+               queue_s=num(queue_s), reopen=reopen, retry_s=num(detail.get("retry_s")), jl=jl, failed_reopen=failed,
+               rewrite_s=num(rewrite.get("seconds")))
 
 
 def load(path: str | Path) -> list[Ask]:
@@ -256,6 +260,9 @@ def _header(a: Ask) -> list[str]:
     reopen = a.reopen or {}
     parts = [f"page {a.page_s:.2f} s ="]
     known = 0.0
+    if a.rewrite_s is not None:
+        parts.append(f"rewrite {a.rewrite_s:.2f} +")
+        known += a.rewrite_s
     if isinstance(reopen.get("s"), (int, float)):
         parts.append(f"reopen {reopen['s']:.2f} (close {reopen.get('close_s')}, open {reopen.get('open_s')}) +")
         known += reopen["s"]

@@ -23,8 +23,8 @@ from .values import escape_like, ground_value, id18, looks_like_id, normalize, p
 
 __all__ = ["Frag", "join_frags", "Scope", "Col", "BuildCtx", "FilterOut", "NameCheck", "filter_frag", "period_frag",
            "related_frag", "where_sql", "count_sql", "aggregate_sql", "group_sql", "trend_sql",
-           "percentage_sql", "list_sql", "MAX_JOINS", "GRAINS", "measure_expr", "group_measure_expr", "quote_value",
-           "name_norm_sql", "NUMBERED_RE", "NAME_OPS", "POSITIVE_OPS", "CONTAINS_OPS"]
+           "rate_trend_sql", "percentage_sql", "list_sql", "MAX_JOINS", "GRAINS", "measure_expr", "group_measure_expr",
+           "quote_value", "name_norm_sql", "NUMBERED_RE", "NAME_OPS", "POSITIVE_OPS", "CONTAINS_OPS"]
 
 MAX_JOINS = 6
 GRAINS = {"day": "day", "week": "week", "month": "month", "quarter": "quarter", "year": "year"}
@@ -1014,6 +1014,14 @@ def trend_sql(scope: Scope, conds: list[Frag], date_col: Col, grain: str, ctx: B
     sel = sel + Frag(f", {measure_expr(measure, mcol)} AS value FROM {scope.from_sql()}")
     keys = "1, 2" if split is not None else "1"
     return sel + where_sql(conds) + Frag(f" GROUP BY {keys} ORDER BY {keys}")
+
+
+def rate_trend_sql(scope: Scope, conds: list[Frag], date_col: Col, grain: str, ctx: BuildCtx, part: Frag) -> Frag:
+    """Part and base counts per bucket in one statement (a rate over time, trend_records with part_filters): the
+    count of :func:`percentage_sql` grouped by :func:`bucket_expr`. A bucket with no record has no row."""
+    return (Frag("SELECT ") + bucket_expr(date_col, grain, ctx) + Frag(" AS bucket, COUNT(*) FILTER (WHERE ") + part
+            + Frag(f") AS part, COUNT(*) AS base FROM {scope.from_sql()}") + where_sql(conds)
+            + Frag(" GROUP BY 1 ORDER BY 1"))
 
 
 def percentage_sql(scope: Scope, conds: list[Frag], part: Frag, blank_col: Col | None = None) -> Frag:

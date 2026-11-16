@@ -19,8 +19,8 @@ from sf_assistant.engine.periods import GRAIN_CAPS, Period, bucket_end, bucket_l
 from sf_assistant.engine.sql_guard import quote_ident
 from sf_assistant.engine.query_builder import (Frag, Scope, aggregate_sql, count_sql, date_fields_text, filter_frag,
                                                group_measure_expr, group_sql, join_frags, list_sql, measure_expr,
-                                               name_norm_sql, percentage_sql, period_frag, sensitive_object_text,
-                                               trend_sql, where_sql)
+                                               name_norm_sql, percentage_sql, period_frag, rate_trend_sql,
+                                               sensitive_object_text, trend_sql, where_sql)
 from sf_assistant.engine.values import escape_like, is_record_number
 
 from sf_assistant.tools import record_base as _base   # the limit SCAN_BUDGET_S: read (and patched) there
@@ -347,7 +347,16 @@ class RecordQueryMixin:
 
     def _trend_records(self, call: _Call, object: str, grain: str, date_field: str, period: str,
                        split_by: str | None = None, measure: str = "count", measure_field: str | None = None,
-                       filters: list | None = None, any_of: list | None = None, related: list | None = None) -> dict:
+                       filters: list | None = None, any_of: list | None = None, related: list | None = None,
+                       part_filters: list | None = None) -> dict:
+        """Measure per bucket. With ``part_filters`` (placement fixes, 2026-11-16) a rate per bucket instead: each
+        bucket gives ``part``, ``base`` and ``percent`` (``value`` = percent) from one statement
+        (:func:`rate_trend_sql`), with the window's own part, base and percent; a bucket with no base record has no
+        percent (null, never 0%)."""
+        if part_filters:
+            if split_by or measure not in (None, "count") or measure_field:
+                raise RecordError("part_filters gives a rate per bucket (part / base x 100) of record counts: leave "
+                                  "split_by, measure and measure_field out.", "E8")
         cat = self.catalog
         spec = self._object(call, object)
         scope = Scope(cat, spec)
@@ -372,6 +381,9 @@ class RecordQueryMixin:
                               "month." if grain in ("day", "week") else
                               f"a {grain} trend over '{period}' gives {len(seq)} buckets (max {cap}); use a longer grain "
                               "or a shorter period.", "E7")
+        if part_filters:
+            return self._rate_trend(call, spec, scope, grain, dref, per, clipped, seq, today, end, filters, any_of,
+                                    related, part_filters)
         mcol = self._measure(call, spec, scope, measure, measure_field)
         scol = None
         trend_split_totals = None
@@ -468,6 +480,95 @@ class RecordQueryMixin:
         for t in scope.tables:
             call.table(t)
         call.summary = f"{len(buckets)} buckets"
+        return res
+
+    def _rate_trend(self, call: _Call, spec: ObjectSpec, scope: Scope, grain: str, dref: Any, per: Period,
+                    clipped: Period, seq: list, today: dt.date, end: dt.date, filters: list | None, any_of: list | None,
+                    related: list | None, part_filters: list) -> dict:
+        """:meth:`_trend_records` with ``part_filters``: the base is ``filters``, ``any_of`` and ``related`` in the
+        window, the part is the base records that also match every part filter (as in
+        :meth:`_percentage_of_records`). Every bucket of the window is listed; one with no base record has
+        ``percent`` and ``value`` null. Window totals: ``part_total``, ``base_total``, ``percent_overall``."""
+        base_conds = self._where(call, spec, scope, {"filters": filters, "any_of": any_of, "related": related},
+                                 use_period=False, result_name="the base", lookup_check=True)
+        base_texts = list(call.applied.get("filters") or [])
+        parts = [filter_frag(scope, item, call.ctx) for item in part_filters]
+        self._ground(call, parts)
+        part_texts = [p.text for p in parts]
+        if set(part_texts) <= set(base_texts):
+            raise RecordError("part_filters repeat filters, so the rate would always be 100%. part_filters should "
+                              "hold only what makes a record count as the part; filters are the base.", "E8")
+        pf, pa = period_frag(scope, dref, clipped, call.ctx)
+        conds = base_conds + [pf]
+        call.applied["period"] = pa
+        call.use(dref)
+        part_conds: list[Frag] = []   # base + part conditions, filled below
+        for p in parts:
+            call.use(p.ref)
+            self._filter_notes(call, scope, p, part_conds, "the part")
+        call.applied["part_filters"] = part_texts
+        part = join_frags(" AND ", [p.frag for p in parts])
+        part_conds.extend(conds + [part])
+        dcol = scope.col(dref)
+        st = call.run(rate_trend_sql(scope, conds, dcol, grain, call.ctx, part), max_rows=1000)
+        call.main(st)
+        call.main_scope, call.main_conds = scope, conds
+        got: dict[dt.date, tuple[int, int]] = {}
+        for b, p_, b_ in st.rows:
+            d = dt.date.fromisoformat(b) if isinstance(b, str) else b
+            got[bucket_start(grain, d)] = (int(p_ or 0), int(b_ or 0))
+        buckets = []
+        for s in seq:
+            p_, b_ = got.get(s, (0, 0))
+            pct = _pct(p_, b_)
+            buckets.append({"bucket": bucket_label(grain, s), "part": p_, "base": b_, "percent": pct, "value": pct})
+        part_total, base_total = sum(b["part"] for b in buckets), sum(b["base"] for b in buckets)
+        first = parts[0]
+        if first.ref is not None and not str(part_filters[0].get("op", "")).startswith("is_"):
+            st_b = call.run(percentage_sql(scope, conds, part, scope.col(first.ref)), max_rows=1)
+            row = dict(zip(st_b.columns, st_b.rows[0])) if st_b.rows else {}
+            out_, in_ = int(row.get("part_field_blank_out") or 0), int(row.get("part_field_blank_in") or 0)
+            if out_:
+                call.note(f"{out_} base records have a blank {first.ref.text}; they are in the base but not in the part")
+            if in_:
+                call.note(f"{in_} base records have a blank {first.ref.text}; they are counted in the part")
+        st_nd = call.run(count_sql(scope, base_conds + [Frag(f"{dcol.expr} IS NULL")]), max_rows=1)
+        nodate = int(st_nd.rows[0][0]) if st_nd.rows else 0
+        empty = [b["bucket"] for b in buckets if not b["base"]]
+        res: dict[str, Any] = {"grain": grain, "date_field": dref.text, "measure": "percent", "buckets": buckets,
+                               "part_total": part_total, "base_total": base_total,
+                               "percent_overall": _pct(part_total, base_total),
+                               "part_is": " and ".join(part_texts),
+                               "base_is": " and ".join(base_texts + (call.applied.get("related") or []))
+                               or f"all {spec.api} records"}
+        nn = [b for b in buckets if b["value"] is not None]
+        if nn:
+            hi = max(nn, key=lambda b: b["value"])
+            lo = min(nn, key=lambda b: b["value"])
+            res["highest"] = {"bucket": hi["bucket"], "value": hi["value"]}
+            res["lowest"] = {"bucket": lo["bucket"], "value": lo["value"]}
+        if buckets:
+            res["first"], res["last"] = buckets[0]["value"], buckets[-1]["value"]
+        res["first_bucket_partial"] = bool(seq) and clipped.start > seq[0]
+        res["last_bucket_partial"] = bool(seq) and seq[-1] <= today < bucket_end(grain, seq[-1])
+        res["records_without_date"] = nodate
+        if empty:
+            call.note(f"no base records in {', '.join(empty)}: no rate there (not 0%)")
+        if res["first_bucket_partial"]:
+            call.note(f"the first bucket ({buckets[0]['bucket']}) covers only {clipped.start.isoformat()} onward (the "
+                      f"period starts inside that {grain})")
+        if res["last_bucket_partial"]:
+            call.note(f"the last bucket ({buckets[-1]['bucket']}) is still running (today is {today.isoformat()})")
+        elif seq and clipped.end_exclusive < bucket_end(grain, seq[-1]):
+            call.note(f"the last bucket ({buckets[-1]['bucket']}) covers only up to "
+                      f"{(clipped.end_exclusive - dt.timedelta(days=1)).isoformat()} (the period ends inside that {grain})")
+        if per.end_exclusive is None or (per.end_exclusive and per.end_exclusive > end):
+            call.note(f"buckets after today's {grain} are left out; the period ends {end.isoformat()} (exclusive)")
+        self._base_notes(call, spec)
+        self._period_notes(call, per, today)
+        for t in scope.tables:
+            call.table(t)
+        call.summary = f"{len(buckets)} buckets, {res['percent_overall']}%"
         return res
 
     def _compare_records(self, call: _Call, object: str, segments: list, date_field: str | None = None,

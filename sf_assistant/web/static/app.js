@@ -304,11 +304,33 @@
     return checked ? checked.value : "merged";
   }
 
+  // The last two answered questions of this page, oldest first, as {role, content} turns: the server reads a
+  // follow-up ("plot this rate") as a whole question with them (agent/followup.py, the ask service's rewrite). Each
+  // text is cut to TURN_CHARS, and the oldest pair goes while the request would pass the server's body limit.
+  var TURN_CHARS = 1500;
+  var MAX_BODY_BYTES = 15000;
+  function recentTurns(question) {
+    var pairs = state.history.filter(function (e) {
+      return e.status === "done" && e.result && typeof e.result.answer === "string" && e.result.answer;
+    }).slice(0, 2).reverse().map(function (e) {
+      return [{ role: "user", content: e.question.slice(0, TURN_CHARS) },
+              { role: "assistant", content: e.result.answer.slice(0, TURN_CHARS) }];
+    });
+    while (pairs.length) {
+      var turns = [].concat.apply([], pairs);
+      var size = new Blob([JSON.stringify({ question: question, recent_turns: turns, mode: "records" })]).size;
+      if (size <= MAX_BODY_BYTES) { return turns; }
+      pairs.shift();
+    }
+    return [];
+  }
+
   async function send() {
     var box = $("question");
     var question = box.value.trim();
     if (state.busy || !question || question.length > state.maxChars) { return; }
     var epoch = state.epoch;
+    var turns = recentTurns(question);   // before this question joins the history
     var entry = { id: state.nextId++, question: question, mode: selectedMode(), askedAt: new Date(),
                   started: Date.now(), status: "waiting", ticket: null, result: null, error: null };
     state.busy = true;
@@ -323,6 +345,7 @@
 
     var body = { question: question };
     if (entry.mode) { body.mode = entry.mode; }
+    if (turns.length) { body.recent_turns = turns; }
     var r = await api("/api/ask", body);
     if (epoch !== state.epoch) { return; }   // signed out meanwhile: nothing of it is shown
 

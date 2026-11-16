@@ -5,7 +5,11 @@ Endpoints (JSON; every POST needs Content-Type application/json):
     POST /api/login   {code}               -> {role: friend|admin} + HttpOnly SameSite=Strict session cookie
     POST /api/logout                        -> {ok}
     GET  /api/status                        -> model / records / queue / limit / job state (role null when signed out)
-    POST /api/ask     {question, mode?}     -> 202 {ticket, position}: the question is queued
+    POST /api/ask     {question, mode?, recent_turns?}
+                                            -> 202 {ticket, position}: the question is queued; recent_turns (the
+                                               last question/answer pairs of this page, {role, content} each) lets
+                                               a follow-up ("plot this rate") be read as a whole question, by the
+                                               ask service's rewrite (Pipeline.answer_followup, agent/followup.py)
     GET  /api/job                           -> {job}: the question of this device, with its answer once done
                                                (answer, kind, source_line, data_ts, seconds, queue_wait_s, charts?,
                                                trace?)
@@ -156,6 +160,7 @@ class Job:
     extra: dict = field(default_factory=dict)
     finished_at: float | None = None
     task: Any = None
+    turns: list = field(default_factory=list)   # the page's earlier question/answer pairs (follow-up rewrite)
 
     @property
     def active(self) -> bool:
@@ -584,6 +589,14 @@ def create_app(settings: WebSettings | None = None, *, pipeline: Any = None, pip
         return {"job": state.job_view(state.current_job(dev), sess.role)}
 
     # ---- ask
+    def _answer(job: Job) -> dict:
+        """The worker's call: with earlier turns the follow-up rewrite first (``Pipeline.answer_followup``, as the
+        ask service runs it); without them ``Pipeline.answer``, exactly as before."""
+        answer_followup = getattr(state.pipeline, "answer_followup", None)
+        if job.turns and callable(answer_followup):
+            return answer_followup(job.question, job.turns, job.mode)
+        return state.pipeline.answer(job.question, job.mode)
+
     def finished(ticket: int, started: float, ctx: dict, fut: asyncio.Future) -> None:
         """Done callback of the worker future (event loop thread): the lock is released only here."""
         if state.running == ticket:
@@ -629,8 +642,7 @@ def create_app(settings: WebSettings | None = None, *, pipeline: Any = None, pip
             ctx = {"session": job.session, "role": job.role, "mode": job.mode, "question": job.question,
                    "timed_out": False}
             try:
-                fut = asyncio.get_running_loop().run_in_executor(state.executor, state.pipeline.answer,
-                                                                 job.question, job.mode)
+                fut = asyncio.get_running_loop().run_in_executor(state.executor, _answer, job)
             except BaseException:
                 state.running = None
                 state.lock.release()
@@ -693,6 +705,9 @@ def create_app(settings: WebSettings | None = None, *, pipeline: Any = None, pip
         if len(question) > settings.max_question_chars:
             raise ErrorReply(400, f"The question is too long: {len(question)} characters, at most "
                                   f"{settings.max_question_chars}.")
+        turns = data.get("recent_turns") or []
+        if pipeline_mod.turns_problem(turns):
+            raise ErrorReply(400, "The earlier turns are not in the expected form.")
         mode = "merged"
         if sess.role == "admin" and data.get("mode") not in (None, ""):
             mode = data.get("mode")
@@ -714,10 +729,12 @@ def create_app(settings: WebSettings | None = None, *, pipeline: Any = None, pip
         dev.asks.append(time.time())
         ticket = state.next_ticket()
         job = dev.job = Job(ticket=ticket, question=question, mode=mode, role=sess.role, session=_short(sess.key),
-                            generation=sess.generation, asked_at=time.time())
+                            generation=sess.generation, asked_at=time.time(), turns=turns)
         state.waiting.append(ticket)
         base = {"event": "ask", "ticket": ticket, "session": _short(sess.key), "role": sess.role,
                 "client": _client(request), "mode": mode, "question": question}
+        if turns:   # how many earlier turns came with it (their text is in the earlier log lines)
+            base["turns"] = len(turns)
         task = asyncio.get_running_loop().create_task(run_job(job, base))
         job.task = task
         state.tasks.add(task)

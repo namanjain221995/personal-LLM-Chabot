@@ -43,6 +43,7 @@ from sf_assistant.agent import tables as T  # noqa: E402
 from sf_assistant.agent import timeline  # noqa: E402
 from sf_assistant.agent.llm import LLM  # noqa: E402
 from sf_assistant.agent.nudges import without_lines  # noqa: E402
+from prompt_changes import notebook_tools  # noqa: E402   # the notebook view of the record tool list
 from sf_assistant.agent.record_session import RecordSession  # noqa: E402
 from sf_assistant.cli import ask as cli_ask, print_outcome, run_file  # noqa: E402
 from sf_assistant.config import load_config, load_records_config  # noqa: E402
@@ -281,7 +282,7 @@ def test_off_chart_question_same_requests(world, monkeypatch, raw):
     assert model.rounds()["record"] == 2 and o.kind == "merged"
     for req in model.requests["record"]:
         assert req["messages"][0]["content"] == rprompts.render_records_system(o.status)   # byte for byte
-        assert _h(req["tools"]) == GOLDEN["records"]["openai_tools_sha256"]                # the catalog as ever
+        assert _h(notebook_tools(req["tools"])) == GOLDEN["records"]["openai_tools_sha256"]   # the catalog as ever
     assert not CHART_KEYS & set(row["jsonl"]) and "charts" not in row
     assert (o.charts, o.charts_switch, o.charts_error, o.charts_talk) == ([], "", "", False)
     assert o.status_lines == [] and "No chart" not in o.final and o.final.endswith(SOURCE)
@@ -401,7 +402,7 @@ def test_on_chart_note_once_every_round(world, monkeypatch, tables):
             charts.RECORDS_CHART_NOTE
         assert system.startswith(rprompts.render_records_system(o.status))   # appended, never inside the template
         assert req["messages"][1:] == off_req["messages"][1:]                # the same user message and results
-        assert req["tools"] == off_req["tools"] and _h(req["tools"]) == GOLDEN["records"]["openai_tools_sha256"]
+        assert req["tools"] == off_req["tools"] and             _h(notebook_tools(req["tools"])) == GOLDEN["records"]["openai_tools_sha256"]
     if tables == "code":
         assert T.RECORDS_TABLES_NOTE + charts.RECORDS_CHART_NOTE in record[0]["messages"][0]["content"]
     others = [r for role, reqs in model.requests.items() if role != "record" for r in reqs]
@@ -474,12 +475,15 @@ def test_map_cases_D_F_G_J_K(world, monkeypatch):
     assert [(e.query_id, e.tool, e.ok) for e in o.rec.evidence] == [("q1", "trend_records", True)]
     assert o.charts[0]["chart"]["type"] == "line" and o.status_lines == []
 
-    # J: the agent refuses twice and calls no tool: the lean bullets are shown, and the line
+    # J: the agent refuses twice and calls no tool: the record step failed, and the answer says so plainly instead of
+    # showing the lean bullets in place of the figures (2026-11-16); the record step read no records, so no note
+    # follows (review of 2026-11-16: only the objects of good data calls keep one), then the line
     model = Model("I cannot draw charts here.")
     o, row = run(world, model)
     assert model.rounds() == {"route": 1, "names": 1, "lean": 2, "knowledge": 0, "record": 2, "merge": 0}
-    assert o.rec.evidence == [] and o.kind == "knowledge" and o.merge_by is None and o.body == LEAN
-    assert o.charts == [] and o.status_lines == [W["no_data"]] and o.final == LEAN + "\n" + W["no_data"]
+    failed = pipeline.RECORDS_FAILED_ANSWER
+    assert o.rec.evidence == [] and o.kind == "none" and o.merge_by is None and o.body == failed
+    assert o.charts == [] and o.status_lines == [W["no_data"]] and o.final == failed + "\n" + W["no_data"]
 
     # K: a failed trend, then fixed: the failed call is skipped
     model = Model(BAD_TREND, TREND_CALL, "10 interviews over the months (`Interview__c`).\n" + SOURCE)
@@ -1384,3 +1388,64 @@ def test_a_result_stays_as_the_model_saw_it(world):
     assert ev.model_result == before and again[1][0]["data"] == o.charts[0]["data"]
     tool_message = next(m for m in model.requests["record"][1]["messages"] if m.get("role") == "tool")
     assert json.loads(tool_message["content"])["result"] == json.loads(json.dumps(before, default=str))
+
+
+# ------------------------------------------------------------------------------------------------ placement fixes
+# The four page questions of 2026-11-16 (placement and its rate), with the scripted model: the owner's definition in the
+# hints, a rate per month in one call and its chart, counts of placements per month, and an empty record step.
+RATE_ARGS = {**TREND_ARGS, "period": "this year",
+             "part_filters": [{"field": "Interview_Outcome__c", "op": "eq", "value": "Offer Received"}]}
+PLACED_ARGS = {**TREND_ARGS, "period": "this year",
+               "filters": [{"field": "Interview_Outcome__c", "op": "eq", "value": "Offer Received"}],
+               "measure": "count_distinct", "measure_field": "Candidate__c"}   # candidates counted: different ones
+RATE_DRAFT = ("The placement rate per month is the share of client interviews (`Interview__c`) with "
+              "`Interview_Outcome__c` = 'Offer Received' among all client interviews of that month.\n" + SOURCE)
+
+
+def test_placement_rate_monthwise_is_one_call_and_a_rate_chart(world):
+    from sf_assistant.engine.business_terms import DEFINITIONS, TERMS_HEADER
+
+    model = Model({"name": "trend_records", "args": RATE_ARGS}, RATE_DRAFT)
+    o, row = run(world, model, "can you plot the placement rate monthwise from january to october?")
+    assert model.rounds()["record"] == 2 and [e.tool for e in o.rec.evidence] == ["trend_records"]
+    user = model.requests["record"][0]["messages"][1]["content"]
+    assert TERMS_HEADER in user and DEFINITIONS["placement"] in user   # the owner's definition reaches the agent
+    (item,) = o.charts
+    res = o.rec.evidence[0].model_result
+    assert item["chart"]["type"] == "line" and item["chart"]["y_keys"] == [W["percent"]]
+    assert _drawn(item) == {b["bucket"]: b["percent"] for b in res["buckets"]}   # the chart's numbers are the result's
+    assert o.status_lines == [] and "No chart" not in o.final and o.kind in ("merged", "records")
+
+
+def test_candidates_placed_per_month_are_offer_interviews_drawn(world):
+    draft = ("Placements per month are client interviews (`Interview__c`) with `Interview_Outcome__c` = "
+             "'Offer Received'.\n" + SOURCE)
+    model = Model({"name": "trend_records", "args": PLACED_ARGS}, draft)
+    o, row = run(world, model, "can you plot the number of candidates placed from january to december 2026")
+    system = model.requests["record"][0]["messages"][0]["content"]
+    assert "- Placements per month this year (business term) -> trend_records" in system
+    assert ('- Candidates placed per month this year (business term) -> trend_records {"object":"Interview__c",'
+            '"grain":"month"') in system and '"measure":"count_distinct","measure_field":"Candidate__c"}' in system
+    (item,) = o.charts
+    res = o.rec.evidence[0].model_result
+    assert item["chart"]["type"] == "line" and len(item["chart"]["y_keys"]) == 1
+    assert _drawn(item) == {b["bucket"]: b["value"] for b in res["buckets"]}
+    assert o.status_lines == [] and W["list"] not in o.final
+
+
+def test_a_source_line_alone_gets_one_more_round(world):
+    model = Model({"name": "trend_records", "args": RATE_ARGS}, SOURCE, RATE_DRAFT)
+    o, row = run(world, model, "can you plot the placement rate monthwise from january to october?")
+    assert model.rounds()["record"] == 3 and len(o.rec.nudges) == 1
+    assert o.rec.nudges[0] == rprompts.RECORDS_FINAL_FORM_MESSAGE and not o.rec.error
+    assert o.charts and o.charts[0]["chart"]["y_keys"] == [W["percent"]] and o.status_lines == []
+
+
+def test_an_empty_record_step_says_the_figures_could_not_be_computed(world):
+    model = Model({"name": "trend_records", "args": RATE_ARGS}, SOURCE)   # every draft is the Source line alone
+    o, row = run(world, model, "can you plot the placement rate monthwise from january to october?")
+    assert o.rec.error == "empty record answer" and o.kind == "none" and o.charts == []
+    # the lean answer names Interview__c, which the record step read: it may follow, labelled
+    assert o.body == f"{pipeline.RECORDS_FAILED_ANSWER}\n\n{pipeline.RECORDS_FAILED_NOTE_LABEL}\n{LEAN}"
+    assert o.status_lines == [W["answer_failed"]] and o.final == o.body + "\n" + W["answer_failed"]
+    assert row["jsonl"]["record_dropped_raw"] == SOURCE and row["jsonl"]["answer_kind"] == "none"

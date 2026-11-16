@@ -41,6 +41,7 @@ from sf_assistant import prompts as _prompt_files   # the hint section's text (p
 from sf_assistant.engine.catalog import (BLANK_VALUES, FIELD_SENSITIVITY, TEXT_INDEX_MAX_DISTINCT, RecordError,
                                          entity_key)
 from sf_assistant.engine.contact import asks_for_contact
+from sf_assistant.engine.business_terms import is_not_the_term, not_the_term   # the owner's terms (2026-11-16)
 from sf_assistant.engine.query_builder import Frag
 from sf_assistant.engine.sql_guard import quote_ident
 from sf_assistant.tools.knowledge_tools import corrected_text
@@ -731,8 +732,10 @@ class ValueSpotsMixin:
         prints; a text place among them is not repeated. All statements within :data:`VALUE_HINT_BUDGET_S`; the
         section is cut to :data:`VALUE_HINT_MAX_CHARS` ("Also" places first, then the linked lists of the last
         spans, then whole spans from the end). No record Id and no stored value other than the named ones."""
+        other = not_the_term(question)   # a business term's other reading is never hinted (engine.business_terms)
         spots = [s for s in self._question_values(question) if isinstance(s, dict) and s.get("listed")
-                 and s.get("object") and s.get("field")]
+                 and s.get("object") and s.get("field") and not (other and all(
+                     is_not_the_term(other, s["object"], s["field"], x) for x in (s.get("values") or [s.get("value")])))]
         printed = {(str(r[0]), str(r[1]), str(r[2])) for r in shown or () if len(r) >= 3}
         spots = [s for s in spots if not (s.get("kind") == "text" and any(
             (s["object"], s["field"], str(v)) in printed for v in (s.get("values") or [s.get("value")])))]

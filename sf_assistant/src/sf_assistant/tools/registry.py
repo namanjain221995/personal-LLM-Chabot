@@ -397,6 +397,14 @@ SPLIT_BY = {"type": "string", "description": "Optional second field (picklist, c
                                              "each group down by, e.g. Interview_Outcome__c."}
 
 
+#: The rate per period of trend_records (placement fixes, 2026-11-16): the one change of the record tool list against
+#: the notebook's (tests/test_tool_registry.py takes both out to compare with the notebook's golden lists).
+TREND_RATE_TEXT = ("With part_filters: part, base and percent per bucket (a rate per period in one call); a bucket "
+                   "with no base records has part and base 0 and percent null (no rate, not 0%). ")
+TREND_PART_FILTERS = {"type": "array", "minItems": 1, "maxItems": 8, "items": FILTER_ITEM_BRIEF,
+                      "description": "What makes a record count as the part (filters are the base); count only."}
+
+
 def _obj_schema(props: dict, required: list[str]) -> dict:
     return {"type": "object", "properties": props, "required": required, "additionalProperties": False}
 
@@ -463,11 +471,12 @@ SCHEMAS: dict[str, tuple[str, dict]] = {
                     ["object", "group_by"])),
     "trend_records": (
         "Counts (or another measure) per day/week/month/quarter/year over a time window, bucketed on the SAME date "
-        "field the window uses. Empty buckets are filled with 0. Example: {\"object\":\"Interview__c\",\"grain\":"
-        "\"month\",\"date_field\":\"Date_of_Interview__c\",\"period\":\"last 6 months\"}",
+        "field the window uses. Empty buckets are filled with 0. " + TREND_RATE_TEXT + "Example: {\"object\":"
+        "\"Interview__c\",\"grain\":\"month\",\"date_field\":\"Date_of_Interview__c\",\"period\":\"last 6 months\"}",
         _obj_schema({"object": OBJECT, "grain": {"type": "string", "enum": ["day", "week", "month", "quarter", "year"]},
                      "date_field": DATE_FIELD, "period": PERIOD, "split_by": SPLIT_BY, "measure": MEASURE,
-                     "measure_field": MEASURE_FIELD, "filters": FILTERS, "any_of": ANY_OF, "related": RELATED},
+                     "measure_field": MEASURE_FIELD, "filters": FILTERS, "any_of": ANY_OF, "related": RELATED,
+                     "part_filters": TREND_PART_FILTERS},
                     ["object", "grain", "date_field", "period"])),
     "compare_records": (
         "Compare 2 to 4 segments of the same object (e.g. ghosted vs rejected, this month vs last month). Each segment "

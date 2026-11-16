@@ -58,8 +58,9 @@ def test_every_file_parses_and_is_well_formed():
     # (code_merge_label; step-2 fixes of 2026-10-30: code_merge_counted) + 4 of the code-built tables (latency plan
     # step 3: records_tables_note, combine_tables_note, records_tables_marker_message, records_table_words) + 2 of the
     # charts of 2026-11-03 (records_chart_note, records_chart_words) + 1 of the ask service of 2026-11-04
-    # (followup_rewrite); the last 28 are new, so the notebook golden does not cover them
-    assert len(files) == 96
+    # (followup_rewrite) + 1 of the placement fixes of 2026-11-16 (business_terms); the last 29 are new, so the
+    # notebook golden does not cover them
+    assert len(files) == 97
     for path in files:
         raw = path.read_bytes()
         assert b"\r" not in raw and not raw.startswith(b"\xef\xbb\xbf"), path.name

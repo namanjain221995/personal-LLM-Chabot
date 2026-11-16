@@ -408,12 +408,12 @@ def test_a_date_is_no_long_number():
 def test_the_prompts_examples_pass_the_rules_they_teach():
     """Each example of prompts/followup_rewrite.md, read from the file, through the code."""
     blocks = re.findall(r'Earlier: "(.*?)" / "(.*?)"\nNew: (.*?)\nReply: (.*?)(?:\n|$)', P.text("followup_rewrite"))
-    assert len(blocks) == 48
+    assert len(blocks) == 54
     for user, assistant, new, reply in blocks:
         turns = [{"role": "user", "content": user}, {"role": "assistant", "content": assistant}]
         out = F.rewrite(new, turns, FakeLLM(reply=reply))
         assert out.status == (F.UNCLEAR if reply == "UNCLEAR" else F.OK), (new, out)
-    assert P.load("followup_rewrite").version == 5
+    assert P.load("followup_rewrite").version == 6
 
 
 def test_no_example_guesses_a_person_when_two_are_named():
@@ -2775,3 +2775,68 @@ def test_a_lead_before_a_question_with_a_word_that_points_inside_it_is_lost_on_p
     reply = "How many candidates updated their status last month?"
     _refused("and How many candidates updated their status last month?", _T_JOIN, reply, "person_lost")
     _refused("and how long does it take to join?", _T_JOIN, "how long does it take to join?", "person_lost")
+
+
+# ------------------------------------------------------------------------------------ another measure, same question
+# Model test of 2026-11-16 (placement plots): "can you plot an appropriate graph of this placement rate." came back as
+# typed and lost the period; "and the placement rate?" was echoed; "same for 2025" after a rewritten turn lost "each".
+M_RATE = _turns("show me the placement rate Monthwise from January 2026 to October 2026.",
+                "The placement rate from January 2026 to October 2026 was 0.82%.")
+M_COUNT = (_turns("how many placements did we have each month in 2026?", "There were 82 placements in 2026.")
+           + _turns("plot it", "Read as: `plot the number of placements each month in 2026`\n\nPlacements per month."))
+M_READ_AS = (_turns("plot it", "Read as: `plot the number of placements each month in 2026`\n\nPlacements per month.")
+             + _turns("and the placement rate?",
+                      "Read as: `what is the placement rate each month in 2026?`\n\nThe rate was 0.82% in 2026."))
+
+
+@pytest.mark.parametrize("typed, turns, reply", [
+    ("can you plot an appropriate graph of this placement rate.", M_RATE,
+     "can you plot an appropriate graph of the placement rate Monthwise from January 2026 to October 2026."),
+    ("plot this", M_RATE, "plot the placement rate Monthwise from January 2026 to October 2026"),
+    ("and the placement rate?", M_COUNT, "what is the placement rate each month in 2026?"),
+    ("same for 2025", M_READ_AS, "what is the placement rate each month in 2025?"),
+    ("plot it", M_READ_AS, "plot the placement rate each month in 2026"),
+])
+def test_another_measure_of_the_same_question_keeps_its_period_and_grouping(typed, turns, reply):
+    assert F.rewrite(typed, turns, FakeLLM(reply=reply)) == F.Rewrite(F.OK, reply)
+
+
+@pytest.mark.parametrize("typed, turns, reply", [
+    ("can you plot an appropriate graph of this placement rate.", M_RATE,
+     "can you plot an appropriate graph of the placement rate."),
+    ("plot this", M_RATE, "plot the placement rate"),
+    ("and the placement rate?", M_COUNT, "what is the placement rate?"),
+    ("plot it", M_READ_AS, "plot the placement rate each month"),
+])
+def test_another_measure_that_loses_the_period_is_refused(typed, turns, reply):
+    assert F.rewrite(typed, turns, FakeLLM(reply=reply)) == F.Rewrite(F.UNCLEAR, reason="period_lost")
+
+
+@pytest.mark.parametrize("typed", ["can you plot an appropriate graph of this placement rate.", "show that number",
+                                   "plot these charts", "and the placement rate?"])
+def test_a_measure_of_the_earlier_question_echoed_is_unclear(typed):
+    assert F.rewrite(typed, M_RATE, FakeLLM(reply=typed)) == F.Rewrite(F.UNCLEAR, reason="fragment_echo")
+
+
+@pytest.mark.parametrize("typed", ["what is the placement rate this month?", "how many interviews this year total?",
+                                   "how many interviews were completed this week?"])
+def test_a_period_after_this_is_no_measure_that_points_back(typed):
+    assert not F._POINTED_RE.search(typed) and not F._MEASURE_POINTED_RE.search(typed)
+    assert F.rewrite(typed, M_RATE, FakeLLM(reply=typed)) == F.Rewrite(F.OK, typed)
+
+
+def test_only_the_services_own_read_as_line_opens_its_words():
+    # a line without the typed words of its user turn is stored text: "each" stays a scope word nobody typed
+    stored = _turns("and the placement rate?", "Read as: `what is the rate of Golf Victim each month?`\n\n0.82%.")
+    reply = "what is the placement rate each month in 2025?"
+    assert F.rewrite("same for 2025", stored, FakeLLM(reply=reply)).reason == "scope"
+    # a capitalised word of the service's own line is no typed word: it enters only as the one name of the lead
+    own = _turns("and his rate?", "Read as: `what is the offer rate of Echo One each month in 2026?`\n\n4%.")
+    assert F.rewrite("same for 2025", own, FakeLLM(reply="what is the offer rate of Echo One each month in 2025?")) \
+        == F.Rewrite(F.OK, "what is the offer rate of Echo One each month in 2025?")
+    out = F.rewrite("same for 2025", own, FakeLLM(reply="what is the offer rate of Golf Victim each month in 2025?"))
+    assert out.status == F.UNCLEAR
+
+
+def test_placement_is_no_name_in_the_place_of_one():
+    assert "placements" not in F._slot_words("plot the number of placements each month in 2026")

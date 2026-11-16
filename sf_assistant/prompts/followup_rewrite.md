@@ -1,6 +1,6 @@
 ---
 id: followup_rewrite
-version: 5
+version: 6
 name: FOLLOWUP_REWRITE_SYSTEM
 module: sf_assistant.agent.followup
 source: "new in the ask service of 2026-11-04 (web/ask_mcp.py, only with earlier turns): the rewrite call before Pipeline.answer; the page and the cli never make it"
@@ -22,7 +22,8 @@ Step 3. Write the full question.
 - A pronoun that points back never stays: his, her, him, he, she, uska, uski, iska, isko and isne go, and the name or record takes their place ("isko" becomes "INT-0001 ko", "uska" becomes "Echo One ka"). A reply that still holds one is wrong: nobody could answer it.
 - A Hinglish question stays Hinglish, with its own words ("kya hai", "kaun hai", "batao", "bhejo"): put the name in with ka, ki or ke, never as "What is ... of".
 - A question that only points ("what about her?", "and him?", "same for Foxtrot Person") takes over the user's earlier question for the person it means. Never reply "what about her Echo One?" or "same for Foxtrot Person": that asks nothing.
-- A count or a list goes on with the period of the user's earlier question, unless the NEW QUESTION gives its own. That holds also when the NEW QUESTION counts something else or has another verb: after a question about last month, "and how many did he cancel?" is about last month. Without the period the count runs over all time, and that number is wrong.
+- A count, a rate, a list or a chart goes on with the period of the user's earlier question, unless the NEW QUESTION gives its own. That holds also when the NEW QUESTION counts something else or has another verb: after a question about last month, "and how many did he cancel?" is about last month. Without the period the count runs over all time, and that number is wrong.
+- A question that names another measure or asks for a chart of the earlier question ("and the offer rate?", "this offer rate", "plot this", "plot it") takes over the user's earlier question with that measure: its person, its period and its grouping ("each month", "monthwise", "by recruiter", "har mahine") stay, in its own language, and a "this" or "that" before the measure becomes "the". When the last answer starts with a "Read as:" line, that line is the earlier question.
 - Copy a name from the turns as it is written there. For a group (they, them), use the words of the user's earlier question for it, never a list of names, also when the answer gives the names.
 - Build the rest from the user's earlier question, not from the answer: no word that only the answer has ("the calls of Echo One in May", never "the calls taken by Echo One"), no field, filter, value or count of its own, and no e-mail address, phone number or other contact detail. Ask for contact details only when the NEW QUESTION does.
 
@@ -39,6 +40,30 @@ Reply: What is the designation of Echo One?
 Earlier: "How many interviews were completed this month?" / "12 interviews were completed this month."
 New: and for last month?
 Reply: How many interviews were completed last month?
+
+Earlier: "show me the offer rate monthwise from March 2025 to August 2025." / "The offer rate from March 2025 to August 2025 was 4.1%."
+New: can you plot a graph of this offer rate.
+Reply: can you plot a graph of the offer rate monthwise from March 2025 to August 2025.
+
+Earlier: "how many offers did we make each month in 2025?" / "We made 40 offers in 2025."
+New: and the offer rate?
+Reply: what is the offer rate each month in 2025?
+
+Earlier: "how many offers did Echo One make each month in 2025?" / "Echo One made 14 offers in 2025."
+New: and the offer rate?
+Reply: what is the offer rate of Echo One each month in 2025?
+
+Earlier: "2025 mein har mahine kitne offers hue?" / "2025 mein 40 offers hue."
+New: aur offer rate?
+Reply: 2025 mein har mahine offer rate kya hai?
+
+Earlier: "how many interviews were completed each week in March?" / "68 interviews were completed in March."
+New: plot this
+Reply: plot the number of interviews completed each week in March
+
+Earlier: "and the offer rate?" / "Read as: `what is the offer rate each month in 2025?` The offer rate in 2025 was 4.1%."
+New: same for 2024
+Reply: what is the offer rate each month in 2024?
 
 Earlier: "When did Echo One join?" / "Echo One joined in 2024."
 New: his email?
@@ -223,4 +248,4 @@ Reply: who is that person Recruiter A?
 Last check before you reply:
 - A complete question (step 1) comes back letter for letter, in its own language, also with "their" or "it" inside it.
 - Any other reply holds no his, her, him, he, she, uska, uski, iska, isko or isne and starts with no and or aur: what they point at takes their place, or the reply is UNCLEAR when step 2 says so.
-- A count or a list keeps the period of the user's earlier question, unless the NEW QUESTION gives its own.
+- A count, a rate, a list or a chart keeps the period and the grouping of the user's earlier question, unless the NEW QUESTION gives its own.

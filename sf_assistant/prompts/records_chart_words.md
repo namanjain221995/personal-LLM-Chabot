@@ -1,6 +1,6 @@
 ---
 id: records_chart_words
-version: 4
+version: 5
 name: RECORDS_CHART_WORDS
 module: sf_assistant.agent.charts
 source: "new in the charts of 2026-11-03 (SFA_CHARTS=on only): the words code writes on a chart and in its reason line"
@@ -11,6 +11,7 @@ bare: A chart needs the data named in the same question, for example: bar chart 
 records_off: No chart: record data is switched off for this answer.
 no_data: No chart: this answer did not use record data.
 failed: No chart: the data could not be read.
+answer_failed: No chart: the figures could not be computed this time.
 people: No chart: answers about named people are not drawn. Ask for counts by a field.
 one_number: No chart: the answer is one number, so there is nothing to compare.
 one_share: No chart: the answer is one percentage, not a set of parts.
@@ -32,6 +33,7 @@ negative: No chart: negative values are not drawn.
 dates: No chart: these values are dates or text, not amounts.
 too_large: No chart: this result is too large to draw.
 fault: No chart: it could not be drawn this time.
+rate_counts: No chart: a rate was asked, and these results hold counts, not a rate per period.
 overrule: a question that asks for a chart
 showing_top: Showing the top <<SHOWN>> of <<TOTAL>> <<UNIT>>.
 showing_low: Showing the lowest <<SHOWN>> of <<TOTAL>> <<UNIT>>.
@@ -62,6 +64,12 @@ avg: Average of <<FIELD>>
 min: Lowest <<FIELD>>
 max: Highest <<FIELD>>
 count_distinct: Distinct <<FIELD>>
+percent: Percent
+rate_part: Part (records)
+rate_base: Base (records)
+rate_of: Percent of the records in each period that match the condition on <<FIELDS>>
+rate_overall: Whole period: <<COUNT>>% (<<SHOWN>> of <<TOTAL>> records)
+no_base: No records in <<LABELS>>, so no rate there (not 0%).
 total: Total
 compared: Compared
 segment: Segment <<COUNT>>
