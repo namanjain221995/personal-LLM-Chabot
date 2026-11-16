@@ -127,29 +127,80 @@ def _pick_artifact(candidates: Sequence[dict], intent: ArtifactIntent) -> Option
 # -------------------------------------------------------------- material --
 
 
+#: How many rows of a Salesforce result reach a file.
+_SF_TABLE_ROWS = 500
+
+
 async def _salesforce_table(instruction: str, history: Sequence[dict]) -> Tuple[List[C.DataTable], List[C.Source], List[str]]:
     """Salesforce mode: ONE guarded query for a data-shaped request, through
     the same engine the chat uses. Empty data is said, not invented."""
-    from .sql import generate_and_run_sql
+    from ..config import settings
+    from ..continuity import LeaseLost, QueuedForRecovery
+    from ..core.schema_cache import schema_cache
+    from .sql import (
+        _cut_line,
+        _fetch_cut_total,
+        _left_out_line,
+        _limit_total,
+        _note_an_empty_table,
+        _nothing_shown_line,
+        count_every_row,
+        deterministic_summary,
+        generate_and_run_sql,
+        is_aggregate,
+        zero_rows_prefix,
+    )
 
     notes: List[str] = []
     try:
-        sql, columns, rows = await asyncio.wait_for(
-            generate_and_run_sql(instruction, history=history, fetch_cap=500), timeout=90.0,
+        result = await asyncio.wait_for(
+            generate_and_run_sql(instruction, history=history, fetch_cap=_SF_TABLE_ROWS), timeout=90.0,
         )
+        sql, columns, rows = result
     except asyncio.TimeoutError:
         notes.append("Salesforce data could not be queried in time; the document says so where numbers were expected.")
         return [], [], notes
+    except (QueuedForRecovery, LeaseLost):
+        raise  # parked for the main model: no document is made of what did not run
     except Exception as exc:  # noqa: BLE001 — the document is still made, without the numbers
         log.info("artifact: salesforce query failed: %s", type(exc).__name__)
         notes.append("Salesforce data was not available for this request; the document says so where numbers were expected.")
         return [], [], notes
-    if not columns or not rows:
-        notes.append("The Salesforce query returned no rows; the document must say the data is empty rather than estimate it.")
+    left_out = getattr(result, "left_out", None) or {}
+    total = await asyncio.to_thread(_limit_total, sql, rows, instruction)
+    if total is None and len(rows) >= _SF_TABLE_ROWS:
+        total = await asyncio.to_thread(_fetch_cut_total, sql, rows, instruction)
+    if rows and not columns:
+        # Held back is not empty: "the data is empty" would be false of every record it matched.
+        if total is None and len(rows) >= _SF_TABLE_ROWS:
+            total = await asyncio.to_thread(count_every_row, sql)
+        notes.append(
+            f"{_nothing_shown_line(sql, rows, left_out, total)} The data is not empty: the document must not call it "
+            "empty, and must not estimate what was held back."
+        )
         return [], [], notes
+    try:
+        schema = await asyncio.to_thread(schema_cache.get, settings.duckdb_path)
+    except Exception:  # noqa: BLE001 — the warning below can read the statement alone
+        schema = {}
+    computed = deterministic_summary(columns, rows, aggregated=is_aggregate(sql), statement=sql)
+    await asyncio.to_thread(_note_an_empty_table, computed, sql, schema)
+    zero = zero_rows_prefix(computed).strip()
+    if zero:
+        notes.append(f"{zero} The document must say so: it must not call the data empty, and must not estimate it.")
+    if not columns or not rows:
+        return [], [], notes
+    if _left_out_line(left_out):
+        notes.append(_left_out_line(left_out))
+    partial = ""
+    if total is not None:
+        # On the table, because code computes totals from it long after this note: a
+        # model that obeyed still got "Total 5000.0" in the file, over 500 rows of 1,200.
+        partial = f"{_cut_line(sql, len(rows), total)} No total in this file covers the whole result."
+        notes.append(f"{partial} Say so wherever the table or a figure from it is used.")
     today = _dt.date.today().isoformat()
     source = C.Source(id="sf1", title="Salesforce (synced data)", text=f"Query run on {today}: {sql[:400]}", kind="salesforce", retrieved_at=today)
-    table = C.DataTable(id="t1", title="Salesforce query result", columns=[str(c) for c in columns], rows=[list(r) for r in rows[:T.MAX_ROWS_PER_SHEET]], source_id="sf1")
+    table = C.DataTable(id="t1", title="Salesforce query result", columns=[str(c) for c in columns], rows=[list(r) for r in rows[:T.MAX_ROWS_PER_SHEET]], source_id="sf1", partial=partial)
     return [table], [source], notes
 
 
@@ -1362,6 +1413,8 @@ async def run_artifact_engine(
         material.tables.extend(sf_tables)
         material.sources.extend(sf_sources)
         material.notes.extend(sf_notes)
+        # Notes reach only the model. This one the person reads too.
+        warnings.extend(table.partial for table in sf_tables if table.partial)
     if operation == "create" and mode == "assistant" and web_allowed:
         await emit("status", {"text": "Checking whether current sources are needed…"})
         material.sources.extend(await _web_sources(instruction, history, effort=effort, user_id=int(user_id), conversation_id=conversation_id, emit=emit))

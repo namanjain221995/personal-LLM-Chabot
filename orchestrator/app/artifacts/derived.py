@@ -756,8 +756,11 @@ def enforce(spec: Any, tables: Sequence[Any], *, parent: Any = None) -> Tuple[An
             out.append(_totals_as_formulas(sheet, derived, notes))
             report["totals"].append(sheet.name)
             continue
-        sheet = _with_resolved_charts(sheet, real)
-        built = _from_binding(sheet, real) or _from_chart(sheet, real) or _from_headlines(sheet, real)
+        # Nothing is worked out from a cut of a result: over 500 of 1,200 rows, "Total" is a
+        # wrong number that code would write into the file. A typed figure goes the same way.
+        whole = [t for t in real if not _table_attr(t, "partial", "")]
+        sheet = _with_resolved_charts(sheet, whole)
+        built = _from_binding(sheet, whole) or _from_chart(sheet, whole) or _from_headlines(sheet, whole)
         if built is not None:
             columns, rows, table, how, more, agg_by_col = built
             try:
@@ -778,7 +781,7 @@ def enforce(spec: Any, tables: Sequence[Any], *, parent: Any = None) -> Tuple[An
             # share % column" to a computed monthly sheet dropped the sheet).
             out.append(kept)
             continue
-        chart_only = _chart_only(sheet, real)
+        chart_only = _chart_only(sheet, whole)
         if chart_only is not None:
             notes.append(f"the {sheet.name} table was left out: its figures were typed, not computed from the data; the chart beside it was computed from the data and is kept")
             out.append(chart_only)

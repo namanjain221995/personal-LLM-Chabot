@@ -142,6 +142,9 @@ PRIVATE_META_KEYS: Dict[str, str] = {
     "salesforce_sources": "Salesforce records",
     "salesforce_scope": "Salesforce records",
     "salesforce_error": "Salesforce records",
+    # An agent step that answered from the catalogue: no statement ran, so there
+    # is no source to read this from, and the org's field names are still in the text.
+    "salesforce_catalogue": "Salesforce records",
     # `citations` is NOT the web-source list (that is `sources`): it is
     # {record_id, object, url} — pointers to Salesforce records.
     "citations": "Salesforce records",

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from typing import Awaitable, Callable, List, Optional, Sequence
 from urllib.parse import urlparse
 
@@ -24,8 +25,50 @@ log = logging.getLogger(__name__)
 Emit = Callable[[str, dict], Awaitable[None]]
 
 # Room per page in the prompt; the 131072 window comfortably holds several.
+#: A link to the company's own org is the one link this engine will not open.
+ORG_LINK_LINE = (
+    "I do not open links to the company's Salesforce org, so that link was not "
+    "fetched. I read Salesforce records only from the synced copy: ask about the "
+    "record by name or number and I will look there."
+)
+#: Where this chat cannot look. A person on assistant mode, or with the Salesforce
+#: feature off, has nowhere to ask, so this line makes no offer.
+ORG_LINK_LINE_NO_RECORDS = (
+    "I do not open links to the company's Salesforce org, so that link was not fetched, "
+    "and this chat does not read Salesforce records, so I cannot say anything about that record."
+)
+#: In the message's place of the link, so "this" cannot come to mean an earlier turn.
+_ORG_LINK_MARKER = "[a link to the company's Salesforce org, not opened]"
+#: A short message with one of these is about the record behind the link.
+_ABOUT_THE_RECORD_RE = re.compile(
+    r"\b(?:this|that|it|here|record|page|link|status|lead|contact|account|opportunity|candidate|report|dashboard|case)\b",
+    re.I,
+)
+_ABOUT_THE_RECORD_CHARS = 200
+#: What the model is told when the message has more in it than the refused link.
+_ORG_LINK_SYSTEM = (
+    "The message holds a link to the company's Salesforce org. It was not opened, and the person has "
+    "already been told so. You know nothing about that record or any other Salesforce record: give no "
+    "status, number, name or date for one. Answer only what the message can settle without it, from what "
+    "it contains and from your own knowledge. If the message carries pasted text or a document, that "
+    "content is the substance of the request — use it."
+)
 _PER_DOC_CHARS = 12000
 _TOTAL_DOC_CHARS = 90000
+
+
+def org_link_line(salesforce: bool) -> str:
+    return ORG_LINK_LINE if salesforce else ORG_LINK_LINE_NO_RECORDS
+
+
+def _only_about_the_link(message: str, refused: Sequence[str]) -> bool:
+    """Nothing else in the message, or nothing a model could answer without the record."""
+    rest = message
+    for url in refused:
+        rest = rest.replace(url, " ")
+    if not re.search(r"\w", rest):
+        return True
+    return len(rest.strip()) < _ABOUT_THE_RECORD_CHARS and bool(_ABOUT_THE_RECORD_RE.search(rest))
 
 
 #: What the sharer is told when their link stays private. Keyed by the
@@ -275,6 +318,7 @@ async def run_url_engine(
     emit: Emit,
     effort: str = "think",
     user_id: Optional[int] = None,
+    salesforce: bool = True,
 ) -> str:
     """Fetch any new URLs, then answer from all pages stored for this chat.
 
@@ -295,6 +339,11 @@ async def run_url_engine(
     level = llm.normalize_effort(effort)
     already = await db.run_in_thread(db.get_url_document_urls, conversation_id)
     attempted: List[dict] = []
+    # The fetcher refuses these anyway. This is what tells the person: left to the
+    # "could not be fetched" prompt below, the model would answer the rest of the
+    # message about that record from nothing.
+    refused = [url for url in urls if net.is_org_host(url)]
+    urls = [url for url in urls if url not in refused]
     for url in urls:
         if url not in already:
             doc = await fetch_and_store(conversation_id, url, emit, user_id=user_id)
@@ -319,30 +368,48 @@ async def run_url_engine(
     queued_sites = [s for s in attempted if s.get("job_id") is not None]
 
     docs = await db.run_in_thread(db.get_url_documents, conversation_id)
-    if not docs:
+    # Pages from earlier in this chat are not what this link asked about.
+    only_refused = bool(refused) and not (urls and docs)
+    line = org_link_line(salesforce) if refused else ""
+    if only_refused and _only_about_the_link(message, refused):
+        await emit("token", {"text": line})
+        await emit("meta", {"route": "url", "fetch_failed": True})
+        return line
+    if refused:
+        await emit("token", {"text": f"{line}\n\n"})
+    if not docs or only_refused:
         # Nothing could be fetched — a paywall, a login wall, a dead host, or a
         # page that is all JavaScript. That is a reason to say so and then still
         # ANSWER, not to stop. Replying with one sentence used to throw away
         # whatever else the message contained, which for a large paste was the
         # entire point of sending it (owner report, 2026-08-11).
         parts: List[str] = []
+        if only_refused:
+            # An earlier turn's "12 open positions" must not become the answer about this
+            # link, so no history, and no address for "this" to lose itself in.
+            asked = message
+            for url in refused:
+                asked = asked.replace(url, _ORG_LINK_MARKER)
+            earlier: Sequence[dict] = []
+            # A link beside it that could not be read is still said to be unread.
+            told = _ORG_LINK_SYSTEM + (" The other links in the message could not be fetched: say so." if urls else "")
+        else:
+            asked = message
+            earlier = recent_turns(history, settings.chat_history_turns)
+            told = (
+                "The links in the user's message could not be fetched — "
+                "they may need a login, block automated readers, or be "
+                "unreachable. Say that plainly in ONE short sentence, then "
+                "answer the rest of the message from what it already "
+                "contains and from your own knowledge. Never pretend you "
+                "read a page you did not. If the message carries pasted "
+                "text or a document, that content is the substance of the "
+                "request — use it."
+            )
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "The links in the user's message could not be fetched — "
-                    "they may need a login, block automated readers, or be "
-                    "unreachable. Say that plainly in ONE short sentence, then "
-                    "answer the rest of the message from what it already "
-                    "contains and from your own knowledge. Never pretend you "
-                    "read a page you did not. If the message carries pasted "
-                    "text or a document, that content is the substance of the "
-                    "request — use it."
-                )
-                + DIAGRAM_INSTRUCTION,
-            },
-            *recent_turns(history, settings.chat_history_turns),
-            {"role": "user", "content": message},
+            {"role": "system", "content": told + DIAGRAM_INSTRUCTION},
+            *earlier,
+            {"role": "user", "content": asked},
         ]
         async for kind, delta in llm.stream_chat_events(
             messages, effort=level, max_tokens=12000
@@ -359,9 +426,10 @@ async def run_url_engine(
             )
             await emit("token", {"text": answer})
         await emit("meta", {"route": "url", "fetch_failed": True})
-        return answer
+        # The stored text is what the stream said.
+        return f"{line}\n\n{answer}" if line else answer
 
-    parts: List[str] = []
+    parts: List[str] = [f"{line}\n\n"] if refused else []
     async for kind, delta in llm.stream_chat_events(
         _answer_messages(message, docs, history), effort=level, max_tokens=12000
     ):

@@ -17,7 +17,7 @@ Pure module: stdlib only.
 from __future__ import annotations
 
 import re
-from typing import Tuple
+from typing import Callable, Tuple
 
 
 class SQLGuardError(ValueError):
@@ -48,10 +48,66 @@ _FORBIDDEN_TABLE_FUNCS = re.compile(
     r"parquet_schema|parquet_file_metadata|parquet_kv_metadata|"
     r"read_json_auto|read_json_objects_auto|read_json_objects|read_json|"
     r"read_ndjson_auto|read_ndjson_objects|read_ndjson|read_text|read_blob|"
-    r"read_xlsx|glob|sniff_csv|delta_scan|iceberg_scan|st_read"
+    r"read_xlsx|glob|sniff_csv|delta_scan|iceberg_scan|st_read|"
+    # A statement in a string reads whatever it names, past what the engine
+    # can see of the statement.
+    r"query|query_table"
     r")\s*\(",
     re.IGNORECASE,
 )
+
+
+#: `E'\\''` and `$$'$$` read differently here and in DuckDB, so anything after one
+#: can hide from every check on the text. Nothing the writer needs is lost.
+_E_STRING_RE = re.compile(r"(?<![\w$])[eE]'")
+#: What DuckDB reads as one token, in the order it reads them: an apostrophe in a
+#: comment or in a quoted name opens no string, and a quote in a string closes no name.
+_TOKEN_RE = re.compile(
+    r"--[^\n]*"
+    r"|/\*.*?(?:\*/|\Z)"
+    r'''|"(?:[^"]|"")*"'''
+    r"|(?<![\w$])\$(?P<tag>(?:[A-Za-z_]\w*)?)\$.*?\$(?P=tag)\$"
+    r"|(?<![\w$])[eE]'(?:[^'\\]|\\.|'')*'"
+    r"|'(?:[^']|'')*'",
+    re.S,
+)
+_PLAIN_NAME_RE = re.compile(r'"\w+"')
+
+
+def mask_literals(sql: str) -> str:
+    """`sql`, position for position, with only what names things left readable.
+
+    Comments go, string contents go, and so do quoted names that are no plain word:
+    `AS "Recruiter's count"` must not open a string, and `AS "from Account"` names no table.
+    """
+
+    def blank(token: "re.Match") -> str:
+        text = token.group(0)
+        if text.startswith(("--", "/*")):
+            return " " * len(text)
+        if text[0] == '"':
+            return text if _PLAIN_NAME_RE.fullmatch(text) else '"' + "_" * (len(text) - 2) + '"'
+        return "'" + "_" * (len(text) - 2) + "'"
+
+    return _TOKEN_RE.sub(blank, sql or "")
+
+
+def outside_literals(sql: str, rewrite: Callable[[str], str]) -> str:
+    """`sql` with `rewrite` applied to everything but its string literals."""
+    parts = []
+    start = 0
+    for token in _TOKEN_RE.finditer(sql or ""):
+        if token.group(0).startswith(('"', "--", "/*")):
+            continue
+        parts += [rewrite(sql[start : token.start()]), token.group(0)]
+        start = token.end()
+    return "".join([*parts, rewrite((sql or "")[start:])])
+
+
+#: The engine's regexes hold the GIL for 30 s on a 30,000-character name, and no thread helps
+#: with that. The longest of 1,327 statements seen is 2,428 characters.
+_MAX_STATEMENT_CHARS = 20000
+_LONG_RUN_RE = re.compile(r"\s{257}|\w{257}")
 
 
 def _scan(sql: str) -> Tuple[str, str]:
@@ -134,11 +190,19 @@ def guard_sql(sql: str) -> str:
     """
     if sql is None or not str(sql).strip():
         raise SQLGuardError("empty SQL statement")
+    text = str(sql)
+    # Length first: the run scan over a very long input is itself slow.
+    if len(text) > _MAX_STATEMENT_CHARS or _LONG_RUN_RE.search(text):
+        raise SQLGuardError("statement too long, or a run of over 256 letters or spaces: write a short statement")
 
-    cleaned, bare = _scan(str(sql))
+    cleaned, bare = _scan(text)
     core = bare.strip().rstrip(";").strip()
     if not core:
         raise SQLGuardError("empty SQL statement (comments only)")
+    if "$" in core or _E_STRING_RE.search(core):
+        raise SQLGuardError(
+            "dollar quotes, $ parameters and E-strings are not allowed: write text as a plain 'string'"
+        )
     if ";" in core:
         raise SQLGuardError("multiple SQL statements are not allowed")
     if not _STARTS_OK.match(core):

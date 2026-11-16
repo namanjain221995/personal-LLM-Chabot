@@ -65,6 +65,8 @@ _SAFE_WORDS: FrozenSet[str] = frozenset(
     team teams term terms text time times top total totals type types unit
     units up update updated user users value values view week weeks work
     working year years
+    create created creates creating creation made send sent receive received
+    start started close closed hire hired offer offered attend attended beech
     """.split()
 )
 
@@ -117,8 +119,12 @@ _DATE_RE = re.compile(
     r"(?:this|last|next|past|previous|coming|current)\s+"
     r"(?:week|month|quarter|year|fortnight|day|weekend|monday|tuesday|"
     r"wednesday|thursday|friday|saturday|sunday)|"
-    r"(?:last|past|next|previous|coming)\s+\d+\s+"
+    r"(?:last|past|next|previous|coming)\s+(?:\d+|two|three|four|five|six|seven|eight|nine|ten|twelve)\s+"
     r"(?:day|days|week|weeks|month|months|quarter|quarters|year|years)|"
+    # "april se june", "may vs june": a period, with no digit anywhere. Bare "may"
+    # is an English word, so it counts only beside another month word.
+    r"january|february|march|april|june|july|august|september|october|november|december|"
+    r"may\s+(?:vs\.?|to|and|or|se|through)|(?:in|during|for|of|since)\s+may|"
     r"ytd|mtd|qtd|q[1-4]|fy\s?\d{2,4}|all\s?time|ever|to date|so far|"
     r"since\s+\S+|between\s+.+\s+and\s+\S+|"
     r"(?:" + _MONTHS + r")\s+\d{1,4}|\d{1,2}\s+(?:" + _MONTHS + r")|"

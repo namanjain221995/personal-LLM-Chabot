@@ -8,7 +8,7 @@ Two different questions, deliberately two different modules:
 
 A capability is a property of the ROLE. A feature is a property of the
 PERSON: an admin may want the whole workspace on the synced Salesforce copy
-but only the two analysts allowed to query the live org, and that has
+but only the two analysts allowed to search the web, and that has
 nothing to do with who can invite members.
 
 RESOLUTION, in order, each layer overriding the one before:
@@ -38,7 +38,6 @@ class Feature(str, Enum):
     WEB_SEARCH = "web_search"
     DEEP_RESEARCH = "deep_research"
     SALESFORCE = "salesforce"
-    SALESFORCE_LIVE = "salesforce_live"
     ATTACHMENTS = "attachments"
     VOICE_INPUT = "voice_input"
     VIDEO_ANALYSIS = "video_analysis"
@@ -116,13 +115,6 @@ FEATURES: tuple[FeatureSpec, ...] = (
         hint="Answer from this workspace's synced Salesforce data.",
         default=True,
     ),
-    FeatureSpec(
-        id=Feature.SALESFORCE_LIVE,
-        label="Live Salesforce",
-        hint="Query the Salesforce org directly over the read-only API. Needs Salesforce.",
-        default=True,
-        requires=Feature.SALESFORCE,
-    ),
 )
 
 BY_ID: Dict[str, FeatureSpec] = {spec.id.value: spec for spec in FEATURES}
@@ -155,8 +147,8 @@ def clean(raw: Any) -> Dict[str, bool]:
 def _apply_invariants(resolved: Dict[str, bool]) -> Dict[str, bool]:
     """A dependency cannot dangle in either direction.
 
-    Down: Salesforce off ⇒ Live Salesforce off, web search off ⇒ deep
-    research off. Repeated until stable, so a chain (a → b → c) settles.
+    Down: web search off ⇒ deep research off. Repeated until stable, so a
+    chain (a → b → c) settles.
     """
     for _ in range(len(FEATURES)):
         changed = False
@@ -207,7 +199,6 @@ class ChatGate:
     mode: str
     web_search: str
     deep_research: bool
-    sf_live: bool
     #: Human-readable names of the tools that were taken away, for the one
     #: status line the user sees. Empty when nothing was blocked — the
     #: overwhelmingly common case, which must cost nothing.
@@ -224,7 +215,6 @@ def enforce_chat(
     mode: str,
     web_search: str,
     deep_research: bool,
-    sf_live: bool,
 ) -> ChatGate:
     """The server-side gate for one chat turn.
 
@@ -239,10 +229,6 @@ def enforce_chat(
     if mode != "assistant" and not allowed(resolved, Feature.SALESFORCE):
         blocked.append(BY_ID[Feature.SALESFORCE.value].label)
         mode = "assistant"
-        sf_live = False
-    elif sf_live and not allowed(resolved, Feature.SALESFORCE_LIVE):
-        blocked.append(BY_ID[Feature.SALESFORCE_LIVE.value].label)
-        sf_live = False
 
     if deep_research and not allowed(resolved, Feature.DEEP_RESEARCH):
         blocked.append(BY_ID[Feature.DEEP_RESEARCH.value].label)
@@ -258,7 +244,6 @@ def enforce_chat(
         mode=mode,
         web_search=web_search,
         deep_research=deep_research,
-        sf_live=sf_live,
         blocked=tuple(blocked),
     )
 

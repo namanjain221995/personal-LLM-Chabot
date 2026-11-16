@@ -335,8 +335,9 @@ def test_the_route_classifier_fallback_and_the_sql_chart_call_never_think(sends,
 
 
 def test_agent_steps_follow_effort(sends):
-    """The planner and the step calls name the turn's level instead of
-    inheriting chat_completion's thinking-on default."""
+    """The step calls name the turn's level instead of inheriting
+    chat_completion's thinking-on default. The plan call has thinking off at every
+    level: at think it spent its whole budget reasoning and came back empty."""
     from app.engines.agent import PlanStep, _run_step_impl, make_plan
 
     async def plan_at(effort):
@@ -353,7 +354,7 @@ def test_agent_steps_follow_effort(sends):
         return _thinking(sends[-1])
 
     assert asyncio.run(plan_at("fast")) is False
-    assert asyncio.run(plan_at("think")) is True
+    assert asyncio.run(plan_at("think")) is False
     assert asyncio.run(step_at("fast")) is False
     assert asyncio.run(step_at("think")) is True
 

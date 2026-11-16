@@ -63,7 +63,7 @@ def test_run_sql_engine_emits_single_contract_meta(warehouse, monkeypatch):
         events.append((event, data))
 
     answer = asyncio.run(sql_engine.run_sql_engine("total by stage", [], emit))
-    assert answer == "Two rows."
+    assert answer == "Two rows.\n\nScope: every row of opportunities."
 
     metas = [d for e, d in events if e == "meta"]
     assert len(metas) == 1, "meta must be emitted exactly once per turn (§10)"
@@ -433,8 +433,8 @@ def test_a_double_query_failure_is_an_honest_message_not_an_error_frame():
             events.append((kind, data))
 
         async def boom(*_a, **_k):
-            raise RuntimeError(
-                'Binder Error: Table "p" does not have a column named "Status__c"'
+            raise sqleng.QueryRefused(
+                RuntimeError('Binder Error: Table "p" does not have a column named "Status__c"')
             )
 
         with (

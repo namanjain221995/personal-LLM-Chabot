@@ -71,8 +71,10 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tup
 from pydantic import ValidationError
 
 from .. import llm
+from ..config import settings
 from ..core import pasted
 from ..core.sf_intel.planner import extract_json_object
+from ..resilience import is_read_timeout
 from . import length as _length
 from . import spec as S
 from . import tables
@@ -129,6 +131,9 @@ class DataTable:
     columns: List[str]
     rows: List[List[Any]]
     source_id: str = ""
+    #: Non-empty when the rows are a cut of a larger result: says so, and no figure
+    #: over the whole table is computed from it (chart_data.compute).
+    partial: str = ""
 
 
 @dataclass
@@ -719,7 +724,18 @@ def _language_line(instruction: str) -> str:
 async def _json(messages: List[dict], schema: dict, name: str, *, thinking: bool, max_tokens: int, effort: Optional[str] = None) -> dict:
     # `max_tokens` is the answer's ceiling; with thinking on, json_completion
     # sizes the pool the reasoning shares (see its docstring).
-    raw = await llm.json_completion(messages, json_schema=schema, schema_name=name, temperature=0.0, max_tokens=max_tokens, thinking=thinking, effort=effort)
+    #
+    # The budget is per call and starts when the call is sent, unlike the stage's
+    # wall clock, which must also cover waiting out an engine reload. One Think
+    # call ran past 19 minutes on the shared engine (65,536 tokens of allowance)
+    # and held the whole stage. A failed section still leaves a document.
+    try:
+        with llm.generation_budget(settings.artifact_model_call_timeout_s):
+            raw = await llm.json_completion(messages, json_schema=schema, schema_name=name, temperature=0.0, max_tokens=max_tokens, thinking=thinking, effort=effort)
+    except Exception as exc:  # noqa: BLE001 — only the read timeout is ours; the rest is re-raised
+        if is_read_timeout(exc):
+            raise ComposeError("model_failure", "The model took too long on one part of this document, so I stopped it. A shorter or narrower request should work.") from exc
+        raise
     obj = extract_json_object(raw or "")
     if not isinstance(obj, dict):
         if llm.get_finish_reason() == "length":

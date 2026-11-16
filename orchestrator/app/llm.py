@@ -611,6 +611,18 @@ async def _primary_send(
         # a wait it did not cause. Fired per attempt: a resilient re-open is a
         # new dispatch.
         _fire_dispatch(on_dispatch)
+        # At the start, because the only other trace of a call is its reply: one
+        # document call ran 19 minutes with the turn stuck and no line on file to
+        # say it had begun. Sizes only, never the text.
+        log.info(
+            "model request: what=%s model=%s stream=%s max_tokens=%s messages=%d chars=%d",
+            what,
+            request.get("model"),
+            stream,
+            request.get("max_tokens"),
+            len(request.get("messages") or ()),
+            sum(len(str(m.get("content") or "")) for m in request.get("messages") or ()),
+        )
         return client.chat.completions.create(**request)
 
     if _is_primary(base_url):
@@ -1938,6 +1950,27 @@ async def chat_with_tools(
     return text, _parse_tool_calls(message)
 
 
+#: How long one `json_completion` generation may run, set by `generation_budget`.
+_generation_budget: ContextVar[Optional[float]] = ContextVar("llm_generation_budget", default=None)
+
+
+@contextlib.contextmanager
+def generation_budget(seconds: Optional[float]):
+    """Bound the `json_completion` calls in this block, each from the moment it is sent.
+
+    Per request on the SDK's `timeout=`, not a clock around the call, so waiting for
+    an engine reload is not spent from it. A non-streamed reply is silent until it is
+    done, so the read timeout is how long the generation may run, and a read timeout
+    is never re-run (`resilience.is_read_timeout`): it raises to the caller.
+    0 or None means no budget, only the client's own timeout.
+    """
+    token = _generation_budget.set(float(seconds) if seconds and seconds > 0 else None)
+    try:
+        yield
+    finally:
+        _generation_budget.reset(token)
+
+
 async def json_completion(
     messages: Sequence[dict],
     *,
@@ -1994,6 +2027,16 @@ async def json_completion(
     extra_body = reasoning_extra_body(settings.main_capabilities, thinking)
     if extra_body is not None:
         base["extra_body"] = extra_body
+    budget_s = _generation_budget.get()
+    if budget_s is not None:
+        import httpx
+
+        base["timeout"] = httpx.Timeout(
+            connect=settings.llm_connect_timeout,
+            read=budget_s,
+            write=settings.llm_write_timeout,
+            pool=settings.llm_write_timeout,
+        )
 
     # ONE settlement for BOTH sends. The guided-JSON downgrade is a caught
     # 400, not a failed turn: the request did reach the engine, so its count

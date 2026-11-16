@@ -66,7 +66,6 @@ import {
   IconGlobe,
   IconMic,
   IconSend,
-  IconSparkles,
   IconStop,
   IconX,
   IconPlay,
@@ -310,20 +309,19 @@ const DATASET_SUFFIXES = [
 /**
  * One active-tool pill: [icon] [label] [×].
  *
- * The four modes rendered through this — Salesforce, Live Salesforce, Web
- * search, Deep research — had four byte-identical copies of the same markup
- * and class list. They share this now so the pill's appearance, and its
- * responsive behaviour, are defined ONCE. Each caller keeps its own
- * `onClick`, because turning a mode off is not the same action for all of
- * them: Salesforce and Live go through activateComposerMenuItem's toggle
- * rules, and closing Live steps DOWN to synced rather than all the way off.
+ * The modes rendered through this — Salesforce, Web search, Deep research —
+ * had byte-identical copies of the same markup and class list. They share
+ * this now so the pill's appearance, and its responsive behaviour, are
+ * defined ONCE. Each caller keeps its own `onClick`, because turning a mode
+ * off is not the same action for all of them: Salesforce goes through
+ * activateComposerMenuItem's toggle rules.
  *
  * WHY THE LABEL IS `sr-only` AND NOT `hidden` BELOW md (2026-09-04).
- * On a 375px screen "[☁ Live Salesforce ×]" ate the control row and pushed
+ * On a 375px screen a long pill label ate the control row and pushed
  * the effort picker and Send out of line, so the label is dropped there. It
  * is dropped with `sr-only`, not `display:none`, because every icon in this
  * app is `aria-hidden` (components/icons.tsx) — the label IS this button's
- * accessible name, and `display:none` would leave four nameless buttons on
+ * accessible name, and `display:none` would leave nameless buttons on
  * every phone. `sr-only` is absolutely positioned, so it is not a flex item:
  * it contributes no width and no gap, which is the real layout removal the
  * row needed, while the accessible name stays "Salesforce" at every width.
@@ -1452,12 +1450,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   Turning off goes through activateComposerMenuItem, NOT a
                   bare prefs spread, so the toggle rules stay in one place
                   (lib/composerMenu.ts). */}
-              {/* ONE pill per mode (owner request 2026-08-06): "Salesforce"
-                  and "Live Salesforce" are the same source — the org — so
-                  showing two pills for Live read as two selections. Synced
-                  mode shows ☁ Salesforce; Live swaps it for ✨ Live
-                  Salesforce. Closing the Live pill steps DOWN to synced
-                  mode (not all the way off) — one × per level. */}
+              {/* sfLive is always false now (lib/prefs.ts): Live Salesforce
+                  was removed, so Salesforce mode shows this one pill. */}
               {prefs.salesforce && !prefs.sfLive && (
                 <ModeChip
                   icon={<IconCloud size={13} />}
@@ -1466,19 +1460,6 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                   onClick={() => {
                     const out = activateComposerMenuItem('salesforce', prefs);
                     if (out.kind === 'prefs') onPrefsChange(out.prefs);
-                  }}
-                />
-              )}
-
-              {prefs.salesforce && prefs.sfLive && (
-                <ModeChip
-                  icon={<IconSparkles size={13} />}
-                  label="Live Salesforce"
-                  title="Live Salesforce is on — every answer queries your org directly. Click to use the synced copy again."
-                  onClick={() => {
-                    const out = activateComposerMenuItem('sf-live', prefs);
-                    if (out.kind === 'prefs') onPrefsChange(out.prefs);
-                    textareaRef.current?.focus();
                   }}
                 />
               )}

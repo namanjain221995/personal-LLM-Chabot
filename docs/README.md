@@ -10,7 +10,8 @@ This directory contains two layers of documentation:
 Start with the current layer. Historical audit pages remain useful for deep
 module traces, but their line numbers, file/test counts, deployment topology,
 and unresolved-finding status must not be treated as current without checking
-source.
+source. That includes every page that describes live Salesforce reads: they were
+removed on 2026-11-04 (see below).
 
 ## Current reading order
 
@@ -33,6 +34,15 @@ source.
 | **My files** (2026-09-30): the page listing everything a person uploaded, what of each file is really stored, its routes, security, cost and metrics | [`MY-FILES.md`](MY-FILES.md) |
 | Salesforce clarification, query-plan safety, context budgeting | [`06-agent-design/SALESFORCE-INTELLIGENCE-MODE.md`](06-agent-design/SALESFORCE-INTELLIGENCE-MODE.md) |
 | The knowledge "brain": forensic audit, RAG/memory/search audit, ADR-0001 (one evidence pipeline, scopes, reranker, index policy), eval and benchmarks | [`07-brain/`](07-brain/) |
+
+## Salesforce boundary
+
+Every answer reads the synced warehouse, and the sync worker is the one process
+that talks to Salesforce (owner order, 2026-11-04). The orchestrator holds no
+credentials and no HTTP client for the org; see
+[`../README.md`](../README.md#12-salesforce-sync-and-warehouse). `01-codebase/`,
+`02-diagrams/` and `_evidence/` keep their 2026-07-31 descriptions of the old live
+path as history.
 
 ## Current deployment boundary
 

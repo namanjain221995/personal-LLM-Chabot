@@ -725,8 +725,18 @@ async def run_crawl_engine(
     conversation_id: str,
     history: Sequence[dict],
     emit: Emit,
+    salesforce: bool = True,
 ) -> str:
     """Crawl → store → embed → summarise. The repo engine's shape exactly."""
+    if net.is_org_host(crawl_url):
+        # The fetcher refuses it anyway, and the reason would then read as a site
+        # whose robots.txt could not be read.
+        from .url import org_link_line
+
+        line = org_link_line(salesforce)
+        await emit("token", {"text": line})
+        await emit("meta", {"route": "crawl"})
+        return line
     host, prefix = _scope_of(crawl_url)
     crawl_id = await db.run_in_thread(
         db.create_web_crawl, conversation_id, crawl_url, prefix

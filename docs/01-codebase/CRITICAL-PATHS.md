@@ -1,5 +1,11 @@
 # Critical paths — end-to-end call traces
 
+> **⚠ Superseded in part (2026-11-04).** Live Salesforce was removed: every answer
+> reads the warehouse, `core/salesforce.py` refuses every call and only the sync
+> worker talks to the org. Every description below of `fetch_live`, live SOQL, the
+> Live toggle, `sf_live` or `SF_LIVE_*` is a snapshot of the older code and has NOT
+> been re-derived. See [`README.md` §12](../../README.md#12-salesforce-sync-and-warehouse).
+
 > **Current launcher addendum (2026-08-11).** Flow 0 is derived from the
 > portable launcher. Flows 1–8 are the detailed 2026-07-31 application audit
 > and retain historical line links. They predate the launcher/overlays and
@@ -1229,7 +1235,7 @@ one `status "Compacting conversation…"` frame at `:274`.
 | 1 | Chat SSE | per-LLM-call 300 s | whole-request deadline, body size (`REL-01`), SSE heartbeat |
 | 2 | Router | `return "rag"` default | any confidence signal; a timeout of its own |
 | 3 | Agent | `MAX_STEPS = 8`, one graph pass, concurrency 3 | wall clock; per-step timeout |
-| 4 | NL→SQL | `read_only` + `enable_external_access=False` | statement timeout, `memory_limit`, injected `LIMIT`, guard/executor string parity (`SEC-07`) |
+| 4 | NL→SQL | `read_only` + `enable_external_access=False`, `SQL_STATEMENT_SECONDS` (interrupt, 30 s), DuckDB's parser tree for what a statement reads (`core/sql_tree.py`) | `memory_limit`, injected `LIMIT` |
 | 5 | RAG | `RAG_TOP_K` 30 → `RAG_FINAL_K` 8 | context-block char cap, reranker admission control, vector index |
 | 6 | Sync | watermark written last | Bulk poll deadline, restart policy (`REL-02`), delete propagation |
 | 7 | Upload/report | `UPLOAD_MAX_MB`, `ARCHIVE_MAX_*`, `MAX_SECTIONS = 6` | pandoc timeout, report retention, off-loop execution |

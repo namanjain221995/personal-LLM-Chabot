@@ -1,18 +1,15 @@
 {
-  "captured_on": "2026-09-28",
+  "captured_on": "2026-11-04",
   "captured_from": {
-    "commit": "integrate-2026-09-28 working tree at bb205c0a + the resolved DIAGRAM_INSTRUCTION: the merge of feat/every-diagram-type-reaches-a-file-r2's ten file-drawing types, feat/understand-every-picture-ask's twenty-two-head list and fix/prompt-lets-the-model-draw's two live findings (the mermaid `-beta` spellings, and no preferred TYPE), with none of the three branches' caps",
-    "orchestrator_tree_captured_from": "the working tree of the merge, because the prompt change IS the change under test; the fixture diff below is the review. Both parent branches recaptured these same twelve files against their own wording, which is why they conflicted; a third wording needs a third capture.",
-    "how": "CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/golden_capture_test (throwaway postgres:18-alpine, --locale=C, fsync off) pytest -q -p no:cacheprovider tests/fixtures/context_assembly_golden/capture_from_baseline.py, twice, diff -r identical",
+    "commit": "branch warehouse-only, uncommitted, on e1d50f79 (origin/main)",
+    "orchestrator_tree_captured_from": "a copy of this worktree's orchestrator/, because the prompt change IS the change under test; the fixture diff below is the review",
+    "how": "FAST_LANE_ENABLED=false CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/golden_capture_test (throwaway postgres:18-alpine) pytest -q -p no:cacheprovider tests/fixtures/context_assembly_golden/capture_from_baseline.py, twice, diff -r identical",
     "FAST_LANE_ENABLED": "false, set by capture_from_baseline.py itself"
   },
-  "determinism": "the two captures were diff -r identical (2026-09-28, 12 passed each in 9.9 s and 9.5 s)",
+  "determinism": "the two captures were diff -r identical (2026-11-04, 12 passed each, 24 files each)",
   "this_capture_changed": {
-    "all 12 *.messages.json": "element 0 (the system message) only, and in it ONE paragraph: DIAGRAMS. Every other element byte-identical.",
-    "no *.meta.json": "byte-identical: the change is prompt text, not routing, knowledge or sources",
-    "why": "the merged DIAGRAM_INSTRUCTION names all twenty-two heads the browser draws, in the spellings mermaid's own detectors accept, says which ten also draw inside a downloaded file, sends the six chart types to the chart lane, prefers NO type (six live refusals were traced to \"prefer `flowchart`\" read with the role ban as a whitelist), and carries no per-answer or node-count cap",
-    "measured": "2,061 chars / 2,065 UTF-8 bytes / 494 tokens (pinned Qwen3.6 tokenizer, in-container, CPU); production ae25da28 is 1,602 / 1,606 / 365, so +129 tokens per prompt",
-    "budget": "inside the +133 the 2026-09-27 raise was accepted at; tests/test_diagram_instruction_budget.py pins it"
+    "salesforce.messages.json": "element 0 (the system message) only, and in it ONE clause removed: ' and can query Salesforce live over the API' (SALESFORCE_ASSISTANT_SYSTEM, engines/chat.py). Elements 1-2 and the other 23 files are byte-identical.",
+    "why": "owner order 2026-11-04: every answer reads the warehouse only, and the orchestrator can no longer reach Salesforce, so the prompt must not say it can."
   },
   "normalised": [
     "today's date (UTC and local ISO) in the engine-bound messages -> <TODAY> (the grounding block's 'Current date:' line)",
@@ -47,7 +44,7 @@
     "rich_fast.meta.json": "8c60198ebd4281fd83100ef3f467f73fbe648a31c61e73b5d3f5d8d015059e67",
     "rich_think.messages.json": "0dcf3cf57e18a7bf4da4d4873289db9b1fe18bac2d869a466a75cc64e3adcc5f",
     "rich_think.meta.json": "6b8128a97f412dd2b211ad2b7c7d9cc83d300fa27209fd4d516318d54aacdbad",
-    "salesforce.messages.json": "39c8c338f5d8895342112bd7b1fc0f70093dd33018c3f927b0ea6e77d61ae391",
+    "salesforce.messages.json": "c9cc3d33b6aca7ce0871938d60cb38a949e75cf2960858f6f59bd82f748bdd27",
     "salesforce.meta.json": "6cbc9e53fb682a4534e63bb6e2b8a3681400575dad9bb8a7b9f7385b260610b7"
   },
   "scenarios": {
@@ -172,6 +169,23 @@
       }
     },
     "2026-09-28, feat/every-diagram-type-reaches-a-file @ 6636dc96 (ten types, six-chart ban, both caps restored) — superseded by this merge",
-    "2026-09-28, this branch's own first capture (2,044 chars / 489 tokens) — superseded by the `-beta` spellings and the removal of the preferred type"
+    "2026-09-28, this branch's own first capture (2,044 chars / 489 tokens) — superseded by the `-beta` spellings and the removal of the preferred type",
+    {
+      "captured_on": "2026-09-28",
+      "captured_from": {
+        "commit": "integrate-2026-09-28 working tree at bb205c0a + the resolved DIAGRAM_INSTRUCTION: the merge of feat/every-diagram-type-reaches-a-file-r2's ten file-drawing types, feat/understand-every-picture-ask's twenty-two-head list and fix/prompt-lets-the-model-draw's two live findings (the mermaid `-beta` spellings, and no preferred TYPE), with none of the three branches' caps",
+        "orchestrator_tree_captured_from": "the working tree of the merge, because the prompt change IS the change under test; the fixture diff below is the review. Both parent branches recaptured these same twelve files against their own wording, which is why they conflicted; a third wording needs a third capture.",
+        "how": "CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/golden_capture_test (throwaway postgres:18-alpine, --locale=C, fsync off) pytest -q -p no:cacheprovider tests/fixtures/context_assembly_golden/capture_from_baseline.py, twice, diff -r identical",
+        "FAST_LANE_ENABLED": "false, set by capture_from_baseline.py itself"
+      },
+      "determinism": "the two captures were diff -r identical (2026-09-28, 12 passed each in 9.9 s and 9.5 s)",
+      "this_capture_changed": {
+        "all 12 *.messages.json": "element 0 (the system message) only, and in it ONE paragraph: DIAGRAMS. Every other element byte-identical.",
+        "no *.meta.json": "byte-identical: the change is prompt text, not routing, knowledge or sources",
+        "why": "the merged DIAGRAM_INSTRUCTION names all twenty-two heads the browser draws, in the spellings mermaid's own detectors accept, says which ten also draw inside a downloaded file, sends the six chart types to the chart lane, prefers NO type (six live refusals were traced to \"prefer `flowchart`\" read with the role ban as a whitelist), and carries no per-answer or node-count cap",
+        "measured": "2,061 chars / 2,065 UTF-8 bytes / 494 tokens (pinned Qwen3.6 tokenizer, in-container, CPU); production ae25da28 is 1,602 / 1,606 / 365, so +129 tokens per prompt",
+        "budget": "inside the +133 the 2026-09-27 raise was accepted at; tests/test_diagram_instruction_budget.py pins it"
+      }
+    }
   ]
 }

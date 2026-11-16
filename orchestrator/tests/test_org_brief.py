@@ -41,12 +41,15 @@ def test_an_unrelated_question_adds_no_grounding_noise():
     assert ob.metric_hint("write me a python function") == ""
 
 
-def test_interview_metric_excludes_initial_calls():
-    """33,147 interview rows, 5,566 of which are Initial Calls. Counting the
-    object is not counting interviews."""
+def test_interview_metric_covers_every_record_type():
+    """Owner fact, default chosen 2026-11-05: the pack says never filter interviews
+    by record-type name, because a genuine interview can be filed under 'Initial
+    Call', and the hand-checked golden counts follow it."""
+    assert ob.INTERVIEW_COUNT_RECORD_TYPE == ""
     hint = ob.metric_hint("how many interviews did we run last month")
-    assert "rt.Name = 'Interview'" in hint
-    assert "Initial Call" in hint
+    assert "rt.Name = 'Interview'" not in hint
+    assert "every record type" in hint
+    assert "initial calls included" in hint
 
 
 def test_candidate_metric_filters_by_record_type_not_is_person_account():
@@ -200,7 +203,7 @@ def test_the_live_engine_actually_injects_the_grounding():
     assert 'grounding_for(question, dialect="soql")' in source
 
 
-def test_the_agent_falls_back_to_live_instead_of_leaking_a_lock_error():
+def test_the_agent_answers_a_busy_warehouse_instead_of_leaking_a_lock_error():
     """High mode surfaced `Could not set lock on file ... PID 0` verbatim."""
     import inspect
 
@@ -208,7 +211,7 @@ def test_the_agent_falls_back_to_live_instead_of_leaking_a_lock_error():
 
     source = inspect.getsource(agent)
     assert "WarehouseBusy" in source
-    assert "fetch_live" in source
+    assert "fetch_live" not in source
 
 
 def test_the_schema_read_waits_for_the_lock():
@@ -397,10 +400,10 @@ def test_the_module_object_name_breaks_the_convention():
 
 
 def test_a_profile_must_aggregate_rather_than_return_hundreds_of_rows():
-    """Only 30 rows reach the answer stage. A 227-row profile query gets
-    summarised from the first 30 — one enrolment presented as the whole
+    """Only 120 rows reach the answer stage. A 227-row profile query gets
+    summarised from the first 120 — one enrolment presented as the whole
     history."""
-    assert "only the first 30 rows reach" in ob.LIST_NOT_COUNT
+    assert "the first 120 rows reach" in ob.LIST_NOT_COUNT
     assert "aggregate" in ob.LIST_NOT_COUNT
 
 

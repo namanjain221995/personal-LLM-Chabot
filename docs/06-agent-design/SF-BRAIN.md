@@ -18,12 +18,11 @@ all Salesforce data is stored locally. PostgreSQL holds only app state
 (users, conversations, messages, feedback).
 
 **The toggle.** The Salesforce chip in the composer sends
-`mode: "salesforce"` on `POST /chat` (with optional `sf_live` for the live
-variant). In Salesforce mode: web search is hard-blocked, the Intelligence
+`mode: "salesforce"` on `POST /chat`. In Salesforce mode: web search is hard-blocked, the Intelligence
 Mode planner may resolve context or ask one clarification, then the router
 (8B model) classifies into sql / rag / vision / report / chat. The SQL engine
-writes one guarded SELECT against the warehouse; live SOQL is the fallback
-and the `sf_live` path.
+writes one guarded SELECT against the warehouse. Nothing reads the org: live SOQL
+and the `sf_live` path were removed on 2026-11-04.
 
 **The knowledge (before this work).** Three hand-built layers:
 
@@ -31,10 +30,10 @@ and the `sf_live` path.
 |---|---|---|
 | Vocabulary | `core/sf_dictionary.py` + `/data/sf_dictionary.json` | API names, labels, types, picklists, lookup targets — retrieved per question (top 4 objects) |
 | Semantics | `core/org_brief.py` | The business model, 29 canonical metrics, query traps, SQL hard rules, answer honesty rules, ONE domain-rules block (training) |
-| Planner | `core/sf_intel/` | Typed live-SOQL plans, clarifications, context budget |
+| Planner | `core/sf_intel/` | Clarifications, context budget, typed query plans (these no longer run) |
 
 All grounding converges in `org_brief.grounding_for(question)`, injected into
-warehouse SQL, live SOQL, and (partially) the sf_intel planner. **Every layer
+warehouse SQL and (partially) the sf_intel planner. **Every layer
 was Python — only an engineer could add knowledge.** `informaton.txt` and the
 schema ZIPs were referenced nowhere.
 
@@ -62,7 +61,7 @@ feeds five knowledge shapes into the existing, proven injection points:
 
 | Pack key | Where it lands at answer time |
 |---|---|
-| `rules` | `org_brief.domain_rules_for` → SQL + live SOQL + sf_intel grounding |
+| `rules` | `org_brief.domain_rules_for` → SQL + sf_intel grounding |
 | `metrics` | `org_brief.match_metrics` → canonical-SQL hints (semantic layer) |
 | `tables` | `org_brief.tables_for` → pinned into the 24-table schema slice |
 | `glossary` | `grounding_for` extras, when the term appears in the question |

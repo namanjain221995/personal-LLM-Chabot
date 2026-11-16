@@ -31,34 +31,38 @@ export function SalesforceSourceLine({
   scope,
   assumptions,
 }: {
-  sources: SalesforceSources;
+  sources?: SalesforceSources;
   scope?: string;
   assumptions?: string[];
 }) {
   const parts: string[] = [];
-  if (sources.objects?.length) parts.push(sources.objects.join(', '));
-  if (typeof sources.record_count === 'number') {
-    parts.push(
-      `${sources.record_count.toLocaleString()} record${
-        sources.record_count === 1 ? '' : 's'
-      }`,
-    );
+  if (sources) {
+    if (sources.objects?.length) parts.push(sources.objects.join(', '));
+    if (typeof sources.record_count === 'number') {
+      parts.push(
+        `${sources.record_count.toLocaleString()} record${
+          sources.record_count === 1 ? '' : 's'
+        }`,
+      );
+    }
+    // "Live" and "synced copy" are not interchangeable, and an answer that
+    // implies the wrong one is worse than one that says nothing.
+    parts.push(sources.source === 'live' ? 'live from Salesforce' : 'synced copy');
+    const stamp = when(sources.query_timestamp);
+    if (stamp) parts.push(stamp);
   }
-  // "Live" and "synced copy" are not interchangeable, and an answer that
-  // implies the wrong one is worse than one that says nothing.
-  parts.push(sources.source === 'live' ? 'live from Salesforce' : 'synced copy');
-  const stamp = when(sources.query_timestamp);
-  if (stamp) parts.push(stamp);
 
   return (
     <div className="mt-2 space-y-1">
-      <p className="inline-flex flex-wrap items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-muted">
-        <IconCloud size={12} className="shrink-0 text-accent" />
-        {parts.join(' · ')}
-        {sources.truncated && (
-          <span className="text-warn">· capped, totals cover what was read</span>
-        )}
-      </p>
+      {sources && (
+        <p className="inline-flex flex-wrap items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-muted">
+          <IconCloud size={12} className="shrink-0 text-accent" />
+          {parts.join(' · ')}
+          {sources.truncated && (
+            <span className="text-warn">· capped, totals cover what was read</span>
+          )}
+        </p>
+      )}
       {scope && (
         <p className="text-xs text-faint">
           <span className="text-muted">Scope:</span> {scope}

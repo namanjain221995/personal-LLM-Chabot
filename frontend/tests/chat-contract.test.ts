@@ -190,7 +190,10 @@ describe('toOrchestratorChatRequest (§10 ChatRequest mapping)', () => {
   });
 });
 
-it('forwards the Live Salesforce flag to the orchestrator (2026-08-06)', () => {
+// Live Salesforce was removed (2026-11-04). A tab opened before that still sends
+// the field; the proxy passes it through and the orchestrator's ChatRequest drops it
+// (orchestrator/tests/test_warehouse_only.py).
+it('passes an old browser sf_live through untouched', () => {
   const req = toOrchestratorChatRequest({
     messages: [{ role: 'user', content: 'how many accounts?' }],
     session_id: 's1',

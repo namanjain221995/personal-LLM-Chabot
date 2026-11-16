@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import operator
+import os
 import re
 from typing import Annotated, Awaitable, Callable, List, Literal, Optional, Sequence, Tuple, TypedDict
 
@@ -113,14 +114,11 @@ _PLAN_SYSTEM = (
     f"Platform. Break the user's request into at most {MAX_STEPS} independent "
     "steps. Respond with ONLY this JSON object, no prose:\n"
     '{"steps": [{"id": 1, "title": "<short step title>", '
-    '"kind": "sql" or "rag" or "salesforce" or "llm" or "web", '
+    '"kind": "sql" or "rag" or "llm" or "web", '
     '"input": "<full instruction for the step>"}]}\n'
     'Step kinds: "sql" computes exact numbers from the SYNCED Salesforce '
     'warehouse (fast, but up to 30 minutes stale and only the configured '
-    'objects); "salesforce" queries the LIVE org over the API — use it when '
-    "the question is about something created or changed today, names a record "
-    "directly, or concerns an object the warehouse does not carry; "
-    '"rag" finds and summarizes content inside Salesforce records; "web" '
+    'objects); "rag" finds and summarizes content inside Salesforce records; "web" '
     "searches the internet and answers from the pages it reads — use it for "
     "current events, market or competitor research, prices, and anything that "
     'changed after training; "llm" reasons '
@@ -128,7 +126,7 @@ _PLAN_SYSTEM = (
     "the user shared earlier in this chat) and general knowledge. Steps must not "
     "depend on each other's outputs — they run in parallel.\n"
     "A request for DATA — a list, a count, records, a breakdown — MUST be a "
-    "sql or salesforce step. Never plan an llm step whose output would be a "
+    "sql step. Never plan an llm step whose output would be a "
     "query for the user to run: this platform executes queries itself, and "
     "an answer telling the user to open Workbench is a failure.\n"
     "A web step's input is a search: never copy a person's name, e-mail "
@@ -151,9 +149,33 @@ _PLAN_SYSTEM_NO_SF = (
 )
 
 
-def _fallback_plan(message: str) -> AgentPlan:
+#: What a request for data sounds like, for the one moment no plan says so. An
+#: agent turn is already a long request, so being generous costs little: the SQL
+#: writer can still say no table holds this.
+_DATA_REQUEST_RE = re.compile(
+    r"\b(?:how many|how much|count|number of|total|sum|average|percent(?:age)?|ratio|"
+    r"breakdown|list|top \d+|compare|comparison|audit|trend|status(?:es)?|by (?:status|month|week|year))\b",
+    re.I,
+)
+
+
+def _fallback_plan(message: str, salesforce: bool = False) -> AgentPlan:
+    """The plan when none came back. A request for data still gets a data step.
+
+    An llm step cannot read a row: at effort think both plan calls came back empty,
+    the fallback's one llm step ran no SQL, and after 654 s the answer said no data
+    rows were provided.
+    """
+    wants_data = salesforce and _DATA_REQUEST_RE.search(message or "")
     return AgentPlan(
-        steps=[PlanStep(id=1, title=(message.strip()[:60] or "Answer"), kind="llm", input=message)]
+        steps=[
+            PlanStep(
+                id=1,
+                title=(message.strip()[:60] or "Answer"),
+                kind="sql" if wants_data else "llm",
+                input=message,
+            )
+        ]
     )
 
 
@@ -162,8 +184,8 @@ def _coerce_no_salesforce(plan: AgentPlan) -> AgentPlan:
     toggle gates ALL Salesforce access. "web" is unrelated to Salesforce and is
     gated separately by `coerce_allowed`, so it survives here."""
     for step in plan.steps:
-        # "salesforce" is a LIVE query against the org — the toggle gates it
-        # exactly like the warehouse paths. _run_step_impl checks the flag too;
+        # "salesforce" now reads the warehouse too — the toggle gates it
+        # exactly like the other paths. _run_step_impl checks the flag too;
         # coercing here means the step never even gets planned.
         if step.kind in ("sql", "rag", "salesforce"):
             step.kind = "llm"
@@ -264,15 +286,17 @@ async def make_plan(
                         ),
                     }
                 )
-            # The planner follows the TURN's level. Left at
-            # chat_completion's thinking-on default it reasoned even when the
-            # person chose Fast — and at Fast `llm.mark_fast_turn` would have
-            # to override it anyway, so meta would have been lying.
+            # No reasoning pass, whatever the level. Reasoning draws on the same
+            # budget as the plan, and at effort think both calls spent all 6,000
+            # tokens on it (finish_reason length, empty content, 283 s each). A
+            # plan is a short translation, like the planner and the SQL writer,
+            # which turned thinking off for the same reason. The level still
+            # decides how many steps are asked for and how the answer is written.
             raw = await llm.chat_completion(
                 prompt,
                 temperature=0.1,
                 max_tokens=6000,
-                thinking=llm.wants_thinking("smart", effort),
+                thinking=False,
             )
             plan = parse_agent_plan(raw)
             return plan if salesforce else _coerce_no_salesforce(plan)
@@ -280,7 +304,7 @@ async def make_plan(
             raise  # parked for the main model (CONTRACT §8.3): no fallback plan, the turn waits
         except Exception as exc:
             last_error = str(exc)[:400]
-    return _fallback_plan(message)
+    return _fallback_plan(message, salesforce)
 
 
 # ---------------------------------------------------------------------------
@@ -332,18 +356,40 @@ async def _run_step_impl(
     written by the planner ("Count opportunities grouped by stage"), so the
     word the user actually typed — "chart" — is usually not in it. Chart
     intent is read from both."""
-    if step.kind == "sql" and salesforce:
+    # "salesforce" was the live step. A plan that still names it reads the
+    # warehouse like any other data step.
+    if step.kind in ("sql", "salesforce") and salesforce:
         from ..core.exports import cap_rows
-        from .live_sf import fetch_live
+        from ..core.schema_cache import schema_cache
         from .sql import (  # reuse (§3b)
+            CredentialRead,
             NoSuchTable,
+            QueryTooSlow,
             WarehouseBusy,
+            WarehouseUnreadable,
+            _catalogue_line,
+            _counted_line,
+            _cut_line,
+            _has_inner_cut,
+            _left_out_line,
+            _limit_total,
+            _literal_misses,
+            _no_date_line,
+            _note_a_cut,
+            _note_an_empty_table,
+            _nothing_shown_line,
+            asks_the_catalogue,
             attach_chart,
             generate_and_run_sql,
+            is_aggregate,
+            objects_read,
+            count_every_row,
+            records_matched,
+            zero_rows_prefix,
         )
 
         try:
-            sql, columns, rows = await generate_and_run_sql(
+            result = await generate_and_run_sql(
                 step.input,
                 history=list(history),
                 # Ground on what the USER asked, not only on the planner's
@@ -355,27 +401,71 @@ async def _run_step_impl(
                 # or Low (which never reach the planner) answered correctly.
                 grounding_question=message,
             )
-        except (WarehouseBusy, NoSuchTable) as reason:
-            # The direct SQL route answers these from live Salesforce. This
-            # one used to let the exception out, so a locked warehouse — which
-            # is most of the day — reached the user as a raw
-            # "Could not set lock on file /data/warehouse.duckdb ... PID 0".
-            soql, live_rows = await fetch_live(step.input, list(history))
-            sample = json.dumps(live_rows[:30], default=str)
-            preview, truncated = live_rows[: settings.sql_preview_row_cap], (
-                len(live_rows) > settings.sql_preview_row_cap
-            )
+            sql, columns, rows = result
+        except CredentialRead as refused:
+            return f"{refused} Say so; do not guess a value.", "credential fields", {}
+        except QueryTooSlow:
             return (
-                f"Live Salesforce result ({len(live_rows)} row(s)):\n{sample}",
-                f"{len(live_rows)} row(s), live from Salesforce",
-                {
-                    "sql": soql,
-                    "live": True,
-                    "reason": str(reason),
-                    "data": preview,
-                    "truncated": truncated,
-                },
+                "That query took too long and was stopped, so this part has no figure. "
+                "Say so; do not guess a value.",
+                "query took too long",
+                {},
             )
+        except WarehouseBusy:
+            return (
+                "The synced Salesforce copy was being refreshed, so this part "
+                "could not be read. Say so and suggest trying again in a few seconds.",
+                "synced copy busy",
+                {},
+            )
+        except WarehouseUnreadable:
+            # A step's failure text reaches the screen and the synthesis, and the
+            # raw DuckDB error holds the server's file path. Nothing is left for
+            # the model to write, so this costs no call.
+            if not os.path.exists(settings.duckdb_path):
+                return (
+                    "The synced Salesforce copy holds no data yet. Say so; do not "
+                    "guess a value.",
+                    "no synced copy yet",
+                    {},
+                )
+            return (
+                "The synced Salesforce copy cannot be read right now. Say so; do "
+                "not guess a value.",
+                "synced copy unreadable",
+                {},
+            )
+        except NoSuchTable as reason:
+            # The planner's input may name the object or the list word when the
+            # person's message does not, so both are read. "not found" would be
+            # false here: the catalogue holds the answer.
+            asked = f"{message}\n{step.input}"
+            if asks_the_catalogue(asked, reason.statement):
+                # No statement ran, so no source is claimed. It is still the org's
+                # field list, and sharing has to know that.
+                return await asyncio.to_thread(_catalogue_line, asked), "from the synced catalogue", {"salesforce_catalogue": True}
+            return (
+                "This data was not found in the synced Salesforce copy. Say so; "
+                "do not guess a value.",
+                "not in the synced copy",
+                {},
+            )
+        try:
+            schema = await asyncio.to_thread(schema_cache.get, settings.duckdb_path)
+        except Exception:  # noqa: BLE001 — the lines below can read the statement alone
+            schema = {}
+        # Who asked what decides what was held back, so the reader is told here too.
+        left_out = getattr(result, "left_out", None) or {}
+        left_out_line = _left_out_line(left_out)
+        # The person's words only: a plan step that says "list 30" or "the latest" is
+        # the planner's, and it asked for no cut.
+        total = await asyncio.to_thread(_limit_total, sql, rows, message)
+        if len(rows) > settings.sql_summary_row_cap:
+            # The figures below would present the fetch cap as the population.
+            rows = rows[: settings.sql_summary_row_cap]
+            total = await asyncio.to_thread(count_every_row, sql)
+        counted = _counted_line(sql, schema)
+        no_date = _no_date_line(sql, rows, schema)
         sample = json.dumps(
             {"columns": list(columns), "rows": [list(r) for r in rows[:30]]}, default=str
         )
@@ -384,7 +474,21 @@ async def _run_step_impl(
             "sql": sql,
             "data": [dict(zip(columns, row)) for row in preview],
             "truncated": truncated,
+            # Read once by merge_step_meta and _source_footer, never sent on.
+            "objects": objects_read(sql, schema),
+            "counted": counted,
+            "left_out_line": left_out_line,
+            "no_date": no_date,
+            "record_count": records_matched(sql, rows, total),
+            "capped": total is not None or _has_inner_cut(sql),
+            "snapshot_time": getattr(result, "snapshot_time", None),
         }
+        if not columns and left_out:
+            # Every column it read was one the question did not name: no rows of
+            # nothing for the proof drawer, and the records it did match are counted.
+            line = _nothing_shown_line(sql, rows, left_out, total)
+            sub_meta.update(data=[], left_out_line=line)
+            return line, "only fields not shown unless asked for", sub_meta
         # Same pipeline, same guarantees as the direct SQL route — an
         # agent-routed chart request now behaves identically to a direct one.
         await attach_chart(sub_meta, f"{message}\n{step.input}", columns, preview)
@@ -395,10 +499,40 @@ async def _run_step_impl(
         # ride with the step output, and the sample stays an illustration.
         from .sql import deterministic_summary
 
-        computed = deterministic_summary(columns, rows)
+        computed = deterministic_summary(columns, rows, aggregated=is_aggregate(sql), statement=sql)
+        await asyncio.to_thread(_note_an_empty_table, computed, sql, schema)
+        if total is not None:
+            _note_a_cut(computed, sql, len(rows), total)
+        warnings = zero_rows_prefix(computed).strip()
+        if warnings:
+            # Same warning as the direct route: a 0 here reads like any other number.
+            misses = await asyncio.to_thread(_literal_misses, sql, schema)
+            warnings = " ".join([warnings, *misses])
+        # Written under the answer by code too: an instruction is not a mechanism, and a
+        # synthesis that wrote "There are 30" read as the whole truth over a cut result.
+        sub_meta["zero_line"] = warnings
+        if total is not None:
+            sub_meta["first_line"] = _cut_line(sql, len(rows), total)
+            warnings = f"{warnings} {sub_meta['first_line'].rstrip('.')}, and the answer must say so.".strip()
+        told = "\n".join(
+            line
+            for line in (
+                warnings,
+                (
+                    "What the query read, exactly as it ran (the reader is shown this "
+                    "under the answer, so do not repeat it, and describe no other "
+                    f"filter): {' '.join(x for x in (counted, no_date) if x)}"
+                )
+                if counted
+                else "",
+                left_out_line,
+            )
+            if line
+        )
         return (
             f"SQL result ({len(rows)} row(s)):\n{sample}\n"
-            "Computed figures (AUTHORITATIVE — calculated in code over every "
+            + (f"{told}\n" if told else "")
+            + "Computed figures (AUTHORITATIVE — calculated in code over every "
             f"row; quote these, never count the sample):\n"
             f"{json.dumps(computed, default=str)[:3000]}",
             f"{len(rows)} row(s)",
@@ -418,40 +552,6 @@ async def _run_step_impl(
         )
         citations = build_citations(hits, base_url=settings.sf_lightning_base_url)
         return answer, f"{len(hits)} record(s)", {"citations": citations}
-
-    if step.kind == "salesforce" and salesforce:
-        # Straight to the org: newer than the warehouse, and works on objects
-        # the warehouse does not carry. Honors SF_LIVE_ENABLED like the SQL
-        # engine's fallback does — this path used to bypass the flag entirely.
-        from ..core.salesforce import (SalesforceUnavailable, UnsafeSoql,
-                                       merge_rows)
-        from .live_sf import describe_rows, fetch_live
-
-        if not settings.sf_live_enabled:
-            return (
-                "Live Salesforce lookups are disabled (SF_LIVE_ENABLED). "
-                "Answer from the synced warehouse instead.",
-                "live lookups disabled",
-                {},
-            )
-        try:
-            soql, live_rows = await fetch_live(step.input, history)
-        except (SalesforceUnavailable, UnsafeSoql) as exc:
-            # The warehouse is still there — degrade to it rather than failing
-            # the step and losing this part of the plan.
-            return (
-                f"Live Salesforce lookup unavailable ({exc}). "
-                "Answer from the synced warehouse instead.",
-                "live lookup unavailable",
-                {},
-            )
-        rows = merge_rows([], live_rows)
-        return (
-            f"Live Salesforce query:\n{soql}\n\nRows ({len(rows)}):\n"
-            + describe_rows(rows),
-            f"{len(rows)} live record(s)",
-            {"sql": soql, "data": rows[:50]},
-        )
 
     if step.kind == "web":
         from .search import research_step  # reuse the Phase 1 pipeline
@@ -554,7 +654,10 @@ async def execute_steps(
             except (QueuedForRecovery, LeaseLost):
                 raise  # parked for the main model: not a failed step
             except Exception as exc:
-                detail = _shorten(str(exc) or exc.__class__.__name__, 200)
+                from .sql import failure_reason
+
+                # A failed model call carries the server's address in its message.
+                detail = _shorten(failure_reason(exc), 200)
                 await emit(
                     "step",
                     {"id": step.id, "title": step.title, "status": "failed", "detail": detail},
@@ -641,6 +744,58 @@ def renumber_web_sources(results: Sequence[dict]) -> None:
 _SQL_PAYLOAD_KEYS = ("sql", "data", "truncated", "chart", "chart_data")
 
 
+#: Written by the engine, never by the model: the synthesis once opened "Based on
+#: the direct Salesforce check" over a warehouse read, echoing the person's words.
+SOURCE_LINE = "Source: the synced Salesforce copy, not a live query."
+
+
+def _source_footer(results: Sequence[dict]) -> str:
+    """What the answer read, one line per sql step, from the statements that ran.
+
+    Each line follows sql._counted_line, so it says the same about a record type or
+    a blank-dropping filter as the direct route does.
+    """
+    sql_steps = [r for r in results if (r.get("meta") or {}).get("sql")]
+    if not sql_steps:
+        return ""
+    lines = [SOURCE_LINE]
+    seen = set()
+    for r in sql_steps:
+        sub = r["meta"]
+        line = " ".join(
+            x for x in (sub.get("zero_line"), sub.get("first_line"), sub.get("counted"), sub.get("left_out_line")) if x
+        )
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        lines.append(f"{_shorten(r['step'].title, 60)}: {line}" if len(sql_steps) > 1 else line)
+    return "\n\n".join(lines)
+
+
+def _source_meta_for(results: Sequence[dict]) -> dict:
+    """`salesforce_sources` and `assumptions` across every sql step that ran."""
+    from .sql import _source_meta
+
+    subs = [r["meta"] for r in results if (r.get("meta") or {}).get("sql")]
+    if not subs:
+        return {}
+    only = subs[0] if len(subs) == 1 else {}
+    return _source_meta(
+        [table for sub in subs for table in sub.get("objects") or []],
+        # A figure per step does not add up to anything, so one step only.
+        record_count=only.get("record_count"),
+        truncated=any(sub.get("capped") for sub in subs),
+        # True of the answer only if it is true of every number in it.
+        assumptions=(
+            [subs[0]["no_date"]]
+            if all(sub.get("no_date") for sub in subs)
+            else []
+        ),
+        # A mixed answer never claims newer than its oldest read.
+        snapshot_time=min((sub["snapshot_time"] for sub in subs if sub.get("snapshot_time")), default=None),
+    )
+
+
 def merge_step_meta(results: Sequence[dict]) -> dict:
     """Merged agent meta (§3b): last sql step, union citations, union files.
 
@@ -653,7 +808,10 @@ def merge_step_meta(results: Sequence[dict]) -> dict:
             {"id": r["step"].id, "title": r["step"].title, "status": r["status"]}
             for r in results
         ],
+        **_source_meta_for(results),
     }
+    if any((r.get("meta") or {}).get("salesforce_catalogue") for r in results):
+        meta["salesforce_catalogue"] = True
     sql_payload: dict = {}
     citations: List[dict] = []
     seen_records = set()
@@ -710,7 +868,15 @@ _SYNTH_SYSTEM = (
     "results — never a SOQL/SQL query, an Apex class or a script for the "
     "user to run somewhere else. This platform runs queries itself; if the "
     "steps returned no rows, say what was looked for and found, not how the "
-    "user could query it by hand."
+    "user could query it by hand.\n"
+    # The code-written Source line under the answer is what the reader can rely on;
+    # this keeps the sentences above it from saying the opposite. The model echoed
+    # a person's "check directly in Salesforce" as "the direct Salesforce check".
+    "SQL step results come from the local synced copy of Salesforce. Never say a "
+    "number came from a live or direct check of Salesforce, whatever the request "
+    "asked for. A step result that says what the query read is the only thing you "
+    "may say about its filters: the reader is shown that line and the source under "
+    "your answer, so write neither yourself."
 )
 # --- AS3 intent-capability BEGIN --- (the file capability line, engines/capability.py)
 from .capability import capability_suffix as _as3_capability_suffix  # noqa: E402
@@ -805,6 +971,8 @@ async def _execute_node(state: AgentState) -> dict:
 
 
 async def _synthesize_node(state: AgentState) -> dict:
+    from .sql import WordingHold
+
     before = llm.get_usage()
     emit = state["emit"]
     results = state.get("results", [])
@@ -812,6 +980,15 @@ async def _synthesize_node(state: AgentState) -> dict:
     # markers it reads, so they have to be plan-wide by the time it sees them.
     renumber_web_sources(results)
     parts: List[str] = []
+    footer = _source_footer(results)
+    # Only over sql results: a web step's "live data" is about somewhere else.
+    hold = WordingHold() if footer else None
+
+    async def say(text: str) -> None:
+        if text:
+            parts.append(text)
+            await emit("token", {"text": text})
+
     # Smart model merges step outputs (§3b); streams reasoning + token events.
     async for kind, text in llm.stream_chat_events(
         _synthesis_messages(state["message"], results),
@@ -825,8 +1002,11 @@ async def _synthesize_node(state: AgentState) -> dict:
         if kind == "reasoning":
             await emit("reasoning", {"text": text})
         else:
-            parts.append(text)
-            await emit("token", {"text": text})
+            await say(hold.feed(text) if hold else text)
+    if hold:
+        await say(hold.flush())
+    if footer:
+        await say(f"\n\n{footer}" if parts else footer)
 
     # §10: the SINGLE final meta, after the token stream, before done.
     await emit("meta", merge_step_meta(results))

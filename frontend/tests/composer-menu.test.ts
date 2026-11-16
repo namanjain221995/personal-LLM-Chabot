@@ -12,10 +12,10 @@ function prefs(over: Partial<ChatPrefs> = {}): ChatPrefs {
 }
 
 describe('composer "+" menu items', () => {
-  // Five rows since Deep Research joined the menu (2026-08-30); the
+  // Four rows since Live Salesforce was removed (2026-11-04); the
   // owner-2026-08-06 rule is unchanged — the menu still reads as the COMPLETE
   // capability list, with every row always visible whatever the mode.
-  it('always offers all five rows: files, web, research, salesforce, live', () => {
+  it('always offers all four rows: files, web, research, salesforce', () => {
     for (const salesforce of [false, true]) {
       const ids = composerMenuItems({
         salesforce,
@@ -28,7 +28,6 @@ describe('composer "+" menu items', () => {
         'web-search',
         'deep-research',
         'salesforce',
-        'sf-live',
       ]);
     }
   });
@@ -42,18 +41,6 @@ describe('composer "+" menu items', () => {
     });
     expect(items.find((i) => i.id === 'web-search')?.hint).toMatch(
       /turns Salesforce off/,
-    );
-  });
-
-  it('promises on the Live row that it turns Salesforce on when it is off', () => {
-    const items = composerMenuItems({
-      salesforce: false,
-      sfLive: false,
-      webSearchOn: false, deepResearchOn: false,
-      streaming: false,
-    });
-    expect(items.find((i) => i.id === 'sf-live')?.hint).toMatch(
-      /turns Salesforce on/,
     );
   });
 
@@ -132,8 +119,7 @@ describe('activating an item', () => {
 });
 
 describe('roving focus skips disabled rows', () => {
-  // Streaming menu: [files: DISABLED, web-search, deep-research, salesforce,
-  // sf-live] — index of the LAST row moved 3 -> 4 when Deep Research landed.
+  // Streaming menu: [files: DISABLED, web-search, deep-research, salesforce].
   const streaming = composerMenuItems({
     salesforce: false,
     sfLive: false,
@@ -143,9 +129,9 @@ describe('roving focus skips disabled rows', () => {
 
   it('walks past the disabled files row in the direction of travel', () => {
     // ArrowUp from web-search (1) targets files (0) — dead — wraps to the
-    // last row, now sf-live at 4.
-    expect(nextEnabledIndex(streaming, 0, false)).toBe(4);
-    // ArrowDown wrap from sf-live (4) targets 0 — dead — lands on 1.
+    // last row, salesforce at 3.
+    expect(nextEnabledIndex(streaming, 0, false)).toBe(3);
+    // ArrowDown wrap from salesforce (3) targets 0 — dead — lands on 1.
     expect(nextEnabledIndex(streaming, 0, true)).toBe(1);
   });
 
@@ -181,36 +167,7 @@ describe('trust footer line', () => {
   });
 });
 
-describe('Live Salesforce (2026-08-06)', () => {
-  it('shows the Live row unchecked while Salesforce is off', () => {
-    const off = composerMenuItems({
-      salesforce: false,
-      sfLive: true, // stale stored value: must not read as active
-      webSearchOn: false, deepResearchOn: false,
-      streaming: false,
-    });
-    const live = off.find((i) => i.id === 'sf-live');
-    expect(live).toBeDefined();
-    expect(live?.checked).toBe(false);
-  });
-
-  it('activating sf-live toggles the pref', () => {
-    const out = activateComposerMenuItem('sf-live', prefs({ salesforce: true }));
-    expect(out.kind).toBe('prefs');
-    if (out.kind === 'prefs') expect(out.prefs.sfLive).toBe(true);
-  });
-
-  it('one click on Live from web mode enters Salesforce mode AND goes live', () => {
-    const out = activateComposerMenuItem(
-      'sf-live',
-      prefs({ salesforce: false, sfLive: false, webSearch: 'on' }),
-    );
-    expect(out).toEqual({
-      kind: 'prefs',
-      prefs: prefs({ salesforce: true, sfLive: true, webSearch: 'auto' }),
-    });
-  });
-
+describe('Live Salesforce was removed (2026-11-04)', () => {
   it('one click on Web search from Salesforce mode switches modes', () => {
     const out = activateComposerMenuItem(
       'web-search',
@@ -233,12 +190,13 @@ describe('Live Salesforce (2026-08-06)', () => {
     }
   });
 
-  it('the trust line is honest about live queries leaving the machine', () => {
-    const live = trustLine(prefs({ salesforce: true, sfLive: true }));
-    expect(live).toContain('live Salesforce org');
-    expect(live).not.toContain('nothing leaves this machine');
-    const synced = trustLine(prefs({ salesforce: true, sfLive: false }));
-    expect(synced).toContain('nothing leaves this machine');
+  it('the trust line says synced whatever a stale pref holds', () => {
+    for (const sfLive of [false, true]) {
+      const line = trustLine(prefs({ salesforce: true, sfLive }));
+      expect(line).toContain('synced Salesforce data');
+      expect(line).toContain('nothing leaves this machine');
+      expect(line).not.toContain('live');
+    }
   });
 });
 
@@ -259,16 +217,6 @@ describe('Deep Research interacts correctly with Salesforce (review 2026-08-30)'
     const out = activateComposerMenuItem(
       'salesforce',
       prefs({ salesforce: false, deepResearch: true }),
-    );
-    if (out.kind !== 'prefs') return;
-    expect(out.prefs.salesforce).toBe(true);
-    expect(out.prefs.deepResearch).toBe(false);
-  });
-
-  it('Live Salesforce disarms it too — it would otherwise sit behind a gate that can never run it', () => {
-    const out = activateComposerMenuItem(
-      'sf-live',
-      prefs({ salesforce: false, sfLive: false, deepResearch: true }),
     );
     if (out.kind !== 'prefs') return;
     expect(out.prefs.salesforce).toBe(true);

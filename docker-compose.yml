@@ -25,6 +25,10 @@
 # SECOND EXCEPTION, 2026-09-13: the developer-platform settings on the
 # orchestrator and frontend services (see the comment there), so a rollback
 # does not run /v1 on code defaults with the pepper silently unset.
+#
+# THIRD EXCEPTION, 2026-11-04: the orchestrator no longer receives Salesforce
+# credentials or SF_LIVE_ENABLED. Answers read the warehouse only, and a rollback
+# to this file must not hand the credentials back. sync-worker keeps them.
 # =============================================================================
 # TechSara Local AI Analysis Platform — docker-compose (spec §6, model serving per
 # the vLLM design: owner override of spec §4 on 2026-07-22 — all models on vLLM).
@@ -570,16 +574,11 @@ services:
   orchestrator:
     build: ./orchestrator
     environment:
-      # Live, READ-ONLY Salesforce lookups for data newer than the last sync
-      # or on objects the warehouse does not carry. Same read-only integration
-      # user as the sync worker; the client-credentials grant needs the org's
-      # My Domain URL.
-      SF_CLIENT_ID: ${SF_CLIENT_ID:-}
-      SF_CLIENT_SECRET: ${SF_CLIENT_SECRET:-}
+      # WAREHOUSE ONLY (owner order 2026-11-04): this service holds no Salesforce
+      # credentials and has no env_file to bring them in. Only sync-worker gets them.
       SF_LOGIN_URL: ${SF_LOGIN_URL:-}
       SF_API_VERSION: ${SF_API_VERSION:-v61.0}
       SF_ENVIRONMENT: ${SF_ENVIRONMENT:-unknown}
-      SF_LIVE_ENABLED: ${SF_LIVE_ENABLED:-true}
       # RAG citation links open records in this Lightning org. Without it the
       # code default (techsara's org) silently produces wrong links elsewhere.
       SF_LIGHTNING_BASE_URL: ${SF_LIGHTNING_BASE_URL:-https://techsara.lightning.force.com}

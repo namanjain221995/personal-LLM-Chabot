@@ -1,5 +1,11 @@
 # Orchestrator — engine layer (`orchestrator/app/engines/`)
 
+> **⚠ Superseded in part (2026-11-04).** Live Salesforce was removed: every answer
+> reads the warehouse, `core/salesforce.py` refuses every call and only the sync
+> worker talks to the org. Every description below of `fetch_live`, live SOQL, the
+> Live toggle, `sf_live` or `SF_LIVE_*` is a snapshot of the older code and has NOT
+> been re-derived. See [`README.md` §12](../../README.md#12-salesforce-sync-and-warehouse).
+
 > **⚠ Superseded in part (2026-08-10).** The app-state layer described below was
 > `/data/app.sqlite3` (stdlib `sqlite3`). It is now PostgreSQL — see
 > [`data-model.md`](data-model.md) and the CHANGELOG entry

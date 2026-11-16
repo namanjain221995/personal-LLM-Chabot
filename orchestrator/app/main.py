@@ -2673,10 +2673,6 @@ class ChatRequest(BaseModel):
     # --- V2 optional fields (defaults preserve v1 behavior) ---
     conversation_id: Optional[str] = None
     mode: Literal["salesforce", "assistant"] = "salesforce"
-    # The composer's "Live Salesforce" toggle: answer straight from the org
-    # (any object/field this integration user can read) instead of the synced
-    # copy. Only meaningful in salesforce mode; ignored elsewhere.
-    sf_live: bool = False
     model: Literal["smart", "fast"] = "smart"
     effort: Literal[
         "fast", "think", "max", "low", "medium", "high", "extra_high"
@@ -4281,12 +4277,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         mode=request.mode,
         web_search=request.web_search,
         deep_research=request.deep_research,
-        sf_live=request.sf_live,
     )
     request.mode = gate.mode  # type: ignore[assignment]
     request.web_search = gate.web_search  # type: ignore[assignment]
     request.deep_research = gate.deep_research
-    request.sf_live = gate.sf_live
     attachments_allowed = feature_access.allowed(
         principal.features, feature_access.Feature.ATTACHMENTS
     )
@@ -4985,7 +4979,6 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     "test_case_id": request.test_case_id,
                     "effort": request.effort,
                     "model_choice": request.model,
-                    "force_live": request.sf_live,
                     "has_attachments": bool(
                         request.pdf_data or request.image_data or request.video_uploads
                     ),
@@ -5326,8 +5319,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # agent steps and/or web search. An explicit user choice always
             # wins; effort "low" opts out entirely.
             # Salesforce mode means "answer from MY data". The AGENT is still
-            # allowed there — it is how a question reaches a live Salesforce
-            # lookup — but automatic WEB SEARCH is not: search is checked
+            # allowed there — it can run several warehouse steps for one
+            # question — but automatic WEB SEARCH is not: search is checked
             # before the route chain, so a classifier that fancied the web
             # hijacked the request and the Salesforce router never saw it.
             # Live, "what problems do customers describe in their support
@@ -6045,7 +6038,6 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # answer below without ever reaching the image branch, so
                 # this gate is where it has to be stopped.
                 and not image_followup.about_the_picture
-                and not request.sf_live
                 and github_ref is None
                 and not repo_followup
                 and not url_list
@@ -6166,11 +6158,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # NOTHING in this turn can answer or re-ask a question this
                 # conversation is waiting on: the source was switched off, or
                 # the turn belongs to the document, vision, repo, URL or
-                # dataset pipeline, or it is an explicit live lookup. A
-                # question left open here is not merely stale — the partial
-                # unique index allows one pending clarification per
-                # conversation, so it silently blocks every future question
-                # until something cancels it.
+                # dataset pipeline. A question left open here is not merely
+                # stale — the partial unique index allows one pending
+                # clarification per conversation, so it silently blocks every
+                # future question until something cancels it.
                 from .core.sf_intel import state as sf_intel_state
 
                 # Not on the path to the answer (plan item 4, 2026-09-13): no
@@ -6776,7 +6767,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .engines.crawl import run_crawl_engine
 
                 answer = await run_crawl_engine(
-                    text, crawl_url, conv_key, history, emit
+                    text, crawl_url, conv_key, history, emit,
+                    salesforce=request.mode != "assistant",
                 )
             elif crawl_site_hits:
                 # Follow-up about a crawled site → answer from the stored
@@ -6807,6 +6799,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     # The sharer is the page's introducer in the shared
                     # corpus (V16) — attributable, purgeable.
                     user_id=viewer,
+                    salesforce=request.mode != "assistant",
                 )
             elif deep_research_on:
                 # Deep Research: the iterative research loop. It sits ABOVE
@@ -6973,15 +6966,6 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     model_choice=request.model,
                     effort=request.effort,
                     grounding=prepared.grounding,
-                )
-            elif request.sf_live:
-                # "Live Salesforce" toggle: skip the router — every text
-                # answer queries the org directly (schema questions included;
-                # the engine's live branch handles both).
-                from .engines.sql import run_sql_engine
-
-                answer = await run_sql_engine(
-                    text, history, emit, force_live=True
                 )
             else:
                 state = await get_graph().ainvoke(

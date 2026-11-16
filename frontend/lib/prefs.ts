@@ -25,10 +25,8 @@ export interface ChatPrefs {
   /** Salesforce mode on (v1 behavior); off → mode "assistant". */
   salesforce: boolean;
   /**
-   * Live Salesforce (2026-08-06): answers query the org directly — any
-   * object or field the read-only integration user can see — instead of the
-   * 30-minute synced copy. Only meaningful while `salesforce` is on; the
-   * server ignores it otherwise and sanitize() keeps the pair coherent.
+   * Always false. Live Salesforce was removed (2026-11-04); the field stays
+   * so old saved prefs and callers keep their shape.
    */
   sfLive: boolean;
   model: ModelChoice;
@@ -117,9 +115,8 @@ function sanitize(raw: unknown): ChatPrefs {
     typeof p.salesforce === 'boolean' ? p.salesforce : DEFAULT_PREFS.salesforce;
   return {
     salesforce,
-    // Live Salesforce is a sub-mode of Salesforce: without the parent toggle
-    // there is no menu item to undo it, so it never survives salesforce=off.
-    sfLive: p.sfLive === true && salesforce,
+    // Live Salesforce was removed: a value saved by the old UI is dropped here.
+    sfLive: false,
     model: p.model === 'fast' || p.model === 'smart' ? p.model : DEFAULT_PREFS.model,
     effort: sanitizeEffort(p.effort),
     // Both of these had composer toggles that are now gone, so a value saved

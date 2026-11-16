@@ -144,3 +144,34 @@ def test_cte_wrapping_insert_rejected():
 def test_junk_rejected(sql):
     with pytest.raises(SQLGuardError):
         guard_sql(sql)
+
+
+# --- rejected: size, because the regexes after this gate hold the GIL ----------
+
+def _statement_of(length):
+    head = "SELECT 1 AS a FROM t WHERE a IN ("
+    tail = "1)"
+    return head + "1, " * ((length - len(head) - len(tail)) // 3) + "1" * ((length - len(head) - len(tail)) % 3) + tail
+
+
+def test_a_statement_at_the_limit_passes_and_one_past_it_does_not():
+    assert len(_statement_of(20000)) == 20000
+    assert guard_sql(_statement_of(20000))
+    assert len(_statement_of(20001)) == 20001
+    with pytest.raises(SQLGuardError, match="too long"):
+        guard_sql(_statement_of(20001))
+
+
+@pytest.mark.parametrize(
+    "sql, passes",
+    [
+        (f"SELECT Name AS {'a' * 256} FROM t", True),
+        (f"SELECT Name AS {'a' * 257} FROM t", False),
+        (f"SELECT Name{' ' * 256}FROM t", True),
+        (f"SELECT Name{' ' * 257}FROM t", False),
+        (f"SELECT Name{chr(10) * 257}FROM t", False),
+        (f"SELECT '{'a' * 257}' FROM t", False),
+    ],
+)
+def test_a_run_of_letters_or_spaces_has_a_limit(sql, passes):
+    assert is_safe_select(sql) is passes

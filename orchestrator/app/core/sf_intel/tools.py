@@ -224,7 +224,7 @@ async def get_salesforce_schema(
         except Exception as exc:  # noqa: BLE001
             log.info("live schema summary unavailable: %s", str(exc)[:160])
 
-    offline = _dictionary_summary(question) or _warehouse_summary(question)
+    offline = _dictionary_summary(question) or await asyncio.to_thread(_warehouse_summary, question)
     notes = _brain_notes(question)
     if notes:
         offline = f"{offline}\n\n{notes}" if offline else notes

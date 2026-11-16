@@ -51,12 +51,12 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
     expect(loadPrefs(storage, 'c2').effort).toBe('max');
   });
 
-  it('DEFAULT-03/04 · Salesforce and Live still persist once chosen', () => {
+  it('DEFAULT-03/04 · Salesforce still persists once chosen, a saved Live does not', () => {
     const storage = makeStorage();
     savePrefs(storage, 'c1', { ...DEFAULT_PREFS, salesforce: true, sfLive: true });
     expect(loadPrefs(storage, 'c1')).toMatchObject({
       salesforce: true,
-      sfLive: true,
+      sfLive: false,
     });
   });
 
@@ -160,7 +160,7 @@ describe('composer prefs (V2 §4c per-conversation persistence)', () => {
   });
 });
 
-describe('Live Salesforce pref (2026-08-06)', () => {
+describe('Live Salesforce pref (removed 2026-11-04)', () => {
   it('sfLive never survives salesforce being off — its menu row would be gone', () => {
     const storage = makeStorage();
     savePrefs(storage, 'c1', {
@@ -174,7 +174,7 @@ describe('Live Salesforce pref (2026-08-06)', () => {
     expect(loadPrefs(storage, 'c1').sfLive).toBe(false);
   });
 
-  it('sfLive persists while salesforce stays on', () => {
+  it('a saved sfLive is dropped while salesforce stays on: the Salesforce pill needs it false', () => {
     const storage = makeStorage();
     savePrefs(storage, 'c1', {
       salesforce: true,
@@ -184,7 +184,7 @@ describe('Live Salesforce pref (2026-08-06)', () => {
       agent: false,
       webSearch: 'auto', deepResearch: false,
     });
-    expect(loadPrefs(storage, 'c1').sfLive).toBe(true);
+    expect(loadPrefs(storage, 'c1').sfLive).toBe(false);
   });
 });
 

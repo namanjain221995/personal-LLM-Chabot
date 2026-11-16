@@ -454,6 +454,9 @@ def shallow_clone(ref: GithubRef, dest: str) -> str:
     cmd = [
         "git", "-c", "core.hooksPath=/dev/null",  # repo hooks never run
         "-c", "credential.helper=",
+        # A link in a repo is a file here, or reading it reads the link's target: a
+        # member's question then returned a key file and /proc/self/environ.
+        "-c", "core.symlinks=false",
         "clone", "--depth", "1", "--no-tags", "--single-branch",
     ]
     if ref.ref:

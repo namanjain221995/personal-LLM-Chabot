@@ -27,7 +27,6 @@ const ALL_ON = {
   web_search: true,
   deep_research: true,
   salesforce: true,
-  salesforce_live: true,
 };
 
 const MENU_STATE = {
@@ -48,14 +47,13 @@ describe('composer menu under feature access', () => {
       'web-search',
       'deep-research',
       'salesforce',
-      'sf-live',
     ]);
   });
 
   it('removes the rows this account may not use', () => {
     const ids = composerMenuItems({
       ...MENU_STATE,
-      features: { ...ALL_ON, salesforce: false, salesforce_live: false },
+      features: { ...ALL_ON, salesforce: false },
     }).map((i) => i.id);
     expect(ids).toEqual(['files', 'web-search', 'deep-research']);
   });
@@ -65,7 +63,7 @@ describe('composer menu under feature access', () => {
     // still honours would be the worse failure.
     expect(featureOn(undefined, 'web_search')).toBe(true);
     expect(featureOn({}, 'salesforce')).toBe(true);
-    expect(composerMenuItems({ ...MENU_STATE })).toHaveLength(5);
+    expect(composerMenuItems({ ...MENU_STATE })).toHaveLength(4);
   });
 });
 
@@ -81,7 +79,6 @@ describe('sticky prefs are corrected to what the account may use', () => {
     const fixed = prefsForFeatures(stale, {
       ...ALL_ON,
       salesforce: false,
-      salesforce_live: false,
       deep_research: false,
     });
     expect(fixed.salesforce).toBe(false);
@@ -102,7 +99,7 @@ describe('the composer menu rendered', () => {
       <Composer
         streaming={false}
         prefs={DEFAULT_PREFS}
-        features={{ ...ALL_ON, deep_research: false, salesforce: false, salesforce_live: false }}
+        features={{ ...ALL_ON, deep_research: false, salesforce: false }}
         onPrefsChange={vi.fn()}
         onSend={vi.fn()}
         onStop={vi.fn()}
@@ -127,30 +124,30 @@ describe('the admin access model', () => {
       default: true,
       requires: 'web_search',
     },
-    { id: 'salesforce', label: 'Salesforce', hint: '', default: true, requires: null },
+    { id: 'attachments', label: 'Photos, files and datasets', hint: '', default: true, requires: null },
     {
-      id: 'salesforce_live',
-      label: 'Live Salesforce',
+      id: 'video_analysis',
+      label: 'Video understanding',
       hint: '',
       default: true,
-      requires: 'salesforce',
+      requires: 'attachments',
     },
   ];
 
   it('drops descendants when a parent is switched off', () => {
     const next = applyFeatureRules(
       catalog,
-      { web_search: false, deep_research: true, salesforce: true, salesforce_live: true },
+      { web_search: false, deep_research: true, attachments: true, video_analysis: true },
       'web_search',
     );
     expect(next.deep_research).toBe(false);
-    expect(next.salesforce_live).toBe(true); // a different branch is untouched
+    expect(next.video_analysis).toBe(true); // a different branch is untouched
   });
 
   it('turns a parent on when a child is switched on', () => {
     const next = applyFeatureRules(
       catalog,
-      { web_search: false, deep_research: true, salesforce: false, salesforce_live: false },
+      { web_search: false, deep_research: true, attachments: false, video_analysis: false },
       'deep_research',
     );
     expect(next.web_search).toBe(true);

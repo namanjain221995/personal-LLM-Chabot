@@ -106,5 +106,5 @@ Effort never decides whether a file is made. Fast: one model call, thinking off,
 
 - pdf.js in the browser: the viewer shows server-rendered page images (one canonical preview for PDF, DOCX and PPTX; the same spec, the same pages), which cost no worker bundle and give the same look everywhere; text selection and search inside the panel are a follow-up.
 - LibreOffice: a PPTX/DOCX is previewed from the spec that made it, not by converting the Office file; the downloaded file is the authoritative one and is labelled so.
-- Live Salesforce inside the job: Salesforce mode gets one guarded query through the existing SQL engine at acceptance; per-section data plans (the legacy report engine's shape) are a follow-up.
+- Per-section Salesforce data inside the job: Salesforce mode gets one guarded warehouse query through the existing SQL engine at acceptance; per-section data plans (the legacy report engine's shape) are a follow-up.
 - A per-user fair scheduler: one render slot, first come first served, with a per-person cap on open jobs.

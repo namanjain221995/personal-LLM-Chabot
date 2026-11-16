@@ -1,7 +1,7 @@
 # TechSara Local AI Platform
 
 **A local-first, private AI analyst for a Salesforce org.** One command starts a
-chat UI, an orchestrator that turns questions into SQL / SOQL / retrieval /
+chat UI, an orchestrator that turns questions into SQL / retrieval /
 web research / reports, a PostgreSQL application database, a DuckDB + LanceDB
 analytics plane kept in sync with Salesforce, and a local inference runtime
 chosen for the machine it runs on — a Mac, a single NVIDIA GPU, a CPU-only
@@ -42,7 +42,7 @@ open http://localhost:3000
 10. [How a chat message is answered](#10-how-a-chat-message-is-answered)
     - [10a. Three ways to answer: chat, web search, Deep Research](#10a-three-ways-to-answer-chat-web-search-deep-research)
 11. [The engines](#11-the-engines)
-12. [Salesforce: sync, warehouse, live queries](#12-salesforce-sync-warehouse-live-queries)
+12. [Salesforce: sync and warehouse](#12-salesforce-sync-and-warehouse)
 13. [The Salesforce Brain (knowledge packs)](#13-the-salesforce-brain-knowledge-packs)
 14. [Salesforce Intelligence Mode](#14-salesforce-intelligence-mode)
 15. [Memory, context and compaction](#15-memory-context-and-compaction)
@@ -67,8 +67,7 @@ plain language. The platform:
 |---|---|---|
 | "How many interviews were scheduled last week per recruiter?" | Writes **one guarded `SELECT`** against the locally synced warehouse (DuckDB), runs it, computes authoritative totals in Python, streams a narrative, shows the SQL, the rows, a CSV/XLSX export and — when it fits — a chart | `orchestrator/app/engines/sql.py` |
 | "What does the onboarding SOP say about the welcome call?" | Retrieves **long-text fields and knowledge packs** (LanceDB + the Brain), reranks, answers with record citations | `engines/rag.py`, `core/brain.py` |
-| "Show me Jayesh's latest status" (ambiguous) | **Salesforce Intelligence Mode** resolves the request, asks *one* targeted clarifying question if needed, compiles a validated query plan (never free-form SOQL), runs it, resumes the original request after the answer | `engines/sf_intel.py`, `core/sf_intel/` |
-| Toggle **Live Salesforce** | Queries the org directly (read-only integration user); live values win when merged with warehouse rows | `engines/live_sf.py` |
+| "Show me Mira's latest status" (ambiguous) | **Salesforce Intelligence Mode** resolves the request, asks *one* targeted clarifying question if needed, answers the resolved request from the warehouse, resumes the original request after the answer | `engines/sf_intel.py`, `core/sf_intel/` |
 | Attach a PDF/DOCX, images, a CSV/XLSX/ZIP dataset | Images are downscaled in the browser to 1600 px on the long edge before upload (2026-08-29); reads **every page** of documents (OCR sidecar for scanned pages), answers about uploaded data from a safe profile or the full table when small, generates real PDF/DOCX reports | `engines/document.py`, `dataset.py`, `dataset_report.py` |
 | Paste a URL or a GitHub repo link | Fetches the pages (SSRF-safe) or shallow-clones the repo (code never executed) and answers with sources / `path:Lstart-Lend` citations | `engines/url.py`, `repo.py` |
 | Turn on **Web search** (assistant mode) | Multi-query search through SearXNG (self-hosted, keyless), reranks the candidates with a cross-encoder, reads the best sources and cites them — ~20 s | `engines/search.py` |
@@ -82,7 +81,7 @@ plain language. The platform:
 UI features (all in [`frontend/`](frontend/)): ChatGPT-style shell with sidebar
 (pinned / recent / archived), search palette (`Ctrl/Cmd+K`), effort picker
 (**Fast / Think / Max**), `+` menu (files, web search, **deep research**,
-Salesforce, live Salesforce), paste-as-chip for long text, reasoning accordion, agent step
+Salesforce), paste-as-chip for long text, reasoning accordion, agent step
 timeline, activity/research drawer, proof drawer (SQL · sources · code · data ·
 chart · files), nine chart types (ECharts), Mermaid diagrams with zoom and PNG
 export, context meter with **Compact now**, background generation that
@@ -166,7 +165,7 @@ referenced by immutable digest in [`compose.yaml`](compose.yaml) and
 │   │                           brain (packs), org_brief (grounding), sf_dictionary, schema_cache,
 │   │                           chart_* (spec/decision/pipeline/profile/png), citations, exports,
 │   │                           pdf/docx, report_render, learned_examples, best_of, clarify, profile
-│   ├── core/sf_intel/          Salesforce Intelligence Mode: interpret → plan → validate → execute
+│   ├── core/sf_intel/          Salesforce Intelligence Mode: interpret → clarify → resolve for the warehouse
 │   ├── publicapi/              the public developer API at /v1: router, models, error envelope, SSE, background, registry
 │   ├── apiplatform/            API keys, resolver, scopes, quotas, idempotency, webhooks, the console API
 │   ├── db.py                   PostgreSQL pool + 7 migrations
@@ -443,7 +442,7 @@ the keys that matter most — every key is documented in the example file:
 | Group | Keys |
 |---|---|
 | Models / auth | `HF_TOKEN` (gated downloads) |
-| Salesforce | `SF_CLIENT_ID`, `SF_USERNAME`, `SF_LOGIN_URL` (**your My Domain URL**, not login.salesforce.com), `SF_API_VERSION=v61.0`, `SF_LIGHTNING_BASE_URL`, `SF_LIVE_ENABLED=true`, and **one** credential: `SF_CLIENT_SECRET` (client-credentials, needed for *live* queries) or `SF_PRIVATE_KEY_B64` / `SF_PRIVATE_KEY_HOST_FILE` (JWT bearer, sync only) |
+| Salesforce | `SF_CLIENT_ID`, `SF_USERNAME`, `SF_LOGIN_URL` (**your My Domain URL**, not login.salesforce.com), `SF_API_VERSION=v61.0`, `SF_LIGHTNING_BASE_URL`, and **one** credential: `SF_CLIENT_SECRET` (client-credentials) or `SF_PRIVATE_KEY_B64` / `SF_PRIVATE_KEY_HOST_FILE` (JWT bearer, sync only) |
 | Local secrets | `POSTGRES_DB/USER/PASSWORD`, `SESSION_SECRET`, `PGADMIN_DEFAULT_EMAIL/PASSWORD`, `SEARXNG_SECRET` — blank = generated into `.runtime/secrets.env`; pool knobs `APP_DB_POOL_*`, `APP_DB_STATEMENT_TIMEOUT_MS` |
 | Ports / exposure | `FRONTEND_PORT=3000`, `ORCHESTRATOR_PORT=8080`, `POSTGRES_PORT`, `PGADMIN_PORT`, `TECHSARA_BIND_ADDRESS=127.0.0.1` (literal IP only), `PUBLISH_MODEL_PORTS=false`, `VLLM_PORT=8000`, `VLLM_ROUTER_PORT=8002`, `VLLM_EMBED_PORT=8003`, `VLLM_OCR_PORT=8004`, `LLAMA_CPP_PORT=8000` |
 | Optional services | `SEARCH_ENABLED`, `SEARCH_PROVIDER=searxng|tavily|brave`, `TAVILY_API_KEY`, `BRAVE_API_KEY`, `COMPOSE_PROFILES=search,admin` |
@@ -544,7 +543,7 @@ Server-Sent Events. The steps, in order:
 6. **Context detection.** GitHub link, pasted URLs (only when the links *are* the request — a long paste with links inside is a document), previously fetched pages and uploaded documents re-injected as question-relevant excerpts on every later turn, uploaded datasets.
 7. **Compaction** (§15) assembles the history within the model window and reports `meta.context` for the context meter.
 8. **Salesforce Intelligence Mode** (§14) runs first in Salesforce mode; a clarification answer *owns the turn*.
-9. **Engine chain**, first match wins: SF Intelligence handled it → PDF → image → GitHub repo → URL list → agent → web search → uploaded dataset → assistant chat → live Salesforce → the **LangGraph router graph** (`graph.py`), which classifies into `sql | rag | vision | report | chat`.
+9. **Engine chain**, first match wins: SF Intelligence handled it → PDF → image → GitHub repo → URL list → agent → web search → uploaded dataset → assistant chat → the **LangGraph router graph** (`graph.py`), which classifies into `sql | rag | vision | report | chat`.
 10. **`meta`** is enriched (route, model, effort, SQL, rows, chart, citations, sources, steps, report files, context, clarification) and **`done`** is sent; the exchange is stored, cross-chat facts are extracted and background compaction runs detached.
 
 **One model, three efforts.** `smart` = the main model (thinking on for *Think*/*Max*, off for *Fast*); `fast` = the router model with thinking off. Legacy `low/medium/high/extra_high` map to `fast/think/think/max`. *Max* additionally runs best-of-3 candidates with a judge for chat answers and deeper agent/search budgets. Thinking budgets are **off by default** (the served vLLM build ignores the server-side budget; client enforcement is never applied when tools are attached). `GEN_WALL_CLOCK_S` (1800 s) is a hang guard, not a budget.
@@ -649,32 +648,34 @@ user or conversation column. Details and the diagram:
 |---|---|---|---|
 | `router.py` | – | Strict-JSON classifier on the router model with few-shots; images force `vision`; unparseable → main-model retry → `rag` | Salesforce-mode questions that reached the graph |
 | `orchestrate.py` | – | Auto-plan `{agent, search}` | Every text turn unless an attachment / explicit agent |
-| `sql.py` | `sql` | Schema slice (≤40 tables × 140 columns, brain-pinned tables first) → one guarded `SELECT` → DuckDB **read-only, no external access** → one retry with the real column list → 500-row preview, 100k-row export, chart, **deterministic summary computed in Python over up to 100k rows** → streamed narrative. Falls back to live Salesforce when the warehouse cannot answer or is locked | router `sql`, live toggle, agent SQL steps, report sections |
+| `sql.py` | `sql` | Schema slice (≤40 tables × 140 columns, brain-pinned tables first) → one guarded `SELECT` → DuckDB **read-only, no external access** → one retry with the real column list → 500-row preview, 100k-row export, chart, **deterministic summary computed in Python over up to 100k rows** → streamed narrative. A missing table or a locked warehouse gets one honest line; it never reads the org | router `sql`, agent SQL steps, report sections |
 | `rag.py` | `rag` | Embed → LanceDB top-30 → rerank (in-process / remote / off) → top-8 → cited answer; also serves brain knowledge for "how does X work" | router `rag`, default fallback |
 | `vision.py` | `vision` | Any number of images (999 ceiling) through the multimodal main model, fitted to one call (smaller before fewer); invoices/contracts return a JSON block first | any attached image |
 | `document.py` + `ocr.py` | `vision` | PDF/DOCX/plain: every page's text layer, OCR sidecar (`baidu/Unlimited-OCR`) for thin pages (≤40), first pages also as images; full text stored for later turns | `pdf` attached |
 | `report.py` | `report` | ≤6 planned sections filled via sql/rag, matplotlib PNGs, Markdown → `.docx` + `.pdf` (pandoc + WeasyPrint) into `/reports` | router `report` |
 | `artifact.py` | `artifact` | **The Artifact Studio.** "Create a PDF / Word / PowerPoint / Excel / CSV about this", "create a CSV dataset of 500 records", "clean up this pasted table and share it as XLSX, CSV, Word and PDF", "make slide 4 shorter", "also as Word" → a durable job (V31), the model writes CONTENT as a validated spec (rows come from code: a pasted table copied verbatim, a seeded generator for sample data), code renders PDF/DOCX/PPTX/XLSX/CSV in a limited subprocess, every file reopened and counted, one card per file with Download all, a side-panel viewer (pages or grid), versions with lineage; Fast/Think/Max change depth (outline, review, a visual pass over the rendered pages), never availability. See [`docs/artifact-studio/`](docs/artifact-studio/) | `artifacts/intent.decide` on the resolved text, every mode |
 | `chat.py` | `chat` | Plain streamed completion (assistant or Salesforce small-talk prompt) | assistant mode, router `chat` |
-| `agent.py` | `agent` | PLAN → EXECUTE (≤8 steps of `sql|rag|llm|web|salesforce`, concurrency 3, `step` events) → SYNTHESIZE; grounded on the user's own sentence, not the planner's paraphrase | agent toggle or auto-plan |
+| `agent.py` | `agent` | PLAN → EXECUTE (≤8 steps of `sql|rag|llm|web`, concurrency 3, `step` events) → SYNTHESIZE; grounded on the user's own sentence, not the planner's paraphrase | agent toggle or auto-plan |
 | `search.py` | `search` | Query rewrite (router model) → 1–6 parallel queries → round-robin merge, per-domain cap → **cross-encoder rerank** → warm store or SSRF-safe fetch (16 concurrent) → extraction → tiered budget → memory chunks → cited answer; SERP cache + per-user rate limit | assistant mode + search wanted |
 | `deep_research.py` | `deep_research` | **The iterative mode.** Plan → search → read → **audit the gaps** → search again (≤3 rounds) → streamed cited report, with every `[n]` validated against the pages actually fetched. One run at a time; run recorded in `research_runs`. See [`docs/01-codebase/deep-research.md`](docs/01-codebase/deep-research.md) | the **Deep research** pill (explicit only) |
 | `crawl.py` | `crawl` | "index this site `<url>`" — robots-respecting, sitemap-first crawl of one site into the web store (caps: 1000 pages / 15 min), then follow-up Q&A answered from the stored copy | crawl intent + URL, or a crawled site in the conversation |
 | `url.py` | `url` | Fetch pasted links safely, store page text, answer with sources | links are the request |
 | `repo.py` | `repo` | Shallow capped clone of a public GitHub repo (hooks off, never executed) → 60-line chunks → overview / code Q&A with `path:Lstart-Lend` | GitHub URL or an indexed repo in the conversation |
 | `dataset.py` / `dataset_report.py` | `dataset` | Answers from a safe **profile** of uploaded CSV/XLSX/ZIP data (full rows when ≤200) wrapped in "DATA, NOT INSTRUCTIONS" delimiters; report variant computes headline facts in Python | uploads exist in the conversation |
-| `live_sf.py` | feeds `sql` | Model writes SOQL → guarded → REST → merged with warehouse rows, live values win; live `describe` for schema questions | warehouse can't answer, or **Live Salesforce** |
+| `live_sf.py` | feeds `sql` | What is left of the removed live path: the test for "is this a question about fields or objects?". Its calls to the org all reach `core/salesforce.py`, which refuses them | a question the warehouse has no table for |
 | `sf_intel.py` | `sql`/`chat`/`clarify` | Salesforce Intelligence Mode (§14) | Salesforce mode |
 
 ---
 
-## 12. Salesforce: sync, warehouse, live queries
+## 12. Salesforce: sync and warehouse
 
 ### Credentials
 
+These go to the sync worker and to nothing else. Compose blanks them on the
+orchestrator, so what `.env` holds cannot reach it.
+
 Identity: `SF_CLIENT_ID`, `SF_USERNAME`, `SF_LOGIN_URL` (My Domain). Plus one of,
-in strict precedence: `SF_CLIENT_SECRET` (client-credentials grant — the only
-grant the orchestrator's **live** path supports), `SF_PRIVATE_KEY_FILE`
+in strict precedence: `SF_CLIENT_SECRET` (client-credentials grant), `SF_PRIVATE_KEY_FILE`
 (compose pins `/data/sf_jwt_key.pem`, which *you* place in the data volume),
 `SF_PRIVATE_KEY_B64` (the launcher stages a host key file into this), or the
 default path. JWT assertions are RS256 with a 180 s validity; tokens are cached
@@ -705,18 +706,29 @@ does not backfill history).
 
 DuckDB allows one writer *or* many readers. The worker opens a connection per
 write (milliseconds), the orchestrator opens read-only and waits up to 4–6 s;
-if the warehouse is still busy the question **falls back to live Salesforce**
-instead of erroring. The one path without a retry is `GET /health`'s DuckDB
+if the warehouse is still busy the person is **told the copy is being refreshed**
+and to try again, instead of seeing the lock error. The one path without a retry is `GET /health`'s DuckDB
 check, so **`status: degraded` with `checks.duckdb.status == "error"` during a
 sync write is normal and transient**, not an outage.
 
-### Live Salesforce and the field dictionary
+### Warehouse only, and the field dictionary
 
-`core/salesforce.py` guards every SOQL (one `SELECT`, injected `LIMIT`, read-only
-user). `core/sf_dictionary.py` + `orchestrator/scripts/build_dictionary_from_metadata.py`
+**Every answer reads the warehouse; the sync worker is the one process that talks
+to Salesforce** (owner order, 2026-11-04). `core/salesforce.py` has no HTTP client
+and no credentials, and every call to it raises `SalesforceUnavailable`, so a record
+changed after the last sync pass is not visible until the next one, and an object
+the sync does not carry is reported as missing.
+
+That covers an uncredentialed GET too. A link to the company's own org pasted into
+chat is not opened, and the answer says so: `core/net.py` refuses the org's hosts for
+every fetcher (URL, crawl, robots, search, web refresh), naming the org from
+`SF_LIGHTNING_BASE_URL` and `SF_LOGIN_URL`. help.salesforce.com, www.salesforce.com
+and other companies' public sites stay fetchable.
+
+`core/sf_dictionary.py` + `orchestrator/scripts/build_dictionary_from_metadata.py`
 build a field dictionary (formulas, roll-ups, picklists, lookups, help text)
 from a metadata retrieve, merged with brain field notes, and `core/org_brief.py`
-turns dictionary + brain + schema into the grounding block every SQL/SOQL
+turns dictionary + brain + schema into the grounding block every SQL
 generation sees.
 
 ---
@@ -736,7 +748,7 @@ Pack schema ([`core/brain.py`](orchestrator/app/core/brain.py)):
 |---|---|
 | `triggers` | words/phrases that pull the pack's `rules` and `tables` into a question (single words are stemmed; phrases matched whole) |
 | `tables` | warehouse tables pinned into the schema slice |
-| `rules` | trap-avoiding rules injected into SQL and SOQL generation (≤5 KB per pack, ≤24 KB per prompt) |
+| `rules` | trap-avoiding rules injected into SQL generation (≤5 KB per pack, ≤24 KB per prompt) |
 | `metrics` | canonical measures with `name`, `table`, `definition`, `sql`, `aliases` |
 | `glossary` | term → meaning, injected when the term appears |
 | `field_notes` | per-object / per-field help merged into the field dictionary (enrich-only; unknown fields are dropped; **last pack in filename order wins**) |
@@ -762,10 +774,10 @@ The Salesforce pill is an agent, not a filter ([`docs/06-agent-design/SALESFORCE
 code in [`orchestrator/app/core/sf_intel/`](orchestrator/app/core/sf_intel/) and
 [`engines/sf_intel.py`](orchestrator/app/engines/sf_intel.py)):
 
-- **Interpret** the request against conversation state, the brain vocabulary (with bounded spelling repair), the field dictionary and known people (full-name resolution runs before any "which Jayesh?" question).
+- **Interpret** the request against conversation state, the brain vocabulary (with bounded spelling repair), the field dictionary and known people (full-name resolution runs before any "which Mira?" question).
 - **Clarify** when genuinely ambiguous (`CLARIFY_MODE=ambiguous`): exactly one targeted question, ≤2 rounds, multi-select and custom answers allowed, rendered in the composer as a control (not a message), persisted with a resume token so it survives reloads, idempotent on double submission, and cancelled explicitly when stale (a pending question would otherwise block the conversation).
-- **Plan, never free-form SOQL**: `plan.py` compiles a validated `SalesforceQueryPlan` — object queryable by this connection, every field readable, relationship depth ≤3, operator allowlist, date literals validated, `LIMIT ≤ 200`, ≤40 fields, ≤20 filters. Rejected plans ask the user instead. There is **no write path**.
-- **Execute, paginate, calculate, verify, answer**, then update the conversation's Salesforce state and **resume the original request**.
+- **Answer from the warehouse**: the resolved request goes to the SQL engine (§11), then the conversation's Salesforce state is updated and the **original request resumes**. There is **no write path**.
+- **The plan compiler does not run**: `plan.py` and its executor stay in the code, but they need the live connection removed on 2026-11-04, so `tools.py` refuses them and no `SalesforceQueryPlan` reaches the org.
 - Progress phases are streamed as `status` events (the UI's phase star is backend-driven only); reasoning deltas are deliberately not forwarded on this route.
 
 ---
@@ -843,7 +855,7 @@ ignores the cookie. FastAPI's own `/docs` and `/openapi.json` are off unless
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | dependency probes (`vllm`, `vllm-router`, `vllm-embed`, `duckdb`, `app_db`, …), served window vs configured, serving flags; `status: ok|degraded`, always HTTP 200 |
-| `POST` | `/chat` | the SSE chat endpoint (`ChatRequest`: `messages` or `message`, `conversation_id`, `mode: salesforce|assistant`, `sf_live`, `model: smart|fast`, `effort: fast|think|max`, `agent`, `web_search: off|auto|on`, **`deep_research`**, `images[]`, `pdf`, `clarification`) |
+| `POST` | `/chat` | the SSE chat endpoint (`ChatRequest`: `messages` or `message`, `conversation_id`, `mode: salesforce|assistant`, `model: smart|fast`, `effort: fast|think|max`, `agent`, `web_search: off|auto|on`, **`deep_research`**, `images[]`, `pdf`, `clarification`) |
 | `GET` | `/chat/attach/{conversation_id}` | re-join a running generation (replays the buffer, then live; 404 once finished) |
 | `POST` | `/chat/stop` · `GET /chat/active` · `POST /chat/compact` | cancel, list running, force compaction |
 | `GET` | `/chat/salesforce/{conversation_id}` · `POST /chat/salesforce/cancel` | starter options + pending clarification; dismiss it |
@@ -873,7 +885,7 @@ Contracts in detail: [`docs/01-codebase/frontend-api-contracts.md`](docs/01-code
 
 - **Enterprise login (2026-09-01).** Every request authenticates: opaque server-side sessions in an HttpOnly `ts_session` cookie (SameSite=Lax; Secure over HTTPS), Argon2id passwords, login throttling, invite-only account creation, workspace roles (`super_admin`/`admin`/`member`) enforced by capability checks on the backend, and an audited admin surface. Ownership is enforced in SQL — a member editing IDs/URLs/cookies gets 404 for anyone else's conversations, uploads, memory, reports and running generations. Full reference: [`docs/AUTH.md`](docs/AUTH.md). First-time setup: `./techsara auth bootstrap --email you@company.com`.
 - **Network exposure still matters.** Model APIs are `expose`-only on an internal network unless `PUBLISH_MODEL_PORTS=true` (they remain unauthenticated); PostgreSQL and pgAdmin never leave loopback; `TECHSARA_BIND_ADDRESS` widens exposure deliberately. In dual cluster mode the main model's head listens on the host (`0.0.0.0:8000` when published, otherwise the Docker bridge gateway only) because NCCL/RoCE needs host networking.
-- **Salesforce**: read-only integration user; SQL through `core/sql_guard.py` (one `SELECT`, no writes/DDL/extensions/file or network table functions, comment-smuggling rejected) on a **read-only DuckDB with external access disabled**; SOQL through a guard with forced `LIMIT`; Intelligence Mode compiles validated plans, the model never writes query text; no write path exists.
+- **Salesforce**: only the sync worker holds credentials (a read-only integration user) and talks to the org; the orchestrator has neither credentials nor an HTTP client for it. SQL through `core/sql_guard.py` (one `SELECT`, no writes/DDL/extensions/file or network table functions, comment-smuggling rejected) on a **read-only DuckDB with external access disabled**; no write path exists.
 - **SSRF**: every outbound fetch goes through `core/net.py` (private/loopback/link-local/metadata ranges refused after DNS, re-checked per redirect, bounded).
 - **Archives / uploads / reports**: zip-slip, symlink, device and bomb protections; report names path-safe; repo clones are data, never executed.
 - **Prompt injection**: dataset content and column profiles are delimited as data; chart selection never sees cell values; titles treat bodies as untrusted; raw chain-of-thought never leaves the Salesforce Intelligence route.
@@ -967,7 +979,7 @@ MOCK_MODE=true npm run dev        # UI-only development
 | Suite | Scope | Size |
 |---|---|---|
 | Launcher | mocks + temp dirs; `test_compose_overlays.py` renders all 13 host fixtures (and the DGX dual-mode fixture) through real `docker compose config` and asserts platform invariants (loopback publication, digest-pinned images, no developer paths); skips without Compose ≥ 2.24 | 474 tests, all green on 2026-09-11 |
-| Orchestrator | SSE contract, routing, Salesforce Intelligence (engine, plans, clarification), org brief / brain / dictionary, charts, live Salesforce, security (SQL guard, SSRF, archives, report paths, DB guard), history, memory, context budgets, reasoning; every app table is truncated before each test | 136 files, ~3,150 tests, all green on 2026-09-11 |
+| Orchestrator | SSE contract, routing, Salesforce Intelligence (engine, plans, clarification), org brief / brain / dictionary, charts, warehouse-only (no way to the org), security (SQL guard, SSRF, archives, report paths, DB guard), history, memory, context budgets, reasoning; every app table is truncated before each test | 136 files, ~3,150 tests, all green on 2026-09-11 |
 | Sync worker | discovery, JWT/secrets, Bulk fallback, upserts, deletes, watermarks, chunking, embedding integrity, CLI | 157 tests |
 | Frontend | Vitest; 35 pure-logic files in Node, 12 component files in jsdom (`// @vitest-environment jsdom`) | 122 files, 1,920 cases |
 
@@ -1087,7 +1099,7 @@ numbers, counts, topology and finding status are not current): the rest of
 - **Node 2 runs an unrelated older `sf-local-ai` stack** (Qwen3.6-35B on port 8000) that competes for its memory; it was left untouched.
 - **Health semantics**: `/health` may report `degraded` transiently during sync writes (§12); `/v1/models` on the main model answers even when the engine is dead — use `scripts/cluster-status.sh --probe` or a real completion as the truth.
 - **Sync worker**: Parquet landing files are never read back and never pruned; a Bulk job stuck `InProgress` polls forever; API-limit warnings do not throttle; a full-size Long Text Area can exceed the CSV field limit and abort that object's extract; `SYNC_AUTO_FIELDS=off` parses as *true* (only `0/false/no` disable it).
-- **Docs drift**: `docs/01-codebase/data-model.md` and `sync-worker.md` describe the 48-object era (now ~1,020 objects, deletes *are* propagated, 11 migrations); some frontend docs still say Next 15 and four effort levels (it is Next 16 and three).
+- **Docs drift**: `docs/01-codebase/data-model.md` and `sync-worker.md` describe the 48-object era (now ~1,020 objects, deletes *are* propagated, 11 migrations); some frontend docs still say Next 15 and four effort levels (it is Next 16 and three); the 2026-07-31 audit pages and diagrams still draw the live Salesforce path removed on 2026-11-04 (§12).
 - **Housekeeping**: a stray git-tracked DuckDB file named `→` sits at the repo root (a shell-redirection accident); `brain/sources/` contains a duplicated 1 MB knowledge base; two top-level `customer-success-*.txt` files duplicate `brain/sources/`.
 - **Reproducibility**: the npm lockfile is committed; the two Python services use ranged requirements without hashes.
 - **Single user, no auth** by design (§20).

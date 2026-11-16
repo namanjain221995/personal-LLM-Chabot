@@ -24,7 +24,6 @@ import {
   IconGlobe,
   IconPaperclip,
   IconPlus,
-  IconSparkles,
 } from './icons';
 
 const ITEM_ICON: Record<ComposerMenuItemId, React.ComponentType<{ size?: number; className?: string }>> = {
@@ -32,7 +31,6 @@ const ITEM_ICON: Record<ComposerMenuItemId, React.ComponentType<{ size?: number;
   'web-search': IconGlobe,
   'deep-research': IconBook,
   salesforce: IconCloud,
-  'sf-live': IconSparkles,
 };
 
 export function AttachMenu({

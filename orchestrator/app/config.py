@@ -726,6 +726,10 @@ class Settings:
         # rows; two corrections on top approach 450 s, Max adds sources and
         # a visual pass. 900 s is the wall above that, not a target.
         self.artifact_stage_timeout_s: float = _float("ARTIFACT_STAGE_TIMEOUT_S", 900.0)
+        # One model call inside a job, from the moment it is sent. The same
+        # measurement is about 84 s a call; a Think call on a busy engine ran past
+        # 19 minutes. 0 turns it off, leaving only the stage's wall clock.
+        self.artifact_model_call_timeout_s: float = _float("ARTIFACT_MODEL_CALL_TIMEOUT_S", 600.0)
         # The renderer subprocess: wall clock and address space. A document
         # that needs more than this is a page-count or image bomb.
         self.artifact_render_timeout_s: float = _float("ARTIFACT_RENDER_TIMEOUT_S", 180.0)
@@ -916,12 +920,6 @@ class Settings:
         # window). Must match the vLLM `--max-model-len` the main model serves
         # — it is not a knob that widens the window, only the app's honest view
         # of it. Raising the actual window is a separate serving change.
-        # Live Salesforce lookups (read-only) for data newer than the last
-        # sync, or on objects the warehouse does not carry.
-        self.sf_client_id: str = os.environ.get("SF_CLIENT_ID", "")
-        self.sf_client_secret: str = os.environ.get("SF_CLIENT_SECRET", "")
-        self.sf_login_url: str = os.environ.get("SF_LOGIN_URL", "")
-        self.sf_private_key_b64: str = os.environ.get("SF_PRIVATE_KEY_B64", "")
         self.sf_api_version: str = os.environ.get("SF_API_VERSION", "v61.0")
         # Explicit deployment label for provenance/evaluation. Never infer
         # this from a hostname: aliases and My Domain URLs do not reliably
@@ -929,10 +927,10 @@ class Settings:
         self.sf_environment: str = (
             os.environ.get("SF_ENVIRONMENT", "unknown").strip().lower() or "unknown"
         )
-        self.sf_live_timeout: float = float(os.environ.get("SF_LIVE_TIMEOUT", "45"))
-        # _bool, not a bespoke not-in list: the old parse treated "off" (and
-        # any typo) as true, silently enabling live lookups.
-        self.sf_live_enabled: bool = _bool("SF_LIVE_ENABLED", True)
+        # Constant, on purpose: answers read the warehouse only (owner order
+        # 2026-11-04). The guards in sf_intel still read this name, and no
+        # environment value turns it back on.
+        self.sf_live_enabled: bool = False
         # MAIN_MODEL_MAX_LEN is the new, explicit spelling and wins when set;
         # MODEL_MAX_CONTEXT remains the historical name so existing .env files
         # keep working. Both describe the SAME number and neither WIDENS the
@@ -1819,6 +1817,10 @@ class Settings:
         # so it matches the export cap: if we will write 100k rows to a CSV,
         # we can count 100k rows in memory.
         self.sql_summary_row_cap: int = _int("SQL_SUMMARY_ROW_CAP", EXPORT_ROW_CAP)
+        # One statement of the writer may take this long. Well over any real answer
+        # (the slowest stored one took 16 ms), well under what stops a whole member's
+        # turn, and it is what ends a six-table join that would run for minutes.
+        self.sql_statement_seconds: float = _float("SQL_STATEMENT_SECONDS", 30.0)
 
         # --- RAG (§8): LanceDB top-30 → rerank → top-8 ---
         self.rag_top_k: int = _int("RAG_TOP_K", 30)

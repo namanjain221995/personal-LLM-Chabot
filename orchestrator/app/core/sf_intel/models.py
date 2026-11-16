@@ -120,6 +120,19 @@ _API_NAME_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*)__[cr]\b")
 _INTERNAL_TOKEN_RE = re.compile(
     r"\b(RecordTypeId|RecordType\.\w+|\w+Id|SOQL|soql|API name|api_name)\b"
 )
+#: A bracket holding one of those is query syntax, not part of the sentence.
+_INTERNAL_ASIDE_RE = re.compile(
+    r"\s*\([^()]*\b(?:RecordType\.\w+|\w+Id|SOQL|soql|api_name)\b[^()]*\)"
+)
+
+
+def _spoken_field(match: "re.Match[str]") -> str:
+    """`ParentId` as a person says it, "parent". Vocabulary with no spoken form goes."""
+    token = match.group(1)
+    if token in ("SOQL", "soql", "API name", "api_name"):
+        return ""
+    name = token.split(".")[0] if "." in token else re.sub(r"_?Id$", "", token)
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name).replace("_", " ").lower()
 
 
 def humanize(text: str) -> str:
@@ -134,10 +147,13 @@ def humanize(text: str) -> str:
     Deterministic and reversible-looking rather than clever: `Foo_Bar__c`
     becomes "foo bar", so the sentence around it still reads.
     """
+    # Deleting the token alone left "linked to other records ( is not null)?" on
+    # a real card, so the bracket goes whole and a bare field name becomes words.
+    cleaned = _INTERNAL_ASIDE_RE.sub("", text or "")
     cleaned = _API_NAME_RE.sub(
-        lambda m: m.group(1).replace("_", " ").strip().lower(), text or ""
+        lambda m: m.group(1).replace("_", " ").strip().lower(), cleaned
     )
-    cleaned = _INTERNAL_TOKEN_RE.sub("", cleaned)
+    cleaned = _INTERNAL_TOKEN_RE.sub(_spoken_field, cleaned)
     # Collapse whatever the substitutions left behind — a removed token can
     # strand a double space or a space before punctuation.
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
@@ -202,6 +218,10 @@ class ClarificationOption(BaseModel):
         object.__setattr__(self, "label", humanize(self.label) or self.label)
         object.__setattr__(self, "description", humanize(self.description))
         return self
+
+    def reading(self) -> str:
+        """The option as the SQL writer reads it: `value` alone was "all"."""
+        return self.label if self.value in ("", self.label) else f"{self.label} ({self.value})"
 
 
 class ClarificationRequest(BaseModel):
@@ -312,6 +332,9 @@ class ClarificationRound(BaseModel):
     question: str
     question_fingerprint: str
     answer: str = ""
+    #: What the person read when they chose it. `answer` is the option's machine
+    #: value, and "all" tells the SQL writer nothing.
+    answer_label: str = ""
     answered: bool = False
     skipped: bool = False
     round_number: int = 1
@@ -356,17 +379,33 @@ class PendingIntent(BaseModel):
         verbatim matters — the answers narrow it, they do not replace it, and a
         rewritten question is how "closing this quarter in North America" turns
         into a query about EMEA only.
+
+        Two lines, because they are two different things. "(Clarified:" is what
+        the person chose on a card, and it binds. "(Assumed:" is a slot the planner
+        or an earlier turn filled in: 9 of 23 such lines had no card behind them
+        and the writer was still told the person picked them. One line each, so
+        `schema_cache.own_words` can cut them from the person's wording.
         """
-        if not self.resolved_slots:
-            return self.original_user_text
-        scope = "; ".join(
-            f"{slot.replace('_', ' ')}: {value}"
-            for slot, value in self.resolved_slots.items()
-            if value
-        )
-        if not scope:
-            return self.original_user_text
-        return f"{self.original_user_text}\n\n(Clarified: {scope})"
+        answered = {r.slot: r for r in self.clarification_history if r.answered}
+        chosen: List[str] = []
+        assumed: List[str] = []
+        for slot, value in self.resolved_slots.items():
+            if not value:
+                continue
+            name = slot.replace("_", " ")
+            value = " ".join(str(value).split())
+            round_ = answered.get(slot)
+            if round_ is None:
+                assumed.append(f"{name}: {value}")
+                continue
+            label = " ".join(round_.answer_label.split()) or value
+            chosen.append(f'{name}: "{label}"' + (f" ({value})" if label != value else ""))
+        lines = [self.original_user_text]
+        if chosen:
+            lines.append(f"(Clarified: the person chose {'; '.join(chosen)}. Do exactly this.)")
+        if assumed:
+            lines.append(f"(Assumed: {'; '.join(assumed)}. Not said by the person.)")
+        return "\n\n".join(lines)
 
 
 class ConversationSalesforceState(BaseModel):

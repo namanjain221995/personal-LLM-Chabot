@@ -167,7 +167,7 @@ async function menuState(): Promise<Record<string, string | null>> {
   const out: Record<string, string | null> = {};
   for (const r of rows) {
     const label = (r.textContent ?? '').trim();
-    for (const key of ['Web search', 'Deep research', 'Live Salesforce', 'Salesforce']) {
+    for (const key of ['Web search', 'Deep research', 'Salesforce']) {
       if (label.startsWith(key) && !(key in out)) out[key] = r.getAttribute('aria-checked');
     }
   }
@@ -213,7 +213,6 @@ describe('DEFAULT · what a brand-new chat looks like', () => {
       'Web search': 'false',
       'Deep research': 'false',
       Salesforce: 'false',
-      'Live Salesforce': 'false',
     });
   });
 
@@ -257,15 +256,14 @@ describe('DEFAULT · New Chat starts neutral however the last one ended', () => 
 
     // Chat A: arm the special modes the way a user does — through the menu,
     // so the app's own exclusivity rules apply rather than a hand-built state.
-    await clickMenuRow('Live Salesforce');
+    await clickMenuRow('Salesforce');
     expect(await menuState()).toMatchObject({
       Salesforce: 'true',
-      'Live Salesforce': 'true',
     });
 
     const first = await ask('scoped question');
     expect(first.mode).toBe('salesforce');
-    expect(first.sf_live).toBe(true);
+    expect(first.sf_live).toBe(false);
 
     // New Chat.
     chatBodies = [];
@@ -279,7 +277,6 @@ describe('DEFAULT · New Chat starts neutral however the last one ended', () => 
       'Web search': 'false',
       'Deep research': 'false',
       Salesforce: 'false',
-      'Live Salesforce': 'false',
     });
 
     // …and so is the wire, which is the half a label check cannot prove.

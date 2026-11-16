@@ -52,10 +52,12 @@ export function downloadCsv(rows: DataRow[], filename: string): void {
  *
  *   Interview__c, fetched 14:32   ->  interview-2026-08-31-1432.csv
  *
- * The timestamp is the query's own `query_timestamp`, so two questions about
- * the same object in one chat still land in two different files, and the file
- * says WHICH pull it came from. Falls back through route to the old name, so a
- * payload carrying none of this still downloads.
+ * A live pull is stamped with its own `query_timestamp`, so the file says WHICH
+ * pull it came from. A synced answer's timestamp is when the snapshot was
+ * published, which many questions share, so that one is stamped when it is
+ * rendered: two questions about the same object in one chat still land in two
+ * different files. Falls back through route to the old name, so a payload
+ * carrying none of this still downloads.
  */
 export function csvFilenameFor(meta: Meta, fallback = 'techsara-data'): string {
   const objects = meta.salesforce_sources?.objects ?? [];
@@ -68,7 +70,10 @@ export function csvFilenameFor(meta: Meta, fallback = 'techsara-data'): string {
     slugifyName(meta.route ?? '') ||
     fallback;
 
-  const when = new Date(meta.salesforce_sources?.query_timestamp ?? Date.now());
+  const sources = meta.salesforce_sources;
+  const when = new Date(
+    sources?.source === 'live' ? (sources.query_timestamp ?? Date.now()) : Date.now(),
+  );
   const stamp = Number.isNaN(when.getTime()) ? null : when;
   if (!stamp) return `${base}.csv`;
 
