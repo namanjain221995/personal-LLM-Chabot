@@ -4,6 +4,7 @@ tests/fixtures/charts/make_fixtures.py)."""
 from __future__ import annotations
 
 import asyncio
+import gc
 import math
 import time
 
@@ -351,7 +352,20 @@ def test_resolve_spec_async_keeps_the_event_loop_free():
         await hb
         return out, max(gaps), elapsed
 
-    out, worst_gap, elapsed = asyncio.run(main())
+    # A full (generation 2) collection stops every thread, the loop's too,
+    # for as long as it walks every tracked object in the process: the 200,000
+    # input rows and whatever earlier tests left. Whether one lands inside the
+    # measurement depends on that heap's history, not on this code. Alone it
+    # did, every run: 44-116 ms, and the loop stalled 102-122 ms (2026-11-16);
+    # after the shard's earlier files it did not, and the worst gap was 21-24
+    # ms; on CI run 43915766055 the gap was 336 ms. Freezing what exists now
+    # leaves the collector only the objects the computation itself makes.
+    gc.collect()
+    gc.freeze()
+    try:
+        out, worst_gap, elapsed = asyncio.run(main())
+    finally:
+        gc.unfreeze()
     ch = out["document"]["blocks"][0]["chart"]
     assert sum(sum(s["values"]) for s in ch["series"]) == sum(r[2] for r in rows)
     assert worst_gap < 0.1, f"event loop stalled {worst_gap * 1000:.0f} ms (compute took {elapsed:.1f} s)"
