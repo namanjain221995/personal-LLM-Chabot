@@ -51,6 +51,7 @@ roles to capabilities:
 | invites.manage | – | ✓ (members only) | ✓ (any role) |
 | workspace_content.read (audited content viewer) | – | ✓ | ✓ |
 | sessions.manage | – | ✓ | ✓ |
+| sf_assistant.use (Salesforce questions in /chat answered by the sf_assistant service) | – | ✓ | ✓ |
 | roles.manage | – | – | ✓ |
 | audit.read | – | – | ✓ |
 | analytics.read (per-member usage table and its export — since 2026-09-13) | – | – | ✓ |

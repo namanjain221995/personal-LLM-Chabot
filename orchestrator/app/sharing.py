@@ -267,11 +267,17 @@ def evaluate(
     # reading only the non-empty turns let its vision answer go public (chat
     # media QA, 2026-10-02). Provenance can only add blocks.
     private_kinds: List[str] = []
+    admins_only = False
     for m in messages:
         if m.get("role") not in ("user", "assistant"):
             continue
         meta = m.get("meta") or {}
         route = str(meta.get("route") or "")
+        # An sf_assistant answer is for admins in phase 1, and a workspace link
+        # is the one route from it to a member. Its `route` is "sql" like any
+        # records answer, so only the engine's own stamp can tell.
+        if meta.get("engine") == "sf_assistant":
+            admins_only = True
         if route in PRIVATE_ROUTES:
             private_kinds.append(PRIVATE_ROUTES[route])
         for key, what in PRIVATE_META_KEYS.items():
@@ -289,6 +295,13 @@ def evaluate(
         if _INTERNAL_URL.search(body):
             internal_links = True
 
+    # First, because the create route shows the first reason only: the sentence
+    # below this one is about links OUTSIDE the workspace.
+    if admins_only:
+        reasons.append(
+            "This conversation holds an answer only administrators may read, "
+            "so it cannot be shared, not even inside the workspace."
+        )
     if private_kinds:
         unique = sorted(set(private_kinds))
         reasons.append(
@@ -313,7 +326,9 @@ def evaluate(
 
     # Secrets are the one thing too dangerous for a workspace link either: a
     # workspace share is still a copy that outlives the conversation.
-    workspace_allowed = bool(policy.get("workspace_enabled", True)) and not secret_kinds
+    workspace_allowed = (
+        bool(policy.get("workspace_enabled", True)) and not secret_kinds and not admins_only
+    )
     if secret_kinds and policy.get("workspace_enabled", True):
         warnings.append("Remove the credential and try again to share internally.")
 

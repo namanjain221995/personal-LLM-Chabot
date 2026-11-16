@@ -1,0 +1,93 @@
+# Own compose project (sf-assistant-ask): the ask service, one MCP tool for the platform's /chat (web/ask_mcp.py). Start
+# and token: ./run.sh up-ask, ./run.sh new-ask-token (see ../docs/runbook.md). It runs on the image the page's project
+# builds and never builds it (the page and the MCP server run on that image). It listens on no TCP port, only on a Unix
+# socket in the named volume sf-local-ai_ask-sock, which the platform's compose creates: only a container with that
+# volume can reach it. It never touches the sf-local-ai stack otherwise: it mounts that stack's data volume READ-ONLY
+# and reaches its vLLM server on localhost:8000 through the host network. Of .private it sees only its two files: the
+# token file read-only, its log writable. Each is a file bind mount, so run.sh creates them first, and new-ask-token
+# rewrites the token file in place (a file bind mount keeps the inode it was created with; the server refuses every
+# token when it sees that the file was replaced).
+name: sf-assistant-ask
+
+services:
+  sf-assistant-ask:
+    image: sf-assistant-web:local
+    pull_policy: never            # built by the page's project (./run.sh up)
+    container_name: sf-assistant-ask
+    restart: unless-stopped
+    network_mode: host            # vLLM on localhost:8000 (records are on only with a local endpoint)
+    mem_limit: 4g                 # the process peaks near 0.85 GB; DuckDB may use 2 GB
+    pids_limit: 512               # threads included: DuckDB takes one per core
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    command: ["python", "/srv/web/ask_mcp.py"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPATH: /srv/sfa/src
+      SFA_HOME: /srv/sfa                           # prompts/, knowledge/ and the two .private files below it
+      SFA_WAREHOUSE: /data/warehouse.read.duckdb   # the live read copy; never /data/warehouse.duckdb
+      SFA_RESOLVER: "${SFA_RESOLVER:-}"            # the spelling help: off or on; empty = on
+      OKEVAL_BASE_URL: http://localhost:8000/v1
+      OKEVAL_MODEL: Qwen/Qwen3.6-35B-A3B-NVFP4
+      OKEVAL_API_KEY: EMPTY
+    volumes:
+      - type: bind
+        source: ../src
+        target: /srv/sfa/src
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../prompts
+        target: /srv/sfa/prompts
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../knowledge
+        target: /srv/sfa/knowledge
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../web
+        target: /srv/web
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind                 # the token file (hashes only); a rotation is seen at the next request
+        source: ../.private/ask_token.json
+        target: /srv/sfa/.private/ask_token.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind                 # the only writable path: the log, appended to
+        source: ../.private/ask_log.jsonl
+        target: /srv/sfa/.private/ask_log.jsonl
+        bind:
+          create_host_path: false
+      - type: volume
+        source: sf-local-ai_data
+        target: /data
+        read_only: true
+      - type: volume               # the Unix socket. The orchestrator, its one client, runs as root and mounts this
+                                   # volume :ro: read-write, it could replace the socket
+        source: sf-local-ai_ask-sock
+        target: /run/sf-assistant-ask
+    healthcheck:
+      test: ["CMD", "python", "/srv/web/ask_mcp.py", "--health"]
+      interval: 60s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+volumes:
+  sf-local-ai_data:
+    external: true
+  sf-local-ai_ask-sock:           # created by the platform's compose; writable by the uid of this image's user
+    external: true

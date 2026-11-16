@@ -1,0 +1,2465 @@
+{
+  "object": {
+    "api_name": "Internal_Interview__c",
+    "label": "Internal Interview",
+    "plural_label": "Internal Interviews",
+    "custom": true,
+    "description": "Synthetic test text for Internal Interview.",
+    "business_domain": [
+      "Interview Management",
+      "Recruitment",
+      "Training",
+      "Mock Interviews"
+    ],
+    "business_semantics": {
+      "primary_concept": "internal interview",
+      "concepts": [
+        "internal interview",
+        "mock interview",
+        "candidate interview",
+        "interview readiness",
+        "interview success",
+        "interview evaluation",
+        "interview scheduling",
+        "interviewer assignment",
+        "support assignment"
+      ],
+      "related_concepts": [
+        "candidate",
+        "lead",
+        "employee",
+        "interviewer",
+        "recruiter",
+        "support person",
+        "session",
+        "interview type",
+        "niche",
+        "resume",
+        "evaluation",
+        "question",
+        "training",
+        "mock assignment"
+      ]
+    },
+    "record_grain": {
+      "description": "Synthetic test text for this item."
+    },
+    "discovery_summary": {
+      "one_line": "Synthetic test text for this item.",
+      "key_concepts": [
+        "internal interview",
+        "mock interview",
+        "candidate",
+        "interviewer",
+        "support",
+        "status",
+        "decision",
+        "score",
+        "interview type",
+        "niche"
+      ],
+      "key_relationships": [
+        "candidate",
+        "lead",
+        "interviewer",
+        "recruiter",
+        "support person",
+        "session",
+        "interview type",
+        "niche",
+        "candidate training",
+        "pipeline interview",
+        "previous interview"
+      ]
+    }
+  },
+  "record_types": [],
+  "fields": [
+    {
+      "api_name": "Name",
+      "label": "Internal Interview Id",
+      "type": "auto_number",
+      "business_meaning": "Synthetic test text for Internal Interview Id.",
+      "required": null,
+      "unique": null,
+      "external_id": false,
+      "filterable": null,
+      "sortable": null,
+      "groupable": null,
+      "calculated": true,
+      "semantic": {
+        "concept": "internal_interview_identifier",
+        "roles": [
+          "identifier",
+          "display_name"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "AI_Assignment_Confidence__c",
+      "label": "AI Assignment Confidence",
+      "type": "percent",
+      "business_meaning": "Synthetic test text for AI Assignment Confidence.",
+      "required": null,
+      "unique": false,
+      "external_id": false,
+      "filterable": null,
+      "sortable": null,
+      "groupable": null,
+      "calculated": false,
+      "precision": 3,
+      "scale": 2,
+      "semantic": {
+        "concept": "ai_interviewer_assignment_confidence",
+        "roles": [
+          "score",
+          "assignment_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "AI_Assignment_Reason__c",
+      "label": "AI Assignment Reason",
+      "type": "long_text_area",
+      "business_meaning": "Synthetic test text for AI Assignment Reason.",
+      "required": null,
+      "filterable": null,
+      "sortable": null,
+      "groupable": null,
+      "calculated": false,
+      "length": 32768,
+      "semantic": {
+        "concept": "ai_interviewer_assignment_reason",
+        "roles": [
+          "descriptive_attribute",
+          "assignment_explanation"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "AI_Audio_Analysis__c",
+      "label": "AI Audio Analysis",
+      "type": "long_text_area",
+      "business_meaning": "Synthetic test text for AI Audio Analysis.",
+      "length": 131072,
+      "semantic": {
+        "concept": "interview_audio_analysis",
+        "roles": [
+          "descriptive_attribute",
+          "ai_analysis"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "AI_Decision__c",
+      "label": "AI Decision",
+      "type": "picklist",
+      "business_meaning": "Synthetic test text for AI Decision.",
+      "semantic": {
+        "concept": "ai_interview_decision",
+        "roles": [
+          "outcome",
+          "categorical_attribute"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": [
+          {
+            "label": "Hire",
+            "value": "Hire",
+            "business_meaning": "Synthetic test text for Hire."
+          },
+          {
+            "label": "No Hire",
+            "value": "No Hire",
+            "business_meaning": "Synthetic test text for No Hire."
+          }
+        ]
+      },
+      "reference": null
+    },
+    {
+      "api_name": "AI_Pregen_Status__c",
+      "label": "AI Pregen Status",
+      "type": "string",
+      "business_meaning": "Synthetic test text for AI Pregen Status.",
+      "length": 255,
+      "semantic": {
+        "concept": "ai_question_pregeneration_status",
+        "roles": [
+          "processing_status",
+          "categorical_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "AI_Pregenerated_Questions__c",
+      "label": "AI Pregenerated Questions",
+      "type": "long_text_area",
+      "business_meaning": "Synthetic test text for AI Pregenerated Questions.",
+      "length": 131072,
+      "semantic": {
+        "concept": "pregenerated_interview_questions",
+        "roles": [
+          "system_payload",
+          "question_content"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "AI_Total_score__c",
+      "label": "AI Total score",
+      "type": "number",
+      "business_meaning": "Synthetic test text for AI Total score.",
+      "precision": 2,
+      "scale": 0,
+      "semantic": {
+        "concept": "ai_interview_score",
+        "roles": [
+          "score",
+          "numeric_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "AI_Video_Analysis__c",
+      "label": "AI Video Analysis",
+      "type": "long_text_area",
+      "business_meaning": "Synthetic test text for AI Video Analysis.",
+      "length": 131072,
+      "semantic": {
+        "concept": "interview_video_analysis",
+        "roles": [
+          "descriptive_attribute",
+          "ai_analysis"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Assignment_Reason__c",
+      "label": "Assignment Reason",
+      "type": "long_text_area",
+      "business_meaning": "Synthetic test text for Assignment Reason.",
+      "length": 32768,
+      "semantic": {
+        "concept": "interviewer_assignment_reason",
+        "roles": [
+          "descriptive_attribute",
+          "assignment_explanation"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Candidate__c",
+      "label": "Candidate",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Candidate.",
+      "semantic": {
+        "concept": "candidate",
+        "roles": [
+          "relationship",
+          "interview_subject"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Account"
+        ],
+        "relationship_name": null,
+        "business_role": "candidate",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Candidate_Lacking_IR__c",
+      "label": "Candidate Lacking (IR)",
+      "type": "multipicklist",
+      "business_meaning": "Synthetic test text for Candidate Lacking (IR).",
+      "semantic": {
+        "concept": "interview_readiness_weakness",
+        "roles": [
+          "evaluation_attribute",
+          "categorical_attribute"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": [
+          {
+            "label": "Area 01",
+            "value": "Area 01"
+          },
+          {
+            "label": "Area 02",
+            "value": "Area 02"
+          },
+          {
+            "label": "Area 03",
+            "value": "Area 03"
+          },
+          {
+            "label": "Area 04",
+            "value": "Area 04"
+          },
+          {
+            "label": "Area 05",
+            "value": "Area 05"
+          },
+          {
+            "label": "Area 06",
+            "value": "Area 06"
+          },
+          {
+            "label": "Area 07",
+            "value": "Area 07"
+          },
+          {
+            "label": "Area 08",
+            "value": "Area 08"
+          },
+          {
+            "label": "Area 09",
+            "value": "Area 09"
+          },
+          {
+            "label": "Area 10",
+            "value": "Area 10"
+          },
+          {
+            "label": "Area 11",
+            "value": "Area 11"
+          },
+          {
+            "label": "Area 12",
+            "value": "Area 12"
+          },
+          {
+            "label": "Area 13",
+            "value": "Area 13"
+          },
+          {
+            "label": "Area 14",
+            "value": "Area 14"
+          },
+          {
+            "label": "Area 15",
+            "value": "Area 15"
+          }
+        ]
+      },
+      "reference": null
+    },
+    {
+      "api_name": "Candidate_Lacking_IS__c",
+      "label": "Candidate Lacking (IS)",
+      "type": "multipicklist",
+      "business_meaning": "Synthetic test text for Candidate Lacking (IS).",
+      "semantic": {
+        "concept": "interview_success_weakness",
+        "roles": [
+          "evaluation_attribute",
+          "categorical_attribute"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": [
+          {
+            "label": "Area 01",
+            "value": "Area 01"
+          },
+          {
+            "label": "Area 02",
+            "value": "Area 02"
+          },
+          {
+            "label": "Area 03",
+            "value": "Area 03"
+          },
+          {
+            "label": "Area 04",
+            "value": "Area 04"
+          },
+          {
+            "label": "Area 05",
+            "value": "Area 05"
+          },
+          {
+            "label": "Area 06",
+            "value": "Area 06"
+          },
+          {
+            "label": "Area 07",
+            "value": "Area 07"
+          },
+          {
+            "label": "Area 08",
+            "value": "Area 08"
+          },
+          {
+            "label": "Area 09",
+            "value": "Area 09"
+          },
+          {
+            "label": "Area 10",
+            "value": "Area 10"
+          },
+          {
+            "label": "Area 11",
+            "value": "Area 11"
+          },
+          {
+            "label": "Area 12",
+            "value": "Area 12"
+          },
+          {
+            "label": "Area 13",
+            "value": "Area 13"
+          },
+          {
+            "label": "Area 14",
+            "value": "Area 14"
+          },
+          {
+            "label": "Area 15",
+            "value": "Area 15"
+          }
+        ]
+      },
+      "reference": null
+    },
+    {
+      "api_name": "Candidate_Training__c",
+      "label": "Candidate Training",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Candidate Training.",
+      "semantic": {
+        "concept": "candidate_training",
+        "roles": [
+          "relationship",
+          "mock_interview_discriminator"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Candidate_Training__c"
+        ],
+        "relationship_name": null,
+        "business_role": "candidate_training",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Combined_Score__c",
+      "label": "Combined Score",
+      "type": "number",
+      "business_meaning": "Synthetic test text for Combined Score.",
+      "precision": 5,
+      "scale": 2,
+      "semantic": {
+        "concept": "combined_interview_score",
+        "roles": [
+          "score",
+          "numeric_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Comment_Summary__c",
+      "label": "Comment Summary",
+      "type": "long_text_area",
+      "business_meaning": "Synthetic test text for Comment Summary.",
+      "semantic": {
+        "concept": "interview_comment_summary",
+        "roles": [
+          "feedback",
+          "descriptive_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Company__c",
+      "label": "Company",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Company.",
+      "semantic": {
+        "concept": "client_company",
+        "roles": [
+          "relationship"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Company__c"
+        ],
+        "relationship_name": null,
+        "business_role": "client_company",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "CT_Session_Request__c",
+      "label": "CT Session Request",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for CT Session Request.",
+      "semantic": {
+        "concept": "ct_session_request",
+        "roles": [
+          "relationship",
+          "rubric_training_context"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "CT_Session_Request__c"
+        ],
+        "relationship_name": null,
+        "business_role": "training_request",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Date__c",
+      "label": "Scheduled Date",
+      "type": "date",
+      "business_meaning": "Synthetic test text for Scheduled Date.",
+      "semantic": {
+        "concept": "legacy_interview_date",
+        "roles": [
+          "temporal_attribute",
+          "legacy_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Deadline__c",
+      "label": "Result Deadline",
+      "type": "date",
+      "business_meaning": "Synthetic test text for Result Deadline.",
+      "semantic": {
+        "concept": "mock_result_deadline",
+        "roles": [
+          "temporal_attribute",
+          "deadline"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Employement_Type__c",
+      "label": "Employement Type",
+      "type": "picklist",
+      "business_meaning": "Employment type of the role. The API name contains a schema typo.",
+      "semantic": {
+        "concept": "employment_type",
+        "roles": [
+          "categorical_attribute"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": [
+          {
+            "label": "B2B",
+            "value": "B2B"
+          },
+          {
+            "label": "C2C",
+            "value": "C2C"
+          },
+          {
+            "label": "W2 Contract",
+            "value": "W2 Contract"
+          },
+          {
+            "label": "Full Time",
+            "value": "Full Time"
+          }
+        ]
+      },
+      "reference": null
+    },
+    {
+      "api_name": "End_Time_IST__c",
+      "label": "End Time IST",
+      "type": "string",
+      "business_meaning": "Synthetic test text for End Time IST.",
+      "semantic": {
+        "concept": "interview_end_time_ist",
+        "roles": [
+          "temporal_attribute",
+          "schedule_mirror"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Evaluation_Parameter__c",
+      "label": "Evaluation Parameter",
+      "type": "multipicklist",
+      "business_meaning": "Synthetic test text for Evaluation Parameter.",
+      "semantic": {
+        "concept": "interview_evaluation_parameter",
+        "roles": [
+          "evaluation_attribute",
+          "categorical_attribute"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": [
+          {
+            "label": "Area 01",
+            "value": "Area 01"
+          },
+          {
+            "label": "Area 02",
+            "value": "Area 02"
+          },
+          {
+            "label": "Area 03",
+            "value": "Area 03"
+          },
+          {
+            "label": "Area 04",
+            "value": "Area 04"
+          },
+          {
+            "label": "Area 05",
+            "value": "Area 05"
+          },
+          {
+            "label": "Area 06",
+            "value": "Area 06"
+          },
+          {
+            "label": "Area 07",
+            "value": "Area 07"
+          },
+          {
+            "label": "Area 08",
+            "value": "Area 08"
+          },
+          {
+            "label": "Area 09",
+            "value": "Area 09"
+          },
+          {
+            "label": "Area 10",
+            "value": "Area 10"
+          },
+          {
+            "label": "Area 11",
+            "value": "Area 11"
+          },
+          {
+            "label": "Area 12",
+            "value": "Area 12"
+          },
+          {
+            "label": "Area 13",
+            "value": "Area 13"
+          },
+          {
+            "label": "Area 14",
+            "value": "Area 14"
+          },
+          {
+            "label": "Area 15",
+            "value": "Area 15"
+          }
+        ]
+      },
+      "reference": null
+    },
+    {
+      "api_name": "Final_Decision_By__c",
+      "label": "Final Decision By",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Final Decision By.",
+      "semantic": {
+        "concept": "final_decision_maker",
+        "roles": [
+          "relationship",
+          "decision_maker"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Recruiter__c"
+        ],
+        "relationship_name": null,
+        "business_role": "final_decision_maker",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Final_Decision_Date__c",
+      "label": "Final Decision Date",
+      "type": "datetime",
+      "business_meaning": "Synthetic test text for Final Decision Date.",
+      "semantic": {
+        "concept": "final_decision_datetime",
+        "roles": [
+          "temporal_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Final_Descion__c",
+      "label": "Final Decision",
+      "type": "picklist",
+      "business_meaning": "Final hiring decision. API name contains the schema typo 'Descion'.",
+      "semantic": {
+        "concept": "final_interview_decision",
+        "roles": [
+          "outcome",
+          "categorical_attribute"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": [
+          {
+            "label": "Hire",
+            "value": "Hire"
+          },
+          {
+            "label": "NoHire",
+            "value": "NoHire"
+          }
+        ]
+      },
+      "reference": null
+    },
+    {
+      "api_name": "Has_Resume__c",
+      "label": "Has Resume",
+      "type": "boolean",
+      "business_meaning": "Synthetic test text for Has Resume.",
+      "semantic": {
+        "concept": "interview_has_resume",
+        "roles": [
+          "boolean_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Hired_Niche__c",
+      "label": "Hired Niche",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Hired Niche.",
+      "semantic": {
+        "concept": "hired_niche",
+        "roles": [
+          "relationship"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Niche__c"
+        ],
+        "relationship_name": null,
+        "business_role": "hired_niche",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Human_Decision__c",
+      "label": "Human Decision",
+      "type": "picklist",
+      "business_meaning": "Synthetic test text for Human Decision.",
+      "semantic": {
+        "concept": "human_interview_decision",
+        "roles": [
+          "outcome",
+          "categorical_attribute"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": [
+          {
+            "label": "Hire",
+            "value": "Hire"
+          },
+          {
+            "label": "NoHire",
+            "value": "NoHire"
+          },
+          {
+            "label": "Retake",
+            "value": "Retake"
+          },
+          {
+            "label": "Pass",
+            "value": "Pass"
+          },
+          {
+            "label": "Fail",
+            "value": "Fail"
+          },
+          {
+            "label": "Needs Improvement",
+            "value": "Needs Improvement"
+          }
+        ]
+      },
+      "reference": null
+    },
+    {
+      "api_name": "Human_Total_Score__c",
+      "label": "Human Total Score",
+      "type": "number",
+      "business_meaning": "Synthetic test text for Human Total Score.",
+      "precision": 5,
+      "scale": 2,
+      "semantic": {
+        "concept": "human_interview_score",
+        "roles": [
+          "score",
+          "numeric_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Interview__c",
+      "label": "Interview",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Interview.",
+      "semantic": {
+        "concept": "pipeline_interview",
+        "roles": [
+          "relationship",
+          "source_record"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Interview__c"
+        ],
+        "relationship_name": null,
+        "business_role": "pipeline_interview",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Interview_History_Notes__c",
+      "label": "Interview History & Notes",
+      "type": "rich_text_area",
+      "business_meaning": "Synthetic test text for Interview History & Notes.",
+      "length": 131072,
+      "semantic": {
+        "concept": "interview_history_notes",
+        "roles": [
+          "descriptive_attribute",
+          "history_content"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Interview_Support_Person__c",
+      "label": "Interview Support Person",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Interview Support Person.",
+      "semantic": {
+        "concept": "interview_support_person",
+        "roles": [
+          "relationship",
+          "legacy_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Recruiter__c"
+        ],
+        "relationship_name": null,
+        "business_role": "support_person",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Interview_Type__c",
+      "label": "Interview Type",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Interview Type.",
+      "semantic": {
+        "concept": "interview_type",
+        "roles": [
+          "relationship",
+          "classification"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Interview_Type__c"
+        ],
+        "relationship_name": null,
+        "business_role": "interview_type",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Interviewer__c",
+      "label": "Interviewer",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Interviewer.",
+      "semantic": {
+        "concept": "interviewer",
+        "roles": [
+          "relationship",
+          "interview_actor"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Recruiter__c"
+        ],
+        "relationship_name": null,
+        "business_role": "interviewer",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Interviewer_Assigned__c",
+      "label": "Interviewer Assigned",
+      "type": "boolean",
+      "business_meaning": "Synthetic test text for Interviewer Assigned.",
+      "semantic": {
+        "concept": "interviewer_assignment_state",
+        "roles": [
+          "boolean_attribute",
+          "assignment_status"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "IR_Feedback__c",
+      "label": "IR Feedback",
+      "type": "long_text_area",
+      "business_meaning": "Synthetic test text for IR Feedback.",
+      "length": 32000,
+      "semantic": {
+        "concept": "interview_readiness_feedback",
+        "roles": [
+          "feedback",
+          "descriptive_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "IS_Feedback__c",
+      "label": "IS Feedback",
+      "type": "long_text_area",
+      "business_meaning": "Synthetic test text for IS Feedback.",
+      "length": 32000,
+      "semantic": {
+        "concept": "interview_success_feedback",
+        "roles": [
+          "feedback",
+          "descriptive_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Is_Final_Week_Mock__c",
+      "label": "Is Final Week Mock",
+      "type": "boolean",
+      "business_meaning": "Synthetic test text for Is Final Week Mock.",
+      "semantic": {
+        "concept": "final_week_mock",
+        "roles": [
+          "boolean_attribute",
+          "mock_classification"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "IS_Improvement_Feedback__c",
+      "label": "IS Improvement Feedback",
+      "type": "long_text_area",
+      "business_meaning": "Synthetic test text for IS Improvement Feedback.",
+      "length": 32000,
+      "semantic": {
+        "concept": "interview_success_improvement_feedback",
+        "roles": [
+          "feedback",
+          "descriptive_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "JD_Link__c",
+      "label": "JD Link",
+      "type": "long_text_area",
+      "business_meaning": "Synthetic test text for JD Link.",
+      "semantic": {
+        "concept": "job_description_link",
+        "roles": [
+          "descriptive_attribute",
+          "resource_reference"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Last_Result_Reminder_At__c",
+      "label": "Last Result Reminder At",
+      "type": "datetime",
+      "business_meaning": "Synthetic test text for Last Result Reminder At.",
+      "semantic": {
+        "concept": "last_mock_result_reminder",
+        "roles": [
+          "temporal_attribute",
+          "operational_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Launch_mode__c",
+      "label": "Launch mode",
+      "type": "picklist",
+      "business_meaning": "Synthetic test text for Launch mode.",
+      "semantic": {
+        "concept": "interview_question_launch_mode",
+        "roles": [
+          "configuration_attribute",
+          "categorical_attribute"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": [
+          {
+            "label": "House Magic",
+            "value": "House Magic"
+          },
+          {
+            "label": "Template",
+            "value": "Template"
+          }
+        ]
+      },
+      "reference": null
+    },
+    {
+      "api_name": "Lead__c",
+      "label": "Lead",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Lead.",
+      "semantic": {
+        "concept": "lead_candidate",
+        "roles": [
+          "relationship",
+          "interview_subject"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Lead"
+        ],
+        "relationship_name": null,
+        "business_role": "lead_candidate",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Mock_Status__c",
+      "label": "Mock Status",
+      "type": "picklist",
+      "business_meaning": "Synthetic test text for Mock Status.",
+      "semantic": {
+        "concept": "mock_assignment_lifecycle",
+        "roles": [
+          "lifecycle_state",
+          "business_status"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": [
+          {
+            "label": "Unassigned",
+            "value": "Unassigned"
+          },
+          {
+            "label": "Active",
+            "value": "Active"
+          },
+          {
+            "label": "Resolved",
+            "value": "Resolved"
+          }
+        ]
+      },
+      "reference": null
+    },
+    {
+      "api_name": "Niche__c",
+      "label": "Niche",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Niche.",
+      "semantic": {
+        "concept": "candidate_niche",
+        "roles": [
+          "relationship",
+          "classification"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Niche__c"
+        ],
+        "relationship_name": null,
+        "business_role": "candidate_niche",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Postion__c",
+      "label": "Position",
+      "type": "string",
+      "business_meaning": "Position title associated with the interview. API name contains the schema typo 'Postion'.",
+      "length": 255,
+      "semantic": {
+        "concept": "position_title",
+        "roles": [
+          "descriptive_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Previous_internal_interview__c",
+      "label": "Previous internal interview",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Previous internal interview.",
+      "semantic": {
+        "concept": "previous_internal_interview",
+        "roles": [
+          "relationship",
+          "reschedule_chain"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Internal_Interview__c"
+        ],
+        "relationship_name": null,
+        "business_role": "previous_interview",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Recruiter__c",
+      "label": "Recruiter",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Recruiter.",
+      "semantic": {
+        "concept": "candidate_recruiter",
+        "roles": [
+          "relationship",
+          "business_owner"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Recruiter__c"
+        ],
+        "relationship_name": null,
+        "business_role": "recruiter",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Result_Reminder_Count__c",
+      "label": "Result Reminder Count",
+      "type": "number",
+      "business_meaning": "Synthetic test text for Result Reminder Count.",
+      "semantic": {
+        "concept": "mock_result_reminder_count",
+        "roles": [
+          "operational_attribute",
+          "numeric_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Round__c",
+      "label": "Round",
+      "type": "picklist",
+      "business_meaning": "Synthetic test text for Round.",
+      "semantic": {
+        "concept": "interview_round",
+        "roles": [
+          "categorical_attribute",
+          "sequence_classification"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": [
+          {
+            "label": "Initial",
+            "value": "Initial"
+          },
+          {
+            "label": "First",
+            "value": "First"
+          },
+          {
+            "label": "Second",
+            "value": "Second"
+          },
+          {
+            "label": "Third",
+            "value": "Third"
+          },
+          {
+            "label": "Fourth",
+            "value": "Fourth"
+          },
+          {
+            "label": "Fifth",
+            "value": "Fifth"
+          },
+          {
+            "label": "Sixth",
+            "value": "Sixth"
+          },
+          {
+            "label": "Seventh",
+            "value": "Seventh"
+          },
+          {
+            "label": "Eighth",
+            "value": "Eighth"
+          },
+          {
+            "label": "Ninth",
+            "value": "Ninth"
+          },
+          {
+            "label": "Tenth",
+            "value": "Tenth"
+          },
+          {
+            "label": "Eleventh",
+            "value": "Eleventh"
+          },
+          {
+            "label": "Twelfth",
+            "value": "Twelfth"
+          },
+          {
+            "label": "Thirteenth",
+            "value": "Thirteenth"
+          },
+          {
+            "label": "Fourteenth",
+            "value": "Fourteenth"
+          },
+          {
+            "label": "Fifteenth",
+            "value": "Fifteenth"
+          },
+          {
+            "label": "Final",
+            "value": "Final"
+          }
+        ]
+      },
+      "reference": null
+    },
+    {
+      "api_name": "Round_Info__c",
+      "label": "Round Info",
+      "type": "picklist",
+      "business_meaning": "Synthetic test text for Round Info.",
+      "semantic": {
+        "concept": "interview_round_type",
+        "roles": [
+          "categorical_attribute",
+          "round_classification"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": [
+          {
+            "label": "Hiring Manager",
+            "value": "Hiring Manager"
+          },
+          {
+            "label": "Leet code style Coding",
+            "value": "Leet code style Coding"
+          },
+          {
+            "label": "System Design",
+            "value": "System Design"
+          },
+          {
+            "label": "Coding Fronted",
+            "value": "Coding Fronted"
+          },
+          {
+            "label": "Backend Coding",
+            "value": "Backend Coding"
+          },
+          {
+            "label": "AI/ML Coding",
+            "value": "AI/ML Coding"
+          },
+          {
+            "label": "Offer Negotiation",
+            "value": "Offer Negotiation"
+          },
+          {
+            "label": "Final Round",
+            "value": "Final Round"
+          },
+          {
+            "label": "Other",
+            "value": "Other"
+          },
+          {
+            "label": "Introduction Call",
+            "value": "Introduction Call"
+          },
+          {
+            "label": "Technical Discussion",
+            "value": "Technical Discussion"
+          },
+          {
+            "label": "Executive Round",
+            "value": "Executive Round"
+          },
+          {
+            "label": "Behavioral Round",
+            "value": "Behavioral Round"
+          },
+          {
+            "label": "Coding Round",
+            "value": "Coding Round"
+          },
+          {
+            "label": "Healthcare Round",
+            "value": "Healthcare Round"
+          },
+          {
+            "label": "Preparation Round",
+            "value": "Preparation Round"
+          },
+          {
+            "label": "Team Matching Round",
+            "value": "Team Matching Round"
+          }
+        ]
+      },
+      "reference": null
+    },
+    {
+      "api_name": "Round_Rank__c",
+      "label": "Round Rank",
+      "type": "number",
+      "business_meaning": "Synthetic test text for Round Rank.",
+      "semantic": {
+        "concept": "interview_round_rank",
+        "roles": [
+          "score",
+          "numeric_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Round_ranking_reason__c",
+      "label": "Round ranking reason",
+      "type": "long_text_area",
+      "business_meaning": "Synthetic test text for Round ranking reason.",
+      "semantic": {
+        "concept": "interview_round_ranking_reason",
+        "roles": [
+          "descriptive_attribute",
+          "ranking_explanation"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Scheduled_Date__c",
+      "label": "Date Of Interview",
+      "type": "date",
+      "business_meaning": "Synthetic test text for Date Of Interview.",
+      "semantic": {
+        "concept": "interview_date",
+        "roles": [
+          "temporal_attribute",
+          "schedule_mirror"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Selected_Time_Zone_End_Time__c",
+      "label": "Selected Time Zone End Time",
+      "type": "picklist",
+      "business_meaning": "Synthetic test text for Selected Time Zone End Time.",
+      "semantic": {
+        "concept": "selected_interview_end_time",
+        "roles": [
+          "temporal_attribute",
+          "schedule_mirror"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": "15-minute AM/PM time-slot values"
+      },
+      "reference": null
+    },
+    {
+      "api_name": "Selected_Time_Zone_Start_Tim__c",
+      "label": "Selected Time Zone Start Time",
+      "type": "picklist",
+      "business_meaning": "Selected interview start-time slot mirrored from Session__c. API name is misspelled in the Salesforce schema.",
+      "semantic": {
+        "concept": "selected_interview_start_time",
+        "roles": [
+          "temporal_attribute",
+          "schedule_mirror"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": "15-minute AM/PM time-slot values"
+      },
+      "reference": null
+    },
+    {
+      "api_name": "Selected_Time_Zone_Start_Time__c",
+      "label": "Selected Time Zone Start Time",
+      "type": "datetime",
+      "business_meaning": "Synthetic test text for Selected Time Zone Start Time.",
+      "semantic": {
+        "concept": "legacy_interview_start_datetime",
+        "roles": [
+          "temporal_attribute",
+          "legacy_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Selected_Timezone_End_Time__c",
+      "label": "Selected Timezone End Time",
+      "type": "datetime",
+      "business_meaning": "Synthetic test text for Selected Timezone End Time.",
+      "semantic": {
+        "concept": "legacy_interview_end_datetime",
+        "roles": [
+          "temporal_attribute",
+          "legacy_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Session__c",
+      "label": "Session",
+      "type": "reference",
+      "business_meaning": "Main Session associated with the interview. The relationship is described as mutual with Session__c.Internal_Interview__c.",
+      "semantic": {
+        "concept": "interview_session",
+        "roles": [
+          "relationship",
+          "schedule_source"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Session__c"
+        ],
+        "relationship_name": null,
+        "business_role": "primary_session",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Source_Interview_Trigger__c",
+      "label": "Source Interview Trigger",
+      "type": "picklist",
+      "business_meaning": "Synthetic test text for Source Interview Trigger.",
+      "semantic": {
+        "concept": "internal_interview_creation_trigger",
+        "roles": [
+          "categorical_attribute",
+          "system_context"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": [
+          {
+            "label": "Scheduled",
+            "value": "Scheduled"
+          },
+          {
+            "label": "Rejected",
+            "value": "Rejected"
+          },
+          {
+            "label": "Ghosted",
+            "value": "Ghosted"
+          }
+        ]
+      },
+      "reference": null
+    },
+    {
+      "api_name": "Start_Time_IST__c",
+      "label": "Start Time IST",
+      "type": "string",
+      "business_meaning": "Synthetic test text for Start Time IST.",
+      "semantic": {
+        "concept": "interview_start_time_ist",
+        "roles": [
+          "temporal_attribute",
+          "schedule_mirror"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Status__c",
+      "label": "Status",
+      "type": "picklist",
+      "business_meaning": "Synthetic test text for Status.",
+      "semantic": {
+        "concept": "internal_interview_lifecycle_status",
+        "roles": [
+          "lifecycle_state",
+          "business_status",
+          "categorical_attribute"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": [
+          {
+            "label": "Unscheduled",
+            "value": "Unscheduled"
+          },
+          {
+            "label": "Scheduled",
+            "value": "Scheduled"
+          },
+          {
+            "label": "Rescheduled",
+            "value": "Rescheduled"
+          },
+          {
+            "label": "Cancelled",
+            "value": "Cancelled"
+          },
+          {
+            "label": "Completed",
+            "value": "Completed"
+          },
+          {
+            "label": "No Show",
+            "value": "No Show"
+          }
+        ]
+      },
+      "reference": null
+    },
+    {
+      "api_name": "Support_Assigned__c",
+      "label": "Support Assigned",
+      "type": "boolean",
+      "business_meaning": "Synthetic test text for Support Assigned.",
+      "semantic": {
+        "concept": "mock_support_assignment_state",
+        "roles": [
+          "boolean_attribute",
+          "assignment_status"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Support_Block_End__c",
+      "label": "Support Block End",
+      "type": "datetime",
+      "business_meaning": "Synthetic test text for Support Block End.",
+      "semantic": {
+        "concept": "support_block_end",
+        "roles": [
+          "temporal_attribute",
+          "system_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Support_Block_Start__c",
+      "label": "Support Block Start",
+      "type": "datetime",
+      "business_meaning": "Synthetic test text for Support Block Start.",
+      "semantic": {
+        "concept": "support_block_start",
+        "roles": [
+          "temporal_attribute",
+          "system_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Support_Notes__c",
+      "label": "Support Notes",
+      "type": "long_text_area",
+      "business_meaning": "Synthetic test text for Support Notes.",
+      "length": 131072,
+      "semantic": {
+        "concept": "interview_support_notes",
+        "roles": [
+          "descriptive_attribute",
+          "support_context"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Template__c",
+      "label": "Template",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Template.",
+      "semantic": {
+        "concept": "interview_template",
+        "roles": [
+          "relationship",
+          "configuration_reference"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "Template__c"
+        ],
+        "relationship_name": null,
+        "business_role": "interview_template",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Time_Zone__c",
+      "label": "Time Zone",
+      "type": "picklist",
+      "business_meaning": "Synthetic test text for Time Zone.",
+      "semantic": {
+        "concept": "interview_time_zone",
+        "roles": [
+          "temporal_context",
+          "categorical_attribute",
+          "schedule_mirror"
+        ]
+      },
+      "picklist": {
+        "restricted": null,
+        "values": [
+          {
+            "label": "ET (Eastern Time)",
+            "value": "ET (Eastern Time)"
+          },
+          {
+            "label": "PT (Pacific Time)",
+            "value": "PT (Pacific Time)"
+          },
+          {
+            "label": "CT (Central Time)",
+            "value": "CT (Central Time)"
+          },
+          {
+            "label": "MT (Mountain Time)",
+            "value": "MT (Mountain Time)"
+          },
+          {
+            "label": "HT (Hawaii Time)",
+            "value": "HT (Hawaii Time)"
+          },
+          {
+            "label": "UTC (Coordinated Universal Time)",
+            "value": "UTC (Coordinated Universal Time)"
+          },
+          {
+            "label": "AT (Alaska Time)",
+            "value": "AT (Alaska Time)"
+          },
+          {
+            "label": "IST (India Standard Time)",
+            "value": "IST (India Standard Time)"
+          }
+        ]
+      },
+      "reference": null
+    },
+    {
+      "api_name": "Total_Attendees__c",
+      "label": "Total Attendees",
+      "type": "rollup_summary",
+      "business_meaning": "Synthetic test text for Total Attendees.",
+      "calculated": true,
+      "semantic": {
+        "concept": "interview_attendee_count",
+        "roles": [
+          "calculated_attribute",
+          "count_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    },
+    {
+      "api_name": "Triggered_By_Step__c",
+      "label": "Triggered By Step",
+      "type": "reference",
+      "business_meaning": "Synthetic test text for Triggered By Step.",
+      "semantic": {
+        "concept": "mock_triggering_training_step",
+        "roles": [
+          "relationship",
+          "process_origin"
+        ]
+      },
+      "picklist": null,
+      "reference": {
+        "target_objects": [
+          "CandidateTrainingStep__c"
+        ],
+        "relationship_name": null,
+        "business_role": "triggering_training_step",
+        "business_meaning": "Synthetic test text for this item."
+      }
+    },
+    {
+      "api_name": "Week_Number__c",
+      "label": "Week Number",
+      "type": "number",
+      "business_meaning": "Synthetic test text for Week Number.",
+      "precision": 2,
+      "scale": 0,
+      "semantic": {
+        "concept": "training_mock_week_number",
+        "roles": [
+          "sequence_attribute",
+          "numeric_attribute"
+        ]
+      },
+      "picklist": null,
+      "reference": null
+    }
+  ],
+  "relationships": [
+    {
+      "field": "Candidate__c",
+      "type": "lookup",
+      "target_objects": [
+        "Account"
+      ],
+      "relationship_name": null,
+      "business_role": "candidate",
+      "business_meaning": "Synthetic test text for Candidate__c.",
+      "direction_semantics": {
+        "from_source": "candidate",
+        "from_target": "internal interviews"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "Lead__c",
+      "type": "lookup",
+      "target_objects": [
+        "Lead"
+      ],
+      "relationship_name": null,
+      "business_role": "lead_candidate",
+      "business_meaning": "Synthetic test text for Lead__c.",
+      "direction_semantics": {
+        "from_source": "lead candidate",
+        "from_target": "internal interviews"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "Candidate_Training__c",
+      "type": "lookup",
+      "target_objects": [
+        "Candidate_Training__c"
+      ],
+      "relationship_name": null,
+      "business_role": "candidate_training",
+      "business_meaning": "Synthetic test text for Candidate_Training__c.",
+      "direction_semantics": {
+        "from_source": "candidate training",
+        "from_target": "mock interviews"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "Company__c",
+      "type": "lookup",
+      "target_objects": [
+        "Company__c"
+      ],
+      "relationship_name": null,
+      "business_role": "client_company",
+      "business_meaning": "Synthetic test text for Company__c.",
+      "direction_semantics": {
+        "from_source": "client company",
+        "from_target": "internal interviews"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "CT_Session_Request__c",
+      "type": "lookup",
+      "target_objects": [
+        "CT_Session_Request__c"
+      ],
+      "relationship_name": null,
+      "business_role": "training_request",
+      "business_meaning": "Synthetic test text for CT_Session_Request__c.",
+      "direction_semantics": {
+        "from_source": "training request",
+        "from_target": "mock interviews"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "Hired_Niche__c",
+      "type": "lookup",
+      "target_objects": [
+        "Niche__c"
+      ],
+      "relationship_name": null,
+      "business_role": "hired_niche",
+      "business_meaning": "Synthetic test text for Hired_Niche__c.",
+      "direction_semantics": {
+        "from_source": "hired niche",
+        "from_target": "interviews"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "Interview__c",
+      "type": "lookup",
+      "target_objects": [
+        "Interview__c"
+      ],
+      "relationship_name": null,
+      "business_role": "pipeline_interview",
+      "business_meaning": "Synthetic test text for Interview__c.",
+      "direction_semantics": {
+        "from_source": "source pipeline interview",
+        "from_target": "internal interviews"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "Interview_Support_Person__c",
+      "type": "lookup",
+      "target_objects": [
+        "Recruiter__c"
+      ],
+      "relationship_name": null,
+      "business_role": "legacy_support_person",
+      "business_meaning": "Synthetic test text for Interview_Support_Person__c.",
+      "direction_semantics": {
+        "from_source": "support person",
+        "from_target": "supported interviews"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "Interview_Type__c",
+      "type": "lookup",
+      "target_objects": [
+        "Interview_Type__c"
+      ],
+      "relationship_name": null,
+      "business_role": "interview_type",
+      "business_meaning": "Synthetic test text for Interview_Type__c.",
+      "direction_semantics": {
+        "from_source": "interview type",
+        "from_target": "interviews of this type"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "Interviewer__c",
+      "type": "lookup",
+      "target_objects": [
+        "Recruiter__c"
+      ],
+      "relationship_name": null,
+      "business_role": "interviewer",
+      "business_meaning": "Synthetic test text for Interviewer__c.",
+      "direction_semantics": {
+        "from_source": "interviewer",
+        "from_target": "interviews conducted"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "Niche__c",
+      "type": "lookup",
+      "target_objects": [
+        "Niche__c"
+      ],
+      "relationship_name": null,
+      "business_role": "candidate_niche",
+      "business_meaning": "Synthetic test text for Niche__c.",
+      "direction_semantics": {
+        "from_source": "candidate niche",
+        "from_target": "interviews in this niche"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "Previous_internal_interview__c",
+      "type": "lookup",
+      "target_objects": [
+        "Internal_Interview__c"
+      ],
+      "relationship_name": null,
+      "business_role": "previous_interview",
+      "business_meaning": "Synthetic test text for Previous_internal_interview__c.",
+      "direction_semantics": {
+        "from_source": "previous internal interview",
+        "from_target": "replacement/rescheduled interview"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "Recruiter__c",
+      "type": "lookup",
+      "target_objects": [
+        "Recruiter__c"
+      ],
+      "relationship_name": null,
+      "business_role": "recruiter",
+      "business_meaning": "Synthetic test text for Recruiter__c.",
+      "direction_semantics": {
+        "from_source": "candidate recruiter",
+        "from_target": "candidate interviews"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "Session__c",
+      "type": "lookup",
+      "target_objects": [
+        "Session__c"
+      ],
+      "relationship_name": null,
+      "business_role": "primary_session",
+      "business_meaning": "Synthetic test text for Session__c.",
+      "direction_semantics": {
+        "from_source": "primary session",
+        "from_target": "internal interview"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "Template__c",
+      "type": "lookup",
+      "target_objects": [
+        "Template__c"
+      ],
+      "relationship_name": null,
+      "business_role": "interview_template",
+      "business_meaning": "Synthetic test text for Template__c.",
+      "direction_semantics": {
+        "from_source": "interview template",
+        "from_target": "interviews using template"
+      },
+      "cardinality": "many_to_one"
+    },
+    {
+      "field": "Triggered_By_Step__c",
+      "type": "lookup",
+      "target_objects": [
+        "CandidateTrainingStep__c"
+      ],
+      "relationship_name": null,
+      "business_role": "triggering_training_step",
+      "business_meaning": "Synthetic test text for Triggered_By_Step__c.",
+      "direction_semantics": {
+        "from_source": "triggering training step",
+        "from_target": "mock interview"
+      },
+      "cardinality": "many_to_one"
+    }
+  ],
+  "child_relationships": [
+    {
+      "child_object": "Interview_Attendee__c",
+      "field": "Internal_Interview__c",
+      "relationship_name": null,
+      "business_role": "interview_attendees",
+      "business_meaning": "Synthetic test text for Internal_Interview__c.",
+      "direction_semantics": {
+        "from_parent": "attendees",
+        "from_child": "interview"
+      }
+    },
+    {
+      "child_object": "Session_Attendee__c",
+      "field": "Internal_Interview__c",
+      "relationship_name": null,
+      "business_role": "session_attendance",
+      "business_meaning": "Synthetic test text for Internal_Interview__c.",
+      "direction_semantics": {
+        "from_parent": "session attendee records",
+        "from_child": "internal interview"
+      }
+    },
+    {
+      "child_object": "Internal_Interview_Section_Log__c",
+      "field": "Internal_Interview__c",
+      "relationship_name": null,
+      "business_role": "section_results",
+      "business_meaning": "Synthetic test text for Internal_Interview__c.",
+      "direction_semantics": {
+        "from_parent": "section logs",
+        "from_child": "interview"
+      }
+    },
+    {
+      "child_object": "Internal_Interview_Question_Log__c",
+      "field": "Internal_Interview__c",
+      "relationship_name": null,
+      "business_role": "question_logs",
+      "business_meaning": "Synthetic test text for Internal_Interview__c.",
+      "direction_semantics": {
+        "from_parent": "question logs",
+        "from_child": "interview"
+      }
+    },
+    {
+      "child_object": "Interview_Evaluation__c",
+      "field": "Internal_Interview__c",
+      "relationship_name": null,
+      "business_role": "interview_evaluations",
+      "business_meaning": "Synthetic test text for Internal_Interview__c.",
+      "direction_semantics": {
+        "from_parent": "evaluations",
+        "from_child": "interview"
+      }
+    },
+    {
+      "child_object": "Resume__c",
+      "field": "Internal_Interview__c",
+      "relationship_name": null,
+      "business_role": "interview_resumes",
+      "business_meaning": "Synthetic test text for Internal_Interview__c.",
+      "direction_semantics": {
+        "from_parent": "resumes",
+        "from_child": "internal interview"
+      }
+    }
+  ],
+  "field_dependencies": [],
+  "temporal_semantics": {
+    "created_at": {
+      "field": "CreatedDate",
+      "business_meaning": "Synthetic test text for CreatedDate."
+    },
+    "updated_at": {
+      "field": "LastModifiedDate",
+      "business_meaning": "Synthetic test text for LastModifiedDate."
+    },
+    "created_by": {
+      "field": "CreatedById",
+      "business_meaning": "Synthetic test text for CreatedById."
+    },
+    "last_updated_by": {
+      "field": "LastModifiedById",
+      "business_meaning": "Synthetic test text for LastModifiedById."
+    }
+  },
+  "validation_rules": [
+    {
+      "name": "Lock_Rescheduled_Session",
+      "active": true,
+      "meaning": "Synthetic test text for Lock_Rescheduled_Session.",
+      "formula": "AND(\n    NOT(ISNEW()),\n    ISPICKVAL(\n        PRIORVALUE(Status__c),\n        \"Rescheduled\"\n    )\n)",
+      "fields_involved": [
+        "Status__c"
+      ],
+      "condition_summary": "Synthetic test text for Lock_Rescheduled_Session.",
+      "error_meaning": "Synthetic test text for Lock_Rescheduled_Session."
+    }
+  ],
+  "automation": {
+    "flows": [
+      {
+        "name": "Interview_Create_Reschedule_Flow",
+        "purpose": "Synthetic test text for Interview_Create_Reschedule_Flow.",
+        "type": "screen",
+        "trigger": null,
+        "fields_read": [
+          "Interview_Type__c",
+          "Scheduled_Date__c",
+          "Time_Zone__c",
+          "Previous_internal_interview__c"
+        ],
+        "fields_written": [
+          "Status__c",
+          "Interview_Type__c",
+          "Scheduled_Date__c",
+          "Time_Zone__c",
+          "Previous_internal_interview__c"
+        ],
+        "related_objects": [
+          "Lead",
+          "Account",
+          "Session__c",
+          "Interview_Attendee__c",
+          "Resume__c"
+        ],
+        "business_process": "interview_creation_and_reschedule"
+      },
+      {
+        "name": "internal_interview_Status_Update",
+        "purpose": "Synthetic test text for internal_interview_Status_Update.",
+        "type": "autolaunched_after_save",
+        "trigger": {
+          "object": "Session__c",
+          "events": [
+            "create",
+            "update"
+          ]
+        },
+        "fields_read": [
+          "Session__c.Status__c",
+          "Session__c.Scheduled_Date__c",
+          "Session__c.Time_Zone__c",
+          "Session__c.Start_Time_IST__c",
+          "Session__c.End_Time_IST__c"
+        ],
+        "fields_written": [
+          "Status__c",
+          "Scheduled_Date__c",
+          "Time_Zone__c",
+          "Start_Time_IST__c",
+          "End_Time_IST__c"
+        ],
+        "related_objects": [
+          "Session__c"
+        ],
+        "business_process": "session_schedule_synchronization"
+      },
+      {
+        "name": "Example_Attendee_Stamp_Flow",
+        "purpose": "Synthetic test text for Example_Attendee_Stamp_Flow.",
+        "type": "autolaunched_after_save",
+        "trigger": {
+          "object": "Interview_Attendee__c",
+          "events": [
+            "create"
+          ]
+        },
+        "fields_read": [
+          "Interview_Attendee__c.Role__c",
+          "Interview_Attendee__c.Candidate__c",
+          "Interview_Attendee__c.Lead__c",
+          "Interview_Attendee__c.Attendee_Recruiter__c"
+        ],
+        "fields_written": [
+          "Candidate__c",
+          "Lead__c",
+          "Interviewer__c"
+        ],
+        "related_objects": [
+          "Interview_Attendee__c",
+          "Account",
+          "Lead",
+          "Recruiter__c"
+        ],
+        "business_process": "interview_attendee_management"
+      },
+      {
+        "name": "Internal_Interview_Conduct_Interview",
+        "purpose": "Synthetic test text for Internal_Interview_Conduct_Interview.",
+        "type": "screen",
+        "trigger": null,
+        "fields_read": [
+          "Status__c",
+          "Launch_mode__c",
+          "Interview_Type__c",
+          "Niche__c",
+          "Template__c",
+          "AI_Pregenerated_Questions__c",
+          "AI_Pregen_Status__c"
+        ],
+        "fields_written": [
+          "Human_Decision__c",
+          "Human_Total_Score__c",
+          "Comment_Summary__c"
+        ],
+        "related_objects": [
+          "Section__c",
+          "Question_Bank__c",
+          "Internal_Interview_Section_Log__c",
+          "Internal_Interview_Question_Log__c",
+          "Interview_Evaluation__c",
+          "Section_Evaluation__c"
+        ],
+        "business_process": "conduct_interview_and_evaluation"
+      }
+    ],
+    "apex": [
+      {
+        "name": "TestApexClass1",
+        "type": "class",
+        "purpose": "Synthetic test text for TestApexClass1.",
+        "fields_read": [],
+        "fields_written": [],
+        "related_objects": [
+          "Internal_Interview__c"
+        ],
+        "business_process": "interview_creation_and_reschedule"
+      },
+      {
+        "name": "TestApexClass2",
+        "type": "class",
+        "purpose": "Synthetic test text for TestApexClass2.",
+        "fields_read": [],
+        "fields_written": [],
+        "related_objects": [
+          "Internal_Interview__c",
+          "Resume__c"
+        ],
+        "business_process": "interview_creation_and_reschedule"
+      },
+      {
+        "name": "TestApexClass3",
+        "type": "rest_resource",
+        "purpose": "Synthetic test text for TestApexClass3.",
+        "fields_read": [
+          "Interviewer_Assigned__c",
+          "Support_Assigned__c"
+        ],
+        "fields_written": [
+          "Interviewer_Assigned__c",
+          "Support_Assigned__c"
+        ],
+        "related_objects": [
+          "Internal_Interview__c",
+          "Session__c",
+          "Interview_Attendee__c",
+          "Session_Attendee__c"
+        ],
+        "business_process": "mock_interviewer_and_support_assignment"
+      },
+      {
+        "name": "TestApexClass4",
+        "type": "class",
+        "purpose": "Synthetic test text for TestApexClass4.",
+        "fields_read": [
+          "Interview_Type__c",
+          "Niche__c"
+        ],
+        "fields_written": [],
+        "related_objects": [
+          "Section__c",
+          "Question_Bank__c",
+          "Section_Interview_Type__c"
+        ],
+        "business_process": "conduct_interview_and_evaluation"
+      },
+      {
+        "name": "TestApexClass5",
+        "type": "class",
+        "purpose": "Synthetic test text for TestApexClass5.",
+        "fields_read": [
+          "Has_Resume__c"
+        ],
+        "fields_written": [],
+        "related_objects": [
+          "Internal_Interview__c",
+          "Resume__c"
+        ],
+        "business_process": "conduct_interview_and_evaluation"
+      },
+      {
+        "name": "TestApexClass6",
+        "type": "class",
+        "purpose": "Synthetic test text for TestApexClass6.",
+        "fields_read": [
+          "Interview_Type__c",
+          "Niche__c"
+        ],
+        "fields_written": [
+          "AI_Pregenerated_Questions__c",
+          "AI_Pregen_Status__c"
+        ],
+        "related_objects": [
+          "Internal_Interview__c",
+          "Resume__c"
+        ],
+        "business_process": "ai_question_pregeneration"
+      },
+      {
+        "name": "TestApexClass7",
+        "type": "class",
+        "purpose": "Synthetic test text for TestApexClass7.",
+        "fields_read": [
+          "AI_Pregenerated_Questions__c",
+          "AI_Pregen_Status__c"
+        ],
+        "fields_written": [],
+        "related_objects": [
+          "Internal_Interview__c"
+        ],
+        "business_process": "conduct_interview_and_evaluation"
+      }
+    ]
+  },
+  "business_process_usage": [
+    {
+      "process_id": "test_process_1",
+      "process_name": "Test Process 1",
+      "object_role": "primary_record",
+      "meaning": "Synthetic test text for Test Process 1."
+    },
+    {
+      "process_id": "test_process_2",
+      "process_name": "Test Process 2",
+      "object_role": "parent_record",
+      "meaning": "Synthetic test text for Test Process 2."
+    },
+    {
+      "process_id": "test_process_3",
+      "process_name": "Test Process 3",
+      "object_role": "schedule_mirror",
+      "meaning": "Synthetic test text for Test Process 3."
+    },
+    {
+      "process_id": "test_process_4",
+      "process_name": "Test Process 4",
+      "object_role": "primary_record",
+      "meaning": "Synthetic test text for Test Process 4."
+    },
+    {
+      "process_id": "test_process_5",
+      "process_name": "Test Process 5",
+      "object_role": "primary_record",
+      "meaning": "Synthetic test text for Test Process 5."
+    },
+    {
+      "process_id": "test_process_6",
+      "process_name": "Test Process 6",
+      "object_role": "mock_record",
+      "meaning": "Synthetic test text for Test Process 6."
+    },
+    {
+      "process_id": "test_process_7",
+      "process_name": "Test Process 7",
+      "object_role": "assessment_interview",
+      "meaning": "Synthetic test text for Test Process 7."
+    }
+  ],
+  "provenance": {
+    "source_environment": "test",
+    "sources": [
+      {
+        "type": "test_fixture",
+        "source": "synthetic",
+        "knowledge_type": "CURATED",
+        "confidence": null
+      }
+    ],
+    "review_status": "synthetic",
+    "notes": "Synthetic test fixture: text and rating values are made up."
+  }
+}

@@ -1,0 +1,80 @@
+# Evaluation sets of `python -m sf_assistant.evaluation run` (sf_assistant/evaluation/runner.py).
+#
+# Paths only, never names: every question and expected file lives in the git-ignored private folder
+# (config.PRIVATE_DIR, .private/ next to pyproject.toml) because it holds real names and record data.
+# Read by sf_assistant/evaluation/sets.py (a small YAML subset: block mappings, flow lists, scalars, comments).
+#
+# Per set:
+#   questions  question file (one question per line, "#" lines are comments; a "# [P01 ...]" or "# [01 ...]" tag line
+#              before a question gives its id)
+#   expected   expected answers (lookup / people / golden graders); optional for route checks
+#   grader     lookup | golden | people | control | route   (sf_assistant/evaluation/autograde.py)
+#   id_prefix  id of a question without a tag line, or with a number-only tag: <prefix><number, 2 digits>
+#   modes      the modes the set can run in (merged = ask; records = ask --records-only)
+#   full       the modes of --level full (the modes of the hand-graded rounds)
+#   quick      questions of --level quick: a fixed, evenly spaced sample of the file
+version: 1
+results_dir: .private/runs/eval   # one folder per run (inside .private/runs/: the ask cli writes its transcripts there)
+today: "2026-10-13"               # --today of every run: the day the expected answers were computed for
+order: [lookup, golden, easy, people_dev, people_holdout, controls]   # --set all
+
+sets:
+  lookup:
+    questions: okeval_run/lookup_eval/questions.txt
+    expected: okeval_run/lookup_eval/expected.json
+    grader: lookup
+    id_prefix: Q
+    modes: [merged, records]
+    full: [merged, records]
+    quick: 10
+  golden:
+    questions: questions/records.txt
+    expected: questions/records_golden.json
+    grader: golden
+    id_prefix: G
+    modes: [merged, records]
+    full: [merged, records]
+    quick: 6
+  easy:
+    questions: questions/easy.txt
+    grader: route
+    id_prefix: E
+    modes: [merged]
+    full: [merged]
+    quick: 2
+  people_dev:
+    questions: okeval_run/lookup_eval/people/dev.txt
+    expected: okeval_run/lookup_eval/people/expected.json
+    grader: people
+    id_prefix: P
+    modes: [merged, records]
+    full: [merged, records]
+    quick: 10
+  people_holdout:
+    questions: okeval_run/lookup_eval/people/holdout.txt
+    expected: okeval_run/lookup_eval/people/expected.json
+    grader: people
+    id_prefix: P
+    modes: [merged, records]
+    full: [merged, records]
+    quick: 5
+  controls:
+    questions: okeval_run/lookup_eval/people/controls.txt
+    expected: okeval_run/lookup_eval/people/expected.json
+    grader: control
+    id_prefix: C
+    modes: [merged]
+    full: [merged]
+    quick: 2
+
+# quick = the sample of every set, merged; standard = every question, merged; full = every question in its full modes
+levels:
+  quick:
+    sample: true
+    modes: [merged]
+  standard:
+    sample: false
+    modes: [merged]
+  full:
+    sample: false
+    modes: full

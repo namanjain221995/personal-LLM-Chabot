@@ -225,6 +225,11 @@ services:
       # until the new path is verified through real requests, then this
       # default flips and the flag goes away.
       SFK_PIPELINE_ENABLED: ${SFK_PIPELINE_ENABLED:-false}
+      # sf_assistant answers Salesforce questions in /chat for admins. OFF ships
+      # first; ON also means the pipeline switch above cannot run. The token
+      # comes from secrets.env through env_file and has no default here.
+      SF_ASSISTANT_ENABLED: ${SF_ASSISTANT_ENABLED:-false}
+      SF_ASSISTANT_SOCKET: ${SF_ASSISTANT_SOCKET:-/run/sf-assistant-ask/ask.sock}
       # The shared trace store. Same file the knowledge service writes.
       SFK_TRACE_DB: ${SFK_TRACE_DB:-/data/traces/db/traces.sqlite}
       SFK_TRACE_EXPORT_DIR: ${SFK_TRACE_EXPORT_DIR:-/data/traces/exports}
@@ -370,6 +375,10 @@ services:
       UV_THREADPOOL_SIZE: ${UV_THREADPOOL_SIZE:-16}
     volumes:
       - data:/data
+      # The sf_assistant service's Unix socket. Read-only, because this
+      # container runs as root and could otherwise replace the socket; connect()
+      # needs no write access to the mount.
+      - ask-sock:/run/sf-assistant-ask:ro
       # The Salesforce brain packs, read-only and LIVE: core/brain.py re-reads
       # on file change, so dropping a new pack into brain/packs/ takes effect
       # on the next question — no rebuild, no restart.
@@ -804,5 +813,15 @@ volumes:
   # evidence the new architecture is judged on and must outlive it.
   knowledge-traces:
     name: sf-local-ai_knowledge-traces
+  # The sf_assistant service's socket and nothing else, in memory. The service
+  # (sf_assistant/web/compose.ask.yaml) names this volume as external and runs
+  # as uid 1000, so this file has to create it first. Only a container with this
+  # volume can reach the service: it has no TCP port.
+  ask-sock:
+    name: sf-local-ai_ask-sock
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "uid=1000,gid=1000,mode=0755"
   v1gateway_spool:
     name: sf-local-ai_v1gateway_spool

@@ -1,0 +1,38 @@
+# Real names, access-code hashes and question logs: never commit
+.private/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.egg-info/
+# cli --file transcripts and sidecars can hold record data: never commit them, wherever they land
+*.jsonl
+ask_*.txt
+# warehouse snapshots hold record data
+*.duckdb
+# knowledge files and kb_build inputs/outputs carry internal endpoint URLs, org ids and Slack ids
+# (keep local, do not commit; same status as in notebooks/object_knowledge_eval/.gitignore).
+# Anchored with a leading "/": an unanchored "knowledge/" would also hide the package source src/sf_assistant/knowledge/.
+/knowledge/
+/kb_build/sources/
+/kb_build/kb.json
+/kb_build/curated/
+/kb_build/doc_extracts/
+/kb_build/skeletons/
+/kb_build/training_module/facts.json
+/kb_build/training_module/features_src.json
+# Safety net for output that holds real names or record data when a command is run with the notebook folder's
+# relative paths (the real places are under .private/): transcripts, grades, question files, reports
+/runs/
+/okeval_run/
+/questions/
+# also the knowledge evaluation's run folders (python -m sf_assistant.evaluation knowledge):
+# reports/knowledge_eval/<object>_<time>/ quote the knowledge files' text, so they stay local like /knowledge/
+/reports/
+# Not part of the public repository: the knowledge build holds hand-written business meaning, the specs and
+# the parity tests name private paths, and the machine's own settings stay on the machine.
+/kb_build/
+/docs/spec/
+/tests/parity/
+/web/.env

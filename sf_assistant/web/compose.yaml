@@ -1,0 +1,155 @@
+# Own compose project (sf-assistant). Start, logs, codes, token: ./run.sh (see ../docs/runbook.md).
+# It never touches the sf-local-ai stack: it only mounts that stack's data volume READ-ONLY and
+# reaches its vLLM server on localhost:8000 through the host network.
+name: sf-assistant
+
+services:
+  sf-assistant-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: "${SFA_UID:-1000}"
+        APP_GID: "${SFA_GID:-1000}"
+    image: sf-assistant-web:local
+    container_name: sf-assistant-web
+    restart: unless-stopped
+    network_mode: host            # vLLM on localhost:8000 (records are on only with a local endpoint)
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      SFA_BIND: "${SFA_BIND:-127.0.0.1}"
+      SFA_PORT: "${SFA_PORT:-8600}"
+      SFA_WAREHOUSE: /data/warehouse.read.duckdb   # the live read copy; never /data/warehouse.duckdb
+      SFA_HOME: /srv/sfa                           # the sf_assistant folder: src/, prompts/, knowledge/objects/
+      PYTHONPATH: /srv/sfa/src
+      SFA_PRIVATE_DIR: /srv/private
+      SFA_ALLOWED_HOSTS: "${SFA_ALLOWED_HOSTS:-}"
+      # the page's limits (docs/runbook.md "Page settings"); empty = the default in web/server.py WebSettings
+      SFA_TIMEOUT_S: "${SFA_TIMEOUT_S:-}"
+      SFA_QUEUE_WAIT_S: "${SFA_QUEUE_WAIT_S:-}"
+      SFA_RATE_PER_HOUR: "${SFA_RATE_PER_HOUR:-}"
+      SFA_SESSION_HOURS: "${SFA_SESSION_HOURS:-}"
+      SFA_COOKIE_SECURE: "${SFA_COOKIE_SECURE:-}"
+      # the spelling help (docs/resolver.md "Wiring"): off or on; empty = on (the code default, since
+      # 2026-10-27). The image's word lists are used.
+      SFA_RESOLVER: "${SFA_RESOLVER:-}"
+      OKEVAL_BASE_URL: http://localhost:8000/v1
+      OKEVAL_MODEL: Qwen/Qwen3.6-35B-A3B-NVFP4
+      OKEVAL_API_KEY: EMPTY
+    volumes:
+      - type: bind                 # the sf_assistant package, its prompts and knowledge files (read-only)
+        source: ..
+        target: /srv/sfa
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: .
+        target: /srv/web
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../.private
+        target: /srv/private
+        bind:
+          create_host_path: false
+      - type: volume
+        source: sf-local-ai_data
+        target: /data
+        read_only: true
+    healthcheck:
+      test: ["CMD", "python", "/srv/web/server.py", "--health"]
+      interval: 60s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+
+  # The MCP server (python -m sf_assistant.server --http): the agents' tools, resources and answer templates over
+  # Streamable HTTP on SFA_MCP_BIND:SFA_MCP_PORT/mcp, bearer token (./run.sh new-mcp-token). Same image as the page
+  # (built by sf-assistant-web). Of .private it sees only its three files (never the web log, the codes, the question
+  # sets or the snapshot): the token file and the audit key read-only, its audit log writable. Each is a file bind
+  # mount, so run.sh creates them first, and new-mcp-token rewrites the token file in place (a file bind mount keeps
+  # the inode it was created with; the server refuses every token when it sees that the file was replaced).
+  sf-assistant-mcp:
+    image: sf-assistant-web:local
+    pull_policy: never           # built locally by the sf-assistant-web service (./run.sh up / up-mcp)
+    container_name: sf-assistant-mcp
+    restart: unless-stopped
+    network_mode: host
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    working_dir: /srv/sfa
+    command: ["python", "-m", "sf_assistant.server", "--http"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPATH: /srv/sfa/src
+      SFA_HOME: /srv/sfa                           # prompts/, knowledge/objects/ and .private/ below it
+      SFA_WAREHOUSE: /data/warehouse.read.duckdb   # the live read copy; never /data/warehouse.duckdb
+      SFA_MCP_BIND: "${SFA_MCP_BIND:-127.0.0.1}"
+      SFA_MCP_PORT: "${SFA_MCP_PORT:-8700}"
+      SFA_MCP_ALLOWED_HOSTS: "${SFA_MCP_ALLOWED_HOSTS:-}"
+      SFA_MCP_RATE_PER_MIN: "${SFA_MCP_RATE_PER_MIN:-30}"
+      SFA_RESOLVER: "${SFA_RESOLVER:-}"            # the spelling help: off or on; empty = on
+    volumes:
+      - type: bind
+        source: ../src
+        target: /srv/sfa/src
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../prompts
+        target: /srv/sfa/prompts
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../knowledge
+        target: /srv/sfa/knowledge
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind                 # the token file (hashes only); a rotation is seen at the next request
+        source: ../.private/mcp_token.json
+        target: /srv/sfa/.private/mcp_token.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind                 # the audit log's HMAC key (the argument hashes)
+        source: ../.private/mcp_audit_key
+        target: /srv/sfa/.private/mcp_audit_key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind                 # the only writable path: the audit log, appended to
+        source: ../.private/mcp_log.jsonl
+        target: /srv/sfa/.private/mcp_log.jsonl
+        bind:
+          create_host_path: false
+      - type: volume
+        source: sf-local-ai_data
+        target: /data
+        read_only: true
+    healthcheck:
+      test: ["CMD", "python", "-m", "sf_assistant.server", "--health"]
+      interval: 60s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+volumes:
+  sf-local-ai_data:
+    external: true

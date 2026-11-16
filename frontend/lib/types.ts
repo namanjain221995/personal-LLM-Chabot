@@ -486,6 +486,8 @@ export interface BranchMeta {
 }
 
 export interface Meta {
+  /** Set to 'sf_assistant' when that service wrote the answer. */
+  engine?: string;
   /**
    * Which engine answered. Optional: a message may carry meta purely to
    * record its place in the tree, before (or without) any engine running.
