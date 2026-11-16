@@ -538,9 +538,18 @@ async def generate_conversation_title(
     if first_user is None and first_assistant is None:
         return {"title": state["title"], "title_source": "auto", "generated": False}
 
+    # An sf_assistant answer stays out of the title, whose words reach other
+    # chats' prompts (memory_recall.format_recall_block), where the agent planner
+    # could write a name from it into a public query. The person's question names
+    # such a chat. The same reason keeps the answer out of recall itself
+    # (db.recall_conversations).
+    answer_text = (first_assistant or {}).get("content", "")
+    if ((first_assistant or {}).get("meta") or {}).get("engine") == "sf_assistant":
+        answer_text = ""
+
     title = await titling.generate_title(
         (first_user or {}).get("content", ""),
-        (first_assistant or {}).get("content", ""),
+        answer_text,
     )
     if title is None:
         return {"title": state["title"], "title_source": "auto", "generated": False}

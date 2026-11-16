@@ -3278,6 +3278,64 @@ def _carries_a_file_to_read(
     return bool(_NAMES_AN_UPLOAD_RE.search(text))
 
 
+def _sf_assistant_leaves_it_to_the_files(
+    text: str,
+    request: "ChatRequest",
+    history: List[dict],
+    artifacts: List[dict],
+    stored_documents: bool,
+) -> bool:
+    """Is this turn for the file paths, which the sf_assistant service cannot do?
+
+    File exports, file edits and questions about a file stay on the older system,
+    and the service's answer is final, so a turn it takes makes no file. Read with
+    the context the artifact gate gives the rules, not from the words alone:
+    "pdf please" and "make slide 4 shorter" only ask for a file when there is an
+    answer or a file to act on.
+
+    A CHART IS THE ONE EXCEPTION, since the service draws it: unless it names a
+    format, or the rules read it as a change to a file in this chat.
+
+    A QUESTION THE GATE READS AS ABOUT A FILE needs more when the last turn was
+    no file: in a chat holding one, the rules also claim "list them" and
+    "summarize this", which after a records answer are about that answer. And with
+    a stored document in the chat, a turn that names a file may mean that upload,
+    which only the older path can read.
+
+    The rules alone, with no model: a turn only the gate's classifier would read
+    as a file stays with the service.
+    """
+    from .artifacts import describe, intent, lexicon
+    from .artifacts.formats import explicit_formats
+
+    if request.artifact_id:
+        return True
+    published = [
+        a for a in artifacts
+        if str((a.get("current") or {}).get("status") or "") in ("completed", "completed_with_warnings")
+    ]
+    last_is_card = intent.last_turn_is_artifact(history)
+    decision = intent.decide(
+        text,
+        has_artifacts=bool(published),
+        artifact_hints=[str(a.get("title") or "") for a in published if a.get("title")],
+        has_assistant_answer=any(
+            str(turn.get("role")) == "assistant"
+            and not intent.is_artifact_turn(turn)
+            and intent.turn_text(turn).strip()
+            for turn in history
+        ),
+        last_turn_is_artifact=last_is_card,
+        last_deliverable=_as3_deliverable_shape(published),
+    )
+    if decision.wants_file:
+        return not (decision.chart_request and decision.action == "create" and not explicit_formats(text))
+    names_a_file = lexicon.file_signal(text)
+    if describe.answers_from_spec(decision) and (last_is_card or names_a_file):
+        return True
+    return stored_documents and names_a_file
+
+
 #: Videos (and audio) a message may reference: no limit in the app since
 #: 2026-10-03 (3 before, docs/chat-media/LIMITS.md); 999 is the technical
 #: ceiling a request is validated against. Each analysis is a detached job
@@ -3471,11 +3529,16 @@ def _request_snapshot(request: "ChatRequest") -> tuple[dict, bool]:
     because /chat loads the stored pictures again from the ids. Taken BEFORE
     /chat turns those refs into inline `images`, so their bytes never reach
     the snapshot.
+
+    A mode the client did not name is left out too: `model_dump` writes the
+    field's default, and a resume would then read it as named (`mode_sent`).
     """
     body = request.model_dump(exclude_none=True)
     had_inline = bool(request.images_data or request.pdf_data)
     for name in _INLINE_BYTE_FIELDS:
         body.pop(name, None)
+    if "mode" not in request.model_fields_set:
+        body.pop("mode", None)
     return body, not had_inline
 
 
@@ -4263,6 +4326,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     client_intent = request.intent_id is not None
     intent_id = request.intent_id or uuid.uuid4().hex
     snapshot, resumable = _request_snapshot(request)
+    # Did the client SAY which mode? The request model defaults to "salesforce",
+    # and the feature gate below assigns `request.mode`, which puts it in
+    # `model_fields_set` for every request, so this is the last place to ask.
+    mode_sent = "mode" in request.model_fields_set
 
     # FEATURE ACCESS (V17, authn/features.py). The composer only offers what
     # this person may use, but the composer is not the gate: rewrite the
@@ -4271,6 +4338,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     # that already respect it. A blocked tool is downgraded with one status
     # line, never a mid-conversation 403.
     from .authn import features as feature_access
+    from .authn.rbac import Cap
 
     gate = feature_access.enforce_chat(
         principal.features,
@@ -5163,6 +5231,38 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 reads.start("recall", read_recall)
                 reads.start("summary", read_summary)
             auto_web_search_allowed = request.mode == "assistant"
+            # A chat holding an sf_assistant answer gets no web search: "his
+            # company?" would send a name from that answer to public engines.
+            # Not tied to the switch or the capability, so it holds after a
+            # switch-off and for an admin who has since become a member, which
+            # is why every person's turn pays for the read. A small-talk lane
+            # turn never searches. When the read fails the web stays closed only
+            # for those who may ask the service: closing it for everyone would
+            # turn web search off for all members during a database fault, to
+            # guard the former admin who happens to ask in such a chat then.
+            if auto_web_search_allowed and not lane.entered:
+                try:
+                    auto_web_search_allowed = not await db.run_in_thread(
+                        db.conversation_has_engine, conv_key, "sf_assistant"
+                    )
+                except Exception:  # noqa: BLE001 — says what it did in the log
+                    auto_web_search_allowed = not principal.can(Cap.SF_ASSISTANT_USE)
+                    logging.getLogger(__name__).warning(
+                        "cannot read whether this chat holds an sf_assistant answer; %s",
+                        "web search stays as asked this turn"
+                        if auto_web_search_allowed
+                        else "no web search this turn",
+                    )
+                # The pill and the footer still say a search goes out, and the
+                # block further down that would refuse it is now skipped.
+                if not auto_web_search_allowed and request.web_search == "on" and settings.search_enabled:
+                    await emit(
+                        "status",
+                        {
+                            "text": "This chat may hold Salesforce answers, so web search "
+                            "stays off here. Start a new chat to search."
+                        },
+                    )
 
             # Deep Research is EXPLICIT-only and needs the web: without a
             # search provider there is nothing to research, so the request
@@ -5362,7 +5462,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # The composer hides the web-search option in that mode, and
             # `search_gate` makes the promise hold for ANY client, not just
             # the current UI. Turning the Salesforce toggle off is how you ask
-            # the web.
+            # the web, in a chat that holds no sf_assistant answer (see above).
             if search_gate:
                 # Looked at again: decide() may have taken a second, in which
                 # another turn of the same person can have spent the last slot.
@@ -5983,6 +6083,16 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # (2026-08-11): the second half of a resumed request was routed to
             # the agent engine and the resume was silently lost.
             sf_outcome = None
+            # A refused sf_assistant line in this chat, or an unclear one as its last
+            # answer, keeps this turn away from the older route, so no rule below may
+            # take it past the bridge (engines/sfk_bridge.py). This holds what the turn
+            # says instead. No read with the switch off.
+            _sf_stop_line = None
+            if request.mode == "salesforce":
+                from .engines import sfk_bridge
+
+                if sfk_bridge.ASSISTANT_ENABLED:
+                    _sf_stop_line = await sfk_bridge.stop_line_for(request, conv_key, principal)
             # --- AS3 intent-capability BEGIN ---
             # A Salesforce planner refusal/clarification of a FILE request is
             # held (not streamed) until the artifact gate has decided: a file
@@ -5990,6 +6100,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # streams exactly what the planner said. (outcome, buffered events)
             _as3_sf_held = None
             _as3_sf_buffer = None
+            _as3_sf_existing = None
             # --- AS3 intent-capability END ---
             # ONE clarification implementation, two planners. Intelligence Mode
             # on → the model plans and may ask; off → the deterministic
@@ -6023,7 +6134,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # RESOLVED request rather than the ambiguous one.
             if answering_clarification or (
                 request.mode == "salesforce"
-                and clarification_available
+                and (clarification_available or _sf_stop_line)
                 and request.text
                 and not (request.pdf_data or request.image_data)
                 # A follow-up about a picture already in this conversation is
@@ -6042,10 +6153,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not repo_followup
                 and not url_list
                 and not dataset_ready
-                and "(Clarified:" not in text
+                and ("(Clarified:" not in text or _sf_stop_line)
             ):
                 from .core.sf_intel.models import ClarificationResponse
-                from .engines import sf_intel, sfk_bridge
+                from .engines import sf_intel
 
                 answer_to_pending = None
                 malformed = False
@@ -6110,14 +6221,40 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     # Skipped when the AS3 buffer is active: that means this
                     # turn carries a file signal and wants an artifact, which
                     # the new pipeline cannot make.
+                    #
+                    # sf_assistant draws charts itself, so for those it may
+                    # answer, a word like "chart" or "report" is no reason to
+                    # skip: only a turn that really ends in a file is, and such
+                    # a turn need not hold a file word. The buffer then still
+                    # holds its token and meta until the gate below has read
+                    # them. A turn with a stop line stays with the bridge, whoever
+                    # asks and whatever they ask, and a file gets a line saying so:
+                    # the file path starts with the older route, which would read
+                    # that question in its history.
                     sf_outcome = None
-                    if _as3_sf_buffer is None:
+                    _sf_bridge_turn = _as3_sf_buffer is None
+                    _sf_wants_a_file = False
+                    if sfk_bridge.ASSISTANT_ENABLED and (_sf_stop_line or principal.can(Cap.SF_ASSISTANT_USE)):
+                        try:
+                            _as3_sf_existing = await reads.get("artifacts", read_artifacts)
+                        except Exception:  # noqa: BLE001 — no list means no file to act on
+                            _as3_sf_existing = []
+                        _sf_wants_a_file = _sf_assistant_leaves_it_to_the_files(
+                            text or "", request, history, _as3_sf_existing, bool(stored_docs)
+                        )
+                        _sf_bridge_turn = bool(_sf_stop_line) or not _sf_wants_a_file
+                    if _sf_bridge_turn:
                         sf_outcome = await sfk_bridge.try_answer(
                             text,
                             emit=_as3_sf_emit,
                             request=request,
                             clarification_response=answer_to_pending,
                             query_trace=query_trace,
+                            principal=principal,
+                            conv_key=conv_key,
+                            mode_sent=mode_sent,
+                            stop_line=_sf_stop_line,
+                            wants_a_file=_sf_wants_a_file,
                         )
                     if sf_outcome is None:
                         sf_outcome = await sf_intel.run(
@@ -6304,7 +6441,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .engines import artifact as artifact_engine_mod
 
                 try:
-                    _existing = await reads.get("artifacts", read_artifacts)
+                    _existing = (
+                        await reads.get("artifacts", read_artifacts)
+                        if _as3_sf_existing is None
+                        else _as3_sf_existing
+                    )
                 except Exception:  # noqa: BLE001 — no list means "create" semantics
                     _existing = []
                 # Only a PUBLISHED artifact can be edited, so only one counts
@@ -6402,6 +6543,56 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # not) be written from this message — see fact_gate above.
             _release_facts(not (artifact_intent is not None and artifact_intent.wants_file))
 
+            def _as3_answers_from_spec() -> bool:
+                return _as3_describe.answers_from_spec(
+                    artifact_intent,
+                    has_read_source=_carries_a_file_to_read(
+                        text, request, video_followup, bool(image_followup_images),
+                        stored_documents=bool(stored_docs),
+                        # A pasted link, a GitHub ref or a crawl instruction is
+                        # a source only the routes BELOW can fetch.
+                        link_to_fetch=(
+                            github_ref is not None or crawl_url is not None or bool(url_list)
+                        ),
+                    ),
+                    # ...AND THE DATASET IN THE ROOM IS THE THIRD FILE. It is
+                    # not carried by the turn, so `has_read_source` cannot see
+                    # it; `answers_from_spec` reads the gate's
+                    # `names_our_file` against it.
+                    has_dataset=bool(dataset_ready),
+                )
+
+            # A STOP LINE CLOSES EVERY PATH THAT CAN READ RECORDS, on the turns that
+            # skipped the gate above too: an attachment, a link, a picture, a dataset.
+            # The file path and the agent would run the older SQL route with the
+            # refused question in their history, and the router is all that a turn
+            # with no text has left. What may still run is named here, not what may
+            # not, so a route added to the chain below starts closed: the engines
+            # that read what the turn brought and no record, as the chain picks them.
+            # Deep research and web search are never on in this mode.
+            if (
+                _sf_stop_line
+                and not (sf_outcome is not None and sf_outcome.handled)
+                and (
+                    (artifact_intent is not None and (artifact_intent.wants_file or _as3_answers_from_spec()))
+                    or not (
+                        request.video_uploads
+                        or video_followup
+                        or request.pdf_uploads
+                        or request.pdf_data
+                        or request.image_data
+                        or image_followup.about_the_picture
+                        or github_ref is not None
+                        or repo_followup
+                        or crawl_url is not None
+                        or crawl_site_hits
+                        or url_list
+                        or (dataset_ready and not request.agent)
+                    )
+                )
+            ):
+                sf_outcome = await sfk_bridge.say_stop_line(_sf_stop_line, emit)
+
             # B8b (2026-09-18): an image attached to a file request is the
             # file's material. The artifact branch sits above the image route,
             # so the image is read HERE, by the main model, and its text goes
@@ -6452,23 +6643,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # workbook we made. `wants_file` is False for such a turn, so
                 # main.py's own image read above is skipped too and the file
                 # would never be opened at all.
-                or _as3_describe.answers_from_spec(
-                    artifact_intent,
-                    has_read_source=_carries_a_file_to_read(
-                        text, request, video_followup, bool(image_followup_images),
-                        stored_documents=bool(stored_docs),
-                        # A pasted link, a GitHub ref or a crawl instruction is
-                        # a source only the routes BELOW can fetch.
-                        link_to_fetch=(
-                            github_ref is not None or crawl_url is not None or bool(url_list)
-                        ),
-                    ),
-                    # ...AND THE DATASET IN THE ROOM IS THE THIRD FILE. It is
-                    # not carried by the turn, so `has_read_source` cannot see
-                    # it; `answers_from_spec` reads the gate's
-                    # `names_our_file` against it.
-                    has_dataset=bool(dataset_ready),
-                )
+                or _as3_answers_from_spec()
             ):
                 # ARTIFACT STUDIO (2026-09-11). A turn that asks for a FILE —
                 # "create a PDF of this", "make a deck for the board", "make
@@ -6936,7 +7111,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     prepared = await _prepare_knowledge(
                         request,
                         text,
-                        allow_network=not want_search,
+                        allow_network=not want_search and auto_web_search_allowed,
                         emit=emit,
                         user_id=viewer,
                         conversation_id=conv_key,
@@ -7005,7 +7180,13 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 from .artifacts import lexicon as _as3_lex
                 from .engines import capability as _as3_capability
 
-                if _as3_capability.denial_in(answer) and _as3_lex.file_signal(text):
+                if _sf_stop_line and _as3_capability.denial_in(answer) and _as3_lex.file_signal(text):
+                    # The file it denied would start the older SQL route too, in
+                    # this mode. The answer is already streamed, so the line follows.
+                    _as3_tail = "\n\n" + _sf_stop_line
+                    await emit("token", {"text": _as3_tail})
+                    answer = f"{answer}{_as3_tail}"
+                elif _as3_capability.denial_in(answer) and _as3_lex.file_signal(text):
                     from . import metrics as _as3_metrics
 
                     _as3_hist = list(history)
@@ -7095,7 +7276,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     answer = f"{answer}{_as3_tail}"
             # --- AS3 intent-capability END ---
             gen.answer = answer
-            memory.add_exchange(scoped_session, text, answer)
+            # Not an sf_assistant answer: this memory is read when a client sends
+            # no turns, and it holds no stamp for the web block to see.
+            if (gen.final_meta or {}).get("engine") != "sf_assistant":
+                memory.add_exchange(scoped_session, text, answer)
             # Durable BEFORE `done`: the row says 'completed' only once the
             # answer is in history, so a status poll that follows the
             # terminal event never reads "completed, nothing persisted".

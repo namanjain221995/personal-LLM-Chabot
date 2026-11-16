@@ -5328,6 +5328,33 @@ def list_confirmed_sql_examples(limit: int = 200) -> List[dict]:
     return examples
 
 
+def conversation_has_engine(conversation_id: str, engine: str) -> bool:
+    """Does a stored message of this conversation carry this `meta.engine`?
+
+    The engine stamps that key when it answers (engines/sfk_bridge.py), so this
+    reads a fact recorded at generation time, as sharing.py's provenance does.
+    """
+    with read_connection() as con:
+        row = con.execute(
+            "SELECT 1 FROM messages WHERE conversation_id = %s AND meta->>'engine' = %s LIMIT 1",
+            (conversation_id, engine),
+        ).fetchone()
+    return row is not None
+
+
+def conversation_has_engine_line(conversation_id: str, engine: str, lines: Sequence[str]) -> bool:
+    """Does a stored answer of this engine, in this conversation, hold one of these
+    lines? Stored answers of any branch count, which is what a regenerate needs: its
+    client sends turns only up to the question. `lines` hold no LIKE wildcard."""
+    with read_connection() as con:
+        row = con.execute(
+            "SELECT 1 FROM messages WHERE conversation_id = %s AND role = 'assistant'"
+            " AND meta->>'engine' = %s AND content LIKE ANY(%s) LIMIT 1",
+            (conversation_id, engine, [f"%{line}%" for line in lines]),
+        ).fetchone()
+    return row is not None
+
+
 def conversation_owner(conversation_id: str) -> Optional[int]:
     """user_id owning this conversation, or None when no such row exists.
 
@@ -5766,6 +5793,10 @@ def replace_messages(
     precisely because of the guarantee above: this function can never reorder
     or shrink a thread, only append to it, so index N before is index N after.
     An explicit `feedback` on an incoming message wins over the carried value.
+
+    THE SF_ASSISTANT STAMP SURVIVES THE SAME WAY. The web block and the
+    workspace-share block read `meta.engine`, so a client's PUT must not be able
+    to lift them by leaving it out.
     """
     now = _now()
     with connection() as con:
@@ -5793,18 +5824,20 @@ def replace_messages(
         if len(messages) < existing:
             raise MessageCountWouldShrink(existing, len(messages))
         # Snapshot the thumbs before the rows they belong to are deleted.
-        carried = [
-            r["feedback"]
-            for r in con.execute(
-                "SELECT feedback FROM messages WHERE conversation_id = %s ORDER BY id",
-                (conversation_id,),
-            ).fetchall()
-        ]
+        before = con.execute(
+            "SELECT feedback, meta->>'engine' AS engine FROM messages"
+            " WHERE conversation_id = %s ORDER BY id",
+            (conversation_id,),
+        ).fetchall()
+        carried = [r["feedback"] for r in before]
+        stamped = {i for i, r in enumerate(before) if r["engine"] == "sf_assistant"}
         con.execute("DELETE FROM messages WHERE conversation_id = %s", (conversation_id,))
         seen_generations = set()
         rows = []
         for index, m in enumerate(messages):
             meta = m.get("meta")
+            if index in stamped:
+                meta = {**(meta or {}), "engine": "sf_assistant"}
             gen_id = (meta or {}).get("generation_id")
             # The unique index would reject a repeated key; a client sending
             # one twice is a bug on its side, not a reason to 500 — keep the
@@ -6268,6 +6301,13 @@ def recall_conversations(
     One statement, not the old rank-then-snippet-per-row pair: LATERAL fetches
     each winner's snippet in the same pass, so this no longer issues N+1
     queries (it was 1 + `limit` round trips, each paying the old connect() tax).
+
+    An sf_assistant answer is never recalled. The chat holding it has no web
+    search; recalled into another chat, the agent planner could write a name from
+    it into a public query. The snippet pass leaves it out, not the ranking: that
+    would open the meta of every matching message of this user on every turn, so
+    such a chat can still take a place among the winners, with its next-best
+    message or with none.
     """
     keywords = _recall_keywords(keywords)
     if not keywords:
@@ -6318,6 +6358,7 @@ def recall_conversations(
         "    SELECT s.role, s.content FROM messages s"
         "     CROSS JOIN LATERAL (SELECT lower(s.content) AS lc OFFSET 0) AS l"
         f"    WHERE s.conversation_id = ranked.id AND ({snippet_any})"
+        "       AND s.meta->>'engine' IS DISTINCT FROM 'sf_assistant'"
         f"     ORDER BY ({snippet_score}) DESC, s.id DESC LIMIT 1"
         "  ) AS snip ON true "
         " ORDER BY ranked.hits DESC, ranked.updated_at DESC"
@@ -6330,6 +6371,8 @@ def recall_conversations(
         rows = con.execute(sql, params).fetchall()
     out: List[dict] = []
     for r in rows:
+        if r["role"] is None:  # the snippet pass found nothing it may show
+            continue
         content = (r["content"] or "").strip().replace("\n", " ")
         if len(content) > _RECALL_SNIPPET_CHARS:
             content = content[:_RECALL_SNIPPET_CHARS] + "…"
@@ -6795,6 +6838,9 @@ def messages_missing_embeddings(
 
     Newest-first so fresh conversations become searchable immediately; the
     older backlog drains a batch per request.
+
+    An sf_assistant answer gets no vector, so semantic recall cannot carry it into
+    another chat. See `recall_conversations`.
     """
     # 2026-09-14: `length(content)` counts characters, so it detoasts (and
     # decompresses) every message of the user the scan reads — 12-14 ms at
@@ -6812,6 +6858,7 @@ def messages_missing_embeddings(
             "   AND (octet_length(m.content) >= 4 * %s OR length(m.content) >= %s)"
             "   AND NOT EXISTS (SELECT 1 FROM message_embeddings e"
             "                    WHERE e.message_id = m.id AND e.model_id = %s)"
+            "   AND (m.role = 'user' OR m.meta->>'engine' IS DISTINCT FROM 'sf_assistant')"
             " ORDER BY m.id DESC LIMIT %s",
             (user_id, min_chars, min_chars, min_chars, model_id, limit),
         ).fetchall()

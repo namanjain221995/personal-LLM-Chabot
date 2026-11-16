@@ -59,6 +59,7 @@ import { Markdown } from './Markdown';
 import { PastedChip } from './PastedChip';
 import { QuotedContext } from './QuotedContext';
 import { ProofDrawer } from './ProofDrawer';
+import { ChartView } from './ChartView';
 import { ArtifactCards, type OpenArtifact } from './artifacts/ArtifactCards';
 import { CopyButton } from './CopyButton';
 import { ReasoningAccordion } from './ReasoningAccordion';
@@ -1575,6 +1576,23 @@ function MessageRowImpl({
                 </div>
               );
             })()}
+
+          {/* An sf_assistant chart shows like an image in the answer, in its own space. */}
+          {message.meta?.engine === 'sf_assistant' &&
+            message.meta.chart &&
+            !!(message.meta.chart_data?.length || message.meta.data?.length) && (
+              <div
+                data-testid="answer-chart"
+                className="my-3 w-full rounded-lg border border-border bg-surface p-3"
+                style={{ minHeight: 444 }}
+              >
+                <ChartView
+                  spec={message.meta.chart}
+                  data={(message.meta.chart_data?.length ? message.meta.chart_data : message.meta.data)!}
+                  minHeight={420}
+                />
+              </div>
+            )}
 
           {message.meta && <ProofDrawer meta={message.meta} />}
 

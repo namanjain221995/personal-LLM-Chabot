@@ -63,7 +63,7 @@ const MESSAGES: Record<string, string> = {
     'A pie or donut needs positive values. The data is in the Data tab.',
 };
 
-function ChartCanvas({ spec, data }: { spec: ChartSpec; data: DataRow[] }) {
+function ChartCanvas({ spec, data, minHeight }: { spec: ChartSpec; data: DataRow[]; minHeight?: number }) {
   const { theme } = useTheme();
   // Resolving CSS custom properties needs a DOM. Start from the literal
   // fallbacks so the first paint (and SSR) is correct, then swap in the
@@ -94,19 +94,19 @@ function ChartCanvas({ spec, data }: { spec: ChartSpec; data: DataRow[] }) {
   // a page-length image.
   const height =
     spec.type === 'horizontal_bar'
-      ? Math.min(1400, Math.max(300, data.length * 26 + 96))
-      : 300;
+      ? Math.min(1400, Math.max(minHeight ?? 300, data.length * 26 + 96))
+      : (minHeight ?? 300);
   return <EChart option={option} height={height} ariaLabel={spec.title || 'Chart'} />;
 }
 
-export function ChartView({ spec, data }: { spec: ChartSpec; data: DataRow[] }) {
+export function ChartView({ spec, data, minHeight }: { spec: ChartSpec; data: DataRow[]; minHeight?: number }) {
   return (
     <figure>
       {spec.title ? (
         <figcaption className="mb-2 text-sm font-medium text-ink">{spec.title}</figcaption>
       ) : null}
       <ChartErrorBoundary>
-        <ChartCanvas spec={spec} data={data} />
+        <ChartCanvas spec={spec} data={data} minHeight={minHeight} />
       </ChartErrorBoundary>
     </figure>
   );

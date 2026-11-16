@@ -177,6 +177,55 @@ def test_a_conversation_is_titled_from_its_first_exchange(alice, monkeypatch):
     assert alice.get("/history/conversations/c1").json()["title"] == "Contact Export Process"
 
 
+def _prompts_of_a_titler(monkeypatch, reply="Interview Count") -> list:
+    prompts: list = []
+
+    async def _call(messages, **kwargs):
+        prompts.append(messages)
+        return reply
+
+    monkeypatch.setattr(titling.llm, "router_chat_completion", _call)
+    return prompts
+
+
+def _chat_with_a_stamped_answer(client, conv_id):
+    _chat(client, conv_id, "how many interviews this week?", "Echo Person had 7 interviews.")
+    with db.connection() as con:
+        con.execute(
+            "UPDATE messages SET meta = %s::jsonb WHERE conversation_id = %s AND role = 'assistant'",
+            ('{"route": "sql", "engine": "sf_assistant"}', conv_id),
+        )
+
+
+def test_an_sf_assistant_answer_stays_out_of_the_title(alice, monkeypatch):
+    """The recall block prints titles into other chats' prompts, and from there the
+    agent planner could write a name into a public query. So only the person's own
+    question names such a chat."""
+    prompts = _prompts_of_a_titler(monkeypatch)
+    _chat_with_a_stamped_answer(alice, "c-stamped")
+    resp = alice.post("/history/conversations/c-stamped/title")
+    assert resp.json() == {"title": "Interview Count", "title_source": "generated", "generated": True}
+    sent = prompts[0][1]["content"]
+    assert "how many interviews this week?" in sent
+    assert "Echo Person" not in sent
+
+
+def test_a_stamped_chat_keeps_its_title_when_the_model_declines(alice, monkeypatch):
+    _prompts_of_a_titler(monkeypatch, reply="New Chat")
+    _chat_with_a_stamped_answer(alice, "c-declined")
+    before = alice.get("/history/conversations/c-declined").json()["title"]
+    resp = alice.post("/history/conversations/c-declined/title")
+    assert resp.json()["generated"] is False
+    assert alice.get("/history/conversations/c-declined").json()["title"] == before
+
+
+def test_any_other_answer_still_goes_into_the_title(alice, monkeypatch):
+    prompts = _prompts_of_a_titler(monkeypatch)
+    _chat(alice, "c-plain", "how do I export contacts?", "Use the Data Loader.")
+    alice.post("/history/conversations/c-plain/title")
+    assert "Use the Data Loader." in prompts[0][1]["content"]
+
+
 def test_a_contentless_exchange_keeps_its_existing_title(alice, monkeypatch):
     """The "hi" case — the whole reason this feature exists. The model votes
     'New Chat'; we must not write that over anything."""

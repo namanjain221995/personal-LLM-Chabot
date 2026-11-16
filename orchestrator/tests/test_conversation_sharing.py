@@ -339,6 +339,79 @@ def test_republishing_makes_a_new_version_on_the_same_link(login_client, public)
     assert owner.get(f"/conversations/{cid}/share").json()["share"]["version"] == 2
 
 
+def _hold_an_sf_assistant_answer(cid: str, text: str = "Echo Person had 7 interviews.") -> None:
+    _say(cid, "user", "how many interviews?")
+    _say(cid, "assistant", text, {"route": "sql", "engine": "sf_assistant"})
+
+
+def test_a_chat_holding_an_sf_assistant_answer_cannot_go_to_the_workspace(login_client):
+    """Admins only in phase 1, and a workspace link is the one route from such an
+    answer to a member."""
+    owner = login_client("olive", role="admin")
+    cid = _conversation("olive", "conv-share-sfa")
+    _hold_an_sf_assistant_answer(cid)
+
+    resp = _create(owner, cid, visibility="workspace")
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == (
+        "This conversation holds an answer only administrators may read, "
+        "so it cannot be shared, not even inside the workspace."
+    )
+    state = owner.get(f"/conversations/{cid}/share").json()
+    assert state["share"] is None
+    assert state["policy"]["workspace_allowed"] is False
+    assert state["policy"]["public_allowed"] is False
+    assert _create(owner, cid).status_code == 422
+
+
+def test_a_workspace_link_made_earlier_cannot_take_such_an_answer_in(login_client):
+    owner = login_client("olive", role="admin")
+    cid = _conversation("olive", "conv-share-sfa-2")
+    token = _create(owner, cid, visibility="workspace").json()["token"]
+    _hold_an_sf_assistant_answer(cid)
+
+    resp = owner.post(f"/conversations/{cid}/share/refresh", json={})
+    assert resp.status_code == 422
+    assert "Echo Person" not in str(owner.get(f"/public/shares/{token}").json())
+
+
+def test_an_older_records_answer_may_still_go_to_the_workspace(login_client):
+    """The block reads the engine's stamp, not the route they share."""
+    owner = login_client("olive", role="admin")
+    cid = _conversation("olive", "conv-share-sfa-3")
+    _say(cid, "assistant", "crm rows", {"route": "sql"})
+    assert _create(owner, cid, visibility="workspace").status_code == 200
+
+
+def test_a_whole_thread_put_cannot_lift_the_workspace_block(login_client):
+    """The block reads the stamp, and a client's PUT must not be able to remove it
+    by leaving it out. Thumbs survive the same way, by position."""
+    owner = login_client("olive", role="admin")
+    cid = _conversation("olive", "conv-share-sfa-4")
+    _hold_an_sf_assistant_answer(cid)
+
+    stored = owner.get(f"/history/conversations/{cid}").json()["messages"]
+    rows = [
+        {"role": m["role"], "content": m["content"], "meta": {k: v for k, v in (m.get("meta") or {}).items() if k != "engine"}}
+        for m in stored
+    ]
+    assert owner.put(f"/history/conversations/{cid}/messages", json={"messages": rows}).status_code == 200
+
+    assert _create(owner, cid, visibility="workspace").status_code == 422
+    assert owner.get(f"/conversations/{cid}/share").json()["policy"]["workspace_allowed"] is False
+
+
+def test_provenance_finds_the_engine_on_a_turn_with_no_words():
+    verdict = sharing.evaluate(
+        [
+            {"role": "user", "content": "hello", "meta": {}},
+            {"role": "assistant", "content": "", "meta": {"route": "sql", "engine": "sf_assistant"}},
+        ]
+    )
+    assert verdict.workspace_allowed is False
+    assert verdict.public_allowed is False
+
+
 def test_new_private_content_leaves_the_old_snapshot_live(login_client, public):
     """The failure to avoid is publishing something nobody reviewed because an
     earlier version happened to be fine."""

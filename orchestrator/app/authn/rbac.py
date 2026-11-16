@@ -34,6 +34,12 @@ class Cap(str, Enum):
     WORKSPACE_CONTENT_READ = "workspace_content.read"
     SESSIONS_MANAGE = "sessions.manage"
     SETTINGS_MANAGE = "settings.manage"
+    #: Have Salesforce questions in /chat answered by the sf_assistant service
+    #: (engines/sfk_bridge.py). Phase 1 is admins only, because the service's
+    #: answers hold real names and no per-role field rule stands behind them
+    #: (owner decision, 2026-11-04). Members have no capability at all, so
+    #: they stay on the older route.
+    SF_ASSISTANT_USE = "sf_assistant.use"
     #: The analytics console: platform-wide usage, per-person leaderboards and
     #: the inference/GPU telemetry behind them. SUPER_ADMIN only — an admin
     #: runs the workspace's people, not its infrastructure, and per-person
@@ -91,6 +97,7 @@ _ADMIN_CAPS: FrozenSet[Cap] = frozenset(
         Cap.INVITES_MANAGE,
         Cap.WORKSPACE_CONTENT_READ,
         Cap.SESSIONS_MANAGE,
+        Cap.SF_ASSISTANT_USE,
         Cap.API_CONSOLE_ACCESS,
         Cap.API_PROJECTS_READ,
         Cap.API_PROJECTS_MANAGE,

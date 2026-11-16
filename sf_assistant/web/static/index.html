@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Salesforce assistant</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/render.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <main id="login-view" class="login" hidden>
+    <form id="login-form" class="login-card" autocomplete="off" novalidate>
+      <h1>Salesforce assistant</h1>
+      <p>Enter the access code you were given.</p>
+      <label for="code">Access code</label>
+      <input id="code" name="code" type="password" inputmode="text" autocapitalize="characters" spellcheck="false"
+             maxlength="64" required>
+      <label class="show-code"><input type="checkbox" id="show-code"> Show the code</label>
+      <button class="btn" type="submit" id="login-btn">Sign in</button>
+      <p class="form-error" id="login-error" role="alert"></p>
+    </form>
+  </main>
+
+  <div id="app-view" hidden>
+    <header class="topbar">
+      <h1>Salesforce assistant</h1>
+      <div class="status" id="status" aria-live="polite">
+        <span id="st-model"><span class="dot" id="st-model-dot"></span><span id="st-model-text">Checking the model</span></span>
+        <span id="st-data"></span>
+        <span id="st-queue"></span>
+        <span id="st-limit"></span>
+      </div>
+      <button class="btn-quiet" type="button" id="logout-btn">Sign out</button>
+      <p class="admin-line" id="st-admin" hidden></p>
+    </header>
+    <p class="visually-hidden" id="announce" role="status"></p>
+
+    <div class="layout">
+      <main>
+        <form class="composer" id="ask-form" novalidate>
+          <label for="question">Your question</label>
+          <textarea id="question" name="question" rows="3" maxlength="4000" enterkeyhint="send"
+                    placeholder="For example: How many interviews were scheduled this week?"></textarea>
+          <fieldset class="modes" id="modes" hidden>
+            <legend>Answer from</legend>
+            <label><input type="radio" name="mode" value="merged" checked> Records and knowledge</label>
+            <label><input type="radio" name="mode" value="records"> Records only</label>
+            <label><input type="radio" name="mode" value="knowledge"> Knowledge only</label>
+          </fieldset>
+          <div class="composer-foot">
+            <span class="hint">Enter sends.<span class="hint-fine"> Shift+Enter adds a new line.</span></span>
+            <span class="counter" id="counter">0 / 1000</span>
+            <button class="btn" type="submit" id="ask-btn">Ask</button>
+          </div>
+        </form>
+
+        <section class="stage" id="stage" aria-busy="false">
+          <p class="empty" id="empty">Ask about Salesforce objects and fields, or about the records themselves:
+            counts, lists and who did what. One question is answered at a time, so yours may wait in line.</p>
+        </section>
+      </main>
+
+      <aside class="history" aria-labelledby="history-title">
+        <h2 id="history-title">Earlier in this session</h2>
+        <p class="none" id="history-none">Your questions will be listed here.</p>
+        <ol id="history-list"></ol>
+      </aside>
+    </div>
+  </div>
+</body>
+</html>

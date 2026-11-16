@@ -1,0 +1,18 @@
+# sf-assistant-web: the top-level pins. requirements.lock (generated from this file, see "The venv and the lock" in
+# ../docs/runbook.md) pins every package; the image and the test venv both install the lock, so both run the same
+# versions.
+# duckdb must match the version that writes the warehouse files.
+duckdb==1.5.6
+fastapi==0.148.0
+uvicorn==0.54.0
+# what ask.py / okeval / okrec import at runtime (same versions as notebooks/object_knowledge_eval/.venv).
+# rank_bm25: okeval.search quietly falls back to a different BM25 without it, which changes the knowledge
+# search results; the server refuses to start on that fallback.
+openai==3.27.0
+pandas==3.0.6
+numpy==2.4.6
+tzdata==2026.5
+rank_bm25==0.2.2
+# the MCP server (src/sf_assistant/server/app.py): the Python MCP SDK. Its dependencies were pinned at versions
+# at least two weeks old when it was added (uv pip compile ... --exclude-newer, see ../docs/runbook.md).
+mcp==2.3.0

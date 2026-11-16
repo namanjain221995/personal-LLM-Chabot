@@ -63,7 +63,9 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
   // payloads have no such key and fall back to `data`, which is exactly
   // what they always rendered.
   const chartRows = meta.chart_data?.length ? meta.chart_data : meta.data;
-  if (meta.chart && chartRows?.length) {
+  // An sf_assistant chart stands in the message itself (MessageRow), not here.
+  const chartInDrawer = !!meta.chart && !!chartRows?.length && meta.engine !== 'sf_assistant';
+  if (chartInDrawer) {
     sections.push({ id: 'chart', label: 'Chart' });
   }
   if (reportFiles.length) {
@@ -86,7 +88,7 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
   const [open, setOpen] = useState<Set<SectionId>>(
     () =>
       new Set<SectionId>(
-        meta.chart && chartRows?.length
+        chartInDrawer
           ? ['chart']
           : reportFiles.length
             ? ['files']

@@ -931,6 +931,16 @@ class Settings:
         # 2026-11-04). The guards in sf_intel still read this name, and no
         # environment value turns it back on.
         self.sf_live_enabled: bool = False
+        # The sf_assistant service (engines/sfk_bridge.py): the Unix socket in
+        # the volume compose mounts read-only, and the service's own bearer
+        # token, which only secrets.env holds. An empty token means the bridge
+        # never calls. SF_ASSISTANT_ENABLED is read by the bridge, beside the
+        # switch of the pipeline before it.
+        self.sf_assistant_socket: str = (
+            os.environ.get("SF_ASSISTANT_SOCKET", "").strip()
+            or "/run/sf-assistant-ask/ask.sock"
+        )
+        self.sf_assistant_token: str = os.environ.get("SF_ASSISTANT_TOKEN", "").strip()
         # MAIN_MODEL_MAX_LEN is the new, explicit spelling and wins when set;
         # MODEL_MAX_CONTEXT remains the historical name so existing .env files
         # keep working. Both describe the SAME number and neither WIDENS the
