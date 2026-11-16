@@ -26,16 +26,19 @@ has no ffmpeg, and a WAV of exactly that shape is decoded without one
 """
 from __future__ import annotations
 
+import contextlib
+import gc
 import hashlib
 import json
 import os
 import stat
-import threading
 import time
+import tracemalloc
 import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
+import anyio.from_thread
 import httpx
 import numpy as np
 import pytest
@@ -812,29 +815,68 @@ def test_the_rate_limits_answer_rate_limited(voice, login_client, monkeypatch):
 
 # ------------------------------------------------------- the stress case --
 
+#: How much more Python heap two hours may need at their peak than ten
+#: minutes did. Measured 2026-11-16, five runs alone: 2.6-3.2 MiB (peaks
+#: 21.8-22.6 MiB, then 24.4-25.2 MiB), most of it the twelve times longer
+#: transcript. A leak of one 8 KB slice per 5 s part (about 11 MiB over two
+#: hours) fails it; so does keeping every part (230 MB).
+HEAP_GROWTH_LIMIT = 8 * 1024 * 1024
 
-class AnonSampler:
-    """Peak RssAnon of this process above a baseline, sampled every 10 ms
-    (the method of tests/test_publicapi_audio_windows.py's two-hour test)."""
 
-    def __init__(self) -> None:
-        self.baseline = fw.rss_anon_bytes()
-        self.peak = 0
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+class PythonHeap:
+    """This process's Python heap above a baseline: every live Python object
+    and every numpy buffer (numpy reports its buffers to tracemalloc), counted
+    from when the block is entered.
 
-    def _loop(self) -> None:
-        while not self._stop.is_set():
-            self.peak = max(self.peak, fw.rss_anon_bytes() - self.baseline)
-            time.sleep(0.01)
+    Not RssAnon (the method until 2026-11-16): resident memory also counts
+    what the C allocator does with freed heap, so the same run measured
+    differently by test order. A ten-minute run that reused heap freed by
+    earlier tests in the shard peaked about 1 MiB above its baseline, and the
+    two-hour run after it was charged 20-35 MiB of fresh heap; alone it failed
+    about 2 runs in 3 at 16.1-17.4 MiB while the Python heap it needed rose
+    about 3 MiB. tracemalloc sees only allocations made inside the block, so
+    earlier tests do not move it. What it cannot see is memory C extensions
+    take with their own malloc (libpq's result buffers, webrtcvad's detector
+    state)."""
 
-    def __enter__(self) -> "AnonSampler":
-        self._thread.start()
+    def __enter__(self) -> "PythonHeap":
+        self._started = not tracemalloc.is_tracing()
+        if self._started:
+            tracemalloc.start(1)
+        gc.collect()
+        self.baseline = tracemalloc.get_traced_memory()[0]
+        tracemalloc.reset_peak()
         return self
 
+    def phase(self) -> Tuple[int, int]:
+        """(peak, held) of the phase since the last call, above the baseline:
+        the most it needed at once, and what is still alive after a collection."""
+        peak = tracemalloc.get_traced_memory()[1] - self.baseline
+        gc.collect()
+        held = tracemalloc.get_traced_memory()[0] - self.baseline
+        tracemalloc.reset_peak()
+        return peak, held
+
     def __exit__(self, *exc: object) -> None:
-        self._stop.set()
-        self._thread.join()
+        if self._started:
+            tracemalloc.stop()
+
+
+@contextlib.contextmanager
+def one_event_loop(client):
+    """Every request of `client` served on ONE event loop, as uvicorn serves
+    them. Left alone, TestClient starts a new loop per request and anyio keeps
+    every one of them alive (its per-loop RunVar map holds the loop's root
+    task, which holds the loop): 1,446 loops, about 5 KB each, 7.6 MiB in the
+    two-hour run, all of it the harness and none of it the server, whose
+    sessions run on their own thread's loop. The app's lifespan is not run,
+    as without the block."""
+    with anyio.from_thread.start_blocking_portal(**client.async_backend) as portal:
+        client.portal = portal
+        try:
+            yield client
+        finally:
+            client.portal = None
 
 
 def test_two_hours_transcribe_word_for_word_with_no_ceiling_and_flat_memory(voice, login_client):
@@ -842,21 +884,21 @@ def test_two_hours_transcribe_word_for_word_with_no_ceiling_and_flat_memory(voic
 
     Pass: every word once, in order, at its time (no word lost or doubled at
     a seam); every part answered 200 (no 413, no 504, no timeout anywhere);
-    outcome 'transcribed'; and the process's anonymous memory after two hours
-    within 16 MiB of what ten minutes needed. Nothing holds the recording in
-    memory: the parts go to disk as they arrive, the PCM is a file, and one
-    window of at most 30 s is in flight at a time.
+    outcome 'transcribed'; and the Python heap two hours need at their peak
+    within HEAP_GROWTH_LIMIT of what ten minutes needed (PythonHeap). Nothing
+    holds the recording in memory: the parts go to disk as they arrive, the
+    PCM is a file, and one window of at most 30 s is in flight at a time.
     """
     warm_script, warm_data = recording(voice.tmp, 600.0, seed=3)
     long_script, long_data = recording(voice.tmp, 7200.0, seed=7)
     assert len(long_data) == 7200 * SR * 2 + 44
     alice = login_client("alice")
     started = time.monotonic()
-    with AnonSampler() as sampler:
+    with one_event_loop(alice), PythonHeap() as heap:
         warm_sid, warm_done, _ = dictate(alice, warm_data)
-        warm_peak = sampler.peak
+        warm_peak, warm_held = heap.phase()
         sid, done, statuses = dictate(alice, long_data)
-        long_peak = sampler.peak
+        long_peak, long_held = heap.phase()
     wall_s = time.monotonic() - started
     segments = all_segments(alice, sid)
     verdict = fw.compare_to_script(as_segments(segments), long_script)
@@ -870,7 +912,8 @@ def test_two_hours_transcribe_word_for_word_with_no_ceiling_and_flat_memory(voic
         "max_start_error_s": verdict.get("max_start_error_s"), "max_end_error_s": verdict.get("max_end_error_s"),
         "windows": row["windows_total"], "longest_clip_s": max(c["seconds"] for c in voice.fake.calls),
         "stitcher": report["stitcher"], "detector": report["detector"],
-        "anon_peak_mib_10min": round(warm_peak / 2**20, 1), "anon_peak_mib_2h": round(long_peak / 2**20, 1),
+        "heap_peak_mib_10min": round(warm_peak / 2**20, 2), "heap_peak_mib_2h": round(long_peak / 2**20, 2),
+        "heap_held_mib_10min": round(warm_held / 2**20, 2), "heap_held_mib_2h": round(long_held / 2**20, 2),
         "wall_s": round(wall_s, 1),
     }))
     assert fw.compare_to_script(as_segments(all_segments(alice, warm_sid)), warm_script)["equal"]
@@ -887,7 +930,7 @@ def test_two_hours_transcribe_word_for_word_with_no_ceiling_and_flat_memory(voic
     # Every window is asked WITH the gate (round 2): speech windows pass it,
     # so two hours of speech cost no second decode.
     assert voice.gate_flags and all(voice.gate_flags), "a speech window was gated and decoded twice"
-    assert long_peak - warm_peak < 16 * 1024 * 1024, (warm_peak, long_peak)
+    assert long_peak - warm_peak < HEAP_GROWTH_LIMIT, (warm_peak, long_peak)
 
 
 # ------------------------------------------------------------ the decoder --
