@@ -1166,7 +1166,11 @@ def test_a_statement_nested_too_deep_is_refused_before_it_runs(one, monkeypatch,
     text, meta = ask("what is this?")
     assert COULD_NOT_WRITE in text
     assert "data" not in meta
-    assert "nested too deeply" in model.writer_user(1)
+    # Very deep trees can fail to load as JSON first (Python's recursion limit
+    # differs by build), which refuses with the "cannot be checked" hint. Either
+    # way the statement never runs.
+    hint = model.writer_user(1)
+    assert "nested too deeply" in hint or "cannot be checked" in hint
 
 
 def test_a_deep_read_of_a_held_column_reads_nothing(one, monkeypatch):
