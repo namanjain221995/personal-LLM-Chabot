@@ -262,3 +262,14 @@ export function trustLine(prefs: ChatPrefs): string {
     ? 'Salesforce is off and web search is on — search queries are sent to the internet.'
     : 'Salesforce is off — answers may use the web, and search queries are sent to the internet.';
 }
+
+/**
+ * The accuracy reminder under the composer, below the trust line. Owner
+ * wording (2026-11-18): Salesforce mode gets its own line because those
+ * answers are still early and can miss records or misread a filter.
+ */
+export function accuracyLine(prefs: ChatPrefs): string {
+  return prefs.salesforce
+    ? 'Salesforce answers may be incomplete or wrong. Please check important info.'
+    : 'TechSara AI can make mistakes. Check important info.';
+}
