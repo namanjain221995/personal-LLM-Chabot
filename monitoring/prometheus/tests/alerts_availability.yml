@@ -1746,3 +1746,43 @@ tests:
       - eval_time: 15m
         alertname: PrometheusRuleEvaluationFailing
         exp_alerts: []
+
+  # ============================================== WebIndexFailing
+  - interval: 1m
+    name: "WebIndexFailing fires when every pass keeps failing"
+    input_series:
+      - series: 'web_index_failures_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",path="index"}'
+        values: '0+1x120'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WebIndexFailing
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: WebIndexFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "The web index has been failing for over 30 minutes"
+              description: >-
+                Web recall is returning nothing, or new pages are not being indexed.
+                Check the orchestrator log for "web indexing failed" and "web recall
+                unavailable". Crash damage limited to empty manifests repairs itself;
+                this firing means the damage is something else. web_pages holds the
+                source text, so the index can be rebuilt from it.
+
+  - interval: 1m
+    name: "WebIndexFailing ignores one failed pass"
+    input_series:
+      - series: 'web_index_failures_total{instance="host.docker.internal:8080",job="orchestrator",node="spark-1",role="head",service="orchestrator",path="index"}'
+        values: '0x10 1x110'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: WebIndexFailing
+        exp_alerts: []
+      - eval_time: 42m
+        alertname: WebIndexFailing
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: WebIndexFailing
+        exp_alerts: []
