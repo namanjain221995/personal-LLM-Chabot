@@ -831,16 +831,6 @@ groups:
           runbook: docs/availability/RUNBOOK.md#rule-evaluation-failing
           safe_command: "curl -s http://127.0.0.1:9090/api/v1/rules | jq '.data.groups[] | select(.rules[]?.lastError != \"\") | {name, file, errors: [.rules[] | select(.lastError != \"\") | {name, lastError}]}'"
 
-  - name: containers
-    rules:
-      - alert: ContainerRestartLoop
-        expr: >-
-          changes(container_start_time_seconds{name!=""}[30m]) > 3
-        for: 5m
-        labels: { severity: warning }
-        annotations:
-          summary: "{{ $labels.name }} restarted repeatedly"
-
   - name: databases
     rules:
       - alert: PostgresDown

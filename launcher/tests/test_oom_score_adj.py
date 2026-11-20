@@ -85,11 +85,11 @@ EXPECTED_SIDE_STACK = {
     # telemetry.
     "compose.voice-store.yaml": {"voice-store": 500},
     "compose.monitoring.yaml": {
-        "grafana": 600, "cadvisor": 600, "postgres-exporter": 600,
+        "grafana": 600, "spark-probe": 600, "spark-local": 600, "postgres-exporter": 600,
         "data-stores-exporter": 600, "blackbox-exporter": 600,
         "prometheus": 500, "node-exporter": 500, "dgx-gpu-exporter": 500,
     },
-    "compose.monitoring-worker.yaml": {"node-exporter": 500, "dgx-gpu-exporter": 500},
+    "compose.monitoring-worker.yaml": {"node-exporter": 500, "dgx-gpu-exporter": 500, "spark-probe": 600, "spark-local": 600},
 }
 
 

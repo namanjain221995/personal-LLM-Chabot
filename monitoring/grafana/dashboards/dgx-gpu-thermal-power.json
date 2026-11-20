@@ -1,17 +1,22 @@
 {
   "uid": "dgx-gpu-thermal-power",
-  "title": "DGX Spark \u2014 GPU / Thermal / Power",
-  "description": "Per-Spark GPU telemetry, combined power, and throttling.",
+  "title": "GPU, thermal and power",
+  "description": "The GB10 on every Spark: what it is doing, what it draws, how hot it runs and whether it is throttling.",
   "tags": [
-    "dgx-spark"
+    "dgx-spark",
+    "fleet"
   ],
-  "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
-  "editable": true,
-  "refresh": "5s",
+  "editable": false,
+  "graphTooltip": 1,
+  "fiscalYearStartMonth": 0,
+  "liveNow": false,
+  "weekStart": "",
+  "timezone": "browser",
+  "refresh": "10s",
   "time": {
-    "from": "now-30m",
+    "from": "now-1h",
     "to": "now"
   },
   "timepicker": {
@@ -21,7 +26,8 @@
       "30s",
       "1m",
       "5m",
-      "15m"
+      "15m",
+      "1h"
     ]
   },
   "templating": {
@@ -34,14 +40,16 @@
           "type": "prometheus",
           "uid": "dgx-prometheus"
         },
+        "refresh": 2,
+        "sort": 3,
         "query": {
-          "query": "label_values(dgx_gpu_up, node)",
-          "refId": "nodes"
+          "query": "label_values(up{job=\"node\"}, node)",
+          "refId": "fleet-nodes"
         },
-        "definition": "label_values(dgx_gpu_up, node)",
+        "definition": "label_values(up{job=\"node\"}, node)",
         "includeAll": true,
-        "allValue": ".*",
         "multi": true,
+        "regex": "",
         "current": {
           "selected": true,
           "text": [
@@ -51,51 +59,784 @@
             "$__all"
           ]
         },
-        "refresh": 1,
-        "sort": 1
+        "allValue": ".*",
+        "hide": 0,
+        "options": [],
+        "skipUrlSync": false
       }
     ]
   },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "title": "Home",
+      "type": "link",
+      "url": "/d/dgx-cluster-overview",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Old pages",
+      "type": "dashboards",
+      "url": "",
+      "icon": "external link",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": true,
+      "tags": [
+        "old-pages"
+      ],
+      "tooltip": ""
+    },
+    {
+      "title": "Spark",
+      "type": "link",
+      "url": "/d/spark-node",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "GPU",
+      "type": "link",
+      "url": "/d/dgx-gpu-thermal-power",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Fabric",
+      "type": "link",
+      "url": "/d/dgx-interconnect",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Hosts",
+      "type": "link",
+      "url": "/d/fleet-hosts",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Containers",
+      "type": "link",
+      "url": "/d/dgx-host-containers",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Databases",
+      "type": "link",
+      "url": "/d/fleet-databases",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Postgres",
+      "type": "link",
+      "url": "/d/dgx-data-stores",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Engine",
+      "type": "link",
+      "url": "/d/dgx-vllm-performance",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Developer API",
+      "type": "link",
+      "url": "/d/dgx-developer-api",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Files",
+      "type": "link",
+      "url": "/d/dgx-files-gateway",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Alerts",
+      "type": "link",
+      "url": "/d/fleet-alerts",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "title": "Monitoring",
+      "type": "link",
+      "url": "/d/fleet-monitoring",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": false,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    }
+  ],
   "panels": [
     {
+      "type": "table",
+      "title": "Every GPU",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Node",
+            "desc": false
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "node",
+                "name",
+                "driver",
+                "Value #B",
+                "Value #C",
+                "Value #D",
+                "Value #E",
+                "Value #F",
+                "Value #G",
+                "Value #H",
+                "Value #I",
+                "Value #J",
+                "Value #K"
+              ]
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {
+              "node": 0,
+              "name": 1,
+              "driver": 2,
+              "Value #B": 3,
+              "Value #C": 4,
+              "Value #D": 5,
+              "Value #E": 6,
+              "Value #F": 7,
+              "Value #G": 8,
+              "Value #H": 9,
+              "Value #I": 10,
+              "Value #J": 11,
+              "Value #K": 12
+            },
+            "renameByName": {
+              "node": "Node",
+              "name": "GPU",
+              "driver": "Driver version",
+              "Value #B": "nvidia-smi",
+              "Value #C": "Busy",
+              "Value #D": "Power",
+              "Value #E": "Temp",
+              "Value #F": "Headroom",
+              "Value #G": "SM clock",
+              "Value #H": "P-state",
+              "Value #I": "GPU memory",
+              "Value #J": "Contexts",
+              "Value #K": "Throttling"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "filterable": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d8d9da",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "nvidia-smi"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#f2495c",
+                      "value": null
+                    },
+                    {
+                      "color": "#76b900",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "answering",
+                        "color": "#76b900",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "NOT ANSWERING",
+                        "color": "#f2495c",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Busy"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percent"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 70
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Power"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "watt"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Temp"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#76b900",
+                      "value": null
+                    },
+                    {
+                      "color": "#fab219",
+                      "value": 86
+                    },
+                    {
+                      "color": "#f2495c",
+                      "value": 90
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "unit",
+                "value": "celsius"
+              },
+              {
+                "id": "custom.width",
+                "value": 70
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Headroom"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "celsius"
+              },
+              {
+                "id": "custom.width",
+                "value": 92
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "SM clock"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "hertz"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "P-state"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 70
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "GPU memory"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "custom.width",
+                "value": 100
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Contexts"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Throttling"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#76b900",
+                      "value": null
+                    },
+                    {
+                      "color": "#f2495c",
+                      "value": 1
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Node"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "GPU"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Driver version"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 120
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (node, name) (dgx_gpu_power_watts{node=~\"$node\"})",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (node) (dgx_gpu_up{node=~\"$node\"})",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (node) (dgx_gpu_utilization_percent{node=~\"$node\"})",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (node) (dgx_gpu_power_watts{node=~\"$node\"})",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (node) (dgx_gpu_temperature_celsius{node=~\"$node\"})",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (node) (dgx_gpu_temperature_headroom_celsius{node=~\"$node\"})",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "F"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (node) (dgx_gpu_clock_sm_hertz{node=~\"$node\"})",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "G"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (node) (dgx_gpu_performance_state{node=~\"$node\"})",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "H"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (node) (dgx_gpu_memory_allocated_bytes{node=~\"$node\"})",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "I"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (node) (dgx_gpu_compute_processes{node=~\"$node\"})",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "J"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (node) (dgx_gpu_throttle_active{node=~\"$node\",reason!=\"sync_boost\"})",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "K"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (node, driver) (dgx_gpu_info{node=~\"$node\"})",
+          "range": false,
+          "instant": true,
+          "legendFormat": "",
+          "format": "table",
+          "refId": "L"
+        }
+      ],
+      "id": 1,
+      "gridPos": {
+        "h": 6,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": 2,
       "type": "row",
-      "title": "Per-Spark GPU",
+      "title": "Activity",
+      "collapsed": false,
+      "panels": [],
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 0
-      },
-      "collapsed": false,
-      "panels": []
+        "y": 6
+      }
     },
     {
       "type": "timeseries",
-      "title": "GPU utilisation",
-      "description": "",
+      "title": "GPU busy",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 1
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "dgx_gpu_utilization_percent{node=~\"$node\"}",
-          "refId": "A",
-          "editorMode": "code",
-          "legendFormat": "{{node}} gpu{{gpu}}",
-          "range": true
-        }
-      ],
       "options": {
         "legend": {
           "displayMode": "table",
@@ -103,597 +844,217 @@
           "showLegend": true,
           "calcs": [
             "lastNotNull",
-            "mean",
             "max"
           ]
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "desc"
+          "sort": "desc",
+          "hideZeros": false
         }
       },
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
-          "min": 0,
-          "max": 100,
-          "decimals": null,
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
             },
-            "axisPlacement": "auto"
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
           },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "#94A3B8",
+                "color": "#d8d9da",
                 "value": null
               }
             ]
-          }
+          },
+          "mappings": [],
+          "min": 0,
+          "max": 100
         },
         "overrides": [
           {
             "matcher": {
-              "id": "byName",
-              "options": "spark-1"
+              "id": "byRegexp",
+              "options": "/^spark-1( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#22D3EE"
+                  "fixedColor": "#3987e5"
                 }
               }
             ]
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "spark-2"
+              "id": "byRegexp",
+              "options": "/^spark-2( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#A78BFA"
+                  "fixedColor": "#d95926"
                 }
               }
             ]
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "Combined"
+              "id": "byRegexp",
+              "options": "/^spark-3( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#FB923C"
+                  "fixedColor": "#199e70"
                 }
               }
             ]
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "Cluster"
+              "id": "byRegexp",
+              "options": "/^spark-4( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#FB923C"
+                  "fixedColor": "#c98500"
                 }
               }
             ]
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "spark-1 TX"
+              "id": "byRegexp",
+              "options": "/^spark-5( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#22D3EE"
+                  "fixedColor": "#d55181"
                 }
               }
             ]
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "spark-2 TX"
+              "id": "byRegexp",
+              "options": "/^spark-6( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#A78BFA"
+                  "fixedColor": "#008300"
                 }
               }
             ]
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "spark-1 RX"
+              "id": "byRegexp",
+              "options": "/^spark-7( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#38BDF8"
+                  "fixedColor": "#9085e9"
                 }
               }
             ]
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "spark-2 RX"
+              "id": "byRegexp",
+              "options": "/^spark-8( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#F472B6"
+                  "fixedColor": "#e66767"
                 }
               }
             ]
           }
         ]
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Memory-controller utilisation",
-      "description": "Percent of time the memory controller was busy. This is NOT memory capacity used \u2014 the GB10 driver reports no framebuffer capacity at all. For capacity, see unified memory on the Host dashboard.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dgx-prometheus"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 1
-      },
+      "description": "The worker rank spins while it waits, so this reads high when nothing useful is happening. Read it with power.",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "dgx-prometheus"
           },
-          "expr": "dgx_gpu_memory_controller_utilization_percent{node=~\"$node\"}",
-          "refId": "A",
           "editorMode": "code",
-          "legendFormat": "{{node}} gpu{{gpu}}",
-          "range": true
-        }
-      ],
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true,
-          "calcs": []
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "min": 0,
-          "max": 100,
-          "decimals": null,
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "fillOpacity": 8,
-            "gradientMode": "opacity",
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "axisPlacement": "auto"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#94A3B8",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-1"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#22D3EE"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-2"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#A78BFA"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Combined"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#FB923C"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Cluster"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#FB923C"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-1 TX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#22D3EE"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-2 TX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#A78BFA"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-1 RX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#38BDF8"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-2 RX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#F472B6"
-                }
-              }
-            ]
-          }
-        ]
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "GPU temperature",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dgx-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 9
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "dgx_gpu_temperature_celsius{node=~\"$node\"}",
-          "refId": "A",
-          "editorMode": "code",
+          "expr": "node:gpu_utilization_percent:avg{node=~\"$node\"}",
+          "range": true,
+          "instant": false,
           "legendFormat": "{{node}}",
-          "range": true
+          "refId": "A"
         }
       ],
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true,
-          "calcs": [
-            "lastNotNull",
-            "mean",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "celsius",
-          "min": null,
-          "max": null,
-          "decimals": null,
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "fillOpacity": 8,
-            "gradientMode": "opacity",
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "axisPlacement": "auto"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#94A3B8",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-1"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#22D3EE"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-2"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#A78BFA"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Combined"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#FB923C"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Cluster"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#FB923C"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-1 TX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#22D3EE"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-2 TX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#A78BFA"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-1 RX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#38BDF8"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-2 RX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#F472B6"
-                }
-              }
-            ]
-          }
-        ]
+      "id": 3,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 7
       }
     },
     {
       "type": "timeseries",
       "title": "GPU power",
-      "description": "",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 9
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "dgx_gpu_power_watts{node=~\"$node\"}",
-          "refId": "A",
-          "editorMode": "code",
-          "legendFormat": "{{node}}",
-          "range": true
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "cluster:gpu_power_watts:sum",
-          "refId": "B",
-          "editorMode": "code",
-          "legendFormat": "Combined",
-          "range": true
-        }
-      ],
       "options": {
         "legend": {
           "displayMode": "table",
@@ -701,57 +1062,180 @@
           "showLegend": true,
           "calcs": [
             "lastNotNull",
-            "mean",
             "max"
           ]
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "desc"
+          "sort": "desc",
+          "hideZeros": false
         }
       },
       "fieldConfig": {
         "defaults": {
           "unit": "watt",
-          "min": null,
-          "max": null,
-          "decimals": null,
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
             },
-            "axisPlacement": "auto"
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
           },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "#94A3B8",
+                "color": "#d8d9da",
                 "value": null
               }
             ]
-          }
+          },
+          "mappings": [],
+          "min": 0
         },
         "overrides": [
           {
             "matcher": {
-              "id": "byName",
-              "options": "spark-1"
+              "id": "byRegexp",
+              "options": "/^spark-1( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#22D3EE"
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-2( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-3( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-4( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-5( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-6( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#008300"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-7( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-8( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e66767"
                 }
               }
             ]
@@ -759,14 +1243,14 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "spark-2"
+              "options": "all Sparks"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#A78BFA"
+                  "fixedColor": "#3987e5"
                 }
               }
             ]
@@ -774,121 +1258,19 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Combined"
+              "options": "all Sparks"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#FB923C"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Cluster"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#FB923C"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-1 TX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#22D3EE"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-2 TX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#A78BFA"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-1 RX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#38BDF8"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-2 RX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#F472B6"
+                  "fixedColor": "#8e929c"
                 }
               }
             ]
           }
         ]
-      }
-    },
-    {
-      "type": "row",
-      "title": "Combined accelerator power and energy",
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 17
-      },
-      "collapsed": false,
-      "panels": []
-    },
-    {
-      "type": "stat",
-      "title": "Combined now",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dgx-prometheus"
-      },
-      "gridPos": {
-        "h": 5,
-        "w": 4,
-        "x": 0,
-        "y": 18
       },
       "targets": [
         {
@@ -896,117 +1278,227 @@
             "type": "prometheus",
             "uid": "dgx-prometheus"
           },
+          "editorMode": "code",
+          "expr": "node:gpu_power_watts:sum{node=~\"$node\"}",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{node}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
           "expr": "cluster:gpu_power_watts:sum",
-          "refId": "A",
-          "editorMode": "code",
-          "instant": true,
-          "range": false
+          "range": true,
+          "instant": false,
+          "legendFormat": "all Sparks",
+          "refId": "B"
         }
       ],
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "orientation": "auto",
-        "textMode": "auto",
-        "colorMode": "background",
-        "graphMode": "area",
-        "justifyMode": "auto"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "watt",
-          "decimals": 1,
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#94A3B8",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      }
-    },
-    {
-      "type": "stat",
-      "title": "Combined average (range)",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dgx-prometheus"
-      },
+      "id": 4,
       "gridPos": {
-        "h": 5,
-        "w": 4,
-        "x": 4,
-        "y": 18
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "avg_over_time(cluster:gpu_power_watts:sum[$__range])",
-          "refId": "A",
-          "editorMode": "code",
-          "instant": true,
-          "range": false
-        }
-      ],
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "orientation": "auto",
-        "textMode": "auto",
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "auto"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "watt",
-          "decimals": 1,
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#94A3B8",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      }
-    },
-    {
-      "type": "stat",
-      "title": "Combined peak (range)",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dgx-prometheus"
-      },
-      "gridPos": {
-        "h": 5,
-        "w": 4,
+        "h": 8,
+        "w": 8,
         "x": 8,
-        "y": 18
+        "y": 7
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Processes using the GPU",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d8d9da",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-1( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-2( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-3( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-4( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-5( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-6( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#008300"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-7( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-8( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e66767"
+                }
+              }
+            ]
+          }
+        ]
       },
       "targets": [
         {
@@ -1014,332 +1506,655 @@
             "type": "prometheus",
             "uid": "dgx-prometheus"
           },
-          "expr": "max_over_time(cluster:gpu_power_watts:sum[$__range])",
-          "refId": "A",
           "editorMode": "code",
-          "instant": true,
-          "range": false
+          "expr": "dgx_gpu_compute_processes{node=~\"$node\"}",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{node}}",
+          "refId": "A"
         }
       ],
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "orientation": "auto",
-        "textMode": "auto",
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "auto"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "watt",
-          "decimals": 1,
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#94A3B8",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
+      "id": 5,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 7
       }
     },
     {
-      "type": "stat",
-      "title": "Accelerator energy, last 1 h",
-      "description": "Mean combined GPU watts over the last hour x 1 h. GPU rail only \u2014 not the machines' wall-socket consumption.",
+      "type": "timeseries",
+      "title": "Busy by process",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
       },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d8d9da",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Worker_TP at 95 % with low power is the rank waiting at a collective. GNOME and remote desktop sessions use the GPU too.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (node, process) (dgx_gpu_process_utilization_percent{node=~\"$node\"})",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{node}} {{process}}",
+          "refId": "A"
+        }
+      ],
+      "id": 6,
       "gridPos": {
-        "h": 5,
-        "w": 6,
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 15
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "GPU memory by owner",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
+            "fillOpacity": 40,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            },
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d8d9da",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Unified memory held by CUDA contexts, attributed through each process's cgroup.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (node, container) (spark_container_gpu_memory_bytes{node=~\"$node\"})",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{node}} {{container}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "spark_host_gpu_memory_bytes{node=~\"$node\"}",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{node}} outside containers",
+          "refId": "B"
+        }
+      ],
+      "id": 7,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
         "x": 12,
-        "y": 18
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "avg_over_time(cluster:gpu_power_watts:sum[1h]) / 1000",
-          "refId": "A",
-          "editorMode": "code",
-          "instant": true,
-          "range": false
-        }
-      ],
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "orientation": "auto",
-        "textMode": "auto",
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "auto"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "kwatth",
-          "decimals": 3,
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#94A3B8",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
+        "y": 15
       }
     },
     {
-      "type": "stat",
-      "title": "Accelerator energy, last 24 h",
-      "description": "Same caveat. Needs 24 h of history to be accurate.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dgx-prometheus"
-      },
-      "gridPos": {
-        "h": 5,
-        "w": 6,
-        "x": 18,
-        "y": 18
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "avg_over_time(cluster:gpu_power_watts:sum[24h]) * 24 / 1000",
-          "refId": "A",
-          "editorMode": "code",
-          "instant": true,
-          "range": false
-        }
-      ],
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "orientation": "auto",
-        "textMode": "auto",
-        "colorMode": "background",
-        "graphMode": "none",
-        "justifyMode": "auto"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "kwatth",
-          "decimals": 2,
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#94A3B8",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
-      }
-    },
-    {
+      "id": 8,
       "type": "row",
-      "title": "Throttling \u2014 the hardware's own explanation for a slowdown",
+      "title": "Thermal",
+      "collapsed": false,
+      "panels": [],
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
         "y": 23
-      },
-      "collapsed": false,
-      "panels": []
-    },
-    {
-      "type": "timeseries",
-      "title": "Throttle reasons active",
-      "description": "1 while the GPU is being held back for that reason.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dgx-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 33
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "dgx_gpu_throttle_active{node=~\"$node\",reason!~\"idle|app_clocks_setting|display_clock_setting\"}",
-          "refId": "A",
-          "editorMode": "code",
-          "legendFormat": "{{node}} {{reason}}",
-          "range": true
-        }
-      ],
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true,
-          "calcs": []
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "min": 0,
-          "max": 1,
-          "decimals": null,
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
-            "fillOpacity": 25,
-            "gradientMode": "opacity",
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "axisPlacement": "auto"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#94A3B8",
-                "value": null
-              }
-            ]
-          }
-        },
-        "overrides": []
       }
     },
     {
       "type": "timeseries",
-      "title": "Cumulative time throttled",
-      "description": "Fraction of wall time spent throttled for each reason.",
+      "title": "GPU temperature",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 33
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "dgx-prometheus"
-          },
-          "expr": "rate(dgx_gpu_throttle_seconds_total{node=~\"$node\"}[5m])",
-          "refId": "A",
-          "editorMode": "code",
-          "legendFormat": "{{node}} {{reason}}",
-          "range": true
-        }
-      ],
       "options": {
         "legend": {
-          "displayMode": "list",
+          "displayMode": "table",
           "placement": "bottom",
           "showLegend": true,
-          "calcs": []
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "desc"
+          "sort": "desc",
+          "hideZeros": false
         }
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit",
-          "min": null,
-          "max": null,
-          "decimals": null,
+          "unit": "celsius",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
             },
-            "axisPlacement": "auto"
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
           },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "#94A3B8",
+                "color": "#d8d9da",
                 "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 86
+              },
+              {
+                "color": "#f2495c",
+                "value": 90
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-1( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-2( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-3( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-4( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-5( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-6( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#008300"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-7( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-8( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e66767"
+                }
               }
             ]
           }
-        },
-        "overrides": []
+        ]
+      },
+      "description": "A shared SoC temperature: heavy CPU work moves it too. Slowdown at 86 °C, shutdown at 90 °C.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "node:gpu_temperature_celsius:max{node=~\"$node\"}",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{node}}",
+          "refId": "A"
+        }
+      ],
+      "id": 9,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 24
       }
     },
     {
       "type": "timeseries",
-      "title": "Clocks",
-      "description": "",
+      "title": "Headroom before throttling",
       "datasource": {
         "type": "prometheus",
         "uid": "dgx-prometheus"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 41
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
+            "fillOpacity": 8,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d8d9da",
+                "value": null
+              }
+            ]
+          },
+          "mappings": [],
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-1( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3987e5"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-2( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d95926"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-3( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#199e70"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-4( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#c98500"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-5( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#d55181"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-6( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#008300"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-7( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#9085e9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "/^spark-8( |$)/"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e66767"
+                }
+              }
+            ]
+          }
+        ]
       },
       "targets": [
         {
@@ -1347,192 +2162,215 @@
             "type": "prometheus",
             "uid": "dgx-prometheus"
           },
-          "expr": "dgx_gpu_clock_sm_hertz{node=~\"$node\"}",
-          "refId": "A",
           "editorMode": "code",
-          "legendFormat": "{{node}} SM",
-          "range": true
+          "expr": "dgx_gpu_temperature_headroom_celsius{node=~\"$node\"}",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{node}}",
+          "refId": "A"
         }
       ],
+      "id": 10,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 24
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Clock",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
       "options": {
         "legend": {
-          "displayMode": "list",
+          "displayMode": "table",
           "placement": "bottom",
           "showLegend": true,
-          "calcs": []
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "desc"
+          "sort": "desc",
+          "hideZeros": false
         }
       },
       "fieldConfig": {
         "defaults": {
           "unit": "hertz",
-          "min": null,
-          "max": null,
-          "decimals": null,
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
             },
-            "axisPlacement": "auto"
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
           },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "#94A3B8",
+                "color": "#d8d9da",
                 "value": null
               }
             ]
-          }
+          },
+          "mappings": [],
+          "min": 0
         },
         "overrides": [
           {
             "matcher": {
-              "id": "byName",
-              "options": "spark-1"
+              "id": "byRegexp",
+              "options": "/^spark-1( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#22D3EE"
+                  "fixedColor": "#3987e5"
                 }
               }
             ]
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "spark-2"
+              "id": "byRegexp",
+              "options": "/^spark-2( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#A78BFA"
+                  "fixedColor": "#d95926"
                 }
               }
             ]
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "Combined"
+              "id": "byRegexp",
+              "options": "/^spark-3( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#FB923C"
+                  "fixedColor": "#199e70"
                 }
               }
             ]
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "Cluster"
+              "id": "byRegexp",
+              "options": "/^spark-4( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#FB923C"
+                  "fixedColor": "#c98500"
                 }
               }
             ]
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "spark-1 TX"
+              "id": "byRegexp",
+              "options": "/^spark-5( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#22D3EE"
+                  "fixedColor": "#d55181"
                 }
               }
             ]
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "spark-2 TX"
+              "id": "byRegexp",
+              "options": "/^spark-6( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#A78BFA"
+                  "fixedColor": "#008300"
                 }
               }
             ]
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "spark-1 RX"
+              "id": "byRegexp",
+              "options": "/^spark-7( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#38BDF8"
+                  "fixedColor": "#9085e9"
                 }
               }
             ]
           },
           {
             "matcher": {
-              "id": "byName",
-              "options": "spark-2 RX"
+              "id": "byRegexp",
+              "options": "/^spark-8( |$)/"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
                   "mode": "fixed",
-                  "fixedColor": "#F472B6"
+                  "fixedColor": "#e66767"
                 }
               }
             ]
           }
         ]
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Performance state (lower is faster)",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "dgx-prometheus"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 41
       },
       "targets": [
         {
@@ -1540,191 +2378,500 @@
             "type": "prometheus",
             "uid": "dgx-prometheus"
           },
-          "expr": "dgx_gpu_performance_state{node=~\"$node\"}",
-          "refId": "A",
           "editorMode": "code",
+          "expr": "dgx_gpu_clock_sm_hertz{node=~\"$node\"}",
+          "range": true,
+          "instant": false,
           "legendFormat": "{{node}}",
-          "range": true
+          "refId": "A"
         }
       ],
+      "id": 11,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 24
+      }
+    },
+    {
+      "id": 12,
+      "type": "row",
+      "title": "Throttling: the hardware's own explanation for a slowdown",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      }
+    },
+    {
+      "type": "state-timeline",
+      "title": "Throttle reasons",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
       "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.85,
         "legend": {
           "displayMode": "list",
           "placement": "bottom",
-          "showLegend": true,
-          "calcs": []
+          "showLegend": false
         },
         "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+          "mode": "single",
+          "sort": "none"
         }
       },
       "fieldConfig": {
         "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "no",
+                  "color": "#2b2f36",
+                  "index": 0
+                },
+                "1": {
+                  "text": "THROTTLED",
+                  "color": "#f2495c",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#8e929c",
+                "value": null
+              }
+            ]
+          },
           "unit": "none",
-          "min": null,
-          "max": null,
-          "decimals": 0,
+          "custom": {
+            "lineWidth": 0,
+            "fillOpacity": 85,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "max by (node, reason) (dgx_gpu_throttle_active{node=~\"$node\",reason!=\"sync_boost\"})",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{node}} {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "id": 13,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 33
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Time throttled",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "lineWidth": 1.5,
             "fillOpacity": 8,
             "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "mode": "none",
               "group": "A"
             },
-            "axisPlacement": "auto"
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "barAlignment": 0,
+            "pointSize": 5,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            },
+            "axisSoftMin": 0,
+            "axisSoftMax": 1
+          },
+          "color": {
+            "mode": "palette-classic-by-name"
           },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "#94A3B8",
+                "color": "#d8d9da",
                 "value": null
               }
             ]
-          }
+          },
+          "mappings": [],
+          "min": 0
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-1"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#22D3EE"
-                }
-              }
-            ]
+        "overrides": []
+      },
+      "description": "Share of time spent throttled, by reason.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
           },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-2"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#A78BFA"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Combined"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#FB923C"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Cluster"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#FB923C"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-1 TX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#22D3EE"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-2 TX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#A78BFA"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-1 RX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#38BDF8"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "spark-2 RX"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#F472B6"
-                }
-              }
-            ]
-          }
-        ]
+          "editorMode": "code",
+          "expr": "sum by (node, reason) (rate(dgx_gpu_throttle_seconds_total{node=~\"$node\",reason!=\"sync_boost\"}[$__rate_interval]))",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{node}} {{reason}}",
+          "interval": "30s",
+          "refId": "A"
+        }
+      ],
+      "id": 14,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 33
       }
     },
     {
-      "type": "text",
-      "title": "What this hardware does not report",
+      "id": 15,
+      "type": "row",
+      "title": "Energy: GPU rail only, not wall power",
+      "collapsed": false,
+      "panels": [],
       "gridPos": {
-        "h": 8,
+        "h": 1,
         "w": 24,
         "x": 0,
-        "y": 49
+        "y": 41
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Last hour",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
       },
       "options": {
-        "mode": "markdown",
-        "content": "\nThe GB10 is an integrated Grace-Blackwell part. Its driver returns **N/A** for\n`memory.total`, `memory.used`, `memory.free`, `power.limit`, `clocks.mem`,\n`fan.speed`, memory temperature and ECC counters \u2014 so those panels do not\nexist here rather than showing zeros.\n\n* **GPU memory** \u2192 use *unified memory* on the Host dashboard. There is no\n  separate framebuffer to measure.\n* **Power headroom** \u2192 no limit is exposed, so percentage-of-cap cannot be shown.\n* **Combined power** is the sum of the two GPU rails, **not** wall-socket draw.\n\nDetails and the DCGM test that led here: `docs/MONITORING.md`.\n"
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "percentChangeColorMode": "standard"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watth",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d8d9da",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "description": "Average watts over one hour is watt-hours.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (node) (avg_over_time(dgx_gpu_power_watts{node=~\"$node\"}[1h]))",
+          "range": false,
+          "instant": true,
+          "legendFormat": "{{node}}",
+          "refId": "A"
+        }
+      ],
+      "id": 16,
+      "gridPos": {
+        "h": 3,
+        "w": 6,
+        "x": 0,
+        "y": 42
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Last 24 hours",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "percentChangeColorMode": "standard"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watth",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d8d9da",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "24 * sum by (node) (avg_over_time(dgx_gpu_power_watts{node=~\"$node\"}[24h]))",
+          "range": false,
+          "instant": true,
+          "legendFormat": "{{node}}",
+          "refId": "A"
+        }
+      ],
+      "id": 17,
+      "gridPos": {
+        "h": 3,
+        "w": 6,
+        "x": 6,
+        "y": 42
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Last 7 days",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "percentChangeColorMode": "standard"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "watth",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d8d9da",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "168 * sum by (node) (avg_over_time(dgx_gpu_power_watts{node=~\"$node\"}[7d]))",
+          "range": false,
+          "instant": true,
+          "legendFormat": "{{node}}",
+          "refId": "A"
+        }
+      ],
+      "id": 18,
+      "gridPos": {
+        "h": 3,
+        "w": 6,
+        "x": 12,
+        "y": 42
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Exporter errors 24h",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "dgx-prometheus"
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "percentChangeColorMode": "standard"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#76b900",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "description": "nvidia-smi calls that failed.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "dgx-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "sum by (node) (increase(dgx_gpu_scrape_errors_total{node=~\"$node\"}[24h]))",
+          "range": false,
+          "instant": true,
+          "legendFormat": "{{node}}",
+          "refId": "A"
+        }
+      ],
+      "id": 19,
+      "gridPos": {
+        "h": 3,
+        "w": 6,
+        "x": 18,
+        "y": 42
       }
     }
   ]

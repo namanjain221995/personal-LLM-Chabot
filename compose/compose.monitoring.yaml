@@ -38,10 +38,11 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
-      # Retention: whichever limit is hit first. 15 days of 5 s GPU/vLLM
-      # samples on this target set measures well under 10 GiB; the size cap is
-      # the backstop that keeps Prometheus from ever filling the disk.
-      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-15d}
+      # Retention: whichever limit is hit first. 15 days measured 1.8 GiB on
+      # 2026-11-05, so 30 days fits well inside the size cap, which is the
+      # backstop that keeps Prometheus from ever filling the disk. Availability
+      # panels need the longer window; old blocks cost disk, not memory.
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-30d}
       - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-20GB}
       - --web.enable-lifecycle
     volumes:
@@ -90,6 +91,11 @@ services:
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
       GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # Grafana serves /metrics with no login by default, and this container is
+      # on a public hostname: anyone could read it through the tunnel (found
+      # 2026-11-05, HTTP 200 from outside). Nothing scrapes it; liveness comes
+      # from the blackbox probe of /api/health.
+      GF_METRICS_ENABLED: "false"
       # PUBLIC HOSTNAME. Behind the Cloudflare Tunnel the browser's address is
       # grafana.techsarasolutions.com, but Grafana only knows it is listening
       # on :3000 -- so every absolute URL it builds (share links, alert links,
@@ -159,6 +165,12 @@ services:
       - --web.listen-address=${MONITORING_NODE_BIND:-172.17.0.1}:9100
       - --collector.netdev
       - --collector.netclass
+      # 62 of this host's 70 interfaces are Docker veths and bridges, at about
+      # 45 series each: half of everything this exporter published, and no
+      # panel or rule reads one of them. Per-container traffic comes from
+      # spark-probe instead.
+      - --collector.netdev.device-exclude=^(veth.*|br-.*|docker.*)$$
+      - --collector.netclass.ignored-devices=^(veth.*|br-.*|docker.*)$$
       # The infiniband collector is what actually measures the RoCE fabric.
       # It is ON BY DEFAULT and must stay on: RoCE/RDMA traffic is INVISIBLE
       # to netdev counters. Measured during one 300-token generation, the IB
@@ -170,12 +182,33 @@ services:
       - --no-collector.zfs
       - --no-collector.xfs
       - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+|snap/.+)($$|/)
+      # Where spark-probe and spark-local leave their files.
+      - --collector.textfile.directory=/textfile
+      - --collector.processes
+      # Every service, so that any of them failing is seen by name. Prometheus
+      # keeps only the failed state for most of them (prometheus.yml, job node).
+      # Not node_systemd_units: that also counts scopes, and a logged-out session
+      # left a harmless failed scope on Spark 2 for hours (2026-11-05).
+      - --collector.systemd
+      - --collector.systemd.unit-include=.+\.service
     network_mode: host
     pid: host
+    # D-Bus is how the systemd collector asks about units, and Docker's default
+    # AppArmor profile refuses that ("An AppArmor policy prevents this sender").
+    # The exporter runs as nobody and needs no capability, so everything else
+    # is taken away in exchange for leaving the profile off.
+    security_opt:
+      - apparmor:unconfined
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /:/host:ro,rslave
+      - /run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:ro
+      - spark-textfile:/textfile:ro
     restart: unless-stopped
     # OOM order: see prometheus above (OPERATIONS.md section 14).
     oom_score_adj: 500
@@ -221,47 +254,105 @@ services:
     deploy: *nvidia-devices
     logging: *monitoring-logging
 
-  # --- Container telemetry -----------------------------------------------
-  # v0.52.1, not the older v0.49.1: this Docker daemon requires API >= 1.44
-  # and 0.49 speaks 1.41, so its Docker factory refused to register and every
-  # metric came back with id="/" and no container name. Forcing
-  # DOCKER_API_VERSION does not help - the version is compiled in.
+  # --- Containers, databases, kernel events, RoCE counters -----------------
+  # Replaced cAdvisor (2026-11-05), which ran on this node only, used 77 MiB and
+  # held the Docker socket: root-equivalent however the bind was marked (audit
+  # F057). This reads Docker's state files and the cgroup tree instead, runs on
+  # every Spark, and has no way to change anything.
   #
-  # /var/run is mounted for the daemon socket, which is what supplies container
-  # NAMES, the minimum for the "which container is restarting?" question to be
-  # answerable. THE `:ro` DOES NOT MAKE THE DOCKER API READ-ONLY, and this
-  # comment used to imply it did: a read-only bind forbids writes to the
-  # directory, not connect() on a unix socket, and cadvisor runs as uid 0, so
-  # anything executing inside it can create a privileged container and mount
-  # the host root (developer-platform audit F057, 2026-09-13). Narrowing the
-  # bind to /var/run/docker.sock:ro removes no privilege either. That is an
-  # ACCEPTED, root-equivalent risk, bounded by: the image is digest-pinned,
-  # the container publishes no port, and container labels are not stored.
-  # The real fix is a read-only docker-socket-proxy sidecar (GET /containers,
-  # /info, /version only) with cadvisor pointed at it via --docker=tcp://...,
-  # verified against the container dashboards before it replaces this mount.
-  cadvisor:
-    image: gcr.io/cadvisor/cadvisor@sha256:f40e65878e25c2e78ea037f73a449527a0fb994e303dc3e34cb6b187b4b91435
+  # IT OPENS NO PORT. It writes a file that node-exporter publishes, so it adds
+  # nothing to the host guard and nothing on the LAN can reach it. Host network
+  # and host PID are for reading: a database on any Compose network can be
+  # dialled, and /proc supplies network counters and PostgreSQL's process titles.
+  #
+  # SYSLOG, to read the kernel log, is its only capability. It runs as root only to
+  # read root-owned state files. It deliberately lacks DAC_READ_SEARCH: with Docker's
+  # default seccomp profile that also unlocks open_by_handle_at, which reads any file
+  # on the host's disk, and this is the container that talks to other programs.
+  # Measuring database volumes needs that capability, so spark-local does it. Its
+  # volumes are read-only except the textfile tmpfs.
+  # See monitoring/exporters/spark-probe/spark_probe.py.
+  spark-probe:
+    image: python@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
     profiles: [monitoring]
-    command:
-      - --housekeeping_interval=10s
-      - --docker_only=true
-      - --store_container_labels=false
-      - --disable_metrics=advtcp,cpu_topology,cpuset,hugetlb,memory_numa,percpu,process,referenced_memory,resctrl,sched,tcp,udp
-    privileged: false
-    volumes:
-      - /:/rootfs:ro
-      - /var/run:/var/run:ro
-      - /sys:/sys:ro
-      - /var/lib/docker:/var/lib/docker:ro
-      - /dev/disk:/dev/disk:ro
+    command: ["python", "-u", "/app/spark_probe.py"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      SPARK_PROBE_GPU_URL: http://127.0.0.1:9835/metrics
+      # Which Compose projects' databases the probe may log in to, using the
+      # password in that container's own environment, to read statistics. `*`
+      # means every project. Liveness, version, connections and size need no
+      # login, so this only decides how deep the numbers go.
+      SPARK_PROBE_DEEP_DB_PROJECTS: ${MONITORING_DB_LOGIN_PROJECTS:-sf-local-ai}
+    network_mode: host
+    pid: host
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYSLOG
+    security_opt:
+      - no-new-privileges:true
     devices:
       - /dev/kmsg:/dev/kmsg:r
-    networks:
-      - application
+    volumes:
+      - ./monitoring/exporters/spark-probe/spark_probe.py:/app/spark_probe.py:ro
+      - /etc/dgx-release:/host/dgx-release:ro
+      - /var/lib/docker/containers:/host/docker/containers:ro
+      - /sys/fs/cgroup:/host/cgroup:ro
+      # What fleet discovery knows, so a Spark waiting for enrolment is visible.
+      - ./.runtime/fleet:/fleet:ro
+      - spark-textfile:/textfile
     restart: unless-stopped
     # OOM order: see prometheus above (OPERATIONS.md section 14).
     oom_score_adj: 600
+    cpus: 0.5
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(time.time()-os.path.getmtime('/textfile/spark_probe.prom')>90)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *monitoring-logging
+
+  # --- NVMe wear and power-loss count; Docker health; database sizes --------
+  # Reading the drive's health log needs CAP_SYS_ADMIN, Docker's health verdicts
+  # need the socket, and walking database volumes needs DAC_READ_SEARCH; each is as
+  # good as root. So this container has NO NETWORK and a read-only root filesystem:
+  # nothing can reach it, and the files it writes are all it can affect. It only
+  # sends GET requests. cAdvisor held the same socket while serving HTTP (audit F057).
+  spark-local:
+    image: python@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+    profiles: [monitoring]
+    command: ["python", "-u", "/app/spark_local.py"]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
+    devices:
+      - /dev/nvme0:/dev/nvme0:r
+    volumes:
+      - ./monitoring/exporters/spark-probe/spark_local.py:/app/spark_local.py:ro
+      # Not ":ro": that would not stop it being used, only imply that it does.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/host/docker/volumes:ro
+      - spark-textfile:/textfile
+    restart: unless-stopped
+    # OOM order: see prometheus above (OPERATIONS.md section 14).
+    oom_score_adj: 600
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(time.time()-os.path.getmtime('/textfile/spark_health.prom')>90)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     logging: *monitoring-logging
 
   # --- PostgreSQL: the application database ------------------------------
@@ -379,3 +470,12 @@ volumes:
     name: sf-local-ai_prometheus
   grafana-data:
     name: sf-local-ai_grafana
+  # In memory on purpose: these files are rewritten every 15 s, and they say
+  # nothing worth keeping across a reboot.
+  spark-textfile:
+    name: sf-local-ai_spark_textfile
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=16m,mode=0755

@@ -135,7 +135,8 @@ class MonitoringComposeTests(unittest.TestCase):
             "grafana",
             "node-exporter",
             "dgx-gpu-exporter",
-            "cadvisor",
+            "spark-probe",
+            "spark-local",
             "blackbox-exporter",
             "postgres-exporter",
             "data-stores-exporter",
@@ -153,7 +154,8 @@ class MonitoringComposeTests(unittest.TestCase):
             "grafana",
             "node-exporter",
             "dgx-gpu-exporter",
-            "cadvisor",
+            "spark-probe",
+            "spark-local",
             "blackbox-exporter",
             "postgres-exporter",
             "data-stores-exporter",
@@ -289,7 +291,7 @@ class MonitoringComposeTests(unittest.TestCase):
     def test_worker_overlay_renders_standalone(self):
         cfg = _render([WORKER_OVERLAY], profile=None)
         self.assertEqual(
-            sorted(cfg["services"]), ["dgx-gpu-exporter", "node-exporter"]
+            sorted(cfg["services"]), ["dgx-gpu-exporter", "node-exporter", "spark-local", "spark-probe"]
         )
 
     def test_images_are_digest_pinned(self):
@@ -315,9 +317,35 @@ class PrometheusConfigTests(unittest.TestCase):
         self.recording = (MONITORING / "prometheus" / "rules" / "recording.yml").read_text()
         self.alerts = (MONITORING / "prometheus" / "rules" / "alerts.yml").read_text()
 
-    def test_both_sparks_are_scraped_for_gpu_and_host(self):
-        for job_marker in ("node: spark-1", "node: spark-2"):
-            self.assertIn(job_marker, self.prom)
+    def test_the_head_is_scraped_directly_and_every_other_spark_is_discovered(self):
+        # A target list naming spark-2 would be one more place to edit for spark-3.
+        self.assertIn("node: spark-1", self.prom)
+        self.assertNotIn("192.168.9.68", _uncommented(self.prom))
+        self.assertNotIn("node: spark-2", _uncommented(self.prom))
+        self.assertIn('/etc/prometheus/targets/sparks-node.json', self.prom)
+        self.assertIn('/etc/prometheus/targets/sparks-gpu.json', self.prom)
+
+    def test_a_scrape_cannot_grow_the_heads_memory_without_limit(self):
+        # Discovery trusts mDNS, so what any one machine can cost must be bounded.
+        for job in ("job_name: dgx-gpu", "job_name: node"):
+            section = _uncommented(self.prom).split(job, 1)[1].split("job_name:", 1)[0]
+            self.assertIn("sample_limit:", section, job)
+
+    def test_a_failed_service_is_seen_by_name_without_keeping_five_series_for_each(self):
+        section = _uncommented(self.prom).split("job_name: node", 1)[1].split("job_name:", 1)[0]
+        self.assertIn('node_systemd_unit_state;(activating|deactivating|inactive)', section)
+        self.assertIn('node_systemd_unit_state;active;', section)
+        self.assertIn("techsara-.*", section)
+
+    def test_a_scrape_is_bounded_in_size_and_labels_too(self):
+        for job in ("job_name: dgx-gpu", "job_name: node"):
+            section = _uncommented(self.prom).split(job, 1)[1].split("job_name:", 1)[0]
+            for limit in ("body_size_limit:", "label_limit:", "label_name_length_limit:", "label_value_length_limit:", "target_limit:", "follow_redirects: false"):
+                self.assertIn(limit, section, f"{job}: {limit}")
+
+    def test_there_is_still_no_notifier(self):
+        # The owner decided against alert mail on 2026-09-15.
+        self.assertNotIn("alerting:", _uncommented(self.prom))
 
     def test_scraping_never_uses_the_roce_subnets(self):
         # Monitoring must not share the fabric it measures.
@@ -527,6 +555,105 @@ class ExporterTests(unittest.TestCase):
             self.assertNotIn(forbidden, source)
 
 
+class SparkProbeDeploymentTests(unittest.TestCase):
+    """What the two new containers may do. Their privileges are the design."""
+
+    def services(self):
+        return (
+            _render([REPO_ROOT / "compose.yaml", HEAD_OVERLAY], env={"GRAFANA_ADMIN_PASSWORD": "test-only"})["services"],
+            _render([WORKER_OVERLAY], profile=None)["services"],
+        )
+
+    @unittest.skipUnless(HAVE_COMPOSE, "docker compose unavailable")
+    def test_neither_container_opens_a_port_or_can_write_to_its_root(self):
+        for services in self.services():
+            for name in ("spark-probe", "spark-local"):
+                svc = services[name]
+                self.assertFalse(svc.get("ports"), name)
+                self.assertTrue(svc.get("read_only"), name)
+                self.assertEqual(svc.get("cap_drop"), ["ALL"], name)
+                self.assertIn("no-new-privileges:true", svc.get("security_opt", []), name)
+                self.assertEqual(svc.get("restart"), "unless-stopped", name)
+
+    @unittest.skipUnless(HAVE_COMPOSE, "docker compose unavailable")
+    def test_the_container_with_root_equivalent_access_has_no_network(self):
+        for services in self.services():
+            svc = services["spark-local"]
+            self.assertEqual(svc.get("network_mode"), "none")
+            self.assertEqual(sorted(svc.get("cap_add")), ["DAC_READ_SEARCH", "SYS_ADMIN"])
+
+    @unittest.skipUnless(HAVE_COMPOSE, "docker compose unavailable")
+    def test_the_container_on_the_network_has_neither_the_socket_nor_sys_admin(self):
+        for services in self.services():
+            svc = services["spark-probe"]
+            # Not DAC_READ_SEARCH: under Docker's default seccomp profile that also unlocks
+            # open_by_handle_at, which reads any file on the host. Security review, 2026-11-05.
+            self.assertEqual(svc.get("cap_add"), ["SYSLOG"])
+            self.assertEqual(svc.get("network_mode"), "host")
+            sources = [v.get("source", "") for v in svc.get("volumes", [])]
+            self.assertFalse([s for s in sources if "docker.sock" in s], "spark-probe must not hold the Docker socket")
+            self.assertFalse([s for s in sources if s.endswith("/volumes")], "spark-probe must not read database volumes")
+
+    @unittest.skipUnless(HAVE_COMPOSE, "docker compose unavailable")
+    def test_only_spark_local_holds_the_docker_socket(self):
+        # cAdvisor held it while serving HTTP (audit F057). Nothing on a network may.
+        for services in self.services():
+            holders = sorted(
+                name for name, svc in services.items()
+                if svc.get("profiles", ["monitoring"]) == ["monitoring"] or "profiles" not in svc
+                for v in svc.get("volumes", [])
+                if "docker.sock" in (v.get("source") or "") and name in {
+                    "prometheus", "grafana", "node-exporter", "dgx-gpu-exporter", "spark-probe", "spark-local",
+                    "blackbox-exporter", "postgres-exporter", "data-stores-exporter",
+                }
+            )
+            self.assertEqual(holders, ["spark-local"])
+
+    @unittest.skipUnless(HAVE_COMPOSE, "docker compose unavailable")
+    def test_cadvisor_is_gone(self):
+        for services in self.services():
+            self.assertNotIn("cadvisor", services)
+
+    @unittest.skipUnless(HAVE_COMPOSE, "docker compose unavailable")
+    def test_node_exporter_publishes_their_files_and_has_given_up_its_capabilities(self):
+        for services in self.services():
+            svc = services["node-exporter"]
+            self.assertIn("--collector.textfile.directory=/textfile", svc["command"])
+            self.assertTrue(svc.get("read_only"))
+            self.assertEqual(svc.get("cap_drop"), ["ALL"])
+
+    @unittest.skipUnless(HAVE_COMPOSE, "docker compose unavailable")
+    def test_docker_bridges_do_not_cost_series(self):
+        # 62 of the head's 70 interfaces were veths and bridges, half of all series.
+        for services in self.services():
+            command = " ".join(services["node-exporter"]["command"])
+            self.assertIn("--collector.netdev.device-exclude=^(veth.*|br-.*|docker.*)", command)
+            self.assertIn("--collector.netclass.ignored-devices=^(veth.*|br-.*|docker.*)", command)
+
+    @unittest.skipUnless(HAVE_COMPOSE, "docker compose unavailable")
+    def test_grafana_does_not_publish_its_own_metrics_to_the_internet(self):
+        # It sits on a public hostname, and /metrics needs no login by default.
+        head, _worker = self.services()
+        self.assertEqual(head["grafana"]["environment"]["GF_METRICS_ENABLED"], "false")
+
+    @unittest.skipUnless(HAVE_COMPOSE, "docker compose unavailable")
+    def test_logging_in_to_other_projects_databases_is_opt_in(self):
+        for services in self.services():
+            self.assertEqual(services["spark-probe"]["environment"]["SPARK_PROBE_DEEP_DB_PROJECTS"], "sf-local-ai")
+
+    def test_the_images_that_hold_privileges_are_pinned(self):
+        # The other Python containers run on the floating tag; these two hold more.
+        for overlay in (HEAD_OVERLAY, WORKER_OVERLAY):
+            text = _uncommented(overlay.read_text())
+            for name in ("spark-probe:", "spark-local:"):
+                image = text.split(f"  {name}", 1)[1].split("image:", 1)[1].split("\n", 1)[0].strip()
+                self.assertIn("@sha256:", image, name)
+
+    def test_the_kernel_log_is_only_read(self):
+        for overlay in (HEAD_OVERLAY, WORKER_OVERLAY):
+            self.assertIn("- /dev/kmsg:/dev/kmsg:r\n", overlay.read_text())
+
+
 class ScriptTests(unittest.TestCase):
     def test_monitoring_script_is_executable_and_parses(self):
         script = REPO_ROOT / "scripts" / "monitoring.sh"
@@ -548,6 +675,22 @@ class ScriptTests(unittest.TestCase):
             "compose/compose.monitoring.yaml",
         ):
             self.assertIn(overlay, text)
+
+    def test_monitoring_script_starts_the_new_services_and_retires_cadvisor(self):
+        text = (REPO_ROOT / "scripts" / "monitoring.sh").read_text()
+        self.assertIn("spark-probe spark-local", text)
+        self.assertNotIn("cadvisor blackbox-exporter", text)
+        self.assertIn("retire_cadvisor", text)
+        # --remove-orphans would also take cloudflared, which is outside this chain.
+        for line in text.splitlines():
+            if not line.lstrip().startswith("#"):
+                self.assertNotIn("--remove-orphans", line)
+
+    def test_monitoring_script_renders_targets_before_anything_starts(self):
+        text = (REPO_ROOT / "scripts" / "monitoring.sh").read_text()
+        up = text.split("  up)\n", 1)[1]
+        self.assertLess(up.index("fleet render"), up.index("head_monitoring_compose up"))
+        self.assertLess(up.index("head_monitoring_compose up"), up.index("fleet sync"))
 
     def test_monitoring_script_never_prints_the_password(self):
         text = (REPO_ROOT / "scripts" / "monitoring.sh").read_text()

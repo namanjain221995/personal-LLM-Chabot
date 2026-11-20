@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Grafana + Prometheus observability for the two-node DGX Spark cluster.
+# Grafana + Prometheus observability for the DGX Spark fleet.
 #
-#   scripts/monitoring.sh up       start Grafana/Prometheus here and the two
-#                                  exporters on Spark 2
+#   scripts/monitoring.sh up       start Grafana/Prometheus here and the exporters
+#                                  on every known Spark, and turn discovery on
 #   scripts/monitoring.sh down     stop and remove (keeps the metric history)
 #   scripts/monitoring.sh stop     stop without removing
 #   scripts/monitoring.sh status   containers + Prometheus target health
 #   scripts/monitoring.sh logs     follow logs (add a service name to filter)
 #   scripts/monitoring.sh restart  restart the head stack
-#   scripts/monitoring.sh verify   prove both Sparks are actually reporting
+#   scripts/monitoring.sh verify   prove every Spark is actually reporting
 #   scripts/monitoring.sh url      print the Grafana URL and how to log in
+#   scripts/monitoring.sh fleet [list|discover|add TARGET|forget NODE|enroll NODE]
+#                                  which Sparks exist (see scripts/lib/fleet.py)
 #
 # Nothing here touches the LLM. The monitoring profile is not a dependency of
 # any inference service, so `down` leaves vLLM, the orchestrator and the
@@ -92,20 +94,19 @@ worker_monitoring_compose() {
     -f compose.monitoring-worker.yaml $*"
 }
 
-sync_worker_monitoring() {
-  local bind="$1"
-  log_info "syncing monitoring files to $CLUSTER_WORKER_SSH"
-  ssh_worker "mkdir -p $WORKER_REMOTE_DIR"
-  # scp, not rsync: two small files, and rsync is not guaranteed on the worker.
-  local remote_dir
-  remote_dir="$(ssh_worker "echo $WORKER_REMOTE_DIR")"
-  # shellcheck disable=SC2086  # the ssh options are a word list on purpose
-  scp -q -o BatchMode=yes ${CLUSTER_WORKER_SSH_OPTS:-} \
-    "$ROOT/compose/compose.monitoring-worker.yaml" \
-    "$ROOT/monitoring/exporters/dgx-gpu/dgx_gpu_exporter.py" \
-    "$CLUSTER_WORKER_SSH:$remote_dir/" \
-    || die "could not copy monitoring files to the worker"
-  check_pass "worker files synced (bind $bind)"
+fleet() { python3 "$ROOT/scripts/lib/fleet.py" "$@"; }
+
+# The Sparks this head knows about, apart from itself: `name address ssh` lines.
+fleet_nodes() {
+  fleet list | awk 'NR>1 && $1 ~ /^spark-/ && $1 != "spark-1" {print $1}'
+}
+
+# cAdvisor is gone from compose.monitoring.yaml, so Compose can no longer name
+# it, and `up --remove-orphans` is not an option here: it would also take
+# cloudflared, which lives in a file outside this chain. The container is
+# removed by its own name, and only that one.
+retire_cadvisor() {
+  docker rm -f "${MONITORING_PROJECT}-cadvisor-1" >/dev/null 2>&1 || true
 }
 
 prom_query() { # prom_query <promql> -> raw JSON
@@ -132,28 +133,29 @@ case "$action" in
     ensure_grafana_password
     log_info "starting Grafana + Prometheus on this node"
     write_ocr_scrape_target
+    # Before Prometheus starts, so its target files exist, and before spark-probe
+    # starts, because a missing bind source would be created as root and then
+    # discovery, which runs as this user, could not write to it.
+    fleet render
     # Named services only: a bare `up -d` would reconcile every service in the
     # project, restarting the LLM stack for a monitoring change.
     head_monitoring_compose up -d --no-deps \
-      prometheus grafana node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
+      prometheus grafana node-exporter dgx-gpu-exporter spark-probe spark-local blackbox-exporter \
       postgres-exporter data-stores-exporter "$@"
-    if is_dual_mode; then
-      bind="$(worker_mgmt_ip)"
-      [ -n "$bind" ] || die "could not determine the worker's management IP (set MONITORING_WORKER_BIND)"
-      sync_worker_monitoring "$bind"
-      log_info "starting exporters on the worker ($bind)"
-      worker_monitoring_compose "$bind" up -d
-    else
-      log_info "cluster is single-node; skipping the worker exporters"
-    fi
+    retire_cadvisor
+    # Every other Spark, each on its own: one being away must not stop the rest.
+    log_info "starting exporters on the other Sparks"
+    fleet sync || log_info "some Sparks were not updated; see above. ./scripts/monitoring.sh fleet list"
+    fleet install-timer || log_info "discovery timer not installed; ./scripts/monitoring.sh fleet discover runs one pass by hand"
     "$0" url
     ;;
   down)
+    fleet uninstall-timer || true
     head_monitoring_compose stop \
-      prometheus grafana node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
+      prometheus grafana node-exporter dgx-gpu-exporter spark-probe spark-local blackbox-exporter \
       postgres-exporter data-stores-exporter
     head_monitoring_compose rm -f \
-      prometheus grafana node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
+      prometheus grafana node-exporter dgx-gpu-exporter spark-probe spark-local blackbox-exporter \
       postgres-exporter data-stores-exporter "$@"
     if is_dual_mode; then
       worker_monitoring_compose "$(worker_mgmt_ip)" down || true
@@ -162,15 +164,18 @@ case "$action" in
     ;;
   stop)
     head_monitoring_compose stop \
-      prometheus grafana node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
+      prometheus grafana node-exporter dgx-gpu-exporter spark-probe spark-local blackbox-exporter \
       postgres-exporter data-stores-exporter "$@"
     # Best effort on the worker: a stop must never fail because Node 2 is away.
     if is_dual_mode; then worker_monitoring_compose "$(worker_mgmt_ip)" stop || true; fi
     ;;
   restart)
     head_monitoring_compose restart \
-      prometheus grafana node-exporter dgx-gpu-exporter cadvisor blackbox-exporter \
+      prometheus grafana node-exporter dgx-gpu-exporter spark-probe spark-local blackbox-exporter \
       postgres-exporter data-stores-exporter "$@"
+    ;;
+  fleet)
+    fleet "${@:-list}"
     ;;
   logs)
     head_monitoring_compose logs --no-color -f "$@"
@@ -203,15 +208,19 @@ for t in sorted(ts, key=lambda x: (x["labels"].get("job", ""), x["labels"].get("
     ;;
   verify)
     # Proof, not vibes: query Prometheus for one value per Spark.
-    echo "== both Sparks reporting? =="
-    for node in spark-1 spark-2; do
-      printf '  %-8s GPU %5s C  %6s W  %5s %% util   mem %5s %%  RoCE tx %10s B/s\n' \
+    echo "== every Spark reporting? =="
+    fleet list | sed 's/^/  /'
+    echo
+    for node in spark-1 $(fleet_nodes); do
+      printf '  %-8s GPU %5s C  %6s W  %5s %% util   mem %5s %%  RoCE tx %10s B/s   containers %4s   databases %3s\n' \
         "$node" \
         "$(prom_scalar "dgx_gpu_temperature_celsius{node=\"$node\"}")" \
         "$(prom_scalar "dgx_gpu_power_watts{node=\"$node\"}")" \
         "$(prom_scalar "dgx_gpu_utilization_percent{node=\"$node\"}")" \
         "$(prom_scalar "node:memory_used_percent:current{node=\"$node\"}")" \
-        "$(prom_scalar "node:roce_transmit_bytes_per_second:sum{node=\"$node\"}")"
+        "$(prom_scalar "node:roce_transmit_bytes_per_second:sum{node=\"$node\"}")" \
+        "$(prom_scalar "spark_containers{node=\"$node\",status=\"running\"}")" \
+        "$(prom_scalar "spark_db_instances{node=\"$node\"}")"
     done
     echo
     echo "== cluster aggregates =="
@@ -276,6 +285,6 @@ for s in r:
     echo "    grep '^GRAFANA_ADMIN_PASSWORD=' .runtime/secrets.env | cut -d= -f2-"
     ;;
   *)
-    die "usage: $0 up|down|stop|restart|status|logs|verify|url"
+    die "usage: $0 up|down|stop|restart|status|logs|verify|url|fleet"
     ;;
 esac

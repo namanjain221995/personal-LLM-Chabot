@@ -1,5 +1,47 @@
 # Changelog
 
+## Fleet monitoring: any number of Sparks, every container and database, generated dashboards (2026-11-05)
+
+The Grafana stack named two Sparks in 37 places on its home page, saw containers on one
+of them, and knew about one database of the sixteen in use. Nothing showed that Spark 2
+had rebooted, that the head had 80 % of its swap in use, or how worn the SSDs were.
+
+- **New Sparks join by themselves.** `scripts/lib/fleet.py` finds them over mDNS on the
+  management LAN, once a minute from a systemd user timer. If this head's SSH key is
+  accepted their exporters start with no further action; if not, they show as
+  `needs_ssh_key` with the one command that fixes it. mDNS is only a hint: nothing becomes
+  a target without proof over SSH, and an enrolled Spark's address only changes when that
+  machine itself confirms it. A Spark that dies stays listed as DOWN, and its name survives
+  a DHCP move. Installing the host packet filter on a third Spark is still a manual step,
+  and `HostGuardNotInstalled` says so.
+- **Every dashboard is built from labels.** `monitoring/grafana/generate_dashboards.py`
+  writes nine of them, with a new home page, one page for everything about a Spark, and
+  new pages for hosts side by side, databases, alerts with availability, and monitoring
+  itself. Old addresses keep working, and every page from before is one click from Home,
+  under "Old pages". A test fails if the committed JSON is stale.
+- **`spark-probe`, on every Spark, replaces cAdvisor.** It reads Docker's state files and
+  the cgroup tree and opens no port. Containers on Spark 2 are visible for the first
+  time, and the Docker socket is off the network: only `spark-local` holds it, with no
+  network interface at all.
+- **Databases are detected.** Any known engine in a container or on the host appears with
+  no configuration: up or down through its own protocol, version, connections by state,
+  CPU, memory and size on disk, none of which needs a login. Deeper statistics need one
+  and are opt-in per project (`MONITORING_DB_LOGIN_PROJECTS`, default `sf-local-ai`). For
+  any other project the password is discarded while parsing and never held.
+- **Also new:** NVMe wear and power-loss counts, GPU Xid errors, OOM kills and other kernel
+  faults, RoCE retransmits and congestion from the NIC, GPU memory by container, per-process
+  GPU busy, systemd units, 54 new alerts with promtool tests (no notifier, as before), and a
+  single fleet verdict at the top of the home page.
+- **Fixed.** `https://grafana.techsarasolutions.com/metrics` answered with no login; Grafana's
+  own metrics are now off. The engine timeline drew READY and BUSY in one colour. The Last
+  failure tile looked like a current problem after recovery. GPU busy was coloured as if
+  95 % meant load, when the worker rank reads that while waiting.
+- **Retention** goes from 15 to 30 days. Series on the `node` job go down, because Docker's
+  veths and bridges are no longer collected.
+
+To roll out: `./scripts/monitoring.sh up`, then `./scripts/monitoring.sh restart`. Neither
+touches the model. See docs/MONITORING.md.
+
 ## `/v1` JSON mode: `response_format` and `text.format` constrain the answer to JSON (2026-10-27)
 
 A tenant moving from the raw vLLM port to the public API found that
