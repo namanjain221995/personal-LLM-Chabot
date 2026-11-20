@@ -46,7 +46,7 @@ import { formatBytes } from '@/lib/format';
 import { MEDIA_ACCEPT, mediaKindFor } from '@/lib/attachments';
 import { imageExtFromMime } from '@/lib/pasted';
 import type { SelectedContext } from '@/lib/types';
-import { activateComposerMenuItem, trustLine } from '@/lib/composerMenu';
+import { accuracyLine, activateComposerMenuItem, trustLine } from '@/lib/composerMenu';
 import { AttachMenu } from './AttachMenu';
 import { VoiceBar, VoiceFollowUpLine } from './VoiceBar';
 import { useVoiceRecorder } from './useVoiceRecorder';
@@ -1584,6 +1584,14 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(
                 leaves this machine" would be untrue. The wording lives in
                 lib/composerMenu.ts so it is unit-tested. */}
             {trustLine(prefs)}
+          </p>
+          {/* The accuracy reminder (owner 2026-11-18). Its own line, so the
+              privacy promise above keeps its wording and its colour. */}
+          <p
+            data-testid="accuracy-line"
+            className="mt-0.5 text-center text-xs text-faint"
+          >
+            {accuracyLine(prefs)}
           </p>
         </div>
       </div>
