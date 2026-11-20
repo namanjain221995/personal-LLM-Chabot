@@ -107,6 +107,11 @@ Images are sent as \`data:\` URLs only, never as links; the rules and limits
 are on [images and OCR](/docs/images). \`instructions\`, when you send it,
 becomes the first system message, ahead of anything in \`input\`.
 
+With [tools](/docs/tools), \`input\` may also hold the model's earlier calls
+to your functions — \`{"type": "function_call", "call_id", "name",
+"arguments"}\`, as a response returned them — each followed by your result,
+\`{"type": "function_call_output", "call_id", "output"}\`.
+
 The API is stateless: it remembers nothing between requests. A conversation
 is whatever you send in \`input\`.
 `;
@@ -114,10 +119,10 @@ const S_A_PARAMETER_WE_CANNOT_HONOUR_IS_REJECTED = `
 ### A parameter we cannot honour is rejected
 
 This is the rule most likely to surprise you, and it is deliberate. Unknown
-and unsupported fields — \`top_p\`, \`n\`, \`seed\`, \`logit_bias\`, \`tools\`,
-\`tool_choice\` and the rest — produce a \`400\` naming the field, rather than
-an answer that ignored the knob you were relying on. (JSON output is
-\`text.format\`, below — honoured, not hinted.)
+and unsupported fields — \`top_p\`, \`n\`, \`seed\`, \`logit_bias\` and the
+rest — produce a \`400\` naming the field, rather than an answer that ignored
+the knob you were relying on. (JSON output is \`text.format\`, below, and tool
+calling is \`tools\` — both honoured, not hinted.)
 
 ~~~json
 {
@@ -282,12 +287,15 @@ const LATER_THE_FIELDS = `
 | Field | Type | Rule |
 | --- | --- | --- |
 | \`model\` | string | Required. A chat model id your key may use. Otherwise \`404 model_not_found\`; a model of another kind, such as an embeddings model, is a \`400\` naming \`model\`. |
-| \`input\` | string, or a list of messages | Required, non-empty. Over the model's input ceiling is \`400 context_length_exceeded\`. A \`user\` message may carry [images](/docs/images). |
+| \`input\` | string, or a list of messages | Required, non-empty. Over the model's input ceiling is \`400 context_length_exceeded\`. A \`user\` message may carry [images](/docs/images); with \`tools\`, the list may also hold \`function_call\` and \`function_call_output\` items. |
 | \`instructions\` | string | Optional. Must not be blank when present. |
 | \`stream\` | boolean | Default \`false\`. See [streaming](/docs/streaming). |
-| \`background\` | boolean | Default \`false\`. See [background responses](/docs/background). May be combined with \`stream\`. |
+| \`background\` | boolean | Default \`false\`. See [background responses](/docs/background). May be combined with \`stream\`; not with a \`function\` tool. |
 | \`store\` | boolean | Default \`true\`: while the request runs it is written down, so it survives a restart of the service and a broken stream can be [resumed](/docs/timeouts#resuming-a-stream). \`false\` keeps nothing, and the request is then cancelled when its client disconnects and cannot be resumed. |
 | \`text\` | object | Optional. JSON mode, \`${MODEL_ID}\` only: \`{"format": {"type": "json_object"}}\`, or \`{"format": {"type": "json_schema", "name": "…", "schema": {…}, "strict": true}}\`. Decoding is constrained, so the answer is valid JSON (matching \`schema\`); the schema is at most 64 KiB. Any other model is a \`400\`. A JSON-mode response is not resumed after an interruption: it fails with the retry-safe \`model_unavailable\`. Details on [Chat Completions](/docs/chat-completions#json-mode). |
+| \`tools\` | list | Optional. \`${MODEL_ID}\` only; any other model is a \`400\`. \`{"type": "function", "name", "description", "parameters", "strict"}\` for your own functions, returned to you as \`function_call\` output items; \`{"type": "web_search"}\`, \`{"type": "web_fetch"}\` or \`{"type": "deep_research"}\` for tools the server runs. Not together with \`text.format\`. See [tool calling](/docs/tools). |
+| \`tool_choice\` | string or object | Optional, with \`tools\`: \`"auto"\` (the default), \`"none"\`, \`"required"\`, \`{"type": "function", "name": "…"}\` or \`{"type": "web_search"}\`. |
+| \`parallel_tool_calls\` | boolean | Optional, with \`tools\`. Passed to the model as sent. |
 | \`max_output_tokens\` | integer | Optional, at least 1, at most the model's ceiling — 1,000,000 on \`${MODEL_ID}\`. Clamped to what your prompt leaves in the window; see below. |
 | \`temperature\` | number | Optional, \`0.0\` to \`2.0\`. Defaults to \`0.2\`, which is what the chat application asks for — except on \`${OCR_MODEL_ID}\`, where it defaults to \`0.0\`. |
 | \`metadata\` | object of strings | Optional. At most 16 keys; keys ≤ 64 characters, values ≤ 512 characters; strings only. |
@@ -348,15 +356,16 @@ const LATER_THE_RESPONSE = `
 | --- | --- |
 | \`id\` | \`resp_\` and 24 hex characters. Keep it: it is how you read, cancel, resume and correlate the response. |
 | \`status\` | One of \`queued\`, \`in_progress\`, \`completed\`, \`failed\`, \`cancelled\`. |
-| \`output\` | A list, always. One assistant message today; it stays a list so a future item kind does not change the shape. |
+| \`output\` | A list, always. The assistant message, followed — when you sent function \`tools\` and the model called one — by one \`function_call\` item per call (\`id\`, \`call_id\`, \`name\`, \`arguments\`, \`status\`). A turn of calls alone has no message. See [tool calling](/docs/tools). |
 | \`max_output_tokens\` | The output ceiling **applied** to this generation, after any clamping. \`null\` only on a response created before 2026-09-13. |
 | \`incomplete_details\` | \`{"reason": "max_output_tokens"}\` when the answer stopped because it reached that ceiling, otherwise \`null\`. \`status\` is still \`completed\`: check this field to learn whether the text was cut. |
 | \`usage\` | \`null\` when the engine reported no counts. Never \`0\` for "not measured". |
 | \`error\` | Present only on a failed response, carrying the same \`code\` vocabulary as the HTTP envelope. |
 
 Read the text at
-\`output[0].content[0].text\`, and write your client so an empty \`output\`
-list is not a crash.
+\`output[0].content[0].text\` — or, when you send function \`tools\`, from the
+item whose \`type\` is \`message\` — and write your client so an empty
+\`output\` list is not a crash.
 
 **A synchronous answer can be a \`200\` with \`"status": "failed"\`.** When a
 synchronous request runs past 15 seconds, the \`200\` and a few spaces are sent

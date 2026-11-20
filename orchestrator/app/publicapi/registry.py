@@ -685,11 +685,10 @@ def _build_main(configured: bool) -> PublicModel:
         chat=bool(getattr(capabilities, "supports_chat", True)),
         streaming=bool(getattr(capabilities, "supports_streaming", True)),
         vision=vision,
-        # False although the checkpoint calls tools: CONTRACT §7 does not
-        # expose tools on /v1, and advertising a capability the endpoint
-        # refuses is how a client ends up with a request that validates
-        # against our schema and fails on our server.
-        tools=False,
+        # Tool calling (2026-11-20, publicapi/tools.py): advertised exactly
+        # when the endpoint accepts `tools`, so a client never holds a request
+        # that validates against our schema and fails on our server.
+        tools=bool(getattr(settings, "public_api_tools_enabled", True)),
         embeddings=False,
         background=True,
         endpoints=_CHAT_ENDPOINTS,

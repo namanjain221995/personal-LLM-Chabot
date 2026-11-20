@@ -5,6 +5,7 @@ import openai
 import pytest
 
 from techsara_conformance import asserts
+from techsara_conformance.features import BUILT
 
 KINDS = {"chat", "embedding", "rerank", "transcription"}
 CAPABILITY_FLAGS = {"chat", "streaming", "vision", "tools", "embeddings", "rerank", "audio_transcription", "ocr", "background"}
@@ -39,13 +40,20 @@ def test_retrieving_an_unknown_model_is_a_404_model_not_found_envelope(client):
 
 
 @pytest.mark.feature("model_catalogue")
-def test_every_listed_model_declares_kind_capabilities_endpoints_and_ceilings(client):
+def test_every_listed_model_declares_kind_capabilities_endpoints_and_ceilings(client, target, features):
+    # §15 (2026-11-20): `tools` is true on the chat model when tool calling is
+    # built and switched on (§8.8), and false on every other model.
+    tools_built = features["tool_calling"].state == BUILT
     for model in client.models.list().data:
         extra = model.model_dump()
         assert extra.get("kind") in KINDS, f"{model.id}: kind {extra.get('kind')!r}"
         capabilities = extra.get("capabilities") or {}
         assert CAPABILITY_FLAGS <= set(capabilities), f"{model.id}: capabilities missing {CAPABILITY_FLAGS - set(capabilities)}"
-        assert capabilities["tools"] is False, f"{model.id}: tools is false for every model (§15)"
+        expected_tools = tools_built and model.id == target.models["chat"]
+        assert capabilities["tools"] is expected_tools, (
+            f"{model.id}: tools is {capabilities['tools']!r}, expected {expected_tools} "
+            f"(§15: true on {target.models['chat']} only, when tool calling is built)"
+        )
         assert isinstance(extra.get("endpoints"), list) and extra["endpoints"], f"{model.id}: no endpoints"
         for key in ("context_window", "max_input_tokens", "max_output_tokens", "default_max_output_tokens"):
             assert key in extra, f"{model.id}: {key} missing (null is allowed, absent is not)"

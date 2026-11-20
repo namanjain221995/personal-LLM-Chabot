@@ -26,7 +26,8 @@ Then run it and read the \`400\`s. They are the list of things to remove.
 | What you may be doing | Here |
 | --- | --- |
 | Sending \`top_p\`, \`n\`, \`seed\`, \`logit_bias\`, \`presence_penalty\`… | Rejected with \`400\` and the field in \`param\`. Remove them. |
-| Sending \`tools\` / \`functions\` | Rejected. [Tool calling](/docs/tools) is not offered. |
+| Sending \`tools\`, \`tool_choice\`, \`parallel_tool_calls\` | Accepted on \`${MODEL_ID}\`: function tools come back as \`tool_calls\` for you to run, and \`web_search\`, \`web_fetch\` and \`deep_research\` are run by the server. Not with \`response_format\`. See [tool calling](/docs/tools). |
+| Sending the legacy \`functions\` / \`function_call\` | Rejected. Use \`tools\`. |
 | Sending image parts in \`content\` | Accepted on the vision models as \`data:\` URLs only; an image *link* is rejected. See [images](/docs/images). |
 | Sending audio parts in \`content\` | Rejected. Use [\`/v1/audio/transcriptions\`](/docs/audio-transcriptions). |
 | Expecting several models | Six, with TechSara ids — see the [model reference](/docs/models); a model your key may not use is \`404\`. |
@@ -61,6 +62,8 @@ for code you already have. The move is small:
 | a system message | \`instructions\`, which becomes the first system message |
 | \`max_tokens\` or \`max_completion_tokens\` | \`max_output_tokens\` |
 | \`choices[0].message.content\` | \`output[0].content[0].text\` |
+| \`{"type": "function", "function": {…}}\` in \`tools\` | \`{"type": "function", "name", "description", "parameters"}\` — the same fields, not nested |
+| \`message.tool_calls\`, then \`tool\` messages | \`function_call\` output items, sent back with \`function_call_output\` items in \`input\` |
 | \`data:\` chunks, then \`[DONE]\` | named lifecycle events, ending at \`response.completed\` |
 | — | \`background: true\`, with a webhook when it finishes |
 

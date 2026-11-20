@@ -58,6 +58,9 @@ hours to do it. Because input and output share the window, a large
 response tells you the value it applied. Read
 [long outputs](/docs/long-output) before asking for more than a few thousand
 tokens. It answers directly, with no separate reasoning phase on this API.
+It is also the one model that takes \`tools\`: your own functions, and web
+search, page reading and deep research run by the server — see
+[tool calling](/docs/tools).
 `;
 const S_VISION_MODEL_ID = `
 ### ${VISION_MODEL_ID}
@@ -109,7 +112,7 @@ const S_THE_CAPABILITY_FLAGS = `
 | \`embeddings\` | The model serves [\`/v1/embeddings\`](/docs/embeddings). |
 | \`rerank\` | The model serves [\`/v1/rerank\`](/docs/rerank). |
 | \`audio_transcription\` | The model serves [\`/v1/audio/transcriptions\`](/docs/audio-transcriptions). |
-| \`tools\` | \`false\` for every model. Tool calling is not offered. See [tool calling](/docs/tools). |
+| \`tools\` | The model takes \`tools\` — your own functions, and web search, page reading and deep research run by the server. \`true\` on \`${MODEL_ID}\` only. See [tool calling](/docs/tools). |
 
 \`endpoints\` lists the paths a model serves, and \`limits\` carries the
 per-request limits that are not token counts. Write your client to ignore a
@@ -168,7 +171,7 @@ curl ${API_BASE_URL}/models \\
       "status": "available",
       "kind": "chat",
       "capabilities": {
-        "chat": true, "streaming": true, "vision": true, "tools": false,
+        "chat": true, "streaming": true, "vision": true, "tools": true,
         "embeddings": false, "rerank": false, "audio_transcription": false,
         "ocr": false, "background": true
       },

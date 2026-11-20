@@ -2197,6 +2197,28 @@ class Settings:
         self.public_api_max_audio_body_bytes: int = _int("PUBLIC_API_MAX_AUDIO_BODY_BYTES", 94_371_840)
         self.public_api_max_media_body_bytes: int = _int("PUBLIC_API_MAX_MEDIA_BODY_BYTES", 20_971_520)
         self.public_api_max_image_bytes: int = _int("PUBLIC_API_MAX_IMAGE_BYTES", 10_485_760)
+        # /v1 tool calling (2026-11-20, publicapi/tools.py). TOOLS_ENABLED off
+        # refuses every `tools` request with a 400, as before the feature. The
+        # three server tools each have their own switch; client function
+        # calling has none beyond the master one. MAX_ROUNDS bounds how many
+        # times one request may run server tools before the model must answer.
+        self.public_api_tools_enabled: bool = _bool("PUBLIC_API_TOOLS_ENABLED", True)
+        self.public_api_tool_web_search_enabled: bool = _bool("PUBLIC_API_TOOL_WEB_SEARCH_ENABLED", True)
+        self.public_api_tool_web_fetch_enabled: bool = _bool("PUBLIC_API_TOOL_WEB_FETCH_ENABLED", True)
+        self.public_api_tool_deep_research_enabled: bool = _bool(
+            "PUBLIC_API_TOOL_DEEP_RESEARCH_ENABLED", True
+        )
+        self.public_api_tool_max_rounds: int = _int("PUBLIC_API_TOOL_MAX_ROUNDS", 6)
+        self.public_api_tool_max_calls_per_round: int = _int("PUBLIC_API_TOOL_MAX_CALLS_PER_ROUND", 4)
+        # One web_search / web_fetch may take this long; all the tool results
+        # of one request may add this many bytes to its prompt.
+        self.public_api_tool_timeout_s: int = _int("PUBLIC_API_TOOL_TIMEOUT_S", 45)
+        self.public_api_tool_result_budget_bytes: int = _int(
+            "PUBLIC_API_TOOL_RESULT_BUDGET_BYTES", 300_000
+        )
+        self.public_api_tool_search_sources: int = _int("PUBLIC_API_TOOL_SEARCH_SOURCES", 6)
+        self.public_api_tool_source_chars: int = _int("PUBLIC_API_TOOL_SOURCE_CHARS", 4000)
+        self.public_api_tool_fetch_chars: int = _int("PUBLIC_API_TOOL_FETCH_CHARS", 40_000)
 
         # --- Webhook delivery growth (security fixes, 2026-09-13) ------------
         # apiplatform/webhooks/queue.py clamps each at use (retention 1 day to

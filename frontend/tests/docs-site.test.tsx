@@ -181,6 +181,16 @@ const KEYS_PY = repoFile('orchestrator', 'app', 'apiplatform', 'keys.py');
 
 /** The changelog heading of the all-models / 1M-output change (2026-09-13). */
 const ALL_MODELS_ENTRY = '2026-09-13 — every model on the API, and answers up to 1,000,000 tokens';
+/** The changelog heading of the no-timeout release (2026-09-13, revision 2). */
+const NO_TIMEOUT_ENTRY = '2026-09-13 — no timeouts, resumable streams, and generations that outlive our deploys';
+/**
+ * The changelog heading of tool calling (2026-11-20, CONTRACT §8.8). Listed with
+ * the release pages only, so it sits above the no-timeout entry; every test
+ * that counted headings from the top counts past it.
+ */
+const TOOLS_ENTRY = '2026-11-20 — tool calling: your own functions, and web search, page reading and deep research';
+/** How many changelog entries the release site lists above the no-timeout one. */
+const AFTER_RELEASE = 1;
 
 // -------------------------------------------------------------- tailwind --
 
@@ -486,23 +496,58 @@ describe('the documented API surface', () => {
     for (const id of registryIds) expect(MODEL_IDS as readonly string[]).toContain(id);
   });
 
-  it('states plainly that tool calling is not offered, because the registry says tools=False', () => {
-    // The registry is the authority (CONTRACT §15). If it ever declares
-    // tools=True this assertion fails first, which is the moment to rewrite
-    // the page rather than the moment a customer discovers the gap. Matched
-    // as `tools=False` or a dataclass default `tools: bool = False`, because
-    // the registry is being reshaped for six models (2026-09-13).
-    expect(REGISTRY_PY).toMatch(/\btools\s*(?::\s*bool\s*)?=\s*False\b/);
+  it('offers tool calling on the main model only, because the registry says so', () => {
+    // The registry is the authority (CONTRACT §15). Until 2026-11-20 every
+    // builder passed `tools=False` and the page said tool calling was not
+    // available. Since tool calling (CONTRACT §8.8) the main model's flag is
+    // driven by PUBLIC_API_TOOLS_ENABLED and every other builder still passes
+    // `tools=False`. If a second model ever gets tools, or the main model
+    // loses its switch, this fails first — the moment to rewrite the pages.
+    const assignments = [...REGISTRY_PY.matchAll(/^\s+tools=(.+),$/gm)];
+    const driven = assignments.filter((m) => m[1] !== 'False');
+    expect(driven.map((m) => m[1])).toEqual([
+      'bool(getattr(settings, "public_api_tools_enabled", True))',
+    ]);
+    expect(assignments.length).toBeGreaterThanOrEqual(MODEL_IDS.length);
+    // ... and that one assignment is inside the techsara-35b builder.
+    const mainStart = REGISTRY_PY.indexOf('id=TECHSARA_35B,');
+    const mainEnd = REGISTRY_PY.indexOf('PublicModel(', mainStart);
+    expect(mainStart).toBeGreaterThanOrEqual(0);
+    expect(driven[0].index!).toBeGreaterThan(mainStart);
+    expect(mainEnd === -1 || driven[0].index! < mainEnd).toBe(true);
     expect(REGISTRY_PY).not.toMatch(/\btools\s*(?::\s*bool\s*)?=\s*True\b/);
+    expect(CONTRACT.replace(/\s+/g, ' ')).toContain(
+      '`tools` is true on `techsara-35b` when `PUBLIC_API_TOOLS_ENABLED` is on (§8.8) and false for every other model.',
+    );
 
     const tools = findDocPage('tools');
     expect(tools).toBeDefined();
-    expect(tools!.body).toContain('Tool calling is not available');
-    expect(tools!.body).toContain('"tools": false');
+    expect(tools!.body).toContain(`on \`${MODEL_ID}\` only`);
+    for (const type of ['function', 'web_search', 'web_fetch', 'deep_research']) {
+      expect(tools!.body).toContain(`\`${type}\``);
+    }
 
-    // And nothing anywhere may advertise the opposite.
+    // No page still says the opposite, and every documented model object
+    // carries `tools: true` exactly when it is the main model.
     for (const page of DOC_PAGES) {
-      expect(page.body).not.toMatch(/"tools":\s*true/);
+      expect(page.body, page.slug).not.toMatch(/Tool calling is not (?:available|offered)|\*\*No tools\.\*\*/);
+      const models: { id?: unknown; capabilities?: { tools?: unknown } }[] = [];
+      for (const match of page.body.matchAll(/^~~~json\n([\s\S]*?)^~~~$/gm)) {
+        let sample: unknown;
+        try {
+          sample = JSON.parse(match[1]);
+        } catch {
+          continue; // a request fragment with an elided value is prose
+        }
+        const s = sample as { id?: unknown; capabilities?: unknown; data?: unknown };
+        if (s.capabilities) models.push(s as never);
+        if (Array.isArray(s.data)) models.push(...(s.data as never[]));
+      }
+      for (const model of models) {
+        if (model.capabilities && 'tools' in model.capabilities) {
+          expect(model.capabilities.tools, `${page.slug}: ${String(model.id)}`).toBe(model.id === MODEL_ID);
+        }
+      }
     }
   });
 });
@@ -1186,8 +1231,9 @@ describe('the unlimited API (owner decision, 2026-09-13)', () => {
     const changelog = findDocPage('changelog')!.body;
     const headings = docHeadingsOf(changelog).map((heading) => heading.text);
     // Newest first: the all-models entry of the same day came after it, and
-    // the no-timeout entry after that once it is live.
-    const offset = LIVE ? 1 : 0;
+    // the no-timeout entry after that once it is live — and, on the release
+    // site, the later entries above it (AFTER_RELEASE: tool calling, 2026-11-20).
+    const offset = LIVE ? 1 + AFTER_RELEASE : 0;
     expect(headings[offset]).toBe(ALL_MODELS_ENTRY);
     expect(headings[offset + 1]).toBe('2026-09-13 — usage limits removed');
     const entry = sectionOf(changelog, '2026-09-13 — usage limits removed');
@@ -1333,7 +1379,8 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
       expect(model.max_input_tokens, model.id).toBe(row.input);
       expect(model.max_output_tokens, model.id).toBe(row.output);
       expect(model.default_max_output_tokens, model.id).toBe(row.defaultOutput);
-      expect(model.capabilities.tools).toBe(false);
+      // CONTRACT §15: the main model advertises tool calling (§8.8), none other.
+      expect(model.capabilities.tools, model.id).toBe(model.id === MODEL_ID);
       for (const endpoint of model.endpoints) expect(routes).toContain(endpoint);
 
       const count = (pattern: RegExp) => Number((pattern.exec(row.other)?.[1] ?? 'NaN').replace(/,/g, ''));
@@ -1696,7 +1743,7 @@ describe('every model on the API (owner request, 2026-09-13)', () => {
 
   it('records the change in the changelog, dated 2026-09-13, as the newest entry before the no-timeout release', () => {
     const changelog = findDocPage('changelog')!.body;
-    expect(docHeadingsOf(changelog)[LIVE ? 1 : 0].text).toBe(ALL_MODELS_ENTRY);
+    expect(docHeadingsOf(changelog)[LIVE ? 1 + AFTER_RELEASE : 0].text).toBe(ALL_MODELS_ENTRY);
     const entry = sectionOf(changelog, ALL_MODELS_ENTRY);
     for (const id of MODEL_IDS) expect(entry).toContain(`\`${id}\``);
     for (const [method, path] of NEW_ROUTES) expect(entry).toContain(`\`${method} ${path}\``);
@@ -2060,9 +2107,9 @@ describe('the no-timeout release (2026-09-13)', () => {
     ];
     const offenders: string[] = [];
     for (const page of RELEASE_PAGES) {
-      // The changelog keeps its history; only the release's own entry is read.
-      const text =
-        page.slug === 'changelog' ? sectionOf(page.body, docHeadingsOf(page.body)[0].text) : page.body;
+      // The changelog keeps its history; only the release's own entry is read
+      // (by name: later entries sit above it since 2026-11-20).
+      const text = page.slug === 'changelog' ? sectionOf(page.body, NO_TIMEOUT_ENTRY) : page.body;
       for (const claim of retired) if (claim.test(text)) offenders.push(`${page.slug}: ${claim}`);
     }
     expect(offenders).toEqual([]);
@@ -2109,12 +2156,14 @@ describe('the no-timeout release (2026-09-13)', () => {
     expect(section).not.toMatch(/Retry-After/);
   });
 
-  it('records the release as the newest changelog entry once it is live, with the client settings in it', () => {
+  it('records the release as the newest changelog entry of its day once it is live, with the client settings in it', () => {
     const changelog = releasePage('changelog').body;
     const headings = docHeadingsOf(changelog).map((heading) => heading.text);
-    expect(headings[0]).toBe('2026-09-13 — no timeouts, resumable streams, and generations that outlive our deploys');
-    expect(headings[1]).toBe(ALL_MODELS_ENTRY);
-    const entry = oneLine(sectionOf(changelog, headings[0]));
+    // Newest first: tool calling (2026-11-20) is the only later entry.
+    expect(headings.slice(0, AFTER_RELEASE)).toEqual([TOOLS_ENTRY]);
+    expect(headings[AFTER_RELEASE]).toBe(NO_TIMEOUT_ENTRY);
+    expect(headings[AFTER_RELEASE + 1]).toBe(ALL_MODELS_ENTRY);
+    const entry = oneLine(sectionOf(changelog, NO_TIMEOUT_ENTRY));
     expect(entry).toContain('`timeout=Timeout(None, connect=10.0)` — never `0`');
     expect(entry).toContain('`timeout: 2_147_483_647` — never `0` or `Infinity`');
     expect(oneLine(docSectionsFor({ noTimeout: false }).flatMap((s) => s.pages).find((p) => p.slug === 'changelog')!.body)).not.toContain('no timeouts, resumable streams');

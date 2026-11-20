@@ -286,7 +286,7 @@ the declared set is served unchanged — a database failure can never add a mode
 ```json
 {"object": "list", "data": [
   {"id": "techsara-35b", "object": "model", "owned_by": "techsara", "status": "available",
-   "capabilities": {"chat": true, "streaming": true, "vision": <bool>, "tools": false, "embeddings": false},
+   "capabilities": {"chat": true, "streaming": true, "vision": <bool>, "tools": <bool>, "embeddings": false},
    "max_input_tokens": <int>, "max_output_tokens": <int>}
 ]}
 ```
@@ -316,8 +316,9 @@ Request body (`models.ResponsesRequest`, `extra="forbid"`, strings stripped):
 | `temperature` | number, optional | 0.0–2.0; absent → 0.2 | 400 |
 | `metadata` | object of string → string | ≤ 16 keys, key 1–64 chars, value ≤ 512 chars | 400 |
 | `text` | `{format: {type, name?, schema?, strict?, description?}}`, optional | JSON mode (2026-10-27): `type` `text` / `json_object` / `json_schema` (`name` + `schema` ≤ 64 KiB required); sent as the engine's `response_format`; `techsara-35b` only; never continued after an interrupt | 400 `param: text.format` |
+| `tools`, `tool_choice`, `parallel_tool_calls` | optional | tool calling (2026-11-20), CONTRACT §8.8: `function` tools returned to the caller, `web_search` / `web_fetch` / `deep_research` run by this server; `techsara-35b` only | 400 `param: tools` |
 
-Any other field — `top_p`, `tools`, `n`, `seed`, `workspace_id`, … — is a 400
+Any other field — `top_p`, `n`, `seed`, `workspace_id`, … — is a 400
 naming the field. The body is never echoed in an error.
 
 Every request runs at effort `fast` (thinking off, `streaming.PUBLIC_EFFORT`).
@@ -408,6 +409,7 @@ Accepted fields, and nothing else (any other top-level field is
 | `stream_options` | only `include_usage` is accepted |
 | `response_format` | `text.format` (`json_schema`'s nested object flattened); refusals name `response_format` |
 | `chat_template_kwargs` | nothing: accepted only as `{"enable_thinking": false}`, which every request already runs with |
+| `tools`, `tool_choice`, `parallel_tool_calls` | the same fields (a function's nested `function` object flattened); `tool` messages and assistant `tool_calls` become `function_call_output` / `function_call` input items (CONTRACT §8.8) |
 
 There is no `background` on this endpoint.
 

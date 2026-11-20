@@ -269,11 +269,14 @@ model on an endpoint its kind does not serve is
 "The model `techsara-embed` does not support /v1/responses." — the model's
 existence is already known to that caller, so saying so discloses nothing.
 
-Not exposed, deliberately: Salesforce, RAG and web search, deep research,
+Not exposed, deliberately: Salesforce, RAG,
 the chat application's own uploads, artifacts, memory, conversation history,
-admin analytics, tool calling, audio translation and speech synthesis. Each
-would need its own product, scope and threat review. Files and uploads are
-exposed only through the rows above (§8.7), which had theirs.
+admin analytics, audio translation and speech synthesis. Each would need its own product, scope and
+threat review. Files and uploads are exposed only through the rows above
+(§8.7), which had theirs. Tool calling, web search, web page reading and deep
+research are exposed since 2026-11-20 **only** as the `tools` of §8.8 on the
+two generating endpoints (owner request); there is no search or research
+endpoint of its own.
 
 ## 8. Request contract
 
@@ -322,6 +325,8 @@ Validation, all enforced server-side:
 | `store` | boolean, default `true`; `false` opts the request out of the durable log (§10, §14): cancelled on disconnect and on a restart, never resumable | 400 when not a boolean; 400 `param: store` with `background: true` |
 | `text` | optional `{"format": {…}}` — JSON mode (2026-10-27). `format.type` `text` (the default), `json_object`, or `json_schema` with `name` (`^[A-Za-z0-9_-]{1,64}$`), `schema` (an object, ≤ 64 KiB serialised), optional `strict` and `description` (≤ 1,024 chars). Sent to the engine as its `response_format`, which **constrains decoding**; `techsara-35b` only. A JSON-mode run is never continued after an interrupt (§10): it fails with the retry-safe `model_unavailable` | 400 `param: text.format`; 400 for any other model |
 
+| `tools`, `tool_choice`, `parallel_tool_calls` | optional — tool calling (2026-11-20), §8.8. `techsara-35b` only | 400 `param: tools` / `tool_choice` / `parallel_tool_calls` |
+
 **Why only `data:` URLs.** vLLM fetches a remote image URL server-side and no
 `--allowed-media-domains` is set, so an `http(s)` URL reaching an engine would
 let a caller probe internal hosts from the cluster network. Every non-`data:`
@@ -346,7 +351,8 @@ anyone's conversation history.
 
 Accepted top-level fields, and nothing else: `model`, `messages`, `stream`,
 `store`, `max_tokens`, `max_completion_tokens`, `temperature`, `response_format`,
-`chat_template_kwargs`, `stream_options`
+`chat_template_kwargs`, `tools`, `tool_choice`, `parallel_tool_calls` (§8.8),
+`stream_options`
 (only `include_usage`). `store` has the meaning of §8.1. `max_completion_tokens` is an alias of `max_tokens`; sending
 both is `400`. `response_format` (2026-10-27) is §8.1's `text.format` in the
 chat spelling: `{"type": "json_object"}`, or `{"type": "json_schema",
@@ -357,7 +363,128 @@ chat spelling: `{"type": "json_object"}`, or `{"type": "json_schema",
 is `400`. A message's `content` is a string or, on a `user` message, a list
 of `{"type": "text", "text"}` and
 `{"type": "image_url", "image_url": {"url": "data:…", "detail": "auto"}}` parts,
-under exactly the image rules of §8.1. There is no `background`.
+under exactly the image rules of §8.1. There is no `background`. With tools
+(§8.8) a message may also be an assistant turn carrying `tool_calls` (its
+`content` may be null) or a `tool` turn `{role, tool_call_id, content}`.
+
+### 8.8 Tool calling (2026-11-20)
+
+`tools` on `POST /v1/responses` and `POST /v1/chat/completions`, on
+`techsara-35b` only (`capabilities.tools`; any other model is `400 param:
+tools`). Code: `publicapi/tools.py`, `models.Tool`, the loop in
+`streaming.Generation._run`. Tests: `tests/test_publicapi_tools.py`.
+
+**Two kinds of tool.**
+
+| `type` | who runs it | what the caller receives |
+|---|---|---|
+| `function` — `{type, name, description?, parameters?, strict?}` (Chat spelling: `{type: "function", function: {…}}`) | the **caller** | the call: `tool_calls` + `finish_reason: "tool_calls"` on Chat, `function_call` output items on Responses |
+| `web_search` (alias `web_search_preview`) | this server: the chat application's own search provider (SearXNG), reranker and page reader, at the Fast budgets | the answer, with markdown links to the sources it used |
+| `web_fetch` | this server: one `http(s)` page or PDF through `core/net.safe_fetch` (the SSRF guard) and robots.txt. **Only a URL that appears in the conversation** — the caller's messages or an earlier tool result of the request — is read; a URL the model composed is refused | the answer |
+| `deep_research` | this server: the chat application's research engine (plan, search, read, verify, report); minutes | the report as the answer, followed by a `## Sources` list for its `[n]` citations |
+
+A server tool takes no field but `type`; an option this API would not honour
+(`search_context_size`, `user_location`, `filters`, …) is a `400` naming it.
+A function `name` is `^[A-Za-z0-9_-]{1,64}$` and may not be `web_search`,
+`web_fetch` or `deep_research`; `parameters` is a JSON Schema ≤ 64 KiB;
+`description` ≤ 4,096 chars; at most 64 tools, whose function definitions
+total ≤ 256 KiB and count toward the 1 MiB text rule; each function name and
+each server tool once. An empty `tools` list is the same as none.
+
+`tool_choice`: `auto` (default), `none`, `required`, or one tool —
+Responses `{"type": "function", "name": …}` / `{"type": "web_search"}`, Chat
+`{"type": "function", "function": {"name": …}}` / `{"type": "web_search"}`. It
+must name a tool in `tools`. A forced choice applies to the **first** model
+call of the request only. `parallel_tool_calls` (boolean) is sent to the
+engine. Both need `tools`.
+
+**The server-tool loop.** The model is called with the definitions; when it
+calls a server tool, the engine stream is closed, the tool runs, its result is
+appended as a `tool` message and the model is called again — at most
+`PUBLIC_API_TOOL_MAX_ROUNDS` (6) model calls per request and
+`PUBLIC_API_TOOL_MAX_CALLS_PER_ROUND` (4) server calls per call; the last
+permitted model call is sent `tool_choice: none`, so the request always ends in
+an answer. `deep_research` is terminal: its report is streamed as the answer
+and the model is not called again. A tool that could not do its work (no
+results, an unreachable page, a blocked address, a robots.txt refusal, search
+unavailable, longer than `PUBLIC_API_TOOL_TIMEOUT_S` — 45 s — for one search
+or one page) tells the **model** so in a fixed sentence and the request still
+completes. A call to a name that is neither a declared function nor a declared
+server tool is answered "that tool does not exist" and never reaches the
+caller or runs. All tool results of one request may add at most
+`PUBLIC_API_TOOL_RESULT_BUDGET_BYTES` (300,000) bytes to its prompt, and never
+more than the context window has left after the caller's own input and the
+output ceiling; when that is spent the next model call is sent `tool_choice:
+none`; only `deep_research` with no free place is an error
+(`503 model_unavailable`, "at capacity", `Retry-After: 60`), because the engine's own refusal
+is a sentence a caller would be billed for. API research runs share one
+admission bucket: one at a time across all keys (`DEEP_RESEARCH_MAX_PER_USER`).
+
+Everything a server tool read from the web — a page's title included —
+reaches the model between `BEGIN WEB CONTENT <tag>` and `END WEB CONTENT
+<tag>` lines, where `<tag>` is 16 random hex characters made for that one
+call, under a sentence that says it is reference material and not
+instructions; the chat template's own markers (`<|`, `|>`, `<tool_`,
+`</tool_`) are broken inside it. This lowers, and does not remove, the risk
+every tool-using model has: text on a page can still persuade the model. A
+caller that declares its own functions **together with** a server tool must
+treat a returned call as possibly shaped by what the model read, and validate
+its arguments before acting on it. A search result is at most
+`PUBLIC_API_TOOL_SEARCH_SOURCES` (6) pages of `PUBLIC_API_TOOL_SOURCE_CHARS`
+(4,000) characters, a fetched page `PUBLIC_API_TOOL_FETCH_CHARS` (40,000), any
+tool message 120,000. **Nothing is stored** (`search.ephemeral`): no search
+log row, no page-store or index write, no memory lookup; a `deep_research`
+run writes no `research_runs` row, no claims, queues no crawl and logs no
+line carrying the question. A page already in the shared store may be served
+from it. The log line for a tool run names the tool, the outcome and the
+time, never its arguments (§16). `public_api_tool_calls_total{tool, outcome}` counts them.
+
+**The caller's functions.** When the model calls a function, generation ends
+there. Each call gets an id of ours, `call_<24 hex>`:
+
+* Chat: `choices[0].message` is `{"role": "assistant", "content": <text or
+  null>, "tool_calls": [{"id", "type": "function", "function": {"name",
+  "arguments"}}]}` and `finish_reason` is `tool_calls`. Streaming: one chunk
+  whose `delta.tool_calls` carries every call whole (each with its `index`),
+  then the `finish_reason` chunk.
+* Responses: `output` is the message (when there is text) followed by one
+  `{"type": "function_call", "id": "fc_…", "call_id", "name", "arguments",
+  "status": "completed"}` per call. Streaming: §10.2.
+
+`arguments` is the JSON string the model wrote; the server does not validate it
+against `parameters`. The result comes back in the next request: Chat as
+`{"role": "tool", "tool_call_id", "content"}` after the echoed assistant
+message, Responses as `{"type": "function_call_output", "call_id", "output"}`
+after the echoed `function_call` item (a `function_call_output` whose `call_id`
+matches no earlier `function_call` in `input` is `400`). A turn that calls both
+a function and a server tool returns the function calls alone.
+
+**What tools change about a request.**
+
+* Not together with JSON mode (`400 param: text.format` / `response_format`).
+* `function` tools not together with `background` (`400 param: background`):
+  nobody is waiting to run the function. Server tools run in the background
+  like any request.
+* A request declaring a `function` tool is **not durable** whatever `store`
+  says: it answers `X-TechSara-Run: none`, is not resumable, and its retry is
+  a new request. A server-tool request is durable, but **a run with tools is
+  never continued** after an interrupt, a yield or a restart (a tool that ran
+  would run again): it fails with the retry-safe `model_unavailable`.
+* Tool definitions and function-call items are counted into the input bound
+  at their byte length; `usage` sums every model call of the request,
+  including the ones `deep_research` makes. `max_output_tokens` bounds the
+  model calls of the loop together (each later call gets what is left); a
+  `deep_research` report is bounded by the research engine's own ceiling
+  (`DEEP_RESEARCH_REPORT_MAX_TOKENS`), not by the request's.
+* An `Idempotency-Key` replay of a function-call response carries no calls,
+  for the reason it carries no text (§13, §16): neither is stored.
+* While a server tool runs the stream carries heartbeats only.
+
+Switches (§12.4): `PUBLIC_API_TOOLS_ENABLED` off refuses every `tools`
+request with `400` and sets `capabilities.tools` false; each server tool has
+its own. `web_search` is refused when no search provider is configured,
+`deep_research` when `DEEP_RESEARCH_ENABLED` is off. No scope beyond
+`responses.write` is required.
 
 ### 8.3 The output ceiling and the shared window (owner decision, 2026-09-13)
 
@@ -853,8 +980,16 @@ response.created → response.queued → response.in_progress
   → response.output_text.delta (×N) → response.output_text.done
   → response.output_text.annotation.added (×K)
   → response.content_part.done → response.output_item.done
+  → response.function_call_arguments.done (×M)
   → response.completed | response.failed | error
 ```
+
+`response.function_call_arguments.done` (tool calling, §8.8) is sent once per
+call to the caller's function, whole — `{item_id, output_index, call_id, name,
+arguments}` — after the message closes; the terminal Response's `output`
+carries the same `function_call` items. A turn that is function calls alone
+has no message item, so its item and content-part events are absent. Only the
+in-memory framer emits it: a request with function tools is never durable.
 
 `response.queued` is sent while the request waits for its engine (a gate, the
 admission lane, a recovering engine), on any engine, followed by `: ping`
@@ -1212,6 +1347,13 @@ defaults. The webhook settings are additionally clamped at use
 
 | setting | default | governs |
 |---|---|---|
+| `PUBLIC_API_TOOLS_ENABLED` | true | §8.8: off refuses every `tools` request |
+| `PUBLIC_API_TOOL_WEB_SEARCH_ENABLED` / `_WEB_FETCH_ENABLED` / `_DEEP_RESEARCH_ENABLED` | true | §8.8: one server tool |
+| `PUBLIC_API_TOOL_MAX_ROUNDS` | 6 | §8.8: model calls per request |
+| `PUBLIC_API_TOOL_MAX_CALLS_PER_ROUND` | 4 | §8.8: server tool runs per model call |
+| `PUBLIC_API_TOOL_TIMEOUT_S` | 45 | §8.8: one `web_search` or `web_fetch` |
+| `PUBLIC_API_TOOL_RESULT_BUDGET_BYTES` | 300000 | §8.8: tool results added to one request's prompt |
+| `PUBLIC_API_TOOL_SEARCH_SOURCES` / `_SOURCE_CHARS` / `_FETCH_CHARS` | 6 / 4000 / 40000 | §8.8: how much a tool hands the model |
 | `PUBLIC_API_ENFORCE_LIMITS` | false | §12.1 |
 | `PUBLIC_API_MAX_BODY_BYTES` | 1,048,576 | JSON body cap; the text rule |
 | `PUBLIC_API_MAX_MEDIA_BODY_BYTES` | 20,971,520 | body cap on the two generation routes |
@@ -1518,7 +1660,8 @@ would otherwise publish the main model under a second id.
 capability flags `chat, streaming, vision, tools, embeddings, rerank,
 audio_transcription, ocr, background`, `endpoints`, `context_window`,
 `max_input_tokens`, `max_output_tokens`, `default_max_output_tokens`, `limits`,
-the gate parameters and the clamp basis. `tools` is false for every model.
+the gate parameters and the clamp basis. `tools` is true on `techsara-35b`
+when `PUBLIC_API_TOOLS_ENABLED` is on (§8.8) and false for every other model.
 
 * `declared_models()` = the models configured and available on this deployment;
   `catalogue()` = all six with `status` `available` or `not_configured`, for the

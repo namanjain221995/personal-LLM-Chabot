@@ -188,6 +188,26 @@ export function startDesignStub({ streamMode = 'helper' } = {}) {
         const requested = (chat ? (b.max_tokens ?? b.max_completion_tokens) : b.max_output_tokens) ?? spec.default_max_output_tokens;
         if (requested > spec.max_output_tokens) return error(res, 400, 'invalid_request_error', 'max_output_tokens');
         const msgs = chat ? b.messages : Array.isArray(b.input) ? b.input : [{ role: 'user', content: b.input }];
+        // §8.8 (2026-11-20): a function tool and no result yet → the call, returned
+        // to the caller; a result (or tool_choice none) → an ordinary answer below.
+        const answered = msgs.some((x) => x.role === 'tool' || x.type === 'function_call_output');
+        if (Array.isArray(b.tools) && b.tools.length && b.tool_choice !== 'none' && !answered) {
+          const fn = chat ? b.tools[0].function : b.tools[0];
+          const callId = `call_${hex24()}`;
+          const args = JSON.stringify({ order_id: '1182' });
+          if (chat) {
+            return json(res, 200, {
+              id: `chatcmpl-${hex24()}`, object: 'chat.completion', created: 1789200000, model: b.model, max_output_tokens: requested,
+              choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [{ id: callId, type: 'function', function: { name: fn.name, arguments: args } }] }, finish_reason: 'tool_calls' }],
+              usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+            });
+          }
+          return json(res, 200, {
+            id: id('resp_'), object: 'response', created_at: 1789200000, status: 'completed', model: b.model,
+            output: [{ type: 'function_call', id: `fc_${callId.slice('call_'.length)}`, call_id: callId, name: fn.name, arguments: args, status: 'completed' }],
+            max_output_tokens: requested, incomplete_details: null, usage: { input_tokens: 5, output_tokens: 1, total_tokens: 6 },
+          });
+        }
         const parts = msgs.flatMap((msg) => (Array.isArray(msg.content) ? msg.content : [{ type: 'input_text', text: msg.content }]));
         let reply = 'ok';
         for (const part of parts) {

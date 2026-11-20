@@ -72,6 +72,12 @@ export const FEATURES = {
     contract: 'CONTRACT-3 §12.1',
     what: 'no RateLimit / RateLimit-Policy headers and no 429 for volume on /v1',
   },
+  'tool-calling': {
+    status: 'planned',
+    scopes: ['responses.write'],
+    contract: 'CONTRACT-3 §8.8, §10.2, §15',
+    what: 'tools / tool_choice on techsara-35b: a function call comes back as tool_calls (Chat) or a function_call item (Responses) and its result is answered',
+  },
 };
 
 /** Every scope the suite can use: the base set plus each feature's. */

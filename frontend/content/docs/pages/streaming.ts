@@ -287,6 +287,7 @@ response.output_text.delta      (many)
 response.output_text.done
 response.content_part.done
 response.output_item.done
+response.function_call_arguments.done   (one per function call, with tools)
 response.completed
 ~~~
 
@@ -298,6 +299,14 @@ terminals, \`response.failed\` and \`error\`, can take the place of
 
 The item and content-part events frame the answer the way both official client
 libraries' stream helpers expect: one assistant message holding one text part.
+
+\`response.function_call_arguments.done\` appears only when you sent function
+[tools](/docs/tools) and the model called one: once per call, whole — \`item_id\`,
+\`output_index\`, \`call_id\`, \`name\`, \`arguments\` — after the message closes
+and before the terminal event, whose \`output\` carries the same
+\`function_call\` items. A turn that is only function calls has no message, so
+the item and content-part events are absent from it. While a tool the server
+runs is working, the stream carries heartbeats only.
 
 Each frame is an \`event:\` line naming the event and a \`data:\` line with a
 JSON object. The object repeats the name in \`type\` and carries a

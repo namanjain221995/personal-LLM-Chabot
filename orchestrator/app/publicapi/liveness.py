@@ -323,6 +323,15 @@ class MainGuard:
             self.dispatched_at = self.clock() if now is None else now
             self._evidence_at = self.dispatched_at if self._evidence_at is None else self._evidence_at
 
+    def rearm(self) -> None:
+        """Forget the last dispatch (tool calling, 2026-11-20). A request that
+        ran a server tool calls the model again: the time the tool took is
+        not engine silence, and the next call's own dispatch starts the
+        measurement afresh. What was learnt about the engine stays."""
+        self.dispatched_at = None
+        self.last_chunk_at = None
+        self._idle_samples.clear()
+
     def chunk(self, now: Optional[float] = None, *, token: bool = True) -> None:
         moment = self.clock() if now is None else now
         if self.dispatched_at is None:

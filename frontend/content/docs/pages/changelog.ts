@@ -16,6 +16,38 @@ const INTRO = `
 Dates are the date of the change in this repository. Anything that alters
 behaviour on \`/v1\` appears here.
 `;
+// 2026-11-20 (CONTRACT §8.8): listed with the release pages only, newest first.
+const S_2026_11_20_TOOL_CALLING = `
+## 2026-11-20 — tool calling: your own functions, and web search, page reading and deep research
+
+* **\`tools\`, \`tool_choice\` and \`parallel_tool_calls\`** are accepted on
+  \`POST /v1/responses\` and \`POST /v1/chat/completions\`, on \`techsara-35b\`
+  only. \`GET /v1/models\` now reports \`"tools": true\` for it; every other
+  model still says \`false\` and refuses \`tools\` with a \`400\`. See
+  [tool calling](/docs/tools).
+* **Your own functions** come back to you: \`tool_calls\` with
+  \`finish_reason: "tool_calls"\` on Chat Completions, \`function_call\` output
+  items on Responses. You run them and send the results back as \`tool\`
+  messages or \`function_call_output\` items.
+* **Three tools the server runs**, returning the answer: \`web_search\` (the
+  answer links its sources; \`web_search_preview\` is accepted as the same
+  tool), \`web_fetch\` (one public page or PDF) and \`deep_research\` (minutes;
+  the report is the answer, with its sources listed). One API research run at a
+  time across every key; a request that finds the place taken fails with the
+  retry-safe \`model_unavailable\` and \`Retry-After: 60\`.
+* **A new stream event**, \`response.function_call_arguments.done\`, one per
+  function call, before the terminal event.
+* **Bounded**: at most 6 model calls per request and 4 server tool runs per
+  call; the last call must answer. Web content reaches the model fenced and
+  labelled as reference material, and nothing of a query is stored.
+* **Rules**: not with JSON mode; function tools not with \`background\`; a
+  request with a function tool is not durable and cannot be resumed; a run with
+  tools is never continued after an interruption — it fails with the
+  retry-safe \`model_unavailable\`.
+* **What did not change**: a request without \`tools\` behaves exactly as
+  before, and the legacy \`functions\` and \`function_call\` fields are still
+  refused.
+`;
 const S_2026_09_13_EVERY_MODEL_ON_THE_API_AND_ANSWERS_UP_TO_1_000_00 = `
 ## 2026-09-13 — every model on the API, and answers up to 1,000,000 tokens
 
@@ -247,7 +279,7 @@ export function changelogPage({
   deploysHeld?: boolean;
 }): DocPage {
   const sections = noTimeout
-    ? [INTRO, laterPre0(deploysHeld), S_2026_09_13_EVERY_MODEL_ON_THE_API_AND_ANSWERS_UP_TO_1_000_00, S_2026_09_13_USAGE_LIMITS_REMOVED, S_2026_09_13_THE_FIRST_END_TO_END_RUN_OF_THE_EXAMPLES, S_2026_09_13_DOCUMENTATION, S_EARLIER_THE_PLATFORM_BEING_BUILT, S_HOW_TO_WATCH_FOR_CHANGES]
+    ? [INTRO, S_2026_11_20_TOOL_CALLING, laterPre0(deploysHeld), S_2026_09_13_EVERY_MODEL_ON_THE_API_AND_ANSWERS_UP_TO_1_000_00, S_2026_09_13_USAGE_LIMITS_REMOVED, S_2026_09_13_THE_FIRST_END_TO_END_RUN_OF_THE_EXAMPLES, S_2026_09_13_DOCUMENTATION, S_EARLIER_THE_PLATFORM_BEING_BUILT, S_HOW_TO_WATCH_FOR_CHANGES]
     : [INTRO, S_2026_09_13_EVERY_MODEL_ON_THE_API_AND_ANSWERS_UP_TO_1_000_00, S_2026_09_13_USAGE_LIMITS_REMOVED, S_2026_09_13_THE_FIRST_END_TO_END_RUN_OF_THE_EXAMPLES, S_2026_09_13_DOCUMENTATION, S_EARLIER_THE_PLATFORM_BEING_BUILT, S_HOW_TO_WATCH_FOR_CHANGES];
   return {
     slug: 'changelog',

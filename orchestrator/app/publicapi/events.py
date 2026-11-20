@@ -55,6 +55,9 @@ RESPONSE_OUTPUT_TEXT_DONE = "response.output_text.done"
 RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED = "response.output_text.annotation.added"
 RESPONSE_CONTENT_PART_DONE = "response.content_part.done"
 RESPONSE_OUTPUT_ITEM_DONE = "response.output_item.done"
+#: Tool calling (2026-11-20): one event per call to the CALLER's function,
+#: carrying the whole call, after the message closes and before the terminal.
+RESPONSE_FUNCTION_CALL_ARGUMENTS_DONE = "response.function_call_arguments.done"
 RESPONSE_COMPLETED = "response.completed"
 RESPONSE_FAILED = "response.failed"
 ERROR = "error"
@@ -85,6 +88,7 @@ EVENT_NAMES: Tuple[str, ...] = (
     RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED,
     RESPONSE_CONTENT_PART_DONE,
     RESPONSE_OUTPUT_ITEM_DONE,
+    RESPONSE_FUNCTION_CALL_ARGUMENTS_DONE,
     RESPONSE_COMPLETED,
     RESPONSE_FAILED,
     ERROR,
@@ -128,13 +132,18 @@ _LIFECYCLE_RANK: Dict[str, int] = {
     RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED: 7,
     RESPONSE_CONTENT_PART_DONE: 8,
     RESPONSE_OUTPUT_ITEM_DONE: 9,
-    RESPONSE_COMPLETED: 10,
+    RESPONSE_FUNCTION_CALL_ARGUMENTS_DONE: 10,
+    RESPONSE_COMPLETED: 11,
 }
 
 #: The events that may legitimately repeat: the text arrives in many deltas,
 #: and an answer may cite many places. Every other rank is a stage, and a
 #: stage happens once.
-_REPEATABLE: Tuple[str, ...] = (RESPONSE_OUTPUT_TEXT_DELTA, RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED)
+_REPEATABLE: Tuple[str, ...] = (
+    RESPONSE_OUTPUT_TEXT_DELTA,
+    RESPONSE_OUTPUT_TEXT_ANNOTATION_ADDED,
+    RESPONSE_FUNCTION_CALL_ARGUMENTS_DONE,
+)
 
 
 # ------------------------------------------------- the item and its part --
@@ -453,6 +462,21 @@ class SequencedEvents:
     def output_item_done(self, text: str, annotations: Optional[Iterable[Mapping[str, Any]]] = None) -> str:
         return self._frame(RESPONSE_OUTPUT_ITEM_DONE, output_item_done_payload(self.item_id, text, annotations))
 
+    def function_call_done(self, item: Mapping[str, Any], *, output_index: int) -> str:
+        """One call to the caller's function, whole (tool calling, 2026-11-20).
+        `item` is the `function_call` output item the terminal snapshot also
+        carries; `output_index` is its place in that snapshot's `output`."""
+        return self._frame(
+            RESPONSE_FUNCTION_CALL_ARGUMENTS_DONE,
+            {
+                "item_id": str(item.get("id") or ""),
+                "output_index": int(output_index),
+                "call_id": str(item.get("call_id") or ""),
+                "name": str(item.get("name") or ""),
+                "arguments": str(item.get("arguments") or "{}"),
+            },
+        )
+
     @property
     def item_open(self) -> bool:
         """Whether `output_item.added` has been emitted on this stream."""
@@ -645,6 +669,31 @@ class ChatCompletionChunks:
         payload: Dict[str, Any] = {"content": str(text)}
         if self._first:
             payload = {"role": "assistant", "content": str(text)}
+            self._first = False
+        return self._chunk([{"index": int(index), "delta": payload, "finish_reason": None}])
+
+    def tool_calls(self, calls: Iterable[Mapping[str, Any]], *, index: int = 0) -> str:
+        """The model's function calls, each whole, in one chunk (tool calling,
+        2026-11-20). The reference dialect may split a call's arguments over
+        many chunks; a client accumulates them by `index`, and one fragment
+        that is the whole string accumulates to the same call."""
+        if self._stopped:
+            raise StreamProtocolError("tool calls were framed after the finish_reason chunk")
+        listed = [
+            {
+                "index": position,
+                "id": str(call.get("call_id") or ""),
+                "type": "function",
+                "function": {
+                    "name": str(call.get("name") or ""),
+                    "arguments": str(call.get("arguments") or "{}"),
+                },
+            }
+            for position, call in enumerate(calls)
+        ]
+        payload: Dict[str, Any] = {"tool_calls": listed}
+        if self._first:
+            payload = {"role": "assistant", "content": None, "tool_calls": listed}
             self._first = False
         return self._chunk([{"index": int(index), "delta": payload, "finish_reason": None}])
 

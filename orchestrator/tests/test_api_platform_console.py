@@ -2614,6 +2614,7 @@ class FakePlan:
         self.explicit_max_output_tokens = True
         self.image_count = 0
         self.response_format = None
+        self.tools = None
         for name, value in overrides.items():
             setattr(self, name, value)
 

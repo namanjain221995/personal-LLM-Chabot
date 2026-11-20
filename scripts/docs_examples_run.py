@@ -307,17 +307,22 @@ class Run:
 
 CURL_WRAPPER = "curl() { command curl -w '\\n@@HTTP %{http_code}@@\\n' \"$@\"; }\n"
 
+# 2026-11-20: the `openai` package 3.x sends through httpx2, not httpx, so a
+# sample written against the SDK (the tools page) reported no status at all.
+# Both transports are wrapped; a sample uses one or the other.
 PY_PRELUDE = '''import sys as _sys
-try:
-    import httpx as _httpx
-    _orig_send = _httpx.Client.send
+def _wrap_send(_mod):
+    _orig_send = _mod.Client.send
     def _send(self, request, *a, **kw):
         r = _orig_send(self, request, *a, **kw)
         print(f"@@HTTP {r.status_code}@@", file=_sys.stderr, flush=True)
         return r
-    _httpx.Client.send = _send
-except ImportError:
-    pass
+    _mod.Client.send = _send
+for _name in ("httpx", "httpx2"):
+    try:
+        _wrap_send(__import__(_name))
+    except ImportError:
+        pass
 '''
 
 JS_PRELUDE = '''const __fetch = globalThis.fetch;
@@ -590,6 +595,25 @@ def expect_tag(tag: str, allowed: Callable[[str], bool], what: str) -> Callable[
     return check
 
 
+def j_prog_all_ok() -> Callable[[Run, Dict], Verdict]:
+    """A program whose NUMBER of requests is the model's choice — a function
+    round trip makes one request per turn, and the model decides how many turns
+    (2026-11-20, tool calling). It passes when it exits 0, made at least one
+    request, every request was a 200, and it printed something."""
+    def judge(run: Run, ctx: Dict) -> Verdict:
+        codes = run.statuses
+        if run.exit != 0:
+            return False, f"exit {run.exit}, HTTP {codes}; {run.stderr.strip()[-300:]}"
+        if not codes or any(c != 200 for c in codes):
+            return False, f"exit 0 but HTTP {codes}, expected one or more 200s"
+        visible = MARK.sub("", run.stdout).strip()
+        if not visible:
+            return False, f"exit 0, HTTP {codes}; printed nothing"
+        tail = visible.replace("\n", " ⏎ ")
+        return True, f"exit 0, HTTP {codes}; printed {len(visible)} chars: {tail[:120]}{'…' if len(tail) > 120 else ''}"
+    return judge
+
+
 # ==================================================================== specs ==
 
 
@@ -617,6 +641,8 @@ NE_MILLION = ("starts a generation of up to 1,000,000 output tokens — hours of
               "shares; the same request shape with the default ceiling is executed by the other samples")
 NE_WEBHOOK = ("webhook verification needs a delivery; the SSRF guard refuses a loopback receiver and the isolated "
               "stack has no public HTTPS endpoint — verified locally against the server's own signer instead")
+NE_RESEARCH = ("starts a deep-research run — minutes of engine time and the one research place every API key "
+               "shares; the server-tool loop it rides is executed by the web_search and web_fetch samples")
 
 
 def _status_is(*ok: str) -> Callable[[str], bool]:
@@ -773,12 +799,27 @@ def build_specs() -> Dict[Tuple[str, int], Spec]:
     S["usage", 2] = Spec("export TECHSARA_API_KEY=", "run", judge=j_curl([200], obj="list"))
     S["usage", 3] = Spec("{", "shape", ref="usage")
 
-    S["tools", 1] = Spec("{", "shape", ref="model")
-    S["tools", 2] = Spec("{", "shape", ref="error_tools")
-    S["tools", 3] = Spec("instructions = (", "run", pre=(("python", 2),),
-                         head='import json\napi = client()\ncustomer_message = "I was charged twice for order 1182 and want my money back."\n',
-                         tail='\nprint("PARSED", parsed)\n',
-                         judge=j_prog([200], stdout_has="PARSED"))
+    # 2026-11-20: tool calling is live (CONTRACT §8.8). The page was "not
+    # available" + a JSON-by-instruction workaround; it is now the function
+    # round trip on both dialects, the stream transcript and the three server
+    # tools. Whether the model chooses to call is the model's decision, so the
+    # function samples are judged by their HTTP outcome and their output, and
+    # the documented call shapes against references forced with
+    # tool_choice "required" (capture_refs).
+    S["tools", 1] = Spec("export TECHSARA_API_KEY=", "run", judge=j_curl([200], obj="chat.completion"))
+    S["tools", 2] = Spec("{", "shape", ref="chat_tool_call")
+    S["tools", 3] = Spec("curl ", "run", judge=j_curl([200], obj="chat.completion"))
+    S["tools", 4] = Spec("import json", "run", judge=j_prog_all_ok())
+    S["tools", 5] = Spec("curl ", "run", judge=j_curl([200]))
+    S["tools", 6] = Spec("{", "shape", ref="response_function_call")
+    S["tools", 7] = Spec("curl ", "run", judge=ok_resp)
+    S["tools", 8] = Spec("import json", "run", judge=j_prog_all_ok())
+    S["tools", 9] = Spec("event: response.created", "check", reason="a stream transcript of a function call",
+                         check=chk_function_call_transcript)
+    S["tools", 10] = Spec("curl ", "run", reason="needs the stack's search provider", judge=ok_resp)
+    S["tools", 11] = Spec("import os", "run", reason="needs outbound HTTPS from the stack",
+                          judge=j_prog_all_ok())
+    S["tools", 12] = Spec("import os", "check", reason=NE_RESEARCH, check=chk_python_parses)
 
     S["python", 1] = Spec("pip install httpx", "run", reason="pip install → the venv's pip with --dry-run",
                           judge=j_prog([], stdout_has="httpx"))
@@ -974,7 +1015,11 @@ def chk_stream_headers(sample: Sample, ctx: Dict) -> Verdict:
 
 
 def chk_event_order(sample: Sample, ctx: Dict) -> Verdict:
-    doc = [l.split()[0] for l in sample.code.strip().split("\n") if l.strip()]
+    # A line the page marks as conditional — `(only while it waits …)`, or
+    # `(… with tools)` (2026-11-20) — is not expected on the plain reference
+    # stream this is compared against.
+    doc = [l.split()[0] for l in sample.code.strip().split("\n")
+           if l.strip() and "(only" not in l and "with tools)" not in l]
     names = [n for n, _ in ctx["refs"].get("stream", {}).get("frames", []) if n]
     collapsed = [n for i, n in enumerate(names) if i == 0 or n != names[i - 1]]
     return collapsed == doc, f"real stream order (repeats collapsed): {' → '.join(collapsed)}"
@@ -1001,6 +1046,42 @@ def chk_stream_transcript(sample: Sample, ctx: Dict) -> Verdict:
             problems.append(f"{n}: " + "; ".join(shape_diff(doc, reals[0])))
     return not problems, ("every documented frame's fields occur on the same event in a real stream"
                           if not problems else "MISMATCH " + " | ".join(problems))
+
+
+def chk_function_call_transcript(sample: Sample, ctx: Dict) -> Verdict:
+    """tools #9: the documented function-call stream against a real one, forced
+    with tool_choice "required" (capture_refs). Every documented event must
+    occur in the real stream with the documented fields, and in that order."""
+    frames = ctx["refs"].get("stream_function_call", {}).get("frames", [])
+    real_names = [n for n, _ in frames if n]
+    by_name: Dict[str, List[Any]] = {}
+    for n, d in frames:
+        try:
+            by_name.setdefault(n, []).append(json.loads(d))
+        except ValueError:
+            pass
+    problems = []
+    doc_names = []
+    for n, d in sse_events(sample.code):
+        doc_names.append(n)
+        doc = json.loads(d)
+        reals = by_name.get(n)
+        if not reals:
+            problems.append(f"event {n} not in the real stream")
+            continue
+        if all(shape_diff(doc, r) for r in reals):
+            problems.append(f"{n}: " + "; ".join(shape_diff(doc, reals[0])))
+    order = [n for n in real_names if n in doc_names]
+    collapsed = [n for i, n in enumerate(order) if i == 0 or n != order[i - 1]]
+    if not problems and collapsed != doc_names:
+        problems.append(f"order: real {' → '.join(collapsed)}")
+    return not problems, ("every documented frame's fields occur on the same event of a real function-call stream, "
+                          "in the documented order" if not problems else "MISMATCH " + " | ".join(problems))
+
+
+def chk_python_parses(sample: Sample, ctx: Dict) -> Verdict:
+    problem = _python_parses(sample.code)
+    return problem is None, problem or "parses"
 
 
 def chk_signature_header(sample: Sample, ctx: Dict) -> Verdict:
@@ -1175,8 +1256,19 @@ def capture_refs(ctx: Dict) -> None:
     _ref(ctx, "error_401", "GET", "/models",
          key="tsk_live_0123456789abcdef_EXAMPLE_KEY_DO_NOT_USE_THIS_IS_NOT_A_SECRETEXAMPL")
     _ref(ctx, "error_top_p", "POST", "/responses", json={"model": MODEL, "input": "hello", "top_p": 0.9})
-    _ref(ctx, "error_tools", "POST", "/responses",
-         json={"model": MODEL, "input": "hello", "tools": [{"type": "function", "name": "lookup"}]})
+    # 2026-11-20, tool calling (CONTRACT §8.8): the call shapes the tools page
+    # documents, with the call forced so the reference is a call every time.
+    fn = {"name": "get_order_status", "description": "Look up the delivery status of one order.",
+          "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}}
+    _ref(ctx, "chat_tool_call", "POST", "/chat/completions",
+         json={"model": MODEL, "messages": [{"role": "user", "content": "Where is order 1182?"}],
+               "tools": [{"type": "function", "function": fn}], "tool_choice": "required"})
+    _ref(ctx, "response_function_call", "POST", "/responses",
+         json={"model": MODEL, "input": "Where is order 1182?", "tools": [{"type": "function", **fn}],
+               "tool_choice": "required"})
+    _ref_stream(ctx, "stream_function_call", "/responses",
+                {"model": MODEL, "input": "Where is order 1182?", "tools": [{"type": "function", **fn}],
+                 "tool_choice": "required", "stream": True})
     _ref(ctx, "error_scope", "POST", "/responses", key=ctx["key_limited"], json={"model": MODEL, "input": "hello"})
     # The same refusal read at the ORIGIN, bypassing the edge: when a header is
     # missing at the edge this says whether the server never sent it or the
@@ -1568,6 +1660,18 @@ def self_test() -> int:
     jp = j_prog([200], stdout_nonempty=True)
     t("the program judge fails a non-zero exit", not jp(Run(1, "x", "@@HTTP 200@@", 1), {})[0])
     t("the program judge reads statuses from stderr", jp(Run(0, "answer", "@@HTTP 200@@\n", 1), {})[0])
+    ja = j_prog_all_ok()
+    t("the any-number-of-turns judge passes one or several 200s",
+      ja(Run(0, "answer", "@@HTTP 200@@\n", 1), {})[0] and ja(Run(0, "answer", "@@HTTP 200@@\n@@HTTP 200@@\n", 1), {})[0])
+    t("the any-number-of-turns judge fails no request, a non-200 turn, or silence",
+      not ja(Run(0, "answer", "", 1), {})[0] and not ja(Run(0, "answer", "@@HTTP 200@@\n@@HTTP 400@@\n", 1), {})[0]
+      and not ja(Run(0, "", "@@HTTP 200@@\n", 1), {})[0])
+    order_doc = Sample("streaming", "Streaming", 3, "text", "other",
+                       "response.created\nresponse.queued   (only while it waits)\nresponse.completed\n"
+                       "response.function_call_arguments.done   (one per function call, with tools)")
+    order_ctx = {"refs": {"stream": {"frames": [("response.created", "{}"), ("response.completed", "{}")]}}}
+    t("the event-order check skips the lines the page marks as conditional",
+      chk_event_order(order_doc, order_ctx)[0], chk_event_order(order_doc, order_ctx)[1])
 
     # Against the real documentation, if the frontend's toolchain is present.
     if ESBUILD.exists():

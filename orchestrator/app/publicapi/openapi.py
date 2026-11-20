@@ -1009,7 +1009,16 @@ def _schemas() -> Dict[str, Any]:
                 "model": {"type": "string", "example": model},
                 "output": {
                     "type": "array",
-                    "items": {"$ref": "#/components/schemas/OutputMessage"},
+                    "description": (
+                        "The assistant message when there is text, then one "
+                        "`function_call` item per call to your functions."
+                    ),
+                    "items": {
+                        "oneOf": [
+                            {"$ref": "#/components/schemas/OutputMessage"},
+                            {"$ref": "#/components/schemas/OutputFunctionCall"},
+                        ]
+                    },
                 },
                 "usage": {"$ref": "#/components/schemas/Usage"},
                 "max_output_tokens": {
@@ -1081,13 +1090,22 @@ def _schemas() -> Dict[str, Any]:
             "properties": {
                 "model": {"type": "string", "maxLength": 64, "example": model},
                 "input": {
-                    "description": "A string, or a list of messages.",
+                    "description": (
+                        "A string, or a list of messages and, for tool calling, "
+                        "`function_call` / `function_call_output` items."
+                    ),
                     "oneOf": [
                         {"type": "string", "minLength": 1},
                         {
                             "type": "array",
                             "minItems": 1,
-                            "items": {"$ref": "#/components/schemas/InputMessage"},
+                            "items": {
+                                "oneOf": [
+                                    {"$ref": "#/components/schemas/InputMessage"},
+                                    {"$ref": "#/components/schemas/FunctionCallInput"},
+                                    {"$ref": "#/components/schemas/FunctionCallOutputInput"},
+                                ]
+                            },
                         },
                     ],
                 },
@@ -1137,6 +1155,23 @@ def _schemas() -> Dict[str, Any]:
                         "it fails with the retry-safe `model_unavailable`."
                     ),
                     "properties": {"format": {"$ref": "#/components/schemas/TextFormat"}},
+                },
+                "tools": {
+                    "type": ["array", "null"],
+                    "maxItems": 64,
+                    "items": {"$ref": "#/components/schemas/Tool"},
+                    "description": (
+                        "Tool calling, `techsara-35b` only (any other model is a 400). "
+                        "At most 64 tools. Not together with JSON mode; a `function` "
+                        "tool not together with `background`. A response that ends "
+                        "with function calls is not durable: it is not resumable and "
+                        "its retry is a new request."
+                    ),
+                },
+                "tool_choice": {"$ref": "#/components/schemas/ToolChoice"},
+                "parallel_tool_calls": {
+                    "type": ["boolean", "null"],
+                    "description": "`false` asks the model for at most one call per turn. Needs `tools`.",
                 },
             },
             "example": {
@@ -1250,7 +1285,13 @@ def _schemas() -> Dict[str, Any]:
                 "messages": {
                     "type": "array",
                     "minItems": 1,
-                    "items": {"$ref": "#/components/schemas/ChatMessage"},
+                    "items": {
+                        "oneOf": [
+                            {"$ref": "#/components/schemas/ChatMessage"},
+                            {"$ref": "#/components/schemas/ChatAssistantToolMessage"},
+                            {"$ref": "#/components/schemas/ChatToolMessage"},
+                        ]
+                    },
                 },
                 "stream": {"type": "boolean", "default": False},
                 "store": {
@@ -1306,7 +1347,210 @@ def _schemas() -> Dict[str, Any]:
                     ),
                     "properties": {"enable_thinking": {"type": "boolean", "enum": [False]}},
                 },
+                "tools": {
+                    "type": ["array", "null"],
+                    "maxItems": 64,
+                    "items": {"$ref": "#/components/schemas/ChatTool"},
+                    "description": (
+                        "Tool calling, `techsara-35b` only (any other model is a 400). "
+                        "At most 64 tools. Not together with JSON mode; a `function` "
+                        "tool not together with `background`. A response that ends "
+                        "with function calls is not durable: it is not resumable and "
+                        "its retry is a new request."
+                    ),
+                },
+                "tool_choice": {
+                    "description": (
+                        "`auto`, `none`, `required`, `{\"type\": \"function\", "
+                        "\"function\": {\"name\": …}}` or `{\"type\": \"web_search\"}`."
+                    ),
+                    "oneOf": [
+                        {"type": "string", "enum": ["auto", "none", "required"]},
+                        {"type": "object"},
+                    ],
+                },
+                "parallel_tool_calls": {"type": ["boolean", "null"]},
             },
+        },
+        "Tool": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["type"],
+            "description": (
+                "One tool the model may call, `techsara-35b` only. `function` is "
+                "YOUR function: the call is returned to you and you send its "
+                "result back in the next request. `web_search`, `web_fetch` and "
+                "`deep_research` are run by this server and take no other field: "
+                "the model is called again with what they returned, and you "
+                "receive the answer. `web_search_preview` is accepted as "
+                "`web_search`."
+            ),
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["function", "web_search", "web_search_preview", "web_fetch", "deep_research"],
+                },
+                "name": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                    "description": "Required with `function`; not allowed otherwise. Not `web_search`, `web_fetch` or `deep_research`.",
+                },
+                "description": {"type": "string", "maxLength": 4096},
+                "parameters": {
+                    "type": "object",
+                    "description": "A JSON Schema of the function's arguments, at most 64 KiB.",
+                },
+                "strict": {"type": "boolean"},
+            },
+        },
+        "ToolChoice": {
+            "description": (
+                "`auto` (the default), `none`, `required`, or one tool: "
+                "`{\"type\": \"function\", \"name\": …}` or `{\"type\": \"web_search\"}`. "
+                "A forced choice applies to the first model call of the request."
+            ),
+            "oneOf": [
+                {"type": "string", "enum": ["auto", "none", "required"]},
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["type"],
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["function", "web_search", "web_search_preview", "web_fetch", "deep_research"],
+                        },
+                        "name": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+                    },
+                },
+            ],
+        },
+        "FunctionCallInput": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["type", "call_id", "name", "arguments"],
+            "description": "An earlier function call of the model, sent back as conversation.",
+            "properties": {
+                "type": {"type": "string", "enum": ["function_call"]},
+                "call_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:\\-]{1,128}$"},
+                "name": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+                "arguments": {"type": "string", "description": "A JSON object, as a string."},
+                "id": {"type": "string", "maxLength": 128},
+                "status": {"type": "string", "enum": ["completed", "in_progress", "incomplete"]},
+            },
+        },
+        "FunctionCallOutputInput": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["type", "call_id", "output"],
+            "description": (
+                "The result of a function call you ran. Its `call_id` must be "
+                "that of a `function_call` item earlier in `input`."
+            ),
+            "properties": {
+                "type": {"type": "string", "enum": ["function_call_output"]},
+                "call_id": {"type": "string", "pattern": "^[A-Za-z0-9_.:\\-]{1,128}$"},
+                "output": {"type": "string"},
+                "id": {"type": "string", "maxLength": 128},
+                "status": {"type": "string", "enum": ["completed", "in_progress", "incomplete"]},
+            },
+        },
+        "OutputFunctionCall": {
+            "type": "object",
+            "required": ["type", "id", "call_id", "name", "arguments", "status"],
+            "description": (
+                "A call to one of your functions. Run it and send the result "
+                "back as a `function_call_output` input item with this `call_id`."
+            ),
+            "properties": {
+                "type": {"type": "string", "enum": ["function_call"]},
+                "id": {"type": "string", "example": "fc_3f8a1c"},
+                "call_id": {"type": "string", "example": "call_3f8a1c"},
+                "name": {"type": "string"},
+                "arguments": {"type": "string", "description": "A JSON object, as a string."},
+                "status": {"type": "string", "enum": ["completed"]},
+            },
+        },
+        "ChatToolCall": {
+            "type": "object",
+            "required": ["id", "type", "function"],
+            "properties": {
+                "id": {"type": "string", "example": "call_3f8a1c"},
+                "type": {"type": "string", "enum": ["function"]},
+                "function": {
+                    "type": "object",
+                    "required": ["name", "arguments"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "arguments": {"type": "string", "description": "A JSON object, as a string."},
+                    },
+                },
+            },
+        },
+        "ChatAssistantToolMessage": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["role", "tool_calls"],
+            "description": "An assistant turn that called functions, echoed back as it was returned.",
+            "properties": {
+                "role": {"type": "string", "enum": ["assistant"]},
+                "content": {"type": ["string", "null"]},
+                "tool_calls": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"$ref": "#/components/schemas/ChatToolCall"},
+                },
+            },
+        },
+        "ChatToolMessage": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["role", "tool_call_id", "content"],
+            "description": "The result of one function call, by its `tool_call_id`.",
+            "properties": {
+                "role": {"type": "string", "enum": ["tool"]},
+                "tool_call_id": {"type": "string"},
+                "content": {"type": "string"},
+                "name": {"type": "string"},
+            },
+        },
+        "ChatTool": {
+            "description": (
+                "As `Tool` on /v1/responses; a function is spelled the Chat "
+                "Completions way, `{\"type\": \"function\", \"function\": {…}}`."
+            ),
+            "oneOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["type", "function"],
+                    "properties": {
+                        "type": {"type": "string", "enum": ["function"]},
+                        "function": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["name"],
+                            "properties": {
+                                "name": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+                                "description": {"type": "string", "maxLength": 4096},
+                                "parameters": {"type": "object"},
+                                "strict": {"type": "boolean"},
+                            },
+                        },
+                    },
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["type"],
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["web_search", "web_search_preview", "web_fetch", "deep_research"],
+                        },
+                    },
+                },
+            ],
         },
         "TextFormat": {
             "type": "object",
@@ -1355,10 +1599,21 @@ def _schemas() -> Dict[str, Any]:
                                 "type": "object",
                                 "properties": {
                                     "role": {"type": "string"},
-                                    "content": {"type": "string"},
+                                    "content": {
+                                        "type": ["string", "null"],
+                                        "description": "Null when the turn is function calls alone.",
+                                    },
+                                    "tool_calls": {
+                                        "type": "array",
+                                        "description": "Present only when the model called your functions.",
+                                        "items": {"$ref": "#/components/schemas/ChatToolCall"},
+                                    },
                                 },
                             },
-                            "finish_reason": {"type": ["string", "null"]},
+                            "finish_reason": {
+                                "type": ["string", "null"],
+                                "description": "`stop`, `length`, or `tool_calls`.",
+                            },
                         },
                     },
                 },
@@ -1416,7 +1671,12 @@ def _stream_description() -> str:
         "`response.output_text.delta` (×N) → `response.output_text.done` → "
         "`response.output_text.annotation.added` (×K, only for `file_citation`s) → "
         "`response.content_part.done` → `response.output_item.done` → "
-        "`response.completed`\n\n"
+        "`response.function_call_arguments.done` (×M, one per call to your "
+        "functions, each whole) → `response.completed`\n\n"
+        "A turn that is function calls alone has no message item: the item and "
+        "content-part events are absent and `output` holds the calls. While a "
+        "server tool (`web_search`, `web_fetch`, `deep_research`) runs, only "
+        "comment lines arrive.\n\n"
         "`response.queued` appears when the model is restarting and the request "
         "is waiting. The terminals are `response.completed`, `response.failed` "
         "and `error`, and **exactly one** is ever sent. `usage` is carried on "

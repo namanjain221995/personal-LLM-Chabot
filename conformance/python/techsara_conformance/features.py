@@ -230,6 +230,15 @@ FEATURES: Dict[str, Feature] = {
             "Files API design 2026-09-13, parity plan A.10-A.11",
             _text_has('"input_file"', "the `input_file` content part"),
         ),
+        # 2026-11-20: `tools` on both generating endpoints, techsara-35b only;
+        # the request schema declaring it is the evidence.
+        Feature(
+            "tool_calling",
+            "tools / tool_choice on /v1/responses and /v1/chat/completions: function calls returned to the caller, "
+            "capabilities.tools true on the chat model only",
+            "CONTRACT-3 §8.8, §10.2, §15",
+            _schema_has("ResponsesRequest", "tools"),
+        ),
     ]
 }
 
