@@ -118,7 +118,8 @@ sf_assistant/
     Dockerfile, compose.yaml  python:3.11-slim with exactly the lock; compose project sf-assistant, services
                               sf-assistant-web (the page) and sf-assistant-mcp (the MCP server, same image)
     run.sh                    page: up | logs | status | new-codes | restart-page;
-                              MCP: up-mcp | mcp-logs | mcp-status | new-mcp-token [--add] [--label NAME] | restart-mcp
+                              MCP: up-mcp | mcp-logs | mcp-status | new-mcp-token [--add] [--label NAME] | restart-mcp;
+                              ask service: up-ask | restart-ask | new-ask-token
   tests/                      fake records only: ported pipeline tests, test_web.py, test_charts.py, test_charts_flow.py,
                               render_check.js, golden/ hashes
 ```

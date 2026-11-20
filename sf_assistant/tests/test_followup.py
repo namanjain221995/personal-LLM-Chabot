@@ -954,6 +954,143 @@ def test_an_echo_that_names_something_or_does_not_point_back_stays(typed):
     assert F.rewrite(typed, M_J, FakeLLM(reply=typed)) == F.Rewrite(F.OK, typed)
 
 
+# ------------------------------------------------------------------- a pointer that goes back inside the question
+SELF_ANCHORED = [
+    # the four real refusals of the ask service (no name in them), word for word
+    "give me all the candidates got an offer. and also tell me how many interviews they have given for these offers.",
+    "give me all the candidates records who have received the offers. also tell me how many total applications happened"
+    " for them and how many interviews they got to reach this offer. find the offer received candidates based on the"
+    " interview outcome offer received.",
+    "give me all the candidates records who have received the offers. also tell me how many total applications happened"
+    " for them and how many interviews they got to reach this offer.",
+    "can you give me active candidates of last six months, monthwise. and also plot a graph for it.",
+    "can you give me active candidates of last six months, monthwise. and also plot a graph for it",
+    # the same shape: a later part after a sentence end or a joining word before a new ask
+    "how many candidates got an offer? how many interviews did they give?",
+    "list the candidates with offers and how many interviews they had",
+    "show the open interviews. who hosted those interviews?",
+    "list the leaves taken in May. how many of them were approved?",
+    "candidates ki list do jinhe offer mila aur unke kitne interviews hue?",
+    # records the name rules do not need, named before the pointer
+    "get me the mocks taken in May. how many of them passed?",
+    "list the submissions from last week. how many of them got interviews?",
+]
+
+
+@pytest.mark.parametrize("typed", SELF_ANCHORED)
+def test_an_echo_that_points_back_only_inside_itself_goes_on_as_typed(typed):
+    assert F._fragment(typed) and F._self_anchored(typed)
+    for turns in (M_J, M_C, M_COUNT):
+        out = F.rewrite(typed, turns, FakeLLM(reply=typed))
+        assert out == F.Rewrite(F.OK, typed) and out.question is typed
+
+
+@pytest.mark.parametrize("reply", [
+    "give me all the candidates who got an offer. and also tell me how many interviews they have given for these "
+    "offers.",
+    "Give me all the candidates got an offer, and also tell me how many interviews they have given for these offers?",
+])
+def test_a_cosmetic_echo_of_such_a_question_is_answered_with_the_typed_text(reply):
+    typed = SELF_ANCHORED[0]
+    assert F.rewrite(typed, M_C, FakeLLM(reply=reply)) == F.Rewrite(F.OK, typed)
+
+
+def test_a_typing_slip_in_such_a_question_stays_as_typed():
+    typed = ("give me all the candidates got an offer. and also tell me how many intervews they have given for these"
+             " offers.")
+    assert F.rewrite(typed, M_C, FakeLLM(reply=SELF_ANCHORED[0])) == F.Rewrite(F.OK, typed)
+    # a slip in the noun a pointer goes back to leaves the pointer with nothing typed before it: the old rules decide
+    assert not F._self_anchored(typed.replace("candidates", "candidtes"))
+
+
+@pytest.mark.parametrize("typed", [
+    # a lead, or no part before the pointer: it points at the turns
+    "and for them?", "how many interviews did they give?", "plot it", "what about these offers?", "same for last month",
+    "aur unke?", "how many offers did they make?", "how many candidates did they hire?",
+    "how many of them are candidates?",
+    # a list joined by "and" is one part
+    "how many offers and interviews did they give?",
+    # a pointer at one person, a measure, an ordinal, a stage, or a noun nothing before names
+    "show the interviews. what is his email?", "list candidates. and uska email?",
+    "list the candidates. plot this placement rate", "show the offers and plot that number",
+    "show the candidates. what about the second one?", "show the candidates. who is that person?",
+    "show the offers. how many are in that stage?", "show the offers. how many of those joined?",
+    "give me the interviews. how many applications did these candidates make?",
+    # a word about the chat or the rest of it, a contact ask
+    "show interviews. how many did they cancel same as before?", "list the candidates. who else did they hire?",
+    "list the candidates and their emails, also email them",
+])
+def test_an_echo_that_still_points_at_the_turns_stays_unclear(typed):
+    assert F._fragment(typed) and not F._self_anchored(typed)
+    out = F.rewrite(typed, M_C, FakeLLM(reply=typed))
+    assert out == F.Rewrite(F.UNCLEAR, reason="fragment_echo") and out.reply == typed
+
+
+@pytest.mark.parametrize("typed", [
+    # the part before the pointer asks nothing: it only restates the turns, or thanks for them
+    "the candidates you listed. how many interviews did they give?",
+    "the candidates you gave. how many offers did they get?",
+    "from your answer, take the candidates. how many interviews did they attend?",
+    "thanks for the candidates. now how many interviews did they give?",
+    "great list of candidates. and how many offers did they get?",
+    "the candidates from before. how many interviews did they attend?",
+    "the candidates mentioned. how many offers did they get?",
+    "the candidates in your reply. what is their interview count? how many did they clear?",
+    "ok got the interviews. now plot it", "ok thanks for the offers. and plot this",
+    "nice, the leaves. how many of them were approved?",
+    "the last list of candidates. how many interviews did they give?",
+    "candidates. how many interviews did they give?", "the offers. did they accept them?",
+    "the candidates list was good. now tell me how many interviews they gave",
+    "you listed 7 candidates. how many interviews did they give?",
+    "ok these are the candidates. how many offers did they get?",
+    "nice list of candidates. plot it",
+    "great, the candidates look right. and how many interviews did they give?",
+    "no, candidates not employees. how many interviews did they give?",
+    "for the recruiters. how many offers did they make?",
+    "upar wale candidates. unke interviews kitne hue?", "pehle wale candidates. unke offers kitne?",
+    "jo candidates aapne bataye. unke kitne interviews hue?", "pichle jawab ke candidates. unke interviews?",
+    "recruiters ka. aur unke offers kitne hain?",
+    # an ask, but about the turns: a count of their records, "you listed", "the other"
+    "those 5 candidates. how many interviews did they give?", "the 3 candidates. did they join?",
+    "show those 5 candidates. how many interviews did they give?",
+    "show the candidates you listed. how many interviews did they give?",
+    "the other candidates. how many interviews did they give?",
+    # a later part that asks nothing of its own, or leads like a follow-up
+    "the recruiters. what about them?", "show the recruiters. what about them?", "candidates? unke interviews?",
+    "show the candidates. unke interviews?", "how many offers last month? and for them, how many interviews?",
+    # "they" did something: people must stand before it, a thing is not enough
+    "interviews last week? how many did they cancel?", "how many interviews last week? how many did they cancel?",
+    "show the interviews. how many did they cancel?", "list the offers and how many interviews they had",
+    # "this offer", "this placement", "this batch": the same noun must stand in an earlier part that asks
+    "show the candidates who got these offers. how many interviews did they give?",
+    "candidates of this placement. how many interviews did they give?",
+    "list the candidates with this offer. how many interviews did they give?",
+    "list the candidates who got offers. how many interviews did they give for this placement?",
+    "candidates of this batch. and how many interviews did they give?",
+])
+def test_an_echo_whose_earlier_part_does_not_name_the_group_itself_stays_unclear(typed):
+    assert F._fragment(typed) and not F._self_anchored(typed)
+    for turns in (M_J, M_C, M_COUNT):
+        out = F.rewrite(typed, turns, FakeLLM(reply=typed))
+        assert out == F.Rewrite(F.UNCLEAR, reason="fragment_echo") and out.reply == typed
+
+
+def test_a_known_gap_a_they_of_the_turns_after_people_of_the_question_goes_on_as_typed():
+    # documented in _self_anchored: only the words can not tell that "they" means the recruiter of the turns here
+    assert F._self_anchored("show the candidates. how many did they hire?")
+
+
+@pytest.mark.parametrize("typed", ["i want it monthwise", "of last six months", "show the open interviews",
+                                   "list the offers and the interviews"])
+def test_a_question_with_no_pointer_is_not_self_anchored(typed):
+    assert not F._self_anchored(typed)
+
+
+def test_a_model_unclear_to_such_a_question_stays_refused():
+    # it names no subject of its own, so a model UNCLEAR stays a refusal (see the module text, step 1)
+    assert F.rewrite(SELF_ANCHORED[0], M_C, FakeLLM(reply="UNCLEAR")) == F.Rewrite(F.UNCLEAR, reason="unclear")
+
+
 def test_a_fragment_with_no_turn_goes_on_as_typed_with_no_call():
     llm = FakeLLM(reply="never read")
     assert F.rewrite("his email?", [], llm) == F.Rewrite(F.OK, "his email?") and llm.calls == []

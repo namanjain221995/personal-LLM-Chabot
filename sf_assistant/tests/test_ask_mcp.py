@@ -1967,7 +1967,7 @@ def test_new_ask_token_in_a_terminal_writes_only_a_hash(tmp_path):
 def test_run_sh_help_lists_the_commands_and_no_code(tmp_path):
     p = subprocess.run(["bash", str(WEB / "run.sh")], capture_output=True, text=True, timeout=60)
     assert p.returncode == 2
-    for word in ("up-ask", "new-ask-token", "sf-local-ai_ask-sock", "new-mcp-token", "restart-mcp"):
+    for word in ("up-ask", "restart-ask", "new-ask-token", "sf-local-ai_ask-sock", "new-mcp-token", "restart-mcp"):
         assert word in p.stdout, word
     assert "set -euo" not in p.stdout
 
@@ -2025,6 +2025,49 @@ def test_up_ask_stops_when_the_socket_volume_is_missing_and_creates_nothing(tmp_
     assert "no volume sf-local-ai_ask-sock" in p.stderr and "creates nothing shared" in p.stderr
     lines = calls.read_text().splitlines()
     assert lines == ["image inspect sf-assistant-web:local", "volume inspect sf-local-ai_ask-sock"]
+
+
+def test_restart_ask_recreates_only_its_own_service_after_the_checks_of_up_ask(tmp_path):
+    run = _run_tree(tmp_path)
+    (tmp_path / "web" / "compose.ask.yaml").write_text("name: fake\n")
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    calls = tmp_path / "docker_calls.txt"
+    (fake / "docker").write_text(f'#!/bin/sh\necho "$@" >> "{calls}"\nexit 0\n')
+    (fake / "docker").chmod(0o700)
+    env = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"}
+    p = subprocess.run(["bash", str(run), "restart-ask"], capture_output=True, text=True, timeout=60, env=env)
+    assert p.returncode == 0, p.stderr
+    lines = calls.read_text().splitlines()
+    assert lines == ["image inspect sf-assistant-web:local", "volume inspect sf-local-ai_ask-sock",
+                     f"compose -p sf-assistant-ask -f {tmp_path}/web/compose.ask.yaml up -d --no-build --force-recreate"]
+    for name in ("ask_log.jsonl", "ask_token.json"):
+        assert (tmp_path / ".private" / name).is_file()
+
+
+@pytest.mark.parametrize("missing, message", [("image inspect", "restart-ask never builds"),
+                                              ("volume inspect", "restart-ask creates nothing shared")])
+def test_restart_ask_stops_when_the_image_or_the_volume_is_missing(tmp_path, missing, message):
+    run = _run_tree(tmp_path)
+    (tmp_path / "web" / "compose.ask.yaml").write_text("name: fake\n")
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    calls = tmp_path / "docker_calls.txt"
+    (fake / "docker").write_text(
+        f'#!/bin/sh\necho "$@" >> "{calls}"\ncase "$1 $2" in "{missing}") exit 1;; esac\nexit 0\n')
+    (fake / "docker").chmod(0o700)
+    env = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"}
+    p = subprocess.run(["bash", str(run), "restart-ask"], capture_output=True, text=True, timeout=60, env=env)
+    assert p.returncode == 1 and message in p.stderr
+    assert not any(line.startswith("compose") for line in calls.read_text().splitlines())
+
+
+def test_restart_ask_refuses_a_bad_switch_before_anything_else(tmp_path):
+    run = _run_tree(tmp_path)
+    p = subprocess.run(["bash", str(run), "restart-ask"], capture_output=True, text=True, timeout=60,
+                       env={**os.environ, "SFA_RESOLVER": "maybe"})
+    assert p.returncode == 2 and "SFA_RESOLVER must be" in p.stderr
+    assert not (tmp_path / ".private").exists()
 
 
 def test_up_ask_refuses_a_bad_switch_before_anything_else(tmp_path):

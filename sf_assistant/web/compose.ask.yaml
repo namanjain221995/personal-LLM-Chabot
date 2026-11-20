@@ -1,5 +1,5 @@
 # Own compose project (sf-assistant-ask): the ask service, one MCP tool for the platform's /chat (web/ask_mcp.py). Start
-# and token: ./run.sh up-ask, ./run.sh new-ask-token (see ../docs/runbook.md). It runs on the image the page's project
+# and token: ./run.sh up-ask, restart-ask, new-ask-token (../docs/runbook.md). It runs on the image the page's project
 # builds and never builds it (the page and the MCP server run on that image). It listens on no TCP port, only on a Unix
 # socket in the named volume sf-local-ai_ask-sock, which the platform's compose creates: only a container with that
 # volume can reach it. It never touches the sf-local-ai stack otherwise: it mounts that stack's data volume READ-ONLY

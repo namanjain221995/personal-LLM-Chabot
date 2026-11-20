@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # sf-assistant web page: ./run.sh up | logs | status | new-codes | restart-page
 #               MCP server: ./run.sh up-mcp | mcp-logs | mcp-status | new-mcp-token | restart-mcp
-#               ask service: ./run.sh up-ask | new-ask-token
+#               ask service: ./run.sh up-ask | restart-ask | new-ask-token
 #
 #   up            build the image and start the container (docker compose -p sf-assistant up -d --build);
 #                 creates ../.private (mode 700). It never creates or prints codes: sign-in answers
@@ -28,6 +28,8 @@
 #                 creates the socket's volume sf-local-ai_ask-sock, which the platform's compose owns. It stops when
 #                 either is missing. Creates its two files in ../.private first: ask_log.jsonl, ask_token.json (empty
 #                 until new-ask-token). Stop it with docker stop sf-assistant-ask
+#   restart-ask   recreate only the ask service on the same image, after the same checks as up-ask (after a change to
+#                 src/, prompts/ or knowledge/objects/: it reads them once, at its start)
 #   new-ask-token new bearer token of the ask service, printed once (only its SHA-256 hash is stored in
 #                 ../.private/ask_token.json; older tokens stop working at their next request). Same rule as
 #                 new-mcp-token: your own terminal only (it refuses to print into a pipe or a file)
@@ -220,12 +222,25 @@ case "${1:-}" in
     echo "Ask service: http://sf-assistant-ask/mcp on the Unix socket /run/sf-assistant-ask/ask.sock of the volume ${ASK_VOLUME}"
     echo "             (Authorization: Bearer <token from ./run.sh new-ask-token>)"
     ;;
+  restart-ask)
+    check_switch
+    ensure_ask_files
+    if ! docker image inspect "$ASK_IMAGE" >/dev/null 2>&1; then
+      echo "no image ${ASK_IMAGE}: restart-ask never builds it (the page and the MCP server run on it); ./run.sh up does" >&2
+      exit 1
+    fi
+    if ! docker volume inspect "$ASK_VOLUME" >/dev/null 2>&1; then
+      echo "no volume ${ASK_VOLUME}: the platform's compose creates it (writable by uid $(id -u)); restart-ask creates nothing shared" >&2
+      exit 1
+    fi
+    ask_compose up -d --no-build --force-recreate
+    ;;
   new-ask-token)
     ensure_private
     python3 -I "$HERE/../src/sf_assistant/server/auth.py" new "$PRIVATE/ask_token.json" --name ask --command new-ask-token "${@:2}"
     ;;
   *)
-    sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac
