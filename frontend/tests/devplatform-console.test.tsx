@@ -699,7 +699,7 @@ const MODEL = {
   object: 'model',
   owned_by: 'techsara',
   status: 'available',
-  capabilities: { chat: true, streaming: true, vision: true, tools: false, embeddings: false },
+  capabilities: { chat: true, streaming: true, vision: true, tools: true, embeddings: false },
   max_input_tokens: 1000000,
   max_output_tokens: 8192,
   enabled: true,
@@ -1545,6 +1545,7 @@ describe('the models table', () => {
       'Chat',
       'Streaming',
       'Vision',
+      'Tools',
     ]);
     const user = userEvent.setup();
     await user.click(screen.getByRole('switch', { name: /publish techsara-35b/i }));
@@ -2049,7 +2050,8 @@ function capabilities(...on: string[]) {
 const CATALOGUE = [
   {
     id: 'techsara-35b', object: 'model', owned_by: 'techsara', status: 'available', kind: 'chat',
-    capabilities: capabilities('chat', 'streaming', 'vision', 'background'), endpoints: CHAT_ENDPOINTS,
+    // Tool calling (2026-11-20, CONTRACT §8.8): the main model only.
+    capabilities: capabilities('chat', 'streaming', 'vision', 'tools', 'background'), endpoints: CHAT_ENDPOINTS,
     context_window: 1_000_000, max_input_tokens: 999_232, max_output_tokens: 1_000_000,
     default_max_output_tokens: 8192, limits: { max_images_per_request: 16 }, enabled: true,
   },
@@ -2115,7 +2117,7 @@ describe('the models page lists every model the platform runs', () => {
       within(within(table).getByRole('list', { name: `${id} capabilities` }))
         .getAllByRole('listitem')
         .map((li) => li.textContent);
-    expect(badges('techsara-35b')).toEqual(['Chat', 'Streaming', 'Vision', 'Background']);
+    expect(badges('techsara-35b')).toEqual(['Chat', 'Streaming', 'Vision', 'Tools', 'Background']);
     expect(badges('techsara-ocr')).toEqual(['Chat', 'Streaming', 'Vision', 'OCR', 'Background']);
     expect(badges('techsara-embed')).toEqual(['Embeddings']);
     expect(badges('techsara-rerank')).toEqual(['Rerank']);

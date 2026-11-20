@@ -1459,6 +1459,33 @@ def _wall_clock_for(wall_clock_s: Any) -> Optional[float]:
     return _wall_clock_for_call(value)
 
 
+def _tool_call_fragments(delta: object) -> List[str]:
+    """One streamed delta's `tool_calls`, each as a JSON string of
+    `{index, id, name, arguments}`.
+
+    The engine sends a call in pieces: the first carries `id` and
+    `function.name`, the rest carry the next fragment of `function.arguments`.
+    Nothing is assembled or parsed here; the caller owns that, because only it
+    knows when the stream ended."""
+    import json
+
+    out: List[str] = []
+    for item in _delta_value(delta, "tool_calls") or []:
+        function = _delta_value(item, "function")
+        index = _delta_value(item, "index")
+        out.append(
+            json.dumps(
+                {
+                    "index": int(index) if isinstance(index, int) else 0,
+                    "id": str(_delta_value(item, "id") or ""),
+                    "name": str(_delta_value(function, "name") or "") if function is not None else "",
+                    "arguments": str(_delta_value(function, "arguments") or "") if function is not None else "",
+                }
+            )
+        )
+    return out
+
+
 async def stream_chat_events(
     messages: Sequence[dict],
     *,
@@ -1475,6 +1502,9 @@ async def stream_chat_events(
     admission_run_id: Optional[str] = None,
     answer_plan: Optional[Any] = None,
     response_format: Optional[dict] = None,
+    tools: Optional[Sequence[dict]] = None,
+    tool_choice: Optional[Any] = None,
+    parallel_tool_calls: Optional[bool] = None,
 ) -> AsyncIterator[Tuple[str, str]]:
     """Streaming completion from the selected model, yielding (kind, delta)
     pairs: ("reasoning", <delta.reasoning_content>) for vLLM thinking deltas
@@ -1482,6 +1512,14 @@ async def stream_chat_events(
 
     `response_format` (/v1 JSON mode, 2026-10-27): sent to the engine as is,
     which constrains decoding to it. None — every chat caller — sends no key.
+
+    `tools` (/v1 tool calling, 2026-11-20): OpenAI function definitions, sent
+    to the engine with `tool_choice` (and `parallel_tool_calls` when given).
+    The engine's own parser turns the model's call into structured deltas;
+    each one is yielded as ("tool_call", <JSON of {index, id, name,
+    arguments}>), where `arguments` is the next FRAGMENT of the JSON string.
+    That kind is yielded only when `tools` was passed, so a caller that
+    passes none — every chat caller — sees the two kinds it always has.
 
     THE NO-TIMEOUT KEYWORDS (2026-09-13, the /v1 no-timeout design, revision
     2). Every one defaults to exactly what chat has always had, so a chat
@@ -1622,6 +1660,11 @@ async def stream_chat_events(
     )
     if response_format is not None:
         request["response_format"] = response_format
+    if tools:
+        request["tools"] = [dict(tool) for tool in tools]
+        request["tool_choice"] = "auto" if tool_choice is None else tool_choice
+        if parallel_tool_calls is not None:
+            request["parallel_tool_calls"] = bool(parallel_tool_calls)
     # A positive per-call clock on the shared transport keeps THE TRANSPORT
     # INVARIANT with a per-request read timeout when it outlasts
     # LLM_REQUEST_TIMEOUT (PR #65). No clock, or a caller-chosen read timeout
@@ -1805,6 +1848,9 @@ async def stream_chat_events(
             if content:
                 token_seen += 1
                 yield "token", str(content)
+            if tools:
+                for fragment in _tool_call_fragments(delta):
+                    yield "tool_call", fragment
     # Usage telemetry (log-only): with budgets off this is the record of what
     # unbounded thinking actually cost, and the data a future budget decision
     # would be made from.

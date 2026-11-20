@@ -107,6 +107,8 @@ from .search import (
     domain_cap,
 )
 
+from . import search as _search  # noqa: E402 - `ephemeral`: a run that keeps nothing
+
 log = logging.getLogger(__name__)
 
 Emit = Callable[[str, dict], Awaitable[None]]
@@ -818,6 +820,10 @@ class ResearchState:
 
 
 def _rlog(state: ResearchState, msg: str, *args) -> None:
+    if _search.is_ephemeral():
+        # A run that must leave no trace (the /v1 tool): these lines carry
+        # the question and the queries.
+        return
     log.info("research[%s] " + msg, state.research_id[:8], *args)
 
 
@@ -2697,6 +2703,8 @@ async def _persist_claims(state: ResearchState) -> None:
     * `origin_user_id` / `origin_conversation_id` make the row attributable
       and purgeable with the conversation.
     """
+    if _search.is_ephemeral():
+        return
     wanted: List[Tuple[str, str, Optional[date], float, List[int]]] = []
     for res in state.resolutions.values():
         if res.status not in (STATUS_CURRENT, STATUS_CONFLICTING):
@@ -2771,6 +2779,8 @@ async def _persist_claims(state: ResearchState) -> None:
 async def _queue_primary_crawls(state: ResearchState) -> None:
     """The top primary domains this run found get a bounded background
     crawl, so the NEXT question about them answers from the corpus."""
+    if _search.is_ephemeral():
+        return
     if not settings.deep_research_background_crawl:
         return
     try:
@@ -3312,9 +3322,14 @@ async def _run(
     # research analytics and making `frees_in_s` quote a dead run's budget to
     # the next person refused a slot. Keeping the task means the id survives
     # the cancellation and the row is closed like every other exit.
-    creating: Optional["asyncio.Future"] = asyncio.ensure_future(
-        db.run_in_thread(
-            db.create_research_run, conversation_id, user_id, message, state.research_id
+    creating: Optional["asyncio.Future"] = (
+        # An ephemeral run (the /v1 tool) has no row: nothing of it is kept.
+        None
+        if _search.is_ephemeral()
+        else asyncio.ensure_future(
+            db.run_in_thread(
+                db.create_research_run, conversation_id, user_id, message, state.research_id
+            )
         )
     )
 

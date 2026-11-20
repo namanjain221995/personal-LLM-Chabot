@@ -84,8 +84,10 @@ def test_a_parameter_the_platform_cannot_honour_is_rejected_and_never_ignored():
     # send. CONTRACT §8: rejected, never silently ignored.
     for field, value in (
         ("top_p", 0.9),
-        ("tools", []),
-        ("tool_choice", "auto"),
+        # `tools` and `tool_choice` are honoured since 2026-11-20 (§8.8); the
+        # older function-calling spelling still is not.
+        ("functions", []),
+        ("function_call", "auto"),
         ("n", 2),
         ("seed", 7),
         ("logit_bias", {}),
@@ -793,8 +795,8 @@ def test_the_registry_declares_the_six_public_ids_with_the_flagship_first():
     assert model.chat is True and model.streaming is True
     # Verified 2026-09-09: the main model IS a vision-language model.
     assert model.vision is True
-    # CONTRACT §7 exposes no tools on /v1.
-    assert model.tools is False and model.embeddings is False
+    # CONTRACT §8.8 (2026-11-20): tool calling, on the main model.
+    assert model.tools is True and model.embeddings is False
     assert model.status == "available"
 
 

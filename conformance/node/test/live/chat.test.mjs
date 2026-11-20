@@ -9,6 +9,13 @@ import { pngDataUrl } from '../../lib/media.mjs';
 
 const messages = [{ role: 'user', content: 'Reply with the single word: ok' }];
 
+/** CONTRACT-3 §8.8 (2026-11-20): the one function the tool-calling test declares. */
+const ORDER_FUNCTION = {
+  name: 'get_order_status',
+  description: 'Look up the delivery status of one order.',
+  parameters: { type: 'object', properties: { order_id: { type: 'string' } }, required: ['order_id'] },
+};
+
 describe('Chat Completions', { skip: liveSkipReason }, () => {
   it('chat.completions.create with max_tokens returns one assistant choice, a finish_reason and usage', async () => {
     const { client } = makeClient();
@@ -119,5 +126,31 @@ describe('Chat Completions', { skip: liveSkipReason }, () => {
       max_tokens: 16,
     });
     assert.match(c.choices[0].message.content.toLowerCase(), /blue/);
+  });
+
+  itPlanned('tool-calling', 'a forced function call returns tool_calls, and the tool result is answered', async () => {
+    const { client } = makeClient();
+    const tools = [{ type: 'function', function: ORDER_FUNCTION }];
+    const convo = [{ role: 'user', content: 'Where is order 1182?' }];
+    const first = await client.chat.completions.create({
+      model: env.chatModel, messages: convo, tools, tool_choice: 'required', max_tokens: 256, temperature: 0,
+    });
+    const choice = first.choices[0];
+    assert.equal(choice.finish_reason, 'tool_calls');
+    const calls = choice.message.tool_calls ?? [];
+    assert.ok(calls.length > 0, 'tool_choice required returned no tool_calls');
+    for (const call of calls) {
+      assert.match(call.id, /^call_[0-9a-f]{24}$/);
+      assert.equal(call.type, 'function');
+      assert.equal(call.function.name, 'get_order_status');
+      assert.equal(typeof call.function.arguments, 'string');
+    }
+    convo.push(choice.message);
+    for (const call of calls) convo.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ status: 'shipped' }) });
+    const second = await client.chat.completions.create({
+      model: env.chatModel, messages: convo, tools, tool_choice: 'none', max_tokens: 64, temperature: 0,
+    });
+    assert.ok(['stop', 'length'].includes(second.choices[0].finish_reason), `finish_reason ${second.choices[0].finish_reason}`);
+    assert.ok((second.choices[0].message.content ?? '').trim().length > 0, 'no answer after the tool result');
   });
 });

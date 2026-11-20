@@ -41,6 +41,7 @@ NEW_DOC = {
         "Response": {"properties": {"incomplete_details": {}}},
         "ChatCompletionRequest": {"properties": {"max_completion_tokens": {}}},
         "InputImage": {"properties": {"type": {"enum": ["input_image"]}}},
+        "ResponsesRequest": {"properties": {"tools": {}}},
     }},
 }
 
@@ -56,6 +57,7 @@ def test_a_schema_that_declares_a_feature_marks_exactly_that_feature_built():
     assert built == {
         "model_catalogue", "output_ceiling", "max_completion_tokens", "idempotency_in_flight_409", "limits_off",
         "capacity_gates", "image_input", "embeddings", "rerank", "audio_transcriptions", "uploads_resume",
+        "tool_calling",
     }
 
 

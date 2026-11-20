@@ -1,6 +1,9 @@
 """POST /v1/chat/completions through the SDK (CONTRACT-3 §8.2)."""
 from __future__ import annotations
 
+import json
+import re
+
 import openai
 import pytest
 
@@ -72,12 +75,48 @@ def test_a_streamed_chat_completion_without_include_usage_sends_no_usage(client,
 
 
 def test_an_unsupported_chat_field_is_refused_by_name(client, target):
+    # `tools` was the field used here until tool calling shipped (2026-11-20,
+    # §8.8); `top_p` is refused on every model and every deployment.
     with pytest.raises(openai.BadRequestError) as caught:
-        client.chat.completions.create(
-            model=target.models["chat"], messages=MESSAGES, max_tokens=4, tools=[{"type": "function", "function": {"name": "f", "parameters": {}}}]
-        )
+        client.chat.completions.create(model=target.models["chat"], messages=MESSAGES, max_tokens=4, top_p=0.5)
     error = asserts.sdk_error(caught.value, code="invalid_request_error")
-    assert error["param"] == "tools" or "tools" in error["message"], error
+    assert error["param"] == "top_p" or "top_p" in error["message"], error
+
+
+ORDER_FUNCTION = {
+    "name": "get_order_status",
+    "description": "Look up the delivery status of one order.",
+    "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]},
+}
+
+
+@pytest.mark.feature("tool_calling")
+def test_a_function_call_round_trip_returns_tool_calls_then_an_answer(client, target):
+    """§8.8: a forced call comes back as `tool_calls` + finish_reason tool_calls;
+    the assistant turn echoed back with a `tool` message is accepted and answered."""
+    tools = [{"type": "function", "function": ORDER_FUNCTION}]
+    messages = [{"role": "user", "content": "Where is order 1182?"}]
+    first = client.chat.completions.create(
+        model=target.models["chat"], messages=messages, tools=tools, tool_choice="required", max_tokens=256, temperature=0
+    )
+    choice = first.choices[0]
+    assert choice.finish_reason == "tool_calls", f"finish_reason {choice.finish_reason!r}"
+    calls = choice.message.tool_calls or []
+    assert calls, "tool_choice required returned no tool_calls"
+    for call in calls:
+        assert re.fullmatch(r"call_[0-9a-f]{24}", call.id), call.id
+        assert call.type == "function" and call.function.name == "get_order_status", call
+        assert isinstance(call.function.arguments, str)
+
+    messages.append(choice.message)
+    for call in calls:
+        messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps({"status": "shipped"})})
+    second = client.chat.completions.create(
+        model=target.models["chat"], messages=messages, tools=tools, tool_choice="none", max_tokens=64, temperature=0
+    )
+    assert second.object == "chat.completion"
+    assert second.choices[0].finish_reason in ("stop", "length"), second.choices[0].finish_reason
+    assert (second.choices[0].message.content or "").strip(), "no answer after the tool result"
 
 
 @pytest.mark.feature("max_completion_tokens")

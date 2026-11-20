@@ -112,6 +112,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Sequence,
     Set,
     Tuple,
 )
@@ -1679,6 +1680,7 @@ async def _run_synchronous(
             finish_reason=finished.chat_finish_reason(),
             usage=counted,
             max_output_tokens=finished.max_output_tokens,
+            tool_calls=finished.tool_calls,
         )
     )
 
@@ -2083,7 +2085,24 @@ def _chat_body(
     finish_reason: str,
     usage: Optional[models.Usage],
     max_output_tokens: Optional[int] = None,
+    tool_calls: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    message: Dict[str, Any] = {"role": "assistant", "content": content}
+    if tool_calls:
+        # Tool calling (2026-11-20): the calls to the caller's functions, in
+        # the reference shape; `content` is null when the model wrote none.
+        message["content"] = content or None
+        message["tool_calls"] = [
+            {
+                "id": str(call.get("call_id") or ""),
+                "type": "function",
+                "function": {
+                    "name": str(call.get("name") or ""),
+                    "arguments": str(call.get("arguments") or "{}"),
+                },
+            }
+            for call in tool_calls
+        ]
     body = {
         "id": completion_id,
         "object": "chat.completion",
@@ -2092,7 +2111,7 @@ def _chat_body(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
+                "message": message,
                 "finish_reason": finish_reason,
             }
         ],
@@ -2584,6 +2603,12 @@ def durable_generation_on(request_model: models.ResponsesRequest) -> bool:
     """Whether this generation runs durably: `store` true and a running
     durable runtime (main.py's lifespan starts it; a process whose schema
     check failed keeps it off and serves the pre-durable path)."""
+    if request_model.has_function_tools():
+        # Tool calling (2026-11-20): a call to the caller's function is an
+        # output the durable event log has no record kind for, so such a
+        # request runs on the non-durable path — it is short, ends at the
+        # call, and its retry is a new request.
+        return False
     return bool(request_model.store) and durable.is_active()
 
 
@@ -3695,6 +3720,10 @@ _CHAT_FIELDS = (
     # API already applies, thinking off — both HONOURED, not dropped.
     "response_format",
     "chat_template_kwargs",
+    # 2026-11-20: tool calling, see publicapi/tools.py.
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
 )
 
 _JSON_SCHEMA_FIELDS = ("name", "schema", "strict", "description")
@@ -3757,6 +3786,152 @@ def _check_chat_template_kwargs(value: Any) -> None:
             "This API runs with thinking off; enable_thinking must be false.",
             param="chat_template_kwargs.enable_thinking",
         )
+
+
+_CHAT_FUNCTION_FIELDS = ("name", "description", "parameters", "strict")
+#: Keys an SDK writes into an assistant message it echoes back, with nothing
+#: in them. Dropped when empty; a value in one is still an unsupported field.
+_CHAT_ECHO_FIELDS = ("refusal", "audio", "function_call", "annotations", "name")
+
+
+def _chat_tools(value: Any) -> Any:
+    """Chat's `tools` → the Responses spelling (`function`'s nested object
+    flattened; a built-in tool is spelled the same on both). The values are
+    validated once, by `models.Tool`."""
+    if not isinstance(value, list):
+        raise errors.invalid_request("tools must be a list.", param="tools")
+    converted = []
+    for index, tool in enumerate(value):
+        param = f"tools.{index}"
+        if not isinstance(tool, Mapping):
+            raise errors.invalid_request("Each tool must be an object.", param=param)
+        if tool.get("type") != "function":
+            converted.append(dict(tool))
+            continue
+        function = tool.get("function")
+        unknown = sorted(key for key in tool if key not in ("type", "function"))
+        if unknown or not isinstance(function, Mapping):
+            raise errors.invalid_request(
+                "A function tool must be {\"type\": \"function\", \"function\": {\"name\": …}}.",
+                param=param,
+            )
+        extra = sorted(key for key in function if key not in _CHAT_FUNCTION_FIELDS)
+        if extra:
+            raise errors.invalid_request(
+                f"Unsupported field in a function: {extra[0]}.", param=f"{param}.function"
+            )
+        converted.append({"type": "function", **function})
+    return converted
+
+
+def _chat_tool_choice(value: Any) -> Any:
+    if not isinstance(value, Mapping) or value.get("type") != "function":
+        return value
+    function = value.get("function")
+    unknown = sorted(key for key in value if key not in ("type", "function"))
+    if unknown or not isinstance(function, Mapping) or sorted(function) != ["name"]:
+        raise errors.invalid_request(
+            "A function tool_choice must be {\"type\": \"function\", \"function\": {\"name\": …}}.",
+            param="tool_choice",
+        )
+    return {"type": "function", "name": function.get("name")}
+
+
+def _chat_tool_text(content: Any, where: str) -> Any:
+    """A `tool` message's content: a string, or text parts joined."""
+    if not isinstance(content, list):
+        return content
+    texts = []
+    for index, part in enumerate(content):
+        if not isinstance(part, Mapping) or part.get("type") != "text" or not isinstance(part.get("text"), str):
+            raise errors.invalid_request(
+                "A tool message's content must be a string or text parts.", param=f"{where}.{index}"
+            )
+        texts.append(part["text"])
+    return "\n".join(texts)
+
+
+def _chat_messages(messages: List[Any]) -> List[Any]:
+    """Chat `messages` → Responses `input` items.
+
+    A plain turn stays one message. An assistant turn with `tool_calls`
+    becomes its text (when it has any) and one `function_call` item per call;
+    a `tool` turn becomes a `function_call_output`. Anything that is not a
+    well-formed tool turn is passed through for the one validator to refuse.
+    """
+    items: List[Any] = []
+    for index, message in enumerate(messages):
+        where = f"messages.{index}"
+        if not isinstance(message, Mapping):
+            items.append(message)
+            continue
+        role = message.get("role")
+        if role == "tool":
+            unknown = sorted(key for key in message if key not in ("role", "content", "tool_call_id", "name"))
+            if unknown:
+                raise errors.invalid_request(
+                    f"Unsupported field in a tool message: {unknown[0]}.", param=where
+                )
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message.get("tool_call_id"),
+                    "output": _chat_tool_text(message.get("content"), f"{where}.content"),
+                }
+            )
+            continue
+        if role == "assistant":
+            message = {
+                key: value
+                for key, value in message.items()
+                if not (key in _CHAT_ECHO_FIELDS and (value is None or value == []))
+            }
+        calls = message.get("tool_calls") if role == "assistant" else None
+        if role == "assistant" and "tool_calls" in message and not calls:
+            message = {key: value for key, value in message.items() if key != "tool_calls"}
+        if not calls:
+            if "content" in message:
+                message = {**message, "content": _chat_content(message.get("content"), f"{where}.content")}
+            items.append(message)
+            continue
+        if not isinstance(calls, list):
+            raise errors.invalid_request("tool_calls must be a list.", param=f"{where}.tool_calls")
+        unknown = sorted(key for key in message if key not in ("role", "content", "tool_calls"))
+        if unknown:
+            raise errors.invalid_request(
+                f"Unsupported field in an assistant message: {unknown[0]}.", param=where
+            )
+        content = message.get("content")
+        if isinstance(content, list):
+            content = _chat_tool_text(content, f"{where}.content")
+        if content is not None and not isinstance(content, str):
+            raise errors.invalid_request("content must be a string or null.", param=f"{where}.content")
+        if content and content.strip():
+            items.append({"role": "assistant", "content": content})
+        for position, call in enumerate(calls):
+            param = f"{where}.tool_calls.{position}"
+            function = call.get("function") if isinstance(call, Mapping) else None
+            if (
+                not isinstance(call, Mapping)
+                or call.get("type", "function") != "function"
+                or not isinstance(function, Mapping)
+                or sorted(key for key in call if key not in ("id", "type", "function", "index"))
+                or sorted(key for key in function if key not in ("name", "arguments"))
+            ):
+                raise errors.invalid_request(
+                    "Each tool call must be {\"id\", \"type\": \"function\", "
+                    "\"function\": {\"name\", \"arguments\"}}.",
+                    param=param,
+                )
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call.get("id"),
+                    "name": function.get("name"),
+                    "arguments": function.get("arguments"),
+                }
+            )
+    return items
 
 
 def _chat_content(content: Any, where: str) -> Any:
@@ -3842,14 +4017,7 @@ def _from_chat_completions(payload: Any) -> Tuple[models.ResponsesRequest, bool]
         )
     messages = payload.get("messages")
     if isinstance(messages, list):
-        messages = [
-            (
-                {**message, "content": _chat_content(message.get("content"), f"messages.{index}.content")}
-                if isinstance(message, Mapping) and "content" in message
-                else message
-            )
-            for index, message in enumerate(messages)
-        ]
+        messages = _chat_messages(messages)
     body: Dict[str, Any] = {
         "model": payload.get("model"),
         "input": messages,
@@ -3870,6 +4038,12 @@ def _from_chat_completions(payload: Any) -> Tuple[models.ResponsesRequest, bool]
         _check_chat_template_kwargs(payload["chat_template_kwargs"])
     if payload.get("response_format") is not None:
         body["text"] = {"format": _chat_response_format(payload["response_format"])}
+    if payload.get("tools") is not None:
+        body["tools"] = _chat_tools(payload["tools"])
+    if payload.get("tool_choice") is not None:
+        body["tool_choice"] = _chat_tool_choice(payload["tool_choice"])
+    if payload.get("parallel_tool_calls") is not None:
+        body["parallel_tool_calls"] = payload["parallel_tool_calls"]
     try:
         parsed = models.parse_responses_request(body)
     except errors.ApiError as refusal:

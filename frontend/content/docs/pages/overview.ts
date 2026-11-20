@@ -58,11 +58,13 @@ library can point at this platform with a base-URL change.
 ## What is deliberately not here
 
 The API runs models. It does not reach the rest of the product: there is no
-endpoint for Salesforce data, retrieval or web search, deep research, file
-uploads, artifacts, conversation history, or anyone's saved memory — and no tool
-calling. Each of
-those is a separate product decision with its own threat model, and none of
-them is one flag away from being exposed.
+endpoint for Salesforce data, retrieval over the product's own data, the chat
+application's uploads, artifacts, conversation history, or anyone's saved
+memory. Each of those is a separate product decision with its own threat model,
+and none of them is one flag away from being exposed. Web search, page reading
+and deep research exist on the API only as [tools](/docs/tools) the model can
+call on \`/v1/responses\` and \`/v1/chat/completions\` — there is no search or
+research endpoint of its own.
 
 Two consequences worth knowing before you design against it:
 

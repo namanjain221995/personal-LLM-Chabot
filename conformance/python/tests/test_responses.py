@@ -1,6 +1,9 @@
 """POST /v1/responses, synchronous, through the SDK (CONTRACT-3 §8.1, §8.3, §9)."""
 from __future__ import annotations
 
+import json
+import re
+
 import openai
 import pytest
 
@@ -165,3 +168,36 @@ def test_hitting_the_applied_ceiling_reports_incomplete_details_and_stays_comple
     assert wire.get("incomplete_details") == {"reason": "max_output_tokens"}, wire.get("incomplete_details")
     assert wire.get("max_output_tokens") == 5, f"applied {wire.get('max_output_tokens')!r}"
     assert response.usage is not None and response.usage.output_tokens <= 5
+
+
+@pytest.mark.feature("tool_calling")
+def test_a_function_call_round_trip_returns_function_call_items_then_an_answer(client, target):
+    """§8.8: a forced call is a `function_call` output item of a completed
+    response; echoed back with its `function_call_output` it is answered."""
+    tools = [{
+        "type": "function",
+        "name": "get_order_status",
+        "description": "Look up the delivery status of one order.",
+        "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]},
+    }]
+    items = [{"role": "user", "content": "Where is order 1182?"}]
+    first = client.responses.create(
+        model=target.models["chat"], input=items, tools=tools, tool_choice="required", max_output_tokens=256, temperature=0
+    )
+    assert first.status == "completed", first.status
+    calls = [item for item in first.output if item.type == "function_call"]
+    assert calls, f"tool_choice required returned no function_call item: {[item.type for item in first.output]}"
+    for call in calls:
+        assert re.fullmatch(r"call_[0-9a-f]{24}", call.call_id), call.call_id
+        assert call.id == "fc_" + call.call_id[len("call_"):], (call.id, call.call_id)
+        assert call.name == "get_order_status" and call.status == "completed", call
+        assert isinstance(call.arguments, str)
+
+    for call in calls:
+        items.append(call)
+        items.append({"type": "function_call_output", "call_id": call.call_id, "output": json.dumps({"status": "shipped"})})
+    second = client.responses.create(
+        model=target.models["chat"], input=items, tools=tools, tool_choice="none", max_output_tokens=64, temperature=0
+    )
+    assert second.status == "completed", second.status
+    assert second.output_text.strip(), "no answer after the function_call_output"

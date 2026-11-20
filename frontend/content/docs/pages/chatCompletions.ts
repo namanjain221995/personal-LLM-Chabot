@@ -76,7 +76,11 @@ const S_WHAT_IS_DIFFERENT_AND_WILL_BE_DIFFERENT = `
   streamed chunk that carries \`finish_reason\`, add a top-level
   \`max_output_tokens\`: the output ceiling applied after clamping.
   \`finish_reason\` is \`length\` when the answer reached it.
-* **No tools.** See [tool calling](/docs/tools).
+* **Tools on \`${MODEL_ID}\` only.** Your own functions come back as
+  \`tool_calls\` with \`finish_reason: "tool_calls"\`; \`web_search\`,
+  \`web_fetch\` and \`deep_research\` are run by the server, which returns the
+  answer. The legacy \`functions\` and \`function_call\` fields are refused.
+  See [tool calling](/docs/tools).
 * **Errors are TechSara's envelope.** \`code\`, \`type\`, \`param\`,
   \`request_id\` — see [errors](/docs/errors).
 `;
@@ -133,9 +137,11 @@ dialect, which is **not** the Responses event grammar:
   sequence number, each one an object whose \`object\` is
   \`chat.completion.chunk\`;
 * the first chunk's delta announces the assistant role;
-* a chunk carrying \`finish_reason\` says why generation ended — \`stop\`, or
-  \`length\` when the answer hit its token ceiling — and carries the applied
-  \`max_output_tokens\`;
+* a chunk carrying \`finish_reason\` says why generation ended — \`stop\`,
+  \`length\` when the answer hit its token ceiling, or \`tool_calls\` when the
+  model called your functions — and carries the applied \`max_output_tokens\`;
+  the calls themselves arrive whole, in one chunk's \`delta.tool_calls\`, just
+  before it;
 * the stream ends with the literal line \`data: [DONE]\`;
 * with \`"stream_options": {"include_usage": true}\`, exactly one extra chunk
   goes out before \`[DONE]\`, with an empty \`choices\` array and the usage
@@ -199,11 +205,19 @@ const LATER_THE_FIELDS_THIS_ENDPOINT_ACCEPTS = `
 | \`stream_options\` | Optional, and only \`{"include_usage": true}\`. |
 | \`response_format\` | Optional. JSON mode, \`${MODEL_ID}\` only: \`{"type": "json_object"}\` or \`{"type": "json_schema", "json_schema": {…}}\`. \`{"type": "text"}\` is the default. See [JSON mode](#json-mode). |
 | \`chat_template_kwargs\` | Optional, and only \`{"enable_thinking": false}\` — which is how this API always runs. \`true\`, or any other key, is a \`400\`. |
+| \`tools\` | Optional. \`${MODEL_ID}\` only: \`{"type": "function", "function": {"name", "description", "parameters", "strict"}}\` for your own functions, and \`{"type": "web_search"}\`, \`{"type": "web_fetch"}\` or \`{"type": "deep_research"}\` for tools the server runs. Not together with \`response_format\`. See [tool calling](/docs/tools). |
+| \`tool_choice\` | Optional, with \`tools\`: \`"auto"\` (the default), \`"none"\`, \`"required"\`, \`{"type": "function", "function": {"name": "…"}}\` or \`{"type": "web_search"}\`. |
+| \`parallel_tool_calls\` | Optional boolean, with \`tools\`. Passed to the model as sent. |
 
 That is the complete list. **Any other field is a \`400\`** —
 \`"Unsupported field: top_p."\`, with the field in \`param\`. The same goes
 for an unknown key inside \`stream_options\`, \`response_format\` or
 \`chat_template_kwargs\`.
+
+With \`tools\`, a \`messages\` list may also hold the assistant turn that made
+the calls — its \`tool_calls\` as received, \`content\` text or \`null\` — and a
+\`{"role": "tool", "tool_call_id", "content"}\` turn per call with your result.
+A completion that ends in calls has \`finish_reason\` \`tool_calls\`.
 
 There is no \`background\` here: background work is a
 [Responses](/docs/background) feature, and this endpoint has no shape to

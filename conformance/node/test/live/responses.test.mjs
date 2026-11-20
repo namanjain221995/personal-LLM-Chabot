@@ -246,6 +246,39 @@ describe('Responses: synchronous', { skip: liveSkipReason }, () => {
     const err = await rejection(client.responses.create({ model: 'techsara-embed', input: SHORT, max_output_tokens: 16 }));
     assertEnvelope(err, { status: 400, type: 'invalid_request_error', param: 'model' });
   });
+
+  itPlanned('tool-calling', 'a forced function call is a function_call item, and its function_call_output is answered', async () => {
+    const { client } = makeClient();
+    const tools = [{
+      type: 'function',
+      name: 'get_order_status',
+      description: 'Look up the delivery status of one order.',
+      parameters: { type: 'object', properties: { order_id: { type: 'string' } }, required: ['order_id'] },
+    }];
+    const items = [{ role: 'user', content: 'Where is order 1182?' }];
+    const first = await client.responses.create({
+      model: env.chatModel, input: items, tools, tool_choice: 'required', max_output_tokens: 256, temperature: 0,
+    });
+    assert.equal(first.status, 'completed');
+    const calls = first.output.filter((item) => item.type === 'function_call');
+    assert.ok(calls.length > 0, `no function_call item: ${first.output.map((item) => item.type).join(', ')}`);
+    for (const call of calls) {
+      assert.match(call.call_id, /^call_[0-9a-f]{24}$/);
+      assert.equal(call.id, `fc_${call.call_id.slice('call_'.length)}`);
+      assert.equal(call.name, 'get_order_status');
+      assert.equal(call.status, 'completed');
+      assert.equal(typeof call.arguments, 'string');
+    }
+    for (const call of calls) {
+      items.push(call);
+      items.push({ type: 'function_call_output', call_id: call.call_id, output: JSON.stringify({ status: 'shipped' }) });
+    }
+    const second = await client.responses.create({
+      model: env.chatModel, input: items, tools, tool_choice: 'none', max_output_tokens: 64, temperature: 0,
+    });
+    assert.equal(second.status, 'completed');
+    assert.ok(second.output_text.trim().length > 0, 'no answer after the function_call_output');
+  });
 });
 
 describe('Responses: streaming', { skip: liveSkipReason }, () => {

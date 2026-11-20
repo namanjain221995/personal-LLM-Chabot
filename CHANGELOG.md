@@ -1,5 +1,42 @@
 # Changelog
 
+## `/v1` tool calling: your own functions, plus web search, page reading and deep research run by the server (2026-11-20)
+
+`/v1` refused `tools` outright, so a program using the API could not do what
+the chat application does every day: look something up, read a link, or run a
+research job. It also could not use the standard function-calling loop every
+OpenAI-shaped client library is built around. The engine has had a tool-call
+parser switched on since the Salesforce planner needed it; `/v1` now uses it.
+
+- `POST /v1/responses` and `POST /v1/chat/completions` accept `tools`,
+  `tool_choice` and `parallel_tool_calls`, on `techsara-35b` only
+  (`GET /v1/models` now says `"tools": true` for it).
+- **Function tools** are yours: the model's call comes back as `tool_calls`
+  with `finish_reason: "tool_calls"` (Chat) or `function_call` output items
+  (Responses), you run it, and you send the result back as a `tool` message or
+  a `function_call_output` item.
+- **Server tools** are run here and you get the answer: `web_search` (the chat
+  application's own search provider, reranker and page reader; the answer
+  links its sources), `web_fetch` (one public page or PDF, through the SSRF
+  guard and robots.txt) and `deep_research` (the research engine; minutes; the
+  report is the answer, with its source list appended). `web_search_preview`
+  is accepted as `web_search`.
+- Bounded: at most 6 model calls per request and 4 server tool runs per call;
+  the last call must answer. One API research run at a time.
+- Web text reaches the model fenced (a random tag per call) and labelled as
+  reference material, never as instructions. `web_fetch` reads only a URL
+  that appears in the conversation. One search or page read is stopped after
+  45 s. Nothing is stored or logged: no search log, no page write, no research
+  run row, no claims.
+- Not with JSON mode. Function tools not with `background`, and a request that
+  declares one is not durable; a run with tools is never continued after an
+  interrupt — it fails with the retry-safe `model_unavailable`.
+- `PUBLIC_API_TOOLS_ENABLED=false` turns the whole feature off; each server
+  tool has its own switch. A request without `tools`, and every chat-app call,
+  sends the engine exactly what it did before.
+- CONTRACT §8.8, API.md, OpenAPI and the `/docs` pages describe it;
+  `tests/test_publicapi_tools.py` pins it.
+
 ## `/v1` JSON mode: `response_format` and `text.format` constrain the answer to JSON (2026-10-27)
 
 A tenant moving from the raw vLLM port to the public API found that

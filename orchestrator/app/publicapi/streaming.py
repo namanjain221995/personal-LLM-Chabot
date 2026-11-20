@@ -78,7 +78,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping,
 
 from .. import llm
 from ..config import settings
-from . import capacity, engines, errors, events, models, planning, registry
+from . import capacity, engines, errors, events, models, planning, registry, tools
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +116,8 @@ PUBLIC_EFFORT = "fast"
 #: answer is the bug fourteen chat call sites had to be taught not to make.
 TOKEN_KIND = "token"
 REASONING_KIND = "reasoning"
+#: `llm.stream_chat_events` with `tools`: one fragment of a streamed call.
+TOOL_CALL_KIND = "tool_call"
 
 #: What a 503 tells the caller to wait before retrying. Short enough that a
 #: well-behaved client comes back inside a warm reload (3 m 32 s measured
@@ -184,6 +186,10 @@ class GenerationSpec:
     #: JSON mode (2026-10-27): the engine's `response_format`, or None. A
     #: stored spec from before this field loads with None.
     response_format: Optional[Dict[str, Any]] = None
+    #: Tool calling (2026-11-20): `ResponsesRequest.tool_config()`, or None.
+    #: Plain JSON, so a durable run's stored spec keeps it; a stored spec from
+    #: before this field loads with None.
+    tools: Optional[Dict[str, Any]] = None
 
     @property
     def planned(self) -> int:
@@ -217,6 +223,7 @@ def spec_from_plan(
         estimated_input_tokens=plan.estimated_input_tokens,
         bounded_input_tokens=plan.bounded_input_tokens,
         response_format=plan.response_format,
+        tools=plan.tools,
     )
 
 
@@ -259,9 +266,12 @@ class StreamOutcome:
     #: empty `output` in between two writes (CONTRACT §8.3 promises the text
     #: a timed-out response produced).
     keep_text: bool = False
+    #: Tool calling (2026-11-20): the calls to the CALLER's functions this
+    #: answer ended with (`tools.wire_calls`), in order. Empty otherwise.
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
 
     def chat_finish_reason(self) -> str:
-        return chat_finish_reason(self.finish_reason)
+        return chat_finish_reason(self.finish_reason, self.tool_calls)
 
     def usage_model(self) -> Optional[models.Usage]:
         return models.Usage.from_llm(self.usage)
@@ -277,7 +287,7 @@ class StreamOutcome:
             created_at=self.created_at,
             status=self.status,  # type: ignore[arg-type]
             model=self.model,
-            output=[models.OutputMessage.of(self.text)] if self.text else [],
+            output=models.output_items(self.text, self.tool_calls),
             usage=self.usage_model(),
             max_output_tokens=self.max_output_tokens,
             incomplete_details=(self.incomplete_details() if self.status == "completed" else None),
@@ -460,6 +470,20 @@ class Generation:
         self.streamed_deltas = 0
         #: Set when the one window retry ran: the `max_tokens` it was sent.
         self.retried_max_tokens: Optional[int] = None
+        #: Tool calling (2026-11-20): the calls to the CALLER's functions the
+        #: answer ended with (`tools.wire_calls`); set by the producer.
+        self.tool_calls: List[Dict[str, Any]] = []
+        #: True while a server tool runs: the engine is rightly silent, so the
+        #: liveness guard is not asked to judge that silence.
+        self._tool_running = False
+        #: True once a server tool wrote the answer itself (deep research).
+        self._tool_wrote_answer = False
+        #: UTF-8 bytes of tool results added to this attempt's prompt, and
+        #: True once that budget is spent: the next model call must answer.
+        self._tool_bytes = 0
+        self._must_answer = False
+        #: Model calls made so far for this attempt (1 without tools).
+        self.rounds = 0
         self._queue: "asyncio.Queue[Optional[_Chunk]]" = asyncio.Queue()
         self._task: Optional[asyncio.Task] = None
         self._last_tick = 0.0
@@ -517,6 +541,21 @@ class Generation:
                 # Only when asked, so every other /v1 call is sent exactly
                 # what it was before JSON mode existed.
                 kwargs["response_format"] = spec.response_format
+            if spec.tools:
+                # A call cannot be continued: the engine would be extending
+                # text while its parser waits for a call it never opened, and
+                # a server tool that already ran would run again.
+                if self.continue_final_message:
+                    raise ContinuationUnsupported()
+                first = self.rounds == 0
+                kwargs["tools"] = spec.tools.get("definitions") or []
+                kwargs["tool_choice"] = tools.engine_choice(
+                    spec.tools,
+                    first_round=first,
+                    last_round=self._must_answer or self.rounds + 1 >= tools.max_rounds(),
+                )
+                if spec.tools.get("parallel") is not None:
+                    kwargs["parallel_tool_calls"] = bool(spec.tools["parallel"])
             return llm.stream_chat_events(self.messages, **kwargs)
         resolved = engines.target(spec.engine)
         if resolved is None:
@@ -629,6 +668,8 @@ class Generation:
                 max_tokens: Optional[int] = None
                 while True:
                     stream = self._open_engine_stream(max_tokens)
+                    assembler = tools.CallAssembler()
+                    wrote = False
                     try:
                         async for kind, delta in stream:
                             if delta and _wall_clock_marker_pending():
@@ -645,11 +686,15 @@ class Generation:
                                     self.guard.chunk()
                                 if isinstance(tracked, capacity.PublicMainGeneration):
                                     tracked.first_token()
+                            if kind == TOOL_CALL_KIND:
+                                assembler.add(str(delta))
+                                continue
                             if kind != TOKEN_KIND:
                                 # A reasoning delta. `/v1` has no channel for
                                 # it and must not append it to the answer.
                                 continue
                             if delta:
+                                wrote = True
                                 self._queue.put_nowait(_Chunk(kind=TOKEN_KIND, text=str(delta)))
                     except asyncio.CancelledError:
                         raise
@@ -676,6 +721,18 @@ class Generation:
                         self.retried_max_tokens = retry
                         max_tokens = retry
                         continue
+                    self.rounds += 1
+                    if spec.tools and assembler and await self._after_calls(assembler, stream, wrote):
+                        # A server tool ran: the model is called again with
+                        # what it returned, with what is left of the output
+                        # ceiling — `max_output_tokens` bounds the request,
+                        # not each call (one streamed delta is one token).
+                        stream = None
+                        left = int(spec.max_tokens) - int(self.streamed_deltas)
+                        if left < 1:
+                            break
+                        max_tokens = left
+                        continue
                     break
         except asyncio.CancelledError:
             raise
@@ -693,6 +750,10 @@ class Generation:
                 self.finish_reason = llm.get_finish_reason()
             except Exception:  # noqa: BLE001 - a missing reason is "not reported"
                 self.finish_reason = None
+            if self._tool_wrote_answer and self.error is None and self.finish_reason != llm.WALL_CLOCK_FINISH:
+                # The reason on record is the tool's own last model call (or
+                # the call that asked for the tool); the answer is complete.
+                self.finish_reason = "stop"
             applied = getattr(llm, "get_applied_max_tokens", None)
             if callable(applied):
                 with contextlib.suppress(Exception):
@@ -708,11 +769,107 @@ class Generation:
                 self.usage = self._counted_usage()
             self._queue.put_nowait(None)
 
+    async def _after_calls(self, assembler: "tools.CallAssembler", stream: Any, wrote: bool) -> bool:
+        """The model asked for tools. True: server tools ran and the model
+        must be called again. False: the answer is over — the calls are the
+        caller's to run (`tool_calls`), or a server tool wrote the answer.
+
+        A turn that asks for the caller's functions AND a server tool returns
+        the caller's calls alone: the caller's next request has no place for
+        a result it never saw, and the model can ask for the search again."""
+        spec = self.spec
+        config = spec.tools or {}
+        ours, theirs = tools.split_calls(assembler.calls(), config)
+        if theirs:
+            self.tool_calls = tools.wire_calls(theirs)
+            tools.count_function_calls(theirs)
+            return False
+        if not ours or self._must_answer or self.rounds >= tools.max_rounds():
+            return False
+        ours = ours[: tools.max_calls_per_round()]
+        allowed = tuple(config.get("server") or ())
+        # The engine's stream is closed BEFORE a tool runs: an open response
+        # would hold its admission lane for the length of a web search.
+        with contextlib.suppress(BaseException):
+            await stream.aclose()
+        # This attempt's own copy: `spec.messages` is frozen and shared.
+        self.messages = [dict(message) for message in self.messages]
+        self.messages.append(
+            {"role": "assistant", "content": "", "tool_calls": [call.engine_form() for call in ours]}
+        )
+        if wrote:
+            # What the model said before calling the tool and what it says
+            # after are separate paragraphs of one answer.
+            self._emit_text("\n\n")
+        self._tool_running = True
+        try:
+            for call in ours:
+                began = time.monotonic()
+                result = await tools.run_server_tool(
+                    call,
+                    emit_text=self._emit_text,
+                    allowed=allowed,
+                    conversation=tools.conversation_text(self.messages),
+                )
+                # The tool and how it went, never its arguments: a query is
+                # the caller's prompt (CONTRACT §16).
+                log.info(
+                    "public %s generation %s ran %s (%s) in %.1fs",
+                    spec.engine, spec.response_id, call.name,
+                    "ok" if result.ok else "no result", time.monotonic() - began,
+                )
+                if result.terminal:
+                    # The tool wrote the answer itself (deep research).
+                    self._tool_wrote_answer = True
+                    return False
+                self.messages.append(
+                    {"role": "tool", "tool_call_id": call.id, "content": self._within_budget(result.content)}
+                )
+        finally:
+            self._tool_running = False
+            rearm = getattr(self.guard, "rearm", None)
+            if callable(rearm):
+                with contextlib.suppress(Exception):
+                    rearm()
+        return True
+
+    def _within_budget(self, content: str) -> str:
+        """A tool result, cut to what is left of this request's budget.
+
+        The planner checked the prompt the caller SENT against the input
+        ceiling; what the tools add was not there to check. So it is bounded
+        here, by the smaller of the setting and the room the window has left
+        (a byte is at least a token's worth), and once it is spent the next
+        model call must answer."""
+        spec = self.spec
+        budget = tools.result_budget_bytes()
+        window = int(spec.context_window or 0)
+        if window > 0 and spec.bounded_input_tokens is not None:
+            room = window - int(spec.bounded_input_tokens) - int(spec.context_reserve or 0) - int(spec.max_tokens)
+            budget = min(budget, max(0, room))
+        left = budget - self._tool_bytes
+        if left < 512:
+            self._must_answer = True
+            return "This result was left out: this request's tool budget is spent. Answer with what you have."
+        clipped = tools.clip_bytes(content, left)
+        self._tool_bytes += len(clipped.encode("utf-8"))
+        if budget - self._tool_bytes < 512:
+            self._must_answer = True
+        return clipped
+
+    def _emit_text(self, text: str) -> None:
+        """Answer text from a server tool, into the same queue the engine's
+        own text takes."""
+        if text:
+            self._queue.put_nowait(_Chunk(kind=TOKEN_KIND, text=str(text)))
+
     # -- the consumer -----------------------------------------------------
 
     def _tick(self, now: float) -> bool:
         """Tick the guard; True when it interrupted this attempt."""
         self._last_tick = now
+        if self._tool_running:
+            return False
         try:
             verdict = self.guard.tick()
         except Exception:  # noqa: BLE001 - a broken guard never ends a generation
@@ -906,6 +1063,7 @@ async def run_to_completion(
         outcome.text = "".join(pieces)
         outcome.usage = generation.usage
         outcome.finish_reason = generation.finish_reason
+        outcome.tool_calls = list(generation.tool_calls)
         outcome.max_output_tokens = generation.applied_max_output_tokens()
         outcome.duration_ms = int((time.monotonic() - started) * 1000)
         if generation.first_token_at is not None:
@@ -1020,13 +1178,14 @@ def _wire(
     error: Optional[errors.ApiError] = None,
     max_output_tokens: Optional[int] = None,
     finish_reason: Optional[str] = None,
+    tool_calls: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     return models.Response(
         id=spec.response_id,
         created_at=spec.created_at,
         status=status,  # type: ignore[arg-type]
         model=spec.model,
-        output=[models.OutputMessage.of(text)] if text else [],
+        output=models.output_items(text, tool_calls),
         usage=models.Usage.from_llm(usage),
         max_output_tokens=(spec.planned if max_output_tokens is None else max_output_tokens),
         incomplete_details=(
@@ -1160,15 +1319,25 @@ async def responses_sse(
             outcome.usage = generation.usage
             outcome.finish_reason = generation.finish_reason
             outcome.max_output_tokens = generation.applied_max_output_tokens()
-            if not emitter.item_open:
-                yield emitter.output_item_added()
-                yield emitter.content_part_added()
-            yield emitter.output_text_done(text)
-            annotations = await annotations_for(annotate, text)
-            for index, annotation in enumerate(annotations):
-                yield emitter.annotation_added(index, annotation)
-            yield emitter.content_part_done(text, annotations)
-            yield emitter.output_item_done(text, annotations)
+            outcome.tool_calls = list(generation.tool_calls)
+            annotations: List[Dict[str, Any]] = []
+            if text or not outcome.tool_calls:
+                # The assistant message. An answer that is ONLY function
+                # calls has none: its `output` holds the calls alone.
+                if not emitter.item_open:
+                    yield emitter.output_item_added()
+                    yield emitter.content_part_added()
+                yield emitter.output_text_done(text)
+                annotations = await annotations_for(annotate, text)
+                for index, annotation in enumerate(annotations):
+                    yield emitter.annotation_added(index, annotation)
+                yield emitter.content_part_done(text, annotations)
+                yield emitter.output_item_done(text, annotations)
+            for position, call in enumerate(outcome.tool_calls):
+                yield emitter.function_call_done(
+                    models.OutputFunctionCall.of(call).model_dump(),
+                    output_index=position + (1 if text else 0),
+                )
             yield emitter.completed(
                 events.with_annotations(
                     _wire(
@@ -1178,6 +1347,7 @@ async def responses_sse(
                         usage=generation.usage,
                         max_output_tokens=outcome.max_output_tokens,
                         finish_reason=generation.finish_reason,
+                        tool_calls=outcome.tool_calls,
                     ),
                     annotations,
                 )
@@ -1285,8 +1455,11 @@ async def chat_completions_sse(
             outcome.usage = generation.usage
             outcome.finish_reason = generation.finish_reason
             outcome.max_output_tokens = generation.applied_max_output_tokens()
+            outcome.tool_calls = list(generation.tool_calls)
+            if outcome.tool_calls:
+                yield chunks.tool_calls(outcome.tool_calls)
             yield chunks.stop(
-                chat_finish_reason(generation.finish_reason),
+                chat_finish_reason(generation.finish_reason, outcome.tool_calls),
                 max_output_tokens=outcome.max_output_tokens,
                 annotations=await annotations_for(annotate, outcome.text),
             )
@@ -1317,8 +1490,9 @@ async def chat_completions_sse(
         await _settle(on_finish, outcome)
 
 
-def chat_finish_reason(reason: Optional[str]) -> str:
-    """`length` when the answer hit its ceiling, `stop` otherwise.
+def chat_finish_reason(reason: Optional[str], tool_calls: Optional[Sequence[Any]] = None) -> str:
+    """`tool_calls` when the answer ended with calls to the caller's
+    functions, `length` when it hit its ceiling, `stop` otherwise.
 
     `reason` is the value the PRODUCER task captured (`Generation.finish_reason`),
     never `llm.get_finish_reason()` read here: that ContextVar is set inside
@@ -1328,6 +1502,8 @@ def chat_finish_reason(reason: Optional[str]) -> str:
     Anything that is not literally `length` is `stop`; there is no third value
     in the compatibility dialect a client would know what to do with.
     """
+    if tool_calls:
+        return "tool_calls"
     return "length" if str(reason or "") == "length" else "stop"
 
 

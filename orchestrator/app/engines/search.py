@@ -11,6 +11,7 @@ Cache (query→sources, TTL) and a per-user rate limit keep it cheap and bounded
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -18,6 +19,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -133,6 +135,27 @@ _FETCH_CONCURRENCY = 16
 _EXTRACT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="extract")
 
 
+#: True while a caller that must leave no trace is searching (the /v1 tools,
+#: 2026-11-20): no search log row, no page-store write, no index write. A
+#: ContextVar, so it follows the request into the tasks it spawns and into
+#: `asyncio.to_thread`, and never leaks into another request.
+_EPHEMERAL: ContextVar[bool] = ContextVar("search_ephemeral", default=False)
+
+
+@contextlib.contextmanager
+def ephemeral():
+    """Search and read without writing anything about it anywhere."""
+    token = _EPHEMERAL.set(True)
+    try:
+        yield
+    finally:
+        _EPHEMERAL.reset(token)
+
+
+def is_ephemeral() -> bool:
+    return bool(_EPHEMERAL.get())
+
+
 async def _extract_bounded(fetched, headers: dict, *, where: str):
     """`_call_extract` on the extraction pool, under EXTRACT_TIMEOUT_MS.
 
@@ -162,7 +185,8 @@ async def _extract_bounded(fetched, headers: dict, *, where: str):
         metrics.inc("search_stage_timeout_total", stage="extract", where=where)
         log.info(
             "extraction exceeded %.1fs; the page falls back to its snippet: %s",
-            budget, fetched.url,
+            # An ephemeral caller's URL is its prompt: the host is enough.
+            budget, (urlparse(fetched.url).hostname or "?") if is_ephemeral() else fetched.url,
         )
         raise
 
@@ -1603,7 +1627,7 @@ async def _fetch_source(
         # store is the whole point (V8): the same URL next time costs a DB
         # read, and the vector index chunks from here. Fire-and-forget so the
         # answer never waits on PostgreSQL.
-        if settings.web_memory_enabled and ext.text.strip():
+        if settings.web_memory_enabled and ext.text.strip() and not is_ephemeral():
             full_text, canon, ctype, title0 = ext.text, fetched.url, fetched.content_type, ext.title
             store = _spawn(
                 db.run_in_thread(
@@ -1995,6 +2019,8 @@ async def _persist_and_index(
     Runs AFTER the answer has started streaming; nothing here can slow the
     user down, and any failure only costs memory of this one search.
     """
+    if is_ephemeral():
+        return
     try:
         await db.run_in_thread(
             _log_search_background,
@@ -2151,6 +2177,45 @@ async def research_step(
             {"phase": "read", "count": sum(1 for s in sources if not s.from_snippet)},
         )
     return answer, _meta_sources(sources, answer)
+
+
+async def web_context(
+    query: str, *, max_sources: int = 6, chars_per_source: int = 4000
+) -> Tuple[str, List[dict]]:
+    """Search → rerank → read for ONE query, with no answer written.
+    → (numbered context block, sources).
+
+    For the /v1 `web_search` tool (publicapi/tools.py, 2026-11-20): the caller's
+    own model call writes the answer, so this stops where `research_step`
+    would start generating. The query is used as given (the model wrote it as a
+    search query, so there is nothing to rewrite), read at the Fast level's
+    budgets, and each page is cut to its query-centred passages.
+
+    Nothing is kept (`ephemeral`): no search log row, no page-store write, no
+    index write, no memory lookup. A page already in the store may be served
+    from it.
+
+    Raises `SearchUnavailableError` when the provider cannot be reached;
+    ("", []) means it answered and nothing readable was found.
+    """
+    effort = "fast"
+    pasted.mark_turn(query)
+    with ephemeral():
+        results = await _collect_results(
+            [query], effort, None, candidates=candidate_budget(effort)
+        )
+        if not results:
+            return "", []
+        target = max(1, min(int(max_sources), source_budget(effort)))
+        results = await _rerank_results(query, results, target, per_domain=domain_cap(effort))
+        sources = _drop_unread_sources(
+            await _fetch_sources(results, query, verdict=_question_verdict(query))
+        )
+    if not sources:
+        return "", []
+    for source in sources:
+        source.text = _select_text(source.text, query, max(500, int(chars_per_source)))
+    return _context_block(sources), _meta_sources(sources)
 
 
 async def run_search_engine(

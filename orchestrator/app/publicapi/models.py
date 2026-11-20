@@ -29,11 +29,21 @@ import json
 import re
 from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Union
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Discriminator,
+    Field,
+    StrictBool,
+    Tag,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from typing_extensions import Annotated
 
 from ..config import settings
-from . import errors
+from . import errors, tools as tooling
 
 # --------------------------------------------------------------- limits --
 
@@ -387,11 +397,197 @@ class InputMessage(_Strict):
         return {"role": self.role, "content": parts}
 
 
+# ---------------------------------------------------------------- tools --
+
+#: Tool calling (2026-11-20). A function's name is sent to the engine and
+#: comes back in a call, so it is our own narrow vocabulary; its `parameters`
+#: schema is rendered into every prompt, so its size is bounded like a JSON
+#: mode schema.
+MAX_TOOLS = 64
+MAX_TOOL_PARAMETERS_BYTES = 64 * 1024
+#: Every definition of a request together: with a forced `tool_choice` the
+#: engine compiles a decoding grammar from all of them.
+MAX_TOOL_DEFINITIONS_BYTES = 256 * 1024
+MAX_TOOL_DESCRIPTION_CHARS = 4096
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_CALL_ID_RE = re.compile(r"^[A-Za-z0-9_.:\-]{1,128}$")
+
+ToolType = Literal[
+    "function",
+    "web_search",
+    "web_search_preview",
+    "web_search_2025_08_26",
+    "web_search_preview_2025_03_11",
+    "web_fetch",
+    "deep_research",
+]
+
+
+def _server_tool_name(kind: str) -> Optional[str]:
+    """The server tool a `type` names, or None for `function`."""
+    if kind == "function":
+        return None
+    return tooling.TYPE_ALIASES.get(kind, kind)
+
+
+class Tool(_Strict):
+    """One entry of `tools`.
+
+    `{"type": "function", "name", "description"?, "parameters"?, "strict"?}`
+    is the caller's own function; `{"type": "web_search"}`, `web_fetch` and
+    `deep_research` are run by this server and take no other field. An option
+    this API would not honour (`search_context_size`, `user_location`, …) is a
+    400 like any other unknown field, never accepted and dropped.
+    """
+
+    type: ToolType
+    name: Optional[str] = None
+    description: Optional[str] = Field(default=None, max_length=MAX_TOOL_DESCRIPTION_CHARS)
+    parameters: Optional[Dict[str, Any]] = None
+    strict: Optional[StrictBool] = None
+
+    @model_validator(mode="after")
+    def _fields_match_the_type(self) -> "Tool":
+        if self.type != "function":
+            if any(v is not None for v in (self.name, self.description, self.parameters, self.strict)):
+                raise ValueError("name, description, parameters and strict apply only to type function")
+            return self
+        if self.name is None or not _TOOL_NAME_RE.match(self.name):
+            raise ValueError("a function needs a name of 1-64 letters, digits, underscores or dashes")
+        if self.name in tooling.SERVER_TOOLS:
+            raise ValueError("that function name is reserved for a built-in tool")
+        if self.parameters is not None:
+            size = len(json.dumps(self.parameters, separators=(",", ":")).encode("utf-8"))
+            if size > MAX_TOOL_PARAMETERS_BYTES:
+                raise ValueError(f"parameters may be at most {MAX_TOOL_PARAMETERS_BYTES} bytes")
+        return self
+
+    def server_tool(self) -> Optional[str]:
+        return _server_tool_name(self.type)
+
+    def engine_definition(self) -> Dict[str, Any]:
+        """This tool as the OpenAI function definition the engine takes."""
+        name = self.server_tool()
+        if name is not None:
+            return tooling.server_definition(name)
+        function: Dict[str, Any] = {
+            "name": self.name,
+            "parameters": self.parameters if self.parameters is not None else {"type": "object", "properties": {}},
+        }
+        if self.description:
+            function["description"] = self.description
+        if self.strict is not None:
+            function["strict"] = self.strict
+        return {"type": "function", "function": function}
+
+
+class ToolChoice(_Strict):
+    """`tool_choice` naming ONE tool: `{"type": "function", "name": …}` or
+    `{"type": "web_search"}`."""
+
+    type: ToolType
+    name: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _name_only_for_a_function(self) -> "ToolChoice":
+        if self.type == "function":
+            if self.name is None or not _TOOL_NAME_RE.match(self.name):
+                raise ValueError("a function choice needs the function's name")
+        elif self.name is not None:
+            raise ValueError("name applies only to type function")
+        return self
+
+    def tool_name(self) -> str:
+        return _server_tool_name(self.type) or str(self.name)
+
+
+class FunctionCallInput(_Strict):
+    """An earlier function call of the model, sent back as conversation:
+    `{"type": "function_call", "call_id", "name", "arguments"}`. `id` and
+    `status` are what a response's own item carries; they are accepted so the
+    item can be echoed back unchanged."""
+
+    type: Literal["function_call"]
+    call_id: str
+    name: str
+    arguments: str
+    id: Optional[str] = Field(default=None, max_length=128)
+    status: Optional[Literal["completed", "in_progress", "incomplete"]] = None
+
+    @field_validator("call_id")
+    @classmethod
+    def _call_id_shape(cls, value: str) -> str:
+        if not _CALL_ID_RE.match(value):
+            raise ValueError("call_id must be 1-128 letters, digits, dot, dash, underscore or colon")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def _name_shape(cls, value: str) -> str:
+        if not _TOOL_NAME_RE.match(value):
+            raise ValueError("name must be 1-64 letters, digits, underscores or dashes")
+        return value
+
+    @field_validator("arguments")
+    @classmethod
+    def _arguments_are_a_json_object(cls, value: str) -> str:
+        try:
+            parsed = json.loads(value or "{}")
+        except ValueError:
+            raise ValueError("arguments must be a JSON object, as a string") from None
+        if not isinstance(parsed, dict):
+            raise ValueError("arguments must be a JSON object, as a string")
+        return value or "{}"
+
+
+class FunctionCallOutputInput(_Strict):
+    """The result of a function call the caller ran:
+    `{"type": "function_call_output", "call_id", "output"}`."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
+
+    type: Literal["function_call_output"]
+    call_id: str
+    output: str
+    id: Optional[str] = Field(default=None, max_length=128)
+    status: Optional[Literal["completed", "in_progress", "incomplete"]] = None
+
+    @field_validator("call_id")
+    @classmethod
+    def _call_id_shape(cls, value: str) -> str:
+        value = value.strip()
+        if not _CALL_ID_RE.match(value):
+            raise ValueError("call_id must be 1-128 letters, digits, dot, dash, underscore or colon")
+        return value
+
+
+def _input_item_kind(value: Any) -> str:
+    """Which input item a list entry is, by its `type`; a plain message has
+    none. A callable discriminator, so a bad message reports the message's
+    error alone and not one per item kind."""
+    kind = value.get("type") if isinstance(value, Mapping) else getattr(value, "type", None)
+    if kind == "function_call":
+        return "FunctionCallInput"
+    if kind == "function_call_output":
+        return "FunctionCallOutputInput"
+    return "InputMessage"
+
+
+InputItem = Annotated[
+    Union[
+        Annotated[InputMessage, Tag("InputMessage")],
+        Annotated[FunctionCallInput, Tag("FunctionCallInput")],
+        Annotated[FunctionCallOutputInput, Tag("FunctionCallOutputInput")],
+    ],
+    Discriminator(_input_item_kind),
+]
+
+
 class ResponsesRequest(_Strict):
     """The body of `POST /v1/responses`, CONTRACT §8 exactly."""
 
     model: str = Field(min_length=1, max_length=64)
-    input: Union[str, List[InputMessage]]
+    input: Union[str, List[InputItem]]
     instructions: Optional[str] = None
     stream: bool = False
     background: bool = False
@@ -408,6 +604,12 @@ class ResponsesRequest(_Strict):
     metadata: Dict[str, str] = Field(default_factory=dict)
     #: JSON mode (2026-10-27), `text.format` — see `TextFormat`.
     text: Optional[TextConfig] = None
+    #: Tool calling (2026-11-20) — see `Tool`, `ToolChoice` and
+    #: `publicapi/tools.py`. `techsara-35b` only; the planner refuses them for
+    #: any other model. An empty `tools` list is the same as none.
+    tools: Optional[List[Tool]] = Field(default=None, max_length=MAX_TOOLS)
+    tool_choice: Optional[Union[Literal["auto", "none", "required"], ToolChoice]] = None
+    parallel_tool_calls: Optional[StrictBool] = None
 
     @field_validator("model")
     @classmethod
@@ -421,9 +623,7 @@ class ResponsesRequest(_Strict):
 
     @field_validator("input")
     @classmethod
-    def _input_is_not_empty(
-        cls, value: Union[str, List[InputMessage]]
-    ) -> Union[str, List[InputMessage]]:
+    def _input_is_not_empty(cls, value: Union[str, List[Any]]) -> Union[str, List[Any]]:
         if isinstance(value, str):
             if not value.strip():
                 raise ValueError("input must not be empty")
@@ -470,7 +670,80 @@ class ResponsesRequest(_Strict):
     # `background` with `store: false` — a job nobody may read back and that
     # a restart would silently drop (`parse_responses_request`).
 
+    @model_validator(mode="after")
+    def _tools_are_consistent(self) -> "ResponsesRequest":
+        declared = self.tools or []
+        functions = [tool.name for tool in declared if tool.type == "function"]
+        if len(set(functions)) != len(functions):
+            raise ValueError("tools: each function name may appear once")
+        server = [tool.server_tool() for tool in declared if tool.type != "function"]
+        if len(set(server)) != len(server):
+            raise ValueError("tools: each built-in tool may appear once")
+        if declared and tooling.definitions_bytes(
+            {"definitions": [tool.engine_definition() for tool in declared if tool.type == "function"]}
+        ) > MAX_TOOL_DEFINITIONS_BYTES:
+            raise ValueError(f"tools: the function definitions may total at most {MAX_TOOL_DEFINITIONS_BYTES} bytes")
+        if not declared:
+            if self.tool_choice not in (None, "auto", "none"):
+                raise ValueError("tool_choice needs tools")
+            if self.parallel_tool_calls is not None:
+                raise ValueError("parallel_tool_calls needs tools")
+        elif isinstance(self.tool_choice, ToolChoice):
+            if self.tool_choice.tool_name() not in set(functions) | set(server):
+                raise ValueError("tool_choice names a tool that is not in tools")
+        if not isinstance(self.input, str):
+            seen: set = set()
+            for item in self.input:
+                if isinstance(item, FunctionCallInput):
+                    seen.add(item.call_id)
+                elif isinstance(item, FunctionCallOutputInput) and item.call_id not in seen:
+                    raise ValueError("input: a function_call_output must follow the function_call with its call_id")
+        return self
+
     # ---------------------------------------------------------- helpers --
+
+    def _input_messages(self) -> List[InputMessage]:
+        """The plain messages of a list input (no function-call items)."""
+        if isinstance(self.input, str):
+            return []
+        return [item for item in self.input if isinstance(item, InputMessage)]
+
+    def tool_config(self) -> Optional[Dict[str, Any]]:
+        """Everything the generation needs to know about this request's tools,
+        as plain JSON (it is stored with a durable run's spec), or None.
+
+        `definitions` is what the engine is sent; `server` the tools this
+        server runs itself; `functions` the caller's; `choice` the engine
+        `tool_choice` for the first model call."""
+        declared = self.tools or []
+        if not declared:
+            return None
+        choice: Any = self.tool_choice if self.tool_choice is not None else "auto"
+        if isinstance(choice, ToolChoice):
+            choice = {"type": "function", "function": {"name": choice.tool_name()}}
+        return {
+            "definitions": [tool.engine_definition() for tool in declared],
+            "server": [tool.server_tool() for tool in declared if tool.type != "function"],
+            "functions": [tool.name for tool in declared if tool.type == "function"],
+            "choice": choice,
+            "parallel": self.parallel_tool_calls,
+        }
+
+    def has_function_tools(self) -> bool:
+        """Whether the caller declared a function of its own."""
+        return any(tool.type == "function" for tool in (self.tools or ()))
+
+    def tool_text_bytes(self) -> int:
+        """UTF-8 bytes of the function-call items in `input`."""
+        if isinstance(self.input, str):
+            return 0
+        total = 0
+        for item in self.input:
+            if isinstance(item, FunctionCallInput):
+                total += len(item.name.encode("utf-8")) + len(item.arguments.encode("utf-8"))
+            elif isinstance(item, FunctionCallOutputInput):
+                total += len(item.output.encode("utf-8"))
+        return total
 
     def chat_messages(self) -> List[Dict[str, Any]]:
         """The request as the `messages` list `llm.stream_chat_events` takes.
@@ -484,14 +757,33 @@ class ResponsesRequest(_Strict):
             messages.append({"role": "system", "content": self.instructions})
         if isinstance(self.input, str):
             messages.append({"role": "user", "content": self.input})
-        else:
-            messages.extend(m.engine_message() for m in self.input)
+            return messages
+        #: The assistant turn function calls are being attached to: a call
+        #: that directly follows assistant text is the same turn.
+        open_turn: Optional[Dict[str, Any]] = None
+        for item in self.input:
+            if isinstance(item, InputMessage):
+                message = item.engine_message()
+                messages.append(message)
+                open_turn = message if item.role == "assistant" and isinstance(message["content"], str) else None
+            elif isinstance(item, FunctionCallInput):
+                if open_turn is None:
+                    open_turn = {"role": "assistant", "content": ""}
+                    messages.append(open_turn)
+                open_turn.setdefault("tool_calls", []).append(
+                    {
+                        "id": item.call_id,
+                        "type": "function",
+                        "function": {"name": item.name, "arguments": item.arguments},
+                    }
+                )
+            else:
+                messages.append({"role": "tool", "tool_call_id": item.call_id, "content": item.output})
+                open_turn = None
         return messages
 
     def image_count(self) -> int:
-        if isinstance(self.input, str):
-            return 0
-        return sum(message.image_count() for message in self.input)
+        return sum(message.image_count() for message in self._input_messages())
 
     def response_format(self) -> Optional[Dict[str, Any]]:
         """The engine `response_format` this request asks for, or None."""
@@ -505,7 +797,9 @@ class ResponsesRequest(_Strict):
             return True
         if isinstance(self.input, str):
             return True
-        return any(text.strip() for message in self.input for text in message.texts())
+        if any(text.strip() for message in self._input_messages() for text in message.texts()):
+            return True
+        return self.tool_text_bytes() > 0
 
     def text_bytes(self) -> int:
         """UTF-8 bytes of every text the request carries — the quantity the
@@ -514,10 +808,10 @@ class ResponsesRequest(_Strict):
         total = len((self.instructions or "").encode("utf-8"))
         if isinstance(self.input, str):
             return total + len(self.input.encode("utf-8"))
-        for message in self.input:
+        for message in self._input_messages():
             for text in message.texts():
                 total += len(text.encode("utf-8"))
-        return total
+        return total + self.tool_text_bytes()
 
     def resolve_max_output_tokens(self, *, ceiling: int, default: int) -> int:
         """How many tokens this request may generate.
@@ -602,7 +896,10 @@ def _most_specific(raised: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
 #: Markers pydantic puts in a `loc` to name which branch of a union or which
 #: internal validator produced the error. They are our schema's vocabulary, not
 #: a field the caller sent, so they never appear in `param`.
-_LOC_NOISE = ("str", "list[InputMessage]", "InputMessage", "input_text", "input_image")
+_LOC_NOISE = (
+    "str", "list[InputMessage]", "InputMessage", "input_text", "input_image",
+    "FunctionCallInput", "FunctionCallOutputInput", "ToolChoice",
+)
 
 
 def _loc_parts(loc: Sequence[Any]) -> List[str]:
@@ -652,6 +949,37 @@ class OutputMessage(_Strict):
     @classmethod
     def of(cls, text: str) -> "OutputMessage":
         return cls(content=[OutputText(text=text)])
+
+
+class OutputFunctionCall(_Strict):
+    """A call to one of the CALLER's functions (tool calling, 2026-11-20).
+    The caller runs it and sends the result back as a `function_call_output`
+    input item carrying the same `call_id`."""
+
+    type: Literal["function_call"] = "function_call"
+    id: str
+    call_id: str
+    name: str
+    arguments: str
+    status: Literal["completed"] = "completed"
+
+    @classmethod
+    def of(cls, call: Mapping[str, Any]) -> "OutputFunctionCall":
+        call_id = str(call.get("call_id") or "")
+        return cls(
+            id="fc_" + call_id.removeprefix("call_"),
+            call_id=call_id,
+            name=str(call.get("name") or ""),
+            arguments=str(call.get("arguments") or "{}"),
+        )
+
+
+def output_items(text: str, tool_calls: Optional[Sequence[Mapping[str, Any]]] = None) -> List[Any]:
+    """A response's `output`: the assistant message when there is text, then
+    one `function_call` item per call the caller must run."""
+    items: List[Any] = [OutputMessage.of(text)] if text else []
+    items.extend(OutputFunctionCall.of(call) for call in (tool_calls or ()))
+    return items
 
 
 class Usage(_Strict):
@@ -736,7 +1064,7 @@ class Response(_Strict):
     created_at: int
     status: ResponseStatus
     model: str
-    output: List[OutputMessage] = Field(default_factory=list)
+    output: List[Union[OutputMessage, OutputFunctionCall]] = Field(default_factory=list)
     usage: Optional[Usage] = None
     #: The output ceiling APPLIED to this generation (2026-09-13). Input and
     #: output share the context window, so a request asking for more than the

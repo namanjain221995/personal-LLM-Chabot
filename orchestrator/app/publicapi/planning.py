@@ -53,7 +53,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
 from ..config import settings
-from . import errors, models, registry
+from . import errors, models, registry, tools
 
 log = logging.getLogger(__name__)
 
@@ -155,6 +155,8 @@ class GenerationPlan:
     image_count: int
     #: JSON mode (2026-10-27): the engine's `response_format`, or None.
     response_format: Optional[Dict[str, Any]] = None
+    #: Tool calling (2026-11-20): `ResponsesRequest.tool_config()`, or None.
+    tools: Optional[Dict[str, Any]] = None
 
     @property
     def engine(self) -> str:
@@ -341,6 +343,8 @@ def plan_generation(
             param="response_format" if endpoint == registry.ENDPOINT_CHAT_COMPLETIONS else "text.format",
         )
 
+    tool_config = _tool_config(request_model, model, endpoint, response_format)
+
     pending = bool(files is not None and files.pending)
     file_images = 0 if files is None or pending else max(0, int(files.images))
     images = request_model.image_count() + file_images
@@ -406,6 +410,11 @@ def plan_generation(
         bounded = upper_bound_with_image_bound(messages, registry.OCR_TOKENS_PER_IMAGE_BOUND)
     else:
         bounded = int(context.upper_bound_messages(caller_messages)) + file_ceiling
+    # Tool definitions are rendered into the prompt by the engine's template,
+    # and a function call's name and arguments ride in `tool_calls`, which the
+    # message counters do not read: both are added at their byte length.
+    tool_bytes = tools.definitions_bytes(tool_config) + _tool_call_bytes(messages)
+    bounded += tool_bytes
     limits = []
     if int(model.max_input_tokens or 0) > 0:
         limits.append(int(model.max_input_tokens))
@@ -417,7 +426,7 @@ def plan_generation(
         )
 
     # 3. clamp to what the window leaves.
-    caller_estimate = int(context.estimate_messages(caller_messages))
+    caller_estimate = int(context.estimate_messages(caller_messages)) + tool_bytes // 3
     estimated = caller_estimate + file_tokens
     if model.clamp_basis == registry.CLAMP_UPPER_BOUND:
         counted = bounded
@@ -481,7 +490,64 @@ def plan_generation(
         explicit_max_output_tokens=explicit,
         image_count=int(images),
         response_format=response_format,
+        tools=tool_config,
     )
+
+
+def _tool_call_bytes(messages: List[Dict[str, Any]]) -> int:
+    total = 0
+    for message in messages:
+        for call in message.get("tool_calls") or ():
+            function = call.get("function") or {}
+            total += _text_bytes(str(function.get("name") or "")) + _text_bytes(str(function.get("arguments") or ""))
+            total += 16
+    return total
+
+
+def _tool_config(
+    request_model: models.ResponsesRequest,
+    model: registry.PublicModel,
+    endpoint: str,
+    response_format: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """The request's tools, or the 400 that says why they cannot run.
+
+    Refused rather than dropped (CONTRACT §8): a caller that sent tools and
+    got plain prose back would have to discover that from the answer."""
+    config = request_model.tool_config()
+    carries_calls = request_model.tool_text_bytes() > 0 or (
+        not isinstance(request_model.input, str)
+        and any(isinstance(item, models.FunctionCallInput) for item in request_model.input)
+    )
+    if config is None and not carries_calls:
+        return None
+    if not tools.enabled():
+        raise errors.invalid_request("Tool calling is not enabled on this deployment.", param="tools")
+    if not model.tools:
+        raise errors.invalid_request(
+            f"The model `{model.id}` does not support tools.",
+            param="tools" if config is not None else ("messages" if endpoint == registry.ENDPOINT_CHAT_COMPLETIONS else "input"),
+        )
+    if config is None:
+        return None
+    if response_format is not None:
+        raise errors.invalid_request(
+            "tools cannot be combined with JSON mode in one request.",
+            param="response_format" if endpoint == registry.ENDPOINT_CHAT_COMPLETIONS else "text.format",
+        )
+    for name in config["server"]:
+        if not tools.server_tool_enabled(name):
+            raise errors.invalid_request(
+                f"The tool `{name}` is not available on this deployment.", param="tools"
+            )
+    if config["functions"] and request_model.background:
+        # A function call ends the response and is answered by a NEW request;
+        # a background job has nobody waiting to run the function.
+        raise errors.invalid_request(
+            "background cannot be combined with function tools; use the built-in tools, or a synchronous or streamed request.",
+            param="background",
+        )
+    return config
 
 
 def applied_max_output_tokens(
