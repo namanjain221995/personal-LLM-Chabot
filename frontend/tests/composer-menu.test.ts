@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  accuracyLine,
   activateComposerMenuItem,
   composerMenuItems,
   nextEnabledIndex,
@@ -163,6 +164,22 @@ describe('trust footer line', () => {
     );
     expect(trustLine(prefs({ salesforce: false, webSearch: 'on' }))).toMatch(
       /web search is on/,
+    );
+  });
+});
+
+describe('accuracy line under the composer', () => {
+  it('uses the owner wording with Salesforce off, whatever web search is', () => {
+    for (const webSearch of ['auto', 'on'] as const) {
+      expect(accuracyLine(prefs({ salesforce: false, webSearch }))).toBe(
+        'TechSara AI can make mistakes. Check important info.',
+      );
+    }
+  });
+
+  it('uses the Salesforce wording with Salesforce on', () => {
+    expect(accuracyLine(prefs({ salesforce: true }))).toBe(
+      'Salesforce answers may be incomplete or wrong. Please check important info.',
     );
   });
 });
