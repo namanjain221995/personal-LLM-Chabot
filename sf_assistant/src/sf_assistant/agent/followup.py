@@ -19,11 +19,13 @@ asks for the full question), ``reason`` says which rule fired, and the reply goe
    first word (:func:`_typed_names`: a capital alone is none, as in "his Email", "can I", "Ok. What" or "What Is His
    Email?"), it holds a word that points back (a pronoun, "that person", "that status", a last "it"), leads with and,
    aur, same or what about, or asks for contact details and names nobody; but a complete question behind such a lead, on
-   another subject (:func:`_another_subject`: "and what is the leave policy?"), is none. A complete question
-   (:func:`_complete`: it names its own subject and has no word that points back, and "this week" or "and" do not) with
-   only its spelling, its question frame or its word order changed is the same case (:func:`_respelt`), and so is
-   ``UNCLEAR`` alone for a reply when that question also says who it is about (:func:`_names_its_own`) or asks how the
-   org works ("Jonas Wicket ka mobile number?", "what is the leave policy?"): the typed question, byte-identical,
+   another subject (:func:`_another_subject`: "and what is the leave policy?"), is none, and nor is a question whose
+   every pointing word goes back to a group or a thing it named itself, in an earlier part of it
+   (:func:`_self_anchored`: "list the candidates who got an offer. how many interviews did they give?"). A complete
+   question (:func:`_complete`: it names its own subject and has no word that points back, and "this week" or "and" do
+   not) with only its spelling, its question frame or its word order changed is the same case (:func:`_respelt`), and so
+   is ``UNCLEAR`` alone for a reply when that question also says who it is about (:func:`_names_its_own`) or asks how
+   the org works ("Jonas Wicket ka mobile number?", "what is the leave policy?"): the typed question, byte-identical,
    because whoever named their subject in full is never told to ask the full question. A model ``UNCLEAR`` is no proof
    of anything else: a question with no subject of its own stays refused on it, whatever its shape, also a complete one
    ("How many candidates joined this quarter?", "How many candidates updated their status?"). Only the typed text goes
@@ -312,6 +314,38 @@ _WIDENS_RE = re.compile(r"(?<![^\W_])(?:all|every|each|whole|entire|everyone|eve
 _WIDE_BESIDE_SHOW = frozenset("all sab sabhi saare sare".split())
 _WIDE_BEFORE_PERIOD = _WIDE_BESIDE_SHOW | frozenset("every each whole entire".split())
 _SHOW_WORDS = frozenset("show list display dikhao dikha".split())
+#: what starts a new part of one question (see _self_anchored): a sentence end, or a joining word before a new ask or a
+#: pointer ("and also tell me", "and how many", "aur unke"), never the "and" of a list ("offers and interviews")
+_CLAUSE_STARTS = _ASK_WORDS | _SHOW_WORDS | _CHART_WORDS | _COUNT_WORDS | _POINT_WORDS | frozenset("""also how when
+where tell give get find can could please kitne batao""".split())
+_PART_RE = re.compile(r"[.!?;।؟？]+(?=\s|$)|(?<![^\W_])(?:and|aur|also|then|plus)\s+(?=(?:"
+                      + "|".join(sorted(_CLAUSE_STARTS, key=len, reverse=True)) + r")(?![^\W_]))", re.IGNORECASE)
+#: records a later part of the same question can point back to and no name rule needs ("the mocks taken in May")
+_ANCHOR_ONLY = frozenset("mock mocks submission submissions".split())
+#: the groups a later part of the same question can say "them" or "unke" of, the people it can say "they" of (who
+#: give, hire or cancel: "how many interviews last week? how many did they cancel?" means people of the turns), and
+#: every thing it can point back to
+_GROUP_NOUNS = _NOT_A_NAME | {f"{w}s" for w in _ROLE_WORDS | _RECORD_NOUNS} | _ANCHOR_ONLY
+_PEOPLE_NOUNS = (_NOT_A_NAME - {"records", "others"}) | {f"{w}s" for w in _ROLE_WORDS}
+_THING_NOUNS = _GROUP_NOUNS | _ROLE_WORDS | _RECORD_NOUNS
+#: the pointers that say who did something: they need people before them
+_AGENT_POINTERS = frozenset("they unhone inhone".split())
+#: what opens a part that asks ("give me", "how many", "show"), after a polite "can you" or "please", or a Hinglish
+#: ask anywhere in it ("candidates ki list do", "offers dikhao"): only such a part names what a later part points back
+#: to, and a later part that points must ask something of its own
+_REQUEST_WORDS = _ASK_WORDS | _SHOW_WORDS | _CHART_WORDS | _COUNT_WORDS | frozenset("""how when where give get find
+fetch pull tell""".split())
+_HI_REQUEST_WORDS = frozenset("dikhao dikha batao bhejo dedo chahiye kya kaun".split())
+_POLITE_RE = re.compile(r"^\W*(?:(?:(?:can|could|would|will)\s+you|please|pls|kindly)(?![^\W_])\W*)+", re.IGNORECASE)
+#: typed words about the chat itself: such a question leans on the turns, whatever it names ("the candidates you
+#: listed", "from your answer", "the other candidates", "upar wale candidates", "jo aapne bataye")
+_TURN_WORDS = frozenset("previous above earlier same again before mentioned other aapne".split())
+_TURN_RE = re.compile(r"(?<![^\W_])(?:you\s+(?:just\s+)?(?:listed|gave|given|showed|shown|shared|sent|told|said|found"
+                      r"|returned|pulled|fetched|got)|your\s+(?:answer|reply|list|last|result|results|response|output"
+                      r"|table)|(?:upar|pehle|pichle|pichhle)\s+(?:wale|wali|waale|waali|jawab|answer|list|reply))"
+                      r"(?![^\W_])", re.IGNORECASE)
+#: "those 5 candidates", "these 3": a count of records of the turns
+_THAT_NUMBER_RE = re.compile(r"(?<![^\W_])(?:that|this|those|these)\s+\d", re.IGNORECASE)
 #: a word in the place of a name, also typed in lower case: "bufa ka email?", "manager of bufa?", "how many for bufa?",
 #: "bufa's team?", "when did bufa join?"
 _SLOT_RE = re.compile(r"(?<![^\W_])(?:(?:of|for|by)\s+([^\W\d_]+)|([^\W\d_]+)\s+(?:ka|ki|ke|ne|ko)|([^\W\d_]+)['’]s"
@@ -432,6 +466,85 @@ def _fragment(question: str) -> bool:
     return (bool(_POINT_WORDS & set(words)) or (bool(words) and words[0] in _FRAGMENT_LEADS)
             or tuple(words[:2]) in _FRAGMENT_PAIRS or bool(_POINTED_RE.search(question))
             or (asks_for_contact(question) and not set(words) - _POINTERS - _FRAME - _CONTACT_WORDS - _ASK_FRAME))
+
+
+def _noun_stem(word: str) -> str:
+    """``word`` without its plural ending, so that "offer" and "offers", "company" and "companies" meet."""
+    return f"{word[:-3]}y" if word.endswith("ies") else word.removesuffix("s")
+
+
+def _self_anchored(question: str) -> bool:
+    """A question that points back only inside itself: every pointing word stands in a later part of it (behind a
+    sentence end, or a joining word before a new ask: :data:`_PART_RE`) than the group or the thing it goes back to, as
+    typed there. "give me the candidates who got an offer. how many interviews did they give for these offers?": "they"
+    after "candidates", "these offers" after "offer". A group word ("them", "unke", :data:`_GROUP_POINTERS`) needs a
+    group noun before it (:data:`_GROUP_NOUNS`), "they" people (:data:`_PEOPLE_NOUNS`), "that interview" or "for these
+    offers" the same noun, and a last "it" or "this" any of them. That noun counts only in a part that asks
+    (:data:`_REQUEST_WORDS`: "give me ...", "can you show ...", "how many ...") and points at nothing itself: "the
+    candidates you listed.", "thanks for the offers.", "those 5 candidates." only restate the turns. Every part with a
+    pointer must ask something of its own too, after no lead of a follow-up: "show the recruiters. what about them?",
+    "unke interviews?" and "and for them, how many interviews?" do not.
+    It never holds for a pointer at one person ("his", "uska"), a measure ("this placement rate"), "the second one", a
+    lead ("and for them?", "same for last month"), a count of nothing, a contact ask, a count of records ("those 5
+    candidates") or a word about the chat or the rest of it ("previous", "same", "you listed", "your answer", "the
+    other", "upar wale", "who else"): those still need the turns. Nor for a question of one part ("how many interviews
+    did they give?", "how many offers did they make?"), whose "they" can mean anyone of the turns, nor for one with no
+    pointer at all. Known gaps, refused as before: a pointer in the same part as its noun ("list the candidates who got
+    offers with the interviews they attended"), and a "they" that means a person of the turns although people stand
+    earlier in the question ("show the candidates. how many did they hire?"), which only the words can not tell."""
+    words = _words(question)
+    if (not words or words[0] in _FRAGMENT_LEADS or tuple(words[:2]) in _FRAGMENT_PAIRS or _no_topic(question)
+            or (_TURN_WORDS | _LEAN_WORDS - {"bhi"}) & set(words) or _TURN_RE.search(question)
+            or _THAT_NUMBER_RE.search(question) or asks_for_contact(question) or _MEASURE_POINTED_RE.search(question)):
+        return False
+    starts = [0] + [m.end() for m in _PART_RE.finditer(question)]
+    parts = [question[a:b] for a, b in zip(starts, starts[1:] + [len(question)])]
+
+    def part(at: int) -> int:
+        return sum(1 for start in starts[1:] if start <= at)
+
+    def asks(text: str) -> bool:
+        said = _words(text)
+        while said and said[0] in _FRAGMENT_LEADS | {"then", "now", "so"}:
+            said = said[1:]
+        if not said or tuple(said[:2]) in _FRAGMENT_PAIRS or (said[0] in {"for", "of"} and said[1:2] and said[1]
+                                                               in _POINT_WORDS):    # "and for them, how many ...?"
+            return False
+        return not _no_topic(" ".join(said)) and (
+            bool(set(said) & (_REQUEST_WORDS | _HI_REQUEST_WORDS)) or ("list", "do") in zip(said, said[1:]))
+
+    def opens_an_ask(text: str) -> bool:
+        said = _words(_POLITE_RE.sub("", text))
+        return bool(said) and (said[0] in _REQUEST_WORDS or bool(set(said) & _HI_REQUEST_WORDS)
+                               or ("list", "do") in zip(said, said[1:]))
+
+    pointed: list[tuple[int, int, frozenset[str] | set[str]]] = []    # (where, how far, what it needs before it)
+    for m in _WORD_RE.finditer(question):
+        word = m.group(0).casefold()
+        if word in _POINT_WORDS:
+            if word not in _GROUP_POINTERS:
+                return False
+            pointed.append((m.start(), m.end(), _PEOPLE_NOUNS if word in _AGENT_POINTERS else _GROUP_NOUNS))
+    for m in _THAT_NOUN_RE.finditer(question):
+        noun = m.group(1).casefold()
+        if noun in _THING_NOUNS or _noun_stem(noun) in _THING_NOUNS:
+            pointed.append((m.start(), m.end(), {_noun_stem(noun), noun}))
+    for m in _POINTED_RE.finditer(question):
+        if any(at < m.end() and m.start() < end for at, end, _ in pointed):
+            continue
+        if not re.fullmatch(r"(?:it|that|this|those|these)\W*", m.group(0), re.IGNORECASE):
+            return False
+        pointed.append((m.start(), m.end(), _THING_NOUNS))
+    if not pointed:
+        return False
+    with_pointer = {part(at) for at, _, _ in pointed}
+    if not all(asks(parts[i]) for i in with_pointer):
+        return False
+    named = [(part(m.start()), m.group(0).casefold()) for m in _WORD_RE.finditer(question)
+             if m.group(0).casefold() in _THING_NOUNS]
+    anchors = {i for i, text in enumerate(parts) if i not in with_pointer and opens_an_ask(text)}
+    return all(any(where in anchors and where < part(at) and (noun in wanted or _noun_stem(noun) in wanted)
+                   for where, noun in named) for at, _, wanted in pointed)
 
 
 def _name_token(token: str) -> bool:
@@ -576,10 +689,11 @@ def _same_but_spelling(typed: list[str], out: list[str]) -> bool:
 
 
 def _respelt(question: str, reply: str) -> bool:
-    """A complete typed question (:func:`_complete`), and ``reply`` holds its words but for close spellings, question
-    frame and order ("who is manager of foxtrot persn", "Who is the manager of Foxtrot Person?"). Nothing added, nothing
-    lost, and only the typed text goes on, so no word of the reply can reach the pipeline."""
-    if not _complete(question) or _fragment(question):
+    """A complete typed question (:func:`_complete`), or one that points back only inside itself
+    (:func:`_self_anchored`), and ``reply`` holds its words but for close spellings, question frame and order ("who is
+    manager of foxtrot persn", "Who is the manager of Foxtrot Person?"). Nothing added, nothing lost, and only the typed
+    text goes on, so no word of the reply can reach the pipeline."""
+    if not _self_anchored(question) and (not _complete(question) or _fragment(question)):
         return False
     typed = [w for w in _words(question) if w not in _FRAME]
     out = [w for w in _words(reply) if w not in _FRAME]
@@ -1115,7 +1229,7 @@ def rewrite(question: str, turns: Any, llm: Any) -> Rewrite:
         return Rewrite(UNCLEAR, reason=reason, reply=text[:MAX_TURN_CHARS])
 
     if not cut and text and _words(text) == _words(question):
-        if _fragment(question) and not _another_subject(question, usable):
+        if _fragment(question) and not _another_subject(question, usable) and not _self_anchored(question):
             return refused("fragment_echo")
         return Rewrite(OK, question)
     if not cut and text and _respelt(question, text):

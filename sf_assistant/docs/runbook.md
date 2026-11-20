@@ -346,6 +346,7 @@ docker volume inspect sf-local-ai_ask-sock    # before the first start: the plat
 cd sf_assistant/web
 ./run.sh new-ask-token --label orchestrator   # owner's own terminal only: prints the token once
 ./run.sh up-ask                               # starts only this service; it never builds the image or creates the volume
+./run.sh restart-ask                          # after a code, prompt or knowledge change: the same checks, then recreates only this service
 docker compose -p sf-assistant-ask -f compose.ask.yaml ps
 docker compose -p sf-assistant-ask -f compose.ask.yaml logs -f --tail=200 sf-assistant-ask
 docker exec sf-assistant-ask python /srv/web/ask_mcp.py --health   # exit 0 when /healthz says ok
