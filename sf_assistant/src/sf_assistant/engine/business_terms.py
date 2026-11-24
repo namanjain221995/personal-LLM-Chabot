@@ -11,7 +11,13 @@ records named in the question (``tools/value_spots.py``) and of the spelling hel
 fields stay (a question may filter on them). The knowledge files say the same in words (``kb_build/curated``:
 Account, Interview__c and Onboarding__c).
 
-Standard library and :mod:`sf_assistant.prompts` only.
+Business-term contracts of 2026-11-24: the terms the record tools enforce by code (candidates, support person
+performance) keep their question words with their contract in :mod:`sf_assistant.engine.term_contracts`; a term that
+the hints show too (support person performance) is added to the words here with :func:`register` when that module is
+imported, which :func:`terms_in` makes sure of. Placement keeps its words here.
+
+Standard library and :mod:`sf_assistant.prompts` only (``engine.term_contracts`` is imported inside a function: it
+imports this module).
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ from typing import Any
 from sf_assistant import prompts as _prompt_files
 
 __all__ = ["BUSINESS_TERMS_TEXT", "DEFINITIONS", "TERM_WORDS", "NOT_THE_TERM", "terms_in", "term_lines",
-           "not_the_term", "is_not_the_term", "TERMS_HEADER"]
+           "not_the_term", "is_not_the_term", "TERMS_HEADER", "register", "HINGLISH_CANDIDATES"]
 
 BUSINESS_TERMS_TEXT = _prompt_files.text("business_terms")
 DEFINITIONS: dict[str, str] = dict(ln.split(": ", 1) for ln in BUSINESS_TERMS_TEXT.split("\n") if ": " in ln)
@@ -34,7 +40,11 @@ _PLACEMENT = r"pla?ce?m[ea]?n?ts?"
 _PLACED = r"pla?ce?d(?!\s+(?:on\s+(?:hold|pause)|an?\s+(?:order|call|request|bid|booking))\b)"
 #: The people a placement is about: "placed" names the term only with one of them as its subject (or in a hiring
 #: phrase), so "sections placed in a template" and "calls placed by recruiters" name no placement.
-_PERSON = r"(?:candidates?|students?|people|persons?|consultants?|trainees?|who|anyone|someone)"
+#: The Hinglish words for candidates (ummeedwar, chhatra, vidyarthi, bacche and their common spellings); the candidate
+#: contract (``engine.term_contracts``) reads the same list (review fixes of 2026-11-24: "kitne bacche placed hue").
+HINGLISH_CANDIDATES = (r"ummeedwar|umeedwar|ummedwar|umedwar|ummidwar|umidwar|ummidvar|umidvar|chhatra|chatra|"
+                       r"vidyarthi|vidyarthiyon|bacche|bachche|bachhe|bacchon|bachchon|bachon|bachhon")
+_PERSON = rf"(?:candidates?|students?|people|persons?|consultants?|trainees?|who|anyone|someone|{HINGLISH_CANDIDATES})"
 #: The words of a question that name a term. "placed on hold" is the Hold status, the onboarding's "placement
 #: services agreement" is a document, "placement of ads" and "pre-placement checks" are no placement, and "placed"
 #: without a person or a hiring phrase is another verb (review of 2026-11-16).
@@ -53,12 +63,28 @@ NOT_THE_TERM: dict[str, frozenset[tuple[str, str, str]]] = {
     "placement": frozenset({("Account", "Candidate_Status__c", "Placed")}),
 }
 TERMS_HEADER = "Business terms of the question (the owner's definitions; use exactly these):"
+#: The hinted terms whose words live with their contract (engine.term_contracts, 2026-11-24), by :func:`register`.
+_REGISTERED: dict[str, re.Pattern] = {}
+
+
+def register(key: str, words: re.Pattern, not_the_term: frozenset[tuple[str, str, str]] = frozenset()) -> None:
+    """Add a term whose question words live with its contract (``engine.term_contracts``): the hints show its
+    definition for a question its words match, and leave ``not_the_term`` values out (:data:`NOT_THE_TERM`)."""
+    _REGISTERED[key] = words
+    if not_the_term:
+        NOT_THE_TERM[key] = frozenset(not_the_term)
+
+
+def _words() -> dict[str, re.Pattern]:
+    """:data:`TERM_WORDS` and then the registered terms (the contracts module registers its own at import)."""
+    from sf_assistant.engine import term_contracts  # noqa: F401 - registers the contracts' hinted terms
+    return {**TERM_WORDS, **_REGISTERED}
 
 
 def terms_in(question: Any) -> list[str]:
-    """The keys of the terms the question names, in :data:`TERM_WORDS` order."""
+    """The keys of the terms the question names, in :data:`TERM_WORDS` order, then the registered terms."""
     text = question if isinstance(question, str) else ""
-    return [k for k, rx in TERM_WORDS.items() if k in DEFINITIONS and rx.search(text)]
+    return [k for k, rx in _words().items() if k in DEFINITIONS and rx.search(text)]
 
 
 def term_lines(question: Any) -> list[str]:

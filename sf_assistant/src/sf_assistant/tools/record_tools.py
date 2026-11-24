@@ -52,6 +52,7 @@ from sf_assistant.tools.names import NamesMixin
 from sf_assistant.tools.lookups import LookupsMixin
 from sf_assistant.tools.meta import MetaMixin
 from sf_assistant.tools.value_spots import ValueSpotsMixin
+from sf_assistant.tools.term_enforce import TermEnforceMixin   # the business-term contracts (2026-11-24)
 # the spelling help's hint section (docs/resolver_integration.md (1)): the knowledge side's text and line format
 from sf_assistant.engine.business_terms import is_not_the_term, not_the_term   # the owner's terms (2026-11-16)
 from sf_assistant.tools.knowledge_tools import (SpellingSpan, _metadata_targets, corrected_text, question_spans,
@@ -140,7 +141,7 @@ class ToolArgError(RecordError):
 # ------------------------------------------------------------------------------------- registry
 
 class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, LookupsMixin, MetaMixin,
-                  ValueSpotsMixin):
+                  ValueSpotsMixin, TermEnforceMixin):
     """Registry of the 14 record tools over one open warehouse snapshot."""
 
     tools: dict[str, Tool]
@@ -200,12 +201,17 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
         the hints and :meth:`question_people` use them. None (the default) spots them here, as before.
 
         ``values``: the stored values the question names that the session's triage kept (:meth:`spot_values` entries,
-        the listed ones); the hint section of the named records uses them. None (the default) spots them here."""
+        the listed ones); the hint section of the named records uses them. None (the default) spots them here.
+
+        The business-term contracts (2026-11-24): the terms the question names are read here once
+        (:meth:`~sf_assistant.tools.term_enforce.TermEnforceMixin._terms_for`); ``call`` enforces them on every record
+        query tool. "" names none, so a call with no question is never changed."""
         with self._lock:
             self._evidence = []
             self._qn = 0
             self._question = str(question or "")
             self._contact_ok = asks_for_contact(self._question)
+            self._terms = self._terms_for(self._question)
             self._given_people = [dict(p) for p in people if isinstance(p, dict)] if people is not None else None
             self._given_values = [dict(v) for v in values if isinstance(v, dict)] if values is not None else None
             self._reset_caches()
@@ -358,7 +364,11 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
         """Run a tool. Never raises. ``{"ok","result","error","chunk_ids"}``; result JSON <= 12,000 chars.
 
         An alias (:data:`TOOL_ALIASES`: ``find_references`` with ``name``) runs its tool (``about_people`` with
-        ``names=[name]``) and is logged as that tool."""
+        ``names=[name]``) and is logged as that tool.
+
+        Business-term contracts (2026-11-24): between the argument check and the handler the question's terms may add
+        a filter, set an argument or refuse the call (T1, T2, T3: ``tools/term_enforce.py``); an added filter that
+        would pass the join cap is left out and the call runs again without it, with a note."""
         t0 = time.perf_counter()
         received = copy.deepcopy(arguments) if isinstance(arguments, dict) else {"_raw": repr(arguments)[:500]}
         if isinstance(name, str) and name in TOOL_ALIASES:
@@ -384,7 +394,23 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
             args, lenient = self._validate(tool, arguments)
             for n in lenient:
                 call.note(n)
-            facts = tool.handler(call, **args)
+            run_args = self._enforce_terms(call, name, args)
+            try:
+                facts = tool.handler(call, **run_args)
+            except RecordError as exc:
+                if not self._join_capped(exc, call):
+                    raise
+                plan, call = call.term_plan, _Call(self, name)   # the added filter passes the join cap: without it
+                if sink is not None:
+                    sink.clear()
+                call.read_as = sink
+                for n in lenient + [x for x in plan.notes if x not in plan.added_notes] + plan.unapplied:
+                    call.note(n)
+                call.term_plan, call.terms_dropped = plan, True
+                run_args = self._without_added(args, plan)
+                call.enforced = run_args if plan.set_args else None
+                facts = tool.handler(call, **run_args)
+            self._finish_terms(call, facts)
             facts.update(self._finish_names(call))
             if call.no_data:   # a person filter on a lookup with no data: the data does not record it (never "0")
                 facts["no_data_fields"] = list(dict.fromkeys(call.no_data))
@@ -425,6 +451,8 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
         finally:
             if token is not None:
                 READ_AS.reset(token)
+        if not out["ok"] and call is not None and call.term_plan is not None:   # the call failed: no filter applied,
+            call.notes[:] = [n for n in call.notes if n not in call.term_plan.added_notes]   # so no note says so
         self._log(qid, name, received, out, call, t0, code)
         return out
 
@@ -474,6 +502,8 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
         if call is not None and (call.read_as or call.did_you_mean):   # the spelling help (resolver_integration (3))
             ev.read_as = _corrections(call.read_as, received)
             ev.did_you_mean = [dict(x) for x in call.did_you_mean] if not ok else []
+        if call is not None and call.enforced is not None:   # the business-term contracts: what the handler ran with
+            ev.enforced_arguments = copy.deepcopy(call.enforced)
         with self._lock:
             self._evidence.append(ev)
 
@@ -1043,12 +1073,23 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
                 raise RecordError(sensitive_object_text(spec.api), "E1d")
 
     def _record_type_note(self, call: _Call, spec: ObjectSpec, args: dict) -> None:
-        used = any(str(f.get("field", "")).split(".")[0] in ("RecordTypeId", "RecordType")
-                   for f in (args.get("filters") or []) + (args.get("any_of") or []) + (args.get("base_filters") or []))
+        """The note that a count includes every record type of its object, unless the call filters the object's own
+        record type: RecordTypeId or RecordType (``RecordTypeId.DeveloperName``; business-term contracts of
+        2026-11-24: the candidate filter code added too). A filter through a lookup (``Candidate__c.RecordTypeId``)
+        narrows the related record, not the counted object's record types, so the note stays. IsPersonAccount alone is
+        no record type (review fixes of 2026-11-24: the employees' own person accounts have it too): the note then says
+        that the flag spans record types."""
+        heads = [str(f.get("field", "")).split(".")[0].lower()
+                 for f in (args.get("filters") or []) + (args.get("any_of") or []) + (args.get("base_filters") or [])]
+        used = any(h in ("recordtypeid", "recordtype") for h in heads)
         with_data = [r for r in spec.record_types if r.get("records")]
         if not used and len(with_data) > 1:
             listed = ", ".join(f"{r.get('developer_name') or r.get('name')} {r['records']}" for r in with_data)
-            call.note(f"includes all record types ({listed}); filter RecordTypeId to narrow")
+            if "ispersonaccount" in heads:
+                call.note(f"IsPersonAccount is no record type: the accounts it keeps can be of several record types "
+                          f"(all {spec.api} records: {listed}); filter RecordTypeId to narrow")
+            else:
+                call.note(f"includes all record types ({listed}); filter RecordTypeId to narrow")
 
     def _future_note(self, call: _Call) -> None:
         per = call.applied.get("period")

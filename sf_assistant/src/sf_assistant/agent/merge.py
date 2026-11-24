@@ -65,6 +65,7 @@ from sf_assistant.agent.nudges import _COUNTING_TOOLS   # the merge by code: wha
 from sf_assistant.agent.record_prompts import COMBINE_SYSTEM, combine_user_message
 from sf_assistant.agent.record_prompts import KNOWLEDGE_LEAN_SYSTEM   # the merge by code: the lean prompt's own words
 from sf_assistant.agent.results import MergeResult, RecordAnswer
+from sf_assistant.agent.term_notes import without_term_line   # the business-term contracts (2026-11-24)
 from sf_assistant.config import LIMITS
 from sf_assistant.engine.types import PERSON_TOOLS, QueryEvidence, RecordsStatus
 
@@ -113,7 +114,18 @@ def clean_knowledge_answer(text: str | None) -> str:
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
-_SCOPE_API = r"[A-Za-z][A-Za-z0-9_]*__c(?:\.[A-Za-z][A-Za-z0-9_]*)*|RecordTypeId|OwnerId|CreatedById|LastModifiedById"
+#: The fields a stated condition is checked on (business-term contracts of 2026-11-24: IsPersonAccount too).
+_SCOPE_API = (r"[A-Za-z][A-Za-z0-9_]*__c(?:\.[A-Za-z][A-Za-z0-9_]*)*|RecordTypeId|IsPersonAccount|OwnerId|CreatedById|"
+              r"LastModifiedById")
+#: The record-type fields a condition may name besides the custom fields and the system lookups.
+_TYPE_FIELDS = ("RecordTypeId", "IsPersonAccount")
+#: A Person Account scope stated as a condition of what was counted: "(Person Accounts only)", "filtered to person
+#: accounts", "where / with person accounts only". Review fixes of 2026-11-24: words that only describe ("the lookup
+#: filter offers Person Accounts only", a knowledge bullet) state no condition.
+_PERSON_SCOPE_RE = re.compile(
+    r"\(\s*(?:only\s+)?person[\s-]?accounts?\b"
+    r"|\b(?:filtered|limited|restricted|scoped|counted)\s+(?:to|on|by)\s+(?:the\s+)?(?:only\s+)?person[\s-]?accounts?\b"
+    r"|\b(?:where|with)\s+(?:only\s+)?person[\s-]?accounts?\s+only\b", re.IGNORECASE)
 #: A condition stated on a field ("records where `X__c` is populated", "filtered by `X__c`", "with `X__c` = ...").
 _FILTER_CLAIM_RE = re.compile(r"\b(?:where|whose|with|filtered\s+(?:on|by)|only\s+(?:records|those)\s+(?:where|with))\s+"
                               r"(?:the\s+)?`?(" + _SCOPE_API + r")`?\s*(?:=|!=|<>|\b(?:is|are|equals|in|has|have|not|"
@@ -124,7 +136,7 @@ def _scope_fields(rec: RecordAnswer) -> set[str]:
     """API names a merged answer may state a condition on: every field the successful data queries used
     (``fields_used``, each path part), the names in their "applied" and notes, and the names in the record answer."""
     out = set(_CUSTOM_FIELD_RE.findall(rec.answer or ""))
-    out.update(f for f in _SYSTEM_LOOKUPS + ("RecordTypeId",) if _names(rec.answer or "", f))
+    out.update(f for f in _SYSTEM_LOOKUPS + _TYPE_FIELDS if _names(rec.answer or "", f))
     for e in rec.evidence:
         if not (e.ok and e.kind == "data"):
             continue
@@ -133,7 +145,7 @@ def _scope_fields(rec: RecordAnswer) -> set[str]:
         res = e.model_result if isinstance(e.model_result, dict) else {}
         side = json.dumps([res.get("applied"), res.get("notes"), e.applied], ensure_ascii=False, default=str)
         out.update(_CUSTOM_FIELD_RE.findall(side))
-        out.update(f for f in _SYSTEM_LOOKUPS + ("RecordTypeId",) if _names(side, f))
+        out.update(f for f in _SYSTEM_LOOKUPS + _TYPE_FIELDS if _names(side, f))
     return out
 
 
@@ -763,10 +775,12 @@ def merge_scope_issues(text: str, rec: RecordAnswer, question: str = "", field_c
     issues: list[str] = []
     allowed = _scope_fields(rec)
     for m in _FILTER_CLAIM_RE.finditer(_body(text or "")):
-        parts = [p for p in m.group(1).split(".") if p.endswith("__c") or p in _SYSTEM_LOOKUPS + ("RecordTypeId",)]
+        parts = [p for p in m.group(1).split(".") if p.endswith("__c") or p in _SYSTEM_LOOKUPS + _TYPE_FIELDS]
         bad = [p for p in parts if p not in allowed]
         if bad:
             issues.append(f"a condition on {', '.join(bad)} that no query applied")
+    if _PERSON_SCOPE_RE.search(_body(text or "")) and not (allowed & set(_TYPE_FIELDS)):
+        issues.append("a condition on RecordTypeId (Person Accounts only) that no query applied")
     lead = _DATE_TIME_RE.sub(" ", _lead(text or ""))
     new = audit_numbers(lead, [rec.answer or "", question] + [str(x) for x in field_check or []])
     if new:
@@ -1834,7 +1848,10 @@ def _counted_line(rec: RecordAnswer, body: str, bullets: list[str] | tuple[str, 
     every filter (review of 2026-10-30: the line would only repeat them). The line states the object, the grouped field
     or the total, every filter, the period (its first and last day: the period's own words, "since ...", "upcoming", do
     not read after "in") and the blank group left out; each value comes from the result and its "applied" block (the
-    number audit passes). Its words: prompts/code_merge_counted.md."""
+    number audit passes). Its words: prompts/code_merge_counted.md. The code line on the candidate filter
+    (``agent.term_notes.with_term_line``, business-term contracts of 2026-11-24) is not the record answer's own words:
+    the grouped field it names (``Candidate__c.RecordTypeId``) does not count as named."""
+    body = without_term_line(body)
     counting = [e for e in rec.evidence if e.ok and e.kind == "data" and e.tool in _COUNTING_TOOLS]
     if len(counting) != 1 or counting[0].tool not in ("group_records", "list_records"):
         return ""

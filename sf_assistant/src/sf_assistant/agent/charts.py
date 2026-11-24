@@ -1714,7 +1714,10 @@ def make(ask: Any, question: Any, final: Any, kind: Any, mode: Any, rec: Any, ca
         clean = _Cleaner(question, [e.model_result for e in evidence if e.ok])
         labels = _Labels(catalog)
         asked = getattr(ask, "type", None)
-        results = [_safe_build(e.tool, e.model_result, e.arguments, e.object, clean, labels, asked, today)
+        # what ran: the arguments code enforced for a business term (the added filter, the completed split), else the
+        # model's (business-term contracts of 2026-11-24)
+        results = [_safe_build(e.tool, e.model_result, getattr(e, "enforced_arguments", None) or e.arguments, e.object,
+                               clean, labels, asked, today)
                    for e in evidence if e.ok and e.kind == "data" and e.tool != "get_sync_status"]
         blocks = getattr(rec, "table_blocks", None) or {}
         items, lines = [], []

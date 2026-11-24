@@ -141,6 +141,12 @@ class _Call:
         # the lookup check of a filter on a child copy (item 9): copy field -> the sentence on its source's count,
         # added to the copy's note by record_tools._mirror_notes (one fact, one note)
         self.copy_sources: dict[str, str] = {}
+        # the business-term contracts (tools/term_enforce.py, 2026-11-24): the plan of this call (None: no term
+        # applied), the arguments the handler ran with when the plan changed them (QueryEvidence.enforced_arguments)
+        # and whether its added filters were left out (the join cap)
+        self.term_plan: Any = None
+        self.enforced: dict[str, Any] | None = None
+        self.terms_dropped = False
 
     def note(self, text: str) -> None:
         if text and text not in self.notes:

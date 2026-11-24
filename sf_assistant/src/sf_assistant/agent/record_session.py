@@ -144,6 +144,7 @@ from sf_assistant.agent.triage import (MISSING_OVERRULE_REASON, PERSON_OVERRULE_
 from sf_assistant.agent.people_answer import (_quoted, agent_people_result, named_spellings, people_answer,
                                               people_tool_nudges)
 from sf_assistant.agent.merge import drop_record_side_caveats, fix_any_role_scope, warehouse_availability
+from sf_assistant.agent.term_notes import drop_unapplied_scope_claims, with_term_line   # business-term contracts
 
 # The rest of the public surface of OLD okrec/session.py (its ``__all__``), re-exported for the callers that import
 # it from here (pipeline, score_records, the tests): the same objects as in the defining modules. Any other name is
@@ -801,6 +802,9 @@ class RecordSession:
         (:func:`with_no_data_line`) and loses made-up overlap clauses (:func:`drop_overlap_clauses`), number-free
         caveats about lookups the question is not about (:func:`drop_record_side_caveats`) and the parts with numbers
         no result holds (:func:`drop_unsupported`, listed in ``dropped_numbers``), before the Source line is added.
+        Business-term contracts (2026-11-24): a Person Account or record-type scope claim that no applied filter backs
+        loses its clause (``agent.term_notes.drop_unapplied_scope_claims``, listed in ``dropped_claims``), and when
+        code added the candidate filter a code line says so before the Source line (``with_term_line``).
         A reply with no text besides its Source line, as written or after these checks (:func:`answer_text`,
         evaluation fix 2), is no answer: ``no_records`` with ``error`` "empty record answer..." and the reply in
         ``dropped_answer``; code then writes the people answer (``code_answer``) for a question that names people, and
@@ -959,6 +963,7 @@ class RecordSession:
             else:
                 no_records, answer = False, reply
             removed: list[str] = []
+            claims: list[str] = []   # scope claims no applied filter backs (business-term contracts, 2026-11-24)
             if answer:
                 # the code rows' own text is a source too: a stored line break reads as a space in a cell, as "n15" in
                 # the facts (code mode only; otherwise the list is as before)
@@ -969,12 +974,15 @@ class RecordSession:
                 answer, removed = drop_unsupported(answer, sources)
                 if xt is not None:   # these checks cut a line of a copy the model typed: code's rows go back
                     answer = _tables.put_back(answer, xt)
+                # the business-term contracts (2026-11-24): a Person Account / record-type claim no query applied goes
+                answer, claims = drop_unapplied_scope_claims(answer, evidence, question)
                 if not answer_text(answer):   # the checks left nothing but the Source line: no answer (fix 2)
                     no_records, answer, empty, dropped = True, "", True, dropped or reply
                     error = error or "empty record answer: the checks left only its Source line"
                 else:
                     if drafts[0] == 0 and person_q:   # a forced answer: no check saw it
                         answer = self._other_people_line(answer, tri)
+                    answer = with_term_line(answer, evidence)   # the candidate filter code added, said by code
                     answer = with_source_line(answer, evidence, status)
                     if xt is not None and xt.blocks:   # a blank line between the last rows and the added Source line
                         answer = _tables.gap_before_source(answer, xt.blocks)
@@ -1016,7 +1024,8 @@ class RecordSession:
             return RecordAnswer(question=question, answer=answer, no_records=no_records, used_data=used_data,
                                 evidence=evidence, agent=r, error=error, unsupported_numbers=unsupported,
                                 seconds=round(time.perf_counter() - t0, 3), nudges=nudges, dropped_answer=dropped,
-                                not_found_answer=found_none, dropped_numbers=removed, code_answer=code_answer,
+                                not_found_answer=found_none, dropped_numbers=removed, dropped_claims=claims,
+                                code_answer=code_answer,
                                 agent_error=agent_error, named_people=list(asked), triage=tri.as_dict(),
                                 named_spellings=named_spellings(tri.people),
                                 code_tables=_tables.answer_counts(xt, answer, blocks, nudged[0], cut) if xt is not None
