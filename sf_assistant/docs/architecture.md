@@ -247,10 +247,15 @@ cli's `ask()` and the page wrap it.
    table, dashboard, detail, summary, report, breakdown, excel, csv only in a display shape) out of the question and
    returns the search text and flags. Guards keep a word inside quotes, an API name, a question about the thing
    itself, a flow or org chart, a grouping ("breakdown by"), a gated word outside its shapes ("the dashboard",
-   "details of", "reports to", "candidates who know excel"), a stored record value or a stored person's name; when
-   the search text would change what the contact rule or the term contracts read, or lose a number or a quoted span,
-   the split is dropped (the flags stay). The search text feeds every step below; the typed text stays in the outcome,
-   the merge, the contact rule, `charts.make` and the JSONL. A question of display words only gets one line
+   "details of", "reports to", "candidates who know excel"), a stored record value or a stored person's name (a
+   value that is only the file word of a file shape, a company named "Excel" in "send X to excel", keeps the word and
+   still sets the file flag); when the search text would change what the contact rule or the term contracts read, or
+   lose a number or a quoted span, the split is dropped (the flags stay). The search text feeds the spelling help,
+   the knowledge step, the route and names calls, the value and people spots, `begin_question`, the hints and the
+   draft checks; the typed text stays in the outcome, the merge, the contact rule, `charts.make`, the JSONL and,
+   with `SFA_CHARTS` on, the record agent's user message (pre-release fix of 2026-11-25: read as "show X of last 6
+   months", "plot X of last 6 months" got a record list instead of a monthly trend with a chart; off, the record
+   agent reads the search text). A question of display words only gets one line
    (`prompts/display_words.md`: the capability line for "can you do visualizations ?", told apart for a file, a
    dashboard and `SFA_CHARTS=off`, else the bare line). Review fixes of 2026-11-25: a refusal the chart grammar reads
    ("hide the pie chart", "stop showing charts") refuses the chart and keeps its words, "visually impaired" or

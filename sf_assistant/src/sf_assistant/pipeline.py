@@ -597,17 +597,22 @@ def _bare_chart_outcome(text, q, registry, session, started_q, records_only, mer
                          _charts.bare_line(), "bare_chart", display=display)
 
 
-def _with_display(fn: Any, display: Any) -> dict:
+def _with_display(fn: Any, display: Any, typed: str | None = None) -> dict:
     """``{"display": display}`` when the session method ``fn`` takes it (``RecordSession.route`` and ``.ask``), else {}:
-    a session of another shape (a test stub, an older caller) is called as before."""
+    a session of another shape (a test stub, an older caller) is called as before. ``typed`` (the question as typed,
+    for ``RecordSession.ask`` only: the record agent's user message keeps the display words, pre-release fix of
+    2026-11-25) goes as ``typed`` when ``fn`` takes it too."""
     import inspect
 
     try:
         params = inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return {}
-    takes = "display" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
-    return {"display": display} if takes else {}
+    any_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    out = {"display": display} if "display" in params or any_kw else {}
+    if out and typed is not None and ("typed" in params or any_kw):
+        out["typed"] = typed
+    return out
 
 
 #: A sentence of a knowledge answer that echoes the agent's require-tools nudge ("You're right, I should not answer from
@@ -754,8 +759,12 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
     Display words (prerequisite P3): :func:`sf_assistant.agent.display.split` takes the display words out of the
     question (with a session, :class:`~sf_assistant.agent.display.SessionGuards` keeps stored values and names whole and
     drops the split when the contact rule or the term contracts would read it otherwise). The search text feeds the
-    spelling help, the knowledge question, the route, names and record calls; the flags feed the chart note, the chart
-    overrule and the record agent's display note. ``Outcome.text``, ``q``, the merge, the contact rule, ``charts.make``
+    spelling help, the knowledge question, the route, names and record calls, the value and people spots and the record
+    hints; with ``SFA_CHARTS`` on, the record agent's user message keeps the typed text (``RecordSession.ask(...,
+    typed=text)``: with the search text "plot X of last 6 months" read as "show X ..." and the model listed records
+    instead of a monthly trend, pre-release check of 2026-11-25; off, it gets the search text as before); the flags
+    feed the chart note, the chart overrule and the record agent's display note. ``Outcome.text``, ``q``, the merge,
+    the contact rule, ``charts.make``
     and the JSONL keep the typed text. A question of display words only gets one line and no model call (``line_reason``
     "display_only": the capability line for "can you do visualizations ?", else the bare line); a chart question that
     names nothing keeps its bare chart line. A visual word (artifact, dashboard) or a chart word ``charts.chart_ask``
@@ -800,6 +809,9 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
     if charts_cfg.on:
         chart_ask, d = chart_reading(chart_ask, d)   # one reading for both steps
     search = d.search or text   # what to fetch: every search below reads it
+    # the record agent's user message: the typed text, display words kept (pre-release fix of 2026-11-25); with
+    # SFA_CHARTS off the search text, as before (no chart word reaches a model that can draw none)
+    agent_text = text if charts_cfg.on else None
     sq = q if search == text else dataclasses.replace(q, question=search)
     with timeline.stage("spelling"):
         spelling = question_spelling(search, registry, session)   # None: the spelling help is off
@@ -815,7 +827,7 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
         mode = "full"
     elif records_only:
         with timeline.stage("records"):
-            rec = session.ask(search, **_with_display(session.ask, d))
+            rec = session.ask(search, **_with_display(session.ask, d, agent_text))
     else:
         from sf_assistant.agent.record_prompts import KNOWLEDGE_RECORDS_NOTE
 
@@ -831,7 +843,7 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
         mode = "lean" if routed is True and not by_value else "full"
         pool = ThreadPoolExecutor(max_workers=1)  # the record agent runs while the knowledge agent answers
         try:
-            shown = _with_display(session.ask, d)
+            shown = _with_display(session.ask, d, agent_text)   # the record agent reads the typed text
             pending = (pool.submit(timeline.run_in, "records", session.ask, search, routed=routed, **shown) if early
                        else pool.submit(timeline.run_in, "records", session.ask, search, **shown))
             if mode == "lean":

@@ -401,7 +401,12 @@ def test_on_chart_note_once_every_round(world, monkeypatch, tables):
         assert system.count(charts.RECORDS_CHART_NOTE) == 1 and system == off_req["messages"][0]["content"] + \
             charts.RECORDS_CHART_NOTE
         assert system.startswith(rprompts.render_records_system(o.status))   # appended, never inside the template
-        assert req["messages"][1:] == off_req["messages"][1:]                # the same user message and results
+        assert req["messages"][2:] == off_req["messages"][2:]                # the same results
+        # the same user message, but for the question: on, the record agent reads the typed text with its chart word;
+        # off, the search text as before (pre-release fix of 2026-11-25); the hints are the same
+        user, off_user = req["messages"][1]["content"], off_req["messages"][1]["content"]
+        assert off_user.startswith(o.display.search) and "graph" not in off_user.split("\n\n")[0]
+        assert user == TREND_ASK + off_user[len(o.display.search):]
         assert req["tools"] == off_req["tools"] and             _h(notebook_tools(req["tools"])) == GOLDEN["records"]["openai_tools_sha256"]
     if tables == "code":
         assert T.RECORDS_TABLES_NOTE + charts.RECORDS_CHART_NOTE in record[0]["messages"][0]["content"]
