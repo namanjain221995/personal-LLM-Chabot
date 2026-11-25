@@ -103,87 +103,12 @@ _RESERVED_KEYS = frozenset({"__proto__"})   # never a key of a row: a page's scr
 
 
 # ------------------------------------------------------------------------------------------------ the ask
-_TYPES = r"bar|bars|pie|line|lines|column|donut|doughnut|area|scatter|stacked|funnel|histogram|trend|distribution"
-#: After a type word typed with "chat" or "char" (a chat, and "char" is four in Hinglish): what makes it a chart.
-_AFTER_TYPO = r"(?=\s*(?:$|[,.;:!?]|of\b|for\b|by\b|me\b|mein\b|ka\b|ki\b|ke\b|banao\b|bana\b|dikhao\b|dikha\b|please\b))"
-_FOLD = [(re.compile(p), r) for p, r in [
-    # "ek bar", "is bar", "har bar" are Hinglish for once, this time, every time ("is bar chart" stays a chart)
-    (r"\b(ek|is|us|har|pichli|pichhli|agli|kitni|kitne|kai|teen|dusri|doosri|pehli|pahli|aakhri|akhri|aur)\s+bar\b"
-     r"(?!\s+(?:charts?|graphs?|plots?)\b)", r"\1 baar"),
-    (r"\b(?:chrat|chartt|chrt|chatr|charrt|cahrt|chaart|chrats)\b", "chart"),
-    (r"\b(?:grafh|garaf|garph|grpah|grph|grahp|grapgh|graphh)\b", "graph"),
-    (r"\bplto\b", "plot"),
-    # also surnames ("did Polt attend"): a typo only right before a word that draws
-    (r"\b(?:graf|graaf)(?=\s+(?:dikhao|dikha|banao|bana|bnao|draw)\b)", "graph"),
-    (r"\b(?:polt|plott)(?=\s+(?:dikhao|dikha|banao|bana|bnao|karo|kar)\b)", "plot"),
-    (r"\b(histogarm|histgram|histogrm|histagram|histrogram|hisogram)\b", "histogram"),
-    (r"\b(scater|scattter|sactter)\b", "scatter"),
-    (rf"\b({_TYPES})\s+chat\b{_AFTER_TYPO}", r"\1 chart"),
-    (rf"\b(bar|pie|line)\s+char\b{_AFTER_TYPO}", r"\1 chart"),
-    (r"\b(bar|pie|line)\s+diagram\b", r"\1 chart"),
-    (r"\b(bar|pie|line|area|column|donut|doughnut|flow|org)(chart|graph|plot)(s?)\b", r"\1 \2\3"),
-]]
-_NOT_A_CHART = re.compile(
-    r"(?<!cash )(?<!fund )(?<!funds )(?<!money )(?<!capital )(?<!net )(?<!free )"
-    r"\b(?:flow|work\s*flow|data\s*flow|process(?:\s+flow)?|org|organi[sz]ation(?:al)?|sequence|swim\s*lane|hierarchy|architecture)[\s-]*(?:charts?|graphs?)\b"
-    r"|\b(?:flowcharts?|orgcharts?)\b"
-    r"|(?<!bar )(?<!pie )(?<!line )(?<!column )(?<!donut )(?<!doughnut )(?<!area )(?<!stacked )"
-    r"\bcharts?\s+of\s+accounts?\b(?!\s+(?:by|per|with|ka|ke|ki|\w+\s*wise)\b)"
-    r"|\b(?:report|dashboard|list\s*view)[\s-]+charts?\b(?!\s+of\b)"
-    r"|\bcharts?\s+(?:views?|themes?)\b(?!\s+of\b)"
-    r"|\bgraph\s*(?:ql|api|db|database|theory|engine|explorer)\b"
-    r"|\b(?:knowledge|data|dependency|call|microsoft|ms|facebook|open|composite)\s+graphs?\b"
-    r"|\bplots?\s*(?:no|num|number)\b\.?(?!\s*of\b)|\bplots?[\s-]*#?[\s-]*(?:[a-z]-)?\d+[a-z]?\b(?!\s+(?:months?|weeks?|years?|days?))"
-    r"|\bplot\s+(?:twist|line)\b|\bplot\s+of\s+(?:the\s+|this\s+)?(?:book|film|movie|story|novel|show|land)\b|\b(?:sub|story)plots?\b"
-    r"|\bgraphical\s+designers?\b|\bjava\s+tree\s*maps?\b"
-)
-_CHART_WORD = r"(?:charts?|graphs?|plots?)"
-_ANY_CHART = r"(?:charts?|graphs?|plots?|histograms?|heat\s*maps?|tree\s*maps?|sunbursts?|gantt)"
-_ABOUT = re.compile(
-    r"\bwhat(?:'s|\s+is|\s+are|\s+does|\s+do)\s+(?:an?\s+|the\s+)?(?:\w+\s+){0,2}?" + _ANY_CHART + r"(?:\s+(?:mean|means|used\s+for))?\W*$"
-    r"|\b" + _ANY_CHART + r"\s+(?:kya|kab|ka\s+matlab|ka\s+mtlb)\b"
-    r"|\b(?:how\s+(?:do|can|to|should)\s+(?:i\s+|we\s+|you\s+)?|can\s+(?:i|we)\s+)(?:add|create|make|build|configure|embed|set\s*up)\b.*\b(?:charts?|graphs?)\b.*\b(?:in|to|on|into)\s+(?:salesforce|lightning|(?:an?\s+|the\s+|my\s+|our\s+)?(?:\w+\s+){0,2}?(?:report|dashboard|list\s*view|page|layout))"
-    r"|\bwhen\s+(?:(?:should|do|can|would)\s+(?:i|we|you|one)|to)\s+use\b.*\b" + _CHART_WORD + r"\b"
-    r"|\bdifference\s+between\s+(?:an?\s+|the\s+)?(?:\w+\s+)?" + _CHART_WORD + r"\b"
-    r"|\bwhich\s+" + _CHART_WORD + r"\s+(?:is|are|should|would|works?|fits?|suits?)\b"
-    r"|\b(?:how\s+(?:do|can|to|should)\s+(?:i\s+|we\s+|you\s+)?read|define)\s+(?:an?\s+|the\s+)?(?:\w+\s+)?" + _CHART_WORD + r"\b"
-    r"|\bwhat(?:'s|\s+is|\s+are)\s+(?:an?\s+|the\s+)?funnels?\s+(?:of|by)\b"
-)
-#: The words that can stand between a refusal and its chart word: any other word is about something else ("no table just
-#: chart", "not submitted candidates graph", "without visa chart"). A type word belongs ("hide the pie chart").
-_REFUSAL_GAP = (r"(?:(?:a|an|the|any|this|that|need|want|show|use|make|me|it|columns|horizontal|vertical|" + _TYPES
-                + r")\s+){0,2}?")
-_STOP = re.compile(
-    r"(?:^|[,.;:!?]\s*|\b(?:and|but|please|with|so)\s+)no\s+(?!of\b)" + _REFUSAL_GAP + _CHART_WORD + r"\b"
-    r"|\b(?:without|skip|hide|remove|drop|(?<!why\s)not|don'?t|dont|do\s+not)\s+" + _REFUSAL_GAP + _CHART_WORD + r"\b"
-    r"|\bbina\s+" + _CHART_WORD + r"\b"
-    r"|\b" + _CHART_WORD + r"\s+(?:\w+\s+)?(?:nahi|nahin|nhi|mat)\b"
-    r"|\b" + _CHART_WORD + r"\s+na\s+\w+"                 # a trailing "na" is a soft please ("chart dikhao na")
-    r"|\b" + _CHART_WORD + r"\s+(?:ke\s+)?(?:bina|bagair)\b"
-    r"|\b" + _CHART_WORD + r"\s+ki\s+(?:zaroorat|zarurat|jarurat)\s+(?:nahi|nahin|nhi)\b"
-    r"|\b" + _CHART_WORD + r"\s+(?:hata|hatao|band)\b"
-    r"|\bno\s+need\s+(?:for|of|to)\s+(?:\w+\s+){0,2}?" + _CHART_WORD + r"\b"
-    r"|\bstop\s+(?:showing|drawing|making)\s+(?:\w+\s+){0,2}?" + _CHART_WORD + r"\b"
-    r"|\b(?:did\s+not|didn'?t)\s+ask\s+for\s+(?:an?\s+|the\s+)?" + _CHART_WORD + r"\b"
-    r"|\b(?:instead\s+of|rather\s+than)\s+(?:an?\s+|the\s+)?" + _CHART_WORD + r"\b"
-)
-#: After "as a line" or "switch to area": the type word ends the clause, or what follows says it is the picture
-#: ("working as line supervisor", "as an area for improvement" and "switch to line manager" are not).
-_ENDS_TYPE = (r"(?=\s*(?:$|[,.;:!?]|please\b|pls\b|plz\b|me\b|mein\b|by\b|per\b|for\s+(?:the|last|this|past|each|every|all)\b"
-              r"|(?:charts?|graphs?|plots?|diagrams?)\b))")
-_ASK = re.compile(
-    r"\b(?:charts?|graphs?|plots?|plotting|plotted|histograms?|graphical(?:ly)?|pictorial(?:ly)?|visuals?\s+(?:view|representation|of)|trend\s*lines?|heat\s*maps?|tree\s*maps?|sunbursts?|gantt)\b"
-    r"|\bvi[sz]u?a?l+i[sz]e[sd]?\b|\bvi[sz]u?a?l+i[sz]ations?\s+of\b"
-    r"|\b(?:show|display|draw|see|dikhao)\b(?:\s+\w+){0,4}\s+visually\b"
-    r"|\b(?:horizontal|vertical|stacked)\s+(?:bars?|columns?)\b"
-    r"|\b(?:pie|donut|doughnut|scatter)\s+(?:of|by|for|me|mein|banao|bana|dikhao)\b"
-    r"|\b(?:isko|ise|iska)\s+(?:bar|line)\s+(?:me|mein)\b"
-    r"|\bfunnel\s+(?:of|by)\b"
-    r"|\b(?:bars?|pie|donut|funnel)\s+please\W*$"
-    r"|\bas\s+(?:an?\s+)?(?:pie|donut|doughnut|bars?|scatter|histogram|funnel|line|area|columns)\b" + _ENDS_TYPE +
-    r"|\bswitch\s+to\s+(?:an?\s+)?(?:bars?|lines?|pie|donut|area|scatter)\b" + _ENDS_TYPE +
-    r"|\bmake\s+(?:it|them|that)\s+(?:an?\s+)?(?:horizontal|vertical|stacked|bars?|lines?|pies?|donut|doughnut|area)\b"
-)
+# The chart ask grammar (_TYPES, _FOLD, fold, _NOT_A_CHART, _ABOUT, _STOP, _ASK, fires, _FILLER ...) lives in
+# agent/display.py since prerequisite P3 (2026-11-25: one home for the display words) and is imported back under
+# the same names, so chart_ask, named_type and bare read as before.
+from sf_assistant.agent.display import (  # noqa: E402,F401
+    _ABOUT, _AFTER_TYPO, _ANY_CHART, _ASK, _CHART_WORD, _ENDS_TYPE, _FILLER, _FOLD, _NOT_A_CHART, _REFUSAL_GAP, _STOP,
+    _TYPES, fires, fold)
 _TYPE_WORDS = [(n, re.compile(p)) for n, p in (
     ("horizontal_bar", r"\bhorizontal(?:\s+(?:bars?|columns?|charts?|graphs?))?\b"), ("donut", r"\b(?:donut|doughnut)\b"), ("pie", r"\bpie\b"),
     ("line", r"\blines?\b"), ("bar", r"\b(?:bars?|columns?|stacked)\b"),
@@ -195,34 +120,12 @@ _REFUSED_TYPE = re.compile(r"\b(?:instead\s+of|rather\s+than|not|no)\s+(?:an?\s+
 _FIELD_BEFORE = re.compile(r"\b(?:in|of)\s+(?!an?\s|the\s)\w+\s+$")
 #: The page's cap on a question (web/server.py); a longer one (the command line has no cap) reads as no ask.
 _MAX_ASK = 1000
-_FILLER = frozenset("""a an the this that it them these those now then please pls plz me my mujhe ek isko iska iski uska uski
-    usko is us ye yeh wo woh ka ki ke ko mein se aur bhi and also or as in on of for with to from show give make
-    draw create get need want can could you i we do display see view plot plots chart charts graph graphs visualize
-    visualise visually graphically graphical bar bars pie line lines donut doughnut column columns horizontal vertical
-    stacked dikhao dikha dikhana dikhado dikhaye banao bana bnao banado de karo kar kardo chahiye dena dedo
-    using into same above previous last earlier again one data records numbers table list dono both
-    just only sirf plus hai kya
-    thing things answer answers result results mai main wale wala upar pichle pichla able are have tum aap sakte sakta
-    sakti ho was not na no showing visible empty wrong visualization visualisation visual plotting plotted""".split())
 _WORD_RE = re.compile(r"[^\W\d_]+|\d+")
 _TIME_WORDS = frozenset("day days week weeks month months quarter quarters year years".split())
 _PERIOD_WORDS = frozenset("this last next past previous pichle is".split())
 _BACK_WORDS = frozenset("""that this it those these them same above previous earlier isko iska iski uska uski usko
     ye yeh wo woh upar pichle pichla""".split())
 _SPLIT_NOUNS = frozenset("source status type name stage level date owner round outcome".split())
-
-
-def fold(q):
-    t = (q or "").lower().replace("’", "'")
-    for p, r in _FOLD:
-        t = p.sub(r, t)
-    return re.sub(r"\s+", " ", t).strip()
-
-
-def fires(t):
-    if _STOP.search(t) or _ABOUT.search(t):
-        return False
-    return bool(_ASK.search(_NOT_A_CHART.sub(" ", t)))
 
 
 def named_type(t):

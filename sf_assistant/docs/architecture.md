@@ -156,6 +156,7 @@ Never sent: the trace, the log record, SQL, parameters, the model address, raw e
 | # | Condition | `status` | `answer` |
 |---|---|---|---|
 | 1 | no letter or digit in the question (empty, or zero-width characters, a NUL or a BOM alone), or over 1,000 characters | `failed` | empty |
+| 1a | small talk (`agent/small_talk.py`: a greeting, thanks, "are you there", "can you tell me one thing"; new 2026-11-25, P6), before `ensure_fresh()` and also with records off: no model call, reason `small_talk` | `answered` | the fixed line |
 | 2 | `pipeline.session` is None after `ensure_fresh()`: no model call | `failed` | empty |
 | 3 | the rewrite call raised, or the endpoint is not local: the typed words are not sent on | `failed` | empty |
 | 4 | the rewrite says UNCLEAR to a question that is not complete or has no subject of its own, or echoes a fragment, or fails the output rule, or `asks_for_contact(rewritten) != asks_for_contact(raw)`, or adds a phone number, or is not bound to the typed question (`agent/followup.py`) | `unclear` | `I could not tell what this refers to. Please ask the full question, with the name or object.` |
@@ -164,8 +165,9 @@ Never sent: the trace, the log record, SQL, parameters, the model address, raw e
 | 7 | kind `merged` or `records` | `answered` | joined |
 | 8 | kind `knowledge` and (`trace.records` is `off` or `error`, or `trace.record_error`) | `failed` | empty |
 | 9 | kind `knowledge` otherwise | `answered` | joined |
+| 9a | kind `none`, `trace.clarify` and text: the clarifying question code wrote when the record step got no data (`agent/clarify.py`; new 2026-11-25, P2), reason `clarify`, though `trace.record_error` is set | `answered` | the text |
 | 10 | kind `none`, and `trace.error` or `trace.record_error`, also with text (a chart's reason line during a model failure; rows read, then an empty reply) | `failed` | empty |
-| 11 | kind `none` with text and no fault (a chart question that names nothing to chart) | `answered` | the text |
+| 11 | kind `none` with text and no fault (a chart question that names nothing to chart, a question of display words only; reason `code_line`, or `small_talk` for small talk `Pipeline.answer` itself answered) | `answered` | the text |
 | 12 | kind `none`, no text | `no_answer` | empty |
 | - | 120 s in line | `busy` | empty |
 | - | 240 s of running | `timeout` | empty |
@@ -237,6 +239,26 @@ no record session, no record is read, and the status stays `failed`.
 Merged mode (records on, the default of the cli and the page). `sf_assistant.pipeline.answer` does this; the
 cli's `ask()` and the page wrap it.
 
+0. **Code first, no model call** (the prerequisites of 2026-11-25). **Small talk** (`agent/small_talk.py`, P6): a
+   greeting, thanks, an acknowledgement, a goodbye, "are you there", an empty ask ("can you tell me one thing") or a
+   help ask, read as a full match of a word table (English, Hinglish, typos; never yes or no, a digit, an Id or any
+   other word), gets one fixed line of `prompts/small_talk.md` and stops (`line_reason` "small_talk"). **Display
+   words** (`agent/display.py`, P3): `split` takes how to show the answer (chart, graph, plot, visualize, artifact;
+   table, dashboard, detail, summary, report, breakdown, excel, csv only in a display shape) out of the question and
+   returns the search text and flags. Guards keep a word inside quotes, an API name, a question about the thing
+   itself, a flow or org chart, a grouping ("breakdown by"), a gated word outside its shapes ("the dashboard",
+   "details of", "reports to", "candidates who know excel"), a stored record value or a stored person's name; when
+   the search text would change what the contact rule or the term contracts read, or lose a number or a quoted span,
+   the split is dropped (the flags stay). The search text feeds every step below; the typed text stays in the outcome,
+   the merge, the contact rule, `charts.make` and the JSONL. A question of display words only gets one line
+   (`prompts/display_words.md`: the capability line for "can you do visualizations ?", told apart for a file, a
+   dashboard and `SFA_CHARTS=off`, else the bare line). Review fixes of 2026-11-25: a refusal the chart grammar reads
+   ("hide the pie chart", "stop showing charts") refuses the chart and keeps its words, "visually impaired" or
+   "visualization engineer" stay as typed, and `pipeline.chart_reading` gives the chart steps one reading, so no
+   string the chart tests pin as no chart ask becomes one; a small-talk name after "this is" / "I am" is capitalised
+   or has a tail and is never a state or record word ("hi, this is about interviews" goes on); a knowledge answer loses
+   a sentence that echoes the require-tools nudge (`pipeline.drop_nudge_echo`).
+
 1. **Triage**, in `RecordSession.route` / `triage`. The **route call** (`route_system`) decides whether the
    question needs record data: `RECORDS` or `NO_RECORDS`. Next to it, code spots stored person names (the name
    index in `tools/names.py`), and one small **names call** (`names_system`, 60 tokens) reads the names in the
@@ -268,6 +290,20 @@ cli's `ask()` and the page wrap it.
      what the model received (`agent/tables.py`: a markdown table for `list_records`, `- label: value` lines for
      groups, periods, segments and a breakdown), and the draft checks, audits and contact rule read the answer with
      its rows ([runbook.md](runbook.md#how-record-rows-are-written-sfa_tables)).
+     **Display note** (P3): a table, detail, summary, breakdown or file flag appends `records_display_note` (one lead
+     line and one line per flag) after the chart note.
+     **Records retry** (P2): a records-routed or chart-overruled question that names nobody gets ONE forced round
+     (`tool_choice` "required", `records_tools_forced_message`) when its draft ran no record tool: at the require-tools
+     nudge, or at the first draft check, and with `records_all_failed_message` when every call failed (never after a
+     not-found or refusal code). A `NO_RECORDS` draft is forced only after a `RECORDS` route and never on a chart
+     question. `LLM.chat` sends the forced choice and, when the server refuses it (HTTP 400 or 422), sends the call
+     again at once as "auto" and keeps forcing off for 10 minutes; a 5xx or a timeout takes the normal retries with
+     the forced choice kept. With no tool run, the draft check asks for the record tools instead of "the final answer
+     from the tool results above". Review fixes of 2026-11-25: an engine fault (E10, E12, E13, internal) gets no forced
+     round and no clarifying question (the record step fails, so the caller's fallback runs); numbers after only
+     `describe_fields` or the sync status get the forced round with `records_run_query_message`; the forced round
+     counts no draft, so the next draft gets the full check (the number audit); once it is spent no second retry
+     message goes; and a forced `NO_RECORDS` draft whose round read no data keeps its `NO_RECORDS`.
 3. **Record tool call**, in `tools/record_tools.py` and its mixins. The arguments are validated against the
    tool's JSON schema (E11 codes). The catalog grounds every object, field, relationship and lookup role, and
    refuses an unknown one with an error code (E1 object, E2 field, E2b documented but not synced, E2c blocked) and a
@@ -328,6 +364,15 @@ tools. After the merge and the contact rule, before the code footer's lines, `ch
 goes before the Source line. `Outcome.charts` reaches the page's job reply, the cli's text and the sidecar (with no
 picture).
 
+**Clarifying question** (P2, `agent/clarify.py`). When the record step of a record question ran no record tool, or
+every call failed, after its forced round (`RecordAnswer.no_data`) and no model fault ended it, code writes a question
+back instead of "the figures could not be computed": a lead line, 2-3 numbered choices and a closing line
+(`prompts/records_clarify.md`), kind `none`, no chart and no line. The choices come from the business terms of the
+question, the objects it names, the objects of the failed calls, the objects of the last answer (`context_objects`,
+from the ask service and the page's follow-up path) or fixed examples, each written with the question's display words
+and period. A reply "2", "the second one", "doosra wala" or the choice's text is read by code in `followup.rewrite`
+(`clarify.choice_reply`) and answered as that choice.
+
 The result is an `Outcome`. `kind` is `merged`, `records`, `knowledge` or `none`. `body` is the answer without the
 code footer, which is what scoring reads. `final` is the answer with it.
 
@@ -378,6 +423,9 @@ folder, which stay out of this repository, name the old paths.
 | 4 | `agent/record_session.py` | `RecordSession`: route, triage, the record agent, the merge entry. Parts: `checks.py` (text cleaners, number audit), `results.py`, `nudges.py`, `triage.py`, `people_answer.py`, `merge.py` (the merge call `combine` and its checks; since 2026-10-29 also `code_merge`, the lean-mode merge by code behind `SFA_MERGE`, with `code_merge_lines` and `plans_aloud` for `pipeline.answer`, new) (`okrec/session.py`) |
 | 4 | `agent/tables.py` | The record rows code writes (latency plan step 3, `SFA_TABLES=code`; new 2026-10-29): the table lines (`MARKER_RE`), the rows of each result shape from `model_result` (`render`, `column_labels`), `expand` (placement, label lines between blocks and before a block that opens the answer, drop reasons, counts), the typed rule (`_typed`: every row of a block typed by the model in a form `_key_re` and `_has_value` read drops the block, and a Total line with split totals it does not give stays: `_total_left`), `put_back` (the rows of such a block come back when a later check cuts a line of the model's copy), `own_lines` (before the reply's cleaners), `strip_markers`, `gap_before_source`, `marked` / `restore` for the merge call, `marker_message`, `answer_counts`, `line_count`, `left_over`; the record side, no duckdb, never raises |
 | 4 | `agent/charts.py` | The charts code draws from record results (`SFA_CHARTS=on`; new 2026-11-03; [runbook.md](runbook.md#charts-sfa_charts)): `chart_ask` (does the question ask for a chart, code only), `drawable_ask` and `note_for` (the route overrule and the record agent's note), `drop_talk` (removes what the model says about a chart), `make` (the answer path: the last chartable result, its type, title, one SVG, or a reason line), `for_tool` (MCP `chart: true`), the core `_build` both share, `_Cleaner` (every label), `_check_svg` (fixed tags and attributes), `for_jsonl`, `text_lines`, `with_chart_arg`; the record side, pure Python, no duckdb, and `make` and `for_tool` never raise. The page imports it at start-up even with the switch off, so an import holds constants only and reads only its two prompt files |
+| 4 | `agent/small_talk.py` | Small talk answered by code (new 2026-11-25, P6): `small_talk` (a full match of a word table: greeting, thanks, ack, bye, presence, empty ask, help; English, Hinglish, typos, a self-introduction after a greeting) and `line` (`prompts/small_talk.md`); standard library, the prompts and `knowledge.resolver.osa_distance` only |
+| 4 | `agent/display.py` | The display words (new 2026-11-25, P3): `split` (the search text and the `Display` flags, with the guards; `SessionGuards` for the stored values, names and the invariant check, which imports the engine inside its methods), `note` (`prompts/records_display_note.md`), `line` (`prompts/display_words.md`), `CHART_VERBS`; and the chart ask grammar moved from `agent/charts.py` (`fold`, `fires`, `_ASK`, `_STOP`, `_ABOUT`, `_NOT_A_CHART`, `_FILLER` ...), which charts imports back. No engine module, no charts import |
+| 4 | `agent/clarify.py` | The clarifying question of a record step that got no data (new 2026-11-25, P2): `build` (lead, 2-3 choices from the terms, the question's objects, the failed calls, the last answer or examples; `prompts/records_clarify.md`) and `choice_reply` (P2c: "2", "the second one" or the choice's text read by code) |
 | 4 | `agent/followup.py` | The follow-up rewrite of the ask service (new 2026-11-04): one short model call that turns a follow-up into a question that stands on its own; `rewrite` (no earlier turn: no call), the output rule, the contact rule's check and the check that the reply is bound to the typed question. Copy it with `prompts/followup_rewrite.md`: the page imports it at start |
 | 4 | `agent/term_notes.py` | The record answer's scope claims kept true to what ran (new 2026-11-24): `drop_unapplied_scope_claims` (for a question about candidates or a call with a record-type filter: a Person Account or record-type claim no applied filter backs loses its clause, never its number), `with_term_line` (the code line "Candidates counted: Person Accounts only (...)" before the Source line), `without_term_line` (the merge's Counted line reads the record answer's own words); no duckdb, never raises |
 | 4 | `agent/record_prompts.py`, `agent/render.py` | Record and merge prompt texts (`render_records_system`); the RECORDS block and trace lines |
@@ -393,7 +441,7 @@ folder, which stay out of this repository, name the old paths.
 | web | `web/server.py`, `web/pipeline.py`, `web/codes.py`, `web/static/` | The LAN page (FastAPI): sign-in, queue, rate limit, log, security headers; pipeline wrapper with read-copy reopen; access codes; the page itself (no CDN) |
 | web | `web/ask_mcp.py` | The ask service: the one MCP tool `ask_salesforce`, the one worker, the status rows, its log ([above](#the-ask-service)) |
 
-Outside `src/`: `prompts/` (96 files), `knowledge/objects/` (91 knowledge files plus one raw file, git-ignored,
+Outside `src/`: `prompts/` (104 files), `knowledge/objects/` (91 knowledge files plus one raw file, git-ignored,
 built by `kb_build/`), `knowledge/components/` (174 flow files and `index.json`, git-ignored, built by
 `kb_build/flows/`), `kb_build/` (not in this repository), `scripts/` (`gen_tools_doc.py`, `gen_prompts_doc.py`),
 `tests/`, and `.private/` (git-ignored data, see [data_and_privacy.md](data_and_privacy.md)). The package only runs

@@ -24,11 +24,16 @@ The tool's contract, which the orchestrator's bridge is built against (docs/arch
   ``charts`` with the closed keys :data:`CHART_KEYS`). ``answer`` is one joined text (:func:`_joined`) and empty on
   every status the caller does not show. Never sent: the trace, the log record, SQL, parameters, the endpoint, raw error
   text, or ``_shape``'s placeholder sentence;
-- ``status``, in this order: ``failed`` for a question with no letter or digit or one that is too long; ``failed`` with
+- ``status``, in this order: ``failed`` for a question with no letter or digit or one that is too long; ``answered``
+  with a fixed line and no model call for small talk (``agent/small_talk.py``: a greeting, thanks, "are you there",
+  "can you tell me one thing"; reason ``small_talk``), before ``ensure_fresh`` and also with records off; ``failed`` with
   no model call when the record session is None after ``ensure_fresh`` (the knowledge side has no local-endpoint guard);
   ``failed`` when the rewrite call raised; ``unclear`` when the rewrite says so or its reply fails a rule
   (``agent/followup.py``), with :data:`UNCLEAR_LINE`; ``failed`` when ``Pipeline.answer`` raised; then :func:`decide` on
   the finished answer. ``busy`` after :data:`QUEUE_WAIT_S` in line, ``timeout`` after :data:`TIMEOUT_S` of running.
+  A clarifying question code writes when the record step got no data (``agent/clarify.py``: 2-3 numbered choices) is
+  ``answered`` with kind ``none`` and reason ``clarify``; a reply "2" (or "the second one", or the choice's text) to it is
+  read by code and answered as that choice, with its ``Read as:`` line.
 
 In ``answer``, ``Read as:`` is a code span, so nothing in it links, and the body and the Source line lose the syntax of
 a Markdown link, image or reference (:func:`_no_links`): a link planted in a record cannot hide where it goes. A refusal
@@ -312,9 +317,12 @@ def _joined(shaped: dict, rewritten: str | None) -> str:
 def decide(shaped: dict) -> tuple[str, str]:
     """``(status, reason)`` of a finished ``Pipeline.answer``, in this order. A refusal goes first: it can end with no
     text at all, and the caller must not send that question elsewhere. A knowledge answer with records off or failed
-    is no answer to a question about records. A fault with kind none is a failure even with text: a chart's reason line
-    during a model failure is no answer, and the caller's fallback should run. Without a fault, text with kind none is
-    the code's own line (a chart question that names nothing to chart)."""
+    is no answer to a question about records. A clarifying question code wrote when the record step got no data
+    (``trace.clarify``) is an answer (reason ``clarify``), though the record step's error is set. A fault with kind none
+    is a failure even with text: a chart's reason line during a model failure is no answer, and the caller's fallback
+    should run. Without a fault, text with kind none is the code's own line: ``small_talk`` for small talk the page or
+    the command line answered (``trace.line_reason``), else ``code_line`` (a chart question that names nothing to
+    chart, a question of display words only)."""
     trace = shaped.get("trace") or {}
     kind = shaped.get("kind") or "none"
     if any(q.get("error_code") in REFUSAL_CODES for q in trace.get("queries") or []):
@@ -325,10 +333,12 @@ def decide(shaped: dict) -> tuple[str, str]:
         if trace.get("records") in ("off", "error") or trace.get("record_error"):
             return "failed", "knowledge_without_records"
         return "answered", ""
+    if trace.get("clarify") and _body(shaped):
+        return "answered", "clarify"
     if trace.get("error") or trace.get("record_error"):
         return "failed", "fault_without_an_answer"
     if _body(shaped):
-        return "answered", "code_line"
+        return "answered", "small_talk" if trace.get("line_reason") == "small_talk" else "code_line"
     return "no_answer", ""
 
 
@@ -527,8 +537,12 @@ class AskService:
             return {"result": result, "reason": reason, "question_used": used, "detail": detail, "error": error}
 
         try:
-            from sf_assistant.agent.followup import FAILED, UNCLEAR, rewrite
+            from sf_assistant.agent.followup import FAILED, UNCLEAR, last_answer_objects, rewrite
+            from sf_assistant.agent.small_talk import line as talk_line, small_talk
 
+            talk = small_talk(question)   # first: no reopen of the read copy, no model call, also with records off
+            if talk:
+                return out(_result("answered", talk_line(talk)), "small_talk", {"small_talk": talk})
             pipeline.ensure_fresh()
             if pipeline.session is None:   # no model call: the question never goes out without the record guard
                 return out(_result("failed"), "records_off", error=str(pipeline.records_error or ""))
@@ -538,7 +552,9 @@ class AskService:
             if step.status == UNCLEAR:
                 return {**out(_result("unclear", UNCLEAR_LINE), f"rewrite_{step.reason}"), "rewrite_reply": step.reply}
             used = step.question
-            shaped = pipeline.answer(used, "merged")
+            objects = last_answer_objects(turns)   # P2b: only the clarifying question reads them
+            shaped = (pipeline.answer(used, "merged", context_objects=objects) if objects
+                      else pipeline.answer(used, "merged"))
             status, reason = decide(shaped)
             kind = shaped.get("kind") or "none"
             if status not in ("answered", "refused"):

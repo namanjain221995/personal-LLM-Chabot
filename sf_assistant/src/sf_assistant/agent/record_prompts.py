@@ -22,7 +22,8 @@ from sf_assistant.config import LIMITS
 if TYPE_CHECKING:  # type hints only
     from sf_assistant.engine.types import RecordsStatus
 
-__all__ = ["RECORDS_AGENT_SYSTEM", "RECORDS_REQUIRE_TOOLS_MESSAGE", "RECORDS_FORCE_ANSWER_MESSAGE",
+__all__ = ["RECORDS_AGENT_SYSTEM", "RECORDS_REQUIRE_TOOLS_MESSAGE", "RECORDS_TOOLS_FORCED_MESSAGE",
+           "RECORDS_ALL_FAILED_MESSAGE", "RECORDS_FORCE_ANSWER_MESSAGE",
            "RECORDS_RUN_QUERY_MESSAGE", "RECORDS_UNSUPPORTED_MESSAGE", "RECORDS_OTHER_LOOKUP_MESSAGE",
            "RECORDS_OTHER_LOOKUP_FIRM_MESSAGE",
            "RECORDS_OTHER_LOOKUP_FITS_MESSAGE", "RECORDS_ELSEWHERE_MESSAGE", "RECORDS_NOT_FOUND_MESSAGE",
@@ -42,6 +43,11 @@ __all__ = ["RECORDS_AGENT_SYSTEM", "RECORDS_REQUIRE_TOOLS_MESSAGE", "RECORDS_FOR
 RECORDS_AGENT_SYSTEM = _prompt_files.text("records_agent_system")
 
 RECORDS_REQUIRE_TOOLS_MESSAGE = _prompt_files.text("records_require_tools_message")
+
+# Prerequisite P2 (2026-11-25): the one forced round (tool_choice "required") of a records-routed question whose draft
+# ran no record tool, and the message when every record call failed (RecordSession.ask).
+RECORDS_TOOLS_FORCED_MESSAGE = _prompt_files.text("records_tools_forced_message")
+RECORDS_ALL_FAILED_MESSAGE = _prompt_files.text("records_all_failed_message")
 
 RECORDS_FORCE_ANSWER_MESSAGE = _prompt_files.text("records_force_answer_message")
 

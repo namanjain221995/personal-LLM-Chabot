@@ -20,6 +20,14 @@ from sf_assistant.engine.types import QueryEvidence
 #: Error codes (``QueryEvidence.error_code``) of a failed call whose answer is "no such person / not recorded":
 #: an unknown name (E4h, E15a), an object with no table (E1b), a documented field that is not synced (E2b).
 NOT_FOUND_CODES = frozenset({"E4h", "E15a", "E1b", "E2b"})
+#: Error codes of a refused call (a blocked field, a sensitive object; tools/records.py): never retried around. The
+#: package's one home; ``web/ask_mcp.py`` keeps the same set in its contract (pinned equal in tests/test_records_retry.py).
+REFUSAL_CODES = frozenset({"E2c", "E1d"})
+#: Error codes of a fault in the engine, not in the call (tools/record_base.py, record_tools.py): the time budget (E10),
+#: the internal query guard (E12), DuckDB or I/O (E13) and an internal tool error. Another forced round would hit the
+#: same fault, and a clarifying question would ask the person about a question that was fine (review of the
+#: prerequisites, 2026-11-25): the record step stays a failure, so the caller's fallback runs.
+ENGINE_CODES = frozenset({"E10", "E12", "E13", "internal"})
 #: List-valued result keys that facts_json may shorten (from the end).
 _FACT_LIST_KEYS = ("rows", "groups", "buckets", "values", "matches", "changes", "fields", "references",
                    "system_references", "matched_records")

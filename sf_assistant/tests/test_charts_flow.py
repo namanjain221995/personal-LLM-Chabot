@@ -455,7 +455,9 @@ def test_map_cases_D_F_G_J_K(world, monkeypatch):
     assert o.mode == "full" and o.kind == "merged" and [e.tool for e in o.rec.evidence] == ["group_records"]
     assert row["jsonl"]["triage"]["overruled_by"] == "chart" and o.charts and o.status_lines == []
     with monkeypatch.context() as mp:
-        mp.setattr(charts, "drawable_ask", lambda question: False)
+        # prerequisite P3: the triage reads the display flags (record_session._chart_question), no longer drawable_ask
+        from sf_assistant.agent import record_session as _rs
+        mp.setattr(_rs, "_chart_question", lambda question, display=None: False)
         model = Model(GROUP_CALL, DRAFT, route="NO_RECORDS")
         o, row = run(world, model)
         assert o.rec.routed_out and o.rec.evidence == [] and o.kind == "knowledge" and model.rounds()["record"] == 0
@@ -475,15 +477,17 @@ def test_map_cases_D_F_G_J_K(world, monkeypatch):
     assert [(e.query_id, e.tool, e.ok) for e in o.rec.evidence] == [("q1", "trend_records", True)]
     assert o.charts[0]["chart"]["type"] == "line" and o.status_lines == []
 
-    # J: the agent refuses twice and calls no tool: the record step failed, and the answer says so plainly instead of
-    # showing the lean bullets in place of the figures (2026-11-16); the record step read no records, so no note
-    # follows (review of 2026-11-16: only the objects of good data calls keep one), then the line
+    # J: the agent refuses twice and calls no tool: the record step failed; since prerequisite P2 (2026-11-25) its second
+    # round is the forced one (the fake ignores tool_choice), and code then asks which question was meant instead of
+    # "the figures could not be computed" (2026-11-16): a question gets no chart line under it
+    from sf_assistant.agent import clarify as _clarify
     model = Model("I cannot draw charts here.")
     o, row = run(world, model)
     assert model.rounds() == {"route": 1, "names": 1, "lean": 2, "knowledge": 0, "record": 2, "merge": 0}
-    failed = pipeline.RECORDS_FAILED_ANSWER
-    assert o.rec.evidence == [] and o.kind == "none" and o.merge_by is None and o.body == failed
-    assert o.charts == [] and o.status_lines == [W["no_data"]] and o.final == failed + "\n" + W["no_data"]
+    assert model.requests["record"][1]["tool_choice"] == "required" and o.rec.no_data == "no_call"
+    assert o.rec.evidence == [] and o.kind == "none" and o.merge_by is None and _clarify.is_clarify(o.body)
+    assert pipeline.RECORDS_FAILED_ANSWER not in o.body and o.clarify["from"] == "question"
+    assert o.charts == [] and o.status_lines == [] and o.final == o.body
 
     # K: a failed trend, then fixed: the failed call is skipped
     model = Model(BAD_TREND, TREND_CALL, "10 interviews over the months (`Interview__c`).\n" + SOURCE)

@@ -63,6 +63,15 @@ asks for the full question), ``reason`` says which rule fired, and the reply goe
    in its past (:func:`_past_forms`), when the first sentence of the last answer holds that form too: "the offers Echo
    One made" after "how many offers did Echo One make?" / "Echo One made 5 offers.".
 
+No call either, and the typed words (or a choice) come back with status ``ok`` (the prerequisites of 2026-11-25): for
+small talk (``agent.small_talk``: "thanks", "ok", "are you there"; reason ``small_talk``), for an ask about what the
+answers can show with plural display nouns only ("can you do visualizations ?", ``agent.display.generic_ask``; "can you
+plot" and "can you make a pie chart" still go to the call: they ask for a chart of the last answer; reason
+``display_only``) and for a
+reply to a clarifying question (``agent.clarify.choice_reply``: "2", "the second one", "doosra wala" or the choice's
+text; the choice comes back, reason ``clarify_choice``). :func:`last_answer_objects` gives the objects the last answer
+named (P2b: only the clarifying question reads them).
+
 A call that raises is status ``failed``, and the typed words are not sent on either way: as a fragment they would be
 answered as a different question. Typed spellings stay: the term resolver reads the question this returns
 (``pipeline.spelling_final``), and a silent correction here would skip its "Read as" line.
@@ -82,6 +91,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sf_assistant import prompts as _prompt_files
+from sf_assistant.agent import display as _display
 from sf_assistant.agent.checks import strip_thinking
 from sf_assistant.agent.merge import _finish_reason
 from sf_assistant.agent.record_session import is_local_endpoint
@@ -90,7 +100,7 @@ from sf_assistant.engine.contact import asks_for_contact, drop_contact_details
 from sf_assistant.knowledge.resolver import osa_distance
 
 __all__ = ["FOLLOWUP_REWRITE_SYSTEM", "FOLLOWUP_MAX_TOKENS", "MAX_QUESTION_CHARS", "MAX_TURNS", "MAX_TURN_CHARS",
-           "MAX_NAME_WORDS", "OK", "UNCLEAR", "FAILED", "Rewrite", "usable_turns", "rewrite"]
+           "MAX_NAME_WORDS", "OK", "UNCLEAR", "FAILED", "Rewrite", "usable_turns", "rewrite", "last_answer_objects"]
 
 FOLLOWUP_REWRITE_SYSTEM = _prompt_files.text("followup_rewrite")
 FOLLOWUP_MAX_TOKENS = LIMITS.followup_max_tokens
@@ -190,7 +200,7 @@ _ALL_TIME_RE = re.compile(r"(?<![^\W_])(?:so\s+far|in\s+total|total|overall|all\
 #: typed words that take over the measure or the chart of the earlier question, and so its period: "this placement
 #: rate", "plot it", "chart this", "and the placement rate?" (a rate behind a lead; never "and his number?")
 _MEASURE_POINTED_RE = re.compile(r"(?<![^\W_])" + _POINTED_MEASURE, re.IGNORECASE)
-_CHART_WORDS = frozenset("plot plots chart charts graph graphs visualise visualize draw".split())
+_CHART_WORDS = _display.CHART_VERBS   # the display words' one home (agent/display.py, prerequisite P3)
 _RATE_WORDS = frozenset("rate rates ratio ratios percentage percentages percent".split())
 #: a reply that counts or lists: it runs over whatever period it says, and over all time when it says none
 _COUNT_OR_LIST_RE = re.compile(r"(?<![^\W_])(?:how\s+(?:many|much)|kitn[aie]|count|list)(?![^\W_])", re.IGNORECASE)
@@ -1208,11 +1218,36 @@ def _unbound(question: str, reply: str, turns: list[dict]) -> str:
     return "person_lost" if _person_lost(question, reply, added, turns) else ""
 
 
+def last_answer_objects(turns: Any) -> tuple[str, ...]:
+    """The API names of objects (``..__c`` and a few standard ones) the last assistant turn names, in order, each once
+    (prerequisite P2b: the clarifying question's choices may use them). () without one. Never raises."""
+    try:
+        from sf_assistant.agent.clarify import _API_RE
+
+        last = next((t["content"] for t in reversed(usable_turns(turns)) if t["role"] == "assistant"), "")
+        return tuple(dict.fromkeys(m.group(0) for m in _API_RE.finditer(last)))
+    except Exception:  # noqa: BLE001 - optional
+        return ()
+
+
 def rewrite(question: str, turns: Any, llm: Any) -> Rewrite:
     """The question to answer for ``question`` after the earlier ``turns`` (see the module text). Never raises."""
+    from sf_assistant.agent.small_talk import small_talk
+
     usable = usable_turns(turns)
     if not usable:
         return Rewrite(OK, question)
+    if small_talk(question):   # P6: the pipeline answers it with a fixed line, so no call here either
+        return Rewrite(OK, question, reason="small_talk")
+    # P3: what the answers can show, with plural nouns only ("can you do visualizations ?"): nothing to rewrite. A verb
+    # or a single chart ("can you plot", "can you make a pie chart") asks for a chart of the last answer (review fix R2)
+    if _display.generic_ask(_display.split(question)):
+        return Rewrite(OK, question, reason="display_only")
+    from sf_assistant.agent.clarify import choice_reply
+
+    choice = choice_reply(question, usable)   # P2c: a reply to the clarifying question picks one of its choices
+    if choice is not None:
+        return Rewrite(OK, choice, reason="clarify_choice")
     if not is_local_endpoint(getattr(getattr(llm, "cfg", None), "base_url", "")):
         return Rewrite(FAILED, reason="not_local")
     try:

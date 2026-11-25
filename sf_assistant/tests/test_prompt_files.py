@@ -59,8 +59,10 @@ def test_every_file_parses_and_is_well_formed():
     # step 3: records_tables_note, combine_tables_note, records_tables_marker_message, records_table_words) + 2 of the
     # charts of 2026-11-03 (records_chart_note, records_chart_words) + 1 of the ask service of 2026-11-04
     # (followup_rewrite) + 1 of the placement fixes of 2026-11-16 (business_terms) + 1 of the business-term contracts
-    # of 2026-11-24 (term_contracts); the last 30 are new, so the notebook golden does not cover them
-    assert len(files) == 98
+    # of 2026-11-24 (term_contracts) + 6 of the prerequisites of 2026-11-25 (small_talk, display_words,
+    # records_display_note, records_tools_forced_message, records_all_failed_message, records_clarify); the last 36 are
+    # new, so the notebook golden does not cover them
+    assert len(files) == 104
     for path in files:
         raw = path.read_bytes()
         assert b"\r" not in raw and not raw.startswith(b"\xef\xbb\xbf"), path.name

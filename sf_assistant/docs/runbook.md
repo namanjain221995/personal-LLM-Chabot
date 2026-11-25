@@ -1412,6 +1412,23 @@ agent on a scripted model, and `python web/ask_mcp.py` as a real process on a de
 question in flight. `tests/test_followup.py` runs the rewrite on a fake model, with its honest list, the honest matrix (what
 passes and what is lost, pinned) and the attack lists. Neither makes a model call.
 
+The prerequisites of 2026-11-25 (small talk, display words, records retry; no new switch) have four test files, none of
+which makes a model call: `tests/test_small_talk.py` (every kind in English, Hinglish and typos, the words that are
+never small talk, the fixed lines with no prompt or bridge text, no model call on the page, CLI and ask service paths,
+the ask service before `ensure_fresh`, no engine module on a `--no-records` run), `tests/test_display_words.py` (each
+flag and shape, the log shapes as templates, Hinglish and typos, every guard, refusals, display-only and capability
+asks, the display note, and the chart ask parity list `tests/golden/chart_ask_parity.json` recorded before the grammar
+moved to `agent/display.py`), `tests/test_display_flow.py` (through `pipeline.answer` on the fake warehouse: no route,
+names, lean, knowledge or record request holds a removed word, the chart and display notes, the chart overrule from the
+flags, the typed text in the outcome and the JSONL, the invariant guard, `SFA_CHARTS=off` and records off) and
+`tests/test_records_retry.py` (the forced `tool_choice` and its fallback in `LLM.chat`, the two `answer_question` hooks,
+the forcing policy on every path, the clarifying question and its sources, a model fault staying `failed`, and the
+replies "2", "the second one", "doosra wala" read by code). The review fixes of the same day are pinned in the same
+four files (sections "review fixes"), among them every string `tests/test_charts.py` pins as no chart ask staying none
+after the display split. Rollback is a revert of the change and a restart of the page, the MCP server and the ask
+service; the forced tool choice has its own fallback (10 minutes off after a server refused it with HTTP 400 or 422;
+a 5xx or a timeout leaves forcing on).
+
 ### The generated docs and the personal-data check
 
 The parity checks of the restructure, which compare this package with the notebook folder it was moved from, read real

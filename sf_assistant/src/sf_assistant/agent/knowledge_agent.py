@@ -248,8 +248,9 @@ def answer_question(
     require_tools: bool = False,
     require_tools_message: str | None = None,
     force_answer_message: str | None = None,
-    check_answer: Callable[[str], str | None] | None = None,
+    check_answer: Callable[[str], Any] | None = None,
     max_checks: int = 1,
+    tools_first: Callable[[str], tuple[str, str | None] | None] | None = None,
 ) -> AgentResult:
     """Answer one question with the tool-calling loop. Never raises.
 
@@ -269,6 +270,13 @@ def answer_question(
             default, accepts every answer, as evaluation runs do).
         max_checks: How many final answers ``check_answer`` sees at most (default 1: only the
             first). A later answer is checked only after the earlier check sent a message back.
+            ``check_answer`` may also return ``(message, tool_choice)``: the message goes back and
+            the next round only is sent with that ``tool_choice`` (``"required"`` forces a tool
+            call; ``LLM.chat``), when it is not None (prerequisite P2 of 2026-11-25).
+        tools_first: With ``require_tools``, called with the draft at the require-tools nudge;
+            it returns ``(message, tool_choice)``: the message to send instead of the nudge text
+            and the tool choice of the next round only (None: none). ``None`` (the default) keeps
+            the nudge as it was. With both hooks unset every request is byte for byte as before.
 
     Returns:
         :class:`AgentResult`. On failure ``error`` is set and ``answer`` holds whatever
@@ -286,8 +294,10 @@ def answer_question(
         answered = False
         nudged = False
         checks = 0
+        choice: str | None = None   # the tool choice of the next round only (a hook asked for it)
         while result.steps < max_steps:
-            resp = llm.chat(messages, tools=tools)
+            resp = llm.chat(messages, tools=tools, **({"tool_choice": choice} if choice else {}))
+            choice = None
             result.steps += 1
             _add_usage(result.usage, resp.get("usage"))
             tool_calls = list(resp.get("tool_calls") or [])
@@ -296,8 +306,16 @@ def answer_question(
             if not tool_calls and require_tools and not result.tool_calls and not nudged:
                 nudged = True
                 timeline.add("check", time.perf_counter(), name="tools_first", nudge=True)
+                message = require_tools_message or REQUIRE_TOOLS_MESSAGE
+                if tools_first is not None:
+                    try:
+                        got = tools_first(_strip_thinking(content) or "")
+                    except Exception:  # a failing hook must not cost the answer
+                        got = None
+                    if got:
+                        message, choice = got[0] or message, got[1]
                 messages.append({"role": "assistant", "content": _strip_thinking(content)})
-                messages.append({"role": "user", "content": require_tools_message or REQUIRE_TOOLS_MESSAGE})
+                messages.append({"role": "user", "content": message})
                 continue
 
             if not tool_calls and check_answer is not None and checks < max(1, int(max_checks or 1)) \
@@ -308,10 +326,13 @@ def answer_question(
                     retry = check_answer(draft)
                 except Exception:  # a failing check must not cost the answer
                     retry = None
+                if isinstance(retry, tuple):   # (message, tool_choice of the next round)
+                    retry, choice = (retry[0] if retry else None), (retry[1] if len(retry) > 1 else None)
                 if retry:
                     messages.append({"role": "assistant", "content": draft})
                     messages.append({"role": "user", "content": retry})
                     continue
+                choice = None
 
             if not tool_calls:
                 result.answer = _strip_thinking(content)
