@@ -5355,6 +5355,147 @@ def conversation_has_engine_line(conversation_id: str, engine: str, lines: Seque
     return row is not None
 
 
+def _server_salesforce(con, generation_ids: Sequence[str], intent_ids: Sequence[str]):
+    """What the server-written rows say about some generations and intents:
+    ({trace id: requested mode}, {generation id: request mode}, {intent id:
+    generation id}). Index lookups on unique keys only — a correlated
+    EXISTS let the planner hash the whole chat_requests table and
+    decompress every request (review R2: 38 ms on a 54-answer chat)."""
+    gens = [g for g in dict.fromkeys(generation_ids) if g]
+    intents = [i for i in dict.fromkeys(intent_ids) if i]
+    requests: dict = {}
+    by_intent: dict = {}
+    if intents:
+        for r in con.execute(
+            "SELECT intent_id, generation_id, request->>'mode' AS mode FROM chat_requests"
+            " WHERE intent_id = ANY(%s)",
+            (intents,),
+        ).fetchall():
+            by_intent[r["intent_id"]] = r["generation_id"]
+            requests[r["generation_id"]] = r["mode"]
+    wanted = [g for g in gens if g not in requests]
+    if wanted:
+        for r in con.execute(
+            "SELECT generation_id, request->>'mode' AS mode FROM chat_requests WHERE generation_id = ANY(%s)",
+            (wanted,),
+        ).fetchall():
+            requests[r["generation_id"]] = r["mode"]
+    traces: dict = {}
+    every = list(dict.fromkeys([*gens, *by_intent.values()]))
+    if every:
+        for r in con.execute(
+            "SELECT trace_id, requested_mode FROM query_traces WHERE trace_id = ANY(%s)", (every,)
+        ).fetchall():
+            traces[r["trace_id"]] = r["requested_mode"]
+    return traces, requests, by_intent
+
+
+def salesforce_chat_state(user_id: int, conversation_id: str) -> List[dict]:
+    """The rows of a conversation that holds Salesforce, or [] when it holds
+    none (toggle-off isolation, app/sf_isolation.py).
+
+    Holding: an assistant row whose meta says Salesforce, or a server row
+    (`query_traces`, or `chat_requests` for a generation with no trace) that
+    says one of the chat's turns asked for Salesforce — a Salesforce answer
+    stopped or not stored yet still makes its chat holding (review F1). That
+    probe is one statement over idx_messages_conversation and the two
+    conversation indexes, with the meta read once per row (review R7). Only
+    a holding chat reads its rows; each row then says whether it is a
+    Salesforce answer, or a question asked in Salesforce mode (by its
+    request, by the answer under it in the tree, or by the row after it),
+    as `messages_missing_embeddings` reads it. Scoped to the owner. Every
+    branch counts.
+    """
+    from .sf_isolation import meta_says_salesforce, server_says_salesforce, sf_meta_sql
+
+    with read_connection() as con:
+        probe = con.execute(
+            "SELECT EXISTS (SELECT 1 FROM conversations c WHERE c.id = %s AND c.user_id = %s) AS owned,"
+            "  (EXISTS (SELECT 1 FROM messages x WHERE x.conversation_id = %s AND x.role = 'assistant'"
+            f"           AND {sf_meta_sql('x')})"
+            "   OR EXISTS (SELECT 1 FROM query_traces t WHERE t.conversation_id = %s"
+            "               AND t.requested_mode = 'salesforce')"
+            "   OR EXISTS (SELECT 1 FROM chat_requests r WHERE r.conversation_id = %s"
+            "               AND CASE WHEN EXISTS (SELECT 1 FROM query_traces t2 WHERE t2.trace_id = r.generation_id)"
+            "                   THEN false ELSE r.request->>'mode' = 'salesforce' END)) AS holding",
+            (conversation_id, int(user_id), conversation_id, conversation_id, conversation_id),
+        ).fetchone()
+        if not probe or not probe["owned"] or not probe["holding"]:
+            return []
+        rows = con.execute(
+            "SELECT id, role, content, meta, generation_id FROM messages"
+            " WHERE conversation_id = %s ORDER BY id",
+            (conversation_id,),
+        ).fetchall()
+        metas = [r["meta"] if isinstance(r["meta"], dict) else {} for r in rows]
+        intents = [
+            str((m.get("intent") or {}).get("id") or "")
+            for r, m in zip(rows, metas)
+            if r["role"] == "user" and isinstance(m.get("intent"), dict)
+        ]
+        traces, requests, by_intent = _server_salesforce(
+            con, [r["generation_id"] for r in rows if r["role"] == "assistant"], intents
+        )
+    out: List[dict] = []
+    sf_branch_parents: set = set()
+    for r, meta in zip(rows, metas):
+        is_sf = r["role"] == "assistant" and (
+            meta_says_salesforce(meta) or server_says_salesforce(r["generation_id"], traces, requests)
+        )
+        if is_sf and isinstance(meta.get("branch"), dict) and meta["branch"].get("parent"):
+            sf_branch_parents.add(str(meta["branch"]["parent"]))
+        out.append(
+            {
+                "id": int(r["id"]),
+                "role": r["role"],
+                "content": r["content"],
+                "mode": meta.get("mode"),
+                "stamped": "sf_isolation" in meta,
+                "is_sf": bool(is_sf),
+                "is_sf_question": False,
+                "holding": True,
+            }
+        )
+    for i, (row, meta) in enumerate(zip(out, metas)):
+        if row["role"] != "user":
+            continue
+        intent = meta.get("intent") if isinstance(meta.get("intent"), dict) else {}
+        branch = meta.get("branch") if isinstance(meta.get("branch"), dict) else {}
+        nxt = out[i + 1] if i + 1 < len(out) else None
+        row["is_sf_question"] = bool(
+            server_says_salesforce(by_intent.get(str(intent.get("id") or "")), traces, requests)
+            or (branch.get("self") and str(branch["self"]) in sf_branch_parents)
+            or (nxt is not None and nxt["is_sf"])
+        )
+    return out
+
+
+def salesforce_chat_ids(user_id: int) -> List[str]:
+    """Every conversation of this user that holds Salesforce: an answer whose
+    meta says so, or a server row of a Salesforce-mode turn (the same signals
+    as `salesforce_chat_state`). One statement; the meta is read once per
+    row. Cached per user by app/sf_isolation.salesforce_chats."""
+    from .sf_isolation import sf_meta_sql
+
+    with read_connection() as con:
+        rows = con.execute(
+            "SELECT m.conversation_id AS id FROM messages m"
+            " WHERE m.conversation_id = ANY(ARRAY(SELECT id FROM conversations WHERE user_id = %s))"
+            f"   AND m.role = 'assistant' AND {sf_meta_sql('m')}"
+            " UNION"
+            " SELECT t.conversation_id FROM query_traces t"
+            " WHERE t.conversation_id = ANY(ARRAY(SELECT id FROM conversations WHERE user_id = %s))"
+            "   AND t.requested_mode = 'salesforce'"
+            " UNION"
+            " SELECT r.conversation_id FROM chat_requests r"
+            " WHERE r.user_id = %s"
+            "   AND NOT EXISTS (SELECT 1 FROM query_traces t2 WHERE t2.trace_id = r.generation_id)"
+            "   AND r.request->>'mode' = 'salesforce'",
+            (int(user_id), int(user_id), int(user_id)),
+        ).fetchall()
+    return [r["id"] for r in rows if r["id"]]
+
+
 def conversation_owner(conversation_id: str) -> Optional[int]:
     """user_id owning this conversation, or None when no such row exists.
 
@@ -5797,7 +5938,19 @@ def replace_messages(
     THE SF_ASSISTANT STAMP SURVIVES THE SAME WAY. The web block and the
     workspace-share block read `meta.engine`, so a client's PUT must not be able
     to lift them by leaving it out.
+
+    SO DO `mode` AND `sf_isolation` (toggle-off isolation, 2026-11-25), and
+    both are SERVER-OWNED (review F5). On an assistant row the stored `mode`
+    and stamp are carried by position and the client's are ignored; every
+    row the Salesforce-answer predicate matches (app/sf_isolation.py) keeps or
+    gains `mode='salesforce'`, and a client may still mark a row
+    'salesforce', which only hides more. A client can never ADD the stamp
+    (it is dropped from every incoming row), so a PUT cannot turn a tainted
+    answer clean or a Salesforce answer into anything else.
     """
+    from .sf_isolation import meta_says_salesforce, note_salesforce_chat, server_says_salesforce
+
+    carry_isolation = bool(getattr(settings, "toggle_off_isolation", True))
     now = _now()
     with connection() as con:
         owned = con.execute(
@@ -5824,13 +5977,40 @@ def replace_messages(
         if len(messages) < existing:
             raise MessageCountWouldShrink(existing, len(messages))
         # Snapshot the thumbs before the rows they belong to are deleted.
-        before = con.execute(
-            "SELECT feedback, meta->>'engine' AS engine FROM messages"
-            " WHERE conversation_id = %s ORDER BY id",
-            (conversation_id,),
-        ).fetchall()
+        server_rows: List[dict] = []
+        if carry_isolation:
+            before = con.execute(
+                "SELECT feedback, role, meta, generation_id, meta->>'engine' AS engine FROM messages"
+                " WHERE conversation_id = %s ORDER BY id",
+                (conversation_id,),
+            ).fetchall()
+            traces, requests, _intents = _server_salesforce(
+                con, [r["generation_id"] for r in before if r["role"] == "assistant"], []
+            )
+            for r in before:
+                meta_b = r["meta"] if isinstance(r["meta"], dict) else {}
+                server_rows.append(
+                    {
+                        "assistant": r["role"] == "assistant",
+                        "is_sf": r["role"] == "assistant"
+                        and (
+                            meta_says_salesforce(meta_b)
+                            or server_says_salesforce(r["generation_id"], traces, requests)
+                        ),
+                        "mode": meta_b.get("mode"),
+                        "isolated": "sf_isolation" in meta_b,
+                    }
+                )
+        else:
+            before = con.execute(
+                "SELECT feedback, meta->>'engine' AS engine FROM messages"
+                " WHERE conversation_id = %s ORDER BY id",
+                (conversation_id,),
+            ).fetchall()
         carried = [r["feedback"] for r in before]
         stamped = {i for i, r in enumerate(before) if r["engine"] == "sf_assistant"}
+        was_salesforce = any(r["is_sf"] for r in server_rows)
+        now_salesforce = False
         con.execute("DELETE FROM messages WHERE conversation_id = %s", (conversation_id,))
         seen_generations = set()
         rows = []
@@ -5838,6 +6018,11 @@ def replace_messages(
             meta = m.get("meta")
             if index in stamped:
                 meta = {**(meta or {}), "engine": "sf_assistant"}
+            if carry_isolation and isinstance(meta or {}, dict):
+                meta = _carry_isolation_meta(meta, server_rows[index] if index < len(server_rows) else None)
+                now_salesforce = now_salesforce or (
+                    str(m.get("role", "")) == "assistant" and meta_says_salesforce(meta)
+                )
             gen_id = (meta or {}).get("generation_id")
             # The unique index would reject a repeated key; a client sending
             # one twice is a bug on its side, not a reason to 500 — keep the
@@ -5874,7 +6059,29 @@ def replace_messages(
             "UPDATE conversations SET updated_at = %s WHERE id = %s",
             (now, conversation_id),
         )
+    if now_salesforce and not was_salesforce:
+        note_salesforce_chat(user_id, conversation_id)
     return {"id": conversation_id, "count": len(messages)}
+
+
+def _carry_isolation_meta(meta: Optional[dict], server: Optional[dict]) -> Optional[dict]:
+    """An incoming row's meta with `mode` and `sf_isolation` as the server
+    owns them (replace_messages, review F5). `server` is the stored row at the
+    same position, or None for an appended row."""
+    meta = dict(meta or {})
+    had = bool(meta)
+    client_sf = meta.get("mode") == "salesforce"
+    meta.pop("sf_isolation", None)
+    if server is not None and server["assistant"]:
+        if server["is_sf"] or client_sf:
+            meta["mode"] = "salesforce"
+        elif server["mode"] is not None:
+            meta["mode"] = server["mode"]
+        else:
+            meta.pop("mode", None)
+        if server["isolated"] and meta.get("mode") != "salesforce":
+            meta["sf_isolation"] = 1
+    return meta if (meta or had) else None
 
 
 def add_message(
@@ -5962,6 +6169,13 @@ def add_message(
             (now, conversation_id),
         )
         message_id = int(inserted["id"])
+    if role == "assistant" and getattr(settings, "toggle_off_isolation", True):
+        from .sf_isolation import meta_says_salesforce, note_salesforce_chat
+
+        if meta_says_salesforce(meta):
+            # The chat may have just become Salesforce-holding: the cached
+            # set the cross-chat reads leave out is read again (review R2).
+            note_salesforce_chat(user_id, conversation_id)
     return {
         "id": message_id,
         "role": role,
@@ -6292,6 +6506,8 @@ def recall_conversations(
     keywords: List[str],
     exclude_conversation_id: Optional[str],
     limit: int = 3,
+    *,
+    exclude_salesforce_chats: bool = False,
 ) -> List[dict]:
     """Cross-chat memory: the user's OTHER conversations whose messages mention
     any of `keywords`, ranked by how many messages match. Returns
@@ -6308,6 +6524,11 @@ def recall_conversations(
     would open the meta of every matching message of this user on every turn, so
     such a chat can still take a place among the winners, with its next-best
     message or with none.
+
+    `exclude_salesforce_chats=True` (the toggle-off reader, app/sf_isolation.py)
+    leaves out every conversation that holds a Salesforce answer, title and
+    questions included: they carry no mode marker, and a later toggle-off
+    answer in such a chat may repeat the Salesforce one.
     """
     keywords = _recall_keywords(keywords)
     if not keywords:
@@ -6340,6 +6561,15 @@ def recall_conversations(
     # conversations))` gives the planner an index condition on
     # idx_messages_conversation: a bitmap of this user's messages on its own,
     # or ANDed with the trigram bitmap when the keywords are selective.
+    salesforce_chats = ""
+    salesforce_ids: List[str] = []
+    if exclude_salesforce_chats:
+        from .sf_isolation import salesforce_chats as _salesforce_chats
+
+        # Read once per user and cached, not re-checked per matching message
+        # (review R2: +30 to +120 ms on the busiest account).
+        salesforce_ids = sorted(_salesforce_chats(user_id))
+        salesforce_chats = "     AND NOT (c.id = ANY(%s))"
     sql = (
         "WITH ranked AS ("
         "  SELECT c.id, c.title, c.updated_at, COUNT(m.id) AS hits"
@@ -6347,6 +6577,7 @@ def recall_conversations(
         "   WHERE c.user_id = %s AND c.id <> %s"
         "     AND m.conversation_id = ANY(ARRAY("
         "           SELECT uc.id FROM conversations uc WHERE uc.user_id = %s AND uc.id <> %s))"
+        f"{salesforce_chats}"
         f"     AND ({like_any})"
         "   GROUP BY c.id, c.title, c.updated_at"
         "   ORDER BY hits DESC, c.updated_at DESC"
@@ -6364,7 +6595,15 @@ def recall_conversations(
         " ORDER BY ranked.hits DESC, ranked.updated_at DESC"
     )
     excluded = exclude_conversation_id or ""
-    params: List[object] = [user_id, excluded, user_id, excluded, *patterns, limit]
+    params: List[object] = [
+        user_id,
+        excluded,
+        user_id,
+        excluded,
+        *([salesforce_ids] if salesforce_chats else []),
+        *patterns,
+        limit,
+    ]
     params += patterns  # snippet_any (LATERAL WHERE)
     params += patterns  # snippet_score (LATERAL ORDER BY)
     with read_connection() as con:
@@ -6841,7 +7080,31 @@ def messages_missing_embeddings(
 
     An sf_assistant answer gets no vector, so semantic recall cannot carry it into
     another chat. See `recall_conversations`.
+
+    TOGGLE-OFF ISOLATION (owner decision 2026-11-25): no NEW Salesforce-mode
+    vector either. A Salesforce answer and the user question of a
+    Salesforce-mode turn are not embedded: no row of a chat that holds
+    Salesforce (app/sf_isolation.salesforce_chats: an answer whose meta says
+    so, or a server row of a Salesforce-mode turn) gets a new vector, and
+    no assistant row whose meta says Salesforce does anywhere. The vectors
+    already stored stay; the cross-chat read filters them.
     """
+    salesforce_ids: List[str] = []
+    if getattr(settings, "toggle_off_isolation", True):
+        from .sf_isolation import salesforce_chats, sf_meta_sql
+
+        # A chat that holds Salesforce gets no NEW vector at all: its
+        # Salesforce answers and questions are owner decision 3, and the
+        # toggle-off read leaves the whole chat out, so any other vector of
+        # it would never be read. One cached set instead of three EXISTS per
+        # row (review R15: 28 ms -> 155 ms, re-checked on every pass).
+        salesforce_ids = sorted(salesforce_chats(user_id))
+        not_salesforce = (
+            "   AND NOT (m.conversation_id = ANY(%s))"
+            f"   AND NOT (m.role = 'assistant' AND {sf_meta_sql('m')})"
+        )
+    else:
+        not_salesforce = ""
     # 2026-09-14: `length(content)` counts characters, so it detoasts (and
     # decompresses) every message of the user the scan reads — 12-14 ms at
     # production size for a sub-millisecond anti-join. `octet_length` reads
@@ -6859,8 +7122,17 @@ def messages_missing_embeddings(
             "   AND NOT EXISTS (SELECT 1 FROM message_embeddings e"
             "                    WHERE e.message_id = m.id AND e.model_id = %s)"
             "   AND (m.role = 'user' OR m.meta->>'engine' IS DISTINCT FROM 'sf_assistant')"
+            f"{not_salesforce}"
             " ORDER BY m.id DESC LIMIT %s",
-            (user_id, min_chars, min_chars, min_chars, model_id, limit),
+            (
+                user_id,
+                min_chars,
+                min_chars,
+                min_chars,
+                model_id,
+                *([salesforce_ids] if not_salesforce else []),
+                limit,
+            ),
         ).fetchall()
     return [
         {
@@ -6916,7 +7188,23 @@ def fetch_message_embeddings(
     Scoped to the owner inside the statement like every accessor here; the
     current conversation is excluded because within-chat context is already
     in the prompt.
+
+    Its only caller is the assistant-mode (toggle-off) cross-chat block, so
+    with TOGGLE_OFF_ISOLATION on no vector of a conversation that holds a
+    Salesforce answer is a candidate: its questions carry no mode, its title
+    is written from the first exchange, and its later toggle-off answers may
+    repeat the Salesforce one (app/sf_isolation.py).
     """
+    excluded_chats = ""
+    salesforce_ids: List[str] = []
+    if getattr(settings, "toggle_off_isolation", True):
+        from .sf_isolation import salesforce_chats
+
+        # The user's Salesforce-holding chats, read once and cached (review
+        # R2: a NOT EXISTS per candidate vector took the fetch from 0.6-2 ms
+        # to 87 ms for the busiest account).
+        salesforce_ids = sorted(salesforce_chats(user_id))
+        excluded_chats = "   AND NOT (e.conversation_id = ANY(%s))"
     with read_connection() as con:
         # Binary results: 500 x 4 KB vectors travel as bytes instead of hex
         # text twice their size that the driver then decodes (2026-09-14:
@@ -6929,8 +7217,15 @@ def fetch_message_embeddings(
             "  JOIN conversations c ON c.id = e.conversation_id"
             " WHERE e.user_id = %s AND e.model_id = %s"
             "   AND e.conversation_id <> %s"
+            f"{excluded_chats}"
             " ORDER BY e.message_id DESC LIMIT %s",
-            (user_id, model_id, exclude_conversation_id or "", limit),
+            (
+                user_id,
+                model_id,
+                exclude_conversation_id or "",
+                *([salesforce_ids] if excluded_chats else []),
+                limit,
+            ),
         ).fetchall()
     return [
         {

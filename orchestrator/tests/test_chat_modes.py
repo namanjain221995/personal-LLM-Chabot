@@ -332,6 +332,8 @@ def test_assistant_mode_bypasses_router_and_duckdb(monkeypatch):
         "mode": "assistant",
         "model": settings.llm_model,
         "effort": "think",
+        # Toggle-off isolation (2026-11-25): written under the guard.
+        "sf_isolation": 1,
     }
     # No Salesforce claims: assistant system prompt, user message last.
     assert rec["model_choice"] == "smart"
@@ -375,7 +377,7 @@ def test_salesforce_mode_chat_route_streams_via_graph(monkeypatch):
     )
 
     with TestClient(app) as client:
-        resp = client.post("/chat", json={"message": "hey there"})
+        resp = client.post("/chat", json={"message": "hey there", "mode": "salesforce"})
     events = _parse_sse(resp.text)
     kinds = [e for e, _ in events]
     assert kinds == ["token", "meta", "done"]
@@ -423,7 +425,7 @@ def test_sql_route_meta_reports_serving_model_not_picker(monkeypatch):
 
     with TestClient(app) as client:
         resp = client.post(
-            "/chat", json={"message": "top accounts", "model": "fast", "effort": "high"}
+            "/chat", json={"message": "top accounts", "mode": "salesforce", "model": "fast", "effort": "high"}
         )
     assert resp.status_code == 200
     meta = dict(_parse_sse(resp.text))["meta"]
@@ -494,8 +496,10 @@ def test_agent_meta_reports_smart_model_and_applied_effort(monkeypatch):
     assert meta["effort"] == "think"
 
 
-def test_salesforce_mode_default_unchanged_router_still_runs(monkeypatch):
-    """V1 behavior preserved: default mode still consults the router."""
+def test_a_request_that_names_no_mode_is_an_assistant_turn(monkeypatch):
+    """The default mode is "assistant" since 2026-11-25 (toggle-off isolation
+    G6; it was "salesforce", fail-open): a client that names no mode never
+    reaches the Salesforce router. The browser always names one."""
     calls = {}
 
     async def route_sql(message, has_image=False, history=()):
@@ -510,7 +514,9 @@ def test_salesforce_mode_default_unchanged_router_still_runs(monkeypatch):
     with TestClient(app) as client:
         resp = client.post("/chat", json={"message": "top accounts"})
     assert resp.status_code == 200
-    assert calls["routed"] == "top accounts"
+    assert "routed" not in calls
+    meta = [json.loads(line[6:]) for line in resp.text.splitlines() if line.startswith("data: {") and '"route"' in line]
+    assert meta and meta[-1]["mode"] == "assistant"
 
 
 # ---------------------------------------------------------------------------
@@ -1274,7 +1280,7 @@ def _web_history(monkeypatch) -> list:
 def test_an_answer_stays_out_of_the_in_process_memory(service, admin, older_route, monkeypatch):
     """This memory is read when a client sends no turns, and it holds no stamp."""
     kept: list = []
-    monkeypatch.setattr(app_main.memory, "add_exchange", lambda session, text, answer: kept.append(answer))
+    monkeypatch.setattr(app_main.memory, "add_exchange", lambda session, text, answer, **_mode: kept.append(answer))
     with TestClient(app) as client:
         client.post("/chat", json=_body("memory-answer"))
         assert kept == []

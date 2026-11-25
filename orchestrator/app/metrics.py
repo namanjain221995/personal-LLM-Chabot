@@ -441,6 +441,12 @@ _LABELS_BY_METRIC: Dict[str, Dict[str, set]] = {
         "category": set(FAST_LANE_CATEGORIES),
         "veto": set(FAST_LANE_VETOES),
     },
+    # Toggle-off isolation (app/sf_isolation.py, core/personal_details.py,
+    # 2026-11-25). Literal here so this module imports nothing.
+    "toggle_off_hidden_turns_total": {"kind": {"sf", "tainted", "quote"}},
+    "toggle_off_needs_salesforce_total": {"rule": {"A", "B", "C", "D", "E"}},
+    "toggle_off_personal_details_masked_total": {"route": set(CHAT_ROUTES)},
+    "toggle_off_state_read_failed_total": {"closed": {"yes", "no"}},
     # The voice archive (app/voice_archive.py, 2026-09-30). Literal here so
     # this module imports nothing; tests/test_voice_archive.py pins these to
     # voice_archive.ERROR_REASONS / PROXY_RESULTS / RESTORE_RESULTS /

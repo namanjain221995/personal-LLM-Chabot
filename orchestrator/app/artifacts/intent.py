@@ -1746,11 +1746,16 @@ def substantial_answer_index(history: Sequence[dict], *, window: int = 3) -> Opt
     """The index in `history` of the most recent SUBSTANTIAL assistant turn
     among the last `window` assistant turns (AS3 (b)): "thanks" → "you're
     welcome" → "give it in docs" still finds the report. Artifact turns are
-    never substantial."""
+    never substantial, and neither is a toggle-off placeholder
+    (app/sf_isolation.py): it is skipped as if it were not there."""
+    from ..sf_isolation import is_placeholder
+
     seen = 0
     for i in range(len(history) - 1, -1, -1):
         turn = history[i]
         if not isinstance(turn, dict) or str(turn.get("role")) != "assistant":
+            continue
+        if is_placeholder(turn.get("content")):
             continue
         seen += 1
         if seen > window:

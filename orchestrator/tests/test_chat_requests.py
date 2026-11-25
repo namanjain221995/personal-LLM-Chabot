@@ -157,6 +157,9 @@ def test_post_chat_records_the_intent_and_the_durable_answer(hello_stream):
             "generation_id": leading["generation_id"],
             "intent_id": "int-1",
             "attempt": 1,
+            # Toggle-off isolation (review F1/F4): the browser's copy of an
+            # answer stopped before its final meta says which mode it was.
+            "mode": "assistant",
         }
         # The engine's meta still comes last and still wins — and it carries
         # the ids too, because that is what gets persisted with the answer.
