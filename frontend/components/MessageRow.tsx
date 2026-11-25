@@ -60,6 +60,7 @@ import { PastedChip } from './PastedChip';
 import { QuotedContext } from './QuotedContext';
 import { ProofDrawer } from './ProofDrawer';
 import { ChartView } from './ChartView';
+import { ChartStreamingContext } from './chart/ChartStreamingContext';
 import { ArtifactCards, type OpenArtifact } from './artifacts/ArtifactCards';
 import { CopyButton } from './CopyButton';
 import { ReasoningAccordion } from './ReasoningAccordion';
@@ -1418,7 +1419,13 @@ function MessageRowImpl({
                   writes per-claim markers, and stripping them delivered a
                   12 KB sourced report as an uncited essay. There they become
                   links to the source instead. */}
-              <Markdown text={displayText} />
+              {/* Charts design v2 §10: a Mermaid number chart stays a
+                  "Drawing the chart…" box until the answer has finished
+                  streaming, so a half-written pie never flashes wrong
+                  numbers and a failing prefix never loads mermaid. */}
+              <ChartStreamingContext.Provider value={streaming}>
+                <Markdown text={displayText} />
+              </ChartStreamingContext.Provider>
               {streaming && <span aria-hidden className="stream-caret" />}
             </div>
           )}
@@ -1583,13 +1590,15 @@ function MessageRowImpl({
             !!(message.meta.chart_data?.length || message.meta.data?.length) && (
               <div
                 data-testid="answer-chart"
-                className="my-3 w-full rounded-lg border border-border bg-surface p-3"
-                style={{ minHeight: 444 }}
+                // No fixed min-height (charts design v2 §5.2): the figure
+                // measures its width, plans, and reserves its own planned
+                // height before the ECharts chunk arrives.
+                className="my-3 w-full min-w-0 max-w-full rounded-lg border border-border bg-surface p-3"
               >
                 <ChartView
                   spec={message.meta.chart}
                   data={(message.meta.chart_data?.length ? message.meta.chart_data : message.meta.data)!}
-                  minHeight={420}
+                  context="inline"
                 />
               </div>
             )}

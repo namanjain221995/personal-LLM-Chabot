@@ -180,7 +180,7 @@ export function ProofDrawer({ meta }: { meta: Meta }) {
               />
             )}
             {s.id === 'chart' && meta.chart && chartRows && (
-              <ChartView spec={meta.chart} data={chartRows} />
+              <ChartView spec={meta.chart} data={chartRows} context="drawer" />
             )}
             {s.id === 'files' && reportFiles.length > 0 && <FileCards files={reportFiles} />}
           </div>

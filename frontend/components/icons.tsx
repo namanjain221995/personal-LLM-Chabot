@@ -373,6 +373,13 @@ export const IconTable = ({ size, className }: IconProps) => (
   </svg>
 );
 
+/** Three bars on a baseline — a chart drawn from a Mermaid number block. */
+export const IconChart = ({ size, className }: IconProps) => (
+  <svg {...base(size, className)}>
+    <path d="M3 20h18M7 16v-5M12 16V6M17 16v-8" />
+  </svg>
+);
+
 /** A parcel — the "Download all" ZIP of a version's files. */
 export const IconPackage = ({ size, className }: IconProps) => (
   <svg {...base(size, className)}>
