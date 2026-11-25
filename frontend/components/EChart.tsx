@@ -6,8 +6,8 @@
  * Two reasons this is its own file:
  *
  *  1. Bundle. `import 'echarts'` pulls the whole library. Registering only
- *     the five chart types and four components this app draws, through
- *     `echarts/core`, keeps the payload to what is actually used — and
+ *     the chart types and components this app draws (lib/echartsSetup.ts),
+ *     through `echarts/core`, keeps the payload to what is actually used — and
  *     because ChartView loads this module with `next/dynamic` + `ssr:
  *     false`, none of it is in the initial chunk. A conversation with no
  *     chart never downloads ECharts at all.
@@ -21,47 +21,33 @@
 
 import { useEffect, useRef } from 'react';
 import ReactEChartsCore from 'echarts-for-react/lib/core';
-import * as echarts from 'echarts/core';
-import {
-  BarChart,
-  FunnelChart,
-  LineChart,
-  PieChart,
-  ScatterChart,
-} from 'echarts/charts';
-import {
-  GridComponent,
-  LegendComponent,
-  TitleComponent,
-  TooltipComponent,
-} from 'echarts/components';
-import { CanvasRenderer } from 'echarts/renderers';
+import { echarts, type ChartInstance } from '@/lib/echartsSetup';
 import type { EChartsOption } from '@/lib/chartOption';
 
-/** The instance handle echarts-for-react hands back — resize is all we need. */
-type ChartInstance = { resize: () => void };
-
-echarts.use([
-  BarChart,
-  LineChart,
-  PieChart,
-  ScatterChart,
-  FunnelChart,
-  GridComponent,
-  LegendComponent,
-  TitleComponent,
-  TooltipComponent,
-  CanvasRenderer,
-]);
+export type { ChartInstance };
 
 export default function EChart({
   option,
   height = 300,
   ariaLabel,
+  interactive = false,
+  onReady,
+  onEvents,
 }: {
   option: EChartsOption;
   height?: number;
   ariaLabel?: string;
+  /**
+   * Chat charts (charts design v2 §8.4): the focusable group, its name and
+   * its description live on the figure around this canvas, so the canvas
+   * itself is hidden from assistive tech. The admin console keeps the
+   * `role="img"` + label it has always had.
+   */
+  interactive?: boolean;
+  /** The live instance, for dispatchAction (legend, keyboard, zoom). */
+  onReady?: (instance: ChartInstance) => void;
+  /** ECharts events (e.g. `datazoom`); handlers are our own functions. */
+  onEvents?: Record<string, (params: unknown) => void>;
 }) {
   const wrapper = useRef<HTMLDivElement | null>(null);
   const chart = useRef<ChartInstance | null>(null);
@@ -93,8 +79,9 @@ export default function EChart({
       ref={wrapper}
       className="w-full min-w-0"
       style={{ height }}
-      role="img"
-      aria-label={ariaLabel}
+      role={interactive ? undefined : 'img'}
+      aria-label={interactive ? undefined : ariaLabel}
+      aria-hidden={interactive ? true : undefined}
     >
       <ReactEChartsCore
         echarts={echarts}
@@ -107,8 +94,10 @@ export default function EChart({
         // width/height 'auto' makes the FIRST paint measure the wrapper, not
         // a stale 0×0 the drawer had while it was still opening.
         opts={{ renderer: 'canvas', width: 'auto', height: 'auto' }}
+        onEvents={onEvents}
         onChartReady={(instance: ChartInstance) => {
           chart.current = instance;
+          onReady?.(instance);
           // Belt and braces with the ResizeObserver: one resize on the next
           // frame catches a chart mounted mid-layout (the tab expanding),
           // which otherwise drew into yesterday's geometry until something

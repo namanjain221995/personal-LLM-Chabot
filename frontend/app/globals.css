@@ -123,6 +123,31 @@
   --ts-chart-3: #b7791f;
   --ts-chart-4: #6d5ae6;
   --ts-chart-5: #c0566b;
+  /* Slots 6-8 (charts design v2 §7.1, 2026-11-25): validated with the dataviz
+     validator on #f4f4f4, #f8f8f8, #1e1e1e and #121212 — worst adjacent CVD
+     ΔE 9.3 (deutan, olive↔rose), worst normal-vision ΔE 15.1. Same hex in
+     both themes, like 1-5. */
+  --ts-chart-6: #4f771e;
+  --ts-chart-7: #aa4ba9;
+  --ts-chart-8: #e95c2c;
+  /* Chat-chart chrome (design v2 §7.3). New names, so the admin console's
+     chart chrome is untouched. */
+  --ts-chart-axis-text: #a3a3a3; /* 6.61:1 on #1e1e1e */
+  --ts-chart-gridline: #333333;
+  --ts-chart-baseline: #525252;
+  --ts-chart-zoom-handle: #6b6b6b; /* 3.13:1, non-text floor */
+  /* Funnel / ordinal ramp, stage 1 (most emphatic) first. Review V11/A16:
+     every step ≥ 3:1 on #1e1e1e and #121212 (3.97-13.9), dataviz --ordinal
+     ALL PASS (monotone L, ΔL ≥ 0.06, one hue). */
+  --ts-chart-ord-1: #c4e1ff;
+  --ts-chart-ord-2: #a9cdfb;
+  --ts-chart-ord-3: #8eb9f0;
+  --ts-chart-ord-4: #73a5e4;
+  --ts-chart-ord-5: #5891d9;
+  --ts-chart-ord-6: #3b7dcd;
+  /* The real ground of a chart in the proof drawer (bg-surface/60 over the
+     page), for sticky rows that must match it (review V14). */
+  --ts-chart-ground-drawer: #121212;
 
   /* Mermaid diagram roles — a CLOSED four-name vocabulary (service, store,
      model, external) shared verbatim with the orchestrator. A diagram names a
@@ -287,6 +312,18 @@ body:has(.auth-light) {
 
 html.light,
 .auth-light {
+  --ts-chart-axis-text: #5d5d5d; /* 5.99:1 on #f4f4f4 */
+  --ts-chart-gridline: #dcdcdc;
+  --ts-chart-baseline: #a8a8a8;
+  --ts-chart-zoom-handle: #8a8a8a; /* 3.14:1, non-text floor */
+  /* ≥ 3.85:1 on #f4f4f4 and #f8f8f8; dataviz --ordinal ALL PASS. */
+  --ts-chart-ord-1: #001c61;
+  --ts-chart-ord-2: #002f75;
+  --ts-chart-ord-3: #0a418b;
+  --ts-chart-ord-4: #1f54a0;
+  --ts-chart-ord-5: #3167b7;
+  --ts-chart-ord-6: #437bcd;
+  --ts-chart-ground-drawer: #f8f8f8;
   --ts-bg: #ffffff;
   --ts-sidebar: #f9f9f9;
   --ts-bubble: #f0f0f0;
@@ -1224,5 +1261,385 @@ a {
   .auth-illustration-copy {
     opacity: 1;
     transform: none;
+  }
+}
+
+/* ------------------------------------------------------- chat charts (v2)
+   Charts design v2 (2026-11-25): the HTML parts of a chat chart — the bar
+   list (every horizontal-bar form), the legend, the toolbar and the notes.
+   Text here is real text: it wraps, never truncates, scales with text zoom
+   and reads in both themes from the same tokens the canvas uses. */
+
+.chart-figure {
+  container-type: inline-size;
+  min-width: 0;
+  max-width: 100%;
+  --chart-ground: var(--ts-surface);
+}
+.chart-figure[data-context='drawer'] {
+  --chart-ground: var(--ts-chart-ground-drawer);
+}
+
+.chart-toolbar {
+  gap: 2px;
+}
+
+.chart-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0 0.5rem;
+  border-radius: 0.375rem;
+  font-size: 0.75rem;
+  color: var(--ts-text-muted);
+  transition: background-color 150ms ease, color 150ms ease;
+}
+.chart-btn:hover {
+  background: var(--ts-surface-2);
+  color: var(--ts-text);
+}
+.chart-btn[aria-expanded='true'],
+.chart-btn[aria-pressed='true'] {
+  color: var(--ts-text);
+  background: var(--ts-surface-2);
+}
+.chart-btn:disabled,
+.chart-btn[aria-disabled='true'] {
+  opacity: 0.45;
+  cursor: default;
+}
+.chart-btn[aria-disabled='true']:hover {
+  background: transparent;
+  color: var(--ts-text-muted);
+}
+
+.chart-legend-item {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+  min-height: 32px;
+  max-width: 100%;
+  padding: 0.35rem 0.5rem;
+  border-radius: 0.375rem;
+  text-align: start;
+  font-size: 0.8125rem;
+  line-height: 1.35;
+  color: var(--ts-text);
+  transition: background-color 150ms ease, opacity 150ms ease;
+}
+.chart-legend-item:hover {
+  background: var(--ts-surface-2);
+}
+/* Hidden series: the name dimmed (still ≥ 4.5:1 in both themes at 0.65) AND
+   struck through, so "off" never rests on colour or opacity alone. Only the
+   name and swatch dim (review A9): the value/share text and the focus ring
+   keep full contrast. */
+.chart-legend-item[aria-pressed='false'] .chart-legend-name,
+.chart-legend-item[aria-pressed='false'] .chart-swatch {
+  opacity: 0.65;
+}
+.chart-legend-item[aria-pressed='false'] .chart-legend-name {
+  text-decoration: line-through;
+}
+.chart-legend-item[aria-pressed='false'] .chart-swatch {
+  background: transparent !important;
+}
+.chart-swatch {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  margin-top: 0.3em;
+  border-radius: 3px;
+  border: 2px solid currentColor;
+}
+/* A 1 px ink ring, as in the tooltip, so a slot that is under 3:1 on a hover
+   or popover ground still reads as a key (review A17). */
+.chart-swatch,
+.chart-popover-dot,
+.chart-value-swatch {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ts-text) 50%, transparent);
+}
+
+@media (pointer: coarse) {
+  .chart-btn,
+  .chart-legend-item,
+  .chart-inline-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  /* 8 px between touch targets (review A18). */
+  .chart-toolbar {
+    gap: 8px;
+  }
+}
+
+/* The bar list: one grid row per category, every row as tall as its label. */
+.chart-bars-viewport {
+  overflow-y: auto;
+  border-radius: 0.375rem;
+}
+.chart-bars-viewport:focus-visible {
+  outline: 2px solid var(--ts-accent);
+  outline-offset: 2px;
+}
+.chart-bars {
+  display: grid;
+  grid-template-columns: fit-content(42%) minmax(0, 1fr) max-content;
+  column-gap: 0.75rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+/* Each <li> stays a real list item (display: contents would drop its
+   semantics in some screen readers); subgrid lines its columns up with every
+   other row's. */
+.chart-bars > li {
+  position: relative;
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: subgrid;
+  align-items: center;
+}
+@supports not (grid-template-columns: subgrid) {
+  .chart-bars > li {
+    grid-template-columns: minmax(96px, 42%) minmax(0, 1fr) max-content;
+    column-gap: 0.75rem;
+  }
+}
+.chart-bars > li.chart-bars-ticks {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--chart-ground);
+}
+.chart-bar-label {
+  min-width: 96px;
+  padding: 0.3rem 0;
+  font-size: 0.8125rem;
+  line-height: 1.35;
+  color: var(--ts-text);
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+.chart-bar-track {
+  position: relative;
+  min-height: 20px;
+  align-self: center;
+}
+.chart-bar-values {
+  align-self: center;
+  padding: 0.3rem 0;
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--ts-text);
+  text-align: end;
+  white-space: nowrap;
+}
+/* Several series: one line per value, each with its colour key (review A4). */
+.chart-value-line {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.35rem;
+}
+.chart-value-swatch {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+/* The measure's name above a bar list, over the values column (review V9). */
+.chart-measure {
+  text-align: end;
+}
+.chart-bar {
+  position: absolute;
+  top: 50%;
+  height: 16px;
+  margin-top: -8px;
+  transform-origin: left center;
+}
+.chart-bar[data-neg='true'] {
+  transform-origin: right center;
+}
+.chart-bar-group {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 3px 0;
+}
+.chart-bar-lane {
+  position: relative;
+  display: block;
+  height: 8px;
+}
+.chart-bar-lane > .chart-bar {
+  top: 0;
+  margin-top: 0;
+  height: 8px;
+}
+.chart-bar-grid,
+.chart-bar-zero {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--ts-chart-gridline);
+  pointer-events: none;
+}
+.chart-bar-zero {
+  background: var(--ts-chart-baseline);
+}
+.chart-tick-row {
+  position: relative;
+  height: 20px;
+  font-size: 0.6875rem;
+  color: var(--ts-chart-axis-text);
+}
+.chart-tick {
+  position: absolute;
+  top: 2px;
+  transform: translateX(-50%);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.chart-tick[data-edge='start'] {
+  transform: none;
+}
+.chart-tick[data-edge='end'] {
+  transform: translateX(-100%);
+}
+.chart-bars li > * {
+  transition: opacity 150ms ease;
+}
+/* Review V6/A8: while one row is active only the other rows' BARS recede;
+   their labels and values stay at full ink (AA), and the tick row is left
+   alone. */
+.chart-bars[data-active='true'] li:not([data-active='true']):not(.chart-bars-ticks) > .chart-bar-track {
+  opacity: 0.45;
+}
+.chart-bars li[data-active='true'] > .chart-bar-label {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.chart-bar-grow {
+  animation: ts-bar-grow 300ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+@keyframes ts-bar-grow {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+/* An overlay anchored to its row (review A5/V7): it takes no grid row, so
+   nothing below moves; pointer events pass through to the row beneath. */
+.chart-bar-popover {
+  position: absolute;
+  top: calc(100% - 2px);
+  inset-inline-end: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: min(320px, 100%);
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--ts-border);
+  border-radius: 0.5rem;
+  background: var(--ts-surface-2);
+  font-size: 0.75rem;
+  pointer-events: none;
+}
+.chart-bar-popover[data-flip='up'] {
+  top: auto;
+  bottom: calc(100% - 2px);
+}
+
+/* Below 480 px of chart width the label takes its own line above the bar, so
+   the bar gets the full width and labels wrap at ~45 characters, not ~19. */
+@container (max-width: 479px) {
+  .chart-bars {
+    grid-template-columns: minmax(0, 1fr) max-content;
+  }
+  .chart-bar-label {
+    grid-column: 1 / -1;
+    min-width: 0;
+    padding-bottom: 0.1rem;
+  }
+  .chart-bars-ticks > .chart-bar-label {
+    display: none;
+  }
+  /* Review V15: the no-subgrid fallback follows the narrow layout too. */
+  @supports not (grid-template-columns: subgrid) {
+    .chart-bars > li {
+      grid-template-columns: minmax(0, 1fr) max-content;
+    }
+  }
+}
+
+.chart-pie-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+}
+.chart-pie-body[data-legend='right'] {
+  flex-direction: row;
+  align-items: center;
+}
+.chart-pie-body[data-legend='right'] > .chart-legend {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.chart-hint {
+  font-size: 0.6875rem;
+  color: var(--ts-text-faint);
+}
+/* The key hint floats just under the plot while it has keyboard focus
+   (review A20): an overlay, so the caption, key and table below never move. */
+.chart-hint-pop {
+  position: absolute;
+  top: calc(100% + 4px);
+  inset-inline-start: 0;
+  z-index: 3;
+  max-width: 100%;
+  padding: 0.15rem 0.45rem;
+  border: 1px solid var(--ts-border);
+  border-radius: 0.375rem;
+  background: var(--ts-surface-2);
+  color: var(--ts-text-muted);
+  pointer-events: none;
+}
+
+/* Windows High Contrast / forced colours (review A6): bars and colour keys
+   keep their series colour (identity is also in the legend and values), and
+   each bar gets a system-colour outline so it never vanishes. */
+@media (forced-colors: active) {
+  .chart-bar,
+  .chart-swatch,
+  .chart-popover-dot,
+  .chart-value-swatch {
+    forced-color-adjust: none;
+  }
+  .chart-bar {
+    outline: 1px solid CanvasText;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chart-bar-grow {
+    animation: none;
+  }
+  .chart-bars li > *,
+  .chart-legend-item,
+  .chart-btn {
+    transition: none;
   }
 }

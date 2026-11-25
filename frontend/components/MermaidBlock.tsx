@@ -32,8 +32,13 @@
  * position:fixed, which is the same trap the fullscreen viewer records above.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { isChartHead, parseMermaidChart } from '@/lib/mermaidChart';
+import type { ChartModel } from '@/lib/chartModel';
+import { ChartFigure } from './ChartView';
+import { ChartErrorBoundary } from './ChartErrorBoundary';
+import { useChartStreaming } from './chart/ChartStreamingContext';
 import {
   ZOOM_MAX,
   ZOOM_MIN,
@@ -55,6 +60,7 @@ import {
 import { CopyButton } from './CopyButton';
 import { useTheme } from './Providers';
 import {
+  IconChart,
   IconCode,
   IconDiagram,
   IconDownload,
@@ -97,7 +103,120 @@ async function getMermaid(dark: boolean) {
  */
 const RENDER_DEBOUNCE_MS = 120;
 
+/**
+ * Mermaid number charts become real charts (charts design v2 §10).
+ *
+ * A ```mermaid block whose first statement is `xychart-beta` / `xychart` or
+ * `pie` is parsed by lib/mermaidChart into the same ChartModel a `meta.chart`
+ * produces, and drawn by ChartFigure: full labels, a bar list for long
+ * category names, tooltips, legend, table and PNG. Mermaid's own xychart
+ * overlapped long labels into an unreadable band (owner, 2026-11-25).
+ *
+ * While the answer is still streaming, a chart-headed block shows a reserved
+ * "Drawing the chart…" box and touches neither the parser nor mermaid: every
+ * newline-terminated prefix of a pie is a valid pie, so partial charts with
+ * wrong numbers would flash, and failing prefixes would load mermaid (~1 MB).
+ * A block the strict parser refuses takes the existing Mermaid path below,
+ * unchanged. The split into three components keeps every hook unconditional.
+ */
 export function MermaidBlock({ code }: { code: string }) {
+  const streaming = useChartStreaming();
+  const chartHead = isChartHead(code);
+  if (chartHead && streaming) return <ChartDrawingPlaceholder code={code} />;
+  if (chartHead) return <MermaidChartOrDiagram code={code} />;
+  return <MermaidDiagram code={code} />;
+}
+
+/**
+ * Review V17: reserve roughly the height the finished chart will take, so the
+ * page moves less when streaming ends — a long x list will become a capped
+ * bar list (520 px), a pie or short chart about 240 px.
+ */
+function placeholderHeight(code: string): number {
+  const head = code.slice(0, 4096);
+  const xs = /x-axis[^[\n]*\[([^\]\n]*)/i.exec(head);
+  const items = xs ? xs[1].split(',').length : 0;
+  return items > 12 ? 520 : 240;
+}
+
+function ChartDrawingPlaceholder({ code }: { code: string }) {
+  const height = placeholderHeight(code);
+  return (
+    <div className="code-block overflow-hidden rounded-ts border border-border bg-surface">
+      <div className="flex items-center gap-1.5 border-b border-border bg-surface-2/60 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted">
+        <IconChart size={13} />
+        Chart
+      </div>
+      <div
+        role="status"
+        className="flex items-center justify-center bg-surface text-xs text-faint"
+        style={{ height: `min(${height}px, 60vh)` }}
+      >
+        Drawing the chart…
+      </div>
+    </div>
+  );
+}
+
+function MermaidChartOrDiagram({ code }: { code: string }) {
+  const parsed = useMemo(() => parseMermaidChart(code), [code]);
+  if (parsed) return <MermaidChartBlock code={code} model={parsed.model} />;
+  return <MermaidDiagram code={code} />;
+}
+
+function MermaidChartBlock({ code, model }: { code: string; model: ChartModel }) {
+  const [view, setView] = useState<'chart' | 'code'>('chart');
+  return (
+    <div
+      className="code-block overflow-hidden rounded-ts border border-border bg-surface"
+      data-testid="mermaid-chart"
+    >
+      <div className="flex items-center justify-between gap-2 border-b border-border bg-surface-2/60 px-3 py-1.5">
+        <span className="inline-flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-muted">
+          <IconChart size={13} />
+          Chart
+        </span>
+        <span className="flex items-center gap-0.5">
+          {/* chart-btn: 32 px, 44 px on a coarse pointer (review A18). */}
+          <button
+            type="button"
+            onClick={() => setView('code')}
+            aria-pressed={view === 'code'}
+            aria-label="Show chart source"
+            title="Code"
+            className="chart-btn"
+          >
+            <IconCode size={15} />
+          </button>
+          <button
+            type="button"
+            onClick={() => setView('chart')}
+            aria-pressed={view === 'chart'}
+            aria-label="Show chart"
+            title="Chart"
+            className="chart-btn"
+          >
+            <IconChart size={15} />
+          </button>
+          <CopyButton text={code} label="Copy chart source" />
+        </span>
+      </div>
+      {view === 'chart' ? (
+        <div className="bg-surface p-3">
+          <ChartErrorBoundary>
+            <ChartFigure model={model} context="mermaid" />
+          </ChartErrorBoundary>
+        </div>
+      ) : (
+        <pre tabIndex={0}>
+          <code>{code}</code>
+        </pre>
+      )}
+    </div>
+  );
+}
+
+function MermaidDiagram({ code }: { code: string }) {
   const { theme } = useTheme();
   const dark = theme === 'dark';
   const [svg, setSvg] = useState<string>('');

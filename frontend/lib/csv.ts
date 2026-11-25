@@ -1,11 +1,41 @@
 /** Client-side CSV building + download for the proof drawer Data section. */
 
 import type { DataRow, Meta } from './types';
+import { isNumeric } from './chartFormat';
+
+/**
+ * CSV formula-injection guard (charts design v2 §8.6, C18; owner question 7).
+ *
+ * A text cell that starts with `=`, `+`, `-`, `@`, TAB or CR is run as a
+ * formula when the file is opened in Excel or Sheets. Salesforce values are
+ * user-controlled text, and chart labels converted from Mermaid are written
+ * by the model (which in assistant mode may have copied them from a web
+ * page), so such cells get a leading `'`, which both programs treat as "this
+ * is text". A real number (`-5`, `-5.2`, `1e3`) is left alone: `isNumeric` is
+ * the app's one numeric predicate.
+ */
+const FORMULA_LEAD = /^[=+\-@\t\r]/;
+/**
+ * Review R11: number-like text — a sign, an optional currency symbol, digits
+ * with grouping or decimal separators, an optional % — is left as it is
+ * (`-1,000`, `-12.5%`, `-$5`, `+1 555 0100`, a lone `-` placeholder). With no
+ * letters, no `(` and no `!` it cannot name a function or a cell, so it cannot
+ * run anything; a quote would only make the cell stop being a number.
+ */
+const NUMBER_LIKE = /^(?:[+-]\s?[$€£¥₹]?\s?\d[\d,.\s]*%?|-)$/;
+
+export function neutraliseFormula(s: string): string {
+  if (!FORMULA_LEAD.test(s)) return s;
+  if (isNumeric(s)) return s;
+  if (NUMBER_LIKE.test(s)) return s;
+  return `'${s}`;
+}
 
 function escapeCell(value: unknown): string {
   if (value === null || value === undefined) return '';
-  const s =
+  const raw =
     typeof value === 'object' ? JSON.stringify(value) : String(value);
+  const s = typeof value === 'number' ? raw : neutraliseFormula(raw);
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 

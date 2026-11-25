@@ -89,15 +89,19 @@ describe('type dispatch', () => {
 // Per-type configuration
 // ---------------------------------------------------------------------------
 
+/** The display text ECharts will draw for each category id (v2: ids, not names). */
+function axisLabels(option: Record<string, unknown>, axis: 'xAxis' | 'yAxis' = 'xAxis'): string[] {
+  const a = option[axis] as { data: string[]; axisLabel: { formatter: (id: string) => string } };
+  return a.data.map((id) => a.axisLabel.formatter(id).replace(/\n/g, ' '));
+}
+
 describe('bar', () => {
   it('puts categories on the x axis and values on the y axis', () => {
     const option = buildChartOption(spec(), CATEGORY_ROWS, palette)!;
     expect((option.xAxis as Record<string, unknown>).type).toBe('category');
-    expect((option.xAxis as Record<string, unknown>).data).toEqual([
-      'Prospecting',
-      'Qualification',
-      'Closed Won',
-    ]);
+    // ECharts only ever sees ids (C12); the formatter gives the full label.
+    expect((option.xAxis as Record<string, unknown>).data).toEqual(['c0', 'c1', 'c2']);
+    expect(axisLabels(option)).toEqual(['Prospecting', 'Qualification', 'Closed Won']);
     expect((option.yAxis as Record<string, unknown>).type).toBe('value');
     expect(seriesOf(option)[0].type).toBe('bar');
   });
@@ -141,19 +145,33 @@ describe('horizontal_bar', () => {
 });
 
 describe('line and area', () => {
-  it('keeps the row order the backend sent — it is already chronological', () => {
+  it('draws dates on a real time axis, positioned from their calendar parts', () => {
     const rows: DataRow[] = [
       { stage: '2026-01', total: 1 },
       { stage: '2026-02', total: 5 },
       { stage: '2026-03', total: 3 },
     ];
     const option = buildChartOption(spec({ type: 'line' }), rows, palette)!;
-    expect((option.xAxis as Record<string, unknown>).data).toEqual([
-      '2026-01',
-      '2026-02',
-      '2026-03',
+    expect((option.xAxis as Record<string, unknown>).type).toBe('time');
+    expect(option.useUTC).toBe(true);
+    expect(seriesOf(option)[0].data).toEqual([
+      [Date.UTC(2026, 0, 1), 1],
+      [Date.UTC(2026, 1, 1), 5],
+      [Date.UTC(2026, 2, 1), 3],
     ]);
-    expect(seriesOf(option)[0].data).toEqual([1, 5, 3]);
+  });
+
+  it('keeps the row order of a category line', () => {
+    const option = buildChartOption(spec({ type: 'line' }), CATEGORY_ROWS, palette)!;
+    expect(axisLabels(option)).toEqual(['Prospecting', 'Qualification', 'Closed Won']);
+    expect(seriesOf(option)[0].data).toEqual([10, 7, 3]);
+  });
+
+  it('draws straight 2 px lines and a 12% area', () => {
+    const area = buildChartOption(spec({ type: 'area' }), CATEGORY_ROWS, palette)!;
+    expect(seriesOf(area)[0].smooth).toBe(false);
+    expect((seriesOf(area)[0].lineStyle as Record<string, unknown>).width).toBe(2);
+    expect((seriesOf(area)[0].areaStyle as Record<string, unknown>).opacity).toBe(0.12);
   });
 
   it('gives area a fill and line none', () => {
@@ -169,8 +187,12 @@ describe('pie and donut', () => {
   it('gives a donut an inner radius and a pie none — chosen here, not by the spec', () => {
     const donut = buildChartOption(spec({ type: 'donut' }), CATEGORY_ROWS, palette)!;
     const pie = buildChartOption(spec({ type: 'pie' }), CATEGORY_ROWS, palette)!;
-    expect(seriesOf(donut)[0].radius).toEqual(['45%', '72%']);
-    expect(seriesOf(pie)[0].radius).toEqual(['0%', '72%']);
+    const [inner, outer] = seriesOf(donut)[0].radius as number[];
+    expect(inner).toBeGreaterThan(0);
+    expect(outer).toBeGreaterThan(inner);
+    expect((seriesOf(pie)[0].radius as number[])[0]).toBe(0);
+    // No slice names on the canvas: the HTML legend is the direct label.
+    expect((seriesOf(pie)[0].label as Record<string, unknown>).show).toBe(false);
   });
 
   it('folds the tail into "Other" past eight slices', () => {
@@ -231,11 +253,17 @@ describe('funnel', () => {
     const option = buildChartOption(spec({ type: 'funnel' }), rows, palette)!;
     const series = seriesOf(option)[0];
     expect(series.sort).toBe('none');
-    expect((series.data as Array<{ name: string }>).map((d) => d.name)).toEqual([
+    expect((series.data as Array<{ name: string }>).map((d) => d.name)).toEqual(['c0', 'c1', 'c2']);
+    const label = series.label as { formatter: (p: { name: string }) => string; color: string; position: string };
+    expect(['c0', 'c1', 'c2'].map((name) => label.formatter({ name }).split('\n')[0])).toEqual([
       'Prospecting',
       'Qualification',
       'Closed Won',
     ]);
+    // Outside labels in text ink — never white text on a light ramp step.
+    expect(label.position).toBe('right');
+    expect(label.color).toBe(palette.text);
+    expect(label.color).not.toBe('#ffffff');
   });
 });
 
@@ -250,11 +278,7 @@ describe('histogram', () => {
     const series = seriesOf(option)[0];
     expect(series.data).toEqual([4, 9, 2]);
     expect(series.barCategoryGap).toBe('0%'); // bins touch
-    expect((option.xAxis as Record<string, unknown>).data).toEqual([
-      '0 - 10',
-      '10 - 20',
-      '20 - 30',
-    ]);
+    expect(axisLabels(option)).toEqual(['0 - 10', '10 - 20', '20 - 30']);
   });
 });
 
@@ -356,6 +380,9 @@ describe('theme', () => {
       '--ts-chart-3': '',            // unset → fallback
       '--ts-chart-4': 'var(--other)', // unresolvable in a canvas → fallback
       '--ts-chart-5': 'rgb(5, 5, 5)',
+      '--ts-chart-6': '#666666',
+      '--ts-chart-7': '',
+      '--ts-chart-8': '#888888',
     };
     const originalWindow = (globalThis as Record<string, unknown>).window;
     (globalThis as Record<string, unknown>).window = {
@@ -368,6 +395,9 @@ describe('theme', () => {
         SERIES_FALLBACK[2],
         SERIES_FALLBACK[3],
         'rgb(5, 5, 5)',
+        '#666666',
+        SERIES_FALLBACK[6],
+        '#888888',
       ]);
     } finally {
       (globalThis as Record<string, unknown>).window = originalWindow;
@@ -385,7 +415,104 @@ describe('theme', () => {
     const option = buildChartOption(spec(), CATEGORY_ROWS, palette)!;
     expect(option.color).toEqual(palette.series);
     const yAxis = option.yAxis as Record<string, Record<string, unknown>>;
-    expect((yAxis.splitLine.lineStyle as Record<string, unknown>).color).toBe(palette.grid);
+    // v2 chrome is new palette fields; the admin console's `grid` is untouched.
+    expect((yAxis.splitLine.lineStyle as Record<string, unknown>).color).toBe(palette.gridline);
+    expect((yAxis.splitLine.lineStyle as Record<string, unknown>).type).toBe('solid');
     expect((option.textStyle as Record<string, unknown>).color).toBe(palette.text);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v2 (charts design v2 §4, §7, §8)
+// ---------------------------------------------------------------------------
+
+describe('v2 option rules', () => {
+  const LONG = Array.from({ length: 6 }, (_, i) => ({
+    stage: `A rather long category name number ${i + 1}`,
+    total: i * 10 + 1,
+  }));
+
+  it('never truncates, hides or rotates-by-default a category label', () => {
+    for (const t of ['bar', 'line', 'area', 'histogram'] as ChartType[]) {
+      const option = buildChartOption(spec({ type: t }), LONG, palette);
+      if (!option) continue;
+      const x = option.xAxis as Record<string, Record<string, unknown>>;
+      if (x.type !== ('category' as unknown)) continue;
+      expect(x.axisLabel.hideOverlap).toBeUndefined();
+      expect(x.axisLabel.width).toBeUndefined();
+      expect(x.axisLabel.overflow).toBeUndefined();
+      expect(x.axisLabel.rich).toBeUndefined();
+      expect(x.axisLabel.rotate === 0 || x.axisLabel.rotate === 45).toBe(true);
+      const texts = axisLabels(option).map((l) => l.replace(/\s+/g, ' '));
+      if (t !== 'histogram') expect(texts).toEqual(LONG.map((r) => r.stage));
+    }
+  });
+
+  it('caps bars at 24 px with a 4 px rounded data end', () => {
+    const option = buildChartOption(spec(), CATEGORY_ROWS, palette)!;
+    const s0 = seriesOf(option)[0];
+    expect(s0.barMaxWidth).toBe(24);
+    expect((s0.itemStyle as Record<string, unknown>).borderRadius).toEqual([4, 4, 0, 0]);
+  });
+
+  it('flips the rounded end for negative columns and keeps labels off the zero line', () => {
+    const option = buildChartOption(
+      spec(),
+      [
+        { stage: 'a', total: 5 },
+        { stage: 'b', total: -3 },
+      ],
+      palette,
+    )!;
+    const data = seriesOf(option)[0].data as Array<{ itemStyle: { borderRadius: number[] } }>;
+    expect(data[1].itemStyle.borderRadius).toEqual([0, 0, 4, 4]);
+    const x = option.xAxis as Record<string, Record<string, unknown>>;
+    expect(x.axisLine.onZero).toBe(false);
+  });
+
+  it('uses the 8-slot palette in y_keys order, never cycling', () => {
+    const keys = Array.from({ length: 8 }, (_, i) => `k${i}`);
+    const option = buildChartOption(
+      spec({ y_keys: keys }),
+      [{ stage: 'x', ...Object.fromEntries(keys.map((k, i) => [k, i + 1])) }],
+      palette,
+    )!;
+    const colors = seriesOf(option).map((s) => (s.itemStyle as Record<string, unknown>).color);
+    expect(colors).toEqual([...SERIES_FALLBACK]);
+    expect(new Set(colors).size).toBe(8);
+  });
+
+  it('confines and wraps the tooltip, and escapes every name', () => {
+    const option = buildChartOption(
+      spec(),
+      [{ stage: '<img src=x onerror=alert(1)>', total: 1 }, { stage: 'b', total: 2 }],
+      palette,
+    )!;
+    const tooltip = option.tooltip as Record<string, unknown>;
+    expect(tooltip.confine).toBe(true);
+    expect(String(tooltip.extraCssText)).toContain('white-space:normal');
+    expect(String(tooltip.extraCssText)).toContain('overflow-wrap:anywhere');
+    const html = (tooltip.formatter as (p: unknown) => string)([
+      { axisValue: 'c0', seriesId: 's0', color: '#0E9D9A', value: 1 },
+    ]);
+    expect(html).not.toContain('<img');
+    expect(html).toContain('&lt;img');
+    expect(html).toContain('dir="auto"');
+  });
+
+  it('sets minInterval 1 for integer data and one tick style per axis', () => {
+    const option = buildChartOption(
+      spec(),
+      [
+        { stage: 'a', total: 25_000 },
+        { stage: 'b', total: 5_000 },
+      ],
+      palette,
+    )!;
+    const y = option.yAxis as Record<string, Record<string, unknown> | number>;
+    expect(y.minInterval).toBe(1);
+    const fmt = (y.axisLabel as Record<string, (v: number) => string>).formatter;
+    expect(fmt(25_000)).toBe('25k');
+    expect(fmt(5_000)).toBe('5k');
   });
 });
