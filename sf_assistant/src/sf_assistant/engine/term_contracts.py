@@ -14,7 +14,12 @@ Three terms (``prompts/business_terms.md`` holds their definitions):
   question that names no leads or contacts.
 - **placement** (``business_terms.TERM_WORDS``): a call that measures placement from Candidate_Status__c 'Placed' (its
   own filters or a related child's) or from Onboarding__c (object, path hop or related child) is REFUSED (T2) unless
-  the question names that field or object; a Candidate_Status__c breakdown gets a note.
+  the question names that field or object; a Candidate_Status__c breakdown gets a note. Placements are dated by the
+  interview date (owner's decision of 2026-11-25), and so are the client interviews a placement rate is taken over:
+  a dated call on Interview__c (outcome filter or not), a call on another object that measures placements through a
+  lookup to Interview__c, or a related Interview__c child that keeps 'Offer Received', dated by another field than
+  Date_of_Interview__c (its period's or trend's date_field, or a date condition in its filters) is REFUSED (T2) with
+  the call to send instead; a call with no date is unchanged (:func:`_placement_date`).
 - **support person performance** (support-person words): a count, group or other measuring call (a list too when
   the question has performance words) on Session__c (object, path hop or related child), on the preferred or
   previous support person, or on the legacy support person of internal mock interviews is REFUSED (T3) unless the
@@ -43,7 +48,7 @@ from sf_assistant.engine import business_terms as _bt
 __all__ = ["TERM_CONTRACTS_TEXT", "TEXTS", "CANDIDATE_PREDICATE", "FLAG_PREDICATE", "PERSON_TYPE", "OUTCOME",
            "OFFER", "Contract", "CONTRACTS", "Terms", "NO_TERMS", "Step", "PathInfo", "View", "Plan", "detect",
            "is_candidate_lookup", "plan", "offer_rates", "blank_outcomes", "BLANK_SHARE_NOTE", "text", "edit_distance",
-           "ENFORCED_TOOLS"]
+           "ENFORCED_TOOLS", "INTERVIEW", "INTERVIEW_DATE"]
 
 TERM_CONTRACTS_TEXT = _prompt_files.text("term_contracts")
 TEXTS: dict[str, str] = dict(ln.split(": ", 1) for ln in TERM_CONTRACTS_TEXT.split("\n") if ": " in ln)
@@ -56,6 +61,9 @@ CANDIDATE_PREDICATE: dict[str, Any] = {"field": "RecordTypeId", "op": "eq", "val
 FLAG_PREDICATE: dict[str, Any] = {"field": "IsPersonAccount", "op": "eq", "value": True}
 #: The outcome field and value of support person performance (the owner's offer rate).
 OUTCOME, OFFER = "Interview_Outcome__c", "Offer Received"
+#: The client interview and its interview date: placements are dated, filtered and trended by it (owner's decision of
+#: 2026-11-25; review finding R2-4, owner item O1).
+INTERVIEW, INTERVIEW_DATE = "Interview__c", "Date_of_Interview__c"
 #: The share of a support call's interviews with a blank outcome from which code says how many are blank.
 BLANK_SHARE_NOTE = 0.2
 #: The record query tools a contract applies to (search, people, history and orientation tools never).
@@ -275,6 +283,10 @@ class View(Protocol):
     # (label, developer name) of each record type: a contains / starts_with filter on the record type's Name or
     # DeveloperName is read through it (a view without it leaves such a filter "unknown")
     def record_types(self, obj: str) -> list[tuple[str, str]]: ...
+    # the date field a date_field argument (or a filter's field) names, read as the record tools read a date_field
+    # (CreatedDate's words, a temporal key such as interview_date); None when it does not resolve or is no date or
+    # date/time field (a view without it: the placement date rule does not apply)
+    def date_path(self, obj: str, text: Any) -> PathInfo | None: ...
 
 
 #: The lookups to Account that are not the candidate (client account, parent, referrer, the employee's own account and
@@ -516,7 +528,7 @@ def plan(terms: Terms, tool: str, args: Any, view: View) -> Plan:
     if "support_performance" in terms.keys:
         _support(terms, tool, obj, parts, related, out)
     if out.reject is None and "placement" in terms.keys:
-        _placement(terms, tool, obj, parts, related, out)
+        _placement(terms, tool, obj, args, parts, related, view, out)
     if out.reject is None and "candidates" in terms.keys:
         _leads(terms, obj, parts, out)
     if out.reject is None and "candidates" in terms.keys:
@@ -573,9 +585,11 @@ def _placed_value(op: Any, value: str) -> bool:
     return "placed".startswith(v) if op == "starts_with" else v in "placed"
 
 
-def _placement(terms: Terms, tool: str, obj: str, parts: list, related: list, out: Plan) -> None:
+def _placement(terms: Terms, tool: str, obj: str, args: dict, parts: list, related: list, view: View,
+               out: Plan) -> None:
     """T2: placement measured from Candidate_Status__c 'Placed' (the call's filters, or a related child's) or from
-    Onboarding__c; a note on a status breakdown."""
+    Onboarding__c, or placements dated by another field than the interview date (:func:`_placement_date`); a note on
+    a status breakdown."""
     if not terms.placed_status:
         q = terms.question.casefold()
         for kind, _raw, item, p in parts:
@@ -599,10 +613,128 @@ def _placement(terms: Terms, tool: str, obj: str, parts: list, related: list, ou
                      else "related child records of Onboarding__c")
             out.reject = ("T2", text("placement_reject", FIELD=where))
             return
+    dated = _placement_date(tool, obj, args, parts, view)
+    if dated is not None:
+        out.reject = ("T2", text("placement_date_reject", FIELD=dated[0], DATE=dated[1]))
+        return
     if tool in ("group_records", "trend_records") and any(
             p is not None and kind in ("group", "split") and p.field == "Candidate_Status__c"
             for kind, _r, _i, p in parts):
         out.notes.append(text("placement_status_note"))
+
+
+def _offer_value(op: Any, value: Any) -> bool:
+    """An Interview_Outcome__c filter value that keeps 'Offer Received', compared as the record tools compare stored
+    values (case, spaces, hyphens and underscores aside): eq / in the value itself; contains / starts_with a part or a
+    start of it of 3 or more letters ("offer")."""
+    v, offer = (re.sub(r"[\s_-]+", "", str(x).casefold()) for x in (value, OFFER))
+    if op in ("eq", "in"):
+        return v == offer
+    if op not in ("contains", "starts_with") or len(v) < 3:
+        return False
+    return offer.startswith(v) if op == "starts_with" else v in offer
+
+
+def _measures_offers(parts: list, prefix: str = "") -> bool:
+    """``parts`` measure placements on the interview at ``prefix`` ("" = the call's object is Interview__c; else the
+    path of a lookup to Interview__c, :func:`_interview_prefix`): a filter (plain, any_of, part, segment) on its
+    Interview_Outcome__c that keeps 'Offer Received', or a group or split by that outcome."""
+    for kind, _raw, item, p in parts:
+        if _rest(p, prefix) != [OUTCOME]:
+            continue
+        if kind in ("group", "split"):
+            return True
+        if item is not None and kind in ("filter", "any_of", "part", "segment") \
+                and any(_offer_value(item.get("op"), v) for v in _values(item)):
+            return True
+    return False
+
+
+def _interview_prefix(path: PathInfo | None) -> str | None:
+    """The path up to its first lookup to Interview__c ("Interview__c", "Evaluation__c.Interview__c"), else None."""
+    if path is None:
+        return None
+    for i, s in enumerate(path.refs):
+        if s.target == INTERVIEW:
+            return ".".join(r.field for r in path.refs[: i + 1])
+    return None
+
+
+def _date_arg(view: View, obj: str, raw: Any) -> PathInfo | None:
+    """The date field ``raw`` names on ``obj`` (:meth:`View.date_path`), None when it names none."""
+    getter = getattr(view, "date_path", None)
+    if getter is None or not isinstance(raw, str) or not raw.strip():
+        return None
+    return getter(obj, raw)
+
+
+def _dated_by(tool: str, args: dict, parts: list, view: View, obj: str, prefix: str = "") -> str | None:
+    """What dates the interviews of ``args`` (on ``obj``; ``prefix`` the path to the interview, "" when ``obj`` is
+    Interview__c) by another field than the interview's Date_of_Interview__c: the date_field of a period (the call's,
+    a compare segment's, a related item's own) or of a trend's buckets, or a date condition in the filters on another
+    date field of the call's object or of the interview itself (not is_blank / is_not_blank, not a comparison with
+    other_field; a date of another linked record, such as the candidate's, is a condition, not the date of the
+    count); None when nothing does. A date_field with no period (list_records' sort order) dates nothing."""
+    want = (prefix.split(".") if prefix else []) + [INTERVIEW_DATE]
+    dated = bool(args.get("period")) or tool == "trend_records" or any(
+        seg.get("period") for seg in _items(args.get("segments")))
+    if dated and args.get("date_field"):
+        d = _date_arg(view, obj, args["date_field"])
+        if d is not None and d.parts != want:
+            return f"date_field {d.text}"
+    for kind, raw, item, p in parts:
+        if p is None or p.parts == want or item is None or kind not in ("filter", "any_of", "part", "segment"):
+            continue
+        rest = _rest(p, prefix) if prefix else None
+        if p.refs and not (rest is not None and len(rest) == 1):
+            continue
+        if item.get("other_field") or item.get("op") in ("is_blank", "is_not_blank"):
+            continue
+        if _date_arg(view, obj, raw) is not None:
+            return f"the filter {_item_text(p, item)}"
+    return None
+
+
+def _placement_date(tool: str, obj: str, args: dict, parts: list, view: View) -> tuple[str, str] | None:
+    """The owner's decision of 2026-11-25 (review finding R2-4, owner item O1): placements are dated and trended by
+    Date_of_Interview__c, and so are the client interviews a placement rate is taken over. For a question that names
+    placement, ``(what dates the interviews by another field, the date field to use)`` for the T2 text, or None when
+    the call is fine:
+
+    - every dated call on Interview__c, whether or not it filters the outcome (the rate's denominator: all client
+      interviews, by interview month);
+    - a call on another object that measures placements through a lookup to Interview__c (``Interview__c.
+      Interview_Outcome__c`` 'Offer Received', or a group or split by it) must date them by ``<lookup>.
+      Date_of_Interview__c``;
+    - a related Interview__c child item whose filters keep 'Offer Received' must date its children by
+      Date_of_Interview__c (a related child that measures no placement counts the parent's records, never the
+      rate's interviews, and is unchanged).
+
+    A call with no date is unchanged. Refused, not rewritten, as the other contracts treat a field the model chose
+    wrongly (T1 record type, T2 status, T3 session): code adds only what is missing (the candidate filter, the
+    support split), and a date condition in the filters has no safe rewrite into a period."""
+    own = [x for x in parts if x[0] != "related"]
+    if obj == INTERVIEW:
+        where = _dated_by(tool, args, own, view, obj)
+        if where is not None:
+            return where, INTERVIEW_DATE
+    else:
+        for pre in dict.fromkeys(x for x in (_interview_prefix(p) for _k, _r, _i, p in own) if x is not None):
+            if _measures_offers(own, pre):
+                where = _dated_by(tool, args, own, view, obj, pre)
+                if where is not None:
+                    return where, f"{pre}.{INTERVIEW_DATE}"
+    for r in _items(args.get("related")):
+        if view.object(r.get("child_object")) != INTERVIEW:
+            continue
+        rparts = [("filter", it.get("field"), it, view.path(INTERVIEW, it.get("field"))) for it in
+                  _items(r.get("filters"))]
+        if not _measures_offers(rparts):
+            continue
+        where = _dated_by("", r, rparts, view, INTERVIEW)
+        if where is not None:
+            return f"{where} of the related {INTERVIEW} records", INTERVIEW_DATE
+    return None
 
 
 def _leads(terms: Terms, obj: str, parts: list, out: Plan) -> None:

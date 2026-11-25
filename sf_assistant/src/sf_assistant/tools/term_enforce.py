@@ -4,7 +4,8 @@
 ``begin_question`` reads the question's terms once (:meth:`TermEnforceMixin._terms_for`,
 :func:`sf_assistant.engine.term_contracts.detect`); ``RecordTools.call`` runs :meth:`TermEnforceMixin._enforce_terms`
 between the argument validation and the handler (the plan of :func:`~sf_assistant.engine.term_contracts.plan`: the
-added candidate filter, the completed support call, or a refusal T1 / T2 / T3 the model reads as the error text) and
+added candidate filter, the completed support call, or a refusal T1 / T2 / T3 the model reads as the error text;
+T2 also refuses placements dated by another field than Date_of_Interview__c) and
 :meth:`TermEnforceMixin._finish_terms` after it (``applied["term_filters"]``, the offer rate of a completed support
 call). An added filter is an ordinary filter item: it runs through the same filter code, so the SQL, ``applied``, the
 evidence, the lookup check, the chart subtitle and the merge's Counted line all state it. ``_Call.enforced`` holds the
@@ -32,10 +33,19 @@ JOIN_CAP_TEXT = "a statement can join at most"
 
 class _CatalogView:
     """:class:`sf_assistant.engine.term_contracts.View` over the record tools' catalog. A name or path that does not
-    resolve is None: the handler then raises its own error (E1, E2, E3 ...)."""
+    resolve is None: the handler then raises its own error (E1, E2, E3 ...). ``date_ref``: the record tools' own reader
+    of a date_field argument (``RecordTools._date_ref``), so the placement date rule reads it as the handler does."""
 
-    def __init__(self, catalog: Any) -> None:
+    def __init__(self, catalog: Any, date_ref: Any = None) -> None:
         self.cat = catalog
+        self.date_ref = date_ref
+
+    def _info(self, ref: Any) -> PathInfo:
+        refs = [Step(h.src, h.field.api, None if h.target == "User|Group" else h.target, h.field.ref_role or "")
+                for h in ref.hops]
+        if ref.field.kind == "reference":
+            refs.append(Step(ref.obj, ref.field.api, self.cat.target_of(ref.field), ref.field.ref_role or ""))
+        return PathInfo(ref.text, tuple(refs), ref.field.api)
 
     def object(self, name: Any) -> str | None:
         try:
@@ -51,11 +61,18 @@ class _CatalogView:
             ref = self.cat.resolve_path(spec, path_text)
         except Exception:  # noqa: BLE001 - the handler raises the error
             return None
-        refs = [Step(h.src, h.field.api, None if h.target == "User|Group" else h.target, h.field.ref_role or "")
-                for h in ref.hops]
-        if ref.field.kind == "reference":
-            refs.append(Step(ref.obj, ref.field.api, self.cat.target_of(ref.field), ref.field.ref_role or ""))
-        return PathInfo(ref.text, tuple(refs), ref.field.api)
+        return self._info(ref)
+
+    def date_path(self, obj: str, path_text: Any) -> PathInfo | None:
+        spec = self.cat.objects.get(obj)
+        if spec is None or not isinstance(path_text, str) or not path_text.strip():
+            return None
+        try:
+            ref = (self.date_ref(spec, path_text) if self.date_ref is not None
+                   else self.cat.resolve_path(spec, path_text))
+        except Exception:  # noqa: BLE001 - the handler raises the error (E5e, E2c)
+            return None
+        return self._info(ref) if ref.field.is_date else None
 
     def record_type(self, obj: str, value: Any) -> str | None:
         spec = self.cat.objects.get(obj)
@@ -111,7 +128,7 @@ class TermEnforceMixin:
         terms = self._terms
         if not terms.keys:
             return args
-        p: Plan = plan(terms, name, args, _CatalogView(self.catalog))
+        p: Plan = plan(terms, name, args, _CatalogView(self.catalog, getattr(self, "_date_ref", None)))
         if p.reject is not None:
             code, msg = p.reject
             obj = _CatalogView(self.catalog).object(args.get("object"))
