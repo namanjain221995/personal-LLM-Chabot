@@ -342,6 +342,15 @@ describe('review fixes: no overlap after zoom-out, in the PNG, on negative tips'
     }
   });
 
+  it('N2: the PNG builder refuses an on-screen layout instead of drawing an overlapping image', () => {
+    const m = model(spec({ type: 'line', title: 'Offices' }), longCats(40, 20).map((x, i) => ({ x, y: i % 9 })));
+    const exportOpts = { title: 'Offices', measure, surface: '#f4f4f4' };
+    const screen = layoutChart(m, { width: 1200, context: 'inline', measure });
+    expect(buildExportOption(screen.model, screen, fallbackPalette('light'), exportOpts)).toBeNull();
+    const planned = layoutChart(m, { width: 1200, context: 'inline', measure, forExport: true });
+    expect(buildExportOption(planned.model, planned, fallbackPalette('light'), exportOpts)).not.toBeNull();
+  });
+
   it('V5: a negative column’s value label sits below its bar, clear of the category labels', () => {
     const rows = ['Alpha', 'Beta', 'Gamma'].map((x, i) => ({ x, y: (i - 1) * 2733 }));
     const { boxes, layout } = expectClean('negative-tips', model(spec({ show_values: true }), rows), 710);

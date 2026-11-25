@@ -43,6 +43,17 @@ describe('axisTickFormatter — one style per axis', () => {
     expect(f(5_000)).toBe('5k');
     expect(f(0)).toBe('0');
   });
+  it('labels a tick with the value it marks: 1,250,000 is "1.25M", not "1.3M" (N1)', () => {
+    const f = axisTickFormatter(1_750_000);
+    expect(f(1_250_000)).toBe('1.25M');
+    expect(f(1_750_000)).toBe('1.75M');
+    expect(f(12_500)).toBe('12.5k');
+    expect(f(1_500_000)).toBe('1.5M');
+    expect(f(2_000_000)).toBe('2M');
+    expect(f(-1_250_000)).toBe('-1.25M');
+    // A value that is not a round tick keeps the short form.
+    expect(f(1_234_567)).toBe('1.2M');
+  });
 });
 
 describe('percent and shares', () => {

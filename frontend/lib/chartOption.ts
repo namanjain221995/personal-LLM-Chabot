@@ -843,6 +843,7 @@ export function horizontalBarOption(
     renderer: 'echarts',
     form: 'columns',
     model,
+    forExport: opts.forExport === true,
     width,
     height,
     grid: { top, right: 72, bottom, left: labelCol },
@@ -956,6 +957,10 @@ export function buildOptionFromModel(
  * The export variant: the same chart with a canvas title and legend above the
  * plot. Text is pre-broken at the export width (C16). `top` is the plot's top
  * edge once the title and legend have taken their room.
+ *
+ * `layout` must be planned for the image (`layoutChart(..., { forExport: true })`,
+ * as lib/chartExport does). An on-screen plan returns null, which the caller
+ * reports as a failed export, rather than a PNG whose labels overlap (N2).
  */
 export function buildExportOption(
   model: ChartModel,
@@ -963,6 +968,7 @@ export function buildExportOption(
   palette: ChartPalette,
   opts: BuildOpts & { title: string; measure: Measure },
 ): { option: EChartsOption; height: number } | null {
+  if (!layout.forExport) return null;
   const measure = opts.measure;
   const width = layout.width;
   const titleLines = opts.title ? wrapLines(opts.title, width - 48, (t) => measure(t) * (16 / 12)) : [];

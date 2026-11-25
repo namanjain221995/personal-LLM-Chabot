@@ -166,7 +166,15 @@ export function axisTickFormatter(maxAbs: number): (v: number) => string {
   return (v: number) => (Number.isInteger(v) ? formatInteger(v) : formatValue(v));
 }
 
-/** Compact from 1,000 up, so every tick on a compact axis reads the same way. */
+/**
+ * Compact from 1,000 up, so every tick on a compact axis reads the same way.
+ *
+ * A tick is labelled with the value it marks (N1): a 2.5× step puts gridlines
+ * at 1,250,000 and 1,750,000, which one decimal would print as "1.3M" and
+ * "1.8M". The fewest decimals (up to 3) that print the value exactly are
+ * used; a value no short form prints exactly (not a round tick) keeps the
+ * usual one decimal ("1.2M" for 1,234,567).
+ */
 function compactTick(v: number): string {
   const abs = Math.abs(v);
   const units: Array<[number, string]> = [
@@ -178,7 +186,15 @@ function compactTick(v: number): string {
   for (const [size, suffix] of units) {
     if (abs >= size) {
       const scaled = v / size;
-      const text = Math.abs(scaled) >= 100 ? scaled.toFixed(0) : scaled.toFixed(1);
+      const fewest = Math.abs(scaled) >= 100 ? 0 : 1;
+      let text = scaled.toFixed(fewest);
+      for (let d = fewest; d <= 3; d++) {
+        const exact = scaled.toFixed(d);
+        if (Math.abs(Number(exact) * size - v) <= abs * 1e-9) {
+          text = exact;
+          break;
+        }
+      }
       return `${text.replace(/\.0$/, '')}${suffix}`;
     }
   }

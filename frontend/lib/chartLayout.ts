@@ -83,6 +83,12 @@ export interface ChartLayout {
   renderer: Renderer;
   form: ChartForm;
   model: ChartModel;
+  /**
+   * Planned for the offscreen PNG (`LayoutCtx.forExport`). `buildExportOption`
+   * draws only such a layout: an on-screen plan keeps its zoom window and
+   * label breaks, which overlap once the whole range is drawn (N2).
+   */
+  forExport: boolean;
   width: number;
   /** Canvas height (ECharts) — reserved before the chunk loads. 0 for HTML forms. */
   height: number;
@@ -635,6 +641,7 @@ export function planLayout(choice: FormChoice, ctx: LayoutCtx): ChartLayout {
     renderer: 'echarts',
     form,
     model,
+    forExport: ctx.forExport === true,
     width: ctx.width,
     height: 0,
     grid: { top: 12, right: 16, bottom: 8, left: 24 },

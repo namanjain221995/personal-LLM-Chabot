@@ -231,6 +231,24 @@ describe('review fixes: the shared scale ticks (V3)', () => {
     expect(b[b.length - 1].x1).toBeLessThanOrEqual(track + 0.01);
   });
 
+  it.each([1_200_000, 1_400_000, 1_700_000, 2_300_000, 12_500_000, 140_000, 1_300_000_000])(
+    'every tick label reads back as the value it marks, up to %i (N1)',
+    (max) => {
+      const mult = { '': 1, k: 1e3, M: 1e6, B: 1e9, T: 1e12 } as const;
+      for (const track of [118, 200, 300, 420, 640, 900]) {
+        const { ticks, label } = fitTicks(0, max, track, measureEst);
+        for (const t of ticks) {
+          const m = /^(-?[\d.]+)([kMBT]?)$/.exec(label(t));
+          expect(m, `tick ${t} printed as "${label(t)}"`).not.toBeNull();
+          const shown = Number(m![1]) * mult[m![2] as keyof typeof mult];
+          expect(Math.abs(shown - t), `tick ${t} printed as "${label(t)}" on a ${track} px track`).toBeLessThanOrEqual(
+            1e-9 * Math.max(1, t),
+          );
+        }
+      }
+    },
+  );
+
   it('prints compact numbers once the scale reaches 10k', () => {
     expect(boxes(0, 1_060_000, 188).map((b) => b.text)).toContain('1M');
   });
