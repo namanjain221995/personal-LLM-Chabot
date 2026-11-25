@@ -2095,6 +2095,256 @@ def test_compose_mounts_only_what_the_contract_lists_and_one_writable_file():
                      "sf-local-ai_ask-sock": ("/run/sf-assistant-ask", False)}
 
 
+#: The six conversation-memory switches the ask service reads at its start (config.memory_settings, design v2 §15.1).
+_MEMORY_SWITCHES = ("SFA_MEMORY", "SFA_MEMORY_SHORTCUTS", "SFA_MEMORY_PATCH_KNOWLEDGE", "SFA_MEMORY_MAX_CALLS",
+                    "SFA_MEMORY_MAX_AGE", "SFA_MEMORY_TOKENS")
+#: The whole environment list of the ask service in web/compose.ask.yaml, in order, each value as written: the switches
+#: pass the shell's (or web/.env's) value through, the rest is pinned.
+_ASK_ENVIRONMENT = [
+    ("PYTHONDONTWRITEBYTECODE", '"1"'), ("PYTHONPATH", "/srv/sfa/src"), ("SFA_HOME", "/srv/sfa"),
+    ("SFA_WAREHOUSE", "/data/warehouse.read.duckdb"), ("SFA_RESOLVER", '"${SFA_RESOLVER:-}"'),
+    ("SFA_ASK_LOG_DAYS", '"${SFA_ASK_LOG_DAYS:-}"'), *[(name, f'"${{{name}:-}}"') for name in _MEMORY_SWITCHES],
+    ("OKEVAL_BASE_URL", "http://localhost:8000/v1"), ("OKEVAL_MODEL", "Qwen/Qwen3.6-35B-A3B-NVFP4"),
+    ("OKEVAL_API_KEY", "EMPTY")]
+
+
+def _compose_environment() -> list[tuple[str, str]]:
+    """The ask service's environment list as (name, value as written) in file order. Every line of the block that is
+    not blank and not a comment must be one ``NAME: value`` entry, so no entry of another form goes unseen."""
+    block = _compose().split("\n    environment:\n", 1)[1].split("\n    volumes:\n", 1)[0]
+    entries = []
+    for line in block.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = re.fullmatch(r" {6}([A-Z][A-Z0-9_]*): (\S+)(?:\s+#.*)?", line)
+        assert m, f"not a NAME: value line of the environment list: {line!r}"
+        entries.append((m.group(1), m.group(2)))
+    return entries
+
+
+#: The ask service's own keys in web/compose.ask.yaml, in file order. The set is closed, so no key outside the
+#: environment list (an env_file above all) can widen what the container gets.
+_ASK_SERVICE_KEYS = ["image", "pull_policy", "container_name", "restart", "network_mode", "mem_limit", "pids_limit",
+                     "read_only", "tmpfs", "cap_drop", "security_opt", "logging", "command", "environment", "volumes",
+                     "healthcheck"]
+
+
+def _compose_keys() -> tuple[list[str], list[str], list[str]]:
+    """The compose file's top-level keys, the names of its services, and the ask service's own keys, each in file
+    order (YAML puts the keys of one mapping at one indentation: none at the top, 2 for a service, 4 for its keys)."""
+    text = _compose()
+    top = re.findall(r"^([\w.-]+):", text, re.M)
+    services = "\n" + text.split("\nservices:\n", 1)[1].split("\nvolumes:\n", 1)[0]
+    names = re.findall(r"^ {2}([\w.-]+):", services, re.M)
+    keys = re.findall(r"^ {4}([\w.-]+):", services.split("\n  sf-assistant-ask:\n", 1)[1], re.M)
+    return top, names, keys
+
+
+def _in_container(value: str, shell: dict) -> str:
+    """What docker compose puts in the container for one value of the list: ``"${NAME:-}"`` is the shell's value
+    (unset: empty); a quoted plain value loses its quotes."""
+    m = re.fullmatch(r'"\$\{([A-Z][A-Z0-9_]*):-\}"', value)
+    return (shell.get(m.group(1)) or "") if m else value.strip('"')
+
+
+def test_compose_passes_the_six_memory_switches_and_nothing_else_changed():
+    """Stage-2 review M1: the service reads the memory switches from its environment, so a switch the code reads must
+    be in the closed list, or rollout step 5 (SFA_MEMORY=on, restart-ask) and the rollback (SFA_MEMORY=off,
+    restart-ask) never reach it. The rest of the list is as before."""
+    assert tuple(sfa_config.MEMORY_ENV_VARS.values()) == _MEMORY_SWITCHES
+    entries = _compose_environment()
+    assert entries == _ASK_ENVIRONMENT
+    assert len({name for name, _ in entries}) == len(entries)
+    # Nothing outside the list reaches the container (stage-3 review r1, N1): no env_file, which would hand it every
+    # line of web/.env (the page's and the MCP server's addresses too), and no key or service the file did not have.
+    top, services, keys = _compose_keys()
+    assert top == ["name", "services", "volumes"] and services == ["sf-assistant-ask"]
+    assert keys == _ASK_SERVICE_KEYS
+    assert not any("env_file" in line.split("#", 1)[0] for line in _compose().splitlines())
+    # the page and the MCP server get none of them: a line in web/.env changes the ask service only
+    page = (WEB / "compose.yaml").read_text(encoding="utf-8")
+    assert not any(name in page for name in _MEMORY_SWITCHES)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda t: t.replace("    environment:\n", "    env_file:\n      - .env\n    environment:\n", 1),
+    lambda t: t.replace("      retries: 3\n", "      retries: 3\n    env_file: .env\n", 1),
+    lambda t: t.replace("    read_only: true\n", "    read_only: true\n    env_file: [.env]\n", 1),
+    lambda t: t.replace("    read_only: true\n", "    read_only: true\n    privileged: true\n", 1),
+    lambda t: t.replace("\nvolumes:\n", "  sf-assistant-other:\n    image: sf-assistant-web:local\n"
+                                        "    env_file: .env\n\nvolumes:\n", 1),
+], ids=["env_file before the list", "env_file after the health check", "env_file in flow form", "a new key",
+        "a second service"])
+def test_the_compose_pin_refuses_a_change_outside_the_environment_list(monkeypatch, mutate):
+    """Stage-3 review r1, N1: each of these leaves the environment list as it is, so only the service's closed key set
+    and the env_file check can catch it."""
+    text = mutate(_compose())
+    assert text != _compose()
+    assert _compose_environment() == _ASK_ENVIRONMENT                  # the list itself is untouched
+    monkeypatch.setitem(globals(), "_compose", lambda: text)
+    assert _compose_environment() == _ASK_ENVIRONMENT
+    with pytest.raises(AssertionError):
+        test_compose_passes_the_six_memory_switches_and_nothing_else_changed()
+
+
+@pytest.mark.parametrize("shell, want", [
+    ({}, sfa_config.MemoryConfig()),                                           # nothing set: shadow and the rest
+    ({"SFA_MEMORY": "on"}, sfa_config.MemoryConfig(mode="on")),                # rollout step 5
+    ({"SFA_MEMORY": "off"}, sfa_config.MemoryConfig(mode="off")),              # the rollback (§15.3)
+    ({"SFA_MEMORY": "shadow", "SFA_MEMORY_SHORTCUTS": "off", "SFA_MEMORY_PATCH_KNOWLEDGE": "on",
+      "SFA_MEMORY_MAX_CALLS": "2", "SFA_MEMORY_MAX_AGE": "0", "SFA_MEMORY_TOKENS": "8000"},
+     sfa_config.MemoryConfig(shortcuts=False, patch_knowledge=True, max_calls=2, max_age=0, tokens=8000)),
+])
+def test_a_switch_in_the_shell_reaches_the_service_through_the_compose_file(shell, want):
+    container = {name: _in_container(value, shell) for name, value in _compose_environment()}
+    assert {name: container[name] for name in _MEMORY_SWITCHES} == {name: shell.get(name, "") for name in
+                                                                      _MEMORY_SWITCHES}
+    assert sfa_config.memory_settings(container) == want
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\t"])
+def test_an_empty_memory_switch_is_the_code_default(blank):
+    """compose passes an unset switch as an empty value: the code reads it as unset, so the defaults hold (shadow, on,
+    off, 3, 2, 12000) and the start-up names no problem."""
+    got = sfa_config.memory_settings({name: blank for name in _MEMORY_SWITCHES})
+    assert got == sfa_config.MemoryConfig() and got.problem == ""
+    assert (got.mode, got.shortcuts, got.patch_knowledge, got.max_calls, got.max_age, got.tokens) == \
+        ("shadow", True, False, 3, 2, 12000)
+
+
+# ------------------------------------------------------------- the runbook's memory-switch steps (docs/runbook.md)
+#: Parts of the runbook's command lines that the tests below look for.
+_STARTUP_CHECK = '.event == "startup"'
+_SHELL_CHECK = "env | grep '^SFA_MEMORY'"
+
+
+def _memory_switch_blocks() -> tuple[str, list[tuple[str, list[str]]]]:
+    """The runbook section "The memory switches" and its bash blocks, each as (its text, its command lines). A line
+    that ends in a backslash is joined to the next one, a comment line is dropped and a trailing comment is cut."""
+    text = (ROOT / "docs" / "runbook.md").read_text(encoding="utf-8")
+    section = text.split("\n### The memory switches\n", 1)[1].split("\n## ", 1)[0]
+    blocks = []
+    for body in re.findall(r"```bash\n(.*?)```", section, re.S):
+        lines = [ln.split("  #", 1)[0].strip() for ln in body.replace("\\\n", "").splitlines()]
+        blocks.append((body, [ln for ln in lines if ln and not ln.startswith("#")]))
+    return section, blocks
+
+
+def _runbook_step(blocks: list[tuple[str, list[str]]], needle: str) -> tuple[str, list[str]]:
+    """The one block that has a command line holding ``needle``."""
+    found = [block for block in blocks if any(needle in ln for ln in block[1])]
+    assert len(found) == 1, needle
+    return found[0]
+
+
+def _switch_line(mode: str) -> str:
+    """The runbook's line that writes ``SFA_MEMORY=<mode>`` into web/.env (step 5: on; the rollback: off)."""
+    _, lines = _runbook_step(_memory_switch_blocks()[1], f"SFA_MEMORY={mode}")
+    found = [ln for ln in lines if ">> .env" in ln]
+    assert len(found) == 1, mode
+    return found[0]
+
+
+def _env_file_value(web: Path, name: str) -> str:
+    """run.sh's own reading of web/.env (``env_file_value``: the last ``NAME=`` line), run on a made-up folder."""
+    func = re.search(r"env_file_value\(\) \{\n.*?\n\}", (WEB / "run.sh").read_text(encoding="utf-8"), re.S).group(0)
+    p = subprocess.run(["bash", "-c", f'HERE="$PWD"\n{func}\nenv_file_value {name}'], cwd=web, capture_output=True,
+                       text=True, timeout=30, check=True)
+    return p.stdout.rstrip("\n")
+
+
+@pytest.mark.parametrize("before", [
+    "SFA_MCP_BIND=192.0.2.11\nSFA_BIND=192.0.2.10",          # no final newline (an editor's or printf's file)
+    "SFA_MCP_BIND=192.0.2.11\nSFA_BIND=192.0.2.10\n",
+    "SFA_BIND=192.0.2.10\nSFA_MEMORY=shadow",                 # a switch line already there: last, no final newline
+    "SFA_MEMORY=on\nSFA_BIND=192.0.2.10\n",
+    None,                                                     # no web/.env yet
+], ids=["no final newline", "final newline", "switch line last", "switch line first", "no file"])
+def test_the_runbook_sets_the_switch_on_a_line_of_its_own_and_keeps_the_rest_of_web_env(tmp_path, before):
+    """Stage-3 review r1, L1: step 5's and the rollback's lines, run as the runbook writes them on a made-up web/.env,
+    leave one ``SFA_MEMORY=`` line holding the mode and every other line as it was, whatever the file's last line.
+    The earlier ``echo 'SFA_MEMORY=on' >> .env`` joined the switch to a last line with no final newline: the service
+    stayed in shadow and the setting on that line (SFA_BIND) broke."""
+    web = tmp_path / "web"
+    web.mkdir()
+    env = web / ".env"
+    if before is not None:
+        env.write_text(before, encoding="utf-8")
+    others = [ln for ln in (before or "").splitlines() if not ln.startswith("SFA_MEMORY=")]
+    for mode in ("on", "off", "on"):                          # step 5, the rollback, step 5 again
+        subprocess.run(["bash", "-c", _switch_line(mode)], cwd=web, check=True, timeout=30)
+        lines = env.read_text(encoding="utf-8").splitlines()
+        assert [ln for ln in lines if "SFA_MEMORY" in ln] == [f"SFA_MEMORY={mode}"]
+        assert [ln for ln in lines if ln and "SFA_MEMORY" not in ln] == others
+        assert _env_file_value(web, "SFA_MEMORY") == mode
+        for line in others:
+            name, value = line.split("=", 1)
+            assert _env_file_value(web, name) == value
+
+
+def test_the_runbook_steps_check_the_shell_and_read_the_new_start_up_line():
+    """Stage-3 review r1, L1: step 1, step 5 and the rollback each check that no value in the shell would win over
+    web/.env, restart, and end with the section's own start-up check, naming the mode it must show. N3: the rollback
+    names the one row the platform's bridge still writes (a failed turn's copy) instead of promising none."""
+    section, blocks = _memory_switch_blocks()
+    check = [ln for ln in blocks[0][1] if _STARTUP_CHECK in ln]
+    assert len(check) == 1
+    for needle, mode in (("grep '^SFA_MEMORY' .env;", "shadow"), ("SFA_MEMORY=on", "on"), ("SFA_MEMORY=off", "off")):
+        body, lines = _runbook_step(blocks, needle)
+        shell = [i for i, ln in enumerate(lines) if _SHELL_CHECK in ln]
+        assert len(shell) == 1 and lines.count("./run.sh restart-ask") == 1, mode
+        assert shell[0] < lines.index("./run.sh restart-ask") < len(lines) - 1 and lines[-1] == check[0], mode
+        assert f'"memory":"{mode}"' in body, mode
+    rollback = section.split("The rollback (design §15.3)", 1)[1].split("```", 1)[0]
+    assert "stores no row of its own" in rollback and "retry line" in rollback
+
+
+@pytest.mark.skipif(shutil.which("jq") is None or shutil.which("awk") is None, reason="the check needs jq and awk")
+def test_the_runbook_start_up_check_finds_the_last_start_in_any_daily_file(tmp_path):
+    """Stage-3 review r1, N2: the service writes its start-up line once, into the daily file of the day it started
+    (ask_mcp.main through RotatingAskLog). The runbook's check reads every daily file and prints the last start-up
+    line, so it still shows the running mode on a later day, when today's file holds no start-up line. A cut line
+    hides nothing after it, and the unknown-date file is left out."""
+    _, blocks = _memory_switch_blocks()
+    checks = {ln for _, lines in blocks for ln in lines if _STARTUP_CHECK in ln}
+    assert len(checks) == 1                                   # the same check in each of the four blocks
+    web = tmp_path / "web"
+    web.mkdir()
+    (tmp_path / ".private").mkdir()
+    logs = tmp_path / ".private" / "ask_logs"
+    now = [dt.datetime(2026, 1, 5, 3, 0, tzinfo=dt.timezone.utc)]
+    log = ask_mcp.RotatingAskLog(str(logs), days=90, clock=lambda: now[0])
+    log.check()
+    log.write({"event": "startup", "ok": True, "seconds": 4.2, "status": {}, "memory": "shadow"})
+    now[0] = dt.datetime(2026, 1, 5, 9, 0, tzinfo=dt.timezone.utc)
+    log.write({"event": "startup", "ok": True, "seconds": 4.1, "status": {}, "memory": "on"})
+    log.write({"event": "ask", "status": "answered"})
+    now[0] = dt.datetime(2026, 1, 5, 19, 0, tzinfo=dt.timezone.utc)   # 00:30 on 2026-01-06 in Kolkata: the next file
+    log.write({"event": "ask", "status": "answered"})
+    with open(logs / "ask_log-2026-01-06.jsonl", "a", encoding="utf-8") as f:
+        f.write('{"ts": "2026-01-05T19:01:00+0000", "event": "ask", "sta')              # cut by a crash
+    # the next start's line comes first in the next file: joined to the cut line, it would be lost
+    (logs / "ask_log-2026-01-07.jsonl").write_text(
+        '{"ts": "2026-01-07T02:01:00+0000", "event": "startup", "ok": true, "memory": "off",'
+        ' "memory_problem": "made-up problem words"}\n'
+        '{"ts": "2026-01-07T02:05:00+0000", "event": "ask", "status": "answered"}\n', encoding="utf-8")
+    (logs / "ask_log-unknown-date.jsonl").write_text('{"event": "startup", "ok": true, "memory": "on"}\n',
+                                                     encoding="utf-8")
+    assert sorted(p.name for p in logs.iterdir()) == ["ask_log-2026-01-05.jsonl", "ask_log-2026-01-06.jsonl",
+                                                      "ask_log-2026-01-07.jsonl", "ask_log-unknown-date.jsonl"]
+
+    def run() -> str:
+        p = subprocess.run(["bash", "-c", next(iter(checks))], cwd=web, capture_output=True, text=True, timeout=30)
+        assert p.returncode == 0, p.stderr
+        return p.stdout
+
+    assert json.loads(run()) == {"ts": "2026-01-07T02:01:00+0000", "ok": True, "memory": "off",
+                                 "memory_problem": "made-up problem words"}
+    (logs / "ask_log-2026-01-07.jsonl").unlink()              # days later, with no start since the one of 2026-01-05
+    assert json.loads(run()) == {"ts": "2026-01-05T09:00:00+0000", "ok": True, "memory": "on",
+                                 "memory_problem": None}
+
+
 def test_the_existing_compose_file_knows_nothing_of_the_service():
     text = (WEB / "compose.yaml").read_text(encoding="utf-8")
     assert "ask_mcp" not in text and "sf-assistant-ask" not in text and "ask_token" not in text

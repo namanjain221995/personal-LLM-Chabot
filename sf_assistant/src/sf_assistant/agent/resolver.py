@@ -55,7 +55,12 @@ plan older than ``max_age`` is not shown to the model: the question is read as t
    sent, and step 5 answers (F4). It returns ``{"kind", "standalone", "ops"}``
    (:func:`parse_reply`; anything else is unclear). Code then checks it: ``new`` and ``about_answer`` need a
    ``standalone`` that passes the v6 rewrite's own reading of a reply (``followup.rewrite`` on the last 4 turns, the
-   binding checks of ``_unbound`` included: the model gets 12 turns, the checks read 4); a ``patch`` goes through
+   binding checks of ``_unbound`` included: the model gets 12 turns, the checks read 4; after a patch or shortcut
+   answer of the plan, its Read-as line names each period once, when the reading keeps every ``eq`` / ``in`` filter
+   value of the plan, says no period but the plan's (or one the person typed), names no time grain but the plan's,
+   and the plan keeps all its groups and rows; the person rule then reads the person's last turn, never that
+   code-written line: ``_Job._read``, stage-2 review finding M5, stage-3 review findings F1, F2, R2-1 to R2-3); a
+   ``patch`` goes through
    ``query_state.apply`` (fields, typed values, the filter cap, the term contracts with the rebuilt terms, the call
    cap, contact fields). A failed check asks (a clarify); a value the person did not type becomes a did-you-mean only
    when it is a picklist value or a record type of its field, never a name or a figure from an answer (F8).
@@ -89,7 +94,9 @@ from sf_assistant.agent.small_talk import line as _talk_line
 from sf_assistant.agent.small_talk import small_talk
 from sf_assistant.config import LIMITS
 from sf_assistant.engine import followup_shortcuts as _shortcuts
+from sf_assistant.engine import term_contracts as TC
 from sf_assistant.engine.contact import asks_for_contact
+from sf_assistant.engine.periods import PeriodError, parse_period
 from sf_assistant.engine.term_contracts import Terms
 from sf_assistant.knowledge.resolver import osa_distance
 
@@ -544,6 +551,101 @@ def render_clarify(clarify: qs.Clarify, plan_line: str = "") -> str:
     return _say(key, plan=plan_line, field=" ".join(str(clarify.field or "").split())[:120], value=value)
 
 
+def _restated_periods(plan: dict | None, today: dt.date) -> list[tuple[str, str]]:
+    """The periods of ``plan`` as its plan line writes them with their dates, each with the plan's own words for it:
+    ``("2026 (2026-01-01 to 2026-10-31)", "2026")`` (``query_state._period_text``, with the dates stored for the
+    words, and the dates the words mean on ``today``, which a line written before the call ran shows). Every call's
+    period and every compare segment's; only words that ``followup`` reads as a period (``followup._periods``), so a
+    phrase whose dates are cut away still names the period the M5 reading checks. ``followup`` may read only a part of
+    the phrase ("March 2026" of "since March 2026", "2026" of "jan 2026"): a reading that keeps that part and changes
+    the period is kept out by :meth:`_Job._keeps_periods`, which reads the whole phrase as ``engine/periods.py`` does
+    (stage-3 review finding R2-1). The longest text comes first."""
+    out: set[tuple[str, str]] = set()
+    for call in (plan or {}).get("calls") or []:
+        if not isinstance(call, dict) or not isinstance(call.get("args"), dict):
+            continue
+        args = call["args"]
+        grain = args.get("grain") if call.get("tool") == "trend_records" else None
+        items = [(args.get("period"), call.get("period"), grain)]
+        stored = call.get("segments") if isinstance(call.get("segments"), list) else []
+        for i, seg in enumerate(args.get("segments") if isinstance(args.get("segments"), list) else []):
+            if isinstance(seg, dict):
+                items.append((seg.get("period"), stored[i] if i < len(stored) else None, None))
+        for phrase, info, per_grain in items:
+            if not isinstance(phrase, str) or not phrase.strip() or not _followup._periods(phrase):
+                continue
+            for said in (qs._period_text(phrase, info, today, per_grain), qs._period_text(phrase, None, today,
+                                                                                            per_grain)):
+                if said and said != phrase and phrase in said:
+                    out.add((said, phrase))
+    return sorted(out, key=lambda pair: (-len(pair[0]), pair))
+
+
+def _said_periods(text: Any, today: dt.date) -> list[str]:
+    """Every period the words of ``text`` make, as the shortcut grammar reads a period (``followup_shortcuts``: a
+    Hinglish period in English words, the all-time words as "all time", else the longest run of words that
+    ``parse_period`` reads, with its "since", "from", "before" or "until" and without a leading "in" or "for"):
+    "each month since March 2026" says "since march 2026", "each week in jan 2026" says "jan 2026". Each run is read
+    once; at most 8. May raise (:meth:`_Job._keeps_periods` reads a fault as a changed period)."""
+    words = _shortcuts.words(text)
+    used = [False] * len(words)
+    out: list[str] = []
+    while len(out) < 8:
+        got = _shortcuts._period(words, used, today)   # marks the words it reads as used
+        if got is None:
+            break
+        out.append(got)
+    return out
+
+
+def _period_range(phrase: str, today: dt.date) -> tuple[dt.date | None, dt.date | None] | None:
+    """The dates ``phrase`` means on ``today`` (``engine.periods.parse_period``: the start and the end, exclusive, None
+    for an open side), or None when it reads none ("all time" means no time limit)."""
+    try:
+        got = parse_period(phrase, today)
+    except PeriodError:
+        return None
+    return got.start, got.end_exclusive
+
+
+#: The arguments that keep only some groups or rows of a call's answer: a ranking's size (group_records ``top``), a
+#: least value per group (``min_value``) and a list's number of rows (list_records ``limit``). No words of a reading
+#: can be seen to keep them: a reading that drops "top 3" runs over every recruiter (stage-3 review finding R2-3).
+_NARROWING_ARGS = ("top", "min_value", "limit")
+#: Words a question holds in roles of their own ("for us", "as a chart", "plot it"): a filter value made of these
+#: words only ("US", "A", "IT") is never kept by its words (:func:`_value_kept`; stage-3 review finding R2-2).
+_GRAMMAR_WORDS = _followup._POINTERS | _followup._FRAME | _shortcuts.FILLER
+
+
+#: The filter operators whose value a question keeps by naming it (:meth:`_Job._keeps_filters`). Never a negation
+#: (ne, not_in, not_contains), a part of a text (contains, starts_with) or a comparison (gt, gte, lt, lte): the same
+#: words name the value whichever way round the question reads it ("outside North America" read as "in North
+#: America"; stage-3 review finding F2).
+_KEPT_OPS = frozenset({"eq", "in"})
+
+
+def _value_kept(path: Any, value: Any, text: str, keys: Iterable[str]) -> bool:
+    """A filter value of the plan that the normalised question ``text`` keeps (:meth:`_Job._keeps_filters`, which
+    asks this only for an operator of :data:`_KEPT_OPS`): the placement contract's ``Interview_Outcome__c`` "Offer
+    Received" when ``keys`` (the terms of the new question) hold placement, the candidates contract's Person Account
+    record type when they hold candidates, else a text or a number that ``text`` holds as whole words. A true or false
+    value, and a value made of pointer, frame or filler words only (:data:`_GRAMMAR_WORDS`: "US" in "for us", "A" in
+    "as a chart", "IT" in "plot it"), is never kept by its words."""
+    name = str(path or "").rsplit(".", 1)[-1].casefold()
+    if name == TC.OUTCOME.casefold() and isinstance(value, str) and _norm(value) == _norm(TC.OFFER):
+        if "placement" in keys:
+            return True
+    elif name in ("recordtypeid", "recordtype") and isinstance(value, str) and _norm(value) == _norm(TC.PERSON_TYPE):
+        if "candidates" in keys:
+            return True
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return False
+    words = _norm(value if isinstance(value, str) else qs._value_text(value))
+    if not words or set(_followup._words(words)) <= _GRAMMAR_WORDS:
+        return False
+    return re.search(rf"(?<![^\W_]){re.escape(words)}(?![^\W_])", text) is not None
+
+
 # ------------------------------------------------------------------------------------------------ one job
 class _Job:
     """One question: the inputs as read, and the steps of §6.2. Lives for one call of :func:`resolve`."""
@@ -575,6 +677,12 @@ class _Job:
         self.plan_ok = self.plan is not None and self.age <= max_age
         self.usable = qs.usable(self.checked, self.gap, max_age)
         self.fresh = self.usable and self.age == 0
+        last = (self.checked.state or {}).get("last") or {}
+        #: the plan answered the very last answer with a patch or a shortcut, so that answer's Read-as line is the plan
+        #: line code wrote (web/ask_mcp.py, design §7.2); the state stores the operation of such an answer only
+        self.patch_answer = self.fresh and last.get("op") is not None
+        #: the model is called (resolve, SFA_MEMORY=on), never in shadow: :meth:`run` sets it
+        self.calls_model = False
         self.label = getattr(view, "label", None) if view is not None else None
         self.line = qs.plan_line(self.plan, today=self.today, label=self.label) if self.plan else ""
         self.stored_terms = self.plan["terms"] if self.plan else None
@@ -621,10 +729,149 @@ class _Job:
         return self._complete(text) or self._another_subject(text)
 
     def _read(self, standalone: Any) -> _followup.Rewrite:
-        """The v6 rewrite's reading of ``standalone`` as the reply to the typed question (last 4 turns)."""
+        """The v6 rewrite's reading of ``standalone`` as the reply to the typed question (last 4 turns).
+
+        With the model called (``SFA_MEMORY=on``) the last answer's plan line names each period once when that is safe
+        (:meth:`_read_turns`, stage-2 review finding M5). When it is so cut after a patch or shortcut answer
+        (``patch_answer``), the line is the plan line code wrote, and the person rule of the reading takes the person's
+        own last turn as the last question, never that line (``followup.rewrite`` ``code_line``, stage-3 review finding
+        F1): its field labels and values ("Interview Outcome = 'Offer Received'") are no people, and the cut was made
+        only for a reading that keeps every filter value of the plan. Shadow (no model call) reads the turns as sent,
+        with no ``code_line``, so its logged decision is the one it was (stage-3 review finding F6)."""
         if not isinstance(standalone, str) or not standalone.strip():
             return _followup.Rewrite(_followup.UNCLEAR, reason="no_standalone")
-        return _followup.rewrite(self.question, self.turns, _Echo(standalone))
+        if not self.calls_model:
+            return _followup.rewrite(self.question, self.turns, _Echo(standalone))
+        turns = self._read_turns(standalone)   # the job's own list when nothing is cut
+        return _followup.rewrite(self.question, turns, _Echo(standalone),
+                                 code_line=self.patch_answer and turns is not self.turns)
+
+    def _read_turns(self, standalone: str) -> list:
+        """The turns :meth:`_read` hands the v6 rewrite for ``standalone``: the turns as sent, except that the
+        ``Read as:`` line of the last answer names each period of the plan once, in the plan's own words (stage-2
+        review finding M5).
+
+        A patch or a shortcut answer reads as its plan line (§7.2), and the plan line writes a period as its words and
+        then its dates: "..., 2026 (2026-01-01 to 2026-10-31), as a chart". ``followup._period_lost`` reads that line
+        as the earlier question and finds three periods in it, so a model's ``new`` reading that keeps "in 2026" was
+        refused, and "and the placement rate?" after "plot it" asked for the full question (owner chain B). Here
+        each period phrase of the plan (:func:`_restated_periods`) followed by the dates code writes for it is cut
+        back to the phrase, so the reading must still keep the period, in the words the plan has for it.
+
+        Only when all of this holds; otherwise the turns go as sent, and the reading is today's:
+
+        - the plan answered the very last answer (``fresh``: gap 0, age 0), so the first line of the last assistant
+          turn is that plan's own line. After a gap, a knowledge answer or an older plan nothing is cut, and the gap
+          and age rules (D10, D13) read as before;
+        - that first line is a ``Read as:`` line that holds such a period with its dates;
+        - ``standalone`` keeps every filter value of the plan (:meth:`_keeps_filters`). The period check was also what
+          refused a ``new`` reading after "plot it" that drops a filter the plan has ("only North America"); the
+          binding checks read the typed "plot it" as the last question, so nothing else would refuse it;
+        - every period ``standalone`` says means the dates of a phrase the cut leaves, or of a period the person typed
+          (:meth:`_keeps_periods`). With the dates gone, the v6 reading checks only the words of the phrase it sees
+          as a period, so "in March 2026" would keep "since March 2026" and "from March 2026" would keep "March 2026"
+          (stage-3 review finding R2-1);
+        - no call keeps only some of its groups or rows, and ``standalone`` names no time grain but the plan's
+          (:meth:`_keeps_grouping`): "top 3" or "by quarter" just before, which the dates in the line made the
+          reading keep (stage-3 review finding R2-3).
+
+        Nothing else of any turn changes. Off never calls the resolver, and shadow never calls this (:meth:`_read`), so
+        both read the turns as sent."""
+        if not self.fresh:
+            return self.turns
+        at = next((i for i in range(len(self.turns) - 1, -1, -1) if isinstance(self.turns[i], dict)
+                   and self.turns[i].get("role") == "assistant" and isinstance(self.turns[i].get("content"), str)
+                   and self.turns[i]["content"].strip()), None)
+        if at is None:
+            return self.turns
+        content = self.turns[at]["content"]
+        head = len(content) - len(content.lstrip())
+        line = content[head:].splitlines()[0]   # the first line, as followup._lead reads it
+        if not line.strip().casefold().startswith(_followup._READ_AS):
+            return self.turns
+        once, cut = line, []
+        for said, phrase in _restated_periods(self.plan, self.today):
+            if said in once:
+                once = once.replace(said, phrase)
+                cut.append(phrase)
+        if once == line or not self._keeps_filters(standalone) or not self._keeps_periods(standalone, cut) \
+                or not self._keeps_grouping(standalone):
+            return self.turns
+        turns = list(self.turns)
+        turns[at] = dict(turns[at], content=content[:head] + once + content[head + len(line):])
+        return turns
+
+    def _keeps_filters(self, standalone: str) -> bool:
+        """``standalone`` keeps every filter of the plan's calls (filters, any-of items, the part and base filters of a
+        rate, a compare's segments): each value of an ``eq`` or ``in`` filter (:data:`_KEPT_OPS`) is in it as a word
+        or words (case and spacing aside), or is the value of a term contract that the terms of a new question from it
+        hold (the placement contract's Interview Outcome "Offer Received" for "placement"; the candidates contract's
+        Person Account record type for "candidates"). Never taken as kept, so the reading then stays today's: a filter
+        of any other operator (a negation, a part of a text, a comparison: the same words name the value either way
+        round, stage-3 review finding F2), a filter with no value (is blank) or another field in place of a value, a
+        true or false value, a record set of an earlier answer (``keys_from``), and a condition on child records
+        (``related``: "with no sessions", "at least 3 interviews", whose words cannot show which way round it is
+        read)."""
+        text = _norm(standalone)
+        keys = self._terms(self.question, standalone, "new").keys
+        for call in (self.plan or {}).get("calls") or []:
+            if not isinstance(call, dict) or not isinstance(call.get("args"), dict) or call.get("keys_from"):
+                return False
+            args = call["args"]
+            if qs._items(args.get("related")):
+                return False
+            items = [it for key in ("filters", "base_filters", "part_filters", "any_of")
+                     for it in qs._items(args.get(key))]
+            for segment in qs._items(args.get("segments")):
+                items += qs._items(segment.get("filters"))
+            for it in items:
+                values = it["values"] if isinstance(it.get("values"), list) else (
+                    [it["value"]] if "value" in it else [])
+                if it.get("op") not in _KEPT_OPS or it.get("other_field") or not values or not all(
+                        _value_kept(it.get("field"), v, text, keys) for v in values):
+                    return False
+        return True
+
+    def _keeps_periods(self, standalone: str, phrases: Iterable[str]) -> bool:
+        """Every period ``standalone`` says (:func:`_said_periods`) means, on the business date, the dates of one of
+        ``phrases`` (the plan's period phrases the cut leaves in the line) or of a period the person typed in the
+        question (a typed period replaces the plan's, and the v6 reading checks it as before). "In March 2026" after
+        "since March 2026", "in 2026" after "jan 2026" and "from March 2026" after "March 2026" say other dates, so
+        nothing is cut and the v6 reading refuses them as at f90cd21b; a reading that says the plan's phrase ("since
+        March 2026") is kept (stage-3 review finding R2-1). A phrase or a said period with no dates ("all time"), or
+        a fault, is never kept."""
+        try:
+            plan = {_period_range(p, self.today) for p in phrases}
+            typed = {_period_range(p, self.today) for p in _said_periods(self.question, self.today)}
+            said = [_period_range(p, self.today) for p in _said_periods(standalone, self.today)]
+        except Exception:  # noqa: BLE001 - not kept: the turns go as sent
+            return False
+        return bool(plan) and None not in plan and all(r is not None and (r in plan or r in typed) for r in said)
+
+    def _keeps_grouping(self, standalone: str) -> bool:
+        """The plan's groups and rows as far as the words of ``standalone`` can show them: no call keeps only some of
+        its groups or rows (:data:`_NARROWING_ARGS`: after "top 3" a reading that drops it runs over every recruiter,
+        and one that keeps it is no reading the v6 checks pass), and every time grain ``standalone`` names ("each
+        month", "by quarter", "monthly"; the shortcut grammar's grain words) is the grain of a trend call of the plan
+        ("each month" right after "by quarter" runs the grain the person just replaced). Stage-3 review finding R2-3.
+        A reading that names no grain is kept: whether a new reading must keep the plan's grouping is owner item O1
+        (stage-3 review finding F4). A fault is never kept."""
+        grains = set()
+        for call in (self.plan or {}).get("calls") or []:
+            args = call.get("args") if isinstance(call, dict) else None
+            if not isinstance(args, dict) or any(args.get(k) is not None for k in _NARROWING_ARGS):
+                return False
+            if call.get("tool") == "trend_records":
+                grains.add(args.get("grain"))
+        try:
+            words = _shortcuts.words(standalone)
+            used = [False] * len(words)
+            named = set()
+            while (grain := _shortcuts._grain(words, used)) is not None:   # marks the words it reads as used
+                named.add(grain)
+        except Exception:  # noqa: BLE001 - not kept: the turns go as sent
+            return False
+        return named <= grains
 
     def _terms(self, typed: str, standalone: str, kind: str) -> Terms:
         return qs.terms_for(self.stored_terms, typed, standalone, kind, self.other_record_types)
@@ -845,6 +1092,7 @@ class _Job:
 
     # -- the steps
     def run(self, llm: Any, call: bool) -> Resolution:
+        self.calls_model = bool(call)
         q = self.question
         if self.pending is not None and _is_confirm(self.pending["choices"]):
             # "ok", "sure", "theek hai" answer a confirm: a yes, read before the small talk would end the pending

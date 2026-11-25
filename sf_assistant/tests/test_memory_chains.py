@@ -46,17 +46,63 @@ def test_the_chain_runs_its_plan_with_memory_on(chain, tmp_path, monkeypatch):
     CR.check_chain(chain, outs)
 
 
+def _watch_the_m5_reading(monkeypatch) -> list:
+    """Every call of the resolver's ``_Job._read_turns`` (the plan line of the last answer with each period named once,
+    stage-2 review finding M5), which only ``SFA_MEMORY=on`` may reach."""
+    from sf_assistant.agent import resolver
+
+    seen: list = []
+    real = resolver._Job._read_turns
+    monkeypatch.setattr(resolver._Job, "_read_turns",
+                        lambda self, standalone: seen.append(standalone) or real(self, standalone))
+    return seen
+
+
+def _watch_the_code_line(monkeypatch) -> list:
+    """The ``code_line`` of every call of ``followup.rewrite`` that passes one (only the memory resolver does, with the
+    model called: stage-3 review finding F1); the ask service's own rewrite passes none."""
+    from sf_assistant.agent import followup
+
+    seen: list = []
+    real = followup.rewrite
+    monkeypatch.setattr(followup, "rewrite", lambda question, turns, llm, **kw: (
+        seen.append(kw["code_line"]) if "code_line" in kw else None) or real(question, turns, llm, **kw))
+    return seen
+
+
 @pytest.mark.parametrize("chain", CHAINS, ids=[c["id"] for c in CHAINS])
 def test_shadow_answers_the_chain_byte_for_byte_as_off(chain, tmp_path, monkeypatch):
+    seen = _watch_the_m5_reading(monkeypatch)
+    code_lines = _watch_the_code_line(monkeypatch)
     off = CR.run_chain(chain, CR.OFF, tmp_path / "off", monkeypatch)
     shadow = CR.run_chain(chain, CR.SHADOW, tmp_path / "shadow", monkeypatch)
     CR.check_parity(chain, off, shadow)
+    # M5 and F1 change only what SFA_MEMORY=on reads: off never calls the resolver, and shadow, which calls no model,
+    # reads every turn as sent (resolver._Job._read) and passes no code_line
+    assert seen == [] and code_lines == []
 
 
 @pytest.mark.xfail(strict=True, reason="a known gap of the build (the chain's known_gap says which)")
 @pytest.mark.parametrize("chain", GAPS, ids=[c["id"] for c in GAPS])
 def test_a_known_gap_still_fails_as_the_design_means_it(chain, tmp_path, monkeypatch):
     CR.check_chain(chain, CR.run_chain(chain, CR.ON, tmp_path, monkeypatch))
+
+
+def test_the_m5_reading_is_what_an_on_run_of_chain_b_reads(tmp_path, monkeypatch):
+    """The control of the parity test's check: the same hook sees the on run of P-B ("and the placement rate?" after
+    "plot it", read with the period named once), so an empty list in off and shadow means they never reached it."""
+    seen = _watch_the_m5_reading(monkeypatch)
+    outs = CR.run_chain(next(c for c in CHAINS if c["id"] == "P-B"), CR.ON, tmp_path, monkeypatch)
+    assert seen == ["What is the placement rate each month in 2026?"] and outs[2].reply["reason"] == "new"
+
+
+def test_the_code_line_is_what_an_on_run_after_chart_it_passes(tmp_path, monkeypatch):
+    """The control of the parity test's ``code_line`` check: the on run of P-B-chart ("and the placement rate?" after
+    "chart it", whose word stands in the plan line) reads that line as the line code wrote, so an empty list in off
+    and shadow means they never passed it."""
+    code_lines = _watch_the_code_line(monkeypatch)
+    outs = CR.run_chain(next(c for c in CHAINS if c["id"] == "P-B-chart"), CR.ON, tmp_path, monkeypatch)
+    assert code_lines == [True] and outs[2].reply["reason"] == "new"
 
 
 # ------------------------------------------------------------------------------------------------ the chain files

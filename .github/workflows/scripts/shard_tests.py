@@ -183,7 +183,7 @@ import sys
 #: The fixed cost per shard measured 1.4-1.8 minutes over the six jobs above
 #: (mean 1.5), so raising this later is cheap — and safe, because the guard
 #: refuses a matrix that disagrees with it.
-SHARDS = 3
+SHARDS = 4
 
 #: Paths are relative to the orchestrator directory, because that is the
 #: workflow step's `working-directory` and what it hands to pytest.

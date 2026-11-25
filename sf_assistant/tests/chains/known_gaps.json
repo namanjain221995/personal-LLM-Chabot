@@ -2,13 +2,13 @@
  "title": "Chains of the design's intent that the build does not meet yet (strict xfail in tests/test_memory_chains.py)",
  "chains": [
   {
-   "id": "P-B-intent",
-   "title": "Placement chain B as the design means it: and the placement rate? after plot it runs the rate",
-   "design": "map_sfa §8 chain B; design v2 §6.4 step 4 (a model new reading passes the v6 checks), §7.2 (the Read-as line of a patch is the plan line)",
-   "known_gap": "After a shortcut or patch answer the Read-as line is the code-written plan line ('2026 (2026-01-01 to 2026-10-31)'). The v6 reading of the model's new question (resolver._read through followup.rewrite) reads that line as the last question and finds two periods in it, so 'in 2026' is refused as period_lost and the dates as more_than_one_name; the resolver then asks for the full question (placements.json P-B pins that). A fix belongs to lane S2 (resolver._read) or followup._period_lost, not to the chains.",
+   "id": "P-B-dated-period-chart",
+   "title": "Placements each month from 2026-01-01 to 2026-10-31, chart it, and the placement rate: the rate runs over the same dates, as the design means it",
+   "design": "design v2 §6.4 step 4 (a model new reading passes the v6 checks), §7.2 (the Read-as line of a shortcut is the plan line); stage-3 review finding F1, the shape the fix leaves",
+   "known_gap": "Found by the stage-3 lane pb fix of review finding F1. The fix lets the person rule read the person's last turn in place of the code-written plan line only where the M5 cut is made: the plan line names a period phrase followed by its dates. Here the period is written as dates only ('..., 2026-01-01 to 2026-10-31, as a chart'), so nothing is cut, the typed words of 'chart it' all stand in the line, followup._last_question takes the line as the last question, and followup._person_lost reads its field label and value (Interview Outcome, 'Offer Received') as people. The reading is refused as person_lost and the resolver asks for the full question (safe: no wrong number). The same holds for a plan with no period ('as a table' after 'placements in North America'). 'plot it' runs here, as at f90cd21b, because its word is not in the line. A fix passes code_line for every patch or shortcut answer whose reading keeps every filter value (agent/resolver.py _Job._read), which reaches beyond the M5 period case: an owner or S2 decision.",
    "steps": [
     {
-     "q": "placements each month in 2026",
+     "q": "placements each month from 2026-01-01 to 2026-10-31",
      "record": [
       {
        "name": "trend_records",
@@ -16,7 +16,7 @@
         "object": "Interview__c",
         "grain": "month",
         "date_field": "Date_of_Interview__c",
-        "period": "2026",
+        "period": "2026-01-01 to 2026-10-31",
         "filters": [
          {
           "field": "Interview_Outcome__c",
@@ -40,7 +40,7 @@
          "object": "Interview__c",
          "grain": "month",
          "date_field": "Date_of_Interview__c",
-         "period": "2026",
+         "period": "2026-01-01 to 2026-10-31",
          "filters": [
           {
            "field": "Interview_Outcome__c",
@@ -59,7 +59,7 @@
           "object": "Interview__c",
           "grain": "month",
           "date_field": "Date_of_Interview__c",
-          "period": "2026",
+          "period": "2026-01-01 to 2026-10-31",
           "filters": [
            {
             "field": "Interview_Outcome__c",
@@ -72,17 +72,13 @@
        ],
        "keys": [
         "placement"
-       ],
-       "period": {
-        "from": "2026-01-01",
-        "to": "2026-10-31"
-       }
+       ]
       }
      }
     },
     {
-     "q": "plot it",
-     "rewrite": "plot placements each month in 2026",
+     "q": "chart it",
+     "rewrite": "chart placements each month from 2026-01-01 to 2026-10-31",
      "record": [
       "The chart is drawn.\nSource: the synthetic warehouse copy."
      ],
@@ -99,7 +95,7 @@
          "object": "Interview__c",
          "grain": "month",
          "date_field": "Date_of_Interview__c",
-         "period": "2026",
+         "period": "2026-01-01 to 2026-10-31",
          "filters": [
           {
            "field": "Interview_Outcome__c",
@@ -120,10 +116,10 @@
      "q": "and the placement rate?",
      "resolve": {
       "kind": "new",
-      "standalone": "What is the placement rate each month in 2026?",
+      "standalone": "What is the placement rate each month from 2026-01-01 to 2026-10-31?",
       "ops": []
      },
-     "rewrite": "What is the placement rate each month in 2026?",
+     "rewrite": "What is the placement rate each month from 2026-01-01 to 2026-10-31?",
      "record": [
       {
        "name": "trend_records",
@@ -131,7 +127,7 @@
         "object": "Interview__c",
         "grain": "month",
         "date_field": "Date_of_Interview__c",
-        "period": "2026",
+        "period": "2026-01-01 to 2026-10-31",
         "part_filters": [
          {
           "field": "Interview_Outcome__c",
@@ -156,7 +152,7 @@
          "object": "Interview__c",
          "grain": "month",
          "date_field": "Date_of_Interview__c",
-         "period": "2026",
+         "period": "2026-01-01 to 2026-10-31",
          "part_filters": [
           {
            "field": "Interview_Outcome__c",
@@ -167,7 +163,7 @@
         }
        }
       ],
-      "answer_starts": "Read as: `What is the placement rate each month in 2026?`",
+      "answer_starts": "Read as: `What is the placement rate each month from 2026-01-01 to 2026-10-31?`",
       "plan": {
        "calls": [
         {
@@ -176,7 +172,7 @@
           "object": "Interview__c",
           "grain": "month",
           "date_field": "Date_of_Interview__c",
-          "period": "2026",
+          "period": "2026-01-01 to 2026-10-31",
           "part_filters": [
            {
             "field": "Interview_Outcome__c",

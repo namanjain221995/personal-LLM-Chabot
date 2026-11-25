@@ -4,7 +4,8 @@
 WHAT IT DELETES. Only what the owner approved, and nothing younger:
   * `query_traces` started more than QUERY_TRACES_RETENTION_DAYS ago (180);
     their `query_trace_events` go by the foreign key's cascade, the only FK
-    onto that table;
+    onto that table. A trace waits while a request of its generation is
+    still within its own period (see the stamp below);
   * orphan traces, older than one day, whose chat has no conversations row
     any more (a chat removed by the users-FK cascade, which the traces'
     `user_id ON DELETE SET NULL` leaves behind). A bare-API key (`u<id>-…`,
@@ -28,6 +29,34 @@ WHAT IT DELETES. Only what the owner approved, and nothing younger:
     numbers before deciding.
 Chats, messages and everything else stay until the person deletes the chat.
 
+IT STAMPS BEFORE IT DELETES (review DS2-1; toggle-off review F4). The
+toggle-off guard reads a `query_traces` or `chat_requests` row as the
+server's word that an answer was a Salesforce answer
+(`sf_isolation.sf_answer_sql`, matched on the answer's `generation_id`).
+Answers stored before the guard stamped `meta.mode` (a failure record, a
+detached answer, the tab's copy of a stopped answer) have no other mark, so
+deleting that row would let the guard pass the answer into toggle-off
+turns. So each batch that deletes trace or request rows first stamps
+`meta.mode = 'salesforce'` on the answers those rows mark, in the SAME
+transaction (one statement): only an assistant row the guard reads as a
+Salesforce answer through one of the batch's rows, only when its meta has
+no mode and no other Salesforce mark, and only by adding that one key; the
+content and every other key stay as they are. The guard then hides what
+it hid before the run, apart from the cases docs/retention.md lists under
+"What it cannot reach". Requests go before traces because the guard
+reads a request only for a generation with no trace: with the traces
+still in place, each answer is stamped by the row the guard actually reads.
+So a trace does not go while its request still stands in a live chat,
+unless the job keeps that request for good (a resumable one, D8) (review
+R1-1): a run whose request item fails or stops at the cap holds the trace
+items back until the next tick, and a trace waits while a request of its
+generation is still within its own period (CHAT_REQUESTS_RETENTION_DAYS
+set past the trace period).
+A dry run counts the answers it would stamp with the same text
+(`messages_stamped`); when an item whose rows mark answers fails, that
+total is reported as unknown, never as a short number (review R2-4). The
+rows still go at the approved periods.
+
 ONE RUNNER (C27). The run opens ONE dedicated connection (not a pooled one,
 so a lock can never be handed back to the pool with it), takes the
 session-level `pg_try_advisory_lock(_LOCK_KEY)` and holds it for the whole
@@ -44,10 +73,11 @@ by this process's clock.
 
 DRY RUN FIRST. CHAT_RETENTION_ENABLED is off by default and
 CHAT_RETENTION_DRY_RUN on. A dry run counts every item with the SAME `WHERE`
-text the delete uses (one `_Item.where` feeds both statements), logs the
-counts only, sets the `retention_candidates{table}` gauge and deletes
-nothing. A real run counts `retention_deleted_total{table}`. Logs carry
-counts, never content.
+text the delete uses (one `_Item.where` feeds both statements), counts the
+answers a real run would stamp the same way, logs the counts only, sets the
+`retention_candidates{table}` gauge and deletes and stamps nothing. A real
+run counts `retention_deleted_total{table}` and
+`retention_stamped_total{table}`. Logs carry counts, never content.
 
 ONCE A BUSINESS DAY. The maintenance loop calls this every 30 minutes; real
 work happens once per business day (Asia/Kolkata) per process. A run that
@@ -76,6 +106,7 @@ from psycopg.rows import dict_row
 
 from . import db, metrics
 from .config import settings
+from .sf_isolation import sf_answer_sql, sf_meta_sql
 
 log = logging.getLogger(__name__)
 
@@ -104,6 +135,14 @@ ORPHAN_GRACE_DAYS = 1
 
 #: The pre-prune backup is deleted after this many days (D11).
 BACKUP_KEEP_DAYS = 30
+
+#: What a run merges into the meta of an answer whose only Salesforce mark
+#: is a row it is about to delete (review DS2-1). One key, added with `||`.
+STAMP = '{"mode": "salesforce"}'
+
+#: The count key (and the log word) of the answers stamped, or in a dry run
+#: the answers a real run would stamp.
+STAMPED = "messages_stamped"
 
 #: The business day the once-a-day gate counts in. India keeps no daylight
 #: saving, so a fixed offset is exact and needs no tz database.
@@ -224,6 +263,11 @@ class _Item:
     delete: bool = True  # False: counted and logged, never deleted (D8)
     needs_table: bool = False  # skip cleanly while the table does not exist
     old_route: bool = False  # D9: deleted only when its own setting is on
+    #: The column holding the generation id the toggle-off guard matches an
+    #: answer on (`messages.generation_id`), for the two tables the guard
+    #: reads; "" for every other table. A batch of an item with `marks`
+    #: stamps before it deletes (review DS2-1).
+    marks: str = ""
 
 
 def _orphan(alias: str = "t") -> str:
@@ -242,7 +286,26 @@ def items(cfg: RetentionConfig) -> List[_Item]:
     """Every rule, in run order. The WHERE clauses are DISJOINT on purpose:
     an orphan old enough for the period rule belongs to the period rule, so
     each row is counted by exactly one item and a dry run's per-item counts
-    are what the real run's items delete."""
+    are what the real run's items delete.
+
+    The request items run BEFORE the trace items (review DS2-1). The guard
+    reads a request only for a generation with no trace, so while the
+    traces still stand each request batch stamps exactly the answers the
+    guard reads through a request, and each trace batch then stamps the
+    answers it reads through a trace. The other order would let a trace
+    delete hand an answer to its request in the middle of a run, and the
+    request batch would then stamp an answer the guard did not read as
+    Salesforce before the run (an answer given in assistant mode to a
+    request that asked for Salesforce, toggle-off review R12).
+
+    For the same reason a trace waits while a request of its generation is
+    still within its own period in a chat that still exists (review R1-1).
+    That only happens when CHAT_REQUESTS_RETENTION_DAYS is set past the
+    trace period; the trace then goes in the run that deletes its request.
+    No request item deletes such a request, so a dry run counts what the
+    real run deletes. An orphan trace needs no wait: its chat is gone, so
+    no answer is left to read. A run whose request item does not finish
+    holds the trace items back (`_run_items`)."""
     terminal = _sql_list(TERMINAL_STATUSES)
     resumable = _sql_list(RESUMABLE_STATUSES)
     older = "{col} < now() - make_interval(days => %s::int)"
@@ -250,23 +313,17 @@ def items(cfg: RetentionConfig) -> List[_Item]:
     traces_days = (cfg.query_traces_days,)
     requests_days = (cfg.chat_requests_days,)
     grace = (ORPHAN_GRACE_DAYS,)
+    request_stands = (
+        " AND NOT EXISTS (SELECT 1 FROM chat_requests r WHERE r.generation_id = t.trace_id"
+        " AND " + younger.format(col="r.created_at")
+        + " AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = r.conversation_id))"
+    )
     return [
-        _Item(
-            "query_traces", "query_traces",
-            older.format(col="t.started_at"),
-            traces_days,
-        ),
-        _Item(
-            "query_traces_orphans", "query_traces",
-            older.format(col="t.started_at")
-            + " AND " + younger.format(col="t.started_at")
-            + " AND t.test_case_id IS NULL AND " + _orphan(),
-            grace + traces_days,
-        ),
         _Item(
             "chat_requests", "chat_requests",
             older.format(col="t.created_at") + f" AND t.status IN {terminal}",
             requests_days,
+            marks="generation_id",
         ),
         _Item(
             "chat_requests_orphans", "chat_requests",
@@ -274,12 +331,27 @@ def items(cfg: RetentionConfig) -> List[_Item]:
             + " AND " + younger.format(col="t.created_at")
             + f" AND t.status IN {terminal} AND " + _orphan(),
             grace + requests_days,
+            marks="generation_id",
         ),
         _Item(
             "chat_requests_resumable_old", "chat_requests",
             older.format(col="t.created_at") + f" AND t.status IN {resumable}",
             requests_days,
             delete=False,
+        ),
+        _Item(
+            "query_traces", "query_traces",
+            older.format(col="t.started_at") + request_stands,
+            traces_days + requests_days,
+            marks="trace_id",
+        ),
+        _Item(
+            "query_traces_orphans", "query_traces",
+            older.format(col="t.started_at")
+            + " AND " + younger.format(col="t.started_at")
+            + " AND t.test_case_id IS NULL AND " + _orphan(),
+            grace + traces_days,
+            marks="trace_id",
         ),
         _Item(
             "sf_query_state_expired", "sf_query_state",
@@ -313,12 +385,94 @@ def count_sql(item: _Item) -> str:
     return f"SELECT count(*) AS n FROM {item.table} t WHERE {item.where}"
 
 
+def stamp_where(item: _Item, generations: str) -> str:
+    """The answers (alias `m` on `messages`) that a delete of `item`'s rows
+    would leave with no Salesforce mark: the ONE text both the dry-run count
+    and the real stamp are built from. `generations` is a sub-select of the
+    generation ids of the rows to delete.
+
+    The match is the guard's own: `sf_isolation.sf_answer_sql`, the SQL form
+    of the per-row rule `db.salesforce_chat_state` applies through
+    `_server_salesforce` and `server_says_salesforce` (a trace by
+    `trace_id = generation_id` decides; with no trace, the request by
+    `generation_id`). So: an assistant row the guard reads as a Salesforce
+    answer, whose `generation_id` is one of the rows'. The guard reads a
+    request only when the generation has no trace, so a request stamps only
+    then; while a trace stands, the trace is the mark and stamps when it
+    goes. Never an answer whose meta has a mode (one stored as 'assistant'
+    stays as it is), never one whose meta already says Salesforce (it needs
+    no stamp). A meta that is SQL NULL or JSON null holds nothing, so the
+    stamp makes it the one-key object (review R1-4); a meta that is an
+    array, a string, a number or a boolean is never stamped, because the
+    merge would not be additive (docs/retention.md lists it under "What it
+    cannot reach").
+
+    There is deliberately NO chat gate (review R2-3). `sf_answer_sql` matches
+    on the generation alone, in any chat, as the guard's per-row reading
+    does; the guard also reads a chat's rows only while a server row of
+    THAT chat (or an answer's meta) says Salesforce, and this text does not
+    copy that probe. So an answer stored in another chat under the
+    generation of a deleted Salesforce row is stamped too, and hidden from
+    then on, although the guard showed it before: the stamp fails closed.
+    No writer is known to store one generation in two chats. A gate would
+    keep a copy of db.py's probe here, which could drift from it, and would
+    leave such a copy of a Salesforce answer readable in toggle-off turns."""
+    if item.marks not in ("trace_id", "generation_id"):
+        raise ValueError(f"{item.name} marks no answer")
+    request_decides = (
+        " AND NOT EXISTS (SELECT 1 FROM query_traces x WHERE x.trace_id = m.generation_id)"
+        if item.table == "chat_requests"
+        else ""
+    )
+    return (
+        f"m.generation_id IN ({generations}){request_decides}"
+        " AND (m.meta IS NULL OR jsonb_typeof(m.meta) IN ('object', 'null'))"
+        " AND m.meta->>'mode' IS NULL"
+        f" AND NOT {sf_meta_sql('m')}"
+        f" AND {sf_answer_sql('m')}"
+    )
+
+
+def _rows_generations(item: _Item) -> str:
+    """The generation ids of every row `item` would delete: its own WHERE."""
+    return f"SELECT t.{item.marks} FROM {item.table} t WHERE {item.where}"
+
+
+def stamp_count_sql(item: _Item) -> str:
+    """The dry run's count of the answers a real run of `item` would stamp:
+    the item's own WHERE, inside `stamp_where`."""
+    return f"SELECT count(*) AS n FROM messages m WHERE {stamp_where(item, _rows_generations(item))}"
+
+
 def delete_sql(item: _Item) -> str:
     """One batch of the real run for `item`: the SAME WHERE, by `ctid`, with
-    LIMIT (the last parameter). `rowcount`, never RETURNING."""
+    LIMIT (the last parameter). A plain delete is read by `rowcount`, never
+    RETURNING.
+
+    For an item whose rows mark answers (`marks`), the batch is ONE statement
+    and so one transaction: it fixes the batch's rows, stamps the answers
+    they mark (`stamp_where`, review DS2-1), deletes those rows, and returns
+    two counts. Every part reads the same snapshot, so the stamp sees the
+    rows the delete removes. `RETURNING 1` only feeds those counts: no
+    column of any row leaves the database."""
+    if not item.marks:
+        return (
+            f"DELETE FROM {item.table} WHERE ctid IN ("
+            f" SELECT t.ctid FROM {item.table} t WHERE {item.where} LIMIT %s)"
+        )
     return (
-        f"DELETE FROM {item.table} WHERE ctid IN ("
-        f" SELECT t.ctid FROM {item.table} t WHERE {item.where} LIMIT %s)"
+        "WITH batch AS MATERIALIZED ("
+        f" SELECT t.ctid AS row_ctid, t.{item.marks} AS generation_id FROM {item.table} t"
+        f" WHERE {item.where} LIMIT %s),"
+        " stamped AS ("
+        " UPDATE messages m SET meta = (CASE WHEN jsonb_typeof(m.meta) = 'object' THEN m.meta"
+        f" ELSE '{{}}'::jsonb END) || '{STAMP}'::jsonb"
+        f" WHERE {stamp_where(item, 'SELECT b.generation_id FROM batch b')}"
+        " RETURNING 1),"
+        " deleted AS ("
+        f" DELETE FROM {item.table} WHERE ctid IN (SELECT b.row_ctid FROM batch b)"
+        " RETURNING 1)"
+        " SELECT (SELECT count(*) FROM deleted) AS deleted, (SELECT count(*) FROM stamped) AS stamped"
     )
 
 
@@ -360,31 +514,54 @@ def _count(con: psycopg.Connection, item: _Item) -> int:
     return int(row["n"]) if row else 0
 
 
-def _delete_batch(con: psycopg.Connection, statement: str, params: Tuple[Any, ...]) -> int:
-    """One batch, one transaction."""
+def _count_stamps(con: psycopg.Connection, item: _Item) -> int:
+    """The dry run: how many answers a real run of `item` would stamp."""
+    row = con.execute(stamp_count_sql(item), item.params).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def _delete_batch(con: psycopg.Connection, statement: str, params: Tuple[Any, ...]) -> Tuple[int, int]:
+    """One batch, one transaction. Returns (rows deleted, answers stamped):
+    the stamping statement returns both as its one row; a plain delete
+    returns its rowcount and stamps nothing."""
     with con.transaction():
-        touched = con.execute(statement, params).rowcount
-    return max(0, int(touched or 0))
+        cursor = con.execute(statement, params)
+        if cursor.description is not None:
+            row = cursor.fetchone() or {}
+            return max(0, int(row.get("deleted") or 0)), max(0, int(row.get("stamped") or 0))
+        touched = cursor.rowcount
+    return max(0, int(touched or 0)), 0
 
 
-def _delete(con: psycopg.Connection, item: _Item, cfg: RetentionConfig) -> Tuple[int, bool]:
-    """Delete `item`'s rows in batches. Returns (rows deleted, capped): capped
-    is True when the run stopped at `max_batches` with full batches, so more
-    rows may remain for the next tick."""
+def _delete(con: psycopg.Connection, item: _Item, cfg: RetentionConfig) -> Tuple[int, int, bool]:
+    """Delete `item`'s rows in batches. Returns (rows deleted, answers
+    stamped, capped): capped is True when the run stopped at `max_batches`
+    with full batches, so more rows may remain for the next tick."""
     statement = delete_sql(item)
     params = (*item.params, cfg.batch)
     total = 0
+    stamped = 0
     for _ in range(cfg.max_batches):
-        touched = _delete_batch(con, statement, params)
+        touched, marked = _delete_batch(con, statement, params)
         total += touched
+        stamped += marked
         if touched < cfg.batch:
-            return total, False
-    return total, True
+            return total, stamped, False
+    return total, stamped, True
 
 
 def _report_deleted(name: str, n: int) -> None:
     for _ in range(n):
         metrics.inc("retention_deleted_total", "chat retention: rows deleted", table=name)
+
+
+def _report_stamped(name: str, n: int) -> None:
+    for _ in range(n):
+        metrics.inc(
+            "retention_stamped_total",
+            "chat retention: answers stamped mode=salesforce before the rows marking them went",
+            table=name,
+        )
 
 
 def _report_candidates(name: str, n: int) -> None:
@@ -428,6 +605,23 @@ def _run_items(con: psycopg.Connection, cfg: RetentionConfig) -> Dict[str, Any]:
     skipped: List[str] = []
     capped = 0
     errors = 0
+    #: Answers stamped (dry run: that a real run would stamp), over every
+    #: item whose rows mark answers (review DS2-1).
+    stamped = 0
+    #: Set in a real run when a request item whose rows mark answers did
+    #: not finish (it failed, or stopped at the cap). The trace items then
+    #: wait for the next tick (review R1-1): a trace deleted while its
+    #: request still stands would hand the guard's reading to the request,
+    #: and the request's batch would later stamp an answer the server gave
+    #: in assistant mode (toggle-off review R12). The failure or the cap
+    #: already leaves the day open, so the next tick runs both again.
+    requests_open = False
+    waiting: List[str] = []
+    #: Set in a dry run when an item whose rows mark answers failed (its
+    #: count or its stamp count): `stamped` then leaves that item's answers
+    #: out, so the run reports the total as unknown instead of a number
+    #: that reads as complete (review R2-4).
+    stamps_unknown = False
     for item in items(cfg):
         try:
             if item.needs_table and not _table_exists(con, item.table):
@@ -439,31 +633,63 @@ def _run_items(con: psycopg.Connection, cfg: RetentionConfig) -> Dict[str, Any]:
                 _report_candidates(item.name, n)
                 if not item.delete:
                     kept.append(item.name)
+                elif item.marks:
+                    stamped += _count_stamps(con, item)
                 continue
             if item.old_route and not cfg.old_route_orphans:
                 continue  # D9 off: the real run leaves the older route alone
-            n, hit_cap = _delete(con, item, cfg)
+            if requests_open and item.table == "query_traces":
+                waiting.append(item.name)
+                continue
+            n, marked, hit_cap = _delete(con, item, cfg)
             counts[item.name] = n
+            stamped += marked
             _report_deleted(item.name, n)
+            _report_stamped(item.name, marked)
             if hit_cap:
                 capped += 1
+                requests_open = requests_open or (item.table == "chat_requests" and bool(item.marks))
                 log.info(
                     "retention: %s reached the cap of %d batches of %d; the next tick continues",
                     item.name, cfg.max_batches, cfg.batch,
                 )
         except Exception:  # noqa: BLE001 - one rule failing must not stop the others
             errors += 1
+            requests_open = requests_open or (item.table == "chat_requests" and bool(item.marks))
+            stamps_unknown = stamps_unknown or (cfg.dry_run and bool(item.marks))
             log.warning("retention: %s failed", item.name, exc_info=True)
+    if waiting:
+        log.info(
+            "retention: held back %s: a chat_requests item did not finish, so the traces "
+            "wait for the next tick",
+            ",".join(waiting),
+        )
     skipped_words = (" skipped=" + ",".join(skipped)) if skipped else ""
     if cfg.dry_run:
-        log.info("retention dry-run: %s%s", _log_words(counts, list(counts)), skipped_words)
+        if stamps_unknown:
+            # No key and no gauge: like the failed item's own count, the
+            # total is missing rather than wrong.
+            words = " ".join(w for w in (_log_words(counts, list(counts)), f"{STAMPED}=unknown") if w)
+        else:
+            counts[STAMPED] = stamped
+            _report_candidates(STAMPED, stamped)
+            words = _log_words(counts, list(counts))
+        log.info("retention dry-run: %s%s", words, skipped_words)
     else:
-        # What was deleted and what was only counted go on separate lines,
-        # so the "deleted" line never names a row still in the table.
+        # What was deleted, what was only counted and what was stamped go on
+        # separate lines, so the "deleted" line never names a row still in
+        # the table.
         deleted = [name for name in counts if name not in kept]
         log.info("retention: deleted %s%s", _log_words(counts, deleted), skipped_words)
         if kept:
             log.info("retention: counted, kept %s", _log_words(counts, kept))
+        counts[STAMPED] = stamped
+        if stamped:
+            log.info(
+                "retention: stamped %s=%d (meta.mode=salesforce on answers whose only "
+                "Salesforce mark was a deleted row)",
+                STAMPED, stamped,
+            )
     kept_open = int(counts.get("chat_requests_resumable_old", 0) or 0)
     if kept_open:
         log.warning(
@@ -489,14 +715,20 @@ def run_chat_retention(*, force: bool = False) -> Dict[str, Any]:
       * status "not_due": this process already finished today's run.
       * status "locked": another runner holds the lock; nothing done.
       * status "failed": the run could not start (connection, lock read).
-      * status "dry_run": one count per item (`<item>`), nothing deleted.
+      * status "dry_run": one count per item (`<item>`), plus
+        `messages_stamped` (the answers a real run would stamp), nothing
+        deleted or stamped. When an item whose rows mark answers failed,
+        `messages_stamped` has no key (its log word reads `unknown`): the
+        total would leave that item's answers out (review R2-4).
       * status "deleted": rows deleted per item, plus
-        `chat_requests_resumable_old` (counted, never deleted).
+        `chat_requests_resumable_old` (counted, never deleted) and
+        `messages_stamped` (the answers stamped before their rows went).
       In the last two, `capped` is the number of items that stopped at the
       batch cap and `errors` the number that failed; either leaves the day
       open, so the next tick runs again. An item whose table does not exist
-      yet (`sf_query_state` before V45), or an older-route item while D9 is
-      off in a real run, has no key.
+      yet (`sf_query_state` before V45), an older-route item while D9 is
+      off in a real run, or a trace item held back because a request item
+      did not finish in this real run, has no key.
 
     `force` skips the once-a-day gate only (tests, an operator's manual run);
     the enabled flag, the dry-run flag and the lock still hold.

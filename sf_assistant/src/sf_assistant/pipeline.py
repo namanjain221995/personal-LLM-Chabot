@@ -295,9 +295,10 @@ class MemoryRun:
     - ``earlier``: the last answer's text for a question about it (§6.7), given to the record agent as data.
     - ``display_only``: the patch changed only how the plan is shown: no triage call (§7.2).
     - ``contact_ok``: whether the person's typed question asks for contact details (``asks_for_contact`` of the typed
-      words, read by the ask service; stage-2 review fix PE1). The record tools' contact flag and the last drop of
-      e-mail addresses and phone numbers read it instead of the question that runs, which for a patch or a shortcut is
-      code's plan line. None: read from the question, as today.
+      words, read by the ask service; stage-2 review fix PE1). The record tools' contact flag, the last drop of
+      e-mail addresses and phone numbers and the chart labels (``charts.make(contact_ok=...)``, stage 3) read it
+      instead of the question that runs, which for a patch or a shortcut is code's plan line. None: read from the
+      question, as today.
 
     Set by :func:`answer` (reset at its start, so a retry after a file swap starts clean): ``evidence`` (the record
     tools' evidence of the answer, for ``query_state.build``), ``shown`` (the display flags the run read), ``kind`` (the
@@ -1070,10 +1071,13 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
     if chart_ask is not None and not clarify:   # never raises; after the contact rule (no chart under a question)
         catalog = getattr(getattr(session, "tools", None), "catalog", None)
         before = final
+        # a memory run's labels follow the person's typed words too (PE1); every other run passes no flag, as before
+        chart_kw = {"contact_ok": memory.contact_ok} if memory is not None and memory.contact_ok is not None else {}
         # a kept design answer reads as a full merge does: it keeps its sentences, and the record text is clean already
         final, chart_items, chart_lines, charts_error = _charts.make(chart_ask, text, final,
                                                                      "merged" if design_kept else kind, mode, rec,
-                                                                     catalog, getattr(status, "today", None))
+                                                                     catalog, getattr(status, "today", None),
+                                                                     **chart_kw)
         charts_talk = charts_talk or final != before
         if final != before and merge_by == "code":   # a bullet went, so its label may be empty; the lines are read anew
             from sf_assistant.agent.merge import CODE_MERGE_LABEL, code_merge_lines

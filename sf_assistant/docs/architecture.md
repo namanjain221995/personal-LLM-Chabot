@@ -562,9 +562,14 @@ What the service assumes of its caller and its switches:
   `off` for the same call, and as a v1 bridge's call only when the last 4 turns a v2 bridge sends are the ones a v1
   bridge sends (the same filter, a user turn without an answer of its own kept). A bridge that sends whole
   question-and-answer pairs only gives the rewrite other turns when the path holds an unanswered question.
-- **The memory switches are read from the ask container's environment.** `web/compose.ask.yaml` does not pass the six
-  `SFA_MEMORY*` names yet (stage-2 review M1, open), so until it does `restart-ask` starts the service on their
-  defaults (`shadow`, which answers as `off`), whatever the shell holds.
+- **The memory switches are read from the ask container's environment, once at its start.** `web/compose.ask.yaml`
+  passes the six `SFA_MEMORY*` names as `"${NAME:-}"`, from the shell that runs `./run.sh` or from the git-ignored
+  `web/.env` (stage-2 review M1, fixed in stage 3). `tests/test_ask_mcp.py` pins the list and the service's keys, so
+  no `env_file:` can hand the container the rest of `web/.env`. Unset or empty is the code default, so a start with
+  none of them set runs `shadow`, which answers as `off`. `./run.sh restart-ask` takes the values of that moment, so a
+  value typed only in front of one command is gone at the next `restart-ask`; one that must stay belongs in `web/.env`
+  ([runbook.md](runbook.md#the-memory-switches), whose steps check the shell and the start-up line). The page's
+  `web/compose.yaml` passes none of them.
 - **Seeded calls run side calls first and the main call last**, so the chart (drawn from the last chartable result)
   and the next plan's main call stay the plan's main call after an operation that added a side call; a seeded main
   call stays the main call unless the record agent added a chartable call of its own.

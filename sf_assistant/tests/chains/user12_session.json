@@ -1,13 +1,13 @@
 {
- "title": "A user-12-style session, Q1-Q8 of the earlier answers (design v2 §16.1 U12)",
+ "title": "A user-12-style session in made-up words: the steps of Q1-Q8 of the earlier answers (design v2 §16.1 U12)",
  "chains": [
   {
    "id": "U12",
-   "title": "Support person performance, then placements, as one chat goes on (my_answers Q1-Q8)",
+   "title": "Support person performance, then placements, as one chat goes on (the steps of my_answers Q1-Q8, every question worded anew)",
    "design": "my_answers_before.md Q1-Q8; design v2 §7.1 (C18), §16.1 U12",
    "steps": [
     {
-     "q": "how is each support person performing this month?",
+     "q": "How well did our interview support staff do this month?",
      "note": "Q1: a new question that names support person performance; the record agent leaves out the outcome split and code completes it",
      "record": [
       {
@@ -61,9 +61,9 @@
      }
     },
     {
-     "q": "visualize it",
+     "q": "draw it as a graph",
      "note": "Q2: a code shortcut; the stored words complete the support call again (C18)",
-     "rewrite": "Visualize how is each support person performing this month",
+     "rewrite": "Draw a graph of how well our interview support staff did this month",
      "record": [
       "The chart is drawn.\nSource: the synthetic warehouse copy."
      ],
@@ -107,7 +107,7 @@
      }
     },
     {
-     "q": "only top 5",
+     "q": "just the top five, please",
      "note": "Q3",
      "record": [
       "The top 5 are shown.\nSource: the synthetic warehouse copy."
@@ -144,9 +144,9 @@
      }
     },
     {
-     "q": "same for last month",
+     "q": "how about for last month then?",
      "note": "Q4: the period changes; top 5, the chart and the outcome split stay",
-     "rewrite": "How is each support person performing last month",
+     "rewrite": "How well did our interview support staff do last month",
      "record": [
       "Last month is shown.\nSource: the synthetic warehouse copy."
      ],
@@ -185,11 +185,11 @@
      }
     },
     {
-     "q": "only for Client Co",
+     "q": "narrow that down to Client Co",
      "note": "Q5: the model's patch adds the client filter; the value is the person's own words",
      "resolve": {
       "kind": "patch",
-      "standalone": "How is each support person performing last month, only for Client Co?",
+      "standalone": "How well did our interview support staff do last month, narrowed down to Client Co?",
       "ops": [
        {
         "add_filter": {
@@ -241,7 +241,7 @@
      }
     },
     {
-     "q": "how many candidates did they support?",
+     "q": "and how many different candidates did those people help?",
      "note": "Q6: another measure; the candidates contract adds the Person Account filter on the candidate lookup",
      "resolve": {
       "kind": "patch",
@@ -298,11 +298,11 @@
      }
     },
     {
-     "q": "who is the best recruiter by placements this year?",
+     "q": "Which recruiter landed the most placements this year?",
      "note": "Q7: a new question with its own subject; the plan is replaced, the placement definition holds, and the candidates scope of Q6 is not carried into it (C15)",
      "resolve": {
       "kind": "new",
-      "standalone": "who is the best recruiter by placements this year?",
+      "standalone": "Which recruiter landed the most placements this year?",
       "ops": []
      },
      "record": [
@@ -384,13 +384,13 @@
         "placement"
        ],
        "show_chart": false,
-       "terms_text": "who is the best recruiter by placements this year?"
+       "terms_text": "Which recruiter landed the most placements this year?"
       },
       "read_as": null
      }
     },
     {
-     "q": "and by month?",
+     "q": "what about month by month?",
      "note": "Q8: a split by time keeps the rest of the placements query",
      "record": [
       "The placements by month are shown.\nSource: the synthetic warehouse copy."

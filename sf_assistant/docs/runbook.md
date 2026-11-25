@@ -477,6 +477,113 @@ What the split does (`scripts/split_ask_log.py`; its docstring has the details):
 go there again. The daily files stay readable, and nothing deletes them while rolled back. To go forward again: stop,
 `python3 -I scripts/split_ask_log.py --apply --append --legacy .private/ask_log.legacy-2.jsonl`, restart.
 
+### The memory switches
+
+Salesforce conversation memory (design v2 of 2026-11-25, §15) has six switches in the ask service. What each mode does
+is in [architecture.md](architecture.md#configuration) ("Contract v2"); in short, `off` is today's contract v1 with
+no state, `shadow` answers byte for byte as `off` and also returns the next query state to a contract-v2 caller, and
+`on` runs the follow-up resolver and the stored plan.
+
+| Switch | Unset or empty | Accepted values |
+|---|---|---|
+| `SFA_MEMORY` | `shadow` | `off`, `shadow`, `on` |
+| `SFA_MEMORY_SHORTCUTS` | `on` | `off`, `on` (used with `SFA_MEMORY=on` only) |
+| `SFA_MEMORY_PATCH_KNOWLEDGE` | `off` | `off`, `on` (owner decision D4: off) |
+| `SFA_MEMORY_MAX_CALLS` | `3` | a whole number from 1 to 3 |
+| `SFA_MEMORY_MAX_AGE` | `2` | a whole number from 0 to 6 |
+| `SFA_MEMORY_TOKENS` | `12000` | a whole number from the resolver's smallest prompt (`memory_tokens_floor()`, about 5,400) to 100000 |
+
+How they reach the service:
+
+- `web/compose.ask.yaml` passes each one as `"${NAME:-}"`, as it passes `SFA_RESOLVER` and `SFA_ASK_LOG_DAYS`: the
+  value comes from the shell that runs `./run.sh` (exported, or typed in front of the command), or else from the
+  git-ignored `web/.env` (a value in the shell wins over it). Unset or empty is the code default in the table
+  (`src/sf_assistant/config.py`, `memory_settings`).
+- The service reads them once, at its start. `./run.sh restart-ask` recreates the container and takes the values of
+  that moment; `docker restart` and a reboot keep the values the container was created with.
+- **A value typed in front of the command lasts for that one start.** The next `restart-ask` or `up-ask` without it
+  (after a code, prompt or knowledge change, for instance) starts on the defaults again, so `on` would quietly become
+  `shadow`. A setting that must stay goes in `web/.env`. `web/compose.yaml` (the page and the MCP server) passes none
+  of these names, so a line there changes the ask service only.
+- A value the code cannot read never stops the service: `SFA_MEMORY` is then `off` (contract v1), any other switch
+  keeps its default, and the container log gets one line that names the switch and what it must be (never the value).
+  Unlike `SFA_RESOLVER`, `run.sh` does not check these values first.
+- They live in `web/compose.ask.yaml`: putting back a compose file older than the one that passes them (for instance
+  for the ask log's rollback above) drops them, and the service runs the defaults (`shadow`) whatever the shell holds.
+
+Which mode the service started in is in the start-up line of the ask log (fixed words, no question text). The service
+writes that line once, at its start, into the daily file of that day, so the check reads every daily file and keeps the
+last start-up line:
+
+```bash
+cd <the sf_assistant folder the service runs from>/web
+awk 1 ../.private/ask_logs/ask_log-2*.jsonl \
+  | jq -cR 'fromjson? | select(type == "object" and .event == "startup") | {ts, ok, memory, memory_problem}' | tail -n 1
+docker logs --tail=50 sf-assistant-ask       # one line here when a switch was refused
+```
+
+- `memory` is the mode of that start, and `ts` is its time in UTC (the container's clock).
+- `"ok":false` (with `"memory":null`) means the start failed, and the service is not answering.
+- A line cut by a crash does not hide a later start: `awk 1` ends a file's cut last line, so it is not joined to the
+  next file's first line, and `jq -R` with `fromjson?` skips a line that is not whole JSON instead of stopping at it.
+- Nothing printed means the service has not started since the daily files began, or the file of its start day is
+  older than `SFA_ASK_LOG_DAYS` and was deleted. A restart writes a new line.
+
+The rollout steps that touch the ask service (design §15.2), each on the owner's word only. Each step sets the switch,
+checks that no value in the shell would win over the file, restarts, and then reads the new start-up line. The line
+comes once the pipeline is built, which takes about 10 s and at most a minute. Until then the check still shows the
+previous start (an older `ts`), so run it again.
+
+Step 1, the release: none of the six switches in `.env` or in the shell, so every switch has its default (`shadow`).
+
+```bash
+cd <the sf_assistant folder the service runs from>/web
+grep '^SFA_MEMORY' .env; env | grep '^SFA_MEMORY'   # both print nothing
+./run.sh restart-ask
+sleep 15                                            # the start-up line comes once the pipeline is built
+awk 1 ../.private/ask_logs/ask_log-2*.jsonl \
+  | jq -cR 'fromjson? | select(type == "object" and .event == "startup") | {ts, ok, memory, memory_problem}' | tail -n 1
+# expect "ok":true and "memory":"shadow", with the ts of this start
+```
+
+Step 5, only after the model evaluation of the chains that the owner asks for: `on`, kept across later restarts. The
+first line changes an `SFA_MEMORY=` line of the git-ignored `.env`, or adds one on a line of its own when there is
+none. The `\n` in front ends a last line that has no final newline. A plain `echo ... >> .env` would join the switch to
+that line, so the service would stay in `shadow` and the setting on that line (for example `SFA_BIND`) would break.
+
+```bash
+cd <the sf_assistant folder the service runs from>/web
+grep -qs '^SFA_MEMORY=' .env && sed -i 's/^SFA_MEMORY=.*/SFA_MEMORY=on/' .env || printf '\nSFA_MEMORY=on\n' >> .env
+grep '^SFA_MEMORY=' .env; env | grep '^SFA_MEMORY'   # SFA_MEMORY=on, once; then nothing: a shell value would win
+./run.sh restart-ask
+sleep 15                                            # the start-up line comes once the pipeline is built
+awk 1 ../.private/ask_logs/ask_log-2*.jsonl \
+  | jq -cR 'fromjson? | select(type == "object" and .event == "startup") | {ts, ok, memory, memory_problem}' | tail -n 1
+# expect "ok":true and "memory":"on", with the ts of this start
+```
+
+The rollback (design §15.3): `SFA_MEMORY=off` with `restart-ask` gives today's behaviour, contract v1 for every call
+and no state. The platform's bridge then gets v1 replies and stores no row of its own for them. One exception: with
+`SF_ASSISTANT_MEMORY=true`, a failed turn that directly follows a stored row still copies that row (the retry line
+keeps its plan), and the service ignores that state while it is off. `SFA_MEMORY=off ./run.sh restart-ask` works
+at once, but the next `restart-ask` reads `web/.env` again, so change the line there too. If `env` prints an
+`SFA_MEMORY` line, that value wins over the file: `unset` it in this shell first.
+
+```bash
+cd <the sf_assistant folder the service runs from>/web
+grep -qs '^SFA_MEMORY=' .env && sed -i 's/^SFA_MEMORY=.*/SFA_MEMORY=off/' .env || printf '\nSFA_MEMORY=off\n' >> .env
+grep '^SFA_MEMORY=' .env; env | grep '^SFA_MEMORY'   # SFA_MEMORY=off, once; then nothing: a shell value would win
+./run.sh restart-ask
+sleep 15                                            # the start-up line comes once the pipeline is built
+awk 1 ../.private/ask_logs/ask_log-2*.jsonl \
+  | jq -cR 'fromjson? | select(type == "object" and .event == "startup") | {ts, ok, memory, memory_problem}' | tail -n 1
+# expect "ok":true and "memory":"off", with the ts of this start
+```
+
+Back to `shadow`: the same first line with `shadow` in place of `off`, then the same checks, expecting
+`"memory":"shadow"`. The platform's own switches (`SF_ASSISTANT_MEMORY`, `SF_ASSISTANT_SUMMARY`) are separate: they
+are orchestrator settings (`docs/CONFIG.md` at the repository root) and need an orchestrator restart.
+
 ## Firewall
 
 Check the host firewall before anyone else uses the page. Until `sudo ufw status` shows the rules below, assume that
