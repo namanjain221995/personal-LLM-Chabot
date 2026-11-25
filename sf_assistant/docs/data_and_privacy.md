@@ -25,4 +25,7 @@ therefore sends record data off this machine. Connect only clients cleared for t
 
 ## Logs and kept files
 
-Logs are written under `.private/` (mode 600, git-ignored). The package does not rotate or delete them.
+Logs are written under `.private/` (mode 600, git-ignored). The package does not rotate or delete them. The keys the
+prerequisites of 2026-11-25 add to an answer's log line hold no new personal data: `display` holds the display words of
+a fixed list and the words a guard kept (the question itself is already in the line), `clarify` and `record_tool_retry`
+hold fixed words, object API names and counts, and `line_reason` / `small_talk` a fixed word.

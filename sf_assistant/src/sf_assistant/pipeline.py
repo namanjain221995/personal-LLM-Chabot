@@ -19,6 +19,11 @@
   charts`);
 * :func:`run_question` = :func:`answer` + :func:`result_row`, without printing (for the web page).
 
+The prerequisites of 2026-11-25 (no model call of their own): small talk gets a fixed line before anything else
+(P6, :mod:`sf_assistant.agent.small_talk`); the display words leave the question before the knowledge and record search
+and come back as flags (P3, :mod:`sf_assistant.agent.display`); a record step that ran no record tool, or whose every
+call failed, after its one forced round, gets a clarifying question code writes (P2, :mod:`sf_assistant.agent.clarify`).
+
 ``sf_assistant.cli.ask`` runs answer -> print -> result_row, exactly as ask.py's ``ask()`` did. ``--no-records``
 imports no record module and no duckdb: every record import below is inside a function.
 """
@@ -257,6 +262,10 @@ class Outcome:
     charts_switch: str = ""                      # why SFA_CHARTS could not be read
     charts_error: str = ""                       # class name of a fault in charts.make
     charts_talk: bool = False                    # drop_talk removed something; no text is kept
+    line_reason: str = ""          # why code answered with one fixed line: small_talk, bare_chart or display_only
+    small_talk: str = ""           # the small-talk kind (agent.small_talk) of a small-talk line
+    display: Any = None            # agent.display.Display of the question (None: not split, e.g. small talk)
+    clarify: dict = field(default_factory=dict)   # the clarifying question's why, from, objects and choices (P2)
 
 
 # ------------------------------------------------------------- the spelling help (docs/resolver_integration.md (1), (6))
@@ -559,26 +568,102 @@ def choose_answer(m: Any, rec: Any, not_found: str, k_answer: str, records_only:
     return k_answer, "knowledge"
 
 
-def _bare_chart_outcome(text, q, registry, session, started_q, records_only, merge_cfg, tables_cfg, charts_cfg):
-    """The :class:`Outcome` of a chart question that names nothing to chart: one line and no model call. With a session
-    ``rec`` has the shape of a NO_RECORDS route in records-only mode, which every reader of an outcome knows."""
-    from sf_assistant.agent import charts as _charts
+def _line_outcome(text, q, registry, session, started_q, records_only, merge_cfg, tables_cfg, charts_cfg, line: str,
+                  reason: str, small_talk: str = "", display: Any = None) -> Outcome:
+    """The :class:`Outcome` of a question code answers with one fixed ``line`` and no model call: ``reason``
+    ``bare_chart`` (a chart question that names nothing to chart), ``small_talk`` (agent.small_talk; ``small_talk`` is
+    its kind) or ``display_only`` (agent.display: only how to show, or a capability ask). With a session ``rec`` has
+    the shape of a NO_RECORDS route in records-only mode, which every reader of an outcome knows."""
     t_assemble = time.perf_counter()
     rec = None
     if session is not None:
         from sf_assistant.agent.record_session import RecordAnswer
         rec = RecordAnswer(question=text, answer="", no_records=True, used_data=False, routed_out=True)
-    line = _charts.bare_line()
     timeline.add("stage", t_assemble, stage="assemble")   # one entry: an answer of this day always has a timeline
     return Outcome(text=text, q=q, r=None, rec=rec, m=None, mode=None, lean_error=None, route_s=None,
                    shown_registry=registry, status=session.status() if session is not None else None,
                    final=line, kind="none", body="", shown=line, started_q=started_q, records_only=records_only,
                    status_lines=[line], timeline=timeline.end(), merge_switch=merge_cfg.problem,
-                   tables_switch=tables_cfg.problem, charts_switch=charts_cfg.problem)
+                   tables_switch=tables_cfg.problem, charts_switch=charts_cfg.problem, line_reason=reason,
+                   small_talk=small_talk, display=display)
+
+
+def _bare_chart_outcome(text, q, registry, session, started_q, records_only, merge_cfg, tables_cfg, charts_cfg,
+                        display: Any = None):
+    """The :class:`Outcome` of a chart question that names nothing to chart: one line and no model call
+    (:func:`_line_outcome`, reason ``bare_chart``)."""
+    from sf_assistant.agent import charts as _charts
+    return _line_outcome(text, q, registry, session, started_q, records_only, merge_cfg, tables_cfg, charts_cfg,
+                         _charts.bare_line(), "bare_chart", display=display)
+
+
+def _with_display(fn: Any, display: Any) -> dict:
+    """``{"display": display}`` when the session method ``fn`` takes it (``RecordSession.route`` and ``.ask``), else {}:
+    a session of another shape (a test stub, an older caller) is called as before."""
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    takes = "display" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    return {"display": display} if takes else {}
+
+
+#: A sentence of a knowledge answer that echoes the agent's require-tools nudge ("You're right, I should not answer from
+#: memory."): the prompt's own wording, never shown (review fix E-22 of the prerequisites, 2026-11-25; the L63 shape).
+_NUDGE_ECHO_RE = re.compile(
+    r"\b(?:should(?:\s+not|n'?t)|must(?:\s+not|n'?t)|will\s+not|won'?t|cannot|can'?t|do\s+not|don'?t)\s+answer\s+from\s+memory\b"
+    r"|\banswer(?:ed|ing)?\s+from\s+memory\b"
+    r"|\b(?:you'?re|you\s+are)\s+right\b[^.!?\n]{0,80}\b(?:memory|tools?|look\s+(?:it\s+)?up)\b"
+    r"|\bwithout\s+(?:calling|using)\s+(?:any|a|the)\s+tools?\b", re.IGNORECASE)
+
+
+def drop_nudge_echo(text: str) -> str:
+    """``text`` without the sentences that echo the require-tools nudge (:data:`_NUDGE_ECHO_RE`); as it was when none
+    does. Never raises."""
+    try:
+        if not text or not _NUDGE_ECHO_RE.search(text):
+            return text
+        lines = []
+        for line in text.split("\n"):
+            parts = re.split(r"(?<=[.!?])\s+", line)
+            kept = [p for p in parts if not _NUDGE_ECHO_RE.search(p)]
+            if kept or not line.strip():
+                lines.append(" ".join(kept) if len(kept) != len(parts) else line)
+        return "\n".join(lines).strip()
+    except Exception:  # noqa: BLE001 - the answer as it was
+        return text
+
+
+def chart_reading(chart_ask: Any, d: Any) -> tuple[Any, Any]:
+    """``(chart_ask, display)`` read the same way (``SFA_CHARTS`` on; prerequisite P3): a chart the question turns down
+    (``"chart"`` in ``display.refused``) is no chart ask; a visual word, or a chart word ``charts.chart_ask`` does not
+    read, is a chart ask with no named type; a chart ask the split missed sets the chart flag. The split refuses every
+    refusal the chart grammar reads and keeps its skill words (review fix R1 of 2026-11-25: no string the chart tests
+    pin as no chart ask becomes one here)."""
+    from sf_assistant.agent import charts as _charts
+
+    if "chart" in (getattr(d, "refused", None) or ()):
+        return None, (dataclasses.replace(d, chart=False) if d.chart else d)
+    if chart_ask is None and d.chart:
+        return _charts.ChartAsk(type=None, bare=False), d
+    if chart_ask is not None and not d.chart:
+        return chart_ask, dataclasses.replace(d, chart=True)
+    return chart_ask, d
+
+
+def _clarify_due(rec: Any) -> bool:
+    """The record step of a record question ran no record tool, or every call failed, after its forced round
+    (``rec.no_data``, prerequisite P2) and no model fault ended it: code asks which question was meant."""
+    if rec is None or not getattr(rec, "no_data", None) or not records_failed(rec):
+        return False
+    agent = getattr(rec, "agent", None)
+    return agent is not None and getattr(agent, "error", None) is None
 
 
 def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_only: bool = False,
-           lean_knowledge: bool = True) -> Outcome:
+           lean_knowledge: bool = True, context_objects: Any = ()) -> Outcome:
     """Answer one question (no printing). The compute part of ask.py's ``ask()``, unchanged.
 
     ``session`` is a ``sf_assistant.agent.record_session.RecordSession`` (records on) or None (records off).
@@ -661,24 +746,64 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
     imported. On, every answer imports it, also a records-off run, which still loads no record module; its chart
     question gets the ``records_off`` line through
     ``agent.nudges`` (``engine.types`` only). No duckdb and no warehouse either way.
+
+    Small talk (prerequisite P6 of 2026-11-25): a greeting, thanks, an acknowledgement, a goodbye, a presence check, an
+    empty ask or a help ask (:func:`sf_assistant.agent.small_talk.small_talk`, a full match) gets its fixed line first,
+    with no model call (:func:`_line_outcome`, ``line_reason`` "small_talk").
+
+    Display words (prerequisite P3): :func:`sf_assistant.agent.display.split` takes the display words out of the
+    question (with a session, :class:`~sf_assistant.agent.display.SessionGuards` keeps stored values and names whole and
+    drops the split when the contact rule or the term contracts would read it otherwise). The search text feeds the
+    spelling help, the knowledge question, the route, names and record calls; the flags feed the chart note, the chart
+    overrule and the record agent's display note. ``Outcome.text``, ``q``, the merge, the contact rule, ``charts.make``
+    and the JSONL keep the typed text. A question of display words only gets one line and no model call (``line_reason``
+    "display_only": the capability line for "can you do visualizations ?", else the bare line); a chart question that
+    names nothing keeps its bare chart line. A visual word (artifact, dashboard) or a chart word ``charts.chart_ask``
+    does not read is a chart ask with no named type. A file ask gets the ``file`` line after the status lines (``final``
+    only) when the answer used record data. The JSONL gets ``display`` (flags, words, kept) when a display word was read.
+
+    Clarifying question (prerequisite P2): when the record step of a record question ran no record tool, or every call
+    failed, after its forced round (``rec.no_data``) and no model fault ended it, ``final`` is the clarifying question
+    of :func:`sf_assistant.agent.clarify.build` instead of :data:`RECORDS_FAILED_ANSWER`, kind "none", no chart and no
+    line (``Outcome.clarify``; the JSONL ``clarify``). ``context_objects``: the objects the last answer named (the ask
+    service and the page's follow-up path; only the clarifying question reads them).
     """
     started_q = time.perf_counter()
     timeline.begin()   # where the seconds go: stage blocks here, model, tool and check entries below (Outcome.timeline)
     merge_cfg = merge_settings()   # SFA_MERGE now: code (the default) or model; an invalid value is code, logged
     tables_cfg = tables_settings()   # SFA_TABLES now: model (the default) or code; an invalid value is model, logged
     charts_cfg = charts_settings()   # SFA_CHARTS now: on (the default) or off; an invalid value is off, logged
+    q = Question(qid=f"ask-{n:03d}", category="cross_section", question=text, expected_facts=[],
+                 expected_tools=["search_knowledge"], answerable=True, source="ask", gold_chunk_ids=[])
+    from sf_assistant.agent import display as _display
+    from sf_assistant.agent.small_talk import line as _talk_line, small_talk as _small_talk
+
+    talk = _small_talk(text)   # P6: one fixed line, no model call
+    if talk:
+        return _line_outcome(text, q, registry, session, started_q, records_only, merge_cfg, tables_cfg, charts_cfg,
+                             _talk_line(talk), "small_talk", small_talk=talk)
     chart_ask = None
     if charts_cfg.on:
         from sf_assistant.agent import charts as _charts
         chart_ask = _charts.chart_ask(text)
-    q = Question(qid=f"ask-{n:03d}", category="cross_section", question=text, expected_facts=[],
-                 expected_tools=["search_knowledge"], answerable=True, source="ask", gold_chunk_ids=[])
+    # P3: what to fetch, apart from how to show it (code only; the spots of SessionGuards run only for a display word)
+    d = _display.split(text, _display.SessionGuards(session) if session is not None else None)
+    if d.empty and d.capability:   # "can you do visualizations ?": what the answers can show, no model call
+        return _line_outcome(text, q, registry, session, started_q, records_only, merge_cfg, tables_cfg, charts_cfg,
+                             _display.line(_display.capability_key(d, charts_cfg.on)), "display_only", display=d)
     if chart_ask is not None and chart_ask.bare:   # names nothing to chart: one line, no model call
         return _bare_chart_outcome(text, q, registry, session, started_q, records_only, merge_cfg, tables_cfg,
-                                   charts_cfg)
+                                   charts_cfg, display=d)
+    if d.empty:   # only how to show, nothing to fetch: one line, no model call
+        return _line_outcome(text, q, registry, session, started_q, records_only, merge_cfg, tables_cfg, charts_cfg,
+                             _display.line(_display.bare_key(charts_cfg.on)), "display_only", display=d)
+    if charts_cfg.on:
+        chart_ask, d = chart_reading(chart_ask, d)   # one reading for both steps
+    search = d.search or text   # what to fetch: every search below reads it
+    sq = q if search == text else dataclasses.replace(q, question=search)
     with timeline.stage("spelling"):
-        spelling = question_spelling(text, registry, session)   # None: the spelling help is off
-    kq = spelling.knowledge_question(q) if spelling is not None else q   # the knowledge step's question
+        spelling = question_spelling(search, registry, session)   # None: the spelling help is off
+    kq = spelling.knowledge_question(sq) if spelling is not None else sq   # the knowledge step's question
     r = rec = m = None
     mode = None          # knowledge step: "full", "lean", "lean+full" or None (records-only: no knowledge agent)
     lean_error = None    # the lean step raised (it should not): the full knowledge agent answered instead
@@ -690,7 +815,7 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
         mode = "full"
     elif records_only:
         with timeline.stage("records"):
-            rec = session.ask(text)
+            rec = session.ask(search, **_with_display(session.ask, d))
     else:
         from sf_assistant.agent.record_prompts import KNOWLEDGE_RECORDS_NOTE
 
@@ -700,14 +825,15 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
         by_value = False   # a stored record value or a chart ask overruled a NO_RECORDS route (value spots, 2026-10-28)
         if early:  # the route call picks the knowledge step: RECORDS -> lean (field meanings only)
             t_route = time.perf_counter()
-            routed = session.route(text)
+            routed = session.route(search, **_with_display(session.route, d))
             route_s = time.perf_counter() - t_route
-            by_value = getattr(_last_triage(session, text), "overruled_by", None) in ("value", "chart")
+            by_value = getattr(_last_triage(session, search), "overruled_by", None) in ("value", "chart")
         mode = "lean" if routed is True and not by_value else "full"
         pool = ThreadPoolExecutor(max_workers=1)  # the record agent runs while the knowledge agent answers
         try:
-            pending = (pool.submit(timeline.run_in, "records", session.ask, text, routed=routed) if early
-                       else pool.submit(timeline.run_in, "records", session.ask, text))
+            shown = _with_display(session.ask, d)
+            pending = (pool.submit(timeline.run_in, "records", session.ask, search, routed=routed, **shown) if early
+                       else pool.submit(timeline.run_in, "records", session.ask, search, **shown))
             if mode == "lean":
                 from sf_assistant.agent.lean import LeanRegistry, lean_knowledge_answer
 
@@ -731,7 +857,7 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
                     rec = pending.result()
             except Exception as exc:  # noqa: BLE001 - RecordSession.ask never raises
                 from sf_assistant.agent.record_session import RecordAnswer
-                rec = RecordAnswer(question=text, answer="", no_records=True, used_data=False,
+                rec = RecordAnswer(question=search, answer="", no_records=True, used_data=False,
                                    error=f"{type(exc).__name__}: {exc}")
         finally:
             pool.shutdown(wait=False)
@@ -743,6 +869,8 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
                 r = answer_question(kq, llm, registry, cfg, system=noted, require_tools=True)
             r.latency_s = round(r.latency_s + lean_s, 3)
             mode, shown_registry = "lean+full", registry
+    if r is not None and r.answer:   # review fix E-22: no sentence that echoes the require-tools nudge is shown
+        r.answer = drop_nudge_echo(r.answer)
     status = session.status() if session is not None else None
     charts_talk = False
     # "Let me plot" forces no merge call; a people answer code wrote holds no talk, and a name can hold a chart word
@@ -798,6 +926,10 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
     # knowledge answer, which does not say that the name is not in the records
     not_found = (getattr(rec, "not_found_answer", "") or "") if rec is not None and rec.no_records else ""
     final, kind = choose_answer(m, rec, not_found, k_answer, records_only, status)
+    clarify: dict = {}
+    if kind == "none" and _clarify_due(rec):   # P2: a question back with 2-3 choices, never the failed-figures line
+        from sf_assistant.agent import clarify as _clarify
+        final, clarify = _clarify.build(search, d, rec, session, tuple(context_objects or ()), charts_on=charts_cfg.on)
     design_kept = False
     if chart_ask is not None and kind == "records" and m is not None and not m.merged and \
             (getattr(rec, "triage", None) or {}).get("overruled_by") == "chart":
@@ -814,7 +946,7 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
             final = drop_contact_details(final, result_numbers(getattr(e, "model_result", None) for e in evidence
                                                                if getattr(e, "ok", False)))[0]
     chart_items, chart_lines, charts_error = [], [], ""
-    if chart_ask is not None:   # never raises; after the contact rule
+    if chart_ask is not None and not clarify:   # never raises; after the contact rule (no chart under a question)
         catalog = getattr(getattr(session, "tools", None), "catalog", None)
         before = final
         # a kept design answer reads as a full merge does: it keeps its sentences, and the record text is clean already
@@ -835,6 +967,8 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
         status_added = status_lines(without_lines(final, inserted), rec.evidence, text,
                                     getattr(session, "status_of", None), getattr(session, "lookup_directions", None))
         final = with_lines(final, status_added)
+    if d.file and kind in ("merged", "records") and final.strip():   # P3: no file is made; the figures are here
+        chart_lines = chart_lines + [_display.line("file")]
     if chart_lines:   # not in body; status_added keeps lookup_footer right
         from sf_assistant.agent.nudges import with_lines
         final = with_lines(final, chart_lines) if final.strip() else "\n".join(chart_lines)
@@ -874,7 +1008,8 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
                    merge_switch=merge_cfg.problem,
                    tables_by="code" if tables_cfg.by == "code" and rec is not None else None,
                    tables_switch=tables_cfg.problem, code_tables=code_tables, charts=chart_items,
-                   charts_switch=charts_cfg.problem, charts_error=charts_error, charts_talk=charts_talk)
+                   charts_switch=charts_cfg.problem, charts_error=charts_error, charts_talk=charts_talk,
+                   display=d, clarify=clarify)
 
 
 def result_row(o: Outcome, session=None) -> dict:
@@ -890,7 +1025,11 @@ def result_row(o: Outcome, session=None) -> dict:
     message; step-3 fix T5): the one key model mode gains. With ``SFA_CHARTS=on`` the row gets ``charts`` (the items
     with their picture, for the page) and the JSONL ``charts`` (the same items with no picture), ``charts_error`` (a
     class name) and ``charts_talk`` (true) when each has something to say; ``charts_switch`` holds the problem when
-    ``SFA_CHARTS`` could not be read. Each key is left out otherwise.
+    ``SFA_CHARTS`` could not be read. Each key is left out otherwise. The prerequisites of 2026-11-25 add, each only
+    when it has something to say: ``line_reason`` (and ``small_talk``, the kind) for a fixed line code wrote,
+    ``display`` (the display flags, the removed display words and the (word, guard) pairs a guard kept), ``clarify``
+    (the clarifying question's why, from, objects and choices), ``record_no_data`` and ``record_tool_retry`` (the
+    forced round of the record step).
     """
     text, r, rec, m, kind, rq = o.text, o.r, o.rec, o.m, o.kind, o.rq
     final, body, k_answer, checks, mode = o.final, o.body, o.k_answer, o.checks, o.mode
@@ -970,6 +1109,20 @@ def result_row(o: Outcome, session=None) -> dict:
         row["jsonl"]["read_as_line"] = o.footed is not None and final != o.footed
     if o.timeline:   # where the seconds went (agent.timeline): names, numbers and fixed words only, no text
         row["jsonl"]["timeline"] = o.timeline
+    if o.line_reason:   # the prerequisites of 2026-11-25: a fixed line code wrote (small talk, display only, bare chart)
+        row["jsonl"]["line_reason"] = o.line_reason
+    if o.small_talk:
+        row["jsonl"]["small_talk"] = o.small_talk
+    # fixed vocabulary, and the user's own words a guard kept; only when a word was removed or refused (review fix R8:
+    # a guard that only kept a word, "details of X", "reports to", adds no key to an ordinary row)
+    if o.display is not None and (o.display.words or o.display.refused):
+        row["jsonl"]["display"] = o.display.as_log()
+    if o.clarify:
+        row["jsonl"]["clarify"] = dict(o.clarify)
+    if rec is not None and getattr(rec, "no_data", None):
+        row["jsonl"]["record_no_data"] = rec.no_data
+    if rec is not None and getattr(rec, "tool_retry", None):
+        row["jsonl"]["record_tool_retry"] = dict(rec.tool_retry)
     return row
 
 
@@ -978,13 +1131,15 @@ def _without_status(text: str, o: Outcome) -> str:
     footer was added."""
     if not o.status_lines:
         return text
+    if o.line_reason and text == "\n".join(o.status_lines):   # one fixed line and nothing else: no record module
+        return o.body
     from sf_assistant.agent.nudges import without_lines
 
     return without_lines(text, o.status_lines)
 
 
 def run_question(text: str, cfg, registry, system, llm, n: int, session=None, records_only: bool = False,
-                 lean_knowledge: bool = True) -> dict:
+                 lean_knowledge: bool = True, context_objects: Any = ()) -> dict:
     """:func:`answer` + :func:`result_row` without printing: the summary row with its JSONL record."""
     return result_row(answer(text, cfg, registry, system, llm, n, session, records_only=records_only,
-                             lean_knowledge=lean_knowledge), session)
+                             lean_knowledge=lean_knowledge, context_objects=context_objects), session)

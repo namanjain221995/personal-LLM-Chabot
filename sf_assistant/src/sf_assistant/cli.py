@@ -145,7 +145,8 @@ def _quer(n: int) -> str:
 
 
 def ask(text: str, cfg, registry, system, llm, n: int, verbose: bool, session=None, max_rows: int = LIMITS.max_rows,
-        records_only: bool = False, records_wanted: bool = False, lean_knowledge: bool = True) -> dict:
+        records_only: bool = False, records_wanted: bool = False, lean_knowledge: bool = True,
+        context_objects=()) -> dict:
     """Answer one question and print it. Returns the summary row (and the JSONL record) for --file runs.
 
     ``session`` is a ``sf_assistant.agent.record_session.RecordSession`` (records on) or None (records off).
@@ -153,10 +154,10 @@ def ask(text: str, cfg, registry, system, llm, n: int, verbose: bool, session=No
     ``lean_knowledge`` (merged mode only): make the route call first and, when it says RECORDS, run the lean
     knowledge step (``sf_assistant.agent.lean``, RECORDS_SPEC §21.19) instead of the full knowledge agent. False
     (--full-knowledge) keeps the full knowledge agent for every question, with the route call inside the record
-    session.
+    session. ``context_objects``: the objects the last answer named (prerequisite P2b; the clarifying question only).
     """
     o = answer(text, cfg, registry, system, llm, n, session, records_only=records_only,
-               lean_knowledge=lean_knowledge)
+               lean_knowledge=lean_knowledge, **({"context_objects": tuple(context_objects)} if context_objects else {}))
     print_outcome(o, session, verbose, max_rows, records_wanted=records_wanted)
     return result_row(o, session)
 

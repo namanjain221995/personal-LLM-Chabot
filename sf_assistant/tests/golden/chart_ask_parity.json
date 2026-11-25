@@ -1,0 +1,2652 @@
+{
+" ": null,
+"  ": null,
+"   ": null,
+"  OFF ": null,
+"  two   spaces ": null,
+" = 'x'": null,
+" AVG ": null,
+" Asc ": null,
+" On ": null,
+" a@example.invalid and more words after it": null,
+" and more words": null,
+" by Status": null,
+" full": null,
+" route=": null,
+" s": null,
+"![": null,
+"![a](b)": null,
+"\"measure\":\"count_distinct\",\"measure_field\":\"Candidate__c\"}": null,
+"\"quoted\" 'single'": null,
+"# ": null,
+"#17232e": null,
+"#2a78d6": null,
+"#586776": null,
+"#eb6834": null,
+"#ffffff": null,
+"%": null,
+"&amp;&#x26;": null,
+"'quoted' = 1": null,
+"(-?[\\d.]+) (-?[\\d.]+)A100 100 0 ([01]) 1 (-?[\\d.]+) (-?[\\d.]+)": null,
+"(?:[MLQAZ][-\\d. ]*)+": null,
+"([MLQAZ])([^MLQAZ]*)": null,
+"(blank)": null,
+"(bucket, value) rows from 2026-01 on.": null,
+"(no name)": null,
+"(other)": null,
+"(unresolved id)": null,
+"*": null,
+"* ": null,
+"* Plot Manager (Closed)": [
+null,
+false
+],
+"**Source:** fake copy, chart word.": [
+null,
+false
+],
+"**Summary:**": null,
+"**{{ Chart: q1 }}** and {{plot q2 bar}} then text.": [
+"bar",
+false
+],
+"**{{chart q1}}**": [
+null,
+false
+],
+",": null,
+", ": null,
+"-": null,
+"- A: 5": null,
+"- Bar chart: (no value)": [
+"bar",
+false
+],
+"- Candidates placed per month this year (business term) -> trend_records {\"object\":\"Interview__c\",\"grain\":\"month\"": null,
+"- Completed: 5": null,
+"- I-Chart Analyst, Scheduled": [
+null,
+false
+],
+"- Placements per month this year (business term) -> trend_records": null,
+"- `Interviewer__c` is the interviewer of the internal interview.": null,
+"- `Interviewer__c` is the interviewer of the internal interview. It appears on the chart.": [
+null,
+false
+],
+"--asks": null,
+"--plain": null,
+"-01": null,
+"-?\\d+(?:\\.\\d+)?": null,
+"-B": null,
+"-c": null,
+".private": null,
+"0": null,
+"0 0 ": null,
+"0.45": null,
+"0.5": null,
+"02d": null,
+"1": null,
+"1,000,000.25": null,
+"1,234,567": null,
+"1,234.5": null,
+"1.5M": null,
+"10": null,
+"10  client": null,
+"10 client": null,
+"10 client interviews (`Interview__c`). ": null,
+"10,000T": null,
+"10.5": null,
+"10K": null,
+"11": null,
+"12": null,
+"121": null,
+"2": null,
+"2,000": null,
+"2,500T": null,
+"2. A is 5": null,
+"2.5": null,
+"2001": null,
+"2026-01": null,
+"2026-01-01": null,
+"2026-01-02": null,
+"2026-01-05": null,
+"2026-01-31": null,
+"2026-02-01": null,
+"2026-02-02": null,
+"2026-02-03": null,
+"2026-03": null,
+"2026-05": null,
+"2026-06": null,
+"2026-06-30": null,
+"2026-07": null,
+"2026-07-01": null,
+"2026-08": null,
+"2026-09": null,
+"2026-09-01": null,
+"2026-09-30": null,
+"2026-10": null,
+"2026-10-01": null,
+"2026-10-01 to 2026-10-31": null,
+"2026-10-31": null,
+"2026-11-01": null,
+"2026-11-01 to 2026-11-30": null,
+"2026-11-03": null,
+"2026-11-04": null,
+"2026-11-05": null,
+"2026-11-30": null,
+"2026-12": null,
+"2026-12-01": null,
+"2026-12-31": null,
+"2027-01-01": null,
+"2B": null,
+"2T": null,
+"3": null,
+"30": null,
+"31": null,
+"4": null,
+"4.5": null,
+"40": null,
+"49": null,
+"5": null,
+"500": null,
+"51": null,
+"6": null,
+"600": null,
+"64": null,
+"640": null,
+"7": null,
+"7123456789": null,
+"8123456789": null,
+"9": null,
+"9,000": null,
+"987": null,
+"9876543210": null,
+":": null,
+": 12": null,
+": 19": null,
+": 4": null,
+"<": null,
+"<!-- comment -->": null,
+"</style>": null,
+"</svg><svg onload=alert(1)>": null,
+"<?xml version='1.0'?>": null,
+"<a ": null,
+"<a href='javascript:alert(1)'>x</a>": null,
+"<html><title>x</title></html>": null,
+"<image": null,
+"<script": null,
+"<script>alert(1)</script>": null,
+"<style>.*?</style>": null,
+"<svg": null,
+"<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(1)\"/>": null,
+"<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:x=\"http://www.w3.org/1999/xlink\"><rect x:href=\"#a\"/></svg>": null,
+"<svg xmlns=\"http://www.w3.org/2000/svg\"><a href=\"javascript:alert(1)\"/></svg>": null,
+"<svg xmlns=\"http://www.w3.org/2000/svg\"><foreignObject/></svg>": null,
+"<svg xmlns=\"http://www.w3.org/2000/svg\"><image href=\"http://example.invalid/x.png\"/></svg>": null,
+"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect fill=\"url(http://example.invalid/#a)\"/></svg>": null,
+"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect style=\"fill:red\"/></svg>": null,
+"<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>": null,
+"<svg xmlns=\"http://www.w3.org/2000/svg\"><style>@import \"http://example.invalid/x.css\";</style></svg>": null,
+"<svg><rect/></svg>": null,
+">": null,
+"@media (prefers-color-scheme:dark){": null,
+"A": null,
+"A ": null,
+"A bar chart has been generated for this data. Completed is the largest group.": [
+"bar",
+false
+],
+"A chart is provided below. Completed is the largest group.": [
+null,
+false
+],
+"A compare_records result; ``rows``: (label, value), or (label, value, applied).": null,
+"A count_records result with a breakdown.": null,
+"A group_records result; ``rows``: (label, value), or (label, value, by).": null,
+"A label over sixteen chars": null,
+"A line per series whose series end at ``last``; before that each holds its own steady value.": null,
+"A long synthetic label over twenty-eight characters (#2)": null,
+"A null row cannot look like a 0: its words fit whole, or a note says what an empty slot is.": null,
+"A people answer code wrote holds no talk, and a stored name in it can hold a chart word.": [
+null,
+false
+],
+"A tick's text as a number: \"1.5M\" is 1500000.": null,
+"A trend ``_fit`` trimmed: the note names a bucket that is no longer there, and nothing is marked.": null,
+"A trend_records result; ``rows``: (bucket, value), or (bucket, value, by).": null,
+"A wide first value over a rising line goes under the point; on a falling line, or with no room under it, over.": null,
+"A: 5": null,
+"ABCDEFGH": null,
+"ASC": null,
+"Address": null,
+"Address__c": null,
+"An unclear route stays None, as for a value: the record agent runs anyway, next to the full knowledge agent.": null,
+"Another Long Field Label": null,
+"Answer **{{chart q1}}** here.": [
+null,
+false
+],
+"Answer here.": null,
+"Answer text.": null,
+"Answer.": null,
+"Approved by the person": null,
+"Approved_By__c.Name": null,
+"Asia/Kolkata": null,
+"AttributeError": null,
+"Average of Bill Rate": null,
+"B": null,
+"B01": null,
+"BCDEFGH": null,
+"Big": null,
+"Bill Rate": null,
+"C": null,
+"C01": null,
+"Canceled": null,
+"Candidate": null,
+"Candidate 1": null,
+"Candidate 2": null,
+"Candidate__c": null,
+"Chart (": [
+null,
+true
+],
+"Chart (bar): ": [
+"bar",
+true
+],
+"Chart (horizontal bar): ": [
+"horizontal_bar",
+true
+],
+"Chart Industries": [
+null,
+false
+],
+"Chart Persson": [
+null,
+false
+],
+"Chart Persson has no interview": [
+null,
+false
+],
+"Chart neeche hai. Completed sabse zyada hai.": [
+null,
+false
+],
+"Client_Bill_Rate__c": null,
+"Code Watch": null,
+"Code Watches": null,
+"Compared": null,
+"Completed": null,
+"Completed is the largest group.": null,
+"Completed sabse zyada hai.": null,
+"Constants only: no env read, no warehouse, no model, no file but its two prompts.": null,
+"Contract": null,
+"CreatedDate": null,
+"D": null,
+"D01": null,
+"D01 overruled: chart": [
+null,
+false
+],
+"D: a NO_RECORDS route reads as a data question; only without that overrule is the evidence empty.": null,
+"DESC": null,
+"Date of Interview": null,
+"Date__c": null,
+"Date_of_Interview__c": null,
+"Day": null,
+"Day__c": null,
+"Days": null,
+"Decision 14 and section 9's list row: a row that holds a chart word and no digit is no talk.": [
+null,
+false
+],
+"Deliverable__c": null,
+"Deliverable__c.Approved_By__c": null,
+"Delta": null,
+"Delta Person": null,
+"Distinct Bill Rate": null,
+"Done": null,
+"Done | 1 | 2 | 3": null,
+"Done.": null,
+"Each result with each key removed, and each key set to each wrong type.": null,
+"Echo One": null,
+"Eight rows, whose null has no room for its words: the first value is wide, and low beside the highest.": null,
+"Employment Type": null,
+"Employment_Type__c": null,
+"Every point of an absolute path that holds only M L Q A Z.": null,
+"Field_": null,
+"Field_With_Many_Long_Words_": null,
+"Filtered on:": null,
+"Filtered on: ": null,
+"Filtered on: Employment Type, Status, Round": null,
+"Filtered on: Interviewer": null,
+"Filtered on: Interviewer, Recruiter": null,
+"Filtered on: Recruiter": null,
+"Filtered on: Recruiter, Employment Type": null,
+"Filtered on: Status": null,
+"Filtered on: Status, Round, Employment Type, related Session records, related Note records, ": null,
+"Filtered on: Status, Status": null,
+"Full": null,
+"Full-Time": null,
+"G": null,
+"G0": null,
+"G1": null,
+"Gantt Systems": [
+"unsupported",
+false
+],
+"Group ": null,
+"Group label ": null,
+"Here are the candidates drawn from the referral pool.": null,
+"Here is a bar chart": [
+"bar",
+false
+],
+"Here is the chart": [
+null,
+false
+],
+"Here is the chart. ": [
+null,
+false
+],
+"Here is the chart: 120 in total.": [
+null,
+false
+],
+"Here is the chart: 120 in total. See the chart.": [
+null,
+false
+],
+"Here is the chart: 120 interviews in total.": [
+null,
+false
+],
+"Highest Bill Rate": null,
+"I cannot draw charts here.": [
+null,
+false
+],
+"I used make_chart to count. There are 2 groups.": null,
+"Id": null,
+"Intake": null,
+"Internal_Interview__c": null,
+"Internal_Interview__c.json": null,
+"Interview": null,
+"Interview Round One - Final": null,
+"Interview Round Two - Final": null,
+"Interview by Status": null,
+"Interview_Outcome__c": null,
+"Interview_Status__c": null,
+"Interview__c": null,
+"Interview__c records": null,
+"Interview__c.Recruiter__c": null,
+"Interviewer__c": null,
+"Interviewer__c.Name": null,
+"Interviews": null,
+"Interviews by Interview Status": null,
+"Interviews by Status": null,
+"Interviews by Status. ": null,
+"Interviews compared": null,
+"Interviews per month": null,
+"Interviews: ": null,
+"Interviews: Average of Bill Rate compared": null,
+"It appears on the chart": [
+null,
+false
+],
+"K": null,
+"KeyError": null,
+"Late": null,
+"Lead": null,
+"Leads": null,
+"Let me plot": [
+null,
+false
+],
+"Let me plot this.": [
+null,
+false
+],
+"Lookup used": null,
+"Lookup used: `Internal_Interview__c.Interviewer__c`": null,
+"Lost": null,
+"Lowest Bill Rate": null,
+"M": null,
+"MAYBE": null,
+"ML": null,
+"Marketing": null,
+"Marketing__c": null,
+"Meeting ": null,
+"Microsoft Graph API integration": null,
+"Mode ``full`` keeps its sentences, never a mark.": null,
+"Month": null,
+"NONE": null,
+"NO_RECORDS": null,
+"NO_TIMELINE": null,
+"Name": null,
+"No Show": null,
+"No chart": null,
+"No session: the knowledge answer and the ``records_off`` line, with no chart.": null,
+"No value is painted over by a later column, sits over a taller one, or meets another value. The highest stays.": null,
+"Not_A_Field__c = 'Person Value'": null,
+"Not_A_Field__c = 'typed value'": null,
+"Not_There__c": null,
+"Note": null,
+"Note__c": null,
+"Notes by ": null,
+"O": null,
+"OKEVAL_RECORDS_MAX_AGE_H": null,
+"OKEVAL_RECORDS_MAX_STEPS": null,
+"OKEVAL_RECORDS_TIMEOUT_S": null,
+"OKEVAL_RECORDS_TODAY": null,
+"OKEVAL_RECORDS_TZ": null,
+"OKEVAL_WAREHOUSE": null,
+"OKEVAL_WAREHOUSE_CONTAINER": null,
+"ON": null,
+"Offer Received": null,
+"On the record answer too: a row code wrote is never read as a sentence, whatever it holds.": null,
+"Open": null,
+"Open | 1 |  | 1": null,
+"Opportunities": null,
+"Opportunity": null,
+"Other": null,
+"Other Recruiter With A Long Name (#3)": null,
+"Other Value": null,
+"P1: blocked fields never reach ``model_result``; a chart reads nothing wider, statements above all.": [
+null,
+false
+],
+"Part": null,
+"Per column: one wide value takes no other value's room.": null,
+"Period": null,
+"Period: 2026-01-01 to 2026-06-30 (by Date of Interview)": null,
+"Period: 2026-10-01 to 2026-10-31 (by Date of Interview)": null,
+"Period: from 2026-01-01 (by Date of Interview)": null,
+"Period: to 2026-01-31 (by Date of Interview)": null,
+"Periods by Date of Interview": null,
+"Periods can skip an axis label; a group or a segment never does.": null,
+"Person": null,
+"Person A": null,
+"Person B": null,
+"Person Value": null,
+"Pinned as they are: these fire and should not (the last fires rightly, but its type reads ``unsupported``).": null,
+"Plain": null,
+"Plain by ": null,
+"Plain__c": null,
+"Q": null,
+"Q4 2031": null,
+"R9: a mark is never an answer's content, unlike a sentence about a chart.": [
+null,
+false
+],
+"R9: no chart marker exists, so one the model types itself is only talk, on every path.": null,
+"RECORDS": null,
+"Rate__c": null,
+"Read as:": null,
+"Read as: 'intervews' as Interview.": null,
+"Readable if ``<style>`` is removed: every mark and text carries its light colour as a plain attribute.": null,
+"Records": null,
+"Records (split)": null,
+"Records (value)": null,
+"Records mode, NO_RECORDS: no answer at all, so the line stands alone, and the page shows it.": null,
+"Records__c": null,
+"Recruiter": null,
+"Recruiter ": null,
+"Recruiter A": null,
+"Recruiter With A Very Long Synthetic Name (#2)": null,
+"Recruiter__c": null,
+"Recruiter__c (Recruiter name)": null,
+"Recruiter__c name contains 'Person'": null,
+"Recruiter__c.Name": null,
+"Recruiter__c.Name = 'Person A'": null,
+"Recruiter__c.Name = 'y'": null,
+"Rest": null,
+"Round": null,
+"Round 2": null,
+"Round 3": null,
+"Round__c": null,
+"Round__c = 'Second'": null,
+"Round__c = 2": null,
+"Round__c = 3": null,
+"Round__c in ('Secret')": null,
+"S": null,
+"S1": null,
+"S2": null,
+"SELECT \"Interview_Status__c\", COUNT(*) FROM main.\"Interview__c\" GROUP BY 1": null,
+"SFA_CHARTS": null,
+"SFA_CHARTS must be off or on": null,
+"SFA_LEXICON": null,
+"SFA_MERGE": null,
+"SFA_RESOLVER": null,
+"SFA_TABLES": null,
+"SUMMARY": null,
+"Same  label": null,
+"Same first twenty chars and one word and the same end": null,
+"Same first twenty chars and two word and the same end": null,
+"Same label": null,
+"Sample Course Track One - V1 - Week 1": null,
+"Sample Course Track One - V1 - Week 2": null,
+"Sample Course Track One V1 - Week 1": null,
+"Sample Course Track One V2 - Week 1": null,
+"Scheduled": null,
+"Secret": null,
+"Section 12.1: with the switch off a chart question imports nothing of the charts, on any surface.": [
+null,
+false
+],
+"Section 12.4: kind ``knowledge`` and a full-mode merge keep their sentences; a record answer does not.": null,
+"Section 19's chain to its end, with made-up question files: counts and fixed words, never a question.": null,
+"Section 19's chain up to the sidecar: a renamed key shows here and not first in the owner's model run.": null,
+"Section 5: the last chartable result with the ``several`` note; a count after a group leaves the group drawn.": null,
+"See the chart below. Completed is the largest group.": [
+null,
+false
+],
+"See the chart.": [
+null,
+true
+],
+"Segment ": null,
+"Segment 1": null,
+"Segment 2": null,
+"Sentinel": null,
+"Separate SQL on a copy of the fake warehouse: the open record tools hold the file with their own settings.": null,
+"Series ": null,
+"Series A": null,
+"Series B": null,
+"Series C": null,
+"Series D": null,
+"Series name to its light colour, from the legend: its swatches and their names in order.": null,
+"Session": null,
+"Session__c": null,
+"Sessions": null,
+"Short": null,
+"Short (#2)": null,
+"Showing": null,
+"Small": null,
+"Source: fake copy.": null,
+"Source: fake copy; chart of accounts not used.": null,
+"Source: preprod sandbox copy, synced 2026-10-13 14:30 UTC.": null,
+"Status": null,
+"Status ": null,
+"Status (split)": null,
+"Status A": null,
+"Status B": null,
+"Status C": null,
+"Status D": null,
+"Status has 3 values. Most are completed.": null,
+"Status has 3 values. See the chart below. Most are completed.": [
+null,
+false
+],
+"Status | S | T | Total": null,
+"Status2__c": null,
+"Status2__c = 'y'": null,
+"Status__c": null,
+"Status__c = 'Completed'": null,
+"Status__c = 'Person Value'": null,
+"Status__c = 'typed value'": null,
+"Status__c = 'x'": null,
+"Sum": null,
+"Sum of ": null,
+"Sum of Bill Rate": null,
+"T": null,
+"T10 and T16: only a series a bucket lacks is 0 on a count line; a null it holds is a gap.": null,
+"T15: 8 series stack, 9 do not, and those stay in the rows.": null,
+"T17 and T3: each row's label on its bar's band, the bar read through the axis, its value at that bar's tip.": null,
+"T17 and T3: each row's label under its column, the column read through the axis, its value over that column.": null,
+"T21: a person's filter reads as its lookup. Two lookups are two words, and one field filtered twice is one.": null,
+"T21: two person filters on two lookups are two words, each saying its lookup.": null,
+"T23 and section 7.1: arguments read as the tool reads them, on the real tool's result.": null,
+"T23: \"no records match\" only for a result with no cut.": null,
+"T23: the tool says the data does not record this; a chart never draws or states the 0 the draft check forbids.": [
+null,
+false
+],
+"T3's layout half, on all shapes: a small parser reads every position and path point. It lives here only.": null,
+"T3: a thin segment stays inside its own share, never under the axis nor over the segment below.": null,
+"T3: the zero line sits at the axis, each bar's base on it, and bar length follows the value within 1 px.": null,
+"T6: named rows against ``group_count``, exact: a special row is not a named one, and a stored blank is.": null,
+"Team": null,
+"Team full": null,
+"The JSONL record without its times, at any depth.": null,
+"The bars and their stack segments: series-coloured marks that are no legend swatch.": null,
+"The chart below shows the breakdown by status. Completed is the largest group.": [
+null,
+false
+],
+"The chart shows 120 interviews.": [
+null,
+false
+],
+"The chart's first series, as label -> value, read from the item's rows.": [
+null,
+false
+],
+"The code will draw the chart. Completed is the largest group.": [
+null,
+false
+],
+"The estimate is not under what Chrome measured on DejaVu Sans, the widest face of the stack, in these.": null,
+"The expected numbers come from separate SQL on the fake warehouse, not from the build.": null,
+"The first value of a line stands at the axis, level with a tick: it starts right of where the ticks end.": null,
+"The heading reads the catalog's labels, and a period past the snapshot's today gets its note.": null,
+"The items of one result, through the pure core.": null,
+"The line manager reports the status. Completed is the largest group.": null,
+"The model's client, with the merge call raising.": null,
+"The note goes on any column chart, and groups and segments are not periods.": [
+"bar",
+false
+],
+"The page's pipeline module under a name of its own: ``tests/test_web.py`` keeps ``pipeline`` for itself.": null,
+"The real answer and row of ``question`` through a new session over the world's tools.": null,
+"The record shows how the graph API was set up. Done.": null,
+"The recruiting dashboard has a bar chart.": [
+"bar",
+false
+],
+"The same question with the switch off (for comparison); the switch goes back to what the test had.": null,
+"The same, with the spelling help on both sides.": null,
+"The second cleaning, in ``make``, uses the same test of an answer.": null,
+"The second item of a breakdown is not spared: no key of the module's reaches the page reply or the sidecar.": null,
+"The split by ": null,
+"The split by Employment Type is left out: two of its names read the same once cleaned.": null,
+"The stages of a timeline; the threads may order them differently from one run to the next.": null,
+"The status chart lists them. ": [
+null,
+false
+],
+"The value texts over the columns, with their boxes: ``(text, left, right, top, bottom)``.": null,
+"There are 12.": null,
+"There are 19.": null,
+"There are 2 groups.": null,
+"There are 5.": null,
+"There are 999 of them: Completed 41.": null,
+"Thin": null,
+"This chart type is not available": [
+null,
+false
+],
+"Top": null,
+"Total": null,
+"Total (split)": null,
+"Total__c": null,
+"Twenty-two characters a": null,
+"Twenty-two characters a and end": null,
+"Twenty-two characters b": null,
+"Twenty-two characters b and end": null,
+"Type__c": null,
+"Type__c = 'Full'": null,
+"Type__c = 'Other Value'": null,
+"Type__c = 'z'": null,
+"Type__c.Name = 'Person B'": null,
+"Typed": null,
+"Typed 77": null,
+"Typed 88": null,
+"W": null,
+"WMQ": null,
+"WMQGDOAU": null,
+"WWWW": null,
+"Watch__c": null,
+"Week": null,
+"What ``ask --file`` runs, with a scripted model per question: ``run_file`` over ``cli.ask``. The sidecar's rows.": null,
+"Wiki": null,
+"With many points one step is too short to see the line run through the text.": null,
+"Word_": null,
+"Yeh raha chart. Completed sabse zyada hai.": [
+null,
+false
+],
+"You answer questions about Salesforce RECORDS": null,
+"You can draw on the bench list for these roles.": null,
+"ZeroDivisionError": null,
+"[\\d.]+": null,
+"[hidden]": null,
+"[hidden] two": null,
+"]]> <![CDATA[": null,
+"_": null,
+"_Cleaner": null,
+"_SvgRefused": null,
+"__": null,
+"__c": null,
+"__proto__": null,
+"__proto__ (split)": null,
+"_build": null,
+"_check_svg": null,
+"_draw": null,
+"_pick": null,
+"_seconds": null,
+"`Interview_Status__c` holds the status.": null,
+"`Interview__c`": null,
+"`Interview__c` = client": null,
+"``(left, top, right, bottom)`` of a bar or a stack segment.": null,
+"``(start, more than half, end)`` of each slice's outer arc, in drawing order, from its path.": null,
+"``RecordTools._fit`` can leave ``groups`` empty with no ``trimmed`` key, when other keys fill its limit.": null,
+"``RecordTools._validate`` drops them, so the tool ran without them, and every group is in the rows.": null,
+"``charts.for_tool`` on the real tool's result over the fake warehouse.": [
+null,
+false
+],
+"``make`` cleans what the model says: a name holding a chart word in code's own text stays, with the line.": [
+"line",
+false
+],
+"``make`` fails inside: the answer whole, the ``fault`` line and a class name, never the fault's text.": null,
+"a": null,
+"a & <b>": null,
+"a & b < c > d": null,
+"a chart reads only model_result": [
+null,
+false
+],
+"a long compare label over sixteen": null,
+"a made-up fault text": null,
+"a note": null,
+"a rate, share or percentage over time: trend_records with part_filters": null,
+"a zero": null,
+"a | (no value)": null,
+"a06000000000099AAA": null,
+"a@example.invalid": null,
+"a_": null,
+"abc123": null,
+"about-a-chart": [
+null,
+false
+],
+"about_people": null,
+"accounts ka chart banao": [
+null,
+false
+],
+"added from the critique": null,
+"advocate as a bar council member": null,
+"aggregate_records": null,
+"agli bar please yaad rakhna": null,
+"all_zero": null,
+"alone": null,
+"alt": null,
+"and then text.": null,
+"another": null,
+"answer": null,
+"answer_body": null,
+"answer_failed": null,
+"answer_kind": null,
+"any_of": null,
+"api aur db ka flow chart banao": null,
+"applied": null,
+"area chart of applications per week": [
+"unsupported",
+false
+],
+"area manager of the west region": null,
+"args": null,
+"args, left_out": null,
+"as a pie": [
+"pie",
+true
+],
+"asc": null,
+"ascending": null,
+"ask": null,
+"asked": null,
+"asks.txt": null,
+"assemble": null,
+"average": null,
+"average experience by niche": null,
+"avg": null,
+"avg bar": null,
+"avg donut": null,
+"avg horizontal": null,
+"avg line": null,
+"avg none": null,
+"avg other": null,
+"avg pie": null,
+"b": null,
+"bad": null,
+"bar": null,
+"bar char of leads": [
+"bar",
+false
+],
+"bar chart": [
+"bar",
+true
+],
+"bar chart by status": [
+"bar",
+false
+],
+"bar chart comparing full time and contract interviews": [
+"bar",
+false
+],
+"bar chart comparing the interviews": [
+"bar",
+false
+],
+"bar chart instead of pie chart of leads": [
+"bar",
+false
+],
+"bar chart of Sentinel Word": [
+"bar",
+false
+],
+"bar chart of accounts": [
+"bar",
+false
+],
+"bar chart of candidates by niche": [
+"bar",
+false
+],
+"bar chart of intervews by status": [
+"bar",
+false
+],
+"bar chart of interviews": [
+"bar",
+false
+],
+"bar chart of interviews by recruiter": [
+"bar",
+false
+],
+"bar chart of interviews by statsu": [
+"bar",
+false
+],
+"bar chart of interviews by status": [
+"bar",
+false
+],
+"bar chart of interviews per month": [
+"bar",
+false
+],
+"bar chart of leads, not a pie": [
+"bar",
+false
+],
+"bar chart of line items": [
+"bar",
+false
+],
+"bar chart of the bill rate by employment type": [
+"bar",
+false
+],
+"bar chart of the e-mail address by status": [
+"bar",
+false
+],
+"bar chart of the internal interviews of ": [
+"bar",
+false
+],
+"bar chart of the internal interviews of Delta Person": [
+"bar",
+false
+],
+"bar chart of the internal interviews of Echo One": [
+"bar",
+false
+],
+"bar chart of this month's interviews by status": [
+"bar",
+false
+],
+"bar chat of candidates": [
+"bar",
+false
+],
+"bar code field on the product": null,
+"bar diagram of leads by source": [
+"bar",
+false
+],
+"bar graph bana do visa wise": [
+"bar",
+false
+],
+"bar grpah of joinings": [
+"bar",
+false
+],
+"barchart of leads by owner": [
+"bar",
+false
+],
+"bare": null,
+"bare with the bare line and no model call: 1 of 4": null,
+"bargraph of joinings": [
+"bar",
+false
+],
+"bina chart ke dikhao": null,
+"bina table ke chart dikhao": [
+null,
+false
+],
+"blank": null,
+"blank_group_value": null,
+"blank_out": null,
+"blank_out_value": null,
+"blind list of run 3": null,
+"bold label": null,
+"bold mark": null,
+"boolean": null,
+"breakdown": null,
+"breakdown key": null,
+"breakdown none": null,
+"breakdown pie": null,
+"broken": null,
+"bucket": null,
+"buckets": null,
+"build": null,
+"by": null,
+"by key": null,
+"by recruiter interviews ka chart chahiye": [
+null,
+false
+],
+"c": null,
+"can i add a chart to the candidate page in salesforce": null,
+"can i get a graph for total leads per city": [
+null,
+false
+],
+"can you chart this": [
+null,
+true
+],
+"can you make a chart": [
+null,
+true
+],
+"can you make a chart of leads in salesforce": [
+null,
+false
+],
+"can you plot the number of candidates placed from january to december 2026": [
+null,
+false
+],
+"can you plot the placement rate monthwise from january to october?": [
+null,
+false
+],
+"can you visualize this": [
+null,
+true
+],
+"candidate address plot no 9 ki details": null,
+"candidate wise chart": [
+null,
+false
+],
+"candidates at plot-45 sector 21": null,
+"candidates by status ka graph plus list": [
+null,
+false
+],
+"candidates in the recruitment funnel": null,
+"candidates ka graph dikhao": [
+null,
+false
+],
+"candidates living at plot number 5": null,
+"candidates under recruiter Plott": null,
+"candidates with java treemap experience": null,
+"candidates with tableau visualization experience": null,
+"candidates without visa chart": [
+null,
+false
+],
+"candidates working as line supervisor": null,
+"cannot ": null,
+"cash flow chart for the year": [
+null,
+false
+],
+"changes": null,
+"chart": [
+null,
+true
+],
+"chart ": [
+null,
+true
+],
+"chart bana ke dikhao candidates by status": [
+null,
+false
+],
+"chart banao": [
+null,
+true
+],
+"chart banao na": [
+null,
+true
+],
+"chart band karo": null,
+"chart bnao": [
+null,
+true
+],
+"chart by lead source": [
+null,
+false
+],
+"chart by month, leads only": [
+null,
+false
+],
+"chart by recruiter of interviews": [
+null,
+false
+],
+"chart chahiye": [
+null,
+true
+],
+"chart dikhao na": [
+null,
+true
+],
+"chart do na": [
+null,
+true
+],
+"chart hatao": null,
+"chart is empty": [
+null,
+true
+],
+"chart it": [
+null,
+true
+],
+"chart ke bagair": null,
+"chart ke bina": null,
+"chart ke bina dikhao candidates by status": null,
+"chart ki jarurat nahi hai": null,
+"chart ki zaroorat nahi hai, sirf numbers do": null,
+"chart mat dikhao": null,
+"chart na banao": null,
+"chart nahi chahiye, sirf table do": null,
+"chart of Q4 2031 vs this month": [
+null,
+false
+],
+"chart of accounts by industry": [
+null,
+false
+],
+"chart of accounts dikhao": null,
+"chart of accounts kidhar hai": null,
+"chart of accounts owner wise": [
+null,
+false
+],
+"chart of accounts per owner": [
+null,
+false
+],
+"chart of leads by area": [
+null,
+false
+],
+"chart of leads in west area": [
+null,
+false
+],
+"chart of leads per area": [
+null,
+false
+],
+"chart of line of business": [
+null,
+false
+],
+"chart of offers this year": [
+null,
+false
+],
+"chart of open positions by funnel stage": [
+null,
+false
+],
+"chart of orders per product line": [
+null,
+false
+],
+"chart of revenue by business line": [
+null,
+false
+],
+"chart view of candidates by niche": [
+null,
+false
+],
+"chart word, lean": [
+null,
+false
+],
+"chart word, records only": [
+null,
+false
+],
+"chart-of-accounts": [
+null,
+false
+],
+"chart. ": [
+null,
+true
+],
+"chartered accountant candidates": null,
+"charts": [
+null,
+true
+],
+"charts dikhao leads ke": [
+null,
+false
+],
+"charts of leads by source": [
+null,
+false
+],
+"charts=-": [
+null,
+true
+],
+"charts=group_records/barx1": [
+null,
+false
+],
+"charts_asks.jsonl": null,
+"charts_error": null,
+"charts_error=": null,
+"charts_flow": null,
+"charts_flow_on": null,
+"charts_switch": null,
+"charts_talk": null,
+"chat history of this session": null,
+"check": null,
+"chrat of leads": [
+null,
+false
+],
+"chrt banao": [
+null,
+true
+],
+"circle": null,
+"class": null,
+"cli_rows": null,
+"code": null,
+"code_answer": null,
+"column chart of submissions": [
+"bar",
+false
+],
+"column level security on Contact": null,
+"column name of candidate status": null,
+"compare": null,
+"compare label": null,
+"compare line": null,
+"compare none": null,
+"compare other": null,
+"compare pie": null,
+"compare placements across recruiters using a bar chart": [
+"bar",
+false
+],
+"compare_records": null,
+"composite graph API limit": null,
+"content": null,
+"could be drawn": null,
+"count": null,
+"count_distinct": null,
+"count_records": null,
+"counted": null,
+"ctrl\u0001\u000b\u001fchars": null,
+"cx": null,
+"cy": null,
+"d": null,
+"d3 charts": [
+null,
+false
+],
+"dashboard chart is not loading": null,
+"dashboard chart of cases by owner": [
+null,
+false
+],
+"dashboard dikhao": null,
+"data": null,
+"data aur chart dono do": [
+null,
+true
+],
+"data dikhao": null,
+"data visualization candidates": null,
+"data-words-without-a-chart-ask": [
+null,
+false
+],
+"date_field": null,
+"dates": null,
+"define bar chart": null,
+"deliverables status wise graph me dikhao": [
+null,
+false
+],
+"desc": null,
+"descending": null,
+"description": null,
+"design": null,
+"did Polt attend the session": null,
+"digit stays": null,
+"dikhao": null,
+"direct.duckdb": null,
+"distinct line": null,
+"does not fit": null,
+"does salesforce support graphql queries": null,
+"does the org have a chart of accounts": null,
+"does the org use GraphQL": null,
+"don't plot it": null,
+"donut": null,
+"donut chart of status": [
+"donut",
+false
+],
+"double space": null,
+"doughnut chart of status": [
+"donut",
+false
+],
+"draft": null,
+"draft, options, talk": null,
+"draw a pie for lead source share": [
+"pie",
+false
+],
+"draw this graphically": [
+null,
+true
+],
+"drawable_ask": null,
+"drop": null,
+"duckdb": null,
+"e": null,
+"e+": null,
+"eight end at 0": null,
+"eight end level": null,
+"ek bar chart banao": [
+"bar",
+true
+],
+"ek bar chat check karo": null,
+"ek bar chat history dekho": null,
+"ek bar please check karo kitne interviews hue": null,
+"empty record answer": null,
+"en": null,
+"end": null,
+"entries": null,
+"eq": null,
+"error": null,
+"esc\u001b[0m": null,
+"esc[0m": null,
+"example": null,
+"explain the onboarding flow": null,
+"extra": null,
+"f": null,
+"f0": null,
+"f0 s": null,
+"f1": null,
+"f1 s": null,
+"failed": null,
+"fake copy": null,
+"fault": null,
+"field": null,
+"field_values": null,
+"fields": null,
+"fill": null,
+"filters": null,
+"find_references": null,
+"first two close": null,
+"first two level": null,
+"first_bucket_partial": null,
+"fixtures": null,
+"flow chart banao": null,
+"flow chart of the candidate onboarding process": null,
+"flow-chart of lead conversion": null,
+"flowchart banake samjhao lead conversion": null,
+"font-family": null,
+"font-size": null,
+"font-weight": null,
+"four end low": null,
+"free text": null,
+"from": null,
+"full": null,
+"full knowledge": null,
+"full rows by code": null,
+"funnel chart of stages": [
+"unsupported",
+false
+],
+"funnel of the conversion stages": [
+"unsupported",
+false
+],
+"funnel stage of the lead": null,
+"g": null,
+"garaf dikhao": [
+null,
+true
+],
+"get_field_history": null,
+"get_field_values": null,
+"get_sync_status": null,
+"give me a table instead of a chart": null,
+"give me a visualisation of leads by source": [
+null,
+false
+],
+"give me chart for candidates created this month week wise": [
+null,
+false
+],
+"give the records and a bar chart of them": [
+"bar",
+true
+],
+"golden": null,
+"graaf dikhao": [
+null,
+true
+],
+"graf bnao month wise": [
+null,
+false
+],
+"graf dikhao": [
+null,
+true
+],
+"grafh": [
+null,
+true
+],
+"grafh dikhao": [
+null,
+true
+],
+"grain": null,
+"graph bana ke do": [
+null,
+true
+],
+"graph bhi dikhao aur data bhi": [
+null,
+true
+],
+"graph database for contacts": null,
+"graph dikhao": [
+null,
+true
+],
+"graph dikhao na": [
+null,
+true
+],
+"graph hata do": null,
+"graph ka matlab kya hai": null,
+"graph ke bagair sirf count batao": null,
+"graph ke bina batao": null,
+"graph mat banao": null,
+"graph neural network candidates": [
+null,
+false
+],
+"graph of candidates by line manager": [
+null,
+false
+],
+"graph of open opportunities by stage": [
+null,
+false
+],
+"graph of this month": [
+null,
+false
+],
+"graph the joinings per month": [
+null,
+false
+],
+"graph-words": [
+null,
+false
+],
+"graphic designer candidates": null,
+"group": null,
+"group 9 rows": null,
+"group bad split": null,
+"group bad split pie": null,
+"group bar": null,
+"group bar 9 rows": null,
+"group donut": null,
+"group donut refused": null,
+"group horizontal": null,
+"group label": null,
+"group line": null,
+"group line 9 rows": null,
+"group long label": null,
+"group none": null,
+"group other": null,
+"group pie": null,
+"group pie refused": null,
+"group_by": null,
+"group_count": null,
+"group_records": null,
+"grouped_by": null,
+"groups": null,
+"grpah of leads by month": [
+null,
+false
+],
+"grph dikhao": [
+null,
+true
+],
+"h l": null,
+"har bar me kitne leads": null,
+"har mahine ki joining line graph me dikhao": [
+"line",
+false
+],
+"har recruiter ka bar graph": [
+"bar",
+false
+],
+"har recruiter ke placements ka chart de do": [
+null,
+false
+],
+"has a Missing__c": null,
+"has a Session__c": null,
+"has a Session__c with Name = 'Typed' (by Session__c)": null,
+"has at least 2 Session__c": null,
+"has no Note__c": null,
+"heading": null,
+"heatmap kya hai": null,
+"height": null,
+"hidden": null,
+"hide names and plot it": [
+null,
+false
+],
+"hide the graph": null,
+"hide the pie chart": null,
+"highest,whole": null,
+"hinglish": null,
+"histogarm of salaries": [
+"unsupported",
+false
+],
+"histogram for experience years": [
+"unsupported",
+false
+],
+"histogram kya hai": null,
+"histogram kya hota hai": null,
+"histogram of salaries": [
+"unsupported",
+false
+],
+"home": null,
+"horizontal": null,
+"horizontal bar": [
+"horizontal_bar",
+true
+],
+"horizontal bar chart of recruiters": [
+"horizontal_bar",
+false
+],
+"horizontal chart of leads by status": [
+"horizontal_bar",
+false
+],
+"horizontal graph of leads": [
+"horizontal_bar",
+false
+],
+"horizontal_bar": null,
+"how do I add a chart to a report in Salesforce": null,
+"how do i add a chart on the Lead layout": null,
+"how do i embed a graph in a lightning page": null,
+"how do you read a line chart": null,
+"how many candidates applied as area sales manager": null,
+"how many candidates for graphical designer role": null,
+"how many candidates per month, show in a graph": [
+null,
+false
+],
+"how many candidates want to switch to line manager role": null,
+"how many dashboards are there": null,
+"how many graphics roles are open": null,
+"how many interviews are there": null,
+"how many interviews are there per status?": null,
+"how many interviews did Graf take last month": null,
+"how many interviews mention communication as an area for improvement": null,
+"how many list view charts are there": null,
+"how many open cases are there": null,
+"how many records are in the knowledge graph": null,
+"how many report folders are there": null,
+"how many visually impaired candidates": null,
+"how to add chart in x ": [
+null,
+false
+],
+"how to create a chart on a dashboard": null,
+"how to embed a graph in a lightning page": null,
+"how to make a chart of candidates by status": [
+null,
+false
+],
+"how to show picklist values as columns in a report": null,
+"href": null,
+"http://": null,
+"http://127.0.0.1:9/v1": null,
+"hunter2": null,
+"i": null,
+"i did not ask for a chart": null,
+"id": null,
+"illi": null,
+"image": null,
+"imported": null,
+"in line with the policy": null,
+"in the rows": null,
+"inf": null,
+"inputSchema": null,
+"interview status": null,
+"interviews": null,
+"interviews per month graph dikhao": [
+null,
+false
+],
+"is bar char candidates select hue": null,
+"is bar chart me dikhao": [
+"bar",
+true
+],
+"is bar please sahi count do": null,
+"is data ka chart bana": [
+null,
+true
+],
+"is in the rows, not on the chart: its values do not add up to each row's total.": [
+null,
+false
+],
+"is shown on the status chart": [
+null,
+false
+],
+"is the status of the interview": null,
+"is there a flow chart for the visa process": null,
+"is_blank": null,
+"iska graph banao": [
+null,
+true
+],
+"iska graph month wise banao": [
+null,
+true
+],
+"isko bar chart me kar do": [
+"bar",
+true
+],
+"isko bar me dikhao": [
+"bar",
+true
+],
+"isko chart me dikhao": [
+null,
+true
+],
+"isko graph mai dikhao": [
+null,
+true
+],
+"isko last 6 months ka graph banao": [
+null,
+true
+],
+"isko line me dikhao": [
+"line",
+true
+],
+"isko pie me dikhao": [
+"pie",
+true
+],
+"javascript:": null,
+"joining trend by month": null,
+"joinings for the last six months as a line graph": [
+"line",
+false
+],
+"jsonl": null,
+"just the data and a chart please": [
+null,
+true
+],
+"just the numbers in a chart": [
+null,
+true
+],
+"just the table please": null,
+"key=[hidden]": null,
+"kind": null,
+"kind=merged": null,
+"kind=none": null,
+"kinds": null,
+"kitne leads aaye har mahine, graph me batao": [
+null,
+false
+],
+"kitni bar please batao": null,
+"knowledge": null,
+"knowledge_mode": null,
+"kya tum chart bana sakte ho": [
+null,
+true
+],
+"l": null,
+"l0": null,
+"l1": null,
+"label": null,
+"last 6 months": null,
+"last month": null,
+"last month*": null,
+"last two close": null,
+"last,written": null,
+"last_bucket_partial": null,
+"lead": null,
+"lead conversion flow ka flow chart do": null,
+"lead wise pie chart": [
+"pie",
+false
+],
+"leads ka chart dikhao na": [
+null,
+false
+],
+"leads ka graph banao na": [
+null,
+false
+],
+"leads without owner graph": [
+null,
+false
+],
+"lean": null,
+"lean dropped": null,
+"lean none": null,
+"lean rows by code": null,
+"lean+full": null,
+"lean_knowledge": null,
+"lets chat about the numbers": null,
+"limit": null,
+"line": null,
+"line char of joinings": [
+"line",
+false
+],
+"line chart me monthly count dikha": [
+"line",
+false
+],
+"line graph of monthly joinings": [
+"line",
+false
+],
+"line grph of joinings": [
+"line",
+false
+],
+"line item on the invoice": null,
+"line manager of the sales team": null,
+"line me lagao": null,
+"line of business for this account": null,
+"list": null,
+"list all dashboards with their folder": null,
+"list candidates by niche and also plot it": [
+null,
+false
+],
+"list candidates working as funnel analyst": null,
+"list interviews and a bar chart of them by status": [
+"bar",
+false
+],
+"list the top five accounts by revenue": null,
+"list view chart on the Contact object": null,
+"list view of open cases": null,
+"list_records": null,
+"listed": null,
+"look-alike-words": null,
+"lookup_footer": null,
+"m": null,
+"made-up fault": null,
+"mail a@example.invalid": null,
+"mail b@example.invalid": null,
+"main character of the story": null,
+"make a flowchart of the application flow": null,
+"make it a line chart": [
+"line",
+true
+],
+"make it a list": null,
+"make it a pie chart by recruiter": [
+"pie",
+true
+],
+"make it a summary": null,
+"make it a table": null,
+"make it horizontal": [
+"horizontal_bar",
+true
+],
+"make that a paragraph": null,
+"make_model": null,
+"mark": null,
+"matches": null,
+"matplotlib": null,
+"max": null,
+"max line": null,
+"mean": null,
+"measure": null,
+"measure,word": null,
+"measure_field": null,
+"median_of_something": null,
+"meeting": null,
+"merge": null,
+"merge call": null,
+"merge failed": null,
+"merge rejected": null,
+"merge_by": null,
+"merge_calls=0": null,
+"merge_calls=1": null,
+"merge_seconds": null,
+"merged": null,
+"merged accepted": null,
+"messages": null,
+"middle": null,
+"min": null,
+"min line": null,
+"min_value": null,
+"minimum": null,
+"mode=full": null,
+"mode=lean": null,
+"model": null,
+"module": null,
+"month": null,
+"month wise joining count": null,
+"month wise joining ka graph": [
+null,
+false
+],
+"monthly submissions trend graph": [
+null,
+false
+],
+"ms graph connection status": null,
+"mujhe ek chart do": [
+null,
+true
+],
+"n": null,
+"name": null,
+"name,key": null,
+"name,tool,res,asked,kind,stacked,series,words": null,
+"name,values": null,
+"names": null,
+"nan": null,
+"narrow values": null,
+"need a bar graph for open positions by client": [
+"bar",
+false
+],
+"negative": null,
+"no bar chart": null,
+"no chart, just numbers": null,
+"no date": null,
+"no named group": null,
+"no need for a chart, just list the candidates": null,
+"no of candidates": null,
+"no of candidates chart": [
+null,
+false
+],
+"no show chart": null,
+"no show chart by recruiter": null,
+"no show count graph": [
+null,
+false
+],
+"no show interviews chart": [
+null,
+false
+],
+"no table just chart": [
+null,
+true
+],
+"no value": null,
+"no-show chart by recruiter": [
+null,
+false
+],
+"no_data": null,
+"no_data_fields": null,
+"no_date": null,
+"no_field_data": null,
+"no_positive": null,
+"no_records": null,
+"no_rows": null,
+"no_rows_min": null,
+"no_rows_top": null,
+"no_value": null,
+"no_values": null,
+"none": null,
+"not a day": null,
+"not in this copy": null,
+"not just the data, plot it too": [
+null,
+false
+],
+"not submitted candidates graph": [
+null,
+false
+],
+"not submitted chart by recruiter": [
+null,
+false
+],
+"not table but chart": [
+null,
+false
+],
+"not xml at all": null,
+"note": null,
+"note,index,label": null,
+"notes": null,
+"nothing": null,
+"now plot that": [
+null,
+true
+],
+"now plot that by month": [
+null,
+true
+],
+"null_no_column": null,
+"object": null,
+"off": null,
+"offer wise graph dikhao": [
+null,
+false
+],
+"ok": null,
+"on": null,
+"one_number": null,
+"one_row": null,
+"one_share": null,
+"onload=": null,
+"only data for 2026 in a chart": [
+null,
+false
+],
+"only_blank": null,
+"op": null,
+"opacity": null,
+"open positions for visualization engineer": null,
+"openai_tools_sha256": null,
+"options": null,
+"order": null,
+"order,word": null,
+"org chart me uske upar kaun hai": null,
+"org chart of the recruitment team": null,
+"org-and-flow": null,
+"org-chart for engineering": null,
+"organisational chart of the client": null,
+"organization chart of the company": null,
+"orgchart of the sales team": null,
+"other": null,
+"other_field": null,
+"overlap": null,
+"overrule": null,
+"overrule_reason": null,
+"overruled=chart": [
+null,
+false
+],
+"overruled_by": null,
+"owner ke hisaab se total hours ka graph banao": [
+null,
+false
+],
+"part_filters": null,
+"partial": null,
+"patched, exc, items": null,
+"path": null,
+"people": null,
+"per month interviews ka graph banao": [
+null,
+false
+],
+"per month revenue chart": [
+null,
+false
+],
+"percent": null,
+"percentage_of_records": null,
+"period": null,
+"periods": null,
+"phrase": null,
+"phrase,expected": null,
+"pichle answer ka graph": [
+null,
+true
+],
+"pichli bar char interviews hue the": null,
+"pichli bar please dekho": null,
+"pictorial view of leads by source": [
+null,
+false
+],
+"pie": null,
+"pie char of status": [
+"pie",
+false
+],
+"pie chart bana k dikhao lead source ka": [
+"pie",
+false
+],
+"pie chart dikhao na": [
+"pie",
+true
+],
+"pie chart kab use karte hain": null,
+"pie chart kya hota hai": null,
+"pie chart me dikhao": [
+"pie",
+true
+],
+"pie chart of placements by client": [
+"pie",
+false
+],
+"pie chat for status": [
+"pie",
+false
+],
+"pie chat of status": [
+"pie",
+false
+],
+"pie chrat of status": [
+"pie",
+false
+],
+"pie diagram of status": [
+"pie",
+false
+],
+"pie me dikhao": [
+"pie",
+true
+],
+"pie of sales by region": [
+"pie",
+false
+],
+"pie rate for the vendor": null,
+"piechart of status": [
+"pie",
+false
+],
+"pipeline.py": null,
+"placement": null,
+"plain": null,
+"plain.txt": null,
+"plot 12b sector 7 address": null,
+"plot 7 sector 21 address": null,
+"plot a-12 candidates": null,
+"plot by month the leads": [
+null,
+false
+],
+"plot by month: interviews": [
+null,
+false
+],
+"plot h1 leads by owner": [
+null,
+false
+],
+"plot kar do": [
+null,
+true
+],
+"plot karo": [
+null,
+true
+],
+"plot karo na": [
+null,
+true
+],
+"plot leads by month": [
+null,
+false
+],
+"plot no 12 candidate address": null,
+"plot no of joinings per month": [
+null,
+false
+],
+"plot no. 45 industrial area candidates": null,
+"plot number of candidates by month": [
+null,
+false
+],
+"plot q1 revenue": [
+null,
+false
+],
+"plot revenue as a line": [
+"line",
+false
+],
+"plot revenue by month": [
+null,
+false
+],
+"plot that by lead source": [
+null,
+true
+],
+"plot that by month for leads": [
+null,
+false
+],
+"plot that by month leads": [
+null,
+false
+],
+"plot that by recruiter": [
+null,
+true
+],
+"plot that for west region": [
+null,
+false
+],
+"plot this for last year": [
+null,
+true
+],
+"plot this year's leads by month": [
+null,
+false
+],
+"plot twist in the project": null,
+"plot-words": [
+null,
+false
+],
+"plotted joinings by month": [
+null,
+false
+],
+"plotting code": [
+null,
+false
+],
+"plotting leads by month": [
+null,
+false
+],
+"pls make graph of leads by owner": [
+null,
+false
+],
+"plto karo": [
+null,
+true
+],
+"private-value": null,
+"private-value-7": null,
+"process flow chart of onboarding": null,
+"prompts": null,
+"properties": null,
+"q": null,
+"q1": null,
+"q2": null,
+"q3": null,
+"q4": null,
+"q5": null,
+"q6": null,
+"q7": null,
+"q9": null,
+"queries": null,
+"query": null,
+"query_id": null,
+"question": null,
+"question, steps, options, env, route": null,
+"questions": null,
+"r": null,
+"rather than a graph show the rows": null,
+"raw": null,
+"raw,mode,on,problem": null,
+"reach a@example.invalid now": null,
+"read: 3 chart rows (3 questions, 0 fit no id)": [
+null,
+false
+],
+"read_as_line": null,
+"read_model_test.py": null,
+"reason": null,
+"rec": null,
+"record": null,
+"record_answer": null,
+"record_dropped_raw": null,
+"records": null,
+"records dropped": null,
+"records only": null,
+"records rows by code": null,
+"records_chart_note": null,
+"records_chart_words.md": null,
+"records_matched": null,
+"records_off": null,
+"records_only": null,
+"records_without_date": null,
+"recruiter wise candidates": null,
+"recruiter wise candidates ka bar chart banao": [
+"bar",
+false
+],
+"recruiter wise interviews ka chart chahiye, top 10": [
+null,
+false
+],
+"rect": null,
+"references": null,
+"related": null,
+"remove table and plot": [
+null,
+false
+],
+"remove the bar chart": null,
+"remove the chart": null,
+"report chart is not loading": null,
+"report chart of leads by source": [
+null,
+false
+],
+"report-dashboard-listview": null,
+"required": null,
+"resolver": null,
+"result": null,
+"result trimmed to fit: showing 0 of 12": null,
+"result trimmed to fit: showing 0 of 5": null,
+"result trimmed to fit: showing 10 of 50": null,
+"result trimmed to fit: showing 2 of 12": null,
+"result trimmed to fit: showing 2 of 3": null,
+"result trimmed to fit: showing 2 of 4 segments": null,
+"result trimmed to fit: showing 49 of 50": null,
+"role": null,
+"rounds= 0": null,
+"rounds= 2": null,
+"route": null,
+"route=False": null,
+"route=True": null,
+"routed": null,
+"rows": null,
+"rows by code": null,
+"rows_in_answer": null,
+"running": null,
+"rx": null,
+"salesforce-words-that-are-still-requests": null,
+"same thing as a bar chart": [
+"bar",
+true
+],
+"same_labels": null,
+"scater plot of rate vs experience": [
+"unsupported",
+false
+],
+"scatter plot of rate vs experience": [
+"unsupported",
+false
+],
+"search_all_knowledge": null,
+"search_records": null,
+"seconds": null,
+"segments": null,
+"several": null,
+"sf_assistant.engine": null,
+"sf_assistant.engine.types": null,
+"sfa_web_pipeline_flow": null,
+"short first, 12": null,
+"short first, 20": null,
+"short first, 30 weeks": null,
+"show a bar chart of interviews by status": [
+"bar",
+false
+],
+"show bar chart of by status the and how many records list count open per month interview interviews": [
+"bar",
+false
+],
+"show candidates with bar council certificate": null,
+"show chart by candidates by recruiter": [
+null,
+false
+],
+"show chart in a line": [
+"line",
+true
+],
+"show it as a bar by month": [
+"bar",
+true
+],
+"show it as a line": [
+"line",
+true
+],
+"show leads visually": [
+null,
+false
+],
+"show me a chart of candidates by status": [
+null,
+false
+],
+"show me a chart of candidates by status ": [
+null,
+false
+],
+"show me the org chart": null,
+"show me the reporting structure of the sales team": null,
+"show opportunity amount by stage in a bar chart": [
+"bar",
+false
+],
+"show the chart of accounts": null,
+"show the org chart of the sales team": null,
+"show the previous answer in a graph": [
+null,
+true
+],
+"show the table instead": null,
+"show this as a bar chart": [
+"bar",
+true
+],
+"show this visually": [
+null,
+true
+],
+"showing": null,
+"showing 3 of 64 groups": null,
+"showing 50 of 51 groups": null,
+"showing 50 of 64 groups": null,
+"showing_low": null,
+"showing_top": null,
+"shown": null,
+"sideways": null,
+"sirf data ka chart": [
+null,
+true
+],
+"sirf table do": null,
+"skip table and chart it": [
+null,
+false
+],
+"skip the chart, just the table": null,
+"skip the line graph": null,
+"some_new_tool": null,
+"source": null,
+"split_adds": null,
+"split_by": null,
+"split_left": null,
+"split_many": null,
+"split_measure": null,
+"split_same": null,
+"stack 9 rows": null,
+"stack bar": null,
+"stack donut": null,
+"stack horizontal": null,
+"stack line": null,
+"stack none": null,
+"stack other": null,
+"stack pie": null,
+"stacked": null,
+"stacked bar of status by recruiter": [
+"bar",
+false
+],
+"stage": null,
+"status chart": [
+null,
+false
+],
+"status ka count dikhao": null,
+"status ka pie chart bana do": [
+"pie",
+false
+],
+"status wise count of leads": null,
+"status_lines": null,
+"stop": null,
+"stop showing charts": null,
+"stop-words": null,
+"string": null,
+"stroke": null,
+"stroke-dasharray": null,
+"stroke-linecap": null,
+"stroke-linejoin": null,
+"stroke-width": null,
+"style": null,
+"subtitle": null,
+"sum": null,
+"summarize the subplot": null,
+"svg": null,
+"svg_b64": null,
+"switch to area manager": null,
+"switch to area manager in the org settings": null,
+"synthetic question": null,
+"t": null,
+"table and chart of leads by source": [
+null,
+false
+],
+"table banao": null,
+"table only": null,
+"table-follow-ups": null,
+"tables": null,
+"tables, options": null,
+"test-key": null,
+"tests": null,
+"text": null,
+"text,kept": null,
+"text,left": null,
+"text-anchor": null,
+"the (blank) group is left out of the ranking": null,
+"the chart is not showing": [
+null,
+true
+],
+"the chart is wrong": [
+null,
+true
+],
+"the first bucket (2026-01) covers only 2026-01-15 onward (the period starts inside that month); first": null,
+"the last bucket (2026-03) covers only up to 2026-03-20 (the period ends inside that month)": null,
+"the last bucket (2026-03) is still running (today is 2026-03-10)": null,
+"the merge model is down": null,
+"the reader of the model test is not in a clean checkout": null,
+"ther": null,
+"this month": null,
+"this month*": null,
+"this year": null,
+"three": null,
+"tie": null,
+"ties": null,
+"ties_at_cutoff": null,
+"ties_at_cutoff_count": null,
+"time_zone": null,
+"timeline": null,
+"title": null,
+"to": null,
+"to_exclusive": null,
+"tok_in": null,
+"tok_in=      0": null,
+"token=abc123 password: hunter2": null,
+"too_large": null,
+"too_many": null,
+"tool": null,
+"tool, args": null,
+"tool, res, question": null,
+"tool,res,args": null,
+"tool,res,word,rows": null,
+"tool_calls": null,
+"tool_lists.json": null,
+"tools": null,
+"tools=-": null,
+"tools=group_recordsx1": null,
+"top": null,
+"top recruiters by placements this month": null,
+"total": null,
+"total_across_groups": null,
+"trend": null,
+"trend bad split": null,
+"trend bad split bar": null,
+"trend bad split line": null,
+"trend bar": null,
+"trend bar 30": null,
+"trend bar 31": null,
+"trend chart of applications": [
+null,
+false
+],
+"trend donut": null,
+"trend horizontal": null,
+"trend line": [
+"line",
+false
+],
+"trend line of joinings": [
+"line",
+false
+],
+"trend none": null,
+"trend of lead conversion last quarter": null,
+"trend other": null,
+"trend pie": null,
+"trend stack 31": null,
+"trend stack bar": null,
+"trend stack bar 31": null,
+"trend stack donut": null,
+"trend stack horizontal": null,
+"trend stack line": null,
+"trend stack none": null,
+"trend stack other": null,
+"trend stack pie": null,
+"trend stack sum": null,
+"trend_records": null,
+"triage": null,
+"trimmed": null,
+"truncated": null,
+"two spaces": null,
+"two; drop table": null,
+"type": null,
+"type_no_fit": null,
+"type_other": null,
+"typed": null,
+"typed words": null,
+"typed,word": null,
+"typo": null,
+"unresolved": null,
+"unresolved_ids": null,
+"unresolved_out": null,
+"unsupported": null,
+"upar wale data ka chart banao": [
+null,
+true
+],
+"url(": null,
+"url(http://example.invalid)": null,
+"use a bar chart instead of a line chart for leads by source": [
+"bar",
+false
+],
+"use a bar chart instead of a pie chart for leads by source": [
+"bar",
+false
+],
+"use a pie chart instead of a bar chart for leads by source": [
+"pie",
+false
+],
+"utf-8": null,
+"value": null,
+"values": null,
+"viewBox": null,
+"visual of leads by source": [
+null,
+false
+],
+"visual representation of candidates by visa status": [
+null,
+false
+],
+"visual studio candidates": null,
+"visualize applications by recruiter": [
+null,
+false
+],
+"visulize candidates by status": [
+null,
+false
+],
+"vizualize leads by source": [
+null,
+false
+],
+"web": null,
+"week": null,
+"week of": null,
+"week of 2026-": null,
+"week of 2026-01-05": null,
+"week of 2026-01-12": null,
+"weird": null,
+"what are charts used for": null,
+"what did I ask in the chat": null,
+"what does Dashboard.ChartTheme hold": null,
+"what does a box plot mean": null,
+"what does the status field of an interview mean?": null,
+"what flow runs when a lead is converted": null,
+"what is ListViewChart.ChartType": null,
+"what is a bar chart": null,
+"what is a dashboard chart": null,
+"what is a data graph": null,
+"what is a heatmap": null,
+"what is a histogram": null,
+"what is a report chart": null,
+"what is in the chart of accounts": null,
+"what is the Graph API": null,
+"what is the chart of accounts object in salesforce": null,
+"what is the chart view in the admin training dashboard": null,
+"what is the difference between a bar chart and a line chart": null,
+"what is the distribution of candidates by niche": null,
+"what is the e-mail address": null,
+"what is the funnel of a candidate in salesforce": null,
+"what is the trend of joinings": null,
+"what was the plot of the movie we discussed": null,
+"what's a treemap": null,
+"when should i use a pie chart": null,
+"which area has most candidates, show a chart": [
+"unsupported",
+false
+],
+"which area has the most candidates": null,
+"which candidates live at plot-45 sector 21": null,
+"which candidates were flagged as a bar raiser": null,
+"which chart is best for this data": null,
+"which dashboard uses the chart theme": null,
+"which dashboards have a bar chart": [
+"bar",
+false
+],
+"which flow updates the candidate status": null,
+"which recruiter has the most joinings? chart it.": [
+null,
+false
+],
+"which reports have a report chart": null,
+"who drew the org chart": null,
+"who is at the top of the org chart": null,
+"who owns the recruiting dashboard": null,
+"who reports to the head of delivery": null,
+"who works as a line manager": null,
+"who works as a line supervisor": null,
+"why not chart it": [
+null,
+false
+],
+"why not show a graph": [
+null,
+false
+],
+"wide values": null,
+"width": null,
+"without a chart": null,
+"without table show chart": [
+null,
+false
+],
+"word=-": null,
+"word=bare": null,
+"words": null,
+"words.txt": null,
+"work": null,
+"workflow chart of the release": null,
+"x": null,
+"x ": null,
+"x_key": null,
+"xmlns=\"http://www.w3.org/2000/svg\"": null,
+"xx": null,
+"y": null,
+"y_keys": null,
+"z": null,
+"zorvex": null,
+"{'bare': 1}": null,
+"{http://www.w3.org/2000/svg}": null,
+"{{": null,
+"{{chart": [
+null,
+true
+],
+"{{chart q1}}": [
+null,
+false
+],
+"{{table": null,
+"{{table q1}}": null,
+"{{table q2}}": null,
+"}": null,
+"é": null,
+"…": null,
+"… (#2)": null,
+"████": null
+}
