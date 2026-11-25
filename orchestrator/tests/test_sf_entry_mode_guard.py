@@ -44,6 +44,12 @@ def test_sf_intel_hands_back_a_non_salesforce_mode_before_reading_any_state(monk
     assert outcome.handled is False and outcome.resolved_text == ""
 
 
+def test_a_request_that_names_no_mode_is_an_assistant_request():
+    request = ChatRequest(message="hello")
+    assert request.mode == "assistant"
+    assert "mode" not in request.model_fields_set
+
+
 def test_main_passes_the_mode_to_sf_intel():
     import inspect
 

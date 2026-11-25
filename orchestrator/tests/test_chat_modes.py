@@ -496,8 +496,10 @@ def test_agent_meta_reports_smart_model_and_applied_effort(monkeypatch):
     assert meta["effort"] == "think"
 
 
-def test_salesforce_mode_default_unchanged_router_still_runs(monkeypatch):
-    """V1 behavior preserved: default mode still consults the router."""
+def test_a_request_that_names_no_mode_is_an_assistant_turn(monkeypatch):
+    """The default mode is "assistant" since 2026-11-25 (toggle-off isolation
+    G6; it was "salesforce", fail-open): a client that names no mode never
+    reaches the Salesforce router. The browser always names one."""
     calls = {}
 
     async def route_sql(message, has_image=False, history=()):
@@ -512,7 +514,9 @@ def test_salesforce_mode_default_unchanged_router_still_runs(monkeypatch):
     with TestClient(app) as client:
         resp = client.post("/chat", json={"message": "top accounts"})
     assert resp.status_code == 200
-    assert calls["routed"] == "top accounts"
+    assert "routed" not in calls
+    meta = [json.loads(line[6:]) for line in resp.text.splitlines() if line.startswith("data: {") and '"route"' in line]
+    assert meta and meta[-1]["mode"] == "assistant"
 
 
 # ---------------------------------------------------------------------------

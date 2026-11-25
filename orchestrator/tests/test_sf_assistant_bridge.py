@@ -1285,8 +1285,11 @@ def test_a_stored_line_that_cannot_be_read_closes_the_fallback_only_for_those_wh
 
 # The turns the bridge would not take to the service, in a chat holding a stop line.
 _LONG_QUESTION = "x " * 600
+#: "no mode" left this list on 2026-11-25: a request that names no mode is an
+#: assistant (toggle-off) turn since then, which no Salesforce path reads at
+#: all (toggle-off isolation G6). Its own test is below the three that use it.
 DECLINES = ["too long", "a pdf reference", "a video reference", "no token", "no socket", "open clarification",
-            "clarification not readable", "former admin", "no mode"]
+            "clarification not readable", "former admin"]
 
 
 def _set_up_decline(decline: str, as_user, monkeypatch) -> tuple:
@@ -1355,6 +1358,17 @@ def test_a_declined_turn_in_a_chat_holding_a_stored_stop_line_stays_away_from_th
     assert older_route == []
     assert service.calls == []
     assert _answers_in(resp.text) == [NEW_CHAT_LINE]
+
+
+def test_a_turn_that_names_no_mode_after_a_stop_line_reaches_no_salesforce_path(service, admin, older_route):
+    """It is an assistant turn: neither the service nor the older route runs."""
+    messages = [{"role": "user", "content": BLOCKED_QUESTION}, {"role": "assistant", "content": PART_ANSWER},
+                {"role": "user", "content": "and his visa number?"}]
+    with TestClient(app) as client:
+        resp = client.post("/chat", json={"messages": messages, "conversation_id": "stop-decline-no-mode"})
+    assert resp.status_code == 200, resp.text
+    assert older_route == []
+    assert service.calls == []
 
 
 def test_a_chat_with_no_conversation_id_after_a_stop_line_stays_away_from_the_older_route(service, admin, older_route):
@@ -1937,7 +1951,8 @@ def test_the_snapshot_keeps_only_a_mode_the_client_named():
     unnamed, _resumable = app_main._request_snapshot(ChatRequest(message=QUESTION))
     assert "mode" not in unnamed
     again = ChatRequest.model_validate(unnamed)
-    assert again.mode == "salesforce"
+    # The default since 2026-11-25 (toggle-off isolation G6).
+    assert again.mode == "assistant"
     assert "mode" not in again.model_fields_set
     named, _resumable = app_main._request_snapshot(ChatRequest(message=QUESTION, mode="salesforce"))
     assert named["mode"] == "salesforce"
@@ -1945,12 +1960,14 @@ def test_the_snapshot_keeps_only_a_mode_the_client_named():
 
 
 def test_a_resume_of_a_client_that_named_no_mode_decides_as_the_first_attempt_did(service, admin, older_route):
+    """Both attempts read the default, which is the assistant since 2026-11-25:
+    no Salesforce path runs."""
     _interrupted_row(admin, "resume-unnamed")
     with TestClient(app) as client:
         resp = client.get("/chat/attach/resume-unnamed")
     assert resp.status_code == 200
     assert service.calls == []
-    assert older_route == [QUESTION]
+    assert older_route == []
 
 
 def test_a_resume_of_a_client_that_named_the_mode_reaches_the_service(service, admin, older_route):
@@ -1973,13 +1990,14 @@ def test_a_member_gets_no_call_through_chat(service, as_user, older_route):
 
 
 def test_an_admin_whose_client_names_no_mode_gets_no_call_through_chat(service, admin, older_route):
-    """The request model defaults to "salesforce", and by the time a turn reaches
-    the bridge the feature gate has assigned the field, so `model_fields_set`
-    holds "mode" for every request. This one fails if the bridge reads it there."""
+    """By the time a turn reaches the bridge the feature gate has assigned the
+    field, so `model_fields_set` holds "mode" for every request. This one fails
+    if the bridge reads it there. Since 2026-11-25 the default is the assistant,
+    so no Salesforce path runs at all."""
     with TestClient(app) as client:
         resp = client.post("/chat", json={"message": QUESTION, "conversation_id": "spy-nomode"})
     assert service.calls == []
-    assert older_route == [QUESTION]
+    assert older_route == []
     assert STATUS_LINE not in resp.text
 
 

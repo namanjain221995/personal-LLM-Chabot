@@ -2681,7 +2681,11 @@ class ChatRequest(BaseModel):
     image_refs: Optional[List[str]] = Field(default=None, fail_fast=True)
     # --- V2 optional fields (defaults preserve v1 behavior) ---
     conversation_id: Optional[str] = None
-    mode: Literal["salesforce", "assistant"] = "salesforce"
+    # "assistant" since 2026-11-25 (toggle-off isolation G6; was "salesforce",
+    # fail-open). The browser always names the mode it is in; a client that
+    # names none gets the toggle-off assistant, and sf_assistant already read
+    # an unnamed mode as off (engines/sfk_bridge.py).
+    mode: Literal["salesforce", "assistant"] = "assistant"
     model: Literal["smart", "fast"] = "smart"
     effort: Literal[
         "fast", "think", "max", "low", "medium", "high", "extra_high"
