@@ -1,0 +1,975 @@
+{
+ "title": "A follow-up right after a patch or shortcut answer keeps the plan's filters and grouping (owner decision of 2026-11-25, items 7 and 8)",
+ "chains": [
+  {
+   "id": "K-filter-kept",
+   "title": "Interviews per recruiter in North America (no period), plot it, and how many were completed: the reading keeps the region and the recruiter, and runs",
+   "design": "owner decision of 2026-11-25, items 7 and 8 (stage-3 owner items O1 and pb R1 / build §4.2): right after a patch or shortcut answer, a model new reading that goes on from the plan keeps every filter of the plan, also with no period, and the plan's grouping and time grain unless the person typed a new one; else it asks (agent/resolver.py _Job._drops_from_plan)",
+   "steps": [
+    {
+     "q": "interviews per recruiter in North America",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "filters": [
+         {
+          "field": "Region__c",
+          "op": "eq",
+          "value": "North America"
+         }
+        ]
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "filters": [
+           {
+            "field": "Region__c",
+            "op": "eq",
+            "value": "North America"
+           }
+          ]
+         }
+        }
+       ],
+       "keys": []
+      }
+     }
+    },
+    {
+     "q": "plot it",
+     "rewrite": "plot interviews per recruiter in North America",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "show_chart": true
+      }
+     }
+    },
+    {
+     "q": "and how many were completed?",
+     "resolve": {
+      "kind": "new",
+      "standalone": "How many interviews per recruiter in North America were completed?",
+      "ops": []
+     },
+     "rewrite": "How many interviews per recruiter in North America were completed?",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "filters": [
+         {
+          "field": "Region__c",
+          "op": "eq",
+          "value": "North America"
+         },
+         {
+          "field": "Interview_Status__c",
+          "op": "eq",
+          "value": "Completed"
+         }
+        ]
+       }
+      },
+      "The answer is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "model": true,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          },
+          {
+           "field": "Interview_Status__c",
+           "op": "eq",
+           "value": "Completed"
+          }
+         ]
+        }
+       }
+      ],
+      "answer_starts": "Read as: `How many interviews per recruiter in North America were completed?`",
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "filters": [
+           {
+            "field": "Region__c",
+            "op": "eq",
+            "value": "North America"
+           },
+           {
+            "field": "Interview_Status__c",
+            "op": "eq",
+            "value": "Completed"
+           }
+          ]
+         }
+        }
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "K-filter-dropped",
+   "title": "Interviews per recruiter in North America (no period), plot it, and how many were completed, read without the region: asks",
+   "design": "owner decision of 2026-11-25, items 7 and 8 (stage-3 owner items O1 and pb R1 / build §4.2): right after a patch or shortcut answer, a model new reading that goes on from the plan keeps every filter of the plan, also with no period, and the plan's grouping and time grain unless the person typed a new one; else it asks (agent/resolver.py _Job._drops_from_plan)",
+   "steps": [
+    {
+     "q": "interviews per recruiter in North America",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "filters": [
+         {
+          "field": "Region__c",
+          "op": "eq",
+          "value": "North America"
+         }
+        ]
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "filters": [
+           {
+            "field": "Region__c",
+            "op": "eq",
+            "value": "North America"
+           }
+          ]
+         }
+        }
+       ],
+       "keys": []
+      }
+     }
+    },
+    {
+     "q": "plot it",
+     "rewrite": "plot interviews per recruiter in North America",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "show_chart": true
+      }
+     }
+    },
+    {
+     "q": "and how many were completed?",
+     "resolve": {
+      "kind": "new",
+      "standalone": "How many interviews per recruiter were completed?",
+      "ops": []
+     },
+     "rewrite": "How many interviews per recruiter were completed?",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "filters": [
+         {
+          "field": "Interview_Status__c",
+          "op": "eq",
+          "value": "Completed"
+         }
+        ]
+       }
+      },
+      "The answer is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "status": "answered",
+      "kind": "none",
+      "reason": "clarify",
+      "model": true,
+      "record": false,
+      "ran_none": true,
+      "detail": "rewrite_filter_lost",
+      "pending": null,
+      "answer_has": [
+       "Please ask the full question."
+      ]
+     },
+     "note": "the plan has no period, so no period check refused this reading at c3ac05fe: it ran over every region; it now asks, as the owner decided"
+    }
+   ]
+  },
+  {
+   "id": "K-grouping-dropped",
+   "title": "Interviews per recruiter in North America (no period), plot it, and how many were completed, read without the recruiter: asks",
+   "design": "owner decision of 2026-11-25, items 7 and 8 (stage-3 owner items O1 and pb R1 / build §4.2): right after a patch or shortcut answer, a model new reading that goes on from the plan keeps every filter of the plan, also with no period, and the plan's grouping and time grain unless the person typed a new one; else it asks (agent/resolver.py _Job._drops_from_plan)",
+   "steps": [
+    {
+     "q": "interviews per recruiter in North America",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "filters": [
+         {
+          "field": "Region__c",
+          "op": "eq",
+          "value": "North America"
+         }
+        ]
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "filters": [
+           {
+            "field": "Region__c",
+            "op": "eq",
+            "value": "North America"
+           }
+          ]
+         }
+        }
+       ],
+       "keys": []
+      }
+     }
+    },
+    {
+     "q": "plot it",
+     "rewrite": "plot interviews per recruiter in North America",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "show_chart": true
+      }
+     }
+    },
+    {
+     "q": "and how many were completed?",
+     "resolve": {
+      "kind": "new",
+      "standalone": "How many interviews in North America were completed?",
+      "ops": []
+     },
+     "rewrite": "How many interviews in North America were completed?",
+     "record": [
+      {
+       "name": "count_records",
+       "args": {
+        "object": "Interview__c",
+        "filters": [
+         {
+          "field": "Region__c",
+          "op": "eq",
+          "value": "North America"
+         },
+         {
+          "field": "Interview_Status__c",
+          "op": "eq",
+          "value": "Completed"
+         }
+        ]
+       }
+      },
+      "The answer is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "status": "answered",
+      "kind": "none",
+      "reason": "clarify",
+      "model": true,
+      "record": false,
+      "ran_none": true,
+      "detail": "rewrite_grouping_lost",
+      "pending": null,
+      "answer_has": [
+       "Please ask the full question."
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "K-typed-group",
+   "title": "Interviews per recruiter in North America (no period), as a table, and how many were completed per candidate: the typed grouping replaces the recruiter, and runs with the region",
+   "design": "owner decision of 2026-11-25, items 7 and 8 (stage-3 owner items O1 and pb R1 / build §4.2): right after a patch or shortcut answer, a model new reading that goes on from the plan keeps every filter of the plan, also with no period, and the plan's grouping and time grain unless the person typed a new one; else it asks (agent/resolver.py _Job._drops_from_plan)",
+   "steps": [
+    {
+     "q": "interviews per recruiter in North America",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "filters": [
+         {
+          "field": "Region__c",
+          "op": "eq",
+          "value": "North America"
+         }
+        ]
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "filters": [
+           {
+            "field": "Region__c",
+            "op": "eq",
+            "value": "North America"
+           }
+          ]
+         }
+        }
+       ],
+       "keys": []
+      }
+     }
+    },
+    {
+     "q": "as a table",
+     "rewrite": "show interviews per recruiter in North America as a table",
+     "record": [
+      "The table is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          }
+         ]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "q": "and how many were completed per candidate?",
+     "resolve": {
+      "kind": "new",
+      "standalone": "How many interviews in North America were completed per candidate?",
+      "ops": []
+     },
+     "rewrite": "How many interviews in North America were completed per candidate?",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Candidate__c",
+        "filters": [
+         {
+          "field": "Region__c",
+          "op": "eq",
+          "value": "North America"
+         },
+         {
+          "field": "Interview_Status__c",
+          "op": "eq",
+          "value": "Completed"
+         }
+        ]
+       }
+      },
+      "The answer is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "model": true,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Candidate__c",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          },
+          {
+           "field": "Interview_Status__c",
+           "op": "eq",
+           "value": "Completed"
+          }
+         ]
+        }
+       }
+      ],
+      "answer_starts": "Read as: `How many interviews in North America were completed per candidate?`",
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Candidate__c",
+          "filters": [
+           {
+            "field": "Region__c",
+            "op": "eq",
+            "value": "North America"
+           },
+           {
+            "field": "Interview_Status__c",
+            "op": "eq",
+            "value": "Completed"
+           }
+          ]
+         }
+        }
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "P-B-grain-dropped",
+   "title": "Placements each month in 2026, plot it, and the placement rate read without the month: asks",
+   "design": "owner decision of 2026-11-25, items 7 and 8 (stage-3 owner items O1 and pb R1 / build §4.2): right after a patch or shortcut answer, a model new reading that goes on from the plan keeps every filter of the plan, also with no period, and the plan's grouping and time grain unless the person typed a new one; else it asks (agent/resolver.py _Job._drops_from_plan); stage-3 review finding F4",
+   "steps": [
+    {
+     "q": "placements each month in 2026",
+     "record": [
+      {
+       "name": "trend_records",
+       "args": {
+        "object": "Interview__c",
+        "grain": "month",
+        "date_field": "Date_of_Interview__c",
+        "period": "2026",
+        "filters": [
+         {
+          "field": "Interview_Outcome__c",
+          "op": "eq",
+          "value": "Offer Received"
+         }
+        ]
+       }
+      },
+      "The placements per month are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "contracts": [
+       "placement"
+      ],
+      "ran": [
+       {
+        "tool": "trend_records",
+        "args": {
+         "object": "Interview__c",
+         "grain": "month",
+         "date_field": "Date_of_Interview__c",
+         "period": "2026",
+         "filters": [
+          {
+           "field": "Interview_Outcome__c",
+           "op": "eq",
+           "value": "Offer Received"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "trend_records",
+         "args": {
+          "object": "Interview__c",
+          "grain": "month",
+          "date_field": "Date_of_Interview__c",
+          "period": "2026",
+          "filters": [
+           {
+            "field": "Interview_Outcome__c",
+            "op": "eq",
+            "value": "Offer Received"
+           }
+          ]
+         }
+        }
+       ],
+       "keys": [
+        "placement"
+       ],
+       "period": {
+        "from": "2026-01-01",
+        "to": "2026-10-31"
+       }
+      }
+     }
+    },
+    {
+     "q": "plot it",
+     "rewrite": "plot placements each month in 2026",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "contracts": [
+       "placement"
+      ],
+      "ran": [
+       {
+        "tool": "trend_records",
+        "args": {
+         "object": "Interview__c",
+         "grain": "month",
+         "date_field": "Date_of_Interview__c",
+         "period": "2026",
+         "filters": [
+          {
+           "field": "Interview_Outcome__c",
+           "op": "eq",
+           "value": "Offer Received"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "show_chart": true
+      },
+      "charts": 1
+     }
+    },
+    {
+     "q": "and the placement rate?",
+     "resolve": {
+      "kind": "new",
+      "standalone": "What is the placement rate in 2026?",
+      "ops": []
+     },
+     "rewrite": "What is the placement rate in 2026?",
+     "record": [
+      {
+       "name": "percentage_of_records",
+       "args": {
+        "object": "Interview__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "2026",
+        "part_filters": [
+         {
+          "field": "Interview_Outcome__c",
+          "op": "eq",
+          "value": "Offer Received"
+         }
+        ]
+       }
+      },
+      "The answer is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "status": "answered",
+      "kind": "none",
+      "reason": "clarify",
+      "model": true,
+      "record": false,
+      "ran_none": true,
+      "detail": "rewrite_grouping_lost",
+      "pending": null,
+      "answer_has": [
+       "Please ask the full question."
+      ]
+     },
+     "note": "the reading keeps 2026 and the placement contract but drops 'each month': it asks"
+    }
+   ]
+  },
+  {
+   "id": "P-B-typed-grain",
+   "title": "Placements each month in 2026, plot it, and the placement rate by quarter: the typed grain replaces the month, and runs over 2026 with the placement contract",
+   "design": "owner decision of 2026-11-25, items 7 and 8 (stage-3 owner items O1 and pb R1 / build §4.2): right after a patch or shortcut answer, a model new reading that goes on from the plan keeps every filter of the plan, also with no period, and the plan's grouping and time grain unless the person typed a new one; else it asks (agent/resolver.py _Job._drops_from_plan)",
+   "steps": [
+    {
+     "q": "placements each month in 2026",
+     "record": [
+      {
+       "name": "trend_records",
+       "args": {
+        "object": "Interview__c",
+        "grain": "month",
+        "date_field": "Date_of_Interview__c",
+        "period": "2026",
+        "filters": [
+         {
+          "field": "Interview_Outcome__c",
+          "op": "eq",
+          "value": "Offer Received"
+         }
+        ]
+       }
+      },
+      "The placements per month are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "contracts": [
+       "placement"
+      ],
+      "ran": [
+       {
+        "tool": "trend_records",
+        "args": {
+         "object": "Interview__c",
+         "grain": "month",
+         "date_field": "Date_of_Interview__c",
+         "period": "2026",
+         "filters": [
+          {
+           "field": "Interview_Outcome__c",
+           "op": "eq",
+           "value": "Offer Received"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "trend_records",
+         "args": {
+          "object": "Interview__c",
+          "grain": "month",
+          "date_field": "Date_of_Interview__c",
+          "period": "2026",
+          "filters": [
+           {
+            "field": "Interview_Outcome__c",
+            "op": "eq",
+            "value": "Offer Received"
+           }
+          ]
+         }
+        }
+       ],
+       "keys": [
+        "placement"
+       ],
+       "period": {
+        "from": "2026-01-01",
+        "to": "2026-10-31"
+       }
+      }
+     }
+    },
+    {
+     "q": "plot it",
+     "rewrite": "plot placements each month in 2026",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "contracts": [
+       "placement"
+      ],
+      "ran": [
+       {
+        "tool": "trend_records",
+        "args": {
+         "object": "Interview__c",
+         "grain": "month",
+         "date_field": "Date_of_Interview__c",
+         "period": "2026",
+         "filters": [
+          {
+           "field": "Interview_Outcome__c",
+           "op": "eq",
+           "value": "Offer Received"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "show_chart": true
+      },
+      "charts": 1
+     }
+    },
+    {
+     "q": "and the placement rate by quarter?",
+     "resolve": {
+      "kind": "new",
+      "standalone": "What is the placement rate by quarter in 2026?",
+      "ops": []
+     },
+     "rewrite": "What is the placement rate by quarter in 2026?",
+     "record": [
+      {
+       "name": "trend_records",
+       "args": {
+        "object": "Interview__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "2026",
+        "part_filters": [
+         {
+          "field": "Interview_Outcome__c",
+          "op": "eq",
+          "value": "Offer Received"
+         }
+        ],
+        "grain": "quarter"
+       }
+      },
+      "The answer is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "model": true,
+      "ran": [
+       {
+        "tool": "trend_records",
+        "args": {
+         "object": "Interview__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "2026",
+         "part_filters": [
+          {
+           "field": "Interview_Outcome__c",
+           "op": "eq",
+           "value": "Offer Received"
+          }
+         ],
+         "grain": "quarter"
+        }
+       }
+      ],
+      "answer_starts": "Read as: `What is the placement rate by quarter in 2026?`",
+      "plan": {
+       "calls": [
+        {
+         "tool": "trend_records",
+         "args": {
+          "object": "Interview__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "2026",
+          "part_filters": [
+           {
+            "field": "Interview_Outcome__c",
+            "op": "eq",
+            "value": "Offer Received"
+           }
+          ],
+          "grain": "quarter"
+         }
+        }
+       ],
+       "keys": [
+        "placement"
+       ]
+      },
+      "contracts": [
+       "placement"
+      ]
+     }
+    }
+   ]
+  }
+ ]
+}

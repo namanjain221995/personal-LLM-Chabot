@@ -13,7 +13,9 @@ For every chain:
   requests of the answer path, no resolver call.
 
 A chain marked ``known_gap`` (``tests/chains/known_gaps.json``) holds the design's intent where the build does not meet
-it yet; it runs as a strict xfail, so a fix shows up as a failure to update it.
+it yet; it runs as a strict xfail, so a fix shows up as a failure to update it. The file holds none today: the last
+one, ``P-B-dated-period-chart``, runs since the owner decision of 2026-11-25 (items 7 and 8) and is in
+``tests/chains/placements.json``.
 
 The model is scripted per step; no model of any kind is called, and every name and value is made up.
 """
@@ -70,22 +72,66 @@ def _watch_the_code_line(monkeypatch) -> list:
     return seen
 
 
+def _watch_the_owner_check(monkeypatch) -> list:
+    """The verdict of every call of the resolver's ``_Job._drops_from_plan`` with the model called (owner decision of
+    2026-11-25, items 7 and 8: a reading right after a patch or shortcut answer keeps the plan's filters and
+    grouping), which only ``SFA_MEMORY=on`` may reach."""
+    from sf_assistant.agent import resolver
+
+    seen: list = []
+    real = resolver._Job._drops_from_plan
+
+    def watch(self, question):
+        got = real(self, question)
+        if self.calls_model:
+            seen.append(got)
+        return got
+
+    monkeypatch.setattr(resolver._Job, "_drops_from_plan", watch)
+    return seen
+
+
 @pytest.mark.parametrize("chain", CHAINS, ids=[c["id"] for c in CHAINS])
 def test_shadow_answers_the_chain_byte_for_byte_as_off(chain, tmp_path, monkeypatch):
     seen = _watch_the_m5_reading(monkeypatch)
     code_lines = _watch_the_code_line(monkeypatch)
+    checked = _watch_the_owner_check(monkeypatch)
     off = CR.run_chain(chain, CR.OFF, tmp_path / "off", monkeypatch)
     shadow = CR.run_chain(chain, CR.SHADOW, tmp_path / "shadow", monkeypatch)
     CR.check_parity(chain, off, shadow)
-    # M5 and F1 change only what SFA_MEMORY=on reads: off never calls the resolver, and shadow, which calls no model,
-    # reads every turn as sent (resolver._Job._read) and passes no code_line
-    assert seen == [] and code_lines == []
+    # M5, F1 and the owner's items 7 and 8 change only what SFA_MEMORY=on reads: off never calls the resolver, and
+    # shadow, which calls no model, reads every turn as sent (resolver._Job._read), passes no code_line and never
+    # checks a reading against the plan
+    assert seen == [] and code_lines == [] and checked == []
 
 
-@pytest.mark.xfail(strict=True, reason="a known gap of the build (the chain's known_gap says which)")
-@pytest.mark.parametrize("chain", GAPS, ids=[c["id"] for c in GAPS])
-def test_a_known_gap_still_fails_as_the_design_means_it(chain, tmp_path, monkeypatch):
-    CR.check_chain(chain, CR.run_chain(chain, CR.ON, tmp_path, monkeypatch))
+if GAPS:   # none today; a new one runs as a strict xfail, so a fix shows up
+    @pytest.mark.xfail(strict=True, reason="a known gap of the build (the chain's known_gap says which)")
+    @pytest.mark.parametrize("chain", GAPS, ids=[c["id"] for c in GAPS])
+    def test_a_known_gap_still_fails_as_the_design_means_it(chain, tmp_path, monkeypatch):
+        CR.check_chain(chain, CR.run_chain(chain, CR.ON, tmp_path, monkeypatch))
+
+
+@pytest.mark.parametrize("chain_id, step, verdict", [
+    ("K-filter-kept", 2, ""), ("K-filter-dropped", 2, "filter_lost"), ("K-grouping-dropped", 2, "grouping_lost"),
+    ("K-typed-group", 2, ""), ("P-B-grain-dropped", 2, "grouping_lost"), ("P-B-typed-grain", 2, ""),
+    ("P-B-dated-period-chart", 2, ""),
+])
+def test_the_owner_check_is_what_an_on_run_of_the_chain_reads(chain_id, step, verdict, tmp_path, monkeypatch):
+    """The control of the parity test's owner check (items 7 and 8): the on run of each chain of the owner's decision
+    reaches ``_Job._drops_from_plan`` once, at the step after the patch or shortcut answer, with the verdict that
+    decides it; an empty list in off and shadow means they never reached it."""
+    checked = _watch_the_owner_check(monkeypatch)
+    outs = CR.run_chain(next(c for c in CHAINS if c["id"] == chain_id), CR.ON, tmp_path, monkeypatch)
+    assert checked == [verdict], checked
+    assert outs[step].reply["reason"] == ("clarify" if verdict else "new")
+
+
+def test_the_known_gaps_file_holds_only_marked_chains():
+    """Every chain of ``known_gaps.json`` is marked ``known_gap`` and explains it, and only that file holds such a
+    chain (so a closed gap moves out and runs with the others)."""
+    for chain in ALL:
+        assert bool(chain.get("known_gap")) == (chain["file"] == "known_gaps.json"), chain["id"]
 
 
 def test_the_m5_reading_is_what_an_on_run_of_chain_b_reads(tmp_path, monkeypatch):
@@ -110,7 +156,7 @@ def test_the_chain_files_hold_every_chain_of_the_design_once():
     ids = [c["id"] for c in ALL]
     assert len(ids) == len(set(ids)), ids
     assert set(DESIGN_IDS) <= {c["id"] for c in CHAINS}, set(DESIGN_IDS) - set(ids)
-    assert len(CHAINS) >= len(DESIGN_IDS) and GAPS
+    assert len(CHAINS) >= len(DESIGN_IDS)
     t04 = next(c for c in CHAINS if c["id"] == "T04")
     assert [s["q"] for s in t04["steps"]][-1] == "visualize it"            # relax, narrow, then visualize it
 

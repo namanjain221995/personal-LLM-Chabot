@@ -1339,17 +1339,20 @@ def test_f3_a_condition_on_child_records_is_never_kept():
     assert _as_sent(state, turns, standalone=reading)
 
 
-def test_f4_a_reading_that_keeps_the_period_and_drops_the_month_runs_as_with_no_shortcut():
-    """Code does not enforce the plan's grouping: after "plot it" a reading that keeps 2026 and drops "each month"
-    runs, as the same reading runs with no shortcut in between (the v6 reading, unchanged). Whether a new reading must
-    keep the plan's grouping is an owner / S2 decision (stage-3 review finding F4). A reading that names another grain
-    or drops a ranking is refused (review finding R2-3, below)."""
+def test_f4_a_reading_that_keeps_the_period_and_drops_the_month_asks_after_a_shortcut():
+    """Owner decision of 2026-11-25, item 7 (stage-3 review finding F4, owner item O1): after "plot it" a reading
+    that keeps 2026 and drops "each month" asks (``rewrite_grouping_lost``), nothing runs. With no shortcut or patch
+    in between, the same reading is the v6 reading's, unchanged: it runs (the owner's rule is for the reading right
+    after a patch or shortcut answer). A reading that names another grain or drops a ranking is refused (review
+    finding R2-3, below)."""
     reading = "What is the placement rate in 2026?"
     state = _placements()
     after, _ = _mr("and the placement rate?", state=state, turns=_after_plot(state), reply=_reply("new", reading))
+    assert (after.action, after.reason, after.detail) == ("reply", "clarify", "rewrite_grouping_lost"), after
+    assert after.question == "" and after.patched is None
     own = _placements(op=None)
     plain, _ = _mr("and the placement rate?", state=own, turns=_after_plot(own)[:2], reply=_reply("new", reading))
-    assert (after.action, after.question) == (plain.action, plain.question) == ("new", reading), (after, plain)
+    assert (plain.action, plain.question) == ("new", reading), plain
 
 
 def test_f5_a_question_about_the_answer_right_after_a_shortcut_reruns_the_plan():
@@ -1574,8 +1577,8 @@ def test_r2_3_every_argument_that_keeps_only_some_groups_or_rows_is_never_cut(ar
 ], ids=["month-after-by-quarter", "month-after-by-week", "month-by-month-after-weekly"])
 def test_r2_3_a_reading_that_names_another_grain_is_refused(typed, grain, reading, same):
     """Right after "by quarter", "each month" (a word of the first question) runs the grain the person just replaced;
-    any grain the reading names must be the plan's. Nothing is cut, so the reading is refused, as at f90cd21b. A
-    reading that names no grain runs (review finding F4, owner item O1)."""
+    any grain the reading names must be the plan's (or one typed in this question). Nothing is cut, so the reading is
+    refused, as at f90cd21b. A reading that names no grain asks too (owner decision of 2026-11-25, item 7; below)."""
     state = _placements(grain=grain, op="set_grain")
     turns = _after_plot(state, typed=typed)
     assert not _job("and the placement rate?", state, turns)._keeps_grouping(reading)
@@ -1584,3 +1587,257 @@ def test_r2_3_a_reading_that_names_another_grain_is_refused(typed, grain, readin
     assert (got.action, got.reason, got.detail) == ("reply", "clarify", "rewrite_period_lost"), got
     got, _ = _mr("and the placement rate?", state=state, turns=turns, reply=_reply("new", same))
     assert (got.action, got.question) == ("new", same), got   # the control: the plan's own grain runs
+
+
+# ------------------------------------------------------------------ owner decision of 2026-11-25: items 7 and 8
+# Right after a patch or shortcut answer, a model "new" reading that goes on from the plan keeps every filter of the
+# plan, also when the plan has no period (item 8), and the plan's grouping and time grain unless the person typed a
+# new one (item 7). Otherwise it asks (step 5, as a refused reading asks) and nothing runs. The chains are in
+# tests/chains/plan_kept.json and tests/chains/placements.json. Made-up values only.
+_PER_RECRUITER = "interviews per recruiter in North America"
+_DONE = "and how many were completed?"
+_DONE_KEEPS = "How many interviews per recruiter in North America were completed?"
+_DONE_NO_REGION = "How many interviews per recruiter were completed?"
+_DONE_NO_RECRUITER = "How many interviews in North America were completed?"
+
+
+def _per_recruiter(filters=(_NORTH,), *, op="set_show", typed="plot it", first=_PER_RECRUITER, keys=(), **args):
+    """The state and the turns right after ``typed`` (a shortcut, or a patch: ``op``) on the interviews per recruiter
+    with ``filters`` and no period."""
+    call = {"tool": "group_records", "args": {"object": "Interview__c", "group_by": "Recruiter__c",
+                                              "filters": [dict(f) for f in filters], **args}}
+    state = _mr_state([call], terms={"keys": list(keys), "text": first},
+                      show={"chart": True, "type": None, "table": False}, op=op)
+    return state, _after_plot(state, first=first, typed=typed)
+
+
+def _drops_seen(monkeypatch) -> list:
+    """The verdict of every call of ``_Job._drops_from_plan`` (the owner's check of items 7 and 8)."""
+    seen: list = []
+    real = MR._Job._drops_from_plan
+    monkeypatch.setattr(MR._Job, "_drops_from_plan", lambda self, question: seen.append(real(self, question))
+                        or seen[-1])
+    return seen
+
+
+@pytest.mark.parametrize("typed, op", [("plot it", "set_show"), ("as a table", "set_show"),
+                                       ("only for North America", "add_filter")],
+                         ids=["plot-it", "as-a-table", "patch"])
+def test_item8_a_reading_that_keeps_the_filter_of_a_plan_with_no_period_runs(typed, op, monkeypatch):
+    """No period, so no period check: the filter is checked on its own. A reading that keeps "North America" and the
+    recruiter runs, read with the person's last turn as the last question (``code_line``)."""
+    state, turns = _per_recruiter(op=op, typed=typed)
+    seen, lines = _drops_seen(monkeypatch), _code_lines(monkeypatch)
+    got, llm = _mr(_DONE, state=state, turns=turns, reply=_reply("new", _DONE_KEEPS))
+    assert (got.action, got.reason, got.detail, got.question) == ("new", "new", "model_new", _DONE_KEEPS), got
+    assert seen == [""] and lines == [True] and len(llm.calls) == 1
+
+
+@pytest.mark.parametrize("typed", ["plot it", "as a table"])
+def test_item8_a_reading_that_drops_the_filter_of_a_plan_with_no_period_asks(typed, monkeypatch):
+    """The owner's case: no period, so nothing refused a reading that drops "North America" after a shortcut (it ran
+    over every region at c3ac05fe). It now asks, nothing runs; the check is what refuses it."""
+    state, turns = _per_recruiter(typed=typed)
+    got, _ = _mr(_DONE, state=state, turns=turns, reply=_reply("new", _DONE_NO_REGION))
+    assert (got.action, got.reason, got.detail) == ("reply", "clarify", "rewrite_filter_lost"), got
+    assert got.question == "" and got.patched is None and got.text
+    monkeypatch.setattr(MR._Job, "_drops_from_plan", lambda self, question: "")
+    got, _ = _mr(_DONE, state=state, turns=turns, reply=_reply("new", _DONE_NO_REGION))
+    assert (got.action, got.question) == ("new", _DONE_NO_REGION)       # what the check keeps out
+
+
+def test_item8_after_a_patch_typed_as_its_value_a_reading_that_drops_it_asks():
+    """After the patch "only for North America" the person's own last turn names the region, so the v6 person rule
+    refuses a reading that drops it already (person_lost); the owner's check stands behind it."""
+    state, turns = _per_recruiter(op="add_filter", typed="only for North America")
+    got, _ = _mr(_DONE, state=state, turns=turns, reply=_reply("new", _DONE_NO_REGION))
+    assert (got.action, got.reason, got.detail) == ("reply", "clarify", "rewrite_person_lost"), got
+    assert _job(_DONE, state, turns)._keeps_filters(_DONE_NO_REGION) is False
+
+
+@pytest.mark.parametrize("reading, kept", [
+    ("How many interviews per recruiter in North America or Europe were completed?", True),
+    ("How many interviews per recruiter in North America were completed?", False),
+    ("How many interviews per recruiter were completed?", False),
+], ids=["both-values", "one-value-dropped", "both-dropped"])
+def test_item8_every_value_of_an_in_filter_must_be_kept(reading, kept):
+    state, turns = _per_recruiter([{"field": "Region__c", "op": "in", "values": ["North America", "Europe"]}],
+                                  first="interviews per recruiter in North America or Europe")
+    got, _ = _mr(_DONE, state=state, turns=turns, reply=_reply("new", reading))
+    assert (got.action, got.detail) == (("new", "model_new") if kept else ("reply", "rewrite_filter_lost")), got
+
+
+def test_item8_a_filter_the_words_cannot_show_kept_asks():
+    """The cost, as in the M5 guard: a filter whose words do not show it kept (a negation, a true or false value, a
+    record set of an earlier answer) is never taken as kept, so right after a shortcut such a plan asks for any reading
+    that goes on from it."""
+    for filters in ([_negated("ne")], [{"field": "Candidate__c.Is_Active__c", "op": "eq", "value": True}]):
+        state, turns = _per_recruiter(filters, first="interviews per recruiter outside North America")
+        got, _ = _mr(_DONE, state=state, turns=turns,
+                     reply=_reply("new", "How many interviews per recruiter outside North America were completed?"))
+        assert (got.action, got.detail) == ("reply", "rewrite_filter_lost"), got
+
+
+def test_item8_a_contract_filter_is_kept_by_its_contract_on_a_plan_with_no_period():
+    """The placement contract's outcome on a plan with no period: "the placement rate per recruiter" keeps it through
+    its terms, as "placement" does on a plan with a period."""
+    state, turns = _per_recruiter([_OFFER], first="placements per recruiter", keys=("placement",), typed="as a table")
+    reading = "What is the placement rate per recruiter?"
+    got, _ = _mr("and the placement rate?", state=state, turns=turns, reply=_reply("new", reading))
+    assert (got.action, got.question) == ("new", reading), got
+    got, _ = _mr("and the placement rate?", state=state, turns=turns,
+                 reply=_reply("new", "What is the interview completion rate per recruiter?"))
+    assert got.action == "reply", got
+
+
+def test_item8_the_known_gap_shape_runs_a_dated_period_after_chart_it(monkeypatch):
+    """Known gap P-B-dated-period-chart, closed: a period written as dates leaves nothing to cut, "chart it" stands in
+    the plan line, and the person rule read that line's "Interview Outcome = 'Offer Received'" as people. The reading
+    keeps every filter and the grain, so the line is read as the line code wrote (``code_line``) and it runs."""
+    state = _dated("2026-01-01 to 2026-10-31", "2026-01-01", "2026-10-31", op="set_show")
+    turns = _after_plot(state, first="placements each month from 2026-01-01 to 2026-10-31", typed="chart it")
+    reading = "What is the placement rate each month from 2026-01-01 to 2026-10-31?"
+    lines = _code_lines(monkeypatch)
+    got, _ = _mr("and the placement rate?", state=state, turns=turns, reply=_reply("new", reading))
+    assert (got.action, got.reason, got.question) == ("new", "new", reading), got
+    assert lines == [True]
+    got, _ = _mr("and the placement rate?", state=state, turns=turns,
+                 reply=_reply("new", "What is the placement rate from 2026-01-01 to 2026-10-31?"))
+    assert (got.action, got.detail) == ("reply", "rewrite_grouping_lost"), got   # the month dropped: asks
+
+
+@pytest.mark.parametrize("typed, show", [("plot it", None), ("chart it", None), ("as a table", _TABLE)],
+                         ids=["plot-it", "chart-it", "as-a-table"])
+def test_item7_a_reading_that_drops_the_grain_asks(typed, show):
+    state = _placements(show=show)
+    got, _ = _mr("and the placement rate?", state=state, turns=_after_plot(state, typed=typed),
+                 reply=_reply("new", "What is the placement rate in 2026?"))
+    assert (got.action, got.reason, got.detail) == ("reply", "clarify", "rewrite_grouping_lost"), got
+    got, _ = _mr("and the placement rate?", state=state, turns=_after_plot(state, typed=typed),
+                 reply=_reply("new", _RATE_2026))
+    assert (got.action, got.reason) == ("new", "new"), got   # the control: "each month" keeps the plan's grain
+
+
+def test_item7_a_reading_that_drops_the_grouping_field_of_a_plan_with_no_period_asks():
+    """The recruiter grouping is dropped: asks. A plural names the field too ("recruiters")."""
+    state, turns = _per_recruiter()
+    got, _ = _mr(_DONE, state=state, turns=turns, reply=_reply("new", _DONE_NO_RECRUITER))
+    assert (got.action, got.reason, got.detail) == ("reply", "clarify", "rewrite_grouping_lost"), got
+    job = _job(_DONE, state, turns)
+    assert job._keeps_groups("How many interviews did the recruiters in North America complete?")
+    assert not job._keeps_groups(_DONE_NO_RECRUITER)
+
+
+@pytest.mark.parametrize("word, forms", [("recruiter", {"recruiter", "recruiters"}), ("status", {"statuses"}),
+                                         ("country", {"countries"})])
+def test_items_7_8_a_plural_names_the_field(word, forms):
+    assert forms <= MR._word_forms([word])
+
+
+@pytest.mark.parametrize("question, reading", [
+    ("and the placement rate by quarter?", "What is the placement rate by quarter in 2026?"),
+    ("and the placement rate weekly?", "What is the placement rate weekly in 2026?"),
+], ids=["by-quarter", "weekly"])
+def test_item7_a_grain_the_person_typed_replaces_the_plans_and_runs(question, reading):
+    """A typed grain is the person's new grouping: the reading that names it runs over the plan's period and filters
+    (the M5 cut is made, since the grain is typed). A reading that names neither the typed grain nor the plan's is
+    still refused."""
+    state = _placements()
+    got, _ = _mr(question, state=state, turns=_after_plot(state), reply=_reply("new", reading))
+    assert (got.action, got.reason, got.question) == ("new", "new", reading), got
+    got, _ = _mr(question, state=state, turns=_after_plot(state),
+                 reply=_reply("new", "What is the placement rate each day in 2026?"))
+    assert got.action == "reply", got
+
+
+def test_item7_a_typed_grain_after_chart_it_on_a_dated_period_runs(monkeypatch):
+    """The typed grain counts as kept for the plan line read as code wrote it, too: a dated period leaves nothing to
+    cut, "chart it" stands in the line, and the reading "by quarter" names a grain the plan does not have but the
+    person typed (it asked as person_lost before)."""
+    state = _dated("2026-01-01 to 2026-10-31", "2026-01-01", "2026-10-31")
+    turns = _after_plot(state, first="placements each month from 2026-01-01 to 2026-10-31", typed="chart it")
+    reading = "What is the placement rate by quarter from 2026-01-01 to 2026-10-31?"
+    lines = _code_lines(monkeypatch)
+    got, _ = _mr("and the placement rate by quarter?", state=state, turns=turns, reply=_reply("new", reading))
+    assert (got.action, got.question) == ("new", reading) and lines == [True], got
+
+
+def test_item7_a_grouping_field_the_person_typed_replaces_the_plans_and_runs():
+    state, turns = _per_recruiter(typed="as a table")
+    reading = "How many interviews in North America were completed per department?"
+    got, _ = _mr("and how many were completed per department?", state=state, turns=turns,
+                 reply=_reply("new", reading))
+    assert (got.action, got.question) == ("new", reading), got
+
+
+def test_items_7_8_the_persons_own_question_as_typed_is_not_checked():
+    """A reading that is the typed question itself takes nothing from the plan: the person asked it whole."""
+    state, turns = _per_recruiter()
+    typed = "how many interviews were completed in 2026?"
+    got, _ = _mr(typed, state=state, turns=turns, reply=_reply("new", typed))
+    assert (got.action, got.question) == ("new", typed), got
+
+
+def test_items_7_8_only_right_after_a_patch_or_shortcut_answer():
+    """The owner's rule is for the reading right after a patch or shortcut answer: a plan that answered a question of
+    its own, a gap and an older plan read as before (the v6 reading; D10 / D13 for patches; owner item 9 keeps it)."""
+    own, turns = _per_recruiter(op=None)
+    assert _job(_DONE, own, turns)._drops_from_plan(_DONE_NO_REGION) == ""
+    state, turns = _per_recruiter()
+    assert _job(_DONE, state, turns, gap=1)._drops_from_plan(_DONE_NO_REGION) == ""
+    older = _per_recruiter()[0]
+    older["plan"]["age"] = 1
+    assert _job(_DONE, older, turns)._drops_from_plan(_DONE_NO_REGION) == ""
+    job = _job(_DONE, state, turns)
+    assert job._drops_from_plan(_DONE_NO_REGION) == ""      # with no model called (shadow): never checked
+    job.calls_model = True
+    assert job._drops_from_plan(_DONE_NO_REGION) == "filter_lost"
+
+
+def test_items_7_8_shadow_never_checks_and_logs_what_it_did(monkeypatch):
+    seen = _drops_seen(monkeypatch)
+    state, turns = _per_recruiter()
+    got = _shadow(_DONE, state=state, turns=turns)
+    assert seen == [] and (got.action, got.reason) == ("model", "model"), got
+    _mr(_DONE, state=state, turns=turns, reply=_reply("new", _DONE_NO_REGION))
+    assert seen == ["filter_lost"]                          # the control: with the model called it is checked
+
+
+def test_items_7_8_a_reading_that_drops_the_plan_is_never_offered_as_a_choice():
+    """The fallback clarify offers the model's reading as a choice to run; one that drops a filter or the grouping is
+    left out (picking it would run without it); one that keeps the plan is offered."""
+    state, turns = _per_recruiter()
+    got, _ = _mr(_DONE, state=state, turns=turns, reply=_reply("unclear", _DONE_NO_REGION))
+    assert got.action == "reply" and got.pending is None and _DONE_NO_REGION not in got.text, got
+    got, _ = _mr(_DONE, state=state, turns=turns, reply=_reply("unclear", _DONE_KEEPS))
+    assert [c["question"] for c in got.pending["choices"]][0] == _DONE_KEEPS, got
+
+
+def test_items_7_8_a_fault_in_the_check_asks(monkeypatch):
+    def boom(self, question):
+        raise RuntimeError("made-up fault")
+
+    monkeypatch.setattr(MR._Job, "_keeps_groups", boom)
+    state, turns = _per_recruiter()
+    got, _ = _mr(_DONE, state=state, turns=turns, reply=_reply("new", _DONE_KEEPS))
+    assert (got.action, got.detail) == ("reply", "rewrite_filter_lost"), got
+
+
+@pytest.mark.parametrize("text, grouping", [
+    ("and the placement rate by quarter?", True), ("and how many per recruiter?", True),
+    ("and how many by the region?", True), ("status wise kitne?", True), ("mahine ke hisaab se", True),
+    ("and the monthly rate?", True), ("and the placement rate?", False), ("and how many of each of them?", False),
+    ("and how many were completed?", False), ("and for 2025?", False),
+], ids=["by-quarter", "per-recruiter", "by-the-region", "status-wise", "hisaab", "monthly", "none", "each-of-them",
+        "completed", "period"])
+def test_items_7_8_a_typed_grouping(text, grouping):
+    assert MR._typed_grouping(text) is grouping
+
+
+@pytest.mark.parametrize("path, words", [
+    ("Recruiter__c", {"recruiter"}), ("Interview_Support_Person__c", {"person"}),
+    ("Recruiter__c.Name", {"recruiter"}), ("Interviewer_Name__c", {"interviewer"}),
+])
+def test_items_7_8_the_words_that_name_a_grouping_field(path, words):
+    state, turns = _per_recruiter()
+    assert _job(_DONE, state, turns)._group_words("Interview__c", path) == words

@@ -57,9 +57,13 @@ plan older than ``max_age`` is not shown to the model: the question is read as t
    ``standalone`` that passes the v6 rewrite's own reading of a reply (``followup.rewrite`` on the last 4 turns, the
    binding checks of ``_unbound`` included: the model gets 12 turns, the checks read 4; after a patch or shortcut
    answer of the plan, its Read-as line names each period once, when the reading keeps every ``eq`` / ``in`` filter
-   value of the plan, says no period but the plan's (or one the person typed), names no time grain but the plan's,
-   and the plan keeps all its groups and rows; the person rule then reads the person's last turn, never that
-   code-written line: ``_Job._read``, stage-2 review finding M5, stage-3 review findings F1, F2, R2-1 to R2-3); a
+   value of the plan, says no period but the plan's (or one the person typed), names no time grain but the plan's
+   (or one the person typed), and the plan keeps all its groups and rows; the person rule then reads the person's
+   last turn, never that code-written line, also when the line has no dated period to cut and the reading keeps the
+   filters and the groups and rows: ``_Job._read``, stage-2 review finding M5, stage-3 review findings F1, F2, R2-1 to
+   R2-3, owner items 7 and 8). Right after a patch or shortcut answer, a ``new`` reading that goes on from the plan
+   must also keep every filter of the plan, with or without a period, and its grouping and time grain unless the
+   person typed a new one; else it asks (``_Job._drops_from_plan``, owner decision of 2026-11-25, items 7 and 8); a
    ``patch`` goes through
    ``query_state.apply`` (fields, typed values, the filter cap, the term contracts with the rebuilt terms, the call
    cap, contact fields). A failed check asks (a clarify); a value the person did not type becomes a did-you-mean only
@@ -615,6 +619,45 @@ _NARROWING_ARGS = ("top", "min_value", "limit")
 #: Words a question holds in roles of their own ("for us", "as a chart", "plot it"): a filter value made of these
 #: words only ("US", "A", "IT") is never kept by its words (:func:`_value_kept`; stage-3 review finding R2-2).
 _GRAMMAR_WORDS = _followup._POINTERS | _followup._FRAME | _shortcuts.FILLER
+#: Words of a field's label or API name that never name it in a question (:meth:`_Job._group_words`).
+_FIELD_FILLER = frozenset({"name", "id", "s", "c", "r"})
+#: "mahine ke hisaab se": a grouping in Hinglish (the shortcut grammar's spellings).
+_HISAAB = frozenset({"hisaab", "hisab", "hisaap"})
+_ARTICLES = frozenset({"the", "a", "an"})
+
+
+def _said_grains(text: Any) -> set[str]:
+    """Every time grain the words of ``text`` name, as the shortcut grammar reads one ("each month", "by quarter",
+    "month by month", "monthly", "har mahine"). May raise."""
+    words = _shortcuts.words(text)
+    used = [False] * len(words)
+    named: set[str] = set()
+    while (grain := _shortcuts._grain(words, used)) is not None:   # marks the words it reads as used
+        named.add(grain)
+    return named
+
+
+def _typed_grouping(text: Any) -> bool:
+    """The typed words set a grouping of their own (owner decision of 2026-11-25, item 7: a new reading keeps the
+    plan's grouping unless the person typed a new one): a time grain, a "by", "per", "each", "every" or "har" before a
+    word that is no pointer, frame or filler word ("per recruiter", "by the region"; not "each of them"), a word
+    ending in "wise" ("status wise", "status-wise") or "ke hisaab se". May raise."""
+    if _said_grains(text):
+        return True
+    words = [w for w in _shortcuts.words(text) if w not in _ARTICLES]
+    if any(a in _shortcuts._BY_WORDS and b not in _GRAMMAR_WORDS and not b.isdigit() for a, b in zip(words, words[1:])):
+        return True
+    return any(w.endswith("wise") for w in words) or bool(_HISAAB & set(words))
+
+
+def _word_forms(words: Iterable[str]) -> set[str]:
+    """``words`` and their plurals ("recruiter", "recruiters"; "status", "statuses"; "country", "countries")."""
+    out: set[str] = set()
+    for w in words:
+        out |= {w, f"{w}s", f"{w}es"}
+        if w.endswith("y") and len(w) > 2:
+            out.add(f"{w[:-1]}ies")
+    return out
 
 
 #: The filter operators whose value a question keeps by naming it (:meth:`_Job._keeps_filters`). Never a negation
@@ -744,7 +787,60 @@ class _Job:
             return _followup.rewrite(self.question, self.turns, _Echo(standalone))
         turns = self._read_turns(standalone)   # the job's own list when nothing is cut
         return _followup.rewrite(self.question, turns, _Echo(standalone),
-                                 code_line=self.patch_answer and turns is not self.turns)
+                                 code_line=self._code_line(standalone, turns))
+
+    def _last_read_as(self) -> tuple[int, int, str] | None:
+        """Where the ``Read as:`` line of the last answer stands: (the turn, the spaces before it, the line), or None
+        when the last answer has no such first line."""
+        at = next((i for i in range(len(self.turns) - 1, -1, -1) if isinstance(self.turns[i], dict)
+                   and self.turns[i].get("role") == "assistant" and isinstance(self.turns[i].get("content"), str)
+                   and self.turns[i]["content"].strip()), None)
+        if at is None:
+            return None
+        content = self.turns[at]["content"]
+        head = len(content) - len(content.lstrip())
+        line = content[head:].splitlines()[0]   # the first line, as followup._lead reads it
+        if not line.strip().casefold().startswith(_followup._READ_AS):
+            return None
+        return at, head, line
+
+    def _code_line(self, standalone: str, turns: list) -> bool:
+        """Whether the v6 reading takes the ``Read as:`` line of the last answer as the plan line code wrote
+        (``followup.rewrite`` ``code_line``: the person rule then reads the person's own last turn, never that line;
+        stage-3 review finding F1). Only right after a patch or shortcut answer (``patch_answer``), and only when the
+        reading keeps the plan: the M5 cut was made (:meth:`_read_turns`), or the line names no period with its dates
+        to cut (a plan with no period, or one whose period is dates already) and ``standalone`` keeps every filter
+        value of the plan and its groups and rows (:meth:`_keeps_filters`, :meth:`_keeps_grouping`). Owner decision
+        of 2026-11-25 on items 7 and 8: "chart it" or "as a table" on such a plan, then "and the placement rate?",
+        was refused as person_lost (the line's "Interview Outcome = 'Offer Received'" read as people; known gap
+        P-B-dated-period-chart). A line the M5 cut would change but whose reading failed a guard reads as before."""
+        if not self.patch_answer:
+            return False
+        if turns is not self.turns:
+            return True
+        found = self._last_read_as()
+        if found is None or any(said in found[2] for said, _ in _restated_periods(self.plan, self.today)):
+            return False
+        return self._keeps_filters(standalone) and self._keeps_grouping(standalone)
+
+    def _drops_from_plan(self, question: str) -> str:
+        """Why a ``new`` reading the v6 checks passed may still not run (owner decision of 2026-11-25, items 7 and 8):
+        right after a patch or shortcut answer of the plan (``patch_answer``, with the model called), a reading that
+        goes on from the plan (its words are not the typed question's own) must keep every filter of the plan
+        (:meth:`_keeps_filters`; also on a plan with no period, where no period check refuses it) and the plan's
+        grouping and time grain unless the person typed a new one (:meth:`_keeps_groups`). "filter_lost" or
+        "grouping_lost" asks (step 5, as a refused reading asks); "" runs. A fault asks too. Off and shadow never come
+        here: shadow calls no model, and off never calls the resolver."""
+        if not (self.calls_model and self.patch_answer):
+            return ""
+        if _followup._words(question) == _followup._words(self.question):
+            return ""   # the person's own question as typed: nothing taken from the plan
+        try:
+            if not self._keeps_filters(question):
+                return "filter_lost"
+            return "" if self._keeps_groups(question) else "grouping_lost"
+        except Exception:  # noqa: BLE001 - not kept: ask
+            return "filter_lost"
 
     def _read_turns(self, standalone: str) -> list:
         """The turns :meth:`_read` hands the v6 rewrite for ``standalone``: the turns as sent, except that the
@@ -779,16 +875,11 @@ class _Job:
         both read the turns as sent."""
         if not self.fresh:
             return self.turns
-        at = next((i for i in range(len(self.turns) - 1, -1, -1) if isinstance(self.turns[i], dict)
-                   and self.turns[i].get("role") == "assistant" and isinstance(self.turns[i].get("content"), str)
-                   and self.turns[i]["content"].strip()), None)
-        if at is None:
+        found = self._last_read_as()
+        if found is None:
             return self.turns
+        at, head, line = found
         content = self.turns[at]["content"]
-        head = len(content) - len(content.lstrip())
-        line = content[head:].splitlines()[0]   # the first line, as followup._lead reads it
-        if not line.strip().casefold().startswith(_followup._READ_AS):
-            return self.turns
         once, cut = line, []
         for said, phrase in _restated_periods(self.plan, self.today):
             if said in once:
@@ -853,9 +944,10 @@ class _Job:
         its groups or rows (:data:`_NARROWING_ARGS`: after "top 3" a reading that drops it runs over every recruiter,
         and one that keeps it is no reading the v6 checks pass), and every time grain ``standalone`` names ("each
         month", "by quarter", "monthly"; the shortcut grammar's grain words) is the grain of a trend call of the plan
-        ("each month" right after "by quarter" runs the grain the person just replaced). Stage-3 review finding R2-3.
-        A reading that names no grain is kept: whether a new reading must keep the plan's grouping is owner item O1
-        (stage-3 review finding F4). A fault is never kept."""
+        ("each month" right after "by quarter" runs the grain the person just replaced), or a grain the person typed
+        in this question ("and the placement rate by quarter?": the owner decision of 2026-11-25, item 7). Stage-3
+        review finding R2-3. A reading that names no grain is kept here; the plan's grouping is checked after the v6
+        reading passes (:meth:`_drops_from_plan`, :meth:`_keeps_groups`). A fault is never kept."""
         grains = set()
         for call in (self.plan or {}).get("calls") or []:
             args = call.get("args") if isinstance(call, dict) else None
@@ -864,14 +956,54 @@ class _Job:
             if call.get("tool") == "trend_records":
                 grains.add(args.get("grain"))
         try:
-            words = _shortcuts.words(standalone)
-            used = [False] * len(words)
-            named = set()
-            while (grain := _shortcuts._grain(words, used)) is not None:   # marks the words it reads as used
-                named.add(grain)
+            named, typed = _said_grains(standalone), _said_grains(self.question)
         except Exception:  # noqa: BLE001 - not kept: the turns go as sent
             return False
-        return named <= grains
+        return named <= grains | typed
+
+    def _keeps_groups(self, standalone: str) -> bool:
+        """``standalone`` keeps the plan's grouping (owner decision of 2026-11-25, item 7; stage-3 review finding F4,
+        owner item O1): it names the time grain of a trend call of the plan ("each month", "monthly"; the shortcut
+        grammar's grain words) and the field of each grouping (a group call's ``group_by``, a ``split_by``) by a word
+        of its label or API name that is not a word of the object ("Interview Support Person" of an Interview: "support
+        person"; a plural counts: "recruiters"), unless the person typed a grouping of their own in this question ("by
+        quarter", "per recruiter", "status wise", "mahine ke hisaab se": :func:`_typed_grouping`). A grain that neither
+        the plan nor the typed words have is never kept. May raise (:meth:`_drops_from_plan` reads a fault as not
+        kept)."""
+        grains: set = set()
+        fields: list[tuple[Any, Any]] = []
+        for call in (self.plan or {}).get("calls") or []:
+            args = call.get("args") if isinstance(call, dict) else None
+            if not isinstance(args, dict):
+                continue
+            tool, obj = call.get("tool"), args.get("object")
+            if tool == "trend_records" and args.get("grain"):
+                grains.add(args["grain"])
+            if tool == "group_records" and args.get("group_by"):
+                fields.append((obj, args["group_by"]))
+            if tool in ("group_records", "trend_records") and args.get("split_by"):
+                fields.append((obj, args["split_by"]))
+        named, typed = _said_grains(standalone), _said_grains(self.question)
+        if not named <= grains | typed:
+            return False
+        if typed or _typed_grouping(self.question):
+            return True
+        if grains and not named & grains:
+            return False
+        have = set(_followup._words(standalone))
+        return all(_word_forms(self._group_words(obj, path)) & have for obj, path in fields)
+
+    def _group_words(self, obj: Any, path: Any) -> set[str]:
+        """The words that name a grouping field in a question: the last word, filler aside ("name", "id"), of its label
+        in the catalog view and of its API name, the words ``query_state`` writes for it in the plan line: "person" of
+        "Interview Support Person", "status" of "Candidate Status" (so "candidates" alone does not keep "by status"),
+        "recruiter" of ``Recruiter__r.Name``."""
+        out = set()
+        for text in (qs._field_word(obj, path, self.label), qs._pretty(path)):
+            words = [w for w in _followup._words(text) if w not in _FIELD_FILLER]
+            if words:
+                out.add(words[-1])
+        return out
 
     def _terms(self, typed: str, standalone: str, kind: str) -> Terms:
         return qs.terms_for(self.stored_terms, typed, standalone, kind, self.other_record_types)
@@ -1026,6 +1158,9 @@ class _Job:
     def _model_new(self, step: int, standalone: str, detail: str) -> Resolution:
         got = self._read(standalone)
         if got.status == _followup.OK and got.question:
+            lost = self._drops_from_plan(got.question)   # owner items 7 and 8: a reading that drops the plan asks
+            if lost:
+                return self._fallback(None, f"rewrite_{lost}")
             return self._new(step, "new", got.question, detail=detail)
         return self._fallback(None, f"rewrite_{got.reason}")
 
@@ -1058,7 +1193,8 @@ class _Job:
                     choices.append({"label": line, "question": line, "ops": canon})
         if reply and reply.get("standalone"):
             got_q = self._read(reply["standalone"])
-            if got_q.status == _followup.OK and got_q.question and all(
+            # a reading that drops a filter or the grouping of the plan is never offered to run (owner items 7, 8)
+            if got_q.status == _followup.OK and got_q.question and not self._drops_from_plan(got_q.question) and all(
                     _norm(c["question"]) != _norm(got_q.question) for c in choices):
                 choices.append({"label": got_q.question, "question": got_q.question, "ops": []})
         if choices:
