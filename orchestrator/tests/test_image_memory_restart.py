@@ -570,7 +570,11 @@ def test_an_ordinary_question_still_reaches_the_salesforce_planner(
     with TestClient(app) as client:
         assert _image_turn(client, "sf-conv-2").status_code == 200
         _restart()
-        resp = _text_turn(client, "sf-conv-2", "How many open opportunities are there this quarter?")
+        # The mode is named: a request that names none is an assistant turn
+        # since 2026-11-25 (toggle-off isolation G6).
+        resp = _text_turn(
+            client, "sf-conv-2", "How many open opportunities are there this quarter?", mode="salesforce"
+        )
         assert resp.status_code == 200
         assert salesforce_planner, "Intelligence Mode stopped seeing ordinary questions"
 

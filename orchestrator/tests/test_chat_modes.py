@@ -332,6 +332,8 @@ def test_assistant_mode_bypasses_router_and_duckdb(monkeypatch):
         "mode": "assistant",
         "model": settings.llm_model,
         "effort": "think",
+        # Toggle-off isolation (2026-11-25): written under the guard.
+        "sf_isolation": 1,
     }
     # No Salesforce claims: assistant system prompt, user message last.
     assert rec["model_choice"] == "smart"
@@ -375,7 +377,7 @@ def test_salesforce_mode_chat_route_streams_via_graph(monkeypatch):
     )
 
     with TestClient(app) as client:
-        resp = client.post("/chat", json={"message": "hey there"})
+        resp = client.post("/chat", json={"message": "hey there", "mode": "salesforce"})
     events = _parse_sse(resp.text)
     kinds = [e for e, _ in events]
     assert kinds == ["token", "meta", "done"]
@@ -423,7 +425,7 @@ def test_sql_route_meta_reports_serving_model_not_picker(monkeypatch):
 
     with TestClient(app) as client:
         resp = client.post(
-            "/chat", json={"message": "top accounts", "model": "fast", "effort": "high"}
+            "/chat", json={"message": "top accounts", "mode": "salesforce", "model": "fast", "effort": "high"}
         )
     assert resp.status_code == 200
     meta = dict(_parse_sse(resp.text))["meta"]
@@ -1274,7 +1276,7 @@ def _web_history(monkeypatch) -> list:
 def test_an_answer_stays_out_of_the_in_process_memory(service, admin, older_route, monkeypatch):
     """This memory is read when a client sends no turns, and it holds no stamp."""
     kept: list = []
-    monkeypatch.setattr(app_main.memory, "add_exchange", lambda session, text, answer: kept.append(answer))
+    monkeypatch.setattr(app_main.memory, "add_exchange", lambda session, text, answer, **_mode: kept.append(answer))
     with TestClient(app) as client:
         client.post("/chat", json=_body("memory-answer"))
         assert kept == []

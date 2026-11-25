@@ -1,15 +1,17 @@
 {
-  "captured_on": "2026-11-04",
+  "captured_on": "2026-11-25",
   "captured_from": {
-    "commit": "branch warehouse-only, uncommitted, on e1d50f79 (origin/main)",
-    "orchestrator_tree_captured_from": "a copy of this worktree's orchestrator/, because the prompt change IS the change under test; the fixture diff below is the review",
-    "how": "FAST_LANE_ENABLED=false CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/golden_capture_test (throwaway postgres:18-alpine) pytest -q -p no:cacheprovider tests/fixtures/context_assembly_golden/capture_from_baseline.py, twice, diff -r identical",
-    "FAST_LANE_ENABLED": "false, set by capture_from_baseline.py itself"
+    "commit": "branch toggle-off-no-salesforce, uncommitted, on 127707fa (origin/main)",
+    "orchestrator_tree_captured_from": "this worktree's orchestrator/, because the prompt change IS the change under test; the fixture diff below is the review",
+    "how": "element 0 of the 11 assistant-mode fixtures edited in place (ASSISTANT_SYSTEM gains one line, below), then every fixture checked by tests/test_context_assembly_golden.py in both CONTEXT_CONCURRENT_READS states against this tree on the run's own throwaway test server; not recaptured with capture_from_baseline.py, whose recipe names a server this run may not use"
   },
-  "determinism": "the two captures were diff -r identical (2026-11-04, 12 passed each, 24 files each)",
+  "determinism": "the 24 golden runs (12 scenarios x 2 flag states) reproduce these bytes on the toggle-off tree (2026-11-25)",
   "this_capture_changed": {
-    "salesforce.messages.json": "element 0 (the system message) only, and in it ONE clause removed: ' and can query Salesforce live over the API' (SALESFORCE_ASSISTANT_SYSTEM, engines/chat.py). Elements 1-2 and the other 23 files are byte-identical.",
-    "why": "owner order 2026-11-04: every answer reads the warehouse only, and the orchestrator can no longer reach Salesforce, so the prompt must not say it can."
+    "11 *.messages.json (all but salesforce)": "element 0 (the system message) only: ASSISTANT_SYSTEM (engines/chat.py) gains '\\n' + PERSONAL_DETAILS_RULE (core/personal_details.py) after its last sentence, before FORMAT. Every other element byte-identical.",
+    "salesforce.messages.json and every *.meta.json": "byte-identical: SALESFORCE_ASSISTANT_SYSTEM is unchanged and the change is prompt text, not routing, knowledge or sources",
+    "why": "toggle-off isolation G8 (owner order 2026-11-25): never state or guess a real person's contact details, salary, date of birth or ID; never profile a colleague, employee or candidate from memory; never guess hidden Salesforce turns or chart figures from them; with no data, never draw the user's own company figures",
+    "measured": "+724 characters per assistant-mode prompt (the rule and its newline); tokens not measured for this change, and the wording awaits the owner-approved model check (design_v2 section 8 step 3)",
+    "review_fixes_2026-11-25": "element 0 of the same 11 files again: PERSONAL_DETAILS_RULE reworded (review R10): 'Never write a profile of a colleague, employee or candidate from memory.' -> 'Never write a profile of a real colleague, employee or candidate from memory; a clearly labelled fictional sample is fine.' Every other element byte-identical; the rule now sits behind TOGGLE_OFF_PROMPT_RULE (default on), off = ASSISTANT_SYSTEM_BASE, the prompt before the rule"
   },
   "normalised": [
     "today's date (UTC and local ISO) in the engine-bound messages -> <TODAY> (the grounding block's 'Current date:' line)",
@@ -22,27 +24,27 @@
     "sources"
   ],
   "sha256": {
-    "first_message.messages.json": "c15c19adcf100088c6bbdb1abaa511598530f7ef3d2f7d09260af3e7f9551a5e",
+    "first_message.messages.json": "1dfa261b48f2ccb9c7bdc4712594960b1f0736f67156c803a556860659d7a132",
     "first_message.meta.json": "a5af6ebca6a1de346cfad75f9ada92f1d788f0e3c307ce87183785c9074cd513",
-    "living_knowledge_topical_fast.messages.json": "8184aa119ddfe28a1b49b493c9638de355679d8d626653de8104cda7bdaba4ad",
+    "living_knowledge_topical_fast.messages.json": "0cc46cb28ada2f0ebb97520953482b560a7827db55c0d45597c46d944f72efdd",
     "living_knowledge_topical_fast.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-    "living_knowledge_topical_fast_at_production_latency.messages.json": "8184aa119ddfe28a1b49b493c9638de355679d8d626653de8104cda7bdaba4ad",
+    "living_knowledge_topical_fast_at_production_latency.messages.json": "0cc46cb28ada2f0ebb97520953482b560a7827db55c0d45597c46d944f72efdd",
     "living_knowledge_topical_fast_at_production_latency.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-    "living_knowledge_topical_think.messages.json": "8184aa119ddfe28a1b49b493c9638de355679d8d626653de8104cda7bdaba4ad",
+    "living_knowledge_topical_think.messages.json": "0cc46cb28ada2f0ebb97520953482b560a7827db55c0d45597c46d944f72efdd",
     "living_knowledge_topical_think.meta.json": "fd7f87f6df5ca1248a4e1c8dcd58fcf4b03c74cf991ee53a758cb6e6d6f57613",
-    "real_fast_accented_page.messages.json": "d472f2cebc0d80e8dd64cab3cb2a719404a9e01bc339885b1325a4305a4bd33e",
+    "real_fast_accented_page.messages.json": "781e433f12b1202c0e06c1279e21da7e9a6e01ffa074c24e7262297698a582c4",
     "real_fast_accented_page.meta.json": "3596bbf76dc6d3df0f15e25cea462406cd83e99f8873d87e8253cfb403f7b2f9",
-    "real_fast_eval_topical_hit.messages.json": "21fc5418d323d1895fc0536b60d277a2b5ce758ad6ea10a8f2ab216e7cae0cac",
+    "real_fast_eval_topical_hit.messages.json": "39f10a1da0ee4a564f2d2fda40446faaba4857fd4016bd1b99a72fa8621e393f",
     "real_fast_eval_topical_hit.meta.json": "a2848f350023a2eb7043ec42c5ade6dc3006233cf9e4c3d0480f85cc8a1c3ddc",
-    "real_fast_passage_past_200k.messages.json": "53ec9a7c7137230b5bcb6ebbe1d6564ecf0447ef1760971098b51612b01e4a3a",
+    "real_fast_passage_past_200k.messages.json": "04a46861f3ed502bee8c557f92e7b852531b39e54718b283b27a1ddd8183246d",
     "real_fast_passage_past_200k.meta.json": "a64172c1e8bdfdff9955e016e122414f312f0c72b376e5ce315be1808c5fb705",
-    "real_fast_timeless_task_with_a_matching_page.messages.json": "a32bb4ad07aa8431920a99a10672c4048db976c264844ebe9f237515a6154380",
+    "real_fast_timeless_task_with_a_matching_page.messages.json": "50a2fe6aefd94c50aeb32273cfd463c5fbe6deb16a9929f29a159f2331479c63",
     "real_fast_timeless_task_with_a_matching_page.meta.json": "ddcccde6d0e3e175d878292727c7eaf0461898ba92e2045c679bec61c9553817",
-    "real_think_eval_topical_hit.messages.json": "21fc5418d323d1895fc0536b60d277a2b5ce758ad6ea10a8f2ab216e7cae0cac",
+    "real_think_eval_topical_hit.messages.json": "39f10a1da0ee4a564f2d2fda40446faaba4857fd4016bd1b99a72fa8621e393f",
     "real_think_eval_topical_hit.meta.json": "a2848f350023a2eb7043ec42c5ade6dc3006233cf9e4c3d0480f85cc8a1c3ddc",
-    "rich_fast.messages.json": "fe1da954335dc7907489726cec9b970fb0f5a380eb70b3c53030fc689b739cfa",
+    "rich_fast.messages.json": "24e4fa11e8b9c870d64e919be1b1c33e066dbf0ed5c6c1f271c341afa70fe384",
     "rich_fast.meta.json": "8c60198ebd4281fd83100ef3f467f73fbe648a31c61e73b5d3f5d8d015059e67",
-    "rich_think.messages.json": "0dcf3cf57e18a7bf4da4d4873289db9b1fe18bac2d869a466a75cc64e3adcc5f",
+    "rich_think.messages.json": "5d6dc4ef9eaa3f90d74930b950f59fec19070f53af3bf2f649e951d6541827c3",
     "rich_think.meta.json": "6b8128a97f412dd2b211ad2b7c7d9cc83d300fa27209fd4d516318d54aacdbad",
     "salesforce.messages.json": "c9cc3d33b6aca7ce0871938d60cb38a949e75cf2960858f6f59bd82f748bdd27",
     "salesforce.meta.json": "6cbc9e53fb682a4534e63bb6e2b8a3681400575dad9bb8a7b9f7385b260610b7"
@@ -185,6 +187,20 @@
         "why": "the merged DIAGRAM_INSTRUCTION names all twenty-two heads the browser draws, in the spellings mermaid's own detectors accept, says which ten also draw inside a downloaded file, sends the six chart types to the chart lane, prefers NO type (six live refusals were traced to \"prefer `flowchart`\" read with the role ban as a whitelist), and carries no per-answer or node-count cap",
         "measured": "2,061 chars / 2,065 UTF-8 bytes / 494 tokens (pinned Qwen3.6 tokenizer, in-container, CPU); production ae25da28 is 1,602 / 1,606 / 365, so +129 tokens per prompt",
         "budget": "inside the +133 the 2026-09-27 raise was accepted at; tests/test_diagram_instruction_budget.py pins it"
+      }
+    },
+    {
+      "captured_on": "2026-11-04",
+      "captured_from": {
+        "commit": "branch warehouse-only, uncommitted, on e1d50f79 (origin/main)",
+        "orchestrator_tree_captured_from": "a copy of this worktree's orchestrator/, because the prompt change IS the change under test; the fixture diff below is the review",
+        "how": "FAST_LANE_ENABLED=false CONTEXT_GOLDEN_CAPTURE_DIR=<scratch> TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:55432/golden_capture_test (throwaway postgres:18-alpine) pytest -q -p no:cacheprovider tests/fixtures/context_assembly_golden/capture_from_baseline.py, twice, diff -r identical",
+        "FAST_LANE_ENABLED": "false, set by capture_from_baseline.py itself"
+      },
+      "determinism": "the two captures were diff -r identical (2026-11-04, 12 passed each, 24 files each)",
+      "this_capture_changed": {
+        "salesforce.messages.json": "element 0 (the system message) only, and in it ONE clause removed: ' and can query Salesforce live over the API' (SALESFORCE_ASSISTANT_SYSTEM, engines/chat.py). Elements 1-2 and the other 23 files are byte-identical.",
+        "why": "owner order 2026-11-04: every answer reads the warehouse only, and the orchestrator can no longer reach Salesforce, so the prompt must not say it can."
       }
     }
   ]

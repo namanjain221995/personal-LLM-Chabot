@@ -335,8 +335,15 @@ async def add_message(
     role = body.role.strip()
     if not role or len(role) > 32:
         raise HTTPException(status_code=400, detail="role must be 1-32 characters")
+    meta = body.meta
+    if isinstance(meta, dict) and "sf_isolation" in meta:
+        # Toggle-off isolation (review F5): the stamp that counts an answer
+        # as written under the guard is the SERVER's to give (main.py
+        # meta_extras). A client copy keeps it only through the PUT's
+        # positional carry of a row the server stored with it.
+        meta = {k: v for k, v in meta.items() if k != "sf_isolation"}
     message = await db.run_in_thread(
-        db.add_message, int(user["id"]), conversation_id, role, body.content, body.meta
+        db.add_message, int(user["id"]), conversation_id, role, body.content, meta
     )
     if message is None:  # missing OR someone else's → 404 (§3c)
         raise _not_found()
@@ -544,7 +551,13 @@ async def generate_conversation_title(
     # such a chat. The same reason keeps the answer out of recall itself
     # (db.recall_conversations).
     answer_text = (first_assistant or {}).get("content", "")
-    if ((first_assistant or {}).get("meta") or {}).get("engine") == "sf_assistant":
+    from .sf_isolation import meta_says_salesforce
+
+    # Every Salesforce answer, not only an sf_assistant one (review F6): a
+    # previous-pipeline answer (mode='salesforce') would put its names into
+    # a title that a toggle-off recall line prints once the chat no longer
+    # holds that answer.
+    if meta_says_salesforce((first_assistant or {}).get("meta")):
         answer_text = ""
 
     title = await titling.generate_title(

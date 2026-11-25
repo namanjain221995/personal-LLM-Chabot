@@ -35,8 +35,15 @@ def conversation_turns(history: Sequence[dict], n: int) -> List[dict]:
 
     Deep Research keeps a private copy of this (`_conversation_turns`); the
     behaviour is identical.
+
+    The toggle-off placeholders (app/sf_isolation.py) are dropped too, and a
+    removed quote leaves only the person's follow-up: "and last month?" after
+    a hidden pair must not gain "salesforce toggle question" as harvested
+    words in a local or web query.
     """
-    return [m for m in recent_turns(history, n) if m.get("role") != "system"]
+    from ..sf_isolation import without_placeholders
+
+    return without_placeholders([m for m in recent_turns(history, n) if m.get("role") != "system"])
 
 # First-run state: the warehouse/vector store do not exist until the
 # sync-worker completes its first Salesforce extract. Engines stream this

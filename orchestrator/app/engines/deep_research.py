@@ -893,8 +893,11 @@ def _conversation_turns(history: Sequence[dict], n: int) -> List[dict]:
     needs the user's saved facts and cross-chat recall. A research PLAN does
     not: on the first live run the planner read the memory block and listed
     the signed-in user's own name as an entity to research. Only what the
-    user actually asked is research context."""
-    return [m for m in recent_turns(history, n) if m.get("role") != "system"]
+    user actually asked is research context. The toggle-off placeholders
+    (app/sf_isolation.py) are not, either."""
+    from ..sf_isolation import without_placeholders
+
+    return without_placeholders([m for m in recent_turns(history, n) if m.get("role") != "system"])
 
 
 def _temporal_note(state: ResearchState) -> str:

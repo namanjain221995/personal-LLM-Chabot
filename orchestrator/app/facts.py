@@ -41,6 +41,10 @@ Four rules now stand between the model and the table:
      message did not contain (`ungrounded_in`), and every row records where
      it came from (`source`, `source_excerpt` — db V40).
   4. A one-off task request is not a durable fact (`is_durable`).
+  5. Another person's phone number, e-mail address or home address is never
+     saved, and one already saved is masked before the facts reach any prompt
+     (owner decision 2026-11-25, core/personal_details.py). The person's own
+     details stay.
 """
 from __future__ import annotations
 
@@ -589,10 +593,59 @@ def states_profile_attribute(fact: str) -> Optional[str]:
     return None
 
 
+def _third_party_rule_on() -> bool:
+    """Owner decision 1 (2026-11-25) has its own switch, so turning the
+    answer mask off (TOGGLE_OFF_MASK_PERSONAL_DETAILS) never turns it off too
+    (review R18)."""
+    return bool(getattr(settings, "facts_block_third_party_contacts", True))
+
+
+def _without_third_party_contacts(facts: List[dict]) -> List[dict]:
+    """Saved facts with another person's phone, e-mail or address masked
+    (owner decision 2026-11-25): the person's own details stay. Read-time
+    only — the stored row is unchanged and the memory panel still lists it."""
+    if not _third_party_rule_on():
+        return list(facts or [])
+    from .core.personal_details import mask_facts
+
+    return mask_facts(facts or [])
+
+
+def _third_party_contact(fact: str) -> bool:
+    if not _third_party_rule_on():
+        return False
+    from .core.personal_details import third_party_contact
+
+    return third_party_contact(fact)
+
+
+def _holds_contact_mask(fact: str) -> bool:
+    """A rewrite or add that carries the read-time mask text copies what the
+    extractor was SHOWN, not what is stored: writing it would overwrite the
+    stored detail with the placeholder (review F14 / R13, owner decision 2:
+    no stored data is cleaned)."""
+    from .core.personal_details import CONTACT_MASK
+
+    return CONTACT_MASK in (fact or "")
+
+
+def _excerpt(text: str) -> str:
+    """The message saved as a fact's `source_excerpt`, with another person's
+    contact details masked (review F17): the excerpt is part of the saved
+    fact row, and owner decision 1 keeps those details out of it."""
+    if not _third_party_rule_on():
+        return text
+    from .core.personal_details import mask_third_party_contacts
+
+    return mask_third_party_contacts(text)
+
+
 def facts_block(facts: List[dict]) -> Optional[str]:
-    """Render saved facts as the system block, or None when there are none."""
+    """Render saved facts as the system block, or None when there are none.
+    Another person's contact details in a saved fact never reach it."""
     if not facts:
         return None
+    facts = _without_third_party_contacts(facts)
     lines = [FACTS_HEADER]
     # The cap bounds the SAVED FACTS, not the label above them: counting the
     # header against it meant the 2026-09-21 rewrite (155 -> 512 chars) would
@@ -1053,9 +1106,15 @@ async def remember_from_message(
         existing = await db.run_in_thread(
             db.list_user_facts, user_id, settings.memory_max_facts
         )
-        saved_lines = "\n".join(
-            f"[{f['id']}] {f['fact']}" for f in existing
-        ) or "(none yet)"
+        shown = _without_third_party_contacts(existing)
+        # Rows the extractor sees only with a detail masked: it never saw
+        # their stored text, so it may not rewrite them (review F14).
+        masked_ids = {
+            f["id"]
+            for f, s in zip(existing, shown)
+            if isinstance(f, dict) and isinstance(s, dict) and s.get("fact") != f.get("fact")
+        }
+        saved_lines = "\n".join(f"[{f['id']}] {f['fact']}" for f in shown) or "(none yet)"
         if complete is None:
             complete = llm.router_chat_completion
         raw = await complete(
@@ -1118,13 +1177,21 @@ async def remember_from_message(
             if missing is not None:
                 log.info("fact rewrite dropped: %r not in the message", missing)
                 continue
+            if _third_party_contact(item["fact"]):
+                # Another person's phone, e-mail or address is never saved
+                # (owner decision 2026-11-25). Not logged: it is that detail.
+                log.info("fact rewrite dropped: it holds a third-party contact detail")
+                continue
+            if item["id"] in masked_ids or _holds_contact_mask(item["fact"]):
+                log.info("fact rewrite dropped: the extractor saw this fact masked")
+                continue
             updated = await db.run_in_thread(
                 db.update_user_fact,
                 user_id,
                 item["id"],
                 item["fact"],
                 source="stated",
-                source_excerpt=text,
+                source_excerpt=_excerpt(text),
             )
             if updated:
                 known[_normalized(item["fact"])] = updated["id"]
@@ -1137,6 +1204,12 @@ async def remember_from_message(
             if missing is not None:
                 log.info("fact dropped: %r not in the message", missing)
                 continue
+            if _third_party_contact(fact):
+                log.info("fact dropped: it holds a third-party contact detail")
+                continue
+            if _holds_contact_mask(fact):
+                log.info("fact dropped: it copies a masked saved fact")
+                continue
             # Replaces rewrite existing rows; only genuine adds consume slots.
             if len(existing) + added >= settings.memory_max_facts:
                 break
@@ -1146,7 +1219,7 @@ async def remember_from_message(
                 fact,
                 conversation_id,
                 source="stated",
-                source_excerpt=text,
+                source_excerpt=_excerpt(text),
             )
             known[_normalized(fact)] = created["id"]
             stored.append(created)

@@ -455,7 +455,13 @@ async def try_answer(text: str, *, emit, request: Any,
 
     `stop_line` is `stop_line_for()` of this turn and `wants_a_file` is the file
     rule's verdict on it: main.py needs both before it can decide to come here.
+
+    A request whose mode is not Salesforce never gets here from main.py; this
+    first line keeps it that way for any other caller (toggle-off isolation,
+    2026-11-25).
     """
+    if getattr(request, "mode", None) != "salesforce":
+        return None
     if ASSISTANT_ENABLED:
         return await _try_assistant(
             text, emit=emit, request=request,

@@ -34,6 +34,7 @@ from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, recent_turns
 from .. import llm
 from ..continuity import LeaseLost, QueuedForRecovery
 from ..config import settings
+from ..core.personal_details import PERSONAL_DETAILS_RULE
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
@@ -330,6 +331,16 @@ _STEP_LLM_SYSTEM = (
 )
 
 
+def _personal_details_rule(salesforce: bool) -> str:
+    """The no-invented-personal-details rule (core/personal_details.py) for a
+    prompt that writes answer text with the Salesforce toggle OFF; nothing
+    with it on, where the step results carry the org's own records, and
+    nothing with TOGGLE_OFF_PROMPT_RULE off (review R10)."""
+    if salesforce or not getattr(settings, "toggle_off_prompt_rule", True):
+        return ""
+    return "\n" + PERSONAL_DETAILS_RULE
+
+
 def _shorten(text: str, limit: int = 120) -> str:
     text = " ".join(str(text).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -589,7 +600,8 @@ async def _run_step_impl(
                 {"role": "system", "content":
                  "Answer from the conversation context and general knowledge. "
                  "State plainly that a web search found no readable sources "
-                 "and that your knowledge may be out of date."},
+                 "and that your knowledge may be out of date."
+                 + _personal_details_rule(salesforce)},
                 *recent_turns(history, settings.chat_history_turns),
                 {"role": "user", "content": step.input},
             ],
@@ -604,7 +616,7 @@ async def _run_step_impl(
     # URL/document content).
     answer = await llm.chat_completion(
         [
-            {"role": "system", "content": _STEP_LLM_SYSTEM},
+            {"role": "system", "content": _STEP_LLM_SYSTEM + _personal_details_rule(salesforce)},
             *recent_turns(history, settings.chat_history_turns),
             {"role": "user", "content": step.input},
         ],
@@ -887,7 +899,7 @@ _SYNTH_SYSTEM = _SYNTH_SYSTEM + _AS3_CAPABILITY
 # --- AS3 intent-capability END ---
 
 
-def _synthesis_messages(message: str, results: Sequence[dict]) -> List[dict]:
+def _synthesis_messages(message: str, results: Sequence[dict], salesforce: bool = True) -> List[dict]:
     blocks = [
         f"### Step {r['step'].id}: {r['step'].title} [{r['status']}]\n{r['output']}"
         for r in results
@@ -904,7 +916,7 @@ def _synthesis_messages(message: str, results: Sequence[dict]) -> List[dict]:
     )
     user = f"Request: {message}\n\nStep results:\n\n" + "\n\n".join(blocks)
     return [{"role": "system", "content": _SYNTH_SYSTEM + "\n"
-             + _chart_line(chart_attached) + DIAGRAM_INSTRUCTION},
+             + _chart_line(chart_attached) + DIAGRAM_INSTRUCTION + _personal_details_rule(salesforce)},
             {"role": "user", "content": user}]
 
 
@@ -991,7 +1003,7 @@ async def _synthesize_node(state: AgentState) -> dict:
 
     # Smart model merges step outputs (§3b); streams reasoning + token events.
     async for kind, text in llm.stream_chat_events(
-        _synthesis_messages(state["message"], results),
+        _synthesis_messages(state["message"], results, state.get("salesforce", True)),
         model_choice="smart",
         effort=state.get("effort", "medium"),
         temperature=0.2,

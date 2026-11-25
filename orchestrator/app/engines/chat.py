@@ -18,6 +18,7 @@ effort are merged in centrally by the /chat endpoint).
 """
 from __future__ import annotations
 
+import re
 import time
 from typing import Awaitable, Callable, List, Optional, Sequence
 
@@ -25,6 +26,7 @@ from . import CODE_INSTRUCTION, DIAGRAM_INSTRUCTION, FORMAT_INSTRUCTION, recent_
 from .. import continuation, llm
 from ..config import settings
 from ..core import answer_sampling, best_of, contract, max_loop, pasted, rewrite_coverage, rewrite_shape
+from ..core.personal_details import PERSONAL_DETAILS_RULE
 
 Emit = Callable[[str, dict], Awaitable[None]]
 
@@ -186,6 +188,23 @@ ASSISTANT_SYSTEM = (
     "first, then the offer — never \"I cannot pull those numbers as soon as "
     "you turn Salesforce mode on\", which says nothing."
 )
+#: ASSISTANT_SYSTEM before the toggle-off prompt rule: what an assistant-mode
+#: turn is sent with TOGGLE_OFF_PROMPT_RULE off (review R10).
+ASSISTANT_SYSTEM_BASE = ASSISTANT_SYSTEM
+# TOGGLE-OFF ISOLATION (2026-11-25, owner order: never invent personal
+# details of real people). Two production answers in this mode carried a
+# profile with a phone number found in no message, fact or source. The code
+# mask below (core/personal_details.Guard) catches phones and e-mails;
+# addresses, salaries and dates of birth have no pattern, so the rule is the
+# only guard for them. Not yet model-checked: the owner's word starts that
+# check (design_v2 §8 step 3), and TOGGLE_OFF_PROMPT_RULE=false rolls it back.
+ASSISTANT_SYSTEM = ASSISTANT_SYSTEM_BASE + "\n" + PERSONAL_DETAILS_RULE
+
+
+def _assistant_system() -> str:
+    if getattr(settings, "toggle_off_prompt_rule", True):
+        return ASSISTANT_SYSTEM
+    return ASSISTANT_SYSTEM_BASE
 
 #: Salesforce mode, and the message really is a pleasantry.
 SALESFORCE_CHAT_SYSTEM = (
@@ -383,7 +402,7 @@ def _messages(
     # and the two capability blocks qualify it. Both assistant modes get it —
     # a Salesforce-mode answer is no less an answer (sweep, 2026-09-18).
     if mode == "assistant":
-        system = ASSISTANT_SYSTEM + FORMAT_INSTRUCTION + DIAGRAM_INSTRUCTION + CODE_INSTRUCTION
+        system = _assistant_system() + FORMAT_INSTRUCTION + DIAGRAM_INSTRUCTION + CODE_INSTRUCTION
     elif is_small_talk(message, mode):
         # Small talk keeps the short prompt it has always had.
         system = SALESFORCE_CHAT_SYSTEM
@@ -474,6 +493,82 @@ def _effort_degraded(
     return out
 
 
+class _DetailsMask:
+    """The toggle-off personal-details mask of ONE chat turn
+    (core/personal_details.py, design G8).
+
+    `answer` masks answer text and is fed BEFORE the loop guard, so the text
+    the guard keeps — the text that is stored — is the masked text.
+    `emit` wraps the engine's emit: it masks every reasoning delta with a
+    second guard (the person sees reasoning at Think and Max), releases the
+    reasoning still held when the answer starts or the meta goes out, and
+    stamps `personal_details_masked` on the final meta."""
+
+    def __init__(self, prompt: Sequence[dict], emit: Emit) -> None:
+        from ..core import personal_details
+
+        allowed = personal_details.prompt_text(prompt)
+        self.answer = personal_details.Guard(allowed)
+        self.reasoning = personal_details.Guard(allowed)
+        self._emit = emit
+        #: The keys of the last reasoning event, carried onto a released
+        #: tail so it reads as the event it belongs to (review R17).
+        self._reasoning_keys: dict = {}
+
+    def mask_text(self, text: str) -> str:
+        """Model text that is shown but not streamed (the best-of judge's
+        reason at Max, review F08), masked whole."""
+        return self.answer.mask(text or "", counted=False) if text else text
+
+    async def _release_reasoning(self, *, final: bool) -> None:
+        held = self.reasoning.held()
+        if not held:
+            return
+        # A token while reasoning still holds part of a number or an address
+        # does NOT end the reasoning stream: a later segment may finish it,
+        # and releasing it now would show it unmasked (review F09). The
+        # final meta always ends it.
+        if not final and re.search(r"[\d+(@]", held):
+            return
+        tail = self.reasoning.finish()
+        if tail:
+            await self._emit("reasoning", {**self._reasoning_keys, "text": tail})
+
+    async def emit(self, event: str, data: dict) -> None:
+        if event == "reasoning":
+            self._reasoning_keys = {k: v for k, v in data.items() if k != "text"}
+            text = self.reasoning.feed(str(data.get("text") or ""))
+            if text:
+                await self._emit("reasoning", {**data, "text": text})
+            return
+        if event in ("token", "meta"):
+            await self._release_reasoning(final=event == "meta")
+        if event == "meta":
+            masked = self.answer.count + self.reasoning.count
+            if masked:
+                from .. import metrics
+
+                data = {**data, "personal_details_masked": masked}
+                for _ in range(masked):
+                    metrics.inc(
+                        "toggle_off_personal_details_masked_total",
+                        "phones and e-mails masked in toggle-off chat answers",
+                        route=str(data.get("route") or "chat"),
+                    )
+        await self._emit(event, data)
+
+    def tail(self, text: str) -> str:
+        """`text` through the answer mask, then everything it still holds."""
+        return self.answer.feed(text) + self.answer.finish()
+
+
+def _details_mask(mode: str, prompt_fn: Callable[[], List[dict]], emit: Emit) -> Optional[_DetailsMask]:
+    """The mask for an assistant-mode (toggle-off) turn, or None."""
+    if mode != "assistant" or not getattr(settings, "toggle_off_mask_personal_details", True):
+        return None
+    return _DetailsMask(prompt_fn(), emit)
+
+
 async def run_chat_engine(
     message: str,
     history: Sequence[dict],
@@ -500,6 +595,12 @@ async def run_chat_engine(
     effort = llm.normalize_effort(effort)
     if lane:
         return await _run_lane(message, history, emit, model_choice=model_choice, effort=effort, lane=lane)
+    # TOGGLE-OFF: no phone or e-mail the prompt did not hold (G8). None in
+    # Salesforce mode and with TOGGLE_OFF_MASK_PERSONAL_DETAILS off, and then
+    # every path below runs exactly as before.
+    details = _details_mask(mode, lambda: _messages(message, history, mode, grounding), emit)
+    if details is not None:
+        emit = details.emit
     # --- effort_policy (answer quality) begin ---
     # The thinking model spends a large, variable share of its budget on
     # reasoning before emitting a single answer token — a small ceiling makes
@@ -596,6 +697,8 @@ async def run_chat_engine(
                     return
                 if loop_shaper is not None:
                     text = loop_shaper.feed(text)
+                if details is not None:
+                    text = details.answer.feed(text)
                 for piece in loop_guard.feed(text):
                     await emit("token", {"text": piece})
                 if loop_guard.verdict is not None:
@@ -625,8 +728,11 @@ async def run_chat_engine(
                 target_words=answer_sampling.requested_words(_length_ask(message)),
                 meta=meta,
             )
-            if loop_shaper is not None and loop_guard.verdict is None:
-                for piece in loop_guard.feed(loop_shaper.finish()):
+            if loop_guard.verdict is None and (loop_shaper is not None or details is not None):
+                loop_tail = loop_shaper.finish() if loop_shaper is not None else ""
+                if details is not None:
+                    loop_tail = details.tail(loop_tail)
+                for piece in loop_guard.feed(loop_tail):
                     await emit("token", {"text": piece})
             for piece in loop_guard.finish():
                 await emit("token", {"text": piece})
@@ -727,6 +833,10 @@ async def run_chat_engine(
                 if compared > 1:
                     await steps.open(STEP_JUDGE)
                 winner, reason = await best_of.select_best(message, candidates)
+                if details is not None:
+                    # The judge's reason is model text that read the drafts;
+                    # it is shown in the step row and the meta (review F08).
+                    reason = details.mask_text(reason)
                 best_of.log_losers(candidates, winner)
                 if compared > 1:
                     await steps.done(f"kept draft {winner.index}: {reason}")
@@ -735,6 +845,8 @@ async def run_chat_engine(
                         "reasoning", {"text": winner.reasoning[start : start + 1000]}
                     )
                 answer = rewrite_shape.shape(message, winner.answer)
+                if details is not None:
+                    answer = details.answer.mask(answer)
                 for start in range(0, len(answer), 200):
                     await emit("token", {"text": answer[start : start + 200]})
                 # ASKED vs COMPARED. `best_of` is the N the operator configured
@@ -846,6 +958,8 @@ async def run_chat_engine(
             return
         if shaper is not None:
             text = shaper.feed(text)
+        if details is not None:
+            text = details.answer.feed(text)
         for piece in guard.feed(text):
             await emit("token", {"text": piece})
         if guard.verdict is not None:
@@ -876,8 +990,11 @@ async def run_chat_engine(
         target_words=answer_sampling.requested_words(_length_ask(message)),
         **({} if answer_plan is None else {"answer_plan": answer_plan}),
     )
-    if shaper is not None and guard.verdict is None:
-        for piece in guard.feed(shaper.finish()):
+    if guard.verdict is None and (shaper is not None or details is not None):
+        tail = shaper.finish() if shaper is not None else ""
+        if details is not None:
+            tail = details.tail(tail)
+        for piece in guard.feed(tail):
             await emit("token", {"text": piece})
     for piece in guard.finish():
         await emit("token", {"text": piece})
@@ -960,9 +1077,19 @@ async def _run_lane(
     """One short streamed completion for a small-talk lane turn."""
     from .. import fast_lane
 
+    prompt = _messages(message, history, "assistant", lane=lane)
+    # The lane is a toggle-off turn too: the same personal-details mask (G8).
+    details = _details_mask("assistant", lambda: prompt, emit)
+    if details is not None:
+        emit = details.emit
+
     async def _out(kind: str, text: str) -> None:
         if kind == "reasoning":
             await emit("reasoning", {"text": text})
+        elif details is not None:
+            text = details.answer.feed(text)
+            if text:
+                await emit("token", {"text": text})
         else:
             await emit("token", {"text": text})
 
@@ -970,7 +1097,7 @@ async def _run_lane(
     # so every delta streams straight through. Thinking follows the effort,
     # and the lane only admits Fast, where llm.wants_thinking is False.
     long = await continuation.stream_long_completion(
-        _messages(message, history, "assistant", lane=lane),
+        prompt,
         on_delta=_out,
         model_choice=model_choice,
         effort=effort,
@@ -979,8 +1106,12 @@ async def _run_lane(
         total_max_tokens=fast_lane.FAST_LANE_MAX_TOKENS,
         deadline_s=settings.continuation_deadline_s or None,
     )
+    if details is not None:
+        rest = details.answer.finish()
+        if rest:
+            await emit("token", {"text": rest})
     meta = {"route": "chat"}
     if long.segment_count > 1 or long.truncated:
         meta["continuation"] = long.as_meta()
     await emit("meta", meta)
-    return long.text
+    return long.text if details is None else details.answer.mask(long.text, counted=False)

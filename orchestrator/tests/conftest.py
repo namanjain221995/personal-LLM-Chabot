@@ -567,17 +567,23 @@ def _knowledge_process_state_clear():
 
     from app.publicapi import sidecars as _public_sidecars
 
+    from app import sf_isolation as _sf_isolation
+
     _web_memory.cache_clear()
     _llm.embed_cache_clear()
     _rerank.reset_for_tests()
     # /v1 pooling: remembered token counts, quarantined inputs and the
     # memory budget are process state too (2026-09-14).
     _public_sidecars.reset_for_tests()
+    # Toggle-off isolation: the per-user set of Salesforce-holding chats is
+    # cached in the process, and user ids restart with every TRUNCATE.
+    _sf_isolation.forget_all()
     yield
     _web_memory.cache_clear()
     _llm.embed_cache_clear()
     _rerank.reset_for_tests()
     _public_sidecars.reset_for_tests()
+    _sf_isolation.forget_all()
 
 
 @pytest.fixture(autouse=True)

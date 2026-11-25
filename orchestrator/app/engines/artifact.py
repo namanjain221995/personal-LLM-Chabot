@@ -405,9 +405,16 @@ def _unreadable_names(notes: Sequence[str]) -> List[str]:
 
 
 def _previous_answer(history: Sequence[dict]) -> str:
+    """The last assistant answer. A toggle-off placeholder (app/sf_isolation.py)
+    is not one: an export of "the previous answer" after a hidden turn finds
+    none, and the file never contains the placeholder sentence."""
+    from ..sf_isolation import is_placeholder
+
     for turn in reversed(list(history)):
         if str(turn.get("role")) == "assistant":
             content = turn.get("content")
+            if is_placeholder(content):
+                continue
             if isinstance(content, list):
                 content = " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
             return str(content or "").strip()
@@ -1236,7 +1243,17 @@ async def run_artifact_engine(
     # 1. What exists already, for follow-ups. A create that the rules
     #    marked as a NEW artifact (CONTRACT-2 §5) never picks a parent,
     #    whatever the later sentences say.
-    existing = await db.run_in_thread(adb.list_artifacts, int(user_id), conversation_id)
+    # A toggle-off turn never reaches a file a Salesforce-mode job made, in any
+    # chat (app/sf_isolation.py): `pick_artifact` falls back to the newest, and
+    # a question about a sheet is answered from its stored spec.
+    from .. import sf_isolation as _sf_isolation
+
+    existing = await db.run_in_thread(
+        adb.list_artifacts,
+        int(user_id),
+        conversation_id,
+        **({"exclude_salesforce": True} if mode == "assistant" and _sf_isolation.enabled() else {}),
+    )
     candidates = [a for a in existing if (a.get("current") or {}).get("status") in ("completed", "completed_with_warnings")]
     # 1a. A QUESTION about one of them is answered from its stored spec and
     #     opens no job (see "answering ABOUT an existing file", above). This
