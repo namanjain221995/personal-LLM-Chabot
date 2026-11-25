@@ -25,9 +25,13 @@ runner are built and tested), and the stage-2 review fixes are applied.
   A bare `docker compose stop` in the repository root would stop the `sf-local-ai` stack.
 - **Never stop, restart or remove anything of the `sf-local-ai` stack** from here, and never open
   `/data/warehouse.duckdb` (the sync-worker's writer file). `run.sh` has deliberately no `down`.
-- **Never delete, truncate or move** `.private/web_log.jsonl`, `.private/mcp_log.jsonl`, `.private/ask_log.jsonl`,
-  `.private/codes.json`, `.private/mcp_token.json`, `.private/ask_token.json` or `.private/mcp_audit_key`. Nothing rotates the logs
-  ([data_and_privacy.md](data_and_privacy.md#logs-and-kept-files)). They live on the host in `.private/`, which is
+- **Never delete, truncate or move** `.private/web_log.jsonl`, `.private/mcp_log.jsonl`, the folder
+  `.private/ask_logs/` or a file in it, `.private/codes.json`, `.private/mcp_token.json`, `.private/ask_token.json` or
+  `.private/mcp_audit_key`. Nothing rotates the page's and the MCP server's logs; the ask service writes one log file
+  per business day and deletes only its own daily files past 90 days ([The ask log](#the-ask-log),
+  [data_and_privacy.md](data_and_privacy.md#logs-and-kept-files)). The one exception is the one-time split of the old
+  single file `.private/ask_log.jsonl`, with the service stopped, by `scripts/split_ask_log.py` ([The ask
+  log](#the-ask-log)). They live on the host in `.private/`, which is
   bind-mounted, so recreating a container does not touch them. Never replace `mcp_token.json` with another file
   (`mv`, an editor that saves by renaming): the MCP container mounts that one file and would refuse every token
   until `./run.sh restart-mcp`. `new-mcp-token` rewrites it in place. The same holds for `ask_token.json`, which the
@@ -337,7 +341,8 @@ volumes:
 ```
 
 It mounts `src/`, `prompts/`, `knowledge/` and `web/` read-only, the data volume read-only at `/data`, and of `.private/`
-only `ask_token.json` read-only and `ask_log.jsonl` read-write, with `mem_limit: 4g` and `pids_limit: 512`. It reads the
+only `ask_token.json` read-only and the log folder `ask_logs/` read-write ([The ask log](#the-ask-log)), with
+`mem_limit: 4g` and `pids_limit: 512`. Its container log is capped at 3 files of 10 MB. It reads the
 code and the knowledge of the folder it is started from, once, at its start: a change needs a restart, and a copy of
 the folder does not follow the folder it came from.
 
@@ -403,6 +408,72 @@ folder, removed afterwards and never printed. A second throwaway container, shar
 reads `/healthz` and gets 401 with no token: as root with the volume `:ro`, as the orchestrator will, and as uid 10001. It
 must log `pipeline ready` in about 10 s and answer `failed` or `no_answer` with empty answer text. Never run it against
 `localhost:8000`: that is a model call on the shared server.
+
+### The ask log
+
+**Since 2026-11-25** (option R2 of the conversation-memory design, owner decision D5): the approved retention keeps the
+ask log 90 days, rotated daily. A file bind mount cannot be rotated by a rename (the container keeps writing into the
+renamed file, as with the token files), so the service now gets a folder and picks the file of each line itself.
+
+| What | How |
+|---|---|
+| Folder | `.private/ask_logs/`, mode 700, created by `./run.sh up-ask` and `restart-ask` (a link there is refused); mounted read-write at `/srv/sfa/.private/ask_logs` (`web/compose.ask.yaml`), the container's only writable host path |
+| Files | `ask_log-YYYY-MM-DD.jsonl`, mode 600, one per business date in **Asia/Kolkata** (`web/ask_log.py`, `RotatingAskLog`). `ts` keeps its old form, the container's local time (UTC) with its offset: `2026-11-25T18:30:00+0000` is 00:00 on 2026-11-26 in Kolkata, so that line is in the file of 2026-11-26 |
+| Lines | the same lines as before (one JSON object per line, `ts` first), each one `O_APPEND` write under the thread lock; a link named like a daily file is never written through |
+| Kept | 90 days: `SFA_ASK_LOG_DAYS` (a whole number from 1 to 3650; empty or unset: 90; any other value keeps 90 and says so once in the container log). At its start and at the first write of each business day the service deletes the files named exactly `ask_log-YYYY-MM-DD.jsonl` whose date is before today minus 90 days: on 2026-11-25 it keeps 2026-08-27 to 2026-11-25, so a line is kept 90 to 91 days while the service writes every day. It runs no timer: a service that writes nothing deletes nothing until its next start or write, so a file is kept **at least** 90 days and is deleted at the first start or write after that. Only names in ASCII digits count. It deletes nothing else (not `ask_log-unknown-date.jsonl`, no other name, no link, no folder). The container log gets the count and the date of a deletion, nothing more. Changing the 90 days is the owner's decision |
+| Container log | `json-file`, at most 3 files of 10 MB (`logging` in `web/compose.ask.yaml`; before 2026-11-25 it had no cap) |
+| Faults | a line that cannot be written costs that line only, and the container log gets `could not write the log: <class name>`; at its start the service refuses (exit 2) a folder it cannot write to |
+
+Read the days in order (their names sort by date):
+
+```bash
+cat .private/ask_logs/ask_log-2*.jsonl | jq -c '{ts, event, status, reason}'   # every day; not the unknown-date file
+jq -c 'select(.event == "ask")' .private/ask_logs/ask_log-2026-11-25.jsonl     # one day
+```
+
+**The one-time split of the old file.** Before 2026-11-25 the service wrote one file, `.private/ask_log.jsonl`.
+`./run.sh up-ask` and `restart-ask` start nothing while that file is there. Split it once, in the `sf_assistant` folder
+the service runs from (the release folder when it runs from one, never another copy), **with the service stopped**, so
+no line lands in the old file after the split. The new `web/compose.ask.yaml`, `web/run.sh`, `web/ask_log.py`,
+`scripts/split_ask_log.py` and the `web/ask_mcp.py` that writes through `RotatingAskLog` go to that folder together: an
+older `ask_mcp.py` finds no writable log file in the new container (its root is read-only) and exits 2 at its start, and
+the new one finds no folder under the old compose file. `./run.sh up-ask` and `restart-ask` check the first half: they
+start nothing (exit 2) while the `web/ask_mcp.py` next to them does not write through `RotatingAskLog`.
+
+```bash
+cd <the sf_assistant folder the service runs from>
+docker stop sf-assistant-ask                              # 1. stop: nothing writes the old file any more
+python3 -I scripts/split_ask_log.py                       # 2. dry run: lines per business day; writes nothing
+python3 -I scripts/split_ask_log.py --apply               # 3. the split; the old file becomes the backup
+ls -la .private/ask_logs .private/ask_log.legacy.jsonl    # 4. drwx------ and -rw------- only; no .private/ask_log.jsonl
+(cd web && ./run.sh restart-ask)                          # 5. start on the folder mount
+```
+
+What the split does (`scripts/split_ask_log.py`; its docstring has the details):
+
+- Each line goes, in its order, to the daily file of its `ts`'s business date. A line with no readable `ts` (a blank
+  line, a line cut before its `ts` ended, a `ts` with no time zone) goes to `ask_log-unknown-date.jsonl`. No line is
+  dropped or changed; a last line with no newline gets one.
+- When every file reads back as written, the old file becomes the backup `.private/ask_log.legacy.jsonl` (mode 600: a
+  hard link, then the old name is removed). The service never sees the backup and never deletes it. The split prints
+  the day from which the backup, and `ask_log-unknown-date.jsonl` if it made one, may be deleted: the day the 90-day
+  rule deletes the daily file of the backup's newest line (that date plus 91 days). Delete them by hand from that day:
+  `rm .private/ask_log.legacy.jsonl .private/ask_logs/ask_log-unknown-date.jsonl`.
+- Daily files dated before the 90 days are written too; the service deletes them at its start, and the dry run counts
+  them.
+- **A folder that already holds log files** (a daily file or the unknown-date file, for instance because the new service
+  ran before the split) is refused: exit 2, nothing written. With `--append` each day's lines are added at the end of
+  that day's file with `O_APPEND` and nothing there is rewritten, so no line already there is lost; that day's split
+  lines then follow its newer lines, and every line keeps its own `ts`. A backup name that exists is never replaced:
+  name another with `--legacy`.
+- Without `--append` the daily files are created new. On any fault, or when the old file changed during the split (the
+  service still running), the files this run made are removed, the old file stays as it was, and the exit code is 1.
+- It prints names, dates, counts and sizes, never a line's text.
+
+**Rollback:** stop the service, put back the earlier `web/compose.ask.yaml`, `web/run.sh` and
+`web/ask_mcp.py`, and run `./run.sh restart-ask`: the earlier `run.sh` creates an empty `.private/ask_log.jsonl` and lines
+go there again. The daily files stay readable, and nothing deletes them while rolled back. To go forward again: stop,
+`python3 -I scripts/split_ask_log.py --apply --append --legacy .private/ask_log.legacy-2.jsonl`, restart.
 
 ## Firewall
 

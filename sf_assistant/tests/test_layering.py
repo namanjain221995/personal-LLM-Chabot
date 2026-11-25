@@ -55,7 +55,10 @@ LIGHT = ["sf_assistant.config", "sf_assistant.engine.types", "sf_assistant.tools
          "sf_assistant.engine.business_terms", "sf_assistant.engine.term_contracts", "sf_assistant.tools.term_enforce",
          "sf_assistant.agent.term_notes",
          # the prerequisites of 2026-11-25: small talk, the display words and the clarifying question
-         "sf_assistant.agent.small_talk", "sf_assistant.agent.display", "sf_assistant.agent.clarify"]
+         "sf_assistant.agent.small_talk", "sf_assistant.agent.display", "sf_assistant.agent.clarify",
+         # Salesforce conversation memory (design v2 of 2026-11-25): the query state (lane S1), the follow-up
+         # resolver and its code shortcuts (lane S2)
+         "sf_assistant.agent.query_state", "sf_assistant.agent.resolver", "sf_assistant.engine.followup_shortcuts"]
 
 
 # ------------------------------------------------------------------------------------------------- static import graph
