@@ -201,6 +201,18 @@ def enabled() -> bool:
     return bool(getattr(settings, "toggle_off_isolation", True))
 
 
+def frozen_holding_chats() -> frozenset:
+    """Conversation ids the owner froze as Salesforce-holding although no row
+    says so (TOGGLE_OFF_FROZEN_HOLDING_CHATS, data review F3). Such a chat
+    reads like one that holds Salesforce only by a server row: every
+    unstamped answer is hidden on a toggle-off turn, and the chat is left
+    out of cross-chat recall and of new vectors. Empty while isolation is
+    off. Read-time only: no stored row changes."""
+    if not enabled():
+        return frozenset()
+    return frozenset(str(i) for i in (getattr(settings, "toggle_off_frozen_holding_chats", None) or ()))
+
+
 # ---------------------------------------------------------------------------
 # The user's Salesforce-holding chats, cached in this process (review R2)
 # ---------------------------------------------------------------------------

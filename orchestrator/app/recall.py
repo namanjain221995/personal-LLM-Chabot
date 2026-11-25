@@ -172,10 +172,41 @@ def chunk_text(text: str) -> List[str]:
     return chunks
 
 
+def _holds_salesforce_sync(conversation_id: str) -> bool:
+    from . import sf_isolation
+
+    if not sf_isolation.enabled():
+        return False
+    owner = db.conversation_owner(conversation_id)
+    if owner is None:
+        return False  # no chat row: add_conversation_chunks cannot store anyway
+    return str(conversation_id) in sf_isolation.salesforce_chats(owner)
+
+
+async def _holds_salesforce(conversation_id: str) -> bool:
+    """TOGGLE-OFF ISOLATION, owner decision 3 widened (2026-11-25): a chat
+    that holds Salesforce gets no NEW folded-chunk vector, the same set and
+    the same flag as `db.messages_missing_embeddings` (sf_isolation
+    .salesforce_chats, TOGGLE_OFF_ISOLATION). The folded turns carry no
+    mode, so the whole chat is the unit. Chunks already stored stay; a
+    toggle-off turn in such a chat never reads them. A failed check stores
+    nothing (it can only leave a vector out)."""
+    try:
+        return await db.run_in_thread(_holds_salesforce_sync, conversation_id)
+    except Exception:  # noqa: BLE001 — fail closed, said in the log
+        log.warning(
+            "cannot read whether conversation %s holds Salesforce; folded turns not indexed",
+            _conversation_ref(conversation_id),
+            exc_info=True,
+        )
+        return True
+
+
 async def index_folded(
     conversation_id: str, folded: Sequence[dict], first_ordinal: int
 ) -> int:
-    """Embed and store turns that were just folded into the summary."""
+    """Embed and store turns that were just folded into the summary. Not in
+    a chat that holds Salesforce (see `_holds_salesforce`)."""
     if not settings.semantic_recall_enabled:
         return 0
     texts: List[str] = []
@@ -196,6 +227,8 @@ async def index_folded(
             )
         ordinal = (first_ordinal + offset + 1) * 1000
     if not texts:
+        return 0
+    if await _holds_salesforce(conversation_id):
         return 0
     vectors = await llm.embed_texts(texts)
     rows = [

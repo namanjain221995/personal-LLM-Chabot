@@ -5404,9 +5404,11 @@ def salesforce_chat_state(user_id: int, conversation_id: str) -> List[dict]:
     Salesforce answer, or a question asked in Salesforce mode (by its
     request, by the answer under it in the tree, or by the row after it),
     as `messages_missing_embeddings` reads it. Scoped to the owner. Every
-    branch counts.
+    branch counts. A chat the owner froze as holding
+    (`sf_isolation.frozen_holding_chats`, data review F3) holds Salesforce
+    whatever its rows say.
     """
-    from .sf_isolation import meta_says_salesforce, server_says_salesforce, sf_meta_sql
+    from .sf_isolation import frozen_holding_chats, meta_says_salesforce, server_says_salesforce, sf_meta_sql
 
     with read_connection() as con:
         probe = con.execute(
@@ -5420,7 +5422,9 @@ def salesforce_chat_state(user_id: int, conversation_id: str) -> List[dict]:
             "                   THEN false ELSE r.request->>'mode' = 'salesforce' END)) AS holding",
             (conversation_id, int(user_id), conversation_id, conversation_id, conversation_id),
         ).fetchone()
-        if not probe or not probe["owned"] or not probe["holding"]:
+        if not probe or not probe["owned"]:
+            return []
+        if not probe["holding"] and str(conversation_id) not in frozen_holding_chats():
             return []
         rows = con.execute(
             "SELECT id, role, content, meta, generation_id FROM messages"
@@ -5473,10 +5477,15 @@ def salesforce_chat_state(user_id: int, conversation_id: str) -> List[dict]:
 def salesforce_chat_ids(user_id: int) -> List[str]:
     """Every conversation of this user that holds Salesforce: an answer whose
     meta says so, or a server row of a Salesforce-mode turn (the same signals
-    as `salesforce_chat_state`). One statement; the meta is read once per
-    row. Cached per user by app/sf_isolation.salesforce_chats."""
-    from .sf_isolation import sf_meta_sql
+    as `salesforce_chat_state`), plus the user's chats the owner froze as
+    holding (data review F3). One statement; the meta is read once per row.
+    Cached per user by app/sf_isolation.salesforce_chats."""
+    from .sf_isolation import frozen_holding_chats, sf_meta_sql
 
+    frozen = sorted(frozen_holding_chats())
+    frozen_sql = (
+        " UNION SELECT c.id FROM conversations c WHERE c.user_id = %s AND c.id = ANY(%s)" if frozen else ""
+    )
     with read_connection() as con:
         rows = con.execute(
             "SELECT m.conversation_id AS id FROM messages m"
@@ -5490,8 +5499,9 @@ def salesforce_chat_ids(user_id: int) -> List[str]:
             " SELECT r.conversation_id FROM chat_requests r"
             " WHERE r.user_id = %s"
             "   AND NOT EXISTS (SELECT 1 FROM query_traces t2 WHERE t2.trace_id = r.generation_id)"
-            "   AND r.request->>'mode' = 'salesforce'",
-            (int(user_id), int(user_id), int(user_id)),
+            "   AND r.request->>'mode' = 'salesforce'"
+            f"{frozen_sql}",
+            (int(user_id), int(user_id), int(user_id), *((int(user_id), frozen) if frozen else ())),
         ).fetchall()
     return [r["id"] for r in rows if r["id"]]
 
