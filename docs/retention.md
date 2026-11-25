@@ -86,7 +86,7 @@ then deletes the rows:
   stamp turns into `{"mode": "salesforce"}`).
 
 Nothing else in the message changes: not the content, not any other meta
-key, not `updated_at`, and never a message whose meta has a mode (an
+key, and never a message whose meta has a mode (an
 answer stored as `assistant` stays `assistant`). For the guard, the result
 is the same as before the run: it hides what it hid before, apart from the
 cases listed under "What it cannot reach": the answer, its question and the

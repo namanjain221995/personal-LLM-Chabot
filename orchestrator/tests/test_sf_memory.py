@@ -802,6 +802,7 @@ def test_the_sweeps_work_is_judged_by_its_counts_never_by_its_status_word(monkey
     assert app_main._retention_rows({"status": "disabled"}) == 0
     assert app_main._retention_rows({"status": "dry_run", "a": 0, "b": 0, "capped": 1, "errors": 2}) == 0
     assert app_main._retention_rows({"status": "deleted", "a": 4, "b": 1, "capped": 9, "errors": 0}) == 5
+    assert app_main._retention_rows({"status": "deleted", "a": 4, "messages_stamped": 3, "errors": 0}) == 4
     results = iter([{"status": "dry_run", "a": 0, "capped": 0, "errors": 0},
                     {"status": "deleted", "a": 4, "capped": 0, "errors": 0}])
 

@@ -4111,11 +4111,12 @@ async def run_rotated_key_expiry() -> Optional[int]:
 
 def _retention_rows(result: dict) -> int:
     """The rows one chat-retention pass deleted or counted: every count but
-    `capped` and `errors`. Never `any(result.values())`: its `status` word is
-    always truthy, so that would read every pass, even a disabled one, as work."""
+    `capped`, `errors` and `messages_stamped` (a stamp marks a message, it
+    removes no row). Never `any(result.values())`: its `status` word is always
+    truthy, so that would read every pass, even a disabled one, as work."""
     return sum(
         value for name, value in result.items()
-        if name not in ("status", "capped", "errors")
+        if name not in ("status", "capped", "errors", "messages_stamped")
         and isinstance(value, int) and not isinstance(value, bool)
     )
 
