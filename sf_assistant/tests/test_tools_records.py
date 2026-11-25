@@ -574,7 +574,9 @@ def test_contact_fields_only_when_the_question_asks(tools):
         r = ok(tools, "count_records", {"object": "Account", "filters": [F("PersonEmail", "c1@example.invalid")]})
         assert r["count"] == 1 and "example.invalid" not in json.dumps(r)
         r = ok(tools, "count_records", {"object": "Account", "filters": [F("PersonEmail", None, "is_blank")]})
-        assert r["count"] == 4  # the client and the three accounts added for the lookup tests
+        # the question counts candidates: code keeps the Person Accounts (business-term contracts of 2026-11-24), so
+        # of the client and the three accounts added for the lookup tests only the candidate Delta Person is left
+        assert r["count"] == 1 and r["applied"]["term_filters"] == ["RecordTypeId = 'Person Account'"]
         tools.begin_question("What is the e-mail address of Candidate 1?")
         r = ok(tools, "list_records", {"object": "Account", "fields": ["PersonEmail"]})
         assert "PersonEmail" in r["columns"] and "example.invalid" in json.dumps(r)

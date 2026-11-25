@@ -2373,8 +2373,10 @@ def _link_roles(lk: dict, directions: Any = None) -> list[str]:
 def _filters_field(e: QueryEvidence, fld: str, label: str = "") -> bool:
     """The call filtered on the base object's field ``fld`` itself (its API name or label as a filter or ``any_of``
     field of the arguments, or the field an ``applied`` filter starts with: "Status__c = 'Completed'"): its split is
-    the filter's, not the person's whole set of records."""
-    args = e.arguments if isinstance(e.arguments, dict) else {}
+    the filter's, not the person's whole set of records. The arguments are those that ran: code's enforced ones for a
+    business term (``QueryEvidence.enforced_arguments``, 2026-11-24), else the model's."""
+    ran = getattr(e, "enforced_arguments", None) or e.arguments
+    args = ran if isinstance(ran, dict) else {}
     keys = {str(fld).lower()} | ({str(label).lower()} if label else set())
     for key in ("filters", "any_of"):
         for x in args.get(key) or []:

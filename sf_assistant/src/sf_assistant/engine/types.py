@@ -103,6 +103,19 @@ class QueryEvidence:
     def did_you_mean(self, value: list[dict[str, Any]]) -> None:
         self.__dict__["_did_you_mean"] = list(value)
 
+    # The business-term contracts (2026-11-24, tools/term_enforce.py): not a dataclass field either, for the same
+    # reason; ``arguments`` stays what the model sent (traces, timeline).
+    @property
+    def enforced_arguments(self) -> dict[str, Any] | None:
+        """The arguments the handler ran with when code changed them (an added candidate filter, a completed support
+        call); None when it ran with ``arguments``. Code that reads what ran (charts, the nudges) reads
+        ``enforced_arguments or arguments``."""
+        return self.__dict__.get("_enforced_arguments")
+
+    @enforced_arguments.setter
+    def enforced_arguments(self, value: dict[str, Any] | None) -> None:
+        self.__dict__["_enforced_arguments"] = value
+
 
 @dataclass
 class RecordsStatus:

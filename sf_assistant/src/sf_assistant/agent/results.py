@@ -47,6 +47,9 @@ class RecordAnswer:
     # the record agent's raw final text when its answer came back empty (the private log only, 2026-11-16: which
     # cleaner left nothing but the Source line)
     dropped_raw: str = ""
+    # business-term contracts (2026-11-24): the Person Account / record-type scope claims no applied filter backed,
+    # cut from the answer (agent.term_notes.drop_unapplied_scope_claims; also when the guard kept the answer whole)
+    dropped_claims: list[str] = field(default_factory=list)
 
     @property
     def data_queries(self) -> int:
