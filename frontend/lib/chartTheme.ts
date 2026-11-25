@@ -13,9 +13,12 @@
  * no DOM (SSR, tests) or when a token is missing. They are a safety net,
  * not a second source of truth: whatever globals.css says wins.
  *
- * The palette is the 5-slot categorical order (teal → blue → amber →
- * violet → rose) chosen for CVD separation and ≥3:1 contrast on both
- * surfaces, assigned in fixed order.
+ * The palette is the 8-slot categorical order (teal → blue → amber →
+ * violet → rose → olive → magenta → orange) chosen for CVD separation and
+ * ≥3:1 contrast on every surface a chart sits on, assigned in fixed order.
+ * Slots 6-8 were added 2026-11-25 (charts design v2 §7.1) and validated with
+ * the dataviz validator on #f4f4f4, #f8f8f8, #1e1e1e and #121212: worst
+ * adjacent CVD ΔE 9.3 (deutan, olive↔rose), worst normal-vision ΔE 15.1.
  *
  * No color in here can come from the backend. `ChartSpec` has no color
  * field, by design.
@@ -30,6 +33,21 @@ export interface ChartPalette {
   surface: string;
   tooltipBg: string;
   tooltipText: string;
+  // --- chat-chart chrome (design v2 §7.3). NEW fields, so the admin console,
+  // which reads `grid`/`axis`/`text` above, keeps its look (C17).
+  /** Axis tick and label ink (AA on the chart surface). */
+  axisText: string;
+  /** Value-axis gridline: a solid, recessive hairline. */
+  gridline: string;
+  /** The zero / category baseline. */
+  baseline: string;
+  /** dataZoom handles and border (≥ 3:1 non-text contrast). */
+  zoomHandle: string;
+  zoomFill: string;
+  /** Focus ring colour (the accent). */
+  focus: string;
+  /** Ordinal ramp for funnel stages, most emphatic first. */
+  ordinal: string[];
 }
 
 export const SERIES_FALLBACK = [
@@ -38,6 +56,9 @@ export const SERIES_FALLBACK = [
   '#B7791F',
   '#6D5AE6',
   '#C0566B',
+  '#4F771E',
+  '#AA4BA9',
+  '#E95C2C',
 ] as const;
 
 const CHROME = {
@@ -48,6 +69,16 @@ const CHROME = {
     surface: '#1e1e1e',
     tooltipBg: '#2a2a2a',
     tooltipText: '#f5f5f5',
+    axisText: '#a3a3a3',
+    gridline: '#333333',
+    baseline: '#525252',
+    zoomHandle: '#6b6b6b',
+    zoomFill: 'rgba(96,165,250,0.18)',
+    focus: '#60a5fa',
+    // dark → light: on a dark surface the lighter step is the louder one, so
+    // stage 1 takes the LAST step.
+    // Review V11/A16: every step ≥ 3:1 on the card and drawer grounds.
+    ordinal: ['#c4e1ff', '#a9cdfb', '#8eb9f0', '#73a5e4', '#5891d9', '#3b7dcd'],
   },
   light: {
     grid: '#e3e3e3',
@@ -56,8 +87,30 @@ const CHROME = {
     surface: '#f4f4f4',
     tooltipBg: '#ffffff',
     tooltipText: '#0d0d0d',
+    axisText: '#5d5d5d',
+    gridline: '#dcdcdc',
+    baseline: '#a8a8a8',
+    zoomHandle: '#8a8a8a',
+    zoomFill: 'rgba(29,78,216,0.12)',
+    focus: '#1d4ed8',
+    ordinal: ['#001c61', '#002f75', '#0a418b', '#1f54a0', '#3167b7', '#437bcd'],
   },
 } as const;
+
+/** Where a chart sits; the 2 px gaps and rings take that background (C19). */
+export type ChartContext = 'inline' | 'drawer' | 'mermaid';
+
+const SURFACES: Record<'dark' | 'light', Record<ChartContext, string>> = {
+  // The drawer is `bg-surface/60` over the page, so its real ground is darker
+  // (dark) or lighter (light) than the card surface.
+  dark: { inline: '#1e1e1e', mermaid: '#1e1e1e', drawer: '#121212' },
+  light: { inline: '#f4f4f4', mermaid: '#f4f4f4', drawer: '#f8f8f8' },
+};
+
+/** The background a chart in `context` actually sits on. */
+export function surfaceFor(theme: 'dark' | 'light', context: ChartContext): string {
+  return (SURFACES[theme] ?? SURFACES.dark)[context] ?? SURFACES.dark.inline;
+}
 
 export type ThemeName = keyof typeof CHROME;
 
@@ -67,6 +120,9 @@ const TOKEN_NAMES = [
   '--ts-chart-3',
   '--ts-chart-4',
   '--ts-chart-5',
+  '--ts-chart-6',
+  '--ts-chart-7',
+  '--ts-chart-8',
 ] as const;
 
 /** A CSS color we are willing to hand to a canvas renderer. */
@@ -79,7 +135,7 @@ function isUsableColor(value: string): boolean {
 }
 
 /**
- * Resolve `--ts-chart-1..5` against the document root.
+ * Resolve `--ts-chart-1..8` against the document root.
  *
  * Returns the literal fallbacks when there is no DOM or a token is unset,
  * so this is safe to call during SSR and from tests.
@@ -105,16 +161,22 @@ export function resolveSeriesColors(root?: Element | null): string[] {
 /** The full palette for `theme`. Series colors come from the CSS tokens. */
 export function resolvePalette(theme: ThemeName, root?: Element | null): ChartPalette {
   const chrome = CHROME[theme] ?? CHROME.dark;
-  return { series: resolveSeriesColors(root), ...chrome };
+  return { series: resolveSeriesColors(root), ...chrome, ordinal: [...chrome.ordinal] };
 }
 
 /** Palette with no DOM involved — SSR, tests, and the error path. */
 export function fallbackPalette(theme: ThemeName): ChartPalette {
   const chrome = CHROME[theme] ?? CHROME.dark;
-  return { series: [...SERIES_FALLBACK], ...chrome };
+  return { series: [...SERIES_FALLBACK], ...chrome, ordinal: [...chrome.ordinal] };
 }
 
-/** Series color for slot `i`, cycling only if a spec has >5 measures. */
+/** Number of categorical slots; the chart model never draws more series than this. */
+export const SERIES_SLOTS = SERIES_FALLBACK.length;
+
+/**
+ * Series color for slot `i`. Chat charts cap their series at SERIES_SLOTS, so
+ * the modulo only ever matters for the admin console's own callers.
+ */
 export function seriesColor(palette: ChartPalette, i: number): string {
   const colors = palette.series.length ? palette.series : [...SERIES_FALLBACK];
   return colors[i % colors.length];

@@ -22,13 +22,25 @@ sys.path.insert(0, str(ROOT / "tests"))
 from sf_assistant.agent import charts, display as D  # noqa: E402
 from sf_assistant.agent import record_prompts as rprompts  # noqa: E402
 import sf_assistant.pipeline as pipeline  # noqa: E402
-from test_records_retry import DRAFT, GROUP_CALL, Model, _switches, run, world  # noqa: E402,F401   # fixtures
+from test_records_retry import (DRAFT, GROUP_CALL, SOURCE, TREND_CALL, Model, _switches, run,  # noqa: E402,F401
+                                world)   # fixtures
 
 
 def _user_texts(model) -> list[str]:
-    """Every user message of the route, names, lean, knowledge and record requests."""
-    return [m["content"] for role in ("route", "names", "lean", "knowledge", "record")
-            for r in model.requests[role] for m in r["messages"] if m.get("role") == "user"]
+    """Every user message of the route, names, lean and knowledge requests, and the hints of the record request (the
+    record agent's own question is the typed text since the pre-release fix of 2026-11-25)."""
+    out = [m["content"] for role in ("route", "names", "lean", "knowledge")
+           for r in model.requests[role] for m in r["messages"] if m.get("role") == "user"]
+    for r in model.requests["record"]:
+        users = [m["content"] for m in r["messages"] if m.get("role") == "user"]
+        out += [users[0].split("\n\n", 1)[1] if "\n\n" in users[0] else ""] + users[1:] if users else []
+    return out
+
+
+def _record_question(model) -> str:
+    """The record agent's question: the first line block of its first user message (the hints follow a blank line)."""
+    first = next(m["content"] for m in model.requests["record"][0]["messages"] if m.get("role") == "user")
+    return first.split("\n\n", 1)[0]
 
 
 @pytest.mark.parametrize("question, removed, flag", [
@@ -44,8 +56,67 @@ def test_no_search_request_holds_a_removed_word(world, question, removed, flag):
     assert o.text == question and row["jsonl"]["question"] == question and row["question"] == question
     assert o.q.question == question and o.rec.question == o.display.search
     assert flag in row["jsonl"]["display"]["flags"] and removed in row["jsonl"]["display"]["words"]
-    if removed == "artifact":   # no request at all names it (L65: it was searched as a field)
-        assert "artifact" not in json.dumps(model.requests).lower()
+    assert _record_question(model) == question   # the record agent reads the typed words (pre-release fix)
+    if removed == "artifact":   # no search request names it (L65: it was searched as a field)
+        others = {k: v for k, v in model.requests.items() if k != "record"}
+        assert "artifact" not in json.dumps(others).lower()
+
+
+@pytest.mark.parametrize("question, search", [
+    ("plot interviews of last 6 months", "show interviews of last 6 months"),
+    ("can you plot interviews of last 6 months", "can you show interviews of last 6 months"),   # L8's shape
+])
+def test_the_record_agent_reads_the_typed_chart_word(world, monkeypatch, question, search):
+    """Pre-release fix of 2026-11-25 (L7, L8, L10): "show X of last 6 months" made the model list records; the record
+    agent's question keeps the typed chart verb, while the spelling help, the route and names calls, the triage's
+    value and people spots, ``begin_question`` and the hints read the search text, and the flags stay as built."""
+    seen: dict[str, list[str]] = {"spelling": [], "begin": [], "hints": [], "values": [], "people": []}
+    real_spelling = pipeline.question_spelling
+    monkeypatch.setattr(pipeline, "question_spelling",
+                        lambda text, *a, **k: seen["spelling"].append(text) or real_spelling(text, *a, **k))
+    tools = world.tools
+    for key, name in (("begin", "begin_question"), ("hints", "object_hints"), ("values", "spot_values"),
+                      ("people", "spot_people")):
+        real = getattr(tools, name)
+        monkeypatch.setattr(tools, name,
+                            lambda q, *a, _real=real, _key=key, **k: seen[_key].append(q) or _real(q, *a, **k))
+    model = Model(TREND_CALL, "10 interviews over the months (`Interview__c`).\n" + SOURCE)
+    o, row = run(world, model, question)
+    # the flags, the search text and the log as built
+    assert o.display.search == search and o.display.flags() == {"chart": True} and o.display.words == ("plot",)
+    assert row["jsonl"]["display"] == {"flags": {"chart": True}, "words": ["plot"], "kept": []}
+    assert o.text == question and o.rec.question == search
+    # the record agent: the typed text, the chart note (the display note adds nothing for a chart)
+    assert _record_question(model) == question
+    system = model.requests["record"][0]["messages"][0]["content"]
+    assert system.endswith(charts.RECORDS_CHART_NOTE) and D.NOTE_LINES["lead"] not in system
+    # every search input: the search text
+    assert model.requests["route"] and model.requests["names"]
+    assert not any("plot" in t.lower() for t in _user_texts(model))
+    assert seen["spelling"] == [search] and seen["begin"] == [search] and seen["hints"] == [search]
+    assert search in seen["values"] and search in seen["people"]
+    # the guards' spots read the typed text (to keep a stored value or name whole), nothing else does
+    assert set(seen["values"]) <= {search, question} and set(seen["people"]) <= {search, question}
+    assert o.charts and o.rec.evidence[0].tool == "trend_records"
+
+
+def test_a_question_without_display_words_reads_as_before(world):
+    """No display word: the record agent's question is the typed text, as it always was."""
+    model = Model(GROUP_CALL, DRAFT)
+    o, _row = run(world, model, "how many interviews are there per status?")
+    assert o.display.search == o.text and _record_question(model) == o.text
+
+
+def test_charts_off_the_record_agent_reads_the_search_text(world, monkeypatch):
+    """With ``SFA_CHARTS`` off the record agent gets the search text, as built (no chart word reaches a model that
+    draws no chart); a table word goes the same way."""
+    monkeypatch.setenv("SFA_CHARTS", "off")
+    model = Model(TREND_CALL, "10 interviews over the months (`Interview__c`).\n" + SOURCE)
+    o, _row = run(world, model, "can you plot interviews of last 6 months")
+    assert _record_question(model) == "can you show interviews of last 6 months" and o.display.chart
+    model = Model(GROUP_CALL, DRAFT)
+    o, _row = run(world, model, "show me a table of interviews by status")
+    assert _record_question(model) == "show interviews by status" and o.display.table
 
 
 def test_the_display_note_follows_the_chart_note(world):
@@ -61,7 +132,10 @@ def test_the_display_note_follows_the_chart_note(world):
     run(world, model, "show a bar chart of interviews by status")
     system = model.requests["record"][0]["messages"][0]["content"]
     assert system.endswith(charts.RECORDS_CHART_NOTE) and D.NOTE_LINES["lead"] not in system
-    assert "chart" not in model.requests["record"][0]["messages"][1]["content"].split("\n")[0]
+    # the record agent reads the typed chart words (pre-release fix of 2026-11-25); the route call does not
+    first = model.requests["record"][0]["messages"][1]["content"].split("\n")[0]
+    assert first == "show a bar chart of interviews by status"
+    assert "chart" not in model.requests["route"][0]["messages"][1]["content"]
 
 
 def test_the_chart_overrule_reads_the_flags(world):

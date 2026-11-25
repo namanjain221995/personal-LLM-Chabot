@@ -10,7 +10,9 @@ they are) with:
 - ``Interview__c.Interview_Support_Person__c`` on 6 interviews of 2 support people with known outcomes, the preferred
   support person, a Lead lookup and the B2B client account (a lookup to Account that is never the candidate);
 - ``Session__c.Session_Role__c`` ('Support' twice: the other reading of support) and an additional attendee lookup;
-- ``Onboarding__c`` (completed onboardings of candidates) and a small ``Contact`` table.
+- ``Onboarding__c`` (completed onboardings of candidates) and a small ``Contact`` table;
+- three ``Interview_Participant__c`` rows (a lookup to Interview__c) created on another day than their interview's
+  date: the placement date rule through a lookup path.
 
 ``TERMS_FACTS`` holds the counts the tests assert (computed from the rows). All names are synthetic and hold no digits.
 """
@@ -28,6 +30,7 @@ ACC_INT = sid("001", 60)
 INT_RT = sid("a0A", 60)            # a client interview of a Recruiter-type account
 ONB = [sid("a0R", i) for i in (1, 2, 3)]
 CON_1 = sid("003", 1)
+PART = [sid("a0J", i) for i in (1, 2, 3)]   # Interview_Participant__c
 
 #: The two support people (Recruiter__c records of the base fixture) and their interviews.
 SUPPORT = {"Recruiter C": ["I-0001", "I-0002"], "Delta  Person": ["I-0004", "I-0005", "I-0008", "I-0010"]}
@@ -73,6 +76,10 @@ def _terms_tables() -> list:
         {"Id": ONB[0], "Name": "ONB-0001", "CreatedDate": day, "Account__c": F.CAND_1, "Status__c": "Completed"},
         {"Id": ONB[1], "Name": "ONB-0002", "CreatedDate": day, "Account__c": F.CAND_KQ, "Status__c": "Completed"},
         {"Id": ONB[2], "Name": "ONB-0003", "CreatedDate": day, "Account__c": F.CAND_2, "Status__c": "Started"}])
+    _with(t, "Interview_Participant__c", {"CreatedDate": F.TS}, [   # created: Aug, Aug, Sep; interviews: Sep, Aug, Sep
+        {"Id": PART[0], "Name": "IP-0001", "Interview__c": by_name["I-0001"], "CreatedDate": "2026-08-20T12:00:00.000Z"},
+        {"Id": PART[1], "Name": "IP-0002", "Interview__c": by_name["I-0005"], "CreatedDate": "2026-08-12T12:00:00.000Z"},
+        {"Id": PART[2], "Name": "IP-0003", "Interview__c": by_name["I-0002"], "CreatedDate": "2026-09-02T12:00:00.000Z"}])
     _with(t, "Contact", {"Id": None, "Name": None, "CreatedDate": F.TS, "AccountId": None}, [
         {"Id": CON_1, "Name": "Candidate 1", "CreatedDate": day, "AccountId": F.CAND_1}])
     return t

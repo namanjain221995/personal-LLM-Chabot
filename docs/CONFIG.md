@@ -291,12 +291,29 @@ assistant-mode request) has no flag.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `TOGGLE_OFF_ISOLATION` | `true` | On a toggle-off turn: earlier Salesforce answers and questions, answers written after one before this guard, and quotes that are not clean text of the chat become placeholders in the history; the summary, folded chunks and compaction are skipped in a chat that holds Salesforce (a stored Salesforce answer, or a server row of a Salesforce-mode turn, stored answer or not); cross-chat recall leaves such chats out; artifacts made by a Salesforce-mode job are not offered; answers carry the `sf_isolation` stamp, which only the server writes, and a history PUT keeps it and `mode` by position. Also stops embedding NEW rows of a chat that holds Salesforce. `false` restores the behaviour before it (answers made while off count as unguarded later, which only hides more). |
+| `TOGGLE_OFF_ISOLATION` | `true` | On a toggle-off turn: earlier Salesforce answers and questions, answers written after one before this guard, and quotes that are not clean text of the chat become placeholders in the history; the summary, folded chunks and compaction are skipped in a chat that holds Salesforce (a stored Salesforce answer, or a server row of a Salesforce-mode turn, stored answer or not); cross-chat recall leaves such chats out; artifacts made by a Salesforce-mode job are not offered; answers carry the `sf_isolation` stamp, which only the server writes, and a history PUT keeps it and `mode` by position. Also stops embedding NEW rows of a chat that holds Salesforce, and new folded-chunk vectors of such a chat (compaction in Salesforce mode and `POST /chat/compact` still write the summary; chunks already stored stay). `false` restores the behaviour before it (answers made while off count as unguarded later, which only hides more). |
 | `TOGGLE_OFF_MASK_PERSONAL_DETAILS` | `true` | A phone number or e-mail in a toggle-off chat answer (and its reasoning, and the best-of judge's reason) that the prompt did not hold is shown as `[phone not available]` / `[email not available]`; meta `personal_details_masked`, metric `toggle_off_personal_details_masked_total`. Package versions, git and SSH targets, decimals, salary ranges, identifiers and counts are not masked. |
 | `FACTS_BLOCK_THIRD_PARTY_CONTACTS` | `true` | Owner decision 1, in every mode: another person's phone, e-mail or address is never saved as a memory fact (nor in its `source_excerpt`), and one already saved is masked before facts reach a prompt; a fact the extractor saw masked is never rewritten. The person's own details stay. |
 | `TOGGLE_OFF_PROMPT_RULE` | `true` | The rule against invented personal details in every assistant-mode answering prompt (chat, agent step, fallback and synthesis). `false` sends those prompts exactly as before the rule. The wording awaits the owner-approved model check. |
 | `TOGGLE_OFF_DETECTOR_RULES` | `ABCD` | Which rules may answer a toggle-off turn with a fixed reply before any model call: A a lookup of the person's own company records (first person or a recent window of time; not code, a how-to or their own life), B takes Salesforce or the CRM as the source (not a product question), C a person's details by company role (of "our/my/this" person or a named one), D a short follow-up on a hidden answer (not one that points at a file). A, B and C never fire for a member without the Salesforce toggle. Empty, `off`, `none`, `false`, `0`, `no` or `disabled` turns A-D off; other characters are ignored. A quote of kept-out text (E) is always answered with a fixed reply and has no switch. Metric `toggle_off_needs_salesforce_total{rule}`. |
+| `TOGGLE_OFF_FROZEN_HOLDING_CHATS` | empty | Conversation ids, separated by commas or spaces, that count as Salesforce-holding although no stored or server row says so (owner decision on data review F3: older toggle-off answers that repeat a Salesforce answer). In such a chat every answer without the `sf_isolation` stamp is hidden on a toggle-off turn, the summary and chunks are skipped, and cross-chat recall and new vectors leave it out. Read-time only; no row changes; an id of another user's chat or an unknown id does nothing. Deployment data: never put ids in the repo. Ignored while `TOGGLE_OFF_ISOLATION` is off. |
 | `TOGGLE_OFF_STATE_TIMEOUT_S` | `2.0` | How long a toggle-off turn waits for the chat's Salesforce state. A slower or failed read counts as failed: for a member with Salesforce every earlier assistant turn is hidden on that turn, with its own status line and no "came from Salesforce" reply; for a member without it the context stays as sent. |
+
+To find the ids for `TOGGLE_OFF_FROZEN_HOLDING_CHATS` from the message ids a
+data review names, read only, and print ids and counts only:
+
+```sql
+BEGIN READ ONLY;
+SELECT m.conversation_id, count(*) AS rows_named
+  FROM messages m WHERE m.id = ANY(:message_ids) GROUP BY 1;
+-- After the restart: each listed chat, its owner, and whether a row already
+-- marks it (false = held only by this setting).
+SELECT c.id, c.user_id,
+       EXISTS (SELECT 1 FROM messages x WHERE x.conversation_id = c.id
+                AND x.role = 'assistant' AND x.meta->>'mode' = 'salesforce') AS marked
+  FROM conversations c WHERE c.id = ANY(:conversation_ids);
+ROLLBACK;
+```
 
 Other metrics: `toggle_off_hidden_turns_total{kind=sf|tainted|quote}` and
 `toggle_off_state_read_failed_total{closed}`. A change needs an orchestrator

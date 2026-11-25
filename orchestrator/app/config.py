@@ -7,6 +7,7 @@ the GPU, or any model runtime.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from typing import Optional
 
@@ -124,6 +125,11 @@ def _detector_rules(raw: Optional[str]) -> str:
         return ""
     letters = {ch for ch in value.upper() if ch in "ABCD"}
     return "".join(ch for ch in "ABCD" if ch in letters)
+
+
+def _id_set(raw: Optional[str]) -> frozenset:
+    """Ids listed in one setting, separated by commas or white space."""
+    return frozenset(part for part in re.split(r"[\s,]+", raw or "") if part)
 
 
 #: Settings the no-timeout /v1 design (revision 2, 2026-09-13) retired: each
@@ -1648,6 +1654,15 @@ class Settings:
         # How long a toggle-off turn waits for the chat's Salesforce state
         # before it counts the read as failed (review R6). Seconds.
         self.toggle_off_state_timeout_s: float = _float("TOGGLE_OFF_STATE_TIMEOUT_S", 2.0)
+        # Owner decision (data review F3, 2026-11-25): conversation ids that
+        # count as Salesforce-holding although no stored or server row says
+        # so (pre-guard toggle-off answers that repeat a Salesforce answer).
+        # Their unstamped answers are hidden on toggle-off turns, and cross-
+        # chat recall and new vectors leave them out. Read-time only; no row
+        # changes. The ids are deployment data, never repo data: empty here.
+        self.toggle_off_frozen_holding_chats: frozenset = _id_set(
+            os.environ.get("TOGGLE_OFF_FROZEN_HOLDING_CHATS", "")
+        )
         # The FLOOR on the blended score; the real gate is vector agreement
         # AND lexical overlap together (living_knowledge._topical). Measured
         # 2026-09-02: a true documentation match scores 0.44-0.61 here.

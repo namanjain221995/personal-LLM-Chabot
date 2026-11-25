@@ -253,6 +253,17 @@ describe('COLOR-11 · nothing but the accent moved', () => {
     '--ts-chart-3': '#b7791f',
     '--ts-chart-4': '#6d5ae6',
     '--ts-chart-5': '#c0566b',
+    // Charts design v2 §7.1 (2026-11-25): three validated slots, same hex in
+    // both themes, plus the chat-chart chrome and the funnel ramp.
+    '--ts-chart-6': '#4f771e',
+    '--ts-chart-7': '#aa4ba9',
+    '--ts-chart-8': '#e95c2c',
+    '--ts-chart-axis-text': '#a3a3a3',
+    '--ts-chart-gridline': '#333333',
+    '--ts-chart-baseline': '#525252',
+    '--ts-chart-zoom-handle': '#6b6b6b',
+    '--ts-chart-ord-1': '#c4e1ff',
+    '--ts-chart-ord-6': '#3b7dcd',
   };
 
   const PINNED_LIGHT: Record<string, string> = {
@@ -269,6 +280,12 @@ describe('COLOR-11 · nothing but the accent moved', () => {
     '--ts-engine-vision-ink': '#5140bd',
     '--ts-engine-report-ink': '#26598f',
     '--ts-engine-agent-ink': '#6d28d9',
+    '--ts-chart-axis-text': '#5d5d5d',
+    '--ts-chart-gridline': '#dcdcdc',
+    '--ts-chart-baseline': '#a8a8a8',
+    '--ts-chart-zoom-handle': '#8a8a8a',
+    '--ts-chart-ord-1': '#001c61',
+    '--ts-chart-ord-6': '#437bcd',
   };
 
   it.each(Object.entries(PINNED_DARK))('dark %s is still %s', (token, value) => {
@@ -338,6 +355,7 @@ describe('COLOR-12 · the remaining greens are the allowlisted ones', () => {
     '#33c7c0': 'Records engine ink (dark)',
     '#0b7c77': 'Records engine ink (light)',
     '#0e9d9a': 'chart series 1 — data semantics, not a UI accent',
+    '#4f771e': 'chart series 6 — data semantics, not a UI accent',
     '#98c379': 'code string token (dark) — syntax highlighting',
     '#50a14f': 'code string token (light) — syntax highlighting',
     '#56b6c2': 'code builtin token (dark) — syntax highlighting',
