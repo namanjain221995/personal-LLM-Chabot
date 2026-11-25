@@ -465,7 +465,37 @@ def truncate_messages(
     # an unanswerable one left open does not merely go stale: it silently
     # blocks every future question in this chat.
     _cancel_pending_clarification(conversation_id)
+    # So does the conversation memory of an answer that was removed: its plan
+    # describes a turn that no longer exists. Only those rows go; rows of the
+    # answers kept stay with their plans (design 2026-11-25 C26).
+    _forget_removed_answers(int(user["id"]), conversation_id)
     return result
+
+
+def _forget_removed_answers(user_id: int, conversation_id: str) -> None:
+    """Delete the `sf_query_state` rows of answers a truncate removed. Never
+    raises: the truncate is already committed. Nothing is read or written
+    while SF_ASSISTANT_MEMORY is off, as with every other part of the memory;
+    rows left from an earlier period are unreachable from another branch and
+    go with the chat. The hash is the toggle-off guard's own helper, so a row
+    is matched to its message exactly as the bridge matched it."""
+    from .config import settings
+
+    if getattr(settings, "sf_assistant_memory", False) is not True:
+        return
+    from . import sf_isolation, sf_memory_store
+
+    try:
+        sf_memory_store.delete_removed_answers(
+            user_id, conversation_id, answer_key=sf_isolation.answer_key
+        )
+    except Exception as exc:  # noqa: BLE001 — a side table must not fail the request
+        import logging
+
+        reason = str(exc) if isinstance(exc, sf_memory_store.StoreError) else type(exc).__name__
+        logging.getLogger(__name__).warning(
+            "conversation memory not trimmed after a truncate of %s: %s", conversation_id, reason
+        )
 
 
 class FeedbackIn(BaseModel):

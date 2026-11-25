@@ -19,6 +19,10 @@ Each tool call and each loop rule that costs one more model call (the tools-firs
 adds an entry to the timeline of the answer being made, when one is open (:mod:`sf_assistant.agent.timeline`;
 sizes, names and flags only).
 
+Seeded calls (Salesforce conversation memory, design v2 of 2026-11-25 §7.1): ``answer_question(seed=...)`` starts the
+messages with calls that already ran (the stored plan's), as one assistant turn and its tool results, and counts them as
+tool calls of the run. Without a seed every request is as before.
+
 Spelling help (``SFA_RESOLVER=on``, docs/resolver_integration.md (1), (6)): :class:`QuestionSpelling` holds one
 question's misspelt names and the knowledge agent's spelling block; :func:`sf_assistant.pipeline.question_spelling`
 makes it and writes the answer's "Read as" line (the wiring layer: this module never reads record-session objects). A
@@ -234,6 +238,30 @@ def _assistant_message(content: str | None, tool_calls: list[dict]) -> dict:
     }
 
 
+def _seed_messages(seed: Iterable[tuple[str, Any, Any]] | None, messages: list[dict], result: AgentResult) -> None:
+    """Append the seeded calls of ``seed`` to ``messages`` (one assistant turn with every call, then one tool message
+    per result, ids ``seed_1``, ``seed_2`` ...) and record them in ``result.tool_calls`` with ``seeded`` True. Nothing
+    for ``None`` or an empty seed."""
+    calls: list[dict] = []
+    payloads: list[dict] = []
+    for item in seed or ():
+        name, arguments, payload = item
+        calls.append({"id": f"seed_{len(calls) + 1}", "name": str(name or ""),
+                      "arguments": arguments if isinstance(arguments, dict) else {}})
+        payloads.append(payload if isinstance(payload, dict) else
+                        {"ok": False, "result": None, "error": "no result", "chunk_ids": []})
+    if not calls:
+        return
+    messages.append(_assistant_message("", calls))
+    for tc, payload in zip(calls, payloads):
+        messages.append({"role": "tool", "tool_call_id": tc["id"], "content": _to_json(payload)})
+        record = {"name": tc["name"], "arguments": tc["arguments"], "ok": bool(payload.get("ok", False)),
+                  "chunk_ids": list(payload.get("chunk_ids") or []), "latency_s": 0.0, "seeded": True}
+        if not record["ok"] and payload.get("error"):
+            record["error"] = str(payload["error"])
+        result.tool_calls.append(record)
+
+
 # --------------------------------------------------------------------------------------
 # public API
 # --------------------------------------------------------------------------------------
@@ -251,6 +279,7 @@ def answer_question(
     check_answer: Callable[[str], Any] | None = None,
     max_checks: int = 1,
     tools_first: Callable[[str], tuple[str, str | None] | None] | None = None,
+    seed: Iterable[tuple[str, Any, Any]] | None = None,
 ) -> AgentResult:
     """Answer one question with the tool-calling loop. Never raises.
 
@@ -277,6 +306,12 @@ def answer_question(
             it returns ``(message, tool_choice)``: the message to send instead of the nudge text
             and the tool choice of the next round only (None: none). ``None`` (the default) keeps
             the nudge as it was. With both hooks unset every request is byte for byte as before.
+        seed: Calls that already ran before the loop (Salesforce conversation memory, design v2 §7.1 step 4: the
+            seeded calls of a stored or patched query plan), as ``(tool name, arguments, payload)``: the arguments
+            sent and the ``registry.call`` result. The messages then start with one assistant turn holding those
+            calls and one tool message per result, as if the model had made them, and they count as tool calls of
+            this run (``tool_calls``, marked ``seeded``), so ``require_tools`` and ``tools_first`` see the tools as
+            used. ``None`` or empty (the default): the messages are byte for byte as before.
 
     Returns:
         :class:`AgentResult`. On failure ``error`` is set and ``answer`` holds whatever
@@ -290,6 +325,7 @@ def answer_question(
     ]
     max_steps = max(1, int(getattr(cfg, "max_tool_steps", 8) or 8))
     try:
+        _seed_messages(seed, messages, result)
         tools = registry.openai_tools()
         answered = False
         nudged = False

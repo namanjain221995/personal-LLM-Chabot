@@ -14,11 +14,11 @@ What these pin:
     stored as NULL, and no log line or error carries state, summary or plan
     text.
 
-STAGE 1 ONLY: the V45 migration is lane P0's (db.py) and is not in the tree
-yet, so the `sf_query_state_table` fixture below creates the table from the
-module's `DDL` constant and drops it again afterwards. Stage 2 replaces the
-fixture with the V45 migration (the table then already exists and the
-fixture leaves it alone).
+The table comes from migration V45, which the suite's session fixture
+applies with every other migration (conftest `app_database`). The
+`sf_query_state_table` fixture below only checks that it is there; the
+per-test truncation of `conversations` and `users` empties it through its
+cascading foreign keys.
 
 All names, texts and ids here are made up.
 """
@@ -35,6 +35,7 @@ import pytest
 
 from app import db
 from app import sf_memory_store as store
+from app.sse import strict_json
 
 _LOGGER = "app.sf_memory_store"
 _PLANTED = "PLANTED-SF-TEXT-a06000000000099AAA"
@@ -42,19 +43,15 @@ _PLANTED = "PLANTED-SF-TEXT-a06000000000099AAA"
 
 @pytest.fixture(scope="module", autouse=True)
 def sf_query_state_table(app_database):
-    """Stage 1 stand-in for migration V45 (lane P0, stage 2 replaces this):
-    the table from the store's own DDL text, dropped again at the end so the
-    shared test database keeps the schema the migrations made."""
+    """The table migration V45 made. Nothing is created or dropped here: a
+    test database without it is a migration failure, not a fixture's job."""
     with db.connection() as con:
-        existed = con.execute(
+        table = con.execute(
             "SELECT to_regclass('public.sf_query_state') AS t"
-        ).fetchone()["t"] is not None
-        if not existed:
-            con.execute(store.DDL)
+        ).fetchone()["t"]
+    assert table is not None, "migration V45 did not create sf_query_state"
+    assert db.schema_version() >= 45
     yield
-    if not existed:
-        with db.connection() as con:
-            con.execute("DROP TABLE IF EXISTS sf_query_state")
 
 
 def _h(text: str) -> str:
@@ -328,14 +325,17 @@ def test_a_typed_backslash_u0000_in_a_state_is_stored_exactly(alice):
 
 def test_the_state_cap_is_measured_on_the_exact_text_stored(alice):
     """The 32 KB rule reads the text that is stored. Each typed `\\u0000`
-    is seven characters there (the backslash is escaped); the old helper
-    counted six fewer per occurrence, so a state over the cap passed."""
+    is seven characters there (the backslash is escaped). The old house
+    helper removed six of them per occurrence, so a state over the cap
+    passed; since stage 2 `db._dumps_jsonb` writes the exact text too (it
+    removes NUL from the object, open point 16)."""
     conv = _chat(alice, "p1-chat-escape-cap")
     unit = "\\u0000"
     overhead = len(db._dumps_jsonb({"pad": ""}).encode("utf-8"))
     copies = (store.STATE_MAX_BYTES - overhead) // 7 + 1  # 7 stored bytes each
     state = {"pad": unit * copies}
-    assert len(db._dumps_jsonb(state).encode("utf-8")) < store.STATE_MAX_BYTES
+    assert db._dumps_jsonb(state) == strict_json(state)
+    assert len(db._dumps_jsonb(state).encode("utf-8")) > store.STATE_MAX_BYTES
     row = _insert(alice, conv, "gen-escape-cap", "answer", state=state)
     assert row is not None and row["state"] is None
 

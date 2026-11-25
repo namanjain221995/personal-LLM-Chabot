@@ -286,6 +286,15 @@ def _key(content: object) -> str:
     return hashlib.sha1(" ".join(text.split()).encode("utf-8")).hexdigest()
 
 
+def answer_key(content: object) -> str:
+    """The public name of `_key`, for the Salesforce conversation memory
+    (design 2026-11-25 §2.3): `sf_query_state` stores and matches its answer,
+    parent and question hashes with this one helper, so the memory and this
+    guard can never disagree about which turn a row belongs to. It adds no
+    behaviour; it calls `_key`."""
+    return _key(content)
+
+
 def _flatten(content: object) -> str:
     if isinstance(content, list):
         return " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))

@@ -1,0 +1,372 @@
+{
+ "title": "Hinglish chains (design v2 §16.1 H01-H04)",
+ "chains": [
+  {
+   "id": "H01",
+   "title": "isko chart me dikhao draws the chart; chart nahi takes it away",
+   "design": "design v2 §6.2 display shortcuts in Hinglish, C14 stop words, §16.1 H01",
+   "steps": [
+    {
+     "q": "is saal recruiter wise kitne interviews hue",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "Recruiter wise interviews are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "q": "isko chart me dikhao",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "show_chart": true
+      },
+      "charts": 1,
+      "read_as": "plan_line"
+     }
+    },
+    {
+     "q": "chart nahi",
+     "record": [
+      "The figures are listed.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "show_chart": false
+      },
+      "charts": 0
+     }
+    }
+   ]
+  },
+  {
+   "id": "H02",
+   "title": "pichle mahine ka and is saal ka change only the period",
+   "design": "design v2 §6.2 period shortcuts in Hinglish, §16.1 H02",
+   "steps": [
+    {
+     "q": "is mahine recruiter wise kitne interviews hue",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this month"
+       }
+      },
+      "Shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this month"
+        }
+       }
+      ],
+      "plan": {
+       "period": {
+        "from": "2026-10-01",
+        "to": "2026-10-31"
+       }
+      }
+     }
+    },
+    {
+     "q": "pichle mahine ka",
+     "record": [
+      "Last month is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "last month"
+        }
+       }
+      ],
+      "plan": {
+       "period": {
+        "from": "2026-09-01",
+        "to": "2026-09-30"
+       }
+      }
+     }
+    },
+    {
+     "q": "is saal ka",
+     "record": [
+      "This year is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "period": {
+        "from": "2026-01-01",
+        "to": "2026-12-31"
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "H03",
+   "title": "top 2 dikhao on a Hinglish candidates count keeps the Person Account scope",
+   "design": "design v2 §6.2 ranking shortcuts in Hinglish, §7.1 terms carried (candidates), §16.1 H03",
+   "steps": [
+    {
+     "q": "status wise kitne candidates hain",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Account",
+        "group_by": "Candidate_Status__c"
+       }
+      },
+      "The candidates by status are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Account",
+         "group_by": "Candidate_Status__c"
+        },
+        "term_filters": [
+         "RecordTypeId = 'Person Account'"
+        ],
+        "enforced_has": {
+         "filters": [
+          {
+           "field": "RecordTypeId",
+           "op": "eq",
+           "value": "PersonAccount"
+          }
+         ]
+        },
+        "result_has": {
+         "groups": [
+          {
+           "group": "(blank)",
+           "value": 2
+          },
+          {
+           "group": "Placed",
+           "value": 2
+          },
+          {
+           "group": "Active",
+           "value": 1
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Account",
+          "group_by": "Candidate_Status__c"
+         }
+        }
+       ],
+       "keys": [
+        "candidates"
+       ]
+      }
+     }
+    },
+    {
+     "q": "top 2 dikhao",
+     "record": [
+      "The top 2 are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Account",
+         "group_by": "Candidate_Status__c",
+         "top": 2,
+         "order": "desc"
+        },
+        "term_filters": [
+         "RecordTypeId = 'Person Account'"
+        ]
+       }
+      ],
+      "plan_line_has": [
+       "top 2",
+       "candidates as Person Accounts"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "H04",
+   "title": "mahine ke hisaab se splits by month, then isko chart me dikhao",
+   "design": "design v2 §6.2 by-period shortcuts in Hinglish, §6.4 set_grain (C13), §16.1 H04",
+   "steps": [
+    {
+     "q": "is saal status wise kitne interviews hue",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Status__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "Shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "q": "mahine ke hisaab se",
+     "record": [
+      "By month.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "trend_records",
+        "args": {
+         "object": "Interview__c",
+         "grain": "month",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "split_by": "Interview_Status__c"
+        }
+       }
+      ],
+      "plan": {
+       "tool": "trend_records"
+      }
+     }
+    },
+    {
+     "q": "isko chart me dikhao",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "plan": {
+       "tool": "trend_records",
+       "show_chart": true
+      },
+      "charts": 1
+     }
+    }
+   ]
+  }
+ ]
+}

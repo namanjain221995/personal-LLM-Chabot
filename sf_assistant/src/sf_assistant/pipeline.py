@@ -26,9 +26,17 @@ call failed, after its one forced round, gets a clarifying question code writes 
 
 ``sf_assistant.cli.ask`` runs answer -> print -> result_row, exactly as ask.py's ``ask()`` did. ``--no-records``
 imports no record module and no duckdb: every record import below is inside a function.
+
+Salesforce conversation memory (design v2 of 2026-11-25, §7; the ask service, ``web/ask_mcp.py``): a question the
+follow-up resolver read runs under a :class:`MemoryRun` (:func:`memory_run`, or ``answer(memory=...)``): the terms the
+record tools enforce, the seeded calls of a stored or patched plan, the plan's display flags and the last answer for a
+question about it; :func:`answer` writes back what ran (the evidence the next query state is built from). Without one,
+nothing of this runs.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import json
 import re
@@ -266,6 +274,98 @@ class Outcome:
     small_talk: str = ""           # the small-talk kind (agent.small_talk) of a small-talk line
     display: Any = None            # agent.display.Display of the question (None: not split, e.g. small talk)
     clarify: dict = field(default_factory=dict)   # the clarifying question's why, from, objects and choices (P2)
+
+
+# ------------------------------------------------------------- Salesforce conversation memory (design v2, §7)
+@dataclass
+class MemoryRun:
+    """How :func:`answer` runs a question the follow-up resolver read (``agent/resolver.py``; the ask service builds one
+    per job, so nothing is kept between jobs, C15), and what it ran.
+
+    Set by the caller:
+
+    - ``terms``: the ``engine.term_contracts.Terms`` the record tools enforce (``begin_question(terms=...)``, §7.1:
+      rebuilt from the stored plan's typed words and the typed follow-up, ``agent.query_state.terms_for``). None: the
+      terms of the question, as today.
+    - ``seed``: the ``agent.record_session.SeedRun`` of a stored or patched plan (§7.1 steps 3-4). The question then
+      runs on the record agent alone, from those calls (the knowledge step is skipped unless ``knowledge``,
+      ``SFA_MEMORY_PATCH_KNOWLEDGE``, §7.2), with no small-talk, display-only or bare-chart line.
+    - ``show``: the plan's display flags (``{"chart", "type", "table"}``) of a seeded run: the chart ask comes from them,
+      not from the words of the question (§7.2; the typed display words are already in them, stop words included).
+    - ``earlier``: the last answer's text for a question about it (§6.7), given to the record agent as data.
+    - ``display_only``: the patch changed only how the plan is shown: no triage call (§7.2).
+    - ``contact_ok``: whether the person's typed question asks for contact details (``asks_for_contact`` of the typed
+      words, read by the ask service; stage-2 review fix PE1). The record tools' contact flag and the last drop of
+      e-mail addresses and phone numbers read it instead of the question that runs, which for a patch or a shortcut is
+      code's plan line. None: read from the question, as today.
+
+    Set by :func:`answer` (reset at its start, so a retry after a file swap starts clean): ``evidence`` (the record
+    tools' evidence of the answer, for ``query_state.build``), ``shown`` (the display flags the run read), ``kind`` (the
+    answer kind) and ``lines`` (the code lines the seeded calls added to the answer). A run with only the defaults
+    (the ask service in ``SFA_MEMORY=shadow``) changes nothing in the answer: it only reads what ran."""
+
+    terms: Any = None
+    seed: Any = None
+    show: dict | None = None
+    earlier: str = ""
+    display_only: bool = False
+    knowledge: bool = False
+    contact_ok: bool | None = None
+    evidence: list = field(default_factory=list)
+    shown: dict = field(default_factory=dict)
+    kind: str = ""
+    lines: list = field(default_factory=list)
+
+    def begin(self) -> None:
+        self.evidence, self.shown, self.kind, self.lines = [], {}, "", []
+
+    def session_kwargs(self, seeded: bool) -> dict:
+        """The keyword arguments of ``RecordSession.ask`` this run sets (none for a run with only the defaults)."""
+        out: dict[str, Any] = {}
+        if self.terms is not None:
+            out["terms"] = self.terms
+        if self.contact_ok is not None:
+            out["contact_ok"] = self.contact_ok
+        if seeded:
+            out["seed"] = self.seed
+            if self.earlier:
+                out["earlier"] = self.earlier
+            if self.display_only:
+                out["triage"] = False
+        return out
+
+
+#: The :class:`MemoryRun` of the question :func:`answer` is answering now, when the caller set one with
+#: :func:`memory_run` (the ask service's pipeline, around ``sf_assistant.cli.ask``); None for every other run.
+_MEMORY_RUN: contextvars.ContextVar[Any] = contextvars.ContextVar("sf_assistant_memory_run", default=None)
+
+
+@contextlib.contextmanager
+def memory_run(run: MemoryRun | None):
+    """While the block runs, :func:`answer` (called in this thread, for example by ``sf_assistant.cli.ask``) runs
+    under ``run``; None changes nothing."""
+    token = _MEMORY_RUN.set(run)
+    try:
+        yield run
+    finally:
+        _MEMORY_RUN.reset(token)
+
+
+def _memory_display(show: Any, d: Any, text: str, charts_on: bool) -> tuple[Any, Any]:
+    """``(chart_ask, display)`` of a seeded run from the plan's display flags (§7.2): a chart ask of the stored type
+    when ``show.chart`` (and charts are on), none otherwise; the table flag from ``show``; never a display-only or
+    capability line (the plan names what to fetch)."""
+    show = show if isinstance(show, dict) else {}
+    chart_ask = None
+    if charts_on and show.get("chart") is True:
+        from sf_assistant.agent import charts as _charts
+        kind = show.get("type") if isinstance(show.get("type"), str) else None
+        chart_ask = _charts.ChartAsk(type=kind, bare=False)
+        d = dataclasses.replace(d, chart=True, refused=frozenset(d.refused) - {"chart"})
+    elif d.chart:
+        d = dataclasses.replace(d, chart=False)
+    return chart_ask, dataclasses.replace(d, table=show.get("table") is True or d.table, empty=False, capability=False,
+                                          search=d.search or text)
 
 
 # ------------------------------------------------------------- the spelling help (docs/resolver_integration.md (1), (6))
@@ -663,7 +763,7 @@ def _clarify_due(rec: Any) -> bool:
 
 
 def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_only: bool = False,
-           lean_knowledge: bool = True, context_objects: Any = ()) -> Outcome:
+           lean_knowledge: bool = True, context_objects: Any = (), memory: MemoryRun | None = None) -> Outcome:
     """Answer one question (no printing). The compute part of ask.py's ``ask()``, unchanged.
 
     ``session`` is a ``sf_assistant.agent.record_session.RecordSession`` (records on) or None (records off).
@@ -767,8 +867,21 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
     of :func:`sf_assistant.agent.clarify.build` instead of :data:`RECORDS_FAILED_ANSWER`, kind "none", no chart and no
     line (``Outcome.clarify``; the JSONL ``clarify``). ``context_objects``: the objects the last answer named (the ask
     service and the page's follow-up path; only the clarifying question reads them).
+
+    Salesforce conversation memory (``memory``, or the run :func:`memory_run` set; None: nothing of this runs): the
+    record tools enforce ``memory.terms``; a seeded run (``memory.seed``, records on) goes to the record agent alone
+    from the plan's calls, with the chart ask from ``memory.show``, the last answer as data for a question about it,
+    the seeded calls' code lines (kept dates, no rows now, a changed set) after the status lines (``final`` only), and,
+    when a stored record set cannot become a filter, its clarifying line (kind "none", ``Outcome.clarify`` why
+    ``memory_<code>``). The run gets back the evidence, the display flags read and the answer kind.
     """
     started_q = time.perf_counter()
+    memory = memory if memory is not None else _MEMORY_RUN.get()
+    if memory is not None:
+        memory.begin()
+    seeded = memory is not None and memory.seed is not None and session is not None
+    only = records_only or (seeded and not memory.knowledge)   # a seeded run: the record agent alone (§7.2)
+    mem_kw = memory.session_kwargs(seeded) if memory is not None and session is not None else {}
     timeline.begin()   # where the seconds go: stage blocks here, model, tool and check entries below (Outcome.timeline)
     merge_cfg = merge_settings()   # SFA_MERGE now: code (the default) or model; an invalid value is code, logged
     tables_cfg = tables_settings()   # SFA_TABLES now: model (the default) or code; an invalid value is model, logged
@@ -778,7 +891,7 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
     from sf_assistant.agent import display as _display
     from sf_assistant.agent.small_talk import line as _talk_line, small_talk as _small_talk
 
-    talk = _small_talk(text)   # P6: one fixed line, no model call
+    talk = "" if seeded else _small_talk(text)   # P6: one fixed line, no model call
     if talk:
         return _line_outcome(text, q, registry, session, started_q, records_only, merge_cfg, tables_cfg, charts_cfg,
                              _talk_line(talk), "small_talk", small_talk=talk)
@@ -788,16 +901,18 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
         chart_ask = _charts.chart_ask(text)
     # P3: what to fetch, apart from how to show it (code only; the spots of SessionGuards run only for a display word)
     d = _display.split(text, _display.SessionGuards(session) if session is not None else None)
-    if d.empty and d.capability:   # "can you do visualizations ?": what the answers can show, no model call
+    if seeded:   # a stored plan runs: the display comes from its flags, and there is something to fetch (§7.2)
+        chart_ask, d = _memory_display(memory.show, d, text, charts_cfg.on)
+    elif d.empty and d.capability:   # "can you do visualizations ?": what the answers can show, no model call
         return _line_outcome(text, q, registry, session, started_q, records_only, merge_cfg, tables_cfg, charts_cfg,
                              _display.line(_display.capability_key(d, charts_cfg.on)), "display_only", display=d)
-    if chart_ask is not None and chart_ask.bare:   # names nothing to chart: one line, no model call
+    if chart_ask is not None and chart_ask.bare and not seeded:   # names nothing to chart: one line, no model call
         return _bare_chart_outcome(text, q, registry, session, started_q, records_only, merge_cfg, tables_cfg,
                                    charts_cfg, display=d)
-    if d.empty:   # only how to show, nothing to fetch: one line, no model call
+    if d.empty and not seeded:   # only how to show, nothing to fetch: one line, no model call
         return _line_outcome(text, q, registry, session, started_q, records_only, merge_cfg, tables_cfg, charts_cfg,
                              _display.line(_display.bare_key(charts_cfg.on)), "display_only", display=d)
-    if charts_cfg.on:
+    if charts_cfg.on and not seeded:
         chart_ask, d = chart_reading(chart_ask, d)   # one reading for both steps
     search = d.search or text   # what to fetch: every search below reads it
     sq = q if search == text else dataclasses.replace(q, question=search)
@@ -813,9 +928,9 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
         with timeline.stage("knowledge"):
             r = answer_question(kq, llm, registry, cfg, system=system, require_tools=True)
         mode = "full"
-    elif records_only:
+    elif only:
         with timeline.stage("records"):
-            rec = session.ask(search, **_with_display(session.ask, d))
+            rec = session.ask(search, **_with_display(session.ask, d), **mem_kw)
     else:
         from sf_assistant.agent.record_prompts import KNOWLEDGE_RECORDS_NOTE
 
@@ -832,8 +947,8 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
         pool = ThreadPoolExecutor(max_workers=1)  # the record agent runs while the knowledge agent answers
         try:
             shown = _with_display(session.ask, d)
-            pending = (pool.submit(timeline.run_in, "records", session.ask, search, routed=routed, **shown) if early
-                       else pool.submit(timeline.run_in, "records", session.ask, search, **shown))
+            pending = (pool.submit(timeline.run_in, "records", session.ask, search, routed=routed, **shown, **mem_kw)
+                       if early else pool.submit(timeline.run_in, "records", session.ask, search, **shown, **mem_kw))
             if mode == "lean":
                 from sf_assistant.agent.lean import LeanRegistry, lean_knowledge_answer
 
@@ -925,9 +1040,12 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
     # the record agent's reply was dropped (a count after a name was not found): code's not-found answer, never the raw
     # knowledge answer, which does not say that the name is not in the records
     not_found = (getattr(rec, "not_found_answer", "") or "") if rec is not None and rec.no_records else ""
-    final, kind = choose_answer(m, rec, not_found, k_answer, records_only, status)
+    final, kind = choose_answer(m, rec, not_found, k_answer, only, status)
     clarify: dict = {}
-    if kind == "none" and _clarify_due(rec):   # P2: a question back with 2-3 choices, never the failed-figures line
+    if seeded and getattr(memory.seed, "stop", ""):   # a stored record set cannot become a filter: ask (§10)
+        final, kind = memory.seed.stop_text(), "none"
+        clarify = {"why": f"memory_{memory.seed.stop}", "from": "memory"}
+    elif kind == "none" and _clarify_due(rec):   # P2: a question back with 2-3 choices, never the failed-figures line
         from sf_assistant.agent import clarify as _clarify
         final, clarify = _clarify.build(search, d, rec, session, tuple(context_objects or ()), charts_on=charts_cfg.on)
     design_kept = False
@@ -941,7 +1059,10 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
         final = _tables.strip_markers(final)
     if rec is not None and final:   # phase 1 (2026-10-26): contact details only when the question asks for them
         from sf_assistant.engine.contact import asks_for_contact, drop_contact_details, result_numbers
-        if not asks_for_contact(text):
+        # a memory run reads the rule from the person's typed words (PE1); every other run from the question
+        contact_asked = (memory.contact_ok if memory is not None and memory.contact_ok is not None
+                         else asks_for_contact(text))
+        if not contact_asked:
             evidence = list(getattr(rec, "evidence", None) or [])
             final = drop_contact_details(final, result_numbers(getattr(e, "model_result", None) for e in evidence
                                                                if getattr(e, "ok", False)))[0]
@@ -967,6 +1088,12 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
         status_added = status_lines(without_lines(final, inserted), rec.evidence, text,
                                     getattr(session, "status_of", None), getattr(session, "lookup_directions", None))
         final = with_lines(final, status_added)
+    if seeded and kind in ("merged", "records") and getattr(memory.seed, "lines", None):
+        # the seeded calls' code lines (D1 kept dates, C7 no rows now, a changed set): in final only, as status lines
+        from sf_assistant.agent.nudges import with_lines
+        memory.lines = list(memory.seed.lines)
+        final = with_lines(final, memory.lines)
+        status_added = status_added + memory.lines
     if d.file and kind in ("merged", "records") and final.strip():   # P3: no file is made; the figures are here
         chart_lines = chart_lines + [_display.line("file")]
     if chart_lines:   # not in body; status_added keeps lookup_footer right
@@ -1000,10 +1127,15 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
     if tables_merge is not None:
         code_tables["merge"] = tables_merge
     timeline.add("stage", t_assemble, stage="assemble")
+    if memory is not None:   # what ran, for the next query state (the ask service builds it)
+        memory.evidence = list(getattr(rec, "evidence", None) or []) if rec is not None else []
+        memory.kind = kind
+        memory.shown = {"chart": chart_ask is not None, "type": getattr(chart_ask, "type", None),
+                        "table": bool(getattr(d, "table", False))}
     return Outcome(text=text, q=q, r=r, rec=rec, m=m, mode=mode, lean_error=lean_error, route_s=route_s,
                    shown_registry=shown_registry, status=status, checks=checks, k_answer=k_answer,
                    not_found=not_found, final=final, kind=kind, body=body, shown=shown, rq=rq, used=used,
-                   started_q=started_q, records_only=records_only, spelling=spelling, footed=footed,
+                   started_q=started_q, records_only=only, spelling=spelling, footed=footed,
                    status_lines=status_added, timeline=timeline.end(), merge_by=merge_by,
                    merge_switch=merge_cfg.problem,
                    tables_by="code" if tables_cfg.by == "code" and rec is not None else None,

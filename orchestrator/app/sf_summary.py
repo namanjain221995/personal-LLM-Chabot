@@ -40,11 +40,12 @@ starts from its own count and catches up.
 NOT REUSED. `compaction._fold` and `compaction.compact`: they index the folded
 turns into `conversation_chunks`, and Salesforce text gets no vectors.
 
-STAGE 2 (the toggle-off guard edits summarize.py, so it is not edited here).
-`_summarize` is the one call into the summariser: once summarize.summarize
-takes an `instructions` parameter, its body becomes the single line named in
-its docstring. SF_ASSISTANT_SUMMARY is read with getattr and a default of
-false, so this module is off until config.py defines `sf_assistant_summary`.
+THE ONE SUMMARISER CALL. `_summarize` calls summarize.summarize with
+`instructions=SF_INSTRUCTIONS`: the same request the assistant-mode fold
+sends (temperature 0, thinking off, SUMMARY_MAX_TOKENS), with the Salesforce
+wording in place of the assistant-mode one. SF_ASSISTANT_SUMMARY
+(config.py `sf_assistant_summary`, default false) is read with getattr, and
+only a real True turns the fold on.
 
 PRIVACY OF THE LOGS. Questions, plan lines and summaries are Salesforce data
 and are never logged: log lines carry the row id, an outcome code and an
@@ -60,7 +61,7 @@ import re
 from typing import Any, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
-from . import db, llm, metrics, summarize
+from . import db, metrics, summarize
 from .config import settings
 
 log = logging.getLogger(__name__)
@@ -288,20 +289,6 @@ def fold_turns(items: Sequence[dict]) -> List[dict]:
         if item["clarify"]:
             turns.append({"role": ROLE_CLARIFY, "content": item["clarify"]})
     return turns
-
-
-def build_messages(existing: str, turns: Sequence[dict]) -> List[dict]:
-    """The fold prompt: the request summarize.build_messages builds, with the
-    Salesforce instructions in place of the assistant-mode ones."""
-    user = (
-        f"{SF_INSTRUCTIONS}\n\n"
-        f"EXISTING SUMMARY:\n{existing.strip() or '(none yet)'}\n\n"
-        f"NEW MESSAGES:\n{summarize.format_turns(turns)}"
-    )
-    return [
-        {"role": "system", "content": summarize._SYSTEM},
-        {"role": "user", "content": user},
-    ]
 
 
 # ------------------------------------------------------------ post-check --
@@ -542,22 +529,10 @@ def _chat_lock(conversation_id: str) -> asyncio.Lock:
 
 
 async def _summarize(existing: str, turns: Sequence[dict]) -> str:
-    """The one call into the platform summariser.
-
-    STAGE 2: once summarize.summarize takes `instructions` (design §11.2),
-    this body becomes the single line
-        return await summarize.summarize(existing, turns, instructions=SF_INSTRUCTIONS)
-    Until then it sends the request summarize.summarize sends (temperature 0,
-    thinking off, SUMMARY_MAX_TOKENS), with the Salesforce instructions."""
-    if not summarize.format_turns(turns).strip():
-        return existing
-    text = await llm.chat_completion(
-        build_messages(existing, turns),
-        temperature=0.0,
-        max_tokens=settings.summary_max_tokens,
-        thinking=False,  # a fold is copying, not reasoning (summarize.summarize)
-    )
-    return (text or "").strip() or existing
+    """The one call into the platform summariser (design §11.2): its own
+    request, with the Salesforce instructions. No `header`: the bridge sends
+    the summary bare and the resolver labels it (SF_HEADER)."""
+    return await summarize.summarize(existing, turns, instructions=SF_INSTRUCTIONS)
 
 
 def _store_summary(

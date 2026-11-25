@@ -94,6 +94,14 @@ class Outcome:
     meta_extras: Dict[str, Any] = field(default_factory=dict)
     #: What the planner assumed on a hand-back. Not for the screen: see _meta_extras.
     assumptions: List[str] = field(default_factory=list)
+    #: Salesforce conversation memory (design 2026-11-25 §3.3), set only by
+    #: the sf_assistant bridge when SF_ASSISTANT_MEMORY is on: the returned
+    #: `state` and `plan_line`, the three branch hashes, `path_pairs`, the
+    #: parent row's summary fields and the out-of-window Salesforce pairs.
+    #: main.py writes it to `sf_query_state` after the answer is stored, on a
+    #: Salesforce-mode turn only. Server-side only: it is never part of
+    #: `meta_extras`, so nothing in it reaches the browser. None: no memory.
+    sf_memory: Optional[Dict[str, Any]] = None
 
 
 class _Phases:

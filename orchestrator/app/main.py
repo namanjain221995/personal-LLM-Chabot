@@ -3952,6 +3952,44 @@ async def _store_answer(gen: "LiveGeneration") -> None:
     gen.persisted = True
 
 
+async def _write_sf_memory(outcome: object, gen: "LiveGeneration", request: "ChatRequest", principal: object) -> None:
+    """Write the conversation-memory row of an sf_assistant answer
+    (app/sf_memory.py; design 2026-11-25 §3.3). Never raises.
+
+    Only when every one of these holds: the answer is durable (`gen.persisted`),
+    the turn ran in Salesforce mode (C19: defence in depth beside the bridge,
+    which never runs in any other mode), the stored meta is the sf_assistant
+    engine's, and the bridge put memory on the outcome (it does only with
+    SF_ASSISTANT_MEMORY on; `sf_memory.write` reads the switch again). The row
+    hashes the stored text, tail included, which is what the browser sends
+    back. The summary fold is started from there, on a row the insert returned.
+    """
+    if not (
+        gen.persisted
+        and request.mode == "salesforce"
+        and (gen.final_meta or {}).get("engine") == "sf_assistant"
+        and isinstance(getattr(outcome, "sf_memory", None), dict)
+    ):
+        return
+    try:
+        from . import sf_memory
+
+        await sf_memory.write(
+            outcome.sf_memory,
+            user_id=gen.user_id,
+            conversation_id=gen.conversation_id,
+            generation_id=gen.generation_id,
+            answer=gen.answer,
+            workspace_id=getattr(principal, "workspace_id", "") or "",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — memory never fails a turn
+        logging.getLogger(__name__).warning(
+            "conversation memory not written for %s: %s", gen.conversation_id, type(exc).__name__
+        )
+
+
 async def _interrupt_open_requests() -> int:
     """Startup and shutdown: every request this process could have been
     running is now 'interrupted'. Never raises — a reconciliation that
@@ -4071,9 +4109,50 @@ async def run_rotated_key_expiry() -> Optional[int]:
         return None
 
 
+def _retention_rows(result: dict) -> int:
+    """The rows one chat-retention pass deleted or counted: every count but
+    `capped` and `errors`. Never `any(result.values())`: its `status` word is
+    always truthy, so that would read every pass, even a disabled one, as work."""
+    return sum(
+        value for name, value in result.items()
+        if name not in ("status", "capped", "errors")
+        and isinstance(value, int) and not isinstance(value, bool)
+    )
+
+
+async def run_chat_retention() -> Optional[dict]:
+    """The chat retention pass (app/retention.py; design 2026-11-25 §12.1) on
+    this loop. Never raises. With CHAT_RETENTION_ENABLED off (the default) the
+    pass returns at once and touches no table; on, it works once a business
+    day under its own advisory lock, dry-run first (CHAT_RETENTION_DRY_RUN).
+
+    Imported by its full path: `app.apifiles.retention` is the Files API's own
+    retention and shares the short name.
+    """
+    try:
+        from app import retention as chat_retention
+
+        result = await chat_retention.sweep()
+        if not isinstance(result, dict):
+            return None
+        rows = _retention_rows(result)
+        errors = result.get("errors")
+        if rows or errors:
+            logging.getLogger(__name__).info(
+                "chat retention: status=%s rows=%d errors=%s capped=%s",
+                result.get("status"), rows, errors or 0, result.get("capped") or 0,
+            )
+        return result
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning("chat retention sweep failed", exc_info=True)
+        return None
+
+
 #: The sweeps the platform maintenance loop runs, in order. Looked up by name
 #: at each tick so a test can substitute one.
-_API_PLATFORM_SWEEPS = ("run_api_platform_prune", "run_rotated_key_expiry")
+_API_PLATFORM_SWEEPS = ("run_api_platform_prune", "run_rotated_key_expiry", "run_chat_retention")
 
 
 async def _api_platform_maintenance_tick() -> None:
@@ -6836,6 +6915,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     await emit("status", {"text": "Reading the attached image…"})
                     _as3_image_read = await _as3_img_material.read_images_text(request.images_data, _as3_img_names)
 
+            # The bridge outcome that answered this turn, when it carries
+            # conversation memory (app/sf_memory.py): written after the answer
+            # is stored, below. None on every other path.
+            _sf_memory_outcome = None
             if toggle_off_block is not None:
                 # TOGGLE-OFF FIXED REPLY (G7): a constant, no model. One token,
                 # one meta, as the visual refusal below; stored as usual with
@@ -6848,6 +6931,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # is now waiting. Either way it already emitted its tokens and
                 # its single meta; there is nothing left for the chain below.
                 answer = sf_outcome.answer
+                if sf_outcome.sf_memory:
+                    _sf_memory_outcome = sf_outcome
             elif artifact_intent is not None and (
                 artifact_intent.wants_file
                 # ...OR ASKS ABOUT A FILE THIS PLATFORM ALREADY MADE. A question
@@ -7531,6 +7616,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # answer is in history, so a status poll that follows the
             # terminal event never reads "completed, nothing persisted".
             await _store_answer(gen)
+            if _sf_memory_outcome is not None:
+                # Conversation memory: the row of this answer, once it is durable
+                # (design 2026-11-25 §3.3). Only on a Salesforce-mode turn, beside
+                # the bridge's own mode gate (C19). Never raises.
+                await _write_sf_memory(_sf_memory_outcome, gen, request, principal)
             await _mark_chat_request(gen, "completed")
             await query_trace.event(
                 "RESPONSE_GENERATED",

@@ -18,12 +18,20 @@ The tool's contract, which the orchestrator's bridge is built against (docs/arch
 
 - arguments ``question`` (at most :data:`MAX_QUESTION` characters), ``recent_turns`` (at most :data:`MAX_TURNS` items
   ``{role, content}``), ``request_id`` (the caller's id, for the log). No user, role or chat id crosses;
+- contract v2 (Salesforce conversation memory, design v2 of 2026-11-25 §4; a call without ``contract``, or with 1, is
+  v1): ``contract`` 2, ``state`` (the parent answer's query state, object or null, at most 32 KB), ``gap`` (0-6),
+  ``summary`` (at most :data:`MAX_SUMMARY` characters, data only) and ``access_profile`` (reserved, string or null). A
+  bad ``state`` is no fault of the call: it is not used, and the log says why. ``recent_turns``, ``state`` and
+  ``summary`` are never written to the log;
 - the reply is the MCP server's envelope ``{ok, result, error, chunk_ids}`` as JSON text; ``ok`` is false only for an
-  unknown tool or arguments of the wrong shape;
+  unknown tool or arguments of the wrong shape (an unknown key gets the fixed text of before, which the v2 bridge
+  reads to fall back to v1: :data:`UNKNOWN_KEYS_ERROR`);
 - ``result`` holds exactly ``status``, ``answer``, ``kind``, ``data_ts``, ``objects``, ``charts`` (:func:`_result`;
-  ``charts`` with the closed keys :data:`CHART_KEYS`). ``answer`` is one joined text (:func:`_joined`) and empty on
-  every status the caller does not show. Never sent: the trace, the log record, SQL, parameters, the endpoint, raw error
-  text, or ``_shape``'s placeholder sentence;
+  ``charts`` with the closed keys :data:`CHART_KEYS`), and on a v2 call answered with ``SFA_MEMORY`` shadow or on, four
+  more (:func:`_with_v2`): ``contract`` 2, ``state`` (the next query state, object or null), ``plan_line`` (code-written,
+  "" with no plan) and ``reason`` (a code of :data:`REASONS`). With ``SFA_MEMORY=off`` every call is answered as v1.
+  ``answer`` is one joined text (:func:`_joined`) and empty on every status the caller does not show. Never sent: the
+  trace, the log record, SQL, parameters, the endpoint, raw error text, or ``_shape``'s placeholder sentence;
 - ``status``, in this order: ``failed`` for a question with no letter or digit or one that is too long; ``answered``
   with a fixed line and no model call for small talk (``agent/small_talk.py``: a greeting, thanks, "are you there",
   "can you tell me one thing"; reason ``small_talk``), before ``ensure_fresh`` and also with records off; ``failed`` with
@@ -34,6 +42,19 @@ The tool's contract, which the orchestrator's bridge is built against (docs/arch
   A clarifying question code writes when the record step got no data (``agent/clarify.py``: 2-3 numbered choices) is
   ``answered`` with kind ``none`` and reason ``clarify``; a reply "2" (or "the second one", or the choice's text) to it is
   read by code and answered as that choice, with its ``Read as:`` line.
+
+The memory modes (``SFA_MEMORY``, :class:`sf_assistant.config.MemoryConfig`, read at start-up; design v2 §6.1, §15.1):
+
+- ``off``: today's v1 for every call: the rewrite on the last :data:`REWRITE_TURNS` turns, six keys, no state.
+- ``shadow`` (the default): every answer is byte for byte the answer of ``off`` (the rewrite still reads the last
+  :data:`REWRITE_TURNS` turns, C31). On a v2 call the resolver's code steps also run on the full input with no model
+  call (``agent.resolver.shadow``, logged), and the reply carries the next state built from what ran.
+- ``on``: a v2 call goes through the resolver (``agent.resolver.resolve``): small talk, a pending clarification, the
+  code shortcuts, a question that stands alone, or one model call that returns a closed patch; a patch or a question
+  about the last answer runs the stored plan as seeded calls through the record tools with the terms rebuilt from the
+  person's typed words (``sf_assistant.pipeline.MemoryRun``), and the "Read as:" line of a patch is its plan line. The
+  resolver's clarifying text is sent as it is written, so the next turn finds it. A fault of the resolver itself falls
+  back to the rewrite. A v1 call is answered as with ``off``.
 
 In ``answer``, ``Read as:`` is a code span, so nothing in it links, and the body and the Source line lose the syntax of
 a Markdown link, image or reference (:func:`_no_links`): a link planted in a record cannot hide where it goes. A refusal
@@ -47,9 +68,12 @@ worker thread, a time limit, and the lock released only in the done callback, be
 a timeout it keeps running, and whoever comes next waits for it and may get ``busy``; its late finish is logged. A
 client that goes away is not noticed (a queued question still runs at its turn).
 
-Each job: ``ensure_fresh``, the session check, the rewrite, ``Pipeline.answer(q, "merged")``. ``.private/ask_log.jsonl``
-gets one line per call, in the page's form: question, the question used, answer, seconds, time in line, status, reason
-and ``_shape``'s log record. It holds real names (docs/data_and_privacy.md). Its faults are written there and never to
+Each job: ``ensure_fresh``, the session check, the rewrite, ``Pipeline.answer(q, "merged")``. The ask log
+(``.private/ask_logs/ask_log-YYYY-MM-DD.jsonl``, one file per business day, kept 90 days: ``web/ask_log.py``
+``RotatingAskLog``) gets one line per call, in the page's form: question, the question used, answer, seconds, time in
+line, status, reason and ``_shape``'s log record; on a v2 call also ``memory``, fixed codes and numbers only (the
+resolver's decision, the state's size, the gap and the age; never the state, the summary or the turns). It holds real
+names (docs/data_and_privacy.md). Its faults are written there and never to
 the container log, whose lines hold start-up facts, class names, the Host and Origin values a refused request sent and,
 at a stop with a question in flight, uvicorn's traceback of framework frames, with no text of the question. A fault in
 the service itself gives status ``failed`` (no raw text on the wire), and a fault in the log never costs a finished
@@ -60,8 +84,10 @@ Run in the container by ``python /srv/web/ask_mcp.py``; ``--health`` is its heal
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import errno
 import functools
+import hashlib
 import http.client
 import json
 import os
@@ -70,7 +96,6 @@ import signal
 import socket
 import stat
 import sys
-import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -83,7 +108,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import ask_log  # noqa: E402
 import pipeline as pipeline_mod  # noqa: E402
+from ask_log import RotatingAskLog  # noqa: E402
 
 TOOL = "ask_salesforce"
 #: the socket, inside the volume the compose file mounts there; ``SFA_ASK_SOCKET`` moves it only for a run outside a
@@ -94,10 +121,22 @@ ASK_NAMES = {"service": "sf-assistant-ask", "token_name": "ask", "command": "new
 PROXY_SCHEMES = ("http", "https", "all")   # the schemes of urllib.request.getproxies() that send the model's calls away
 QUEUE_WAIT_S = 120.0           # longest wait for the lock, then "busy"
 TIMEOUT_S = 240.0              # per question, then "timeout" (the page's limit); a client waits up to 120 + 240 + 10 s
-MAX_QUESTION = 1000            # characters; the page's limit. agent/followup.py has the same three limits
-MAX_TURNS = 4                  # recent_turns: the last 2 turns
+MAX_QUESTION = 1000            # characters; the page's limit. agent/followup.py has the same limits
+MAX_TURNS = 12                 # recent_turns: 6 pairs (contract v2); only the resolver reads more than the last 4
+REWRITE_TURNS = 4              # the turns the rewrite reads (followup.MAX_TURNS, unchanged; C31)
 MAX_TURN_CHARS = 2000
 MAX_REQUEST_ID = 200           # characters of request_id kept in the log, as the MCP audit log cuts its values
+MAX_SUMMARY = 8000             # characters of the Salesforce summary (contract v2)
+MAX_GAP = 6                    # the largest gap the contract sends
+CONTRACTS = (1, 2)
+#: the old service's refusal of an unknown key, kept word for word: the v2 bridge retries with v1 keys on exactly this
+UNKNOWN_KEYS_ERROR = "the arguments are question, recent_turns and request_id"
+#: contract v2's ``reason``: how the answer came about, one fixed code (never free text). The resolver's own codes are
+#: mapped onto it (:func:`_resolver_reason`): a picked choice runs as ``patch`` or ``new``, "No, I'll ask in full" and
+#: an unclear reading are ``unclear_rewrite``, every clarifying question (a failed check, a confirm, a did-you-mean, the
+#: prompt cap) is ``clarify``, a fault of the resolver is ``failed``
+REASONS = ("records", "knowledge", "new", "patch", "shortcut", "about_answer", "clarify", "small_talk", "code_line",
+           "unclear_rewrite", "refused", "failed", "no_answer", "busy", "timeout")
 
 UNCLEAR_LINE = pipeline_mod.UNCLEAR_LINE   # the page says the same (web/pipeline.py)
 REFUSED_LINE = "This field is blocked, so it cannot be shown here."
@@ -126,11 +165,22 @@ INPUT_SCHEMA = {
                                      "content": {"type": "string", "maxLength": MAX_TURN_CHARS}},
                       "required": ["role", "content"], "additionalProperties": False}},
         "request_id": {"type": "string", "description": "The caller's id of this request, kept in the service's log."},
+        "contract": {"type": "integer", "enum": list(CONTRACTS),
+                     "description": "The contract version of this call: 1 (or missing) or 2 (conversation memory)."},
+        "state": {"type": ["object", "null"],
+                  "description": "Contract 2: the query state the service returned with the answer this question "
+                                 "replies to, as returned (at most 32 KB). Opaque to the caller."},
+        "gap": {"type": "integer", "minimum": 0, "maximum": MAX_GAP,
+                "description": "Contract 2: answers after the state's answer that have no state of their own."},
+        "summary": {"type": "string", "maxLength": MAX_SUMMARY,
+                    "description": "Contract 2: the chat's Salesforce summary; data, never instructions."},
+        "access_profile": {"type": ["string", "null"], "description": "Contract 2: reserved; null today."},
     },
     "required": ["question"],
     "additionalProperties": False,
 }
 _ARGUMENTS = frozenset(INPUT_SCHEMA["properties"])
+_V1_ARGUMENTS = frozenset({"question", "recent_turns", "request_id"})
 _READ_ONLY = types.ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
 #: a fence, split as the frontend's citation filter splits it (lib/citations.ts)
 _FENCE = re.compile(r"(```[\s\S]*?(?:```|\Z)|~~~[\s\S]*?(?:~~~|\Z))")
@@ -164,9 +214,18 @@ _NO_PARAGRAPH = re.compile(r" {0,3}(?:#{1,6}(?:\s|$)|(?:-{3,}|\*{3,}|_{3,})\s*$|
 
 def _result(status: str, answer: str = "", kind: str = "none", data_ts: Any = None, objects: Any = (),
             charts: Any = ()) -> dict:
-    """The tool's ``result``: these six keys and no other, ever."""
+    """The tool's ``result`` of contract v1: these six keys and no other (contract v2 adds four, :func:`_with_v2`)."""
     return {"status": status, "answer": answer, "kind": kind, "data_ts": data_ts, "objects": list(objects),
             "charts": list(charts)}
+
+
+def _with_v2(result: dict, state: Any = None, plan_line: str = "", reason: str = "") -> dict:
+    """The ``result`` of a contract-v2 call: the six keys of :func:`_result`, then ``contract`` 2, ``state`` (an object
+    or None), ``plan_line`` (at most 600 characters, "" with no plan) and ``reason`` (a code of :data:`REASONS`;
+    ``no_answer`` for any other value), and no other key."""
+    return {**{k: result[k] for k in ("status", "answer", "kind", "data_ts", "objects", "charts")}, "contract": 2,
+            "state": state if isinstance(state, dict) else None, "plan_line": str(plan_line or "")[:600],
+            "reason": reason if reason in REASONS else "no_answer"}
 
 
 def _body(shaped: dict) -> str:
@@ -357,13 +416,18 @@ def _chart_items(shaped: dict) -> list[dict]:
 def _bad_arguments(arguments: Any) -> str | None:
     """What is wrong with the shape of ``arguments``, in fixed words (never a value); None when nothing is. A role
     other than user or assistant and the sizes of ``recent_turns`` are no fault: ``agent/followup.py`` drops and cuts
-    them. The question's own limits are status ``failed`` (:meth:`AskService.ask`)."""
+    them. The question's own limits are status ``failed`` (:meth:`AskService.ask`). Contract v2's keys are accepted
+    (an unknown key still gets :data:`UNKNOWN_KEYS_ERROR`, the old service's text, C34); ``contract`` must be 1 or 2,
+    while a ``state``, ``gap``, ``summary`` or ``access_profile`` of another shape is no fault: it is not used, and the
+    log says so (C10)."""
     if not isinstance(arguments, dict) or set(arguments) - _ARGUMENTS:
-        return "the arguments are question, recent_turns and request_id"
+        return UNKNOWN_KEYS_ERROR
     if not isinstance(arguments.get("question"), str):
         return "question must be a string"
     if not isinstance(arguments.get("request_id", ""), str):
         return "request_id must be a string"
+    if "contract" in arguments and (type(arguments["contract"]) is not int or arguments["contract"] not in CONTRACTS):
+        return "contract must be 1 or 2"
     return pipeline_mod.turns_problem(arguments.get("recent_turns", []))   # the page checks them the same way
 
 
@@ -379,38 +443,13 @@ def _tool_result(out: dict) -> types.CallToolResult:
 
 
 # ---------------------------------------------------------------- the log
-
-class AskLog:
-    """``.private/ask_log.jsonl``, mode 600 (``run.sh`` creates it first: a file bind mount needs it). Real names."""
-
-    def __init__(self, path: str) -> None:
-        self.path = str(path)
-        self._lock = threading.Lock()
-
-    def check(self) -> None:
-        """Raises OSError when the log cannot be appended to."""
-        os.close(os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600))
-
-    def write(self, event: dict) -> None:
-        """Append one line. Never raises: a fault in the log must not cost a finished answer. A value JSON cannot hold
-        costs the line its text, and the fixed words stay."""
-        try:
-            stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-            try:
-                line = json.dumps({"ts": stamp, **event}, ensure_ascii=False, default=str)
-            except Exception as exc:  # noqa: BLE001
-                line = json.dumps({"ts": stamp, "event": str(event.get("event")), "status": str(event.get("status")),
-                                   "log_fault": type(exc).__name__})
-            with self._lock:
-                fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-                with os.fdopen(fd, "a", encoding="utf-8", errors="backslashreplace") as fh:
-                    fh.write(line + "\n")
-        except Exception as exc:  # noqa: BLE001 - the class name only: the text can hold names
-            print(f"sf-assistant-ask: could not write the log: {type(exc).__name__}", file=sys.stderr, flush=True)
-
+# The log is web/ask_log.py's RotatingAskLog: one file per business day in .private/ask_logs (mode 700), each file mode
+# 600, kept SFA_ASK_LOG_DAYS days (90). Its interface is the one of the single-file writer it replaced: ``path``,
+# ``check()`` (raises OSError when the log cannot be appended to) and ``write(event)`` (never raises).
 
 def _ask_line(base: dict, out: dict, seconds: float, queue_wait: float | None = None) -> dict:
-    """The log line of a finished job: what the reply holds and what it does not."""
+    """The log line of a finished job: what the reply holds and what it does not. ``memory`` (a v2 call): fixed codes
+    and numbers only, never the state, the summary or the turns (design v2 §4.1, §12.3)."""
     line = {**base, "status": out["result"]["status"], "reason": out["reason"], "question_used": out["question_used"],
             "answer": out["result"]["answer"], "seconds": seconds, "detail": out["detail"]}
     if queue_wait is not None:
@@ -419,23 +458,488 @@ def _ask_line(base: dict, out: dict, seconds: float, queue_wait: float | None = 
         line["error"] = out["error"]
     if out.get("rewrite_reply"):   # what the model wrote when code refused it: how an honest refusal is diagnosed
         line["rewrite_reply"] = out["rewrite_reply"]
+    if out.get("memory"):
+        line["memory"] = out["memory"]
     return line
+
+
+# ---------------------------------------------------------------- conversation memory
+
+class _Request:
+    """The contract-v2 part of one call (design v2 §4.1), read once; never logged. A value of another shape is not
+    used and is named in ``problems`` (fixed words, for the log): it is no fault of the call (C10)."""
+
+    def __init__(self, arguments: dict) -> None:
+        self.problems: list[str] = []
+        state = arguments.get("state")
+        if state is not None and not isinstance(state, dict):
+            self.problems.append("state_invalid")
+            state = None
+        self.state = state
+        gap = arguments.get("gap")
+        if gap is not None and (type(gap) is not int or not 0 <= gap <= MAX_GAP):
+            self.problems.append("gap_invalid")
+        # None: no readable gap; the resolver then reads a stored state as an earlier answer's, never the last one's
+        self.gap = gap if type(gap) is int and 0 <= gap <= MAX_GAP else None
+        summary = arguments.get("summary", "")
+        if not isinstance(summary, str):
+            self.problems.append("summary_invalid")
+            summary = ""
+        self.summary = summary[:MAX_SUMMARY]
+        profile = arguments.get("access_profile")
+        if profile is not None and not isinstance(profile, str):
+            self.problems.append("access_profile_invalid")
+        self.profile = profile if isinstance(profile, str) else None
+
+
+def _rewrite_turns(turns: Any) -> Any:
+    """The turns the rewrite and the clarifying question's objects read: the last :data:`REWRITE_TURNS` of what was
+    sent, as a v1 bridge sends them (C31); anything that is no list as it is."""
+    return list(turns)[-REWRITE_TURNS:] if isinstance(turns, list) else turns
+
+
+def _knowledge_build(pipeline: Any) -> str:
+    """A short id of the knowledge copy the pipeline reads (``state.kb``): the sha256 of its file names and contents.
+    "" when there is none."""
+    folder = getattr(pipeline, "knowledge_dir", None)
+    if not isinstance(folder, str) or not os.path.isdir(folder):
+        return ""
+    h = hashlib.sha256()
+    try:
+        for name in sorted(n for n in os.listdir(folder) if n.endswith(".json")):
+            with open(os.path.join(folder, name), "rb") as fh:
+                h.update(name.encode("utf-8") + b"\0" + hashlib.sha256(fh.read()).digest())
+    except OSError:
+        return ""
+    return "kb:" + h.hexdigest()[:16]
+
+
+def _resolver_reason(res: Any) -> str:
+    """The contract-v2 reason of a resolver decision (:data:`REASONS`)."""
+    if res.reason == "clarify_choice":   # a picked choice runs as a patch (it has ops) or as a question of its own
+        return "patch" if res.action == "patch" else "new"
+    if res.reason in ("ask_full", "unclear_rewrite"):
+        return "unclear_rewrite"
+    if res.reason in ("new", "patch", "shortcut", "about_answer", "clarify", "small_talk"):
+        return res.reason
+    return "failed"
+
+
+class _MemoryJob:
+    """The memory part of one v2 job in shadow or on (design v2 §6-§9). It reads the parent state, asks the resolver,
+    builds the next state from what ran (``agent.query_state.build``) and writes the log entry. Nothing in it outlives
+    the job (C15)."""
+
+    def __init__(self, service: "AskService", question: str, turns: Any, req: _Request) -> None:
+        from sf_assistant.agent import query_state as qs
+
+        self.qs = qs
+        self.cfg = service.memory
+        self.kb = service.kb
+        self.question, self.turns, self.req = question, turns, req
+        self.view = self.today = self.label = None
+        self.names: tuple[str, ...] = ()
+        self.res: Any = None
+        self.checked = self._check(None)
+        self.state_reason = self.checked.reason
+        self.out_state: dict | None = None
+        self.v2_reason = ""
+
+    # ---- inputs
+    def _check(self, view: Any) -> Any:
+        """The parent state as ``query_state.check`` reads it; a fault there is a state that cannot be used (the
+        answer never pays for a fault of the memory part)."""
+        try:
+            return self.qs.check(self.req.state, profile=self.req.profile, view=view, max_calls=self.cfg.max_calls)
+        except Exception:  # noqa: BLE001
+            return self.qs.Checked(None, "state_invalid")
+
+    def pending_in(self) -> bool:
+        """The parent state holds a pending clarification at gap 0 (a reply to it goes to the resolver)."""
+        return self.checked.pending is not None and self.req.gap == 0
+
+    def read(self, pipeline: Any) -> None:
+        """The catalog view, the business date and the record-type words of the open record session, then the parent
+        state checked again with the view (a field a release removed is named)."""
+        tools = getattr(getattr(pipeline, "session", None), "tools", None)
+        catalog = getattr(tools, "catalog", None)
+        if catalog is not None and getattr(catalog, "objects", None) is not None:
+            self.view = self.qs.PlanView(catalog)
+            self.label = self.view.label
+        today = getattr(tools, "today", None)
+        try:
+            day = today() if callable(today) else None
+        except Exception:  # noqa: BLE001 - no business date: the resolver says resolver_error
+            day = None
+        self.today = day if isinstance(day, dt.date) else None
+        names = getattr(tools, "other_record_types", None)
+        try:
+            self.names = tuple(names()) if callable(names) else ()
+        except Exception:  # noqa: BLE001
+            self.names = ()
+        self.checked = self._check(self.view)
+        self.state_reason = self.checked.reason
+
+    def _resolver_args(self) -> dict:
+        from sf_assistant.config import charts_settings
+
+        return {"today": self.today, "view": self.view, "profile": self.req.profile, "max_calls": self.cfg.max_calls,
+                "max_age": self.cfg.max_age, "max_tokens": self.cfg.tokens, "shortcuts": self.cfg.shortcuts,
+                "charts_on": charts_settings().on, "other_record_types": self.names}
+
+    def shadow(self) -> None:
+        """What the code steps would decide (no model call; the log only)."""
+        from sf_assistant.agent import resolver
+
+        self.res = resolver.shadow(self.question, self.turns, self.req.state, self.req.gap, self.req.summary,
+                                   **self._resolver_args())
+
+    def resolve(self, llm: Any) -> Any:
+        from sf_assistant.agent import resolver
+
+        self.res = resolver.resolve(self.question, self.turns, self.req.state, self.req.gap, self.req.summary, llm,
+                                    **self._resolver_args())
+        return self.res
+
+    def parent(self) -> Any:
+        """The parent state the next one is built from: the resolver's reading (a reply at a gap keeps the plan at
+        least one answer old, M8), else the state as checked."""
+        res = self.res
+        return res.checked if res is not None and res.reason != "resolver_error" else self.checked
+
+    def stored_terms(self) -> Any:
+        plan = self.parent().plan
+        return plan["terms"] if plan else None
+
+    # ---- the run
+    def run_for(self, res: Any) -> Any:
+        """The ``sf_assistant.pipeline.MemoryRun`` of a resolver decision (new, patch, about_answer).
+
+        The contact rule is read from the person's typed words (stage-2 review fix PE1), never from the question that
+        runs: a patch or a shortcut runs its plan line, which holds the typed values of earlier questions ("Phone
+        Support"). A new question reads its typed words (for a picked choice, the question the clarification was
+        for), which the rewrite's check already holds to the standalone's reading; a patch and a question about the
+        last answer read the follow-up typed now, as ``query_state.apply`` does."""
+        from sf_assistant.agent.record_session import SeedRun
+        from sf_assistant.engine.contact import asks_for_contact
+        from sf_assistant.pipeline import MemoryRun
+
+        if res.action == "new":
+            return MemoryRun(terms=res.terms, contact_ok=asks_for_contact(res.typed or self.question))
+        plan = res.patched if res.action == "patch" else res.plan
+        seed = SeedRun(calls=self.qs.run_calls(plan, self.today), today=self.today, label=self.label)
+        show = self._typed_show((res.plan or {}).get("show")) if res.action == "patch" else None
+        return MemoryRun(terms=res.terms, seed=seed, show=show,
+                         earlier=self._earlier(res.earlier_answer) if res.action == "about_answer" else "",
+                         display_only=bool(res.action == "patch" and res.patched is not None
+                                           and res.patched.display_only),
+                         knowledge=self.cfg.patch_knowledge, contact_ok=asks_for_contact(self.question))
+
+    def _earlier(self, text: Any) -> str:
+        """The last answer as the record agent gets it for a question about it (§6.7), under the contact rule
+        (stage-2 review fix PE3): whole when the typed question asks for contact details; not at all when the question
+        that answer was for asked for them (it may hold any kind of contact detail, a link or an address as well as
+        an e-mail address; the plan's calls re-run, so the agent still has the rows); otherwise without e-mail
+        addresses and phone numbers (``engine.contact.drop_contact_details``)."""
+        from sf_assistant.engine.contact import asks_for_contact, drop_contact_details
+
+        text = str(text or "")
+        if not text.strip() or asks_for_contact(self.question):
+            return text
+        before = self._earlier_question()
+        if before is None or asks_for_contact(before):
+            return ""
+        return drop_contact_details(text)[0]
+
+    def _earlier_question(self) -> str | None:
+        """The user turn the last assistant turn answered (None when the turns hold none before it)."""
+        turns = [t for t in self.turns if isinstance(t, dict)] if isinstance(self.turns, list) else []
+        last = next((i for i in range(len(turns) - 1, -1, -1) if turns[i].get("role") == "assistant"), None)
+        if last is None:
+            return None
+        return next((str(turns[i].get("content") or "") for i in range(last - 1, -1, -1)
+                     if turns[i].get("role") == "user"), None)
+
+    def typed_turns(self) -> str:
+        """The person's own words in the turns sent (the user turns), one per line: the next state's value screen
+        counts a value in them as typed (stage-2 review fix M3: a new question's standalone carries a name the person
+        typed in an earlier question). Read for that screen only; never stored or logged."""
+        turns = self.turns if isinstance(self.turns, list) else []
+        return "\n".join(" ".join(t["content"].split())[:MAX_QUESTION] for t in turns if isinstance(t, dict)
+                         and t.get("role") == "user" and isinstance(t.get("content"), str))
+
+    def _typed_show(self, show: Any) -> dict:
+        """The patched plan's display flags with the typed question's own display words applied (§7.2): a chart word
+        sets the chart, a chart refusal ("without the chart", "chart nahi") clears it, a table word sets the table."""
+        from sf_assistant.agent import display as _display
+
+        out = dict(self.qs.clean_show(show))
+        try:
+            d = _display.split(self.question)
+        except Exception:  # noqa: BLE001 - the patched flags as they are
+            return out
+        if "chart" in d.refused:
+            out["chart"], out["type"] = False, None
+        elif d.chart:
+            out["chart"] = True
+        if d.table:
+            out["table"] = True
+        return out
+
+    # ---- the next state
+    def _made_at(self) -> str:
+        return dt.datetime.now(ask_log.BUSINESS_TZ).isoformat(timespec="seconds")
+
+    def _build(self, kind: str, **kw: Any) -> dict | None:
+        """``query_state.build`` with the job's parent, view and business date; the value screen of a records
+        answer also counts the user turns sent as typed (M3) and keeps a date only when typed (PE2)."""
+        try:
+            return self.qs.build(kind, parent=self.parent(), kb=self.kb, made_at=self._made_at(),
+                                 profile=self.req.profile, max_calls=self.cfg.max_calls, label=self.label,
+                                 view=self.view, reason=self.v2_reason, today=self.today,
+                                 typed_also=self.typed_turns(), **kw)
+        except Exception:  # noqa: BLE001 - no state: the bridge stores none, and the next turn reads text only
+            return None
+
+    def finish(self, reason: str, kind: str | None, *, run: Any = None, used: str | None = None,
+               text: str = "") -> dict:
+        """The v2 part of the reply (``state``, ``plan_line``, ``reason``). ``kind``: the answer kind the next state
+        is built for (``query_state.ANSWER_KINDS``), or None for no state (a failure: the bridge stores no row)."""
+        self.v2_reason = reason
+        try:
+            state = self._next(kind, run, used, text)
+        except Exception:  # noqa: BLE001 - no state: the bridge stores none, and the next turn reads text only
+            state = None
+        self.out_state = state
+        try:
+            line = self.qs.plan_line(state, today=self.today, label=self.label) if state else ""
+        except Exception:  # noqa: BLE001 - no line rather than no answer
+            line = ""
+        return {"state": state, "plan_line": line, "reason": reason}
+
+    def _next(self, kind: str | None, run: Any, used: str | None, text: str) -> dict | None:
+        """The next state for an answer of ``kind`` (see :meth:`finish`)."""
+        res = self.res
+        state = None
+        if kind == "records":
+            on = self.cfg.on and res is not None and res.action in ("new", "patch", "about_answer")
+            if on and res.action == "about_answer":   # the parent plan re-ran unchanged (C6)
+                state = self._build("about_answer")
+            else:
+                if on:
+                    typed, terms, terms_kind = res.typed or self.question, res.terms, res.terms_kind
+                else:   # the rewrite answered: the chain goes on only where the code steps read a follow-up
+                    follows = res is not None and res.action in ("patch", "about_answer")
+                    terms_kind = "patch" if follows else "new"
+                    typed = self.question
+                    terms = self.qs.terms_for(self.stored_terms(), typed, used or self.question, terms_kind,
+                                              self.names)
+                # a patch keeps the flags it ran with (the plan's, with the typed display words); else what ran
+                show = (run.show if run is not None and run.show is not None else (res.plan or {}).get("show")) \
+                    if on and res.action == "patch" else (run.shown if run else None)
+                state = self._build(
+                    "records", evidence=run.evidence if run is not None else [],
+                    seeds=run.seed.ran if run is not None and run.seed is not None else None,
+                    question="" if on and res.action == "patch" else (used or self.question),
+                    terms=self.qs.next_terms(self.stored_terms(), typed, terms, terms_kind), show=show,
+                    op=res.op if on and res.action == "patch" else None)
+        elif kind == "clarify":
+            from sf_assistant.agent import resolver
+
+            if res is not None and res.action == "reply" and res.reason == "clarify" and self.cfg.on:
+                # the question as it was sent (stage-2 review fix N1): the next turn finds it in the last assistant
+                # turn only so (strictness); _no_links leaves ordinary text as it is. The labels stay as shown
+                pending = res.pending
+                if isinstance(pending, dict) and isinstance(pending.get("asked"), str):
+                    pending = dict(pending, asked=_no_links(pending["asked"]))
+            else:
+                pending = resolver.pending_from_clarify(text, self.question)
+            state = self._build("clarify", pending=pending)
+        elif kind is not None:
+            state = self._build(kind)
+        return state
+
+    def log(self) -> dict:
+        """The ask log's ``memory`` entry: fixed codes and numbers only."""
+        res, plan = self.res, (self.out_state or {}).get("plan")
+        entry: dict[str, Any] = {"mode": self.cfg.mode, "contract": 2, "state_in": self.state_reason
+                                 or ("ok" if self.checked.state else "none"), "gap": self.req.gap,
+                                 "state_bytes": self.qs.state_bytes(self.out_state) if self.out_state else 0,
+                                 "plan_calls": len(plan["calls"]) if plan else 0,
+                                 "age": plan["age"] if plan else None, "reason": self.v2_reason}
+        if self.req.problems:
+            entry["input"] = list(self.req.problems)
+        if res is not None:
+            entry["resolver"] = res.log()
+            entry["shortcut"] = res.reason == "shortcut"
+            if getattr(res, "reply", ""):   # its size only: the model's text can quote the summary or the turns (L3)
+                entry["resolver"]["reply_chars"] = len(res.reply)
+        return entry
+
+
+# ---------------------------------------------------------------- the job
+# Module functions, so that a job needs only the pipeline (and, on a v2 call, the memory part).
+
+def _out(mem: _MemoryJob | None, result: dict, reason: str = "", detail: Any = None, error: str = "",
+         used: str | None = None, *, v2: str = "", kind: str | None = None, run: Any = None,
+         text: str = "") -> dict:
+    """The job's outcome: the v1 ``result`` and what the log reads; with ``mem`` also the v2 part (``v2``: the
+    reason code, ``kind``: the answer kind the next state is built for, None for none) and the log's ``memory``."""
+    out = {"result": result, "reason": reason, "question_used": used, "detail": detail, "error": error}
+    if mem is not None:
+        out["v2"] = mem.finish(v2 or "failed", kind, run=run, used=used, text=text)
+        out["memory"] = mem.log()
+    return out
+
+def _answered(mem: _MemoryJob | None, shaped: dict, question: str, used: str, read_as: str | None, *,
+              run: Any = None, decided: str = "") -> dict:
+    """The outcome of a finished ``Pipeline.answer``: :func:`decide`, then the text (``read_as``: the "Read as:"
+    line, None for none). ``decided``: the resolver's reason code for a records answer (on), else "records"."""
+    status, reason = decide(shaped)
+    kind = shaped.get("kind") or "none"
+    log = shaped.get("log")
+
+    def done(result: dict, v2: str, state_kind: str | None, text: str = "") -> dict:
+        return _out(mem, result, reason, log, used=used, v2=v2, kind=state_kind, run=run, text=text)
+
+    if status not in ("answered", "refused"):
+        return done(_result(status, kind=kind), "no_answer" if status == "no_answer" else "failed", None)
+    if status == "refused" and kind not in ("merged", "records"):
+        # text that does not come from the records says nothing about the refusal, and the caller shows this
+        # answer and asks nobody else: the person gets the reason instead
+        return done(_result(status, REFUSED_LINE, kind, objects=_objects(shaped)), "refused", "refused")
+    text = _joined(shaped, read_as)
+    if status == "refused":   # the person is told that one part was blocked
+        text = f"{text}\n\n{REFUSED_PART_LINE}" if text else REFUSED_LINE
+    result = _result(status, text, kind, shaped.get("data_ts"), _objects(shaped), _chart_items(shaped))
+    if status == "refused":
+        return done(result, "refused", "refused")
+    if reason == "clarify":
+        return done(result, "clarify", "clarify", text)
+    if reason in ("small_talk", "code_line"):
+        return done(result, reason, "small_talk" if reason == "small_talk" else "unclear")
+    if kind == "knowledge":
+        return done(result, "knowledge", "knowledge")
+    return done(result, decided or "records", "records")
+
+def _small_talk_read(mem: _MemoryJob | None, pipeline: Any) -> None:
+    """Before a small-talk reply of a v2 job: the catalog words and the business date of the open record session, so
+    the reply's plan line reads as the one of the answer before (stage-2 review fix L2). No reopen and no model call;
+    a fault here never costs the reply."""
+    if mem is None or mem.view is not None:
+        return
+    try:
+        mem.read(pipeline)
+    except Exception:  # noqa: BLE001 - the plan line then has no catalog words
+        pass
+
+def _job_v1(pipeline: Any, question: str, turns: Any, mem: _MemoryJob | None, seen: dict | None = None) -> dict:
+    """Today's job (``SFA_MEMORY`` off, a v1 call, shadow, or the on job after a fault of the resolver): the
+    rewrite on the last :data:`REWRITE_TURNS` turns (C31), then ``Pipeline.answer``. With ``mem`` (shadow, or the
+    resolver's fault) the answer runs under a ``MemoryRun`` with nothing set, which changes nothing in it and reads
+    what ran, and the reply gets the next state. ``seen``: the job's holder of the question used, which the log line
+    of a fault reads (stage-2 review fix L1: as before the job moved)."""
+    from sf_assistant.agent.followup import FAILED, UNCLEAR, last_answer_objects, rewrite
+    from sf_assistant.agent.small_talk import line as talk_line, small_talk
+
+    short = _rewrite_turns(turns)
+    talk = small_talk(question)   # first: no reopen of the read copy, no model call, also with records off
+    if talk:
+        _small_talk_read(mem, pipeline)
+        return _out(mem, _result("answered", talk_line(talk)), "small_talk", {"small_talk": talk},
+                    v2="small_talk", kind="small_talk")
+    pipeline.ensure_fresh()
+    if pipeline.session is None:   # no model call: the question never goes out without the record guard
+        return _out(mem, _result("failed"), "records_off", error=str(pipeline.records_error or ""))
+    if mem is not None and mem.res is None:   # shadow: the code steps on the full input, no model call
+        mem.read(pipeline)
+        mem.shadow()
+    step = rewrite(question, short, pipeline.llm)
+    if step.status == FAILED:      # the typed words are not sent on: as a fragment they mean something else
+        return _out(mem, _result("failed"), f"rewrite_{step.reason}", error=step.error)
+    if step.status == UNCLEAR:
+        return {**_out(mem, _result("unclear", UNCLEAR_LINE), f"rewrite_{step.reason}", v2="unclear_rewrite",
+                       kind="unclear"), "rewrite_reply": step.reply}
+    used = step.question
+    if seen is not None:
+        seen["used"] = used
+    objects = last_answer_objects(short)   # P2b: only the clarifying question reads them
+    run = None
+    if mem is not None:
+        from sf_assistant.pipeline import MemoryRun
+
+        run = MemoryRun()   # nothing set: the answer is today's; it only reads what ran
+    extra = {"memory": run} if run is not None else {}
+    shaped = (pipeline.answer(used, "merged", context_objects=objects, **extra) if objects
+              else pipeline.answer(used, "merged", **extra))
+    return _answered(mem, shaped, question, used, used if used != question else None, run=run)
+
+def _job_on(pipeline: Any, question: str, turns: Any, mem: _MemoryJob, seen: dict | None = None) -> dict:
+    """The job of a v2 call with ``SFA_MEMORY=on`` (design v2 §6-§9): the resolver decides, then a reply is sent
+    as the resolver wrote it, or a question, a patched plan or a question about the last answer runs. ``seen``: as
+    for :func:`_job_v1`."""
+    from sf_assistant.agent.followup import last_answer_objects
+    from sf_assistant.agent.small_talk import line as talk_line, small_talk
+
+    talk = small_talk(question)
+    if talk and not mem.pending_in():   # as v1: no reopen, no model call; a reply to a pending goes on
+        _small_talk_read(mem, pipeline)
+        return _out(mem, _result("answered", talk_line(talk)), "small_talk", {"small_talk": talk},
+                    v2="small_talk", kind="small_talk")
+    pipeline.ensure_fresh()
+    if pipeline.session is None:   # no model call: the question never goes out without the record guard
+        return _out(mem, _result("failed"), "records_off", error=str(pipeline.records_error or ""))
+    mem.read(pipeline)
+    res = mem.resolve(pipeline.llm)
+    if res.action == "reply":
+        if res.status == "answered":
+            # small talk or a clarifying question: its text as the resolver wrote it, so the next turn finds the
+            # question it asked (strictness, §6.2 step 1). Only the syntax of a Markdown link loses its force
+            # (_no_links): a choice may hold words of an earlier answer; ordinary text comes through unchanged
+            text = _no_links(res.text)
+            return _out(mem, _result("answered", text), res.reason, {"memory": res.detail},
+                        v2=_resolver_reason(res), kind=res.state_kind or "small_talk", text=text)
+        if res.status == "unclear":
+            # no rewrite_reply (stage-2 review fix L3): the resolver's prompt held the summary, the plan and 12 turns,
+            # and the log never holds them; the memory entry has the resolver's codes and the reply's size
+            return _out(mem, _result("unclear", UNCLEAR_LINE), f"resolver_{res.detail or res.reason}",
+                        v2="unclear_rewrite", kind="unclear")
+        if res.reason == "resolver_error":   # a fault of the resolver itself: today's rewrite answers
+            return _job_v1(pipeline, question, turns, mem, seen)
+        return _out(mem, _result("failed"), f"resolver_{res.reason}", error=res.error)
+    run = mem.run_for(res)
+    used = res.question or question
+    if seen is not None:
+        seen["used"] = used
+    objects = last_answer_objects(_rewrite_turns(turns))
+    shaped = (pipeline.answer(used, "merged", context_objects=objects, memory=run) if objects
+              else pipeline.answer(used, "merged", memory=run))
+    if res.action == "patch":
+        read_as = res.plan_line or None   # a patch or a shortcut reads as its plan line (§7.2)
+    else:
+        read_as = used if used != question else None
+    return _answered(mem, shaped, question, used, read_as, run=run, decided=_resolver_reason(res))
 
 
 # ---------------------------------------------------------------- the service
 
 class AskService:
-    """The tool over one built ``Pipeline``. Tests pass small limits and a pipeline on fakes."""
+    """The tool over one built ``Pipeline``. Tests pass small limits and a pipeline on fakes. ``memory``: the memory
+    switches (:class:`sf_assistant.config.MemoryConfig`; None: read from the environment now, ``SFA_MEMORY`` and the
+    rest)."""
 
-    def __init__(self, pipeline: Any, tokens: Any, log: AskLog, *, queue_wait_s: float = QUEUE_WAIT_S,
-                 timeout_s: float = TIMEOUT_S) -> None:
+    def __init__(self, pipeline: Any, tokens: Any, log: RotatingAskLog, *, queue_wait_s: float = QUEUE_WAIT_S,
+                 timeout_s: float = TIMEOUT_S, memory: Any = None) -> None:
         from sf_assistant import __version__
+        from sf_assistant.config import memory_settings
 
         self.pipeline = pipeline
         self.tokens = tokens
         self.log = log
         self.queue_wait_s = queue_wait_s
         self.timeout_s = timeout_s
+        self.memory = memory if memory is not None else memory_settings()
+        self.kb = _knowledge_build(pipeline) if not self.memory.off else ""
         self.lock = asyncio.Lock()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ask")
         self.late = False               # the running question passed its limit and still holds the lock
@@ -459,7 +963,7 @@ class AskService:
             result = await self.ask(params.arguments)
         except Exception as exc:  # noqa: BLE001 - the SDK would send the error's text and log it with a traceback
             self._note({"event": "ask", "status": "failed", "reason": "service_fault", "error": type(exc).__name__})
-            result = _result("failed")
+            result = self._plain(_result("failed"), self._request(params.arguments), "failed")
         return _tool_result({"ok": True, "result": result, "error": None, "chunk_ids": []})
 
     def _note(self, event: dict) -> None:
@@ -469,32 +973,55 @@ class AskService:
         except Exception as exc:  # noqa: BLE001 - the class name only: the text can hold names
             print(f"sf-assistant-ask: could not write the log: {type(exc).__name__}", file=sys.stderr, flush=True)
 
+    def _request(self, arguments: Any) -> _Request | None:
+        """The v2 part of a call that is answered as v2 (``contract`` 2 and ``SFA_MEMORY`` shadow or on), else None:
+        the call is answered as v1, six keys and no state. Never raises."""
+        try:
+            if self.memory.off or not isinstance(arguments, dict) or arguments.get("contract") != 2:
+                return None
+            return _Request(arguments)
+        except Exception:  # noqa: BLE001 - as v1
+            return None
+
+    @staticmethod
+    def _plain(result: dict, req: _Request | None, reason: str) -> dict:
+        """A reply with no answer of the job (failed before it, busy, timeout): v2-shaped for a v2 call, no state."""
+        return _with_v2(result, None, "", reason) if req is not None else result
+
+    @staticmethod
+    def _final(out: dict) -> dict:
+        """The ``result`` of a finished job: v2-shaped when the job answered a v2 call."""
+        v2 = out.get("v2")
+        return _with_v2(out["result"], **v2) if v2 is not None else out["result"]
+
     # ---- one question
     async def ask(self, arguments: dict) -> dict:
         """Wait for the lock, answer in the worker thread; the tool's ``result``. ``run_job`` of web/server.py, with
         the outcome returned instead of kept for a later fetch."""
         question = arguments["question"].strip()   # as the page does; nothing else changes it when no turn is given
+        req = self._request(arguments)
         base = {"event": "ask", "request_id": arguments.get("request_id", "")[:MAX_REQUEST_ID],
                 "question": question[:MAX_QUESTION]}
         if not any(ch.isalnum() for ch in question) or len(question) > MAX_QUESTION:   # a BOM or a NUL alone is empty
             self._note({**base, "status": "failed", "reason": "too_long" if len(question) > MAX_QUESTION else "empty"})
-            return _result("failed")
+            return self._plain(_result("failed"), req, "failed")
         entered = time.monotonic()
         try:
             async with asyncio.timeout(self.queue_wait_s):
                 await self.lock.acquire()
         except TimeoutError:
             self._note({**base, "status": "busy", "queue_wait_s": round(time.monotonic() - entered, 2)})
-            return _result("busy")
+            return self._plain(_result("busy"), req, "busy")
         except asyncio.CancelledError:   # the server stops
             self._note({**base, "status": "abandoned", "queue_wait_s": round(time.monotonic() - entered, 2)})
             raise
         queue_wait = round(time.monotonic() - entered, 2)
         started = time.monotonic()
         ctx = {"base": base, "timed_out": False}
+        # a v1 call runs the job with the two arguments of before (a job a test puts in its place takes those)
+        job_args = (question, arguments.get("recent_turns")) + ((req,) if req is not None else ())
         try:
-            fut = asyncio.get_running_loop().run_in_executor(self.executor, self._job, question,
-                                                             arguments.get("recent_turns"))
+            fut = asyncio.get_running_loop().run_in_executor(self.executor, self._job, *job_args)
         except BaseException:
             self.lock.release()
             raise
@@ -510,9 +1037,9 @@ class AskService:
                 raise
             self.late = not fut.done()   # the thread may have ended in the same turn of the loop: nothing is late then
             self._note({**base, "status": "timeout", "seconds": seconds, "queue_wait_s": queue_wait})
-            return _result("timeout")
+            return self._plain(_result("timeout"), req, "timeout")
         self._note(_ask_line(base, out, round(time.monotonic() - started, 2), queue_wait))
-        return out["result"]
+        return self._final(out)
 
     def _finished(self, started: float, ctx: dict, fut: asyncio.Future) -> None:
         """Done callback of the worker future (event loop thread): the lock is released only here."""
@@ -528,48 +1055,25 @@ class AskService:
         else:
             self._note({**_ask_line(ctx["base"], fut.result(), seconds), "event": "late_finish"})
 
-    def _job(self, question: str, turns: Any) -> dict:
-        """One question, in the worker thread. Never raises: a fault is status failed, with its text only in the log."""
-        pipeline = self.pipeline
-        used = None
-
-        def out(result: dict, reason: str = "", detail: Any = None, error: str = "") -> dict:
-            return {"result": result, "reason": reason, "question_used": used, "detail": detail, "error": error}
-
+    def _job(self, question: str, turns: Any, req: _Request | None = None) -> dict:
+        """One question, in the worker thread. Never raises: a fault is status failed, with its text only in the log.
+        ``req``: the v2 part of a call answered as v2 (None: v1)."""
+        mem = None
+        seen: dict = {}   # the question used, for the log line of a fault (L1)
         try:
-            from sf_assistant.agent.followup import FAILED, UNCLEAR, last_answer_objects, rewrite
-            from sf_assistant.agent.small_talk import line as talk_line, small_talk
-
-            talk = small_talk(question)   # first: no reopen of the read copy, no model call, also with records off
-            if talk:
-                return out(_result("answered", talk_line(talk)), "small_talk", {"small_talk": talk})
-            pipeline.ensure_fresh()
-            if pipeline.session is None:   # no model call: the question never goes out without the record guard
-                return out(_result("failed"), "records_off", error=str(pipeline.records_error or ""))
-            step = rewrite(question, turns, pipeline.llm)
-            if step.status == FAILED:      # the typed words are not sent on: as a fragment they mean something else
-                return out(_result("failed"), f"rewrite_{step.reason}", error=step.error)
-            if step.status == UNCLEAR:
-                return {**out(_result("unclear", UNCLEAR_LINE), f"rewrite_{step.reason}"), "rewrite_reply": step.reply}
-            used = step.question
-            objects = last_answer_objects(turns)   # P2b: only the clarifying question reads them
-            shaped = (pipeline.answer(used, "merged", context_objects=objects) if objects
-                      else pipeline.answer(used, "merged"))
-            status, reason = decide(shaped)
-            kind = shaped.get("kind") or "none"
-            if status not in ("answered", "refused"):
-                return out(_result(status, kind=kind), reason, shaped.get("log"))
-            if status == "refused" and kind not in ("merged", "records"):
-                # text that does not come from the records says nothing about the refusal, and the caller shows this
-                # answer and asks nobody else: the person gets the reason instead
-                return out(_result(status, REFUSED_LINE, kind, objects=_objects(shaped)), reason, shaped.get("log"))
-            text = _joined(shaped, used if used != question else None)
-            if status == "refused":   # the person is told that one part was blocked
-                text = f"{text}\n\n{REFUSED_PART_LINE}" if text else REFUSED_LINE
-            result = _result(status, text, kind, shaped.get("data_ts"), _objects(shaped), _chart_items(shaped))
-            return out(result, reason, shaped.get("log"))
+            mem = _MemoryJob(self, question, turns, req) if req is not None else None
+        except Exception:  # noqa: BLE001 - the memory part never costs an answer: as v1 (a reply without contract 2)
+            mem = None
+        try:
+            if mem is not None and self.memory.on:
+                return _job_on(self.pipeline, question, turns, mem, seen)
+            return _job_v1(self.pipeline, question, turns, mem, seen)
         except Exception as exc:  # noqa: BLE001 - never sent to the client; the text can hold names
-            return out(_result("failed"), "exception", error=f"{type(exc).__name__}: {str(exc)[:300]}")
+            out = {"result": _result("failed"), "reason": "exception", "question_used": seen.get("used"),
+                   "detail": None, "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+            if req is not None:
+                out["v2"] = {"state": None, "plan_line": "", "reason": "failed"}
+            return out
 
     # ---- health and shutdown
     def health(self) -> dict:
@@ -687,12 +1191,15 @@ def main(argv: list[str]) -> int:
 
     from sf_assistant.server.auth import TokenStore
 
-    log = AskLog(str(config.PRIVATE_DIR / "ask_log.jsonl"))
+    log = RotatingAskLog(str(config.PRIVATE_DIR / ask_log.DIR_NAME))   # one file per business day (web/ask_log.py)
     try:
         log.check()
     except OSError as exc:
         say(f"cannot append to the log {log.path}: {type(exc).__name__}; not starting without it")
         return 2
+    memory = config.memory_settings()   # SFA_MEMORY and the rest, read once (restart-ask changes them)
+    if memory.problem:   # fixed words: the value itself is never repeated
+        say(memory.problem)
     t0 = time.perf_counter()
     try:
         pipeline = pipeline_mod.Pipeline.from_home(home, os.environ.get("SFA_WAREHOUSE") or config.CONTAINER_SOURCE,
@@ -702,11 +1209,12 @@ def main(argv: list[str]) -> int:
         say(f"pipeline could not be built: {type(exc).__name__}; the log has the reason")
         return 2
     status = pipeline.status()
-    log.write({"event": "startup", "ok": True, "seconds": round(time.perf_counter() - t0, 2), "status": status})
+    log.write({"event": "startup", "ok": True, "seconds": round(time.perf_counter() - t0, 2), "status": status,
+               "memory": memory.mode, **({"memory_problem": memory.problem} if memory.problem else {})})
     say(f"pipeline ready in {time.perf_counter() - t0:.1f} s: "
         f"{status.get('status_line') or status.get('records_error')}")
     tokens = TokenStore(str(config.PRIVATE_DIR / "ask_token.json"))
-    service = AskService(pipeline, tokens, log)
+    service = AskService(pipeline, tokens, log, memory=memory)
     state = tokens.state()
     if state != "ok":
         say(f"no valid token in {tokens.path} ({state}): every request is refused until the owner runs "

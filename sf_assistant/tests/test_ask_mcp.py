@@ -46,6 +46,7 @@ from sf_assistant.knowledge.store import knowledge_files  # noqa: E402
 from sf_assistant.server.auth import TokenStore, write_tokens  # noqa: E402
 
 KEYS = {"status", "answer", "kind", "data_ts", "objects", "charts"}
+V2_KEYS = KEYS | {"contract", "state", "plan_line", "reason"}   # contract v2 (Salesforce conversation memory)
 PLACEHOLDER = "No answer was found for this question."
 SOURCE = "Source: fake copy, synced 2026-01-01 00:00 UTC."
 TURNS = [{"role": "user", "content": "Who manages Echo One?"},
@@ -125,16 +126,19 @@ class Service:
                  **limits):
         self.tmp = tmp_path
         self.ask_mod, self.llm = ask_mod or FakeAsk(), llm or FakeLLM()
-        self.log_path = tmp_path / "ask_log.jsonl"
+        self.log_path = tmp_path / "ask_logs"            # the daily log files' folder (web/ask_log.py)
         self.token_path = tmp_path / "ask_token.json"
         wh = tmp_path / "warehouse.read.duckdb"
         if records:
             wh.write_text("v1")
-        log = ask_mcp.AskLog(str(self.log_path))
+        log = ask_mcp.RotatingAskLog(str(self.log_path))
         self.pipeline = pipeline_mod.Pipeline(
             self.ask_mod, types.SimpleNamespace(model="fake-model", base_url="http://localhost:8000/v1"), None, None,
             self.llm, types.SimpleNamespace(warehouse=str(wh)), log=log.write)
         self.token = write_tokens(str(self.token_path), label="test")[0]
+        # the memory switches of the design default (shadow), whatever SFA_MEMORY the shell has; a test that wants
+        # another mode passes memory=
+        limits.setdefault("memory", sfa_config.MemoryConfig())
         self.service = ask_mcp.AskService(self.pipeline, TokenStore(str(self.token_path)), log, **limits)
         self.sock_dir = tempfile.mkdtemp(prefix="sfa-ask-")   # short: a socket's path has a limit of 107 bytes
         self.sock_path = os.path.join(self.sock_dir, "ask.sock")
@@ -180,9 +184,7 @@ class Service:
         return result
 
     def log(self) -> list[dict]:
-        if not self.log_path.exists():
-            return []
-        return [json.loads(ln) for ln in self.log_path.read_text(encoding="utf-8").splitlines()]
+        return log_lines(self.log_path)
 
     def asks(self) -> list[dict]:
         return [ln for ln in self.log() if ln.get("event") in ("ask", "late_finish")]
@@ -193,6 +195,17 @@ class Service:
         self.thread.join(10)
         self.service.close()
         shutil.rmtree(self.sock_dir, ignore_errors=True)
+
+
+def log_lines(folder: Path) -> list[dict]:
+    """Every line of the daily log files in ``folder``, oldest file first (a run near midnight in Asia/Kolkata writes
+    two)."""
+    return [json.loads(ln) for path in sorted(Path(folder).glob("ask_log-*.jsonl"))
+            for ln in path.read_text(encoding="utf-8").splitlines()]
+
+
+def log_files(folder: Path) -> list[Path]:
+    return sorted(Path(folder).glob("ask_log-*.jsonl"))
 
 
 @pytest.fixture
@@ -227,10 +240,12 @@ def test_tools_list_returns_exactly_one_tool_with_the_contract_schema(make):
     assert [t["name"] for t in tools] == ["ask_salesforce"]
     schema = tools[0]["inputSchema"]
     assert schema["additionalProperties"] is False and schema["required"] == ["question"]
-    assert set(schema["properties"]) == {"question", "recent_turns", "request_id"}
+    assert set(schema["properties"]) == {"question", "recent_turns", "request_id", "contract", "state", "gap",
+                                         "summary", "access_profile"}   # contract v2 (design v2 §4.1)
     assert schema["properties"]["question"]["maxLength"] == 1000
     turns = schema["properties"]["recent_turns"]
-    assert turns["maxItems"] == 4 and turns["items"]["additionalProperties"] is False
+    # 12 turns (6 pairs) for the resolver; the rewrite keeps reading the last 4 (followup.MAX_TURNS, C31)
+    assert turns["maxItems"] == 12 and turns["items"]["additionalProperties"] is False
     assert turns["items"]["properties"]["role"]["enum"] == ["user", "assistant"]
     assert turns["items"]["properties"]["content"]["maxLength"] == 2000
     assert schema["properties"]["request_id"]["type"] == "string"
@@ -246,8 +261,9 @@ def test_the_only_method_families_are_the_tool_ones(make):
 
 def test_the_limits_are_the_contract_values_and_match_the_rewrite():
     assert (ask_mcp.QUEUE_WAIT_S, ask_mcp.TIMEOUT_S) == (120.0, 240.0)
-    assert (ask_mcp.MAX_QUESTION, ask_mcp.MAX_TURNS, ask_mcp.MAX_TURN_CHARS) == (1000, 4, 2000)
+    assert (ask_mcp.MAX_QUESTION, ask_mcp.MAX_TURNS, ask_mcp.MAX_TURN_CHARS) == (1000, 12, 2000)
     assert (followup.MAX_QUESTION_CHARS, followup.MAX_TURNS, followup.MAX_TURN_CHARS) == (1000, 4, 2000)
+    assert ask_mcp.REWRITE_TURNS == followup.MAX_TURNS == 4
     assert (ask_mcp.SOCKET_PATH, ask_mcp.ASK_HOST) == ("/run/sf-assistant-ask/ask.sock", "sf-assistant-ask")
     assert ask_mcp.UNCLEAR_LINE == ("I could not tell what this refers to. Please ask the full question, with the "
                                     "name or object.")
@@ -599,7 +615,7 @@ class World:
             return session, lines
 
         rcfg = sfa_config.load_records_config(warehouse=str(wh), today=dt.date(2026, 10, 13))
-        log = ask_mcp.AskLog(str(tmp / "ask_log.jsonl"))
+        log = ask_mcp.RotatingAskLog(str(tmp / "ask_logs"))
         ask_mod = types.SimpleNamespace(ask=cli_ask, open_record_session=open_session)
         pipe = pipeline_mod.Pipeline(ask_mod, cfg, registry, system, llm, rcfg, log=log.write, knowledge_dir=str(kn))
         self.service = ask_mcp.AskService(pipe, types.SimpleNamespace(state=lambda: "ok"), log)
@@ -693,6 +709,170 @@ def test_real_a_complete_multi_line_question_is_answered_as_typed(world):
                            {"role": "assistant", "content": "Echo One reports to Delta Person."}])
     assert out["result"]["status"] == "answered" and out["question_used"] == question
     assert "Read as:" not in out["result"]["answer"]
+
+
+# ------------------------------------------------------------------------------------------------- contract v2
+# Salesforce conversation memory (design v2 of 2026-11-25 §4, §6.1, §16.1): the service accepts v1 and v2; with
+# SFA_MEMORY shadow (the default) a v2 call's answer is the v1 answer and the reply carries the next state.
+MEM_OFF = sfa_config.MemoryConfig(mode="off")
+MEM_SHADOW = sfa_config.MemoryConfig(mode="shadow")
+
+
+def v2_args(question: str, **kw) -> dict:
+    return {"question": question, "request_id": "req-1", "contract": 2, **kw}
+
+
+def v2_result(s: Service, arguments: dict) -> dict:
+    envelope = s.call(arguments)
+    assert envelope["ok"] is True and envelope["error"] is None, envelope
+    assert set(envelope["result"]) == V2_KEYS and envelope["result"]["contract"] == 2
+    assert envelope["result"]["reason"] in ask_mcp.REASONS
+    return envelope["result"]
+
+
+def test_a_v1_call_is_answered_as_before_in_every_memory_mode(make):
+    for memory in (MEM_OFF, MEM_SHADOW, sfa_config.MemoryConfig(mode="on")):
+        s = make(memory=memory)
+        assert s.ask("How many?") == {"status": "answered", "answer": "There are 3 records.", "kind": "merged",
+                                      "data_ts": "2026-01-01 00:00 UTC", "objects": [], "charts": []}
+        assert "memory" not in s.asks()[-1]
+
+
+def test_a_v2_call_gets_the_six_keys_and_four_more_and_the_v1_answer(make):
+    s = make()
+    result = v2_result(s, v2_args("How many?", state=None, gap=0, summary="", access_profile=None))
+    assert result["reason"] == "records" and result["plan_line"] == ""
+    assert isinstance(result["state"], dict) and result["state"]["v"] == 1 and result["state"]["plan"] is None
+    assert {k: result[k] for k in KEYS} == s.ask("How many?")                    # the answer is the v1 answer
+    line = [ln for ln in s.asks() if "memory" in ln][0]
+    assert line["memory"]["mode"] == "shadow" and line["memory"]["resolver"]["model"] is False
+
+
+def test_access_profile_is_accepted_and_changes_no_answer(make):
+    s = make()
+    plain = v2_result(s, v2_args("How many?"))
+    profiled = v2_result(s, v2_args("How many?", access_profile="profile-a"))
+    assert {k: plain[k] for k in KEYS} == {k: profiled[k] for k in KEYS}
+    assert profiled["state"]["profile"] == "profile-a" and plain["state"]["profile"] is None
+
+
+@pytest.mark.parametrize("extra", [{"user": "Echo One"}, {"chat_id": "c1"}, {"contract": 2, "states": {}},
+                                   {"contract": 2, "query_state": None}])
+def test_unknown_keys_are_refused_with_the_old_services_fixed_text(make, extra):
+    s = make()
+    envelope = s.call({"question": "how many?", **extra})
+    assert envelope["ok"] is False and envelope["error"] == ask_mcp.UNKNOWN_KEYS_ERROR
+    assert ask_mcp.UNKNOWN_KEYS_ERROR == "the arguments are question, recent_turns and request_id"   # C34, the bridge
+    assert s.ask_mod.calls == [] and s.llm.calls == []
+
+
+@pytest.mark.parametrize("contract", [3, 0, "2", True, 2.0, None])
+def test_a_contract_other_than_1_or_2_is_refused(make, contract):
+    s = make()
+    envelope = s.call({"question": "how many?", "contract": contract})
+    assert envelope["ok"] is False and envelope["error"] == "contract must be 1 or 2"
+    assert s.ask_mod.calls == []
+
+
+@pytest.mark.parametrize("state, why", [
+    ("a text", "state_invalid"), ([1, 2], "state_invalid"), ({"v": 99, "plan": None}, "state_version_unknown"),
+    ({"v": 1, "plan": "x"}, "state_invalid"), ({"v": 1, "made_at": "x" * 40_000}, "state_too_large")])
+def test_a_bad_state_is_no_fault_of_the_call(make, state, why):
+    s = make()
+    result = v2_result(s, v2_args("How many?", state=state, gap=0))
+    assert result["status"] == "answered" and result["answer"] == "There are 3 records."
+    entry = [ln for ln in s.asks() if "memory" in ln][-1]["memory"]
+    assert entry["state_in"] == why or (why == "state_invalid" and entry.get("input") == ["state_invalid"])
+
+
+def test_other_v2_values_of_the_wrong_shape_are_no_fault_and_are_named_in_the_log(make):
+    s = make()
+    result = v2_result(s, v2_args("How many?", gap=9, summary=7, access_profile=3))
+    assert result["status"] == "answered"
+    entry = [ln for ln in s.asks() if "memory" in ln][-1]["memory"]
+    assert entry["input"] == ["gap_invalid", "summary_invalid", "access_profile_invalid"] and entry["gap"] is None
+
+
+def test_with_memory_off_a_v2_call_is_answered_as_v1(make):
+    s = make(memory=MEM_OFF)
+    envelope = s.call(v2_args("How many?", state={"v": 1}, gap=0, summary="x", access_profile=None))
+    assert envelope["ok"] and set(envelope["result"]) == KEYS
+    assert "memory" not in s.asks()[-1]
+
+
+def test_the_rewrite_reads_the_last_four_turns_in_shadow_and_off(make):
+    """C31: the schema takes 12 turns; the rewrite gets the last 4, exactly what a v1 bridge sends."""
+    turns = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i} about Echo One"} for i in range(10)]
+    for memory in (MEM_OFF, MEM_SHADOW):
+        s12, s4 = make(memory=memory, llm=FakeLLM(reply="UNCLEAR")), make(memory=memory, llm=FakeLLM(reply="UNCLEAR"))
+        s12.call(v2_args("and for last month?", recent_turns=turns, gap=0))
+        s4.call({"question": "and for last month?", "request_id": "req-1", "recent_turns": turns[-4:]})
+        assert s12.llm.calls == s4.llm.calls and len(s12.llm.calls) == 1
+        text = json.dumps(s12.llm.calls[0])
+        assert "turn 5 about" not in text and "turn 6 about" in text and "turn 9 about" in text
+        assert ask_mcp.REWRITE_TURNS == followup.MAX_TURNS == 4
+
+
+def test_no_log_line_holds_the_turns_the_state_or_the_summary(make):
+    s = make(llm=FakeLLM(reply="UNCLEAR"))
+    turns = [{"role": "user", "content": "TURN-MARK about Echo One"}, {"role": "assistant", "content": "TURN-MARK."}]
+    state = {"v": 1, "made_at": "", "kb": "", "profile": None, "pending": None, "last": {},
+             "plan": {"question": "STATE-MARK", "terms": {"keys": [], "text": "STATE-MARK"}, "calls": [],
+                      "show": {}, "age": 0}}
+    v2_result(s, v2_args("and for last month?", recent_turns=turns, state=state, gap=0, summary="SUMMARY-MARK"))
+    v2_result(s, v2_args("How many?", recent_turns=turns, state=state, gap=0, summary="SUMMARY-MARK"))
+    text = "".join(p.read_text(encoding="utf-8") for p in log_files(s.log_path))
+    assert '"memory"' in text
+    for mark in ("TURN-MARK", "STATE-MARK", "SUMMARY-MARK"):
+        assert mark not in text, mark
+
+
+def test_a_clarifying_question_on_a_v2_call_is_answered_kind_none_with_its_choices_pending(make):
+    from sf_assistant.agent import clarify
+
+    text = (f"{clarify.TEXTS['lead']}\n1. How many interviews were there last month?\n"
+            f"2. Show the number of interviews per month\n\n{clarify.TEXTS['tail']}")
+    answer = row(text, "none", record_error="no data")
+    answer["jsonl"]["clarify"] = {"why": "no_call", "from": "objects"}
+    s = make(FakeAsk(answer))
+    result = v2_result(s, v2_args("interviews?"))
+    assert (result["status"], result["kind"], result["reason"]) == ("answered", "none", "clarify")
+    pending = result["state"]["pending"]
+    assert [c["question"] for c in pending["choices"]] == ["How many interviews were there last month?",
+                                                           "Show the number of interviews per month"]
+    assert pending["asked"] in result["answer"] and pending["for"] == "interviews?"
+
+
+def test_a_v2_reply_with_no_answer_has_no_state(make):
+    s = make(FakeAsk(error=RuntimeError("boom")))
+    result = v2_result(s, v2_args("How many?"))
+    assert result["status"] == "failed" and result["state"] is None and result["reason"] == "failed"
+    s2 = make()
+    assert v2_result(s2, v2_args("​"))["status"] == "failed"
+
+
+def test_busy_on_a_v2_call_is_v2_shaped_with_no_state(make):
+    gate, entered = threading.Event(), threading.Event()
+    s = make(FakeAsk(gated(gate, entered)), queue_wait_s=0.3)
+    t, box = in_thread(s.ask, "first question")
+    assert entered.wait(10)
+    busy = v2_result(s, v2_args("second question"))
+    assert (busy["status"], busy["state"], busy["plan_line"], busy["reason"]) == ("busy", None, "", "busy")
+    gate.set()
+    t.join(10)
+
+
+def test_small_talk_on_a_v2_call_keeps_the_parent_plan(make):
+    s = make()
+    plan = {"question": "q", "terms": {"keys": [], "text": "how many interviews"}, "age": 0,
+            "show": {"chart": False, "type": None, "table": False},
+            "calls": [{"role": "main", "tool": "count_records", "args": {"object": "Interview__c"}, "nonempty": True}]}
+    state = {"v": 1, "made_at": "", "kb": "", "profile": None, "plan": plan, "pending": None,
+             "last": {"kind": "records", "reason": "records", "op": None}}
+    result = v2_result(s, v2_args("thanks", state=state, gap=0))
+    assert (result["status"], result["reason"]) == ("answered", "small_talk") and s.ask_mod.calls == []
+    assert result["state"]["plan"]["calls"] == plan["calls"] and result["state"]["plan"]["age"] == 0
+    assert result["plan_line"].startswith("number of Interview")
 
 
 # ------------------------------------------------------------------------------------------------- busy and timeout
@@ -839,7 +1019,7 @@ def test_the_late_flag_is_not_left_on_when_the_thread_ended_with_the_timeout(tmp
 
     (tmp_path / "x").write_text("v1")
     gate = threading.Event()
-    log = ask_mcp.AskLog(str(tmp_path / "l.jsonl"))
+    log = ask_mcp.RotatingAskLog(str(tmp_path / "logs"))
     svc = ask_mcp.AskService(Pipe(), types.SimpleNamespace(state=lambda: "ok"), log, queue_wait_s=1, timeout_s=0.1)
 
     def job(question, turns):
@@ -1327,7 +1507,8 @@ def test_the_log_is_private_and_holds_what_the_reply_does_not(make):
     answer = row(f"Echo One hosted 3.\n\n{SOURCE}", "merged", "1 q, 3 rows", (query(),), charts=[chart_item()])
     s = make(FakeAsk(answer))
     s.ask("How many did Echo One host?")
-    assert stat.S_IMODE(os.stat(s.log_path).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(s.log_path).st_mode) == 0o700
+    assert [stat.S_IMODE(os.stat(f).st_mode) for f in log_files(s.log_path)] == [0o600]
     line = s.asks()[-1]
     assert set(line) >= {"ts", "event", "request_id", "status", "reason", "question", "question_used", "answer",
                          "seconds", "queue_wait_s", "detail"}
@@ -1407,7 +1588,7 @@ def test_a_detail_json_cannot_hold_keeps_the_answer_and_a_line_of_fixed_words(ma
 
 def test_a_folder_the_log_cannot_be_written_to_never_stops_a_question(make):
     s = make()
-    s.service.log.path = str(s.tmp / "nowhere" / "ask_log.jsonl")
+    s.service.log.path = str(s.tmp / "nowhere" / "ask_logs")
     assert s.ask("How many?")["status"] == "answered"
 
 
@@ -1773,9 +1954,11 @@ def test_the_real_program_starts_serves_on_the_socket_and_goes_away_clean(tmp_pa
         r = real_call(path, token, arguments)
         result = json.loads(r.json()["result"]["content"][0]["text"])["result"]
         assert result["status"] == "failed" and result["answer"] == ""            # the dead address: the rewrite failed
-        lines = [json.loads(x) for x in (home / ".private" / "ask_log.jsonl").read_text().splitlines()]
+        lines = log_lines(home / ".private" / "ask_logs")
         assert [ln["reason"] for ln in lines if ln.get("event") == "ask"] == ["rewrite_call_failed"]
-        assert stat.S_IMODE(os.stat(home / ".private" / "ask_log.jsonl").st_mode) == 0o600
+        assert stat.S_IMODE(os.stat(home / ".private" / "ask_logs").st_mode) == 0o700
+        assert {stat.S_IMODE(os.stat(f).st_mode) for f in log_files(home / ".private" / "ask_logs")} == {0o600}
+        assert not (home / ".private" / "ask_log.jsonl").exists()        # the single file of before is never made
         proc.send_signal(signal.SIGTERM)
         assert proc.wait(30) == 0
         assert not os.path.exists(path) and proc.stdout.read() == b""
@@ -1804,7 +1987,8 @@ def test_sigterm_with_a_question_in_flight_exits_before_dockers_sigkill(tmp_path
     try:
         thread.start()
         t0 = time.monotonic()
-        while b"ask" not in Path(home / ".private" / "ask_log.jsonl").read_bytes() and time.monotonic() - t0 < 2:
+        while not any(ln.get("event") == "ask" for ln in log_lines(home / ".private" / "ask_logs")) \
+                and time.monotonic() - t0 < 2:
             time.sleep(0.05)
         time.sleep(1.0)                                                         # the question runs: the model holds it
         assert proc.poll() is None and box == []
@@ -1850,10 +2034,22 @@ def test_the_real_program_refuses_a_socket_something_answers_on(tmp_path):
 
 def test_the_log_check_raises_on_a_folder_it_cannot_write(tmp_path):
     with pytest.raises(OSError):
-        ask_mcp.AskLog(str(tmp_path / "nowhere" / "ask_log.jsonl")).check()
-    path = tmp_path / "ask_log.jsonl"
-    ask_mcp.AskLog(str(path)).check()
-    assert path.exists() and stat.S_IMODE(os.stat(path).st_mode) == 0o600
+        ask_mcp.RotatingAskLog(str(tmp_path / "nowhere" / "ask_logs")).check()
+    path = tmp_path / "ask_logs"
+    ask_mcp.RotatingAskLog(str(path)).check()
+    assert path.is_dir() and stat.S_IMODE(os.stat(path).st_mode) == 0o700
+    assert [stat.S_IMODE(os.stat(f).st_mode) for f in log_files(path)] == [0o600]   # today's file, created empty
+
+
+def test_the_service_writes_through_the_daily_log_of_web_ask_log():
+    """The writer swap (design v2 §12.3): main() opens the folder the compose file mounts, through RotatingAskLog, and
+    nothing in the service opens the single file of before (run.sh check_ask_writer agrees)."""
+    import ask_log
+
+    text = (WEB / "ask_mcp.py").read_text(encoding="utf-8")
+    assert "RotatingAskLog(str(config.PRIVATE_DIR / ask_log.DIR_NAME))" in text and ask_log.DIR_NAME == "ask_logs"
+    assert '"ask_log.jsonl"' not in text and not hasattr(ask_mcp, "AskLog")
+    assert ask_mcp.RotatingAskLog is ask_log.RotatingAskLog
 
 
 # ------------------------------------------------------------------------------------------------- compose and run.sh
@@ -1894,7 +2090,7 @@ def test_compose_mounts_only_what_the_contract_lists_and_one_writable_file():
     assert found == {"../src": ("/srv/sfa/src", True), "../prompts": ("/srv/sfa/prompts", True),
                      "../knowledge": ("/srv/sfa/knowledge", True), "../web": ("/srv/web", True),
                      "../.private/ask_token.json": ("/srv/sfa/.private/ask_token.json", True),
-                     "../.private/ask_log.jsonl": ("/srv/sfa/.private/ask_log.jsonl", False),
+                     "../.private/ask_logs": ("/srv/sfa/.private/ask_logs", False),   # the daily log folder
                      "sf-local-ai_data": ("/data", True),
                      "sf-local-ai_ask-sock": ("/run/sf-assistant-ask", False)}
 
@@ -1981,9 +2177,12 @@ def test_up_ask_creates_its_two_files_private_and_refuses_a_missing_image(tmp_pa
     env = {**os.environ, "PATH": f"{fake}:{os.environ['PATH']}"}
     p = subprocess.run(["bash", str(run), "up-ask"], capture_output=True, text=True, timeout=60, env=env)
     assert p.returncode == 1 and "never builds" in p.stderr
-    for name in ("ask_log.jsonl", "ask_token.json"):
-        path = tmp_path / ".private" / name
-        assert path.is_file() and stat.S_IMODE(os.stat(path).st_mode) == 0o600 and path.stat().st_size == 0
+    logs = tmp_path / ".private" / "ask_logs"                 # the daily log folder (web/ask_log.py), mode 700
+    assert logs.is_dir() and not logs.is_symlink() and stat.S_IMODE(os.stat(logs).st_mode) == 0o700
+    assert list(logs.iterdir()) == []
+    path = tmp_path / ".private" / "ask_token.json"
+    assert path.is_file() and stat.S_IMODE(os.stat(path).st_mode) == 0o600 and path.stat().st_size == 0
+    assert not (tmp_path / ".private" / "ask_log.jsonl").exists()
     assert stat.S_IMODE(os.stat(tmp_path / ".private").st_mode) == 0o700
     assert "No token yet" in p.stderr
 
@@ -2041,8 +2240,8 @@ def test_restart_ask_recreates_only_its_own_service_after_the_checks_of_up_ask(t
     lines = calls.read_text().splitlines()
     assert lines == ["image inspect sf-assistant-web:local", "volume inspect sf-local-ai_ask-sock",
                      f"compose -p sf-assistant-ask -f {tmp_path}/web/compose.ask.yaml up -d --no-build --force-recreate"]
-    for name in ("ask_log.jsonl", "ask_token.json"):
-        assert (tmp_path / ".private" / name).is_file()
+    assert (tmp_path / ".private" / "ask_logs").is_dir() and (tmp_path / ".private" / "ask_token.json").is_file()
+    assert not (tmp_path / ".private" / "ask_log.jsonl").exists()
 
 
 @pytest.mark.parametrize("missing, message", [("image inspect", "restart-ask never builds"),

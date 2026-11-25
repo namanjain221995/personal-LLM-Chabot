@@ -62,8 +62,10 @@ def test_every_file_parses_and_is_well_formed():
     # of 2026-11-24 (term_contracts) + 6 of the prerequisites of 2026-11-25 (small_talk, display_words,
     # records_display_note, records_tools_forced_message, records_all_failed_message, records_clarify) + 1 of the
     # Salesforce conversation memory of 2026-11-25 (followup_resolve: the follow-up resolver's prompt and the lines
-    # code writes); the last 37 are new, so the notebook golden does not cover them
-    assert len(files) == 105
+    # code writes) + 2 of its stage 2 (plan_line_words: the plan line's words, moved from agent/query_state.py;
+    # memory_exec: the lines of a re-run plan and the note of a question about the last answer); the last 39 are new,
+    # so the notebook golden does not cover them
+    assert len(files) == 107
     for path in files:
         raw = path.read_bytes()
         assert b"\r" not in raw and not raw.startswith(b"\xef\xbb\xbf"), path.name

@@ -520,11 +520,56 @@ in [runbook.md](runbook.md#page-settings). The MCP server reads:
 | `SFA_MCP_AUDIT_KEY` | `.private/mcp_audit_key` | the HMAC key of the audit log's argument hashes (created when missing and the folder is writable) |
 
 The ask service has no bind and no port. Its limits are constants in `web/ask_mcp.py`, not settings: 120 s in line, 240 s
-of running, 1,000 characters per question, 4 messages of 2,000 characters. Its socket is the constant
-`/run/sf-assistant-ask/ask.sock` (`SFA_ASK_SOCKET` moves it only for a run outside a container, as the tests do; the
-compose file leaves it unset). Its token file and log are `.private/ask_token.json` and `.private/ask_log.jsonl`.
+of running, 1,000 characters per question, 12 messages of 2,000 characters (the follow-up rewrite reads the last 4).
+Its socket is the constant `/run/sf-assistant-ask/ask.sock` (`SFA_ASK_SOCKET` moves it only for a run outside a
+container, as the tests do; the compose file leaves it unset). Its token file is `.private/ask_token.json`; its log is
+one file per business day in `.private/ask_logs/` (`web/ask_log.py`, kept `SFA_ASK_LOG_DAYS` days, 90).
 `web/compose.ask.yaml` pins `OKEVAL_BASE_URL`, `OKEVAL_MODEL` and `OKEVAL_API_KEY`, as the page's service does, and the
 service refuses to start with a proxy set in the environment.
+
+**Contract v2 (Salesforce conversation memory, design of 2026-11-25).** The tool `ask_salesforce` accepts v1 and v2
+calls. A v2 call adds `contract: 2`, `state` (the query state the service returned with the answer this question
+replies to, at most 32 KB, opaque to the caller), `gap` (0-6), `summary` (the chat's Salesforce summary, at most 8,000
+characters, data only) and `access_profile` (reserved, null today). An unknown key still gets the old service's fixed
+text ("the arguments are question, recent_turns and request_id"), which the platform's bridge reads to fall back to v1;
+`contract` must be 1 or 2; a `state` of another shape or version is not used and is no fault of the call. A v2 reply
+holds the six result keys and four more: `contract: 2`, `state` (the next query state, or null), `plan_line` (code
+written, at most 600 characters) and `reason` (a fixed code: `records`, `knowledge`, `new`, `patch`, `shortcut`,
+`about_answer`, `clarify`, `small_talk`, `code_line`, `unclear_rewrite`, `refused`, `failed`, `no_answer`, `busy`,
+`timeout`). No new status: a clarifying question is `answered`, kind `none`, reason `clarify`, with the choices in
+`state.pending`; its text goes out as the resolver wrote it. `recent_turns`, `state` and `summary` never reach the log;
+a v2 call's log line gets `memory`, fixed codes and numbers only.
+
+The switches (`src/sf_assistant/config.py`, `MemoryConfig`; read once at the service's start, so a change needs
+`./run.sh restart-ask`):
+
+| Variable | Default | Sets |
+|---|---|---|
+| `SFA_MEMORY` | `shadow` | `off`: every call is v1 (no state). `shadow`: answers byte for byte as `off`; a v2 call also gets the next state built from what ran, and the resolver's code steps are logged (no model call). `on`: a v2 call goes through the follow-up resolver (`agent/resolver.py`); a patch or a question about the last answer runs the stored plan as seeded calls through the record tools, with the business terms rebuilt from the person's typed words (`agent/query_state.py`), and its "Read as:" line is the plan line. Any other value: off, with a start-up line |
+| `SFA_MEMORY_SHORTCUTS` | `on` | the resolver's code shortcuts (visualize it, top N, same for a period, by month), with `on` only |
+| `SFA_MEMORY_PATCH_KNOWLEDGE` | `off` | the knowledge step on a patched follow-up (off: the record agent alone) |
+| `SFA_MEMORY_MAX_CALLS` | `3` | the most record calls a stored plan holds (1-3); an answer with more stores no plan |
+| `SFA_MEMORY_MAX_AGE` | `2` | the most answers after its own a plan may still be patched after, with a confirm (0-6) |
+| `SFA_MEMORY_TOKENS` | `12000` | the resolver's prompt cap; a value below its smallest prompt with a full plan and a question (`memory_tokens_floor()`, about 5,400) is refused |
+| `SFA_ASK_LOG_DAYS` | `90` | days the daily log files are kept (`web/ask_log.py`) |
+
+The page (`web/pipeline.py`) has no store: with `SFA_MEMORY=on` its follow-ups go through the resolver with no state;
+otherwise it keeps the follow-up rewrite.
+
+What the service assumes of its caller and its switches:
+
+- **The shadow rewrite reads the last 4 of the turns sent** (`_rewrite_turns`, C31). Shadow answers byte for byte as
+  `off` for the same call, and as a v1 bridge's call only when the last 4 turns a v2 bridge sends are the ones a v1
+  bridge sends (the same filter, a user turn without an answer of its own kept). A bridge that sends whole
+  question-and-answer pairs only gives the rewrite other turns when the path holds an unanswered question.
+- **The memory switches are read from the ask container's environment.** `web/compose.ask.yaml` does not pass the six
+  `SFA_MEMORY*` names yet (stage-2 review M1, open), so until it does `restart-ask` starts the service on their
+  defaults (`shadow`, which answers as `off`), whatever the shell holds.
+- **Seeded calls run side calls first and the main call last**, so the chart (drawn from the last chartable result)
+  and the next plan's main call stay the plan's main call after an operation that added a side call; a seeded main
+  call stays the main call unless the record agent added a chartable call of its own.
+- **The log** of an on-mode call that the resolver could not read holds its codes and the reply's length, never the
+  reply.
 
 ## Tests and parity
 

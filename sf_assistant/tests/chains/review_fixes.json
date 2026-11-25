@@ -1,0 +1,308 @@
+{
+ "chains": [
+  {
+   "id": "RV-M2",
+   "title": "Compare with previous month on a grouping keeps this month as the main call",
+   "design": "stage-2 review M2; design v2 §6.4 compare_period, §8 (an op changes the main call by default)",
+   "steps": [
+    {
+     "q": "how many interviews by status this month",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Status__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this month"
+       }
+      },
+      "The interviews by status are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Interview_Status__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this month"
+         }
+        }
+       ]
+      }
+     }
+    },
+    {
+     "q": "Compare with previous month",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "compare_period": {
+         "phrase": "previous month"
+        }
+       }
+      ]
+     },
+     "record": [
+      "Both months are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "model": true,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "previous month"
+        }
+       },
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this month"
+        }
+       }
+      ],
+      "plan": {
+       "period": {
+        "phrase": "this month",
+        "from": "2026-10-01",
+        "to": "2026-10-31"
+       }
+      },
+      "read_as": "plan_line",
+      "plan_line_has": [
+       "number of Interviews per Interview Status, this month (2026-10-01 to 2026-10-31); also "
+      ]
+     }
+    },
+    {
+     "q": "only top 2",
+     "record": [
+      "The top 2 are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "previous month"
+        }
+       },
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this month",
+         "top": 2,
+         "order": "desc"
+        }
+       }
+      ],
+      "plan": {
+       "period": {
+        "phrase": "this month"
+       }
+      },
+      "plan_line_has": [
+       "this month (2026-10-01 to 2026-10-31), top 2"
+      ]
+     }
+    },
+    {
+     "q": "visualize it",
+     "record": [
+      "Shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "charts": 1,
+      "plan": {
+       "show_chart": true
+      },
+      "plan_line_has": [
+       "this month (2026-10-01 to 2026-10-31), top 2, as a chart"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "RV-M3",
+   "title": "A model new question that carries a name typed earlier stores its own plan",
+   "design": "stage-2 review M3; design v2 §7.3, §9 (a records answer stores its own plan at age 0)",
+   "steps": [
+    {
+     "q": "how many interviews per recruiter for Client Co this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "filters": [
+         {
+          "field": "Client_Account__c",
+          "op": "eq",
+          "value": "Client Co"
+         }
+        ],
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "filters": [
+           {
+            "field": "Client_Account__c",
+            "op": "eq",
+            "value": "Client Co"
+           }
+          ],
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ]
+      }
+     }
+    },
+    {
+     "q": "what about by outcome?",
+     "resolve": {
+      "kind": "new",
+      "standalone": "How many interviews for Client Co this year by outcome?",
+      "ops": []
+     },
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Outcome__c",
+        "filters": [
+         {
+          "field": "Client_Account__c",
+          "op": "eq",
+          "value": "Client Co"
+         }
+        ],
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews by outcome are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Outcome__c",
+         "filters": [
+          {
+           "field": "Client_Account__c",
+           "op": "eq",
+           "value": "Client Co"
+          }
+         ],
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Interview_Outcome__c",
+          "filters": [
+           {
+            "field": "Client_Account__c",
+            "op": "eq",
+            "value": "Client Co"
+           }
+          ],
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "age": 0
+      },
+      "plan_line_has": [
+       "number of Interviews per Interview Outcome"
+      ]
+     }
+    },
+    {
+     "q": "visualize it",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Outcome__c",
+         "filters": [
+          {
+           "field": "Client_Account__c",
+           "op": "eq",
+           "value": "Client Co"
+          }
+         ],
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "charts": 1,
+      "read_as": "plan_line",
+      "plan_line_has": [
+       "number of Interviews per Interview Outcome"
+      ]
+     }
+    }
+   ]
+  }
+ ]
+}

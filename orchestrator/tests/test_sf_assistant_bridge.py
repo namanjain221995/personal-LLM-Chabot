@@ -21,6 +21,14 @@ What is proved here is the orchestrator's half, and the properties it owes:
 4. THE SHAPE. Meta and charts arrive in the contract the frontend already reads,
    through the real parse_chart_spec, with no `sql`, ever.
 
+5. MEMORY (SF_ASSISTANT_MEMORY). Off, the call is exactly today's v1 call and no
+   store function runs. On, the call carries contract v2 (window, the parent
+   row's state, gap, summary, a null access profile); the old service's refusal
+   is asked again once with v1 keys and then v1 for ten minutes; a pending
+   clarification lets a polite word through both conversational rules; what the
+   reply says for memory is kept before the fixed-line reset and never reaches
+   meta; each answer through /chat writes its row.
+
 Invented names only. No model call.
 """
 from __future__ import annotations
@@ -42,7 +50,7 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from app import db, llm
+from app import db, llm, sf_isolation, sf_memory, sf_memory_store
 from app import main as app_main
 from app.authn import rbac
 from app.authn.rbac import Cap, Role
@@ -67,6 +75,8 @@ RETRY_LINE = "I could not answer that just now. Please try again in a moment, wi
 NEW_CHAT_LINE = "This chat holds a blocked or unclear answer, so I cannot do that here. Please start a new chat for it."
 ASK_AGAIN_LINE = "I could not tell what the last question referred to, so I cannot do that yet. Please ask again with the full question."
 READ_FAILED_LINE = "I could not check this chat just now, so I cannot do that yet; please try again in a moment."
+#: The old service's refusal of a key it does not know (web/ask_mcp.py before contract v2).
+V1_REFUSAL = "the arguments are question, recent_turns and request_id"
 #: Every key meta may carry from this path, before main.py adds its own.
 META_KEYS = {
     "route", "engine", "salesforce_sources", "salesforce_scope", "assumptions",
@@ -86,9 +96,9 @@ def result_of(status="answered", answer=ANSWER, kind="records", data_ts="2026-01
             "objects": list(objects), "charts": list(charts)}
 
 
-def tool_reply(result, *, ok=True, is_error=False) -> bytes:
+def tool_reply(result, *, ok=True, is_error=False, error=None) -> bytes:
     """A whole JSON-RPC body around the service's envelope."""
-    envelope = {"ok": ok, "result": result, "error": None if ok else "bad arguments", "chunk_ids": []}
+    envelope = {"ok": ok, "result": result, "error": None if ok else (error or "bad arguments"), "chunk_ids": []}
     text = json.dumps(envelope)
     return json.dumps({"jsonrpc": "2.0", "id": 1,
                        "result": {"content": [{"type": "text", "text": text}], "isError": is_error}}).encode()
@@ -110,6 +120,12 @@ class FakeAskService:
         self.status = 200
         self.body = tool_reply(result_of())
         self.delay = 0.0
+        #: A service from before contract v2: any key but the three v1 keys is
+        #: refused with its fixed text, as web/ask_mcp.py did (conversation memory).
+        self.speaks_v1_only = False
+        #: When set, the body a call with no `contract` gets: the v2 service
+        #: answers a v1 call as v1, with the six keys only (web/ask_mcp.py).
+        self.v1_body = None
         self.hung_up = threading.Event()
         self._loop = asyncio.new_event_loop()
         self._ready = threading.Event()
@@ -139,6 +155,11 @@ class FakeAskService:
             return 406, b"{}"
         if headers.get("authorization") != f"Bearer {TOKEN}":
             return 401, b"{}"
+        arguments = call["body"].get("params", {}).get("arguments", {})
+        if self.speaks_v1_only and set(arguments) - {"question", "recent_turns", "request_id"}:
+            return 200, tool_reply(None, ok=False, is_error=True, error=V1_REFUSAL)
+        if self.v1_body is not None and "contract" not in arguments:
+            return self.status, self.v1_body
         return self.status, self.body
 
     async def _serve(self, reader, writer) -> None:
@@ -196,6 +217,9 @@ def service(monkeypatch):
 @pytest.fixture(autouse=True)
 def _clean_registry(monkeypatch):
     _live_generations.clear()
+    # Conversation memory's "the service speaks v1" hold, and its probe, are per process.
+    monkeypatch.setattr(sfk_bridge, "_ask_v1_until", 0.0)
+    monkeypatch.setattr(sfk_bridge, "_ask_v1_probe_at", 0.0)
     # The same reason as test_chat_requests: a TestClient block's lifespan exit
     # leaves the shutdown flag raised, and the ASGI tests run no lifespan.
     monkeypatch.setattr(app_main, "_shutting_down", False)
@@ -2287,6 +2311,642 @@ def test_keys_the_service_should_not_send_go_no_further(service):
     assert set(meta) <= META_KEYS
     assert "sql" not in meta
     assert "SELECT" not in json.dumps(meta)
+
+
+# ---------------------------------------------------------------------------
+# 5. Conversation memory: contract v2 (SF_ASSISTANT_MEMORY, design 2026-11-25 §3, §4)
+# ---------------------------------------------------------------------------
+
+MEM_CHAT = "conv-mem"
+FIRST_Q = "how many interviews happened this month?"
+FIRST_A = "There were 12 interviews this month.\n\nSource: fake copy, synced 2026-01-01 00:00 UTC."
+PLAN_LINE = "interviews, 1-30 Nov 2026"
+STATE = {"v": 1, "plan": {"question": FIRST_Q, "calls": [{"role": "main", "tool": "count_records",
+                                                          "args": {"object": "Interview__c"}}]},
+         "pending": None, "last": {"kind": "records", "reason": "records"}}
+CLARIFY_A = "Which interviews do you mean?\n1. Client interviews\n2. Mock interviews"
+PENDING_STATE = {"v": 1, "plan": None, "last": {"kind": "none", "reason": "clarify"},
+                 "pending": {"asked": "Which interviews do you mean?", "for": FIRST_Q,
+                             "choices": [{"n": 1, "label": "Client interviews", "question": "q one"},
+                                         {"n": 2, "label": "Mock interviews", "question": "q two"}]}}
+#: Every store function: a test that patches them all to raise proves no read and no write.
+STORE_FUNCTIONS = ("insert", "fetch_candidates", "pick", "lookup", "update_summary", "delete_removed_answers")
+
+
+def v2_result(status="answered", answer=ANSWER, *, state=None, plan_line=PLAN_LINE, reason="records",
+              contract=2, **kwargs) -> dict:
+    """The v2 `result`: the six keys plus the four of contract v2."""
+    return {**result_of(status, answer, **kwargs), "contract": contract, "state": state,
+            "plan_line": plan_line, "reason": reason}
+
+
+@pytest.fixture()
+def memory_on(monkeypatch):
+    monkeypatch.setattr(settings, "sf_assistant_memory", True)
+
+
+def _no_store(monkeypatch) -> list:
+    """Every store function raises, and the calls are kept."""
+    calls: list = []
+
+    def refuse(name):
+        def raising(*_a, **_k):
+            calls.append(name)
+            raise AssertionError(f"sf_memory_store.{name} was called")
+        return raising
+
+    for name in STORE_FUNCTIONS:
+        monkeypatch.setattr(sf_memory_store, name, refuse(name))
+    return calls
+
+
+def _owner(name: str = "p2-mem-admin") -> SimpleNamespace:
+    """An admin as the bridge sees it, owning the memory chat."""
+    user_id = int(db.create_user(name, "!p2-test"))
+    db.create_conversation(user_id, MEM_CHAT, "made-up chat")
+    return SimpleNamespace(can=lambda cap: rbac.can(Role.ADMIN, cap), user_id=user_id, workspace_id="")
+
+
+def _row(owner, answer, *, parent="", question="", state=STATE, plan_line=PLAN_LINE, **kwargs) -> dict:
+    """A stored row of `answer`; `parent` and `question` are texts ('' for none)."""
+    key = sf_isolation.answer_key
+    return sf_memory_store.insert(
+        user_id=owner.user_id, conversation_id=MEM_CHAT, generation_id=kwargs.pop("generation", os.urandom(8).hex()),
+        answer_sha1=key(answer), parent_sha1=key(parent) if parent else "",
+        question_sha1=key(question) if question else "", contract=kwargs.pop("contract", 2),
+        state=state, plan_line=plan_line, **kwargs)
+
+
+def _mem_turn(text, *, history=(), owner, stop_line=None):
+    """One turn straight through `try_answer`, in the memory chat."""
+    messages = [*({"role": role, "content": content} for role, content in history),
+                {"role": "user", "content": text}]
+    request = ChatRequest(messages=messages, mode="salesforce", conversation_id=MEM_CHAT)
+    events: list = []
+
+    async def emit(event, data):
+        events.append((event, data))
+
+    async def run():
+        return await sfk_bridge.try_answer(
+            text, emit=emit, request=request, query_trace=SimpleNamespace(request_id="req-1"),
+            principal=owner, conv_key=MEM_CHAT, mode_sent=True, stop_line=stop_line)
+
+    return asyncio.run(run()), events, request
+
+
+def _arguments(service, index: int = -1) -> dict:
+    return service.calls[index]["body"]["params"]["arguments"]
+
+
+def _v1_arguments(request, text) -> dict:
+    """Exactly the call the switch-off bridge makes."""
+    return {"question": text, "recent_turns": sfk_bridge._recent_turns(request), "request_id": "req-1"}
+
+
+HISTORY = [("user", f"question {n}") if n % 2 == 0 else ("assistant", f"answer {n}") for n in range(16)]
+
+
+@pytest.mark.parametrize("switch", [False, None, "true", 1], ids=["false", "unset", "a string", "one"])
+def test_with_memory_off_the_call_is_todays_v1_call_and_no_store_is_touched(service, monkeypatch, switch):
+    owner = _owner()
+    _row(owner, "answer 15", parent="answer 13", question="question 14")
+    touched = _no_store(monkeypatch)
+    monkeypatch.setattr(settings, "sf_assistant_memory", switch)
+    outcome, _events, request = _mem_turn(QUESTION, history=HISTORY, owner=owner)
+    assert outcome.handled is True and outcome.answer == ANSWER
+    assert _arguments(service) == _v1_arguments(request, QUESTION)
+    assert len(_arguments(service)["recent_turns"]) == 4
+    assert outcome.sf_memory is None
+    assert touched == []
+
+
+def test_with_memory_on_a_first_question_carries_contract_2_with_no_state(service, memory_on):
+    owner = _owner()
+    service.body = tool_reply(v2_result(state=STATE))
+    outcome, events, _request = _mem_turn(QUESTION, owner=owner)
+    assert _arguments(service) == {"question": QUESTION, "recent_turns": [], "request_id": "req-1", "contract": 2,
+                                   "state": None, "gap": 0, "summary": "", "access_profile": None}
+    memory = outcome.sf_memory
+    assert memory["contract"] == 2 and memory["state"] == STATE and memory["plan_line"] == PLAN_LINE
+    assert memory["reason"] == "records" and memory["kind"] == "records" and memory["clarify"] == ""
+    assert memory["parent_sha1"] == "" and memory["question_sha1"] == sf_isolation.answer_key(QUESTION)
+    assert memory["path_pairs"] == 1 and memory["summary"] == "" and memory["summary_pairs"] == 0
+    # Nothing of it reaches the stream, and meta is what it always was.
+    assert set(_meta_of(events)) <= META_KEYS
+    assert PLAN_LINE not in json.dumps(events) and "count_records" not in json.dumps(events)
+    assert not outcome.meta_extras
+
+
+def test_a_follow_up_sends_the_stored_state_and_summary_of_the_answer_it_replies_to(service, memory_on):
+    owner = _owner()
+    _row(owner, FIRST_A, question=FIRST_Q, summary="The person studies interviews.", path_pairs=1)
+    service.body = tool_reply(v2_result(state=STATE))
+    outcome, _events, _request = _mem_turn("and last month?", history=[("user", FIRST_Q), ("assistant", FIRST_A)],
+                                           owner=owner)
+    arguments = _arguments(service)
+    assert arguments["state"] == STATE and arguments["gap"] == 0
+    assert arguments["summary"] == "The person studies interviews."
+    assert arguments["recent_turns"] == [{"role": "user", "content": FIRST_Q}, {"role": "assistant", "content": FIRST_A}]
+    assert arguments["access_profile"] is None
+    memory = outcome.sf_memory
+    assert memory["parent_sha1"] == sf_isolation.answer_key(FIRST_A)
+    assert memory["path_pairs"] == 2 and memory["summary"] == "The person studies interviews."
+
+
+def test_the_window_is_the_newest_whole_pairs_within_the_pairs_and_tokens(service, memory_on, monkeypatch):
+    owner = _owner()
+    history = [("user", f"question {n}") if n % 2 == 0 else ("assistant", f"answer {n} " + "x" * 2500)
+               for n in range(16)]
+    _outcome, _events, _request = _mem_turn(QUESTION, history=history, owner=owner)
+    turns = _arguments(service)["recent_turns"]
+    assert len(turns) == 12, "six pairs, the contract's most"
+    assert turns[0] == {"role": "user", "content": "question 4"}
+    assert all(len(turn["content"]) <= 2000 for turn in turns)
+    monkeypatch.setattr(settings, "sf_assistant_memory_pairs", 2)
+    _mem_turn(QUESTION, history=history, owner=owner)
+    assert [" ".join(turn["content"].split()[:2]) for turn in _arguments(service)["recent_turns"]] == [
+        "question 12", "answer 13", "question 14", "answer 15"]
+    # A budget that holds three pairs and a half sends three whole pairs, never half of one.
+    monkeypatch.setattr(settings, "sf_assistant_memory_pairs", 6)
+    monkeypatch.setattr(settings, "sf_assistant_memory_tokens", 2100)
+    _mem_turn(QUESTION, history=history, owner=owner)
+    assert [turn["role"] for turn in _arguments(service)["recent_turns"]] == ["user", "assistant"] * 3
+    # Below that, never fewer turns than the v1 call sends (review F1): its whole pairs.
+    monkeypatch.setattr(settings, "sf_assistant_memory_tokens", 800)
+    _outcome, _events, request = _mem_turn(QUESTION, history=history, owner=owner)
+    assert _arguments(service)["recent_turns"] == sfk_bridge._recent_turns(request)
+    assert [turn["role"] for turn in _arguments(service)["recent_turns"]] == ["user", "assistant"] * 2
+
+
+#: A path whose newest question was never answered (a send that failed or was
+#: stopped before any text): two user turns in a row reach the bridge.
+UNANSWERED = [("user", "how many interviews were there in October 2026?"),
+              ("assistant", "There were 9 interviews in October 2026."),
+              ("user", "how many placements were there in October 2026?")]
+
+
+@pytest.mark.parametrize("history", [UNANSWERED, UNANSWERED[:1], [UNANSWERED[0], *UNANSWERED]],
+                         ids=["after an answer", "the first question", "twice before an answer"])
+def test_a_question_no_answer_followed_is_sent_as_the_v1_call_sends_it(service, memory_on, monkeypatch, history):
+    """Review F1: turning SF_ASSISTANT_MEMORY on changes nothing the service
+    reads in shadow or off (the last four turns), so an unanswered question
+    stays in the window."""
+    owner = _owner()
+    monkeypatch.setattr(settings, "sf_assistant_memory", False)
+    _outcome, _events, request = _mem_turn("and in November?", history=history, owner=owner)
+    v1 = _arguments(service)["recent_turns"]
+    assert v1 == sfk_bridge._recent_turns(request) and {"role": "user", "content": history[-1][1]} in v1
+    monkeypatch.setattr(settings, "sf_assistant_memory", True)
+    service.body = tool_reply(v2_result(state=None))
+    _mem_turn("and in November?", history=history, owner=owner)
+    v2 = _arguments(service)
+    assert v2["contract"] == 2 and v2["recent_turns"][-4:] == v1
+    assert v2["recent_turns"] == [{"role": role, "content": content} for role, content in history]
+
+
+def test_the_old_services_refusal_is_asked_again_once_with_the_v1_keys_then_v1_for_a_while(
+    service, memory_on, monkeypatch
+):
+    from app import metrics
+
+    owner = _owner()
+    service.speaks_v1_only = True
+    mismatch = (("event", "contract_mismatch"),)
+    before = metrics._counters.get("sf_memory_events_total", {}).get(mismatch, 0.0)
+    outcome, _events, request = _mem_turn(QUESTION, history=HISTORY, owner=owner)
+    assert outcome.handled is True and outcome.answer == ANSWER
+    assert len(service.calls) == 2
+    assert _arguments(service, 0)["contract"] == 2
+    assert _arguments(service, 1) == _v1_arguments(request, QUESTION)
+    assert outcome.sf_memory is None, "a v1 reply writes no row"
+    assert metrics._counters["sf_memory_events_total"][mismatch] == before + 1
+    # The next turn pays one call, with the v1 keys, and reads no row.
+    touched = _no_store(monkeypatch)
+    outcome, _events, request = _mem_turn(QUESTION, history=HISTORY, owner=owner)
+    assert len(service.calls) == 3 and _arguments(service) == _v1_arguments(request, QUESTION)
+    assert outcome.sf_memory is None and touched == []
+
+
+def test_ten_minutes_after_the_refusal_contract_2_is_tried_again(service, memory_on, monkeypatch):
+    owner = _owner()
+    monkeypatch.setattr(sfk_bridge, "_ask_v1_until", sfk_bridge.time.monotonic() - 1)
+    service.body = tool_reply(v2_result(state=STATE))
+    outcome, _events, _request = _mem_turn(QUESTION, owner=owner)
+    assert _arguments(service)["contract"] == 2 and outcome.sf_memory["state"] == STATE
+
+
+def test_during_the_hold_one_turn_a_minute_tries_contract_2_and_its_reply_ends_the_hold(
+    service, memory_on, monkeypatch
+):
+    """Review N2. The v2 service answers a v1 call as v1, with no `contract`,
+    so a held bridge learns nothing from its v1 calls: one turn a minute is
+    asked with contract v2 again, and its `contract: 2` ends the hold."""
+    owner = _owner()
+    service.speaks_v1_only = True
+    _mem_turn(QUESTION, history=HISTORY, owner=owner)
+    assert sfk_bridge._service_speaks_v1(), "the refusal started the hold"
+    # The service is fixed: v1 calls get v1 replies, v2 calls get v2 replies.
+    service.speaks_v1_only = False
+    service.v1_body = tool_reply(result_of())
+    service.body = tool_reply(v2_result(state=STATE))
+    outcome, _events, _request = _mem_turn(QUESTION, owner=owner)
+    assert "contract" not in _arguments(service) and outcome.sf_memory is None, "held: a v1 call"
+    assert sfk_bridge._service_speaks_v1(), "a v1 reply ends nothing"
+    monkeypatch.setattr(sfk_bridge, "_ask_v1_probe_at", sfk_bridge.time.monotonic() - 1)  # a minute later
+    outcome, _events, _request = _mem_turn(QUESTION, owner=owner)
+    assert _arguments(service)["contract"] == 2 and outcome.sf_memory["state"] == STATE, "the probe"
+    assert sfk_bridge._ask_v1_until == 0.0 and not sfk_bridge._service_speaks_v1()
+    _mem_turn(QUESTION, owner=owner)
+    assert _arguments(service)["contract"] == 2
+
+
+def test_a_probe_the_old_service_refuses_again_is_asked_with_v1_and_holds_anew(service, memory_on, monkeypatch):
+    owner = _owner()
+    service.speaks_v1_only = True
+    now = sfk_bridge.time.monotonic()
+    monkeypatch.setattr(sfk_bridge, "_ask_v1_until", now + 30)
+    outcome, _events, request = _mem_turn(QUESTION, history=HISTORY, owner=owner)
+    assert len(service.calls) == 2 and _arguments(service, 0)["contract"] == 2
+    assert _arguments(service, 1) == _v1_arguments(request, QUESTION) and outcome.answer == ANSWER
+    assert sfk_bridge._ask_v1_until > now + 500 and sfk_bridge._ask_v1_probe_at > now + 50
+    _mem_turn(QUESTION, history=HISTORY, owner=owner)
+    assert len(service.calls) == 3 and _arguments(service) == _v1_arguments(request, QUESTION), "no second probe"
+
+
+@pytest.mark.parametrize("error", ["question must be a string", "contract must be 1 or 2", None])
+def test_any_other_refusal_is_not_asked_again(service, memory_on, error):
+    owner = _owner()
+    service.body = tool_reply(None, ok=False, is_error=True, error=error)
+    outcome, events, _request = _mem_turn(QUESTION, owner=owner)
+    assert len(service.calls) == 1
+    assert outcome is None, "no answer: the older route runs, as it always did"
+    assert [event for event, _data in events] == ["status"]
+    assert sfk_bridge._ask_v1_until == 0.0
+
+
+@pytest.mark.parametrize("stop_line", [None, NEW_CHAT_LINE], ids=["no stop line", "a chat holding a refused line"])
+@pytest.mark.parametrize("word", ["yes", "ok", "no", "sure"])
+def test_a_polite_word_that_answers_the_services_pending_question_reaches_the_service(
+    service, memory_on, stop_line, word
+):
+    """Both conversational rules step aside (design C37): the noted line on a
+    stop-line turn, and the decline to the older route."""
+    assert sf_intel.is_conversational(word)
+    owner = _owner()
+    _row(owner, CLARIFY_A, question=FIRST_Q, state=PENDING_STATE)
+    service.body = tool_reply(v2_result(state=STATE, reason="patch"))
+    outcome, _events, _request = _mem_turn(word, history=[("user", FIRST_Q), ("assistant", CLARIFY_A)],
+                                           owner=owner, stop_line=stop_line)
+    assert len(service.calls) == 1
+    assert _arguments(service)["state"] == PENDING_STATE and _arguments(service)["gap"] == 0
+    assert outcome.answer == ANSWER and outcome.sf_memory["state"] == STATE
+
+
+@pytest.mark.parametrize("stop_line", [None, NEW_CHAT_LINE], ids=["no stop line", "a chat holding a refused line"])
+def test_without_a_pending_question_a_polite_word_goes_where_it_always_did(service, memory_on, stop_line):
+    owner = _owner()
+    _row(owner, FIRST_A, question=FIRST_Q, state=STATE)
+    outcome, _events, _request = _mem_turn("yes", history=[("user", FIRST_Q), ("assistant", FIRST_A)],
+                                           owner=owner, stop_line=stop_line)
+    assert service.calls == []
+    if stop_line:
+        assert outcome.answer == NOTED_LINE and outcome.sf_memory is None
+    else:
+        assert outcome is None
+
+
+@pytest.mark.parametrize(
+    "between",
+    [
+        pytest.param([("user", "thanks"), ("assistant", NOTED_LINE)], id="a transparent turn"),
+        pytest.param([("user", "who are the top recruiters?"), ("assistant", "An older-route answer.")],
+                     id="an answer with no row"),
+    ],
+)
+def test_a_pending_question_with_any_turn_after_it_is_over(service, memory_on, between):
+    owner = _owner()
+    _row(owner, CLARIFY_A, question=FIRST_Q, state=PENDING_STATE)
+    outcome, _events, _request = _mem_turn("yes", history=[("user", FIRST_Q), ("assistant", CLARIFY_A), *between],
+                                           owner=owner, stop_line=NEW_CHAT_LINE)
+    assert service.calls == [] and outcome.answer == NOTED_LINE
+
+
+def test_the_retry_lines_copy_of_a_pending_state_is_no_question_to_answer(service, memory_on):
+    owner = _owner()
+    _row(owner, RETRY_LINE, parent=CLARIFY_A, question="2", state=PENDING_STATE)
+    _row(owner, CLARIFY_A, question=FIRST_Q, state=PENDING_STATE)
+    history = [("user", FIRST_Q), ("assistant", CLARIFY_A), ("user", "2"), ("assistant", RETRY_LINE)]
+    outcome, _events, _request = _mem_turn("yes", history=history, owner=owner, stop_line=NEW_CHAT_LINE)
+    assert service.calls == [] and outcome.answer == NOTED_LINE
+
+
+@pytest.mark.parametrize("stop_line", [None, NEW_CHAT_LINE], ids=["no stop line", "a chat holding a refused line"])
+def test_a_pending_reply_to_a_service_that_speaks_v1_is_handled_as_before(service, memory_on, stop_line):
+    owner = _owner()
+    _row(owner, CLARIFY_A, question=FIRST_Q, state=PENDING_STATE)
+    service.speaks_v1_only = True
+    outcome, _events, _request = _mem_turn("yes", history=[("user", FIRST_Q), ("assistant", CLARIFY_A)],
+                                           owner=owner, stop_line=stop_line)
+    assert len(service.calls) == 1, "no v1 call: a v1 service has no pending question"
+    if stop_line:
+        assert outcome.answer == NOTED_LINE
+    else:
+        assert outcome is None
+
+
+@pytest.mark.parametrize("stop_line", [None, NEW_CHAT_LINE], ids=["no stop line", "a chat holding a refused line"])
+@pytest.mark.parametrize("reply", ["2", "Client interviews"])
+def test_a_pending_reply_that_is_no_polite_word_is_asked_again_with_the_v1_keys(service, memory_on, stop_line, reply):
+    """Review F2: only a polite word is let through by the pending exception;
+    a "2" or a choice's label reaches the service with memory off too, so a
+    v1 service's refusal of the v2 call is followed by today's v1 call."""
+    assert not sf_intel.is_conversational(reply)
+    owner = _owner()
+    _row(owner, CLARIFY_A, question=FIRST_Q, state=PENDING_STATE)
+    service.speaks_v1_only = True
+    outcome, _events, request = _mem_turn(reply, history=[("user", FIRST_Q), ("assistant", CLARIFY_A)],
+                                          owner=owner, stop_line=stop_line)
+    assert len(service.calls) == 2 and _arguments(service, 0)["contract"] == 2
+    assert _arguments(service, 1) == _v1_arguments(request, reply)
+    assert outcome.answer == ANSWER and outcome.sf_memory is None
+    assert sfk_bridge._service_speaks_v1()
+
+
+def test_the_older_routes_open_card_still_wins_over_a_pending_reply(service, memory_on, monkeypatch):
+    owner = _owner()
+    _row(owner, CLARIFY_A, question=FIRST_Q, state=PENDING_STATE)
+
+    async def open_card(_conv_key):
+        return {"question": "an older card"}
+
+    monkeypatch.setattr(sf_state, "get_pending", open_card)
+    outcome, _events, _request = _mem_turn("yes", history=[("user", FIRST_Q), ("assistant", CLARIFY_A)], owner=owner)
+    assert service.calls == [] and outcome is None
+
+
+@pytest.mark.parametrize(("status", "line", "reason"),
+                         [("unclear", UNCLEAR_LINE, "unclear_rewrite"), ("refused", REFUSED_LINE, "refused")])
+def test_a_fixed_line_keeps_the_replys_state_for_memory_and_nothing_new_in_meta(
+    service, memory_on, status, line, reason
+):
+    """Design C2: the bridge empties `result` for a fixed line; what memory needs
+    is read before that, and meta is built from the emptied result as before."""
+    owner = _owner()
+    _row(owner, FIRST_A, question=FIRST_Q, state=STATE)
+    service.body = tool_reply(v2_result(status, "", state=STATE, reason=reason, kind="records"))
+    outcome, events, _request = _mem_turn("what about them?", history=[("user", FIRST_Q), ("assistant", FIRST_A)],
+                                          owner=owner)
+    assert outcome.answer == line
+    assert _meta_of(events) == {"route": "sql", "engine": "sf_assistant"}
+    memory = outcome.sf_memory
+    assert memory["state"] == STATE and memory["plan_line"] == PLAN_LINE
+    assert memory["reason"] == reason and memory["kind"] == "records"
+
+
+def test_a_clarifying_answer_keeps_its_text_as_the_clarify_of_its_pair(service, memory_on):
+    owner = _owner()
+    service.body = tool_reply(v2_result("answered", CLARIFY_A, state=PENDING_STATE, reason="clarify", kind="none"))
+    outcome, _events, _request = _mem_turn(FIRST_Q, owner=owner)
+    assert outcome.answer == CLARIFY_A, "the clarifying text goes out exactly as the service wrote it"
+    assert outcome.sf_memory["clarify"] == CLARIFY_A and outcome.sf_memory["kind"] == "none"
+
+
+@pytest.mark.parametrize("status", ["failed", "busy", "timeout", "no_answer"])
+def test_the_retry_line_carries_the_plan_of_the_answer_it_follows(service, memory_on, status):
+    owner = _owner()
+    _row(owner, FIRST_A, question=FIRST_Q, state=STATE, plan_line=PLAN_LINE)
+    service.body = tool_reply(v2_result(status, "", state=None, reason=status))
+    outcome, _events, _request = _mem_turn("and last month?", history=[("user", FIRST_Q), ("assistant", FIRST_A)],
+                                           owner=owner, stop_line=NEW_CHAT_LINE)
+    assert outcome.answer == RETRY_LINE
+    memory = outcome.sf_memory
+    assert memory["state"] == STATE and memory["plan_line"] == PLAN_LINE and memory["contract"] == 2
+    assert memory["reason"] == "" and memory["parent_sha1"] == sf_isolation.answer_key(FIRST_A)
+    # With no stop line there is no answer here: the older route runs, and no row.
+    outcome, _events, _request = _mem_turn("and last month?", history=[("user", FIRST_Q), ("assistant", FIRST_A)],
+                                           owner=owner)
+    assert outcome is None
+
+
+def test_the_retry_line_copies_no_plan_from_an_earlier_answer(service, memory_on):
+    owner = _owner()
+    _row(owner, FIRST_A, question=FIRST_Q, state=STATE)
+    service.body = tool_reply(v2_result("busy", "", state=None, reason="busy"))
+    history = [("user", FIRST_Q), ("assistant", FIRST_A), ("user", "who are the top recruiters?"),
+               ("assistant", "An older-route answer.")]
+    outcome, _events, _request = _mem_turn("and last month?", history=history, owner=owner, stop_line=NEW_CHAT_LINE)
+    assert _arguments(service)["gap"] == 1
+    assert outcome.answer == RETRY_LINE and outcome.sf_memory is None
+
+
+def test_a_read_that_fails_asks_exactly_as_v1_for_this_turn(service, memory_on, monkeypatch):
+    owner = _owner()
+
+    def fails(*_a, **_k):
+        raise sf_memory_store.StoreError("lookup", "sqlstate 57P01")
+
+    monkeypatch.setattr(sf_memory_store, "fetch_candidates", fails)
+    service.body = tool_reply(v2_result(state=STATE))
+    outcome, _events, request = _mem_turn(QUESTION, history=HISTORY, owner=owner)
+    assert _arguments(service) == _v1_arguments(request, QUESTION)
+    assert outcome.answer == ANSWER and outcome.sf_memory is None
+
+
+@pytest.mark.parametrize("failure", ["store", "bug"])
+def test_a_read_that_fails_leaves_the_trace_outcome_error_and_counts_once(
+    service, memory_on, monkeypatch, caplog, failure
+):
+    """Review N1 (design §13): the trace of the turn tells "the read failed,
+    asked as v1" from "memory off", with codes only."""
+    from app import metrics
+
+    owner = _owner()
+
+    def fails(*_a, **_k):
+        raise sf_memory_store.StoreError("lookup", "sqlstate 57P01")
+
+    async def broken(*_a, **_k):
+        raise RuntimeError("a bug quoting a06000000000099AAA")
+
+    if failure == "store":
+        monkeypatch.setattr(sf_memory_store, "fetch_candidates", fails)
+    else:
+        monkeypatch.setattr(sf_memory, "lookup", broken)
+    events: list = []
+
+    async def event(stage, **kwargs):
+        events.append((stage, kwargs))
+
+    error = (("event", "lookup_error"),)
+    before = metrics._counters.get("sf_memory_events_total", {}).get(error, 0.0)
+    request = ChatRequest(messages=[{"role": "user", "content": QUESTION}], mode="salesforce",
+                          conversation_id=MEM_CHAT)
+
+    async def emit(_event, _data):
+        return None
+
+    caplog.set_level(logging.DEBUG)
+    outcome = asyncio.run(sfk_bridge.try_answer(
+        QUESTION, emit=emit, request=request, query_trace=SimpleNamespace(request_id="req-1", event=event),
+        principal=owner, conv_key=MEM_CHAT, mode_sent=True, stop_line=None))
+    assert outcome.answer == ANSWER and "contract" not in _arguments(service)
+    assert events == [("SF_MEMORY", {"component": "orchestrator.app.sf_memory", "details": {"outcome": "error"}})]
+    assert metrics._counters["sf_memory_events_total"][error] == before + 1
+    assert "a06000000000099AAA" not in caplog.text
+    # With memory off the turn leaves no memory event at all.
+    monkeypatch.setattr(settings, "sf_assistant_memory", False)
+    events.clear()
+    asyncio.run(sfk_bridge.try_answer(
+        QUESTION, emit=emit, request=request, query_trace=SimpleNamespace(request_id="req-1", event=event),
+        principal=owner, conv_key=MEM_CHAT, mode_sent=True, stop_line=None))
+    assert events == []
+
+
+def test_a_memory_step_that_breaks_never_costs_the_answer(service, memory_on, monkeypatch):
+    owner = _owner()
+    _row(owner, FIRST_A, question=FIRST_Q, state=STATE)
+    history = [("user", FIRST_Q), ("assistant", FIRST_A)]
+
+    async def broken_lookup(*_a, **_k):
+        raise RuntimeError("a bug")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sf_memory, "lookup", broken_lookup)
+        outcome, _events, request = _mem_turn(QUESTION, history=history, owner=owner)
+    assert _arguments(service) == _v1_arguments(request, QUESTION)
+    assert outcome.answer == ANSWER and outcome.sf_memory is None
+
+    def broken(*_a, **_k):
+        raise RuntimeError("a bug")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sf_memory.Memory, "record", broken)
+        service.body = tool_reply(v2_result(state=STATE))
+        outcome, _events, _request = _mem_turn(QUESTION, history=history, owner=owner)
+    assert _arguments(service)["contract"] == 2
+    assert outcome.answer == ANSWER and outcome.sf_memory is None
+    # A pending reply whose v2 call cannot be built goes where the rule always sent it.
+    _row(owner, CLARIFY_A, question=FIRST_Q, state=PENDING_STATE)
+    with monkeypatch.context() as patch:
+        patch.setattr(sf_memory.Memory, "arguments", broken)
+        calls = len(service.calls)
+        outcome, _events, _request = _mem_turn("yes", history=[("user", FIRST_Q), ("assistant", CLARIFY_A)],
+                                               owner=owner, stop_line=NEW_CHAT_LINE)
+        assert len(service.calls) == calls and outcome.answer == NOTED_LINE
+        # Review F2: the rule always sent a "2" to the service, so it gets the v1 call.
+        service.body = tool_reply(result_of())
+        outcome, _events, request = _mem_turn("2", history=[("user", FIRST_Q), ("assistant", CLARIFY_A)],
+                                              owner=owner, stop_line=NEW_CHAT_LINE)
+    assert len(service.calls) == calls + 1 and _arguments(service) == _v1_arguments(request, "2")
+    assert outcome.answer == ANSWER and outcome.sf_memory is None
+
+
+def test_a_reply_with_no_contract_writes_no_memory(service, memory_on):
+    owner = _owner()
+    service.body = tool_reply(result_of())
+    outcome, _events, _request = _mem_turn(QUESTION, owner=owner)
+    assert _arguments(service)["contract"] == 2
+    assert outcome.answer == ANSWER and outcome.sf_memory is None
+
+
+def test_an_asker_the_bridge_cannot_name_gets_the_v1_call(service, memory_on):
+    _owner()
+    outcome, _events, request = _mem_turn(QUESTION, history=HISTORY, owner=ADMIN)
+    assert _arguments(service) == _v1_arguments(request, QUESTION) and outcome.sf_memory is None
+
+
+def test_a_declined_turn_reads_no_memory(service, memory_on, monkeypatch):
+    owner = _owner()
+    touched = _no_store(monkeypatch)
+    monkeypatch.setattr(sfk_bridge, "_ask_no_token_logged", True)
+    monkeypatch.setattr(settings, "sf_assistant_token", "")
+    outcome, _events, _request = _mem_turn(QUESTION, history=HISTORY, owner=owner)
+    assert outcome is None and service.calls == [] and touched == []
+
+
+def _stored_rows(conversation_id: str) -> list:
+    with db.connection() as con:
+        return con.execute(
+            "SELECT * FROM sf_query_state WHERE conversation_id = %s ORDER BY id", (conversation_id,)).fetchall()
+
+
+def test_through_chat_each_answer_writes_its_row_and_the_next_turn_reads_it(service, admin, older_route, memory_on):
+    service.body = tool_reply(v2_result(state=STATE))
+    with TestClient(app) as client:
+        resp = client.post("/chat", json=_body("mem-chat"))
+        assert _answers_in(resp.text) == [ANSWER]
+        rows = _stored_rows("mem-chat")
+        assert len(rows) == 1
+        first = rows[0]
+        assert first["user_id"] == admin["id"] and first["contract"] == 2 and first["state"] == STATE
+        assert first["answer_sha1"] == sf_isolation.answer_key(ANSWER)
+        assert first["parent_sha1"] == "" and first["question_sha1"] == sf_isolation.answer_key(QUESTION)
+        assert first["plan_line"] == PLAN_LINE and first["path_pairs"] == 1
+        stored = app_main._persisted_answer("mem-chat", first["generation_id"])
+        assert stored["content"] == ANSWER
+        assert not {"state", "plan_line", "contract", "reason"} & set(stored["meta"])
+        follow = "and last month?"
+        client.post("/chat", json={"messages": [{"role": "user", "content": QUESTION},
+                                                {"role": "assistant", "content": ANSWER},
+                                                {"role": "user", "content": follow}],
+                                   "mode": "salesforce", "conversation_id": "mem-chat"})
+    assert _arguments(service)["state"] == STATE and _arguments(service)["gap"] == 0
+    rows = _stored_rows("mem-chat")
+    assert len(rows) == 2
+    assert rows[1]["parent_sha1"] == sf_isolation.answer_key(ANSWER)
+    assert rows[1]["question_sha1"] == sf_isolation.answer_key(follow)
+    assert rows[1]["path_pairs"] == 2
+    assert older_route == []
+
+
+def test_an_answer_that_was_not_stored_writes_no_row(service, admin, older_route, memory_on, monkeypatch):
+    async def not_stored(gen):
+        return None
+
+    monkeypatch.setattr(app_main, "_store_answer", not_stored)
+    service.body = tool_reply(v2_result(state=STATE))
+    with TestClient(app) as client:
+        client.post("/chat", json=_body("mem-unstored"))
+    assert len(service.calls) == 1 and _stored_rows("mem-unstored") == []
+
+
+@pytest.mark.parametrize("status", ["failed", "busy"])
+def test_an_older_route_answer_writes_no_row(service, admin, older_route, memory_on, status):
+    service.body = tool_reply(v2_result(status, "", state=None, reason=status))
+    with TestClient(app) as client:
+        client.post("/chat", json=_body("mem-fallback"))
+    assert older_route == [QUESTION] and _stored_rows("mem-fallback") == []
+
+
+def test_stop_during_the_wait_writes_no_row(service, admin, older_route, memory_on):
+    service.delay = 30.0
+    service.body = tool_reply(v2_result(state=STATE))
+
+    async def scenario():
+        async with _async_client() as client:
+            first = asyncio.create_task(client.post("/chat", json=_body("mem-stop")))
+            await _wait_until(lambda: bool(service.calls))
+            await client.post("/chat/stop", json={"conversation_id": "mem-stop"})
+            return await first
+
+    asyncio.run(scenario())
+    assert service.hung_up.wait(5)
+    assert _stored_rows("mem-stop") == []
+
+
+def test_with_memory_off_a_chat_turn_reads_and_writes_nothing(service, admin, older_route, monkeypatch):
+    touched = _no_store(monkeypatch)
+    service.body = tool_reply(v2_result(state=STATE))
+    messages = [{"role": role, "content": content} for role, content in HISTORY]
+    with TestClient(app) as client:
+        client.post("/chat", json={"messages": [*messages, {"role": "user", "content": QUESTION}],
+                                   "mode": "salesforce", "conversation_id": "mem-off"})
+    arguments = _arguments(service)
+    assert set(arguments) == {"question", "recent_turns", "request_id"}
+    assert arguments["recent_turns"] == [{"role": role, "content": content} for role, content in HISTORY[-4:]]
+    assert touched == []
+    assert _stored_rows("mem-off") == []
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,431 @@
+{
+ "title": "The placement chains A and B (design v2 §16.1 P-A, P-B)",
+ "chains": [
+  {
+   "id": "P-A",
+   "title": "The placement rate monthwise, then plot this placement rate",
+   "design": "map_sfa §8 placement chain A; the placement definition (a client interview with the outcome Offer Received); design v2 §16.1 P-A",
+   "steps": [
+    {
+     "q": "placement rate monthwise from January to October 2026",
+     "record": [
+      {
+       "name": "trend_records",
+       "args": {
+        "object": "Interview__c",
+        "grain": "month",
+        "date_field": "Date_of_Interview__c",
+        "period": "2026-01-01 to 2026-10-31",
+        "part_filters": [
+         {
+          "field": "Interview_Outcome__c",
+          "op": "eq",
+          "value": "Offer Received"
+         }
+        ]
+       }
+      },
+      "The placement rate per month is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "contracts": [
+       "placement"
+      ],
+      "ran": [
+       {
+        "tool": "trend_records",
+        "args": {
+         "object": "Interview__c",
+         "grain": "month",
+         "date_field": "Date_of_Interview__c",
+         "period": "2026-01-01 to 2026-10-31",
+         "part_filters": [
+          {
+           "field": "Interview_Outcome__c",
+           "op": "eq",
+           "value": "Offer Received"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "trend_records",
+         "args": {
+          "object": "Interview__c",
+          "grain": "month",
+          "date_field": "Date_of_Interview__c",
+          "period": "2026-01-01 to 2026-10-31",
+          "part_filters": [
+           {
+            "field": "Interview_Outcome__c",
+            "op": "eq",
+            "value": "Offer Received"
+           }
+          ]
+         }
+        }
+       ],
+       "keys": [
+        "placement"
+       ]
+      }
+     }
+    },
+    {
+     "q": "plot this placement rate",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "plot the placement rate monthwise from January to October 2026",
+      "ops": [
+       {
+        "set_show": {
+         "chart": true
+        }
+       }
+      ]
+     },
+     "rewrite": "plot the placement rate monthwise from January to October 2026",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "kind": "records",
+      "model": true,
+      "contracts": [
+       "placement"
+      ],
+      "ran": [
+       {
+        "tool": "trend_records",
+        "args": {
+         "object": "Interview__c",
+         "grain": "month",
+         "date_field": "Date_of_Interview__c",
+         "period": "2026-01-01 to 2026-10-31",
+         "part_filters": [
+          {
+           "field": "Interview_Outcome__c",
+           "op": "eq",
+           "value": "Offer Received"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "trend_records",
+         "args": {
+          "object": "Interview__c",
+          "grain": "month",
+          "date_field": "Date_of_Interview__c",
+          "period": "2026-01-01 to 2026-10-31",
+          "part_filters": [
+           {
+            "field": "Interview_Outcome__c",
+            "op": "eq",
+            "value": "Offer Received"
+           }
+          ]
+         }
+        }
+       ],
+       "show_chart": true,
+       "keys": [
+        "placement"
+       ]
+      },
+      "charts": 1
+     }
+    }
+   ]
+  },
+  {
+   "id": "P-B",
+   "title": "Placements each month, plot it, and the placement rate, same for 2025",
+   "design": "map_sfa §8 placement chain B; design v2 §6.5 (a new question about the same records), §16.1 P-B",
+   "steps": [
+    {
+     "q": "placements each month in 2026",
+     "record": [
+      {
+       "name": "trend_records",
+       "args": {
+        "object": "Interview__c",
+        "grain": "month",
+        "date_field": "Date_of_Interview__c",
+        "period": "2026",
+        "filters": [
+         {
+          "field": "Interview_Outcome__c",
+          "op": "eq",
+          "value": "Offer Received"
+         }
+        ]
+       }
+      },
+      "The placements per month are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "contracts": [
+       "placement"
+      ],
+      "ran": [
+       {
+        "tool": "trend_records",
+        "args": {
+         "object": "Interview__c",
+         "grain": "month",
+         "date_field": "Date_of_Interview__c",
+         "period": "2026",
+         "filters": [
+          {
+           "field": "Interview_Outcome__c",
+           "op": "eq",
+           "value": "Offer Received"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "trend_records",
+         "args": {
+          "object": "Interview__c",
+          "grain": "month",
+          "date_field": "Date_of_Interview__c",
+          "period": "2026",
+          "filters": [
+           {
+            "field": "Interview_Outcome__c",
+            "op": "eq",
+            "value": "Offer Received"
+           }
+          ]
+         }
+        }
+       ],
+       "keys": [
+        "placement"
+       ],
+       "period": {
+        "from": "2026-01-01",
+        "to": "2026-10-31"
+       }
+      }
+     }
+    },
+    {
+     "q": "plot it",
+     "rewrite": "plot placements each month in 2026",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "contracts": [
+       "placement"
+      ],
+      "ran": [
+       {
+        "tool": "trend_records",
+        "args": {
+         "object": "Interview__c",
+         "grain": "month",
+         "date_field": "Date_of_Interview__c",
+         "period": "2026",
+         "filters": [
+          {
+           "field": "Interview_Outcome__c",
+           "op": "eq",
+           "value": "Offer Received"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "show_chart": true
+      },
+      "charts": 1
+     }
+    },
+    {
+     "q": "and the placement rate?",
+     "note": "known gap (stage2_build_S4.md): after an answer whose Read-as line is the code-written plan line, the v6 reading of the model's new question finds two periods in that line ('2026' and its dates) and refuses 'in 2026' as period_lost, so the resolver asks; the design intent is in known_gaps.json",
+     "resolve": {
+      "kind": "new",
+      "standalone": "What is the placement rate each month in 2026?",
+      "ops": []
+     },
+     "rewrite": "What is the placement rate each month in 2026?",
+     "expect": {
+      "status": "answered",
+      "kind": "none",
+      "reason": "clarify",
+      "model": true,
+      "record": false,
+      "ran_none": true,
+      "detail": "rewrite_period_lost",
+      "pending": null,
+      "answer": "I could not tell how this goes on from the last query (number of Interviews by month, where Interview Outcome = 'Offer Received', 2026 (2026-01-01 to 2026-10-31), as a chart). Please ask the full question.",
+      "plan": {
+       "calls": [
+        {
+         "tool": "trend_records",
+         "args": {
+          "object": "Interview__c",
+          "grain": "month",
+          "date_field": "Date_of_Interview__c",
+          "period": "2026",
+          "filters": [
+           {
+            "field": "Interview_Outcome__c",
+            "op": "eq",
+            "value": "Offer Received"
+           }
+          ]
+         }
+        }
+       ],
+       "show_chart": true,
+       "age": 0
+      }
+     }
+    },
+    {
+     "q": "What is the placement rate each month in 2026?",
+     "note": "the person asks in full: a complete question with a usable plan goes to the model (C11), which gives it back as typed",
+     "resolve": {
+      "kind": "new",
+      "standalone": "What is the placement rate each month in 2026?",
+      "ops": []
+     },
+     "record": [
+      {
+       "name": "trend_records",
+       "args": {
+        "object": "Interview__c",
+        "grain": "month",
+        "date_field": "Date_of_Interview__c",
+        "period": "2026",
+        "part_filters": [
+         {
+          "field": "Interview_Outcome__c",
+          "op": "eq",
+          "value": "Offer Received"
+         }
+        ]
+       }
+      },
+      "The placement rate per month is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "model": true,
+      "contracts": [
+       "placement"
+      ],
+      "ran": [
+       {
+        "tool": "trend_records",
+        "args": {
+         "object": "Interview__c",
+         "grain": "month",
+         "date_field": "Date_of_Interview__c",
+         "period": "2026",
+         "part_filters": [
+          {
+           "field": "Interview_Outcome__c",
+           "op": "eq",
+           "value": "Offer Received"
+          }
+         ]
+        }
+       }
+      ],
+      "read_as": null,
+      "plan": {
+       "calls": [
+        {
+         "tool": "trend_records",
+         "args": {
+          "object": "Interview__c",
+          "grain": "month",
+          "date_field": "Date_of_Interview__c",
+          "period": "2026",
+          "part_filters": [
+           {
+            "field": "Interview_Outcome__c",
+            "op": "eq",
+            "value": "Offer Received"
+           }
+          ]
+         }
+        }
+       ],
+       "keys": [
+        "placement"
+       ],
+       "terms_text": "What is the placement rate each month in 2026?"
+      }
+     }
+    },
+    {
+     "q": "same for 2025",
+     "rewrite": "What is the placement rate each month in 2025?",
+     "record": [
+      "2025 is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "contracts": [
+       "placement"
+      ],
+      "ran": [
+       {
+        "tool": "trend_records",
+        "args": {
+         "object": "Interview__c",
+         "grain": "month",
+         "date_field": "Date_of_Interview__c",
+         "period": "2025",
+         "part_filters": [
+          {
+           "field": "Interview_Outcome__c",
+           "op": "eq",
+           "value": "Offer Received"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "period": {
+        "from": "2025-01-01",
+        "to": "2025-12-31"
+       },
+       "keys": [
+        "placement"
+       ]
+      },
+      "plan_line_has": [
+       "2025"
+      ]
+     }
+    }
+   ]
+  }
+ ]
+}

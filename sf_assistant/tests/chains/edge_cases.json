@@ -1,0 +1,806 @@
+{
+ "title": "Gaps, ages, months, call caps and data changes (design v2 §16.1 K01, G01, N01, M01, X01, R01, V01)",
+ "chains": [
+  {
+   "id": "K01",
+   "title": "A knowledge-only answer mid-chain: the next visualize it confirms first, and yes runs it",
+   "design": "design v2 §6.5 age rule (C4, D13), §9 (knowledge only: the parent plan one answer older), §16.1 K01",
+   "steps": [
+    {
+     "q": "how many interviews by status this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Status__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews by status are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "age": 0
+      }
+     }
+    },
+    {
+     "q": "what does the interview status field mean?",
+     "route": [
+      "NO_RECORDS"
+     ],
+     "resolve": {
+      "kind": "new",
+      "standalone": "what does the interview status field mean?",
+      "ops": []
+     },
+     "expect": {
+      "status": "answered",
+      "kind": "knowledge",
+      "reason": "knowledge",
+      "model": true,
+      "record": false,
+      "ran_none": true,
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Interview_Status__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "age": 1
+      },
+      "answer_has": [
+       "No record data was used"
+      ]
+     }
+    },
+    {
+     "q": "visualize it",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "set_show": {
+         "chart": true
+        }
+       }
+      ]
+     },
+     "note": "no shortcut on a plan one answer old: the model's patch confirms first",
+     "expect": {
+      "reason": "clarify",
+      "kind": "none",
+      "model": true,
+      "record": false,
+      "ran_none": true,
+      "detail": "confirm_age",
+      "clarify": true,
+      "answer": "Do you mean: number of Interviews per Interview Status, this year (2026-01-01 to 2026-12-31), as a chart?\n\n1. Yes\n2. No, I'll ask in full",
+      "pending": [
+       "Yes",
+       "No, I'll ask in full"
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Interview_Status__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "age": 1
+      }
+     }
+    },
+    {
+     "q": "1",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Interview_Status__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "age": 0,
+       "show_chart": true
+      },
+      "charts": 1,
+      "pending": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "G01",
+   "title": "A fallback answer mid-chain is a gap: visualize it confirms, never runs silently",
+   "design": "design v2 §6.5 gap rule (D10), §3.1 walk-back with a gap, §16.1 G01",
+   "steps": [
+    {
+     "q": "how many interviews per recruiter this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "age": 0
+      }
+     }
+    },
+    {
+     "q": "who is the manager of Echo One?",
+     "bridge": "fallback",
+     "answer": "The older route answered this question.",
+     "note": "the older route answered: no row, so the next lookup walks back to the last row with gap 1"
+    },
+    {
+     "q": "visualize it",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "set_show": {
+         "chart": true
+        }
+       }
+      ]
+     },
+     "expect": {
+      "reason": "clarify",
+      "kind": "none",
+      "model": true,
+      "record": false,
+      "ran_none": true,
+      "detail": "confirm_gap",
+      "sent_gap": 1,
+      "clarify": true,
+      "answer": "Do you mean: number of Interviews per Recruiter, this year (2026-01-01 to 2026-12-31), as a chart?\n\n1. Yes\n2. No, I'll ask in full",
+      "pending": [
+       "Yes",
+       "No, I'll ask in full"
+      ]
+     }
+    },
+    {
+     "q": "yes",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "sent_gap": 0,
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "show_chart": true,
+       "age": 0
+      },
+      "charts": 1
+     }
+    }
+   ]
+  },
+  {
+   "id": "N01",
+   "title": "Thanks mid-chain, and a turn the bridge answered itself, are no gap: visualize it is a shortcut",
+   "design": "design v2 §0.2 transparent turns (C3), §9 small talk keeps the plan, §16.1 N01",
+   "steps": [
+    {
+     "q": "how many interviews per recruiter this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "age": 0
+      }
+     }
+    },
+    {
+     "q": "thanks",
+     "expect": {
+      "reason": "small_talk",
+      "kind": "none",
+      "model": false,
+      "record": false,
+      "ran_none": true,
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "age": 0
+      },
+      "pending": null
+     }
+    },
+    {
+     "q": "hello",
+     "bridge": "transparent",
+     "answer": "Hello! Ask me a question about the Salesforce records.",
+     "note": "the bridge's own conversational reply: stepped over, no gap"
+    },
+    {
+     "q": "visualize it",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "sent_gap": 0,
+      "sent_turns": 6,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "show_chart": true
+      },
+      "charts": 1
+     }
+    }
+   ]
+  },
+  {
+   "id": "M01",
+   "title": "A chat that crosses a month keeps the stored dates of this month, and a typed period is today's",
+   "design": "design v2 §7.4 periods (D1: the stored dates kept, with a note), §16.1 M01",
+   "worlds": {
+    "september": {
+     "today": "2026-09-20"
+    }
+   },
+   "steps": [
+    {
+     "q": "how many interviews by status this month",
+     "world": "september",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Status__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this month"
+       }
+      },
+      "The interviews by status are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this month"
+        }
+       }
+      ],
+      "plan": {
+       "period": {
+        "phrase": "this month",
+        "from": "2026-09-01",
+        "to": "2026-09-30"
+       }
+      }
+     }
+    },
+    {
+     "q": "visualize it",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "note": "the next answer is asked on 2026-10-13: 'this month' now means October, the stored dates are kept",
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "2026-09-01 to 2026-09-30"
+        }
+       }
+      ],
+      "answer_has": [
+       "The dates of the earlier answer are kept: 2026-09-01 to 2026-09-30."
+      ],
+      "plan": {
+       "period": {
+        "from": "2026-09-01",
+        "to": "2026-09-30"
+       },
+       "show_chart": true
+      }
+     }
+    },
+    {
+     "q": "same for this month",
+     "record": [
+      "This month is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this month"
+        }
+       }
+      ],
+      "plan": {
+       "period": {
+        "phrase": "this month",
+        "from": "2026-10-01",
+        "to": "2026-10-31"
+       }
+      },
+      "answer_not": [
+       "The dates of the earlier answer are kept"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "X01",
+   "title": "An answer that ran more than 3 queries stores no plan; the next follow-up reads text only",
+   "design": "design v2 §7.3 / §8 (D2: more than 3 calls, plan null), §16.1 X01",
+   "steps": [
+    {
+     "q": "how many interviews this year by status, by recruiter, by region and by outcome",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Status__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Region__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Outcome__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "Four breakdowns are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "kind": "merged",
+      "ran": [
+       {
+        "tool": "group_records"
+       },
+       {
+        "tool": "group_records"
+       },
+       {
+        "tool": "group_records"
+       },
+       {
+        "tool": "group_records"
+       }
+      ],
+      "plan": null
+     },
+     "v1": {
+      "record": [
+       {
+        "name": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       },
+       {
+        "name": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       },
+       {
+        "name": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Region__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       },
+       {
+        "name": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Outcome__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       },
+       "Four breakdowns are shown.\nSource: the synthetic warehouse copy."
+      ]
+     }
+    },
+    {
+     "q": "visualize it",
+     "resolve": {
+      "kind": "unclear",
+      "standalone": "",
+      "ops": []
+     },
+     "expect": {
+      "status": "unclear",
+      "reason": "unclear_rewrite",
+      "model": true,
+      "ran_none": true,
+      "plan": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "R01",
+   "title": "A field removed between two answers: the follow-up asks, naming the field",
+   "design": "design v2 §7.4 re-validation (my_answers B9), §14, §16.1 R01",
+   "worlds": {
+    "no_region": {
+     "drop_fields": [
+      "Interview__c.Region__c"
+     ]
+    }
+   },
+   "steps": [
+    {
+     "q": "how many interviews per region this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Region__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews per region are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Region__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        },
+        "result_has": {
+         "groups": [
+          {
+           "group": "North America",
+           "value": 4
+          },
+          {
+           "group": "Europe",
+           "value": 3
+          },
+          {
+           "group": "(blank)",
+           "value": 2
+          },
+          {
+           "group": "Asia Pacific",
+           "value": 1
+          }
+         ]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "q": "visualize it",
+     "world": "no_region",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "set_show": {
+         "chart": true
+        }
+       }
+      ]
+     },
+     "note": "the stored plan no longer passes re-validation: no shortcut; the model's patch is refused, naming the field",
+     "expect": {
+      "reason": "clarify",
+      "kind": "none",
+      "ran_none": true,
+      "record": false,
+      "model": true,
+      "detail": "field_removed",
+      "pending": null,
+      "answer": "The last query (number of Interviews per Region, this year (2026-01-01 to 2026-12-31)) uses Interview__c.Region__c, which is no longer in the data, so it cannot be changed. Please ask the full question.",
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Region__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ]
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "V01",
+   "title": "A filter value that stops matching: the unchanged re-run says so instead of a plain zero",
+   "design": "design v2 §7.4 values that stopped matching (C7, nonempty), §16.1 V01",
+   "worlds": {
+    "no_apac": {
+     "set": [
+      {
+       "table": "Interview__c",
+       "name": "I-0007",
+       "field": "Region__c",
+       "value": null
+      }
+     ]
+    }
+   },
+   "steps": [
+    {
+     "q": "how many interviews in Asia Pacific by status this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Status__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year",
+        "filters": [
+         {
+          "field": "Region__c",
+          "op": "eq",
+          "value": "Asia Pacific"
+         }
+        ]
+       }
+      },
+      "Shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "Asia Pacific"
+          }
+         ]
+        },
+        "result_has": {
+         "groups": [
+          {
+           "group": "Cancelled",
+           "value": 1
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "nonempty": true
+      }
+     }
+    },
+    {
+     "q": "visualize it",
+     "world": "no_apac",
+     "record": [
+      "Nothing to draw.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "Asia Pacific"
+          }
+         ]
+        }
+       }
+      ],
+      "answer_has": [
+       "No records match the earlier query (",
+       "now; the data may have changed since the earlier answer."
+      ],
+      "plan": {
+       "nonempty": false
+      }
+     }
+    }
+   ]
+  }
+ ]
+}

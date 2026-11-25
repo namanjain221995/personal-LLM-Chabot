@@ -324,6 +324,18 @@ def preload_package() -> list[str]:
     return sorted(names)
 
 
+@contextlib.contextmanager
+def _memory_run(memory: Any):
+    """``sf_assistant.pipeline.memory_run(memory)`` for a conversation-memory run; nothing (and no import) for None."""
+    if memory is None:
+        yield None
+        return
+    from sf_assistant.pipeline import memory_run
+
+    with memory_run(memory):
+        yield memory
+
+
 def file_identity(path: str) -> tuple | None:
     """``(device, inode, mtime_ns, size)`` of ``path``, None when it cannot be read."""
     try:
@@ -353,9 +365,11 @@ class Pipeline:
 
     def __init__(self, ask_mod: Any, cfg: Any, registry: Any, system: Any, llm: Any, rcfg: Any,
                  log: Callable[[dict], None] | None = None, max_rows: int = 20, objects: list[str] | None = None,
-                 knowledge_dir: str | None = None, remove_knowledge_dir: bool = False, resolver: Any = None) -> None:
+                 knowledge_dir: str | None = None, remove_knowledge_dir: bool = False, resolver: Any = None,
+                 memory: Any = None) -> None:
         self.ask_mod = ask_mod
         self.resolver = resolver                    # the spelling help settings (settings.resolver); None: the env
+        self.memory = memory                        # conversation memory (settings.memory); None: the page as before
         self.knowledge_dir = knowledge_dir          # the start-up copy every record session reads
         self._remove_knowledge_dir = remove_knowledge_dir
         self.cfg, self.registry, self.system, self.llm, self.rcfg = cfg, registry, system, llm, rcfg
@@ -425,7 +439,8 @@ class Pipeline:
                     event["spelling"] = spelling
                 log(event)
             return cls(ask_mod, cfg, registry, system, llm, rcfg, log=log, objects=objects,
-                       knowledge_dir=knowledge_dir, remove_knowledge_dir=True, resolver=settings.resolver)
+                       knowledge_dir=knowledge_dir, remove_knowledge_dir=True, resolver=settings.resolver,
+                       memory=settings.memory)
         except BaseException:
             shutil.rmtree(knowledge_dir, ignore_errors=True)
             raise
@@ -513,20 +528,23 @@ class Pipeline:
             shutil.rmtree(self.knowledge_dir, ignore_errors=True)
 
     # ---- one question
-    def _run(self, question: str, mode: str, context_objects: Any = ()) -> tuple[dict, str, Any]:
+    def _run(self, question: str, mode: str, context_objects: Any = (), memory: Any = None) -> tuple[dict, str, Any]:
         session = self.session if mode in ("merged", "records") else None
         self._n += 1
         extra = {"context_objects": tuple(context_objects)} if context_objects else {}   # fakes without it still work
-        with self._capture.capture() as buf:
+        with self._capture.capture() as buf, _memory_run(memory):
             row = self.ask_mod.ask(question, self.cfg, self.registry, self.system, self.llm, self._n, False, session,
                                    self.max_rows, records_only=mode == "records" and session is not None,
                                    records_wanted=mode != "knowledge", lean_knowledge=True, **extra)
         return row, buf.getvalue(), session
 
-    def answer(self, question: str, mode: str = "merged", context_objects: Any = ()) -> dict:
+    def answer(self, question: str, mode: str = "merged", context_objects: Any = (), memory: Any = None) -> dict:
         """Answer one question. Returns answer, kind, source_line, data_ts, trace (admin), log (web log) and, with a
         chart, charts. ``context_objects``: the objects the last answer named (prerequisite P2b; only the clarifying
-        question of a record step that got no data reads them)."""
+        question of a record step that got no data reads them). ``memory``: a ``sf_assistant.pipeline.MemoryRun`` (the
+        ask service's conversation memory): the question runs under it (``sf_assistant.pipeline.memory_run``, around
+        ``ask_mod.ask``), and it gets back what ran; None (the page, the ask service with ``SFA_MEMORY=off``): nothing
+        changes."""
         if mode not in MODES:
             raise ValueError(f"unknown mode {mode!r}")
         with self._run_lock:
@@ -546,7 +564,7 @@ class Pipeline:
             failed_reopen = None   # the reopen after a swap error that failed (no retry): {close_s, open_s, s}
             t_run = time.perf_counter()
             try:
-                row, stdout, session = self._run(question, mode, context_objects)
+                row, stdout, session = self._run(question, mode, context_objects, memory)
             except Exception:
                 swapped = self.session is not None and file_identity(self.rcfg.warehouse) != self.session_identity
                 if not swapped:
@@ -555,7 +573,7 @@ class Pipeline:
                 if not self._open_session("error during a file swap"):
                     raise
                 retry_s = round(time.perf_counter() - t_run, 2)
-                row, stdout, session = self._run(question, mode, context_objects)
+                row, stdout, session = self._run(question, mode, context_objects, memory)
                 retried = True
             if (not retried and session is not None and _swap_error(row)
                     and file_identity(self.rcfg.warehouse) != self.session_identity):
@@ -563,7 +581,7 @@ class Pipeline:
                 t_swap = time.perf_counter()
                 if self._open_session("query error during a file swap"):
                     retry_s = round(time.perf_counter() - t_run, 2)
-                    row, stdout, session = self._run(question, mode, context_objects)
+                    row, stdout, session = self._run(question, mode, context_objects, memory)
                     retried = True
                 else:
                     failed_reopen = {**(self._reopen or {}), "s": round(time.perf_counter() - t_swap, 2)}
@@ -579,11 +597,20 @@ class Pipeline:
         or the model reworded it (``standalone_changed``): only it could have come back (review of 2026-11-16: the page
         refused complete questions on a busy model); ``log["rewrite"]["answered"]`` is then "typed". The model's own
         UNCLEAR stays a refusal. ``log["rewrite"]`` says what the rewrite did (status, reason, ``seconds`` of the
-        rewrite call; the question used only when it changed)."""
+        rewrite call; the question used only when it changed).
+
+        With ``SFA_MEMORY=on`` (``self.memory``, from the page's Settings) the follow-up resolver reads the turns in
+        place of the rewrite (:meth:`_followup_memory`; design v2 §6.1): the page has no store, so it runs with no state
+        and can only answer a reply or run a question of its own. A fault of the resolver itself falls back to the
+        rewrite below."""
         from sf_assistant.agent.followup import FAILED, UNCLEAR, last_answer_objects, rewrite, usable_turns
 
         if not usable_turns(turns):
             return self.answer(question, mode)
+        if getattr(getattr(self, "memory", None), "on", False) and mode != "knowledge":
+            got = self._followup_memory(question, turns, mode)
+            if got is not None:
+                return got
         t0 = time.perf_counter()
         step = rewrite(question, turns, self.llm)
         info = {"status": step.status, "reason": step.reason, "seconds": round(time.perf_counter() - t0, 2)}
@@ -611,6 +638,57 @@ class Pipeline:
         if step.question != question:
             info["question_used"] = step.question
             out["answer"] = read_as_line(step.question) + "\n\n" + str(out.get("answer") or "")
+        out.setdefault("log", {})["rewrite"] = info
+        if isinstance(out.get("trace"), dict):
+            out["trace"]["rewrite"] = dict(info)
+        return out
+
+    def _followup_memory(self, question: str, turns: Any, mode: str) -> dict | None:
+        """The page's follow-up with ``SFA_MEMORY=on``: ``agent.resolver.resolve`` with no state (the page stores none),
+        then the reply it wrote or its question, run under a ``MemoryRun`` with its terms (``begin_question(terms=)``)
+        and with a Read-as line when it changed. None when the resolver itself failed (the rewrite then answers)."""
+        from sf_assistant.agent import query_state as qs
+        from sf_assistant.agent import resolver
+        from sf_assistant.agent.followup import last_answer_objects
+        from sf_assistant.config import charts_settings
+        from sf_assistant.pipeline import MemoryRun
+
+        t0 = time.perf_counter()
+        self.ensure_fresh()
+        tools = getattr(self.session, "tools", None)
+        catalog = getattr(tools, "catalog", None)
+        try:
+            today = tools.today() if callable(getattr(tools, "today", None)) else None
+            names = tuple(tools.other_record_types()) if callable(getattr(tools, "other_record_types", None)) else ()
+        except Exception:  # noqa: BLE001 - no business date: resolver_error, and the rewrite answers
+            today, names = None, ()
+        mem = self.memory
+        res = resolver.resolve(question, turns, None, 0, "", self.llm, today=today,
+                               view=qs.PlanView(catalog) if catalog is not None else None, max_calls=mem.max_calls,
+                               max_age=mem.max_age, max_tokens=mem.tokens, shortcuts=mem.shortcuts,
+                               charts_on=charts_settings().on, other_record_types=names)
+        info = {"memory": res.log(), "seconds": round(time.perf_counter() - t0, 2)}
+        if res.action == "reply":
+            if res.reason == "resolver_error":
+                return None
+            if res.status == "failed" and _typed_may_run(question):   # as the rewrite: a complete question runs
+                run = MemoryRun(terms=None)
+                out = self.answer(question, mode, memory=run)
+                out.setdefault("log", {})["rewrite"] = {**info, "answered": "typed"}
+                return out
+            text = {"answered": res.text, "unclear": UNCLEAR_LINE}.get(res.status, REWRITE_FAILED_LINE)
+            return {"answer": text, "kind": "none", "source_line": None, "data_ts": None,
+                    "trace": {"mode": mode, "rewrite": dict(info), "queries": [], "timings": {}},
+                    "log": {"rewrite": info}}
+        if res.action != "new":   # no state: no plan to patch or to ask about
+            return None
+        objects = last_answer_objects(list(turns)[-4:] if isinstance(turns, list) else turns)
+        run = MemoryRun(terms=res.terms)
+        out = (self.answer(res.question, mode, objects, memory=run) if objects
+               else self.answer(res.question, mode, memory=run))
+        if res.question != question:
+            info["question_used"] = res.question
+            out["answer"] = read_as_line(res.question) + "\n\n" + str(out.get("answer") or "")
         out.setdefault("log", {})["rewrite"] = info
         if isinstance(out.get("trace"), dict):
             out["trace"]["rewrite"] = dict(info)

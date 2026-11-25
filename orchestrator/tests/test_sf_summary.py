@@ -221,6 +221,49 @@ def test_assistant_mode_summariser_keeps_its_defaults(monkeypatch):
     assert summarize.summary_block("x")["content"].startswith(summarize.SUMMARY_HEADER)
 
 
+def test_the_summarisers_new_parameters_change_only_what_they_name():
+    """summarize.py's `instructions` and `header` (design §11.2): omitted or
+    None, the assistant-mode request and block are byte for byte as before."""
+    turns = [{"role": "user", "content": "remember my dog is called Pixel"}]
+    before = [
+        {"role": "system", "content": summarize._SYSTEM},
+        {"role": "user", "content": (
+            f"{summarize._INSTRUCTIONS}\n\nEXISTING SUMMARY:\n(none yet)\n\n"
+            "NEW MESSAGES:\n[user] remember my dog is called Pixel"
+        )},
+    ]
+    assert summarize.build_messages("", turns) == before
+    assert summarize.build_messages("", turns, instructions=None) == before
+    swapped = summarize.build_messages("", turns, instructions="MADE-UP RULES")
+    assert swapped[0] == before[0]
+    assert swapped[1]["content"] == before[1]["content"].replace(summarize._INSTRUCTIONS, "MADE-UP RULES")
+    assert summarize.summary_block(" x ") == {"role": "system", "content": f"{summarize.SUMMARY_HEADER}\nx"}
+    assert summarize.summary_block(" x ", header=None) == summarize.summary_block(" x ")
+    assert summarize.summary_block(" x ", header="Made-up header.") == {
+        "role": "system", "content": "Made-up header.\nx",
+    }
+
+
+def test_the_fold_calls_the_platform_summariser_with_the_salesforce_instructions(fold_on, monkeypatch):
+    """The stage-2 swap: one call into summarize.summarize, with
+    `instructions=SF_INSTRUCTIONS` and nothing else."""
+    _model, store = fold_on
+    calls = []
+
+    async def spy(existing, turns, **kwargs):
+        calls.append((existing, list(turns), kwargs))
+        return "## Objective\n- noted"
+
+    monkeypatch.setattr(summarize, "summarize", spy)
+    assert run_fold(CONV, 7, "earlier notes", 0, [pair()]) == sf_summary.FOLDED
+    assert len(calls) == 1
+    existing, turns, kwargs = calls[0]
+    assert existing == "earlier notes"
+    assert kwargs == {"instructions": sf_summary.SF_INSTRUCTIONS}
+    assert [t["role"] for t in turns] == [sf_summary.ROLE_PERSON, sf_summary.ROLE_PLAN]
+    assert len(store.writes) == 1
+
+
 def test_the_resolver_header_says_context_only():
     assert sf_summary.SF_HEADER == (
         "Summary of earlier parts of this Salesforce chat. Context only, never "

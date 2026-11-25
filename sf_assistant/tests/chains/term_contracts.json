@@ -1,0 +1,743 @@
+{
+ "title": "Patches that meet the business-term contracts (design v2 §16.1 T01-T05)",
+ "chains": [
+  {
+   "id": "T01",
+   "title": "A patch that would count candidates from Lead records is refused (T1) and asks; the plan stays",
+   "design": "design v2 §6.4 checks on every patched plan (term plan, T1 becomes a clarify), §16.1 T01",
+   "steps": [
+    {
+     "q": "how many candidates had interviews this year, by interview status",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Status__c",
+        "measure": "count_distinct",
+        "measure_field": "Candidate__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "Shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "measure": "count_distinct",
+         "measure_field": "Candidate__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        },
+        "term_filters": [
+         "Candidate__c.RecordTypeId = 'Person Account'"
+        ]
+       }
+      ],
+      "plan": {
+       "keys": [
+        "candidates"
+       ]
+      }
+     }
+    },
+    {
+     "q": "group them by Lead__c instead",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "set_group": {
+         "field": "Lead__c"
+        }
+       }
+      ]
+     },
+     "expect": {
+      "status": "answered",
+      "kind": "none",
+      "reason": "clarify",
+      "model": true,
+      "record": false,
+      "ran_none": true,
+      "detail": "check_term_reject",
+      "answer": "That change would count candidates from records that are not candidates (candidates are Person Accounts). Please ask the full question.",
+      "pending": null,
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Interview_Status__c",
+          "measure": "count_distinct",
+          "measure_field": "Candidate__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "keys": [
+        "candidates"
+       ],
+       "age": 0
+      }
+     }
+    },
+    {
+     "q": "visualize it",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "measure": "count_distinct",
+         "measure_field": "Candidate__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        },
+        "term_filters": [
+         "Candidate__c.RecordTypeId = 'Person Account'"
+        ]
+       }
+      ],
+      "plan": {
+       "show_chart": true
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "T02",
+   "title": "A patch that would measure placements from the candidate status is refused (T2) and asks",
+   "design": "design v2 §6.4 (T2 becomes a clarify), the placement definition, §16.1 T02",
+   "steps": [
+    {
+     "q": "how many placements per recruiter this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "filters": [
+         {
+          "field": "Interview_Outcome__c",
+          "op": "eq",
+          "value": "Offer Received"
+         }
+        ],
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "Shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "contracts": [
+       "placement"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "filters": [
+          {
+           "field": "Interview_Outcome__c",
+           "op": "eq",
+           "value": "Offer Received"
+          }
+         ],
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "filters": [
+           {
+            "field": "Interview_Outcome__c",
+            "op": "eq",
+            "value": "Offer Received"
+           }
+          ],
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "keys": [
+        "placement"
+       ]
+      }
+     }
+    },
+    {
+     "q": "only the placed ones",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "add_filter": {
+         "field": "Candidate__c.Candidate_Status__c",
+         "op": "eq",
+         "value": "Placed"
+        }
+       }
+      ]
+     },
+     "expect": {
+      "reason": "clarify",
+      "kind": "none",
+      "model": true,
+      "ran_none": true,
+      "detail": "check_term_reject",
+      "answer": "That change would count placements from something that is not a placement (a placement is a client interview with the outcome Offer Received). Please ask the full question.",
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "filters": [
+           {
+            "field": "Interview_Outcome__c",
+            "op": "eq",
+            "value": "Offer Received"
+           }
+          ],
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "keys": [
+        "placement"
+       ]
+      }
+     }
+    },
+    {
+     "q": "top 3",
+     "record": [
+      "The top 3 are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "contracts": [
+       "placement"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "filters": [
+          {
+           "field": "Interview_Outcome__c",
+           "op": "eq",
+           "value": "Offer Received"
+          }
+         ],
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "top": 3,
+         "order": "desc"
+        }
+       }
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "T03",
+   "title": "A patch that would measure support people by the preferred support person is refused (T3)",
+   "design": "design v2 §6.4 (T3 becomes a clarify), the support performance definition, §16.1 T03",
+   "steps": [
+    {
+     "q": "how is each support person performing this year?",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Support_Person__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "Shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "contracts": [
+       "support"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Support_Person__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        },
+        "enforced_has": {
+         "split_by": "Interview_Outcome__c"
+        },
+        "result_has": {
+         "offer_rate_overall_pct": 20.0,
+         "total_across_groups": 10
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Interview_Support_Person__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "keys": [
+        "support_performance"
+       ]
+      }
+     }
+    },
+    {
+     "q": "group by Preferred_Support_Person__c instead",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "set_group": {
+         "field": "Preferred_Support_Person__c"
+        }
+       }
+      ]
+     },
+     "expect": {
+      "reason": "clarify",
+      "kind": "none",
+      "model": true,
+      "ran_none": true,
+      "detail": "check_term_reject",
+      "answer": "That change would measure support person performance from something else (it is the client interviews of each support person). Please ask the full question.",
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Interview_Support_Person__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ]
+      }
+     }
+    },
+    {
+     "q": "only top 2",
+     "record": [
+      "The top 2 are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "contracts": [
+       "support"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Support_Person__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "top": 2,
+         "order": "desc"
+        },
+        "enforced_has": {
+         "split_by": "Interview_Outcome__c"
+        }
+       }
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "T04",
+   "title": "Relax the candidates scope, narrow it again, then visualize it: the narrowing holds",
+   "design": "design v2 §7.1 (C18: relaxing flags come only from typed words, per contract), stage-1 review fix H1, stage1_report open point 19, §16.1 T04",
+   "steps": [
+    {
+     "q": "how many candidates by status",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Account",
+        "group_by": "Candidate_Status__c"
+       }
+      },
+      "The candidates by status are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Account",
+         "group_by": "Candidate_Status__c"
+        },
+        "term_filters": [
+         "RecordTypeId = 'Person Account'"
+        ],
+        "result_has": {
+         "total_across_groups": 5
+        }
+       }
+      ],
+      "plan": {
+       "keys": [
+        "candidates"
+       ],
+       "terms_text": "how many candidates by status"
+      }
+     }
+    },
+    {
+     "q": "show the top 2 of all account types",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "set_top": {
+         "n": 2,
+         "order": "desc"
+        }
+       }
+      ]
+     },
+     "record": [
+      "All account types are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "note": "the relaxation: typed words ask for every account type, so no Person Account filter",
+     "expect": {
+      "reason": "patch",
+      "model": true,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Account",
+         "group_by": "Candidate_Status__c",
+         "top": 2,
+         "order": "desc"
+        },
+        "term_filters": []
+       }
+      ],
+      "plan_line_has": [
+       "every account type"
+      ],
+      "answer_not": [
+       "Person Accounts only"
+      ]
+     }
+    },
+    {
+     "q": "only candidates, top 3",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "set_top": {
+         "n": 3,
+         "order": "desc"
+        }
+       }
+      ]
+     },
+     "record": [
+      "The candidates are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "note": "the narrowing: the newest typed question that names the contract decides its flags",
+     "expect": {
+      "reason": "patch",
+      "model": true,
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Account",
+         "group_by": "Candidate_Status__c",
+         "top": 3,
+         "order": "desc"
+        },
+        "term_filters": [
+         "RecordTypeId = 'Person Account'"
+        ]
+       }
+      ],
+      "plan_line_has": [
+       "candidates as Person Accounts"
+      ]
+     }
+    },
+    {
+     "q": "visualize it",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "note": "names nothing: the chain's last narrowing still holds (H1)",
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Account",
+         "group_by": "Candidate_Status__c",
+         "top": 3,
+         "order": "desc"
+        },
+        "term_filters": [
+         "RecordTypeId = 'Person Account'"
+        ]
+       }
+      ],
+      "plan": {
+       "show_chart": true,
+       "keys": [
+        "candidates"
+       ],
+       "terms_text": "how many candidates by status\nshow the top 2 of all account types\nonly candidates, top 3\nvisualize it"
+      },
+      "plan_line_has": [
+       "candidates as Person Accounts",
+       "as a chart"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "T05",
+   "title": "A candidates set, then their interviews: the Person Account scope reaches the path filter",
+   "design": "design v2 §10 follow_set with the set's enforced filters (C22), §6.4 which_link, §16.1 T05",
+   "steps": [
+    {
+     "q": "how many active candidates are there",
+     "record": [
+      {
+       "name": "count_records",
+       "args": {
+        "object": "Account",
+        "filters": [
+         {
+          "field": "Candidate_Status__c",
+          "op": "eq",
+          "value": "Active"
+         }
+        ]
+       }
+      },
+      "There is 1 active candidate.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "count_records",
+        "args": {
+         "object": "Account",
+         "filters": [
+          {
+           "field": "Candidate_Status__c",
+           "op": "eq",
+           "value": "Active"
+          }
+         ]
+        },
+        "term_filters": [
+         "RecordTypeId = 'Person Account'"
+        ],
+        "result_has": {
+         "count": 1
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "count_records",
+         "args": {
+          "object": "Account",
+          "filters": [
+           {
+            "field": "Candidate_Status__c",
+            "op": "eq",
+            "value": "Active"
+           }
+          ]
+         }
+        }
+       ],
+       "keys": [
+        "candidates"
+       ]
+      }
+     }
+    },
+    {
+     "q": "show their interviews",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "follow_set": {
+         "object": "Interview__c"
+        }
+       }
+      ]
+     },
+     "note": "two lookups of Interview__c point at Account: code asks which one",
+     "expect": {
+      "reason": "clarify",
+      "kind": "none",
+      "model": true,
+      "ran_none": true,
+      "detail": "which_link",
+      "clarify": true,
+      "pending": [
+       "Candidate",
+       "Client Account",
+       "No, I'll ask in full"
+      ]
+     }
+    },
+    {
+     "q": "1",
+     "record": [
+      "Their interviews are listed.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "model": false,
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "list_records",
+        "args": {
+         "object": "Interview__c",
+         "filters": [
+          {
+           "field": "Candidate__c.Candidate_Status__c",
+           "op": "eq",
+           "value": "Active"
+          },
+          {
+           "field": "Candidate__c.RecordTypeId",
+           "op": "eq",
+           "value": "PersonAccount"
+          }
+         ]
+        },
+        "result_has": {
+         "total_count": 4
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "list_records",
+         "args": {
+          "object": "Interview__c",
+          "filters": [
+           {
+            "field": "Candidate__c.Candidate_Status__c",
+            "op": "eq",
+            "value": "Active"
+           },
+           {
+            "field": "Candidate__c.RecordTypeId",
+            "op": "eq",
+            "value": "PersonAccount"
+           }
+          ]
+         }
+        }
+       ]
+      }
+     }
+    }
+   ]
+  }
+ ]
+}

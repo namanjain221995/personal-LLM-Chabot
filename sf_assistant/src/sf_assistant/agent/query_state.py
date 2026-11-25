@@ -31,10 +31,10 @@ The parts:
   and a narrowing follow-up ends it for the rest of the chain. :func:`next_terms` gives the next state's ``terms``.
 - **Building** (§7.3, §8, §9): :func:`build` writes the next state from the answer kind and, for a records answer,
   the evidence (:func:`plan_from_evidence`: the successful calls of the 7 contract tools; main picked as
-  ``charts._pick`` picks; more than 3 calls store no plan; a call of the record agent's with a value the person
-  never gave, a name or a figure it took from a result, is left out, and its compare labels are code's words).
-  Answers that ran no query carry the parent plan, one age older; a clarify, an unclear reply or small talk carry it
-  at the same age.
+  ``charts._pick`` picks, a seeded main call kept as the main call; more than 3 calls store no plan; a call of the
+  record agent's with a value the person never gave, a name, a figure or a date it took from a result, is left out,
+  and its compare labels are code's words; when every call is left out so, no plan). Answers that ran no query carry
+  the parent plan, one age older; a clarify, an unclear reply or small talk carry it at the same age.
 - **Checking** (§5, §7.4): :func:`check` reads a state that came back (bad shapes, impossible dates, an unknown
   ``v``, an access profile that differs, more than 32 KB as the platform measures it) and, with a view of the
   catalog, names the fields that no longer resolve or are blocked.
@@ -46,7 +46,8 @@ The parts:
   relative period (D1); :func:`keys_filter`, :func:`set_keys` and :func:`keys_digest` turn a stored record set into an
   ``in`` filter at run time, so no record id is ever stored; :func:`stale_empty` marks an unchanged re-run that now
   finds nothing although it found rows before (C7).
-- **The plan line** (C20): :func:`plan_line` describes a plan in code-written words (:data:`PLAN_LINE_WORDS`): object,
+- **The plan line** (C20): :func:`plan_line` describes a plan in code-written words (:data:`PLAN_LINE_WORDS`, the
+  prompt file ``prompts/plan_line_words.md``): object,
   measure, grouping, filters as stored, term scope, period dates, top N and display. It holds no figure from a result;
   the only figures in it are dates, limits and the values of the plan's own arguments.
 
@@ -68,7 +69,8 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable
 
-from sf_assistant import prompts as _prompt_files   # fill only: the plan line's words are PLAN_LINE_WORDS below
+from sf_assistant import prompts as _prompt_files   # the plan line's words (prompts/plan_line_words.md) and fill
+from sf_assistant.engine import followup_shortcuts as _shortcuts   # the period grammar of the typed words
 from sf_assistant.engine.catalog import SYSTEM_LOOKUPS, RecordError
 from sf_assistant.engine.contact import asks_for_contact
 from sf_assistant.engine.periods import PeriodError, bucket_end, parse_period
@@ -192,6 +194,11 @@ _DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
 #: A date or date-time filter value (a period's bound the agent wrote): a date may stand in a plan (§16.1).
 _DATE_VALUE_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?",
                             re.ASCII)
+#: Period words that name a point in time of their own (a year, a date, a month, a quarter), so they could come from a
+#: result (a date of birth, the busiest month); words without them ("last 12 months", "this year", "pichle mahine")
+#: are relative to today and carry nothing a result gave (stage-2 review fix PE2).
+_ABSOLUTE_PERIOD_RE = re.compile(r"\d{4}|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b|\bq[1-4]\b",
+                                 re.IGNORECASE)
 #: A group's ``min_value`` this small carries no figure of a result (the schema's own "2 for duplicates").
 _PLAIN_MIN_VALUES = (0, 1, 2)
 _REASON_RE = re.compile(r"[a-z0-9_]{0,40}")
@@ -564,14 +571,111 @@ def schema_value(view: Any, obj: Any, path: Any, value: Any) -> bool:
     return False
 
 
-def _untyped_value(args: dict, typed: str, view: Any) -> bool:
+def _typed_ranges(typed: str, today: dt.date) -> list[tuple[str | None, str | None]]:
+    """The (first day, last day) of every period the typed words name, read on ``today`` with the period grammar of
+    the shortcuts (``engine.followup_shortcuts``; several per question, Hinglish included); (None, None) for words that
+    mean all time. What the record agent may write as a date or a period without the person typing it as such."""
+    out: list[tuple[str | None, str | None]] = []
+    for line in str(typed or "").splitlines():
+        try:
+            ws = _shortcuts.words(line)
+            used = [False] * len(ws)
+            for _round in range(6):
+                phrase = _shortcuts._period(ws, used, today)
+                if phrase is None:
+                    break
+                got = (None, None) if phrase == _shortcuts.ALL_TIME else _dates(phrase, today)
+                if got is not None and got not in out:
+                    out.append(got)
+        except Exception:  # noqa: BLE001 - no period read on this line
+            continue
+    return out
+
+
+def _boundaries(ranges: Iterable[tuple[str | None, str | None]]) -> frozenset[str]:
+    """The days a filter bound of a typed period can be: its first and last day, the day before the first (``gt``)
+    and the day after the last (``lt``)."""
+    out: set[str] = set()
+    for first, last in ranges:
+        for day, step in ((first, -1), (last, 1)):
+            if not day:
+                continue
+            out.add(day)
+            try:
+                out.add((dt.date.fromisoformat(day) + dt.timedelta(days=step)).isoformat())
+            except ValueError:
+                pass
+    return frozenset(out)
+
+
+class _TypedPeriods:
+    """The periods the typed words name (:func:`_typed_ranges`) and their days (:func:`_boundaries`), read once and
+    only when a date or a period needs them (reading long turns takes a while)."""
+
+    def __init__(self, typed: str, today: dt.date) -> None:
+        self.typed, self.today = typed, today
+        self._ranges: list | None = None
+        self._bounds: frozenset[str] | None = None
+
+    @property
+    def ranges(self) -> list:
+        if self._ranges is None:
+            self._ranges = _typed_ranges(self.typed, self.today)
+        return self._ranges
+
+    @property
+    def bounds(self) -> frozenset[str]:
+        if self._bounds is None:
+            self._bounds = _boundaries(self.ranges)
+        return self._bounds
+
+
+def _untyped_period(phrase: Any, have: str, periods: _TypedPeriods, today: dt.date) -> bool:
+    """A call's period words that the person never gave (stage-2 review fix PE2): words that are not typed, whose
+    dates are not those of a period the typed words name and do not start and end on its days (a date of birth the
+    agent read in a result, written as "1990-01-01 to 2026-10-13", is such a period). Words relative to today with no
+    year, date, month or quarter of their own (:data:`_ABSOLUTE_PERIOD_RE`: "last 12 months", the chart note's default)
+    and words that mean all time are kept."""
+    if not isinstance(phrase, str) or not phrase.strip() or typed_value(phrase, have):
+        return False
+    if not _ABSOLUTE_PERIOD_RE.search(phrase):
+        return False
+    try:
+        if _shortcuts.period_phrase(phrase, today=today) == _shortcuts.ALL_TIME:
+            return False
+        got = _dates(phrase, today)
+    except Exception:  # noqa: BLE001 - words that do not read as a period: never typed as one
+        got = None
+    if got is None:
+        return True
+    if got in periods.ranges:
+        return False
+    first, last = got
+    bounds = periods.bounds
+    return not ((first is not None or last is not None) and (first is None or first in bounds)
+                and (last is None or last in bounds))
+
+
+def _untyped_value(args: dict, typed: str, view: Any, today: dt.date | None = None,
+                   periods: _TypedPeriods | None = None) -> bool:
     """The record agent's call holds a value the person never gave (stage-1 review fixes F2 and M11; design §2.4,
     §10, C20, D14): a filter value that is not typed (``typed``: the chain's typed questions), not true or false, not
     a date, and not schema data of its field (:func:`schema_value`: a picklist value, a record type); a record Id the
     person did not type; or a group's ``min_value`` that is neither typed nor 0, 1 or 2 (the schema's "2 for
     duplicates"). Such a call is not kept: a state holds no name, figure or record Id the agent took from a result, so
-    none reaches ``plan_line``, the resolver's prompt or the Salesforce summary."""
+    none reaches ``plan_line``, the resolver's prompt or the Salesforce summary.
+
+    ``today`` (the business date; stage-2 review fix PE2): a date is then kept only when it is typed or is a day of a
+    period the typed words name (:func:`_boundaries`), and the call's period words and each compare segment's are
+    screened the same way (:func:`_untyped_period`), so a date the agent read in a result (a date of birth) is not
+    kept either. Without ``today`` every date and period is kept, as in stage 1. ``periods``: the typed periods,
+    shared by the calls of one answer (read here when not given)."""
     have = str(typed or "")
+    if today is not None and periods is None:
+        periods = _TypedPeriods(have, today)
+    if today is not None and any(_untyped_period(p, have, periods, today) for p in (
+            [args.get("period")] + [s.get("period") for s in _items(args.get("segments"))])):
+        return True
     for obj, field_path, v in _value_items(args):
         if isinstance(v, bool):
             continue
@@ -582,6 +686,10 @@ def _untyped_value(args: dict, typed: str, view: Any) -> bool:
         s = str(v).strip()
         if _RECORD_ID_RE.fullmatch(s):
             if s.casefold() in have.casefold() or schema_value(view, obj, field_path, s):
+                continue
+            return True
+        if _DATE_VALUE_RE.fullmatch(s) and periods is not None:
+            if typed_value(s, have) or s[:10] in periods.bounds:
                 continue
             return True
         if typed_value(s, have) or _DATE_VALUE_RE.fullmatch(s) or schema_value(view, obj, field_path, s):
@@ -657,37 +765,55 @@ def _chartable_result(e: Any) -> bool:
 def plan_from_evidence(evidence: Iterable[Any], *, question: str = "", terms: Any = None, show: Any = None,
                        seeds: Iterable[Any] | None = None, max_calls: int = MAX_CALLS,
                        validate: Callable[[str, dict], dict] | None = None,
-                       label: Callable | None = None, view: Any = None) -> tuple[dict | None, str]:
+                       label: Callable | None = None, view: Any = None, today: dt.date | None = None,
+                       typed_also: str = "") -> tuple[dict | None, str]:
     """(plan, why) from one answer's evidence (§7.3): the successful calls of the 7 contract tools, seeded or added
     by the record agent, in call order, an identical call once (its last run). ``why`` is "" with a plan, "no_calls"
-    when none ran and "too_many" past ``max_calls`` (D2: no plan). The main call is the last one a chart is drawn from,
-    else the last call. ``seeds``: the :class:`RunCall` list the answer started from (their stored form and record
-    sets are kept; the fresh re-run of a set, and the agent sending a seeded call again, are no calls of their own).
-    A call of the agent's that holds a value the person never gave (:func:`_untyped_value`: not typed in
-    ``terms["text"]``, no date, no schema value of its field) is left out, and its compare labels are code's words.
+    when none ran, "screened" when calls ran but the value screen left every one out (stage-2 review fix M3: no plan,
+    and never the plan of an earlier answer) and "too_many" past ``max_calls`` (D2: no plan). The main call is the
+    last one a chart is drawn from, else the last call; a seeded main call stays the main call unless the record agent
+    added a call a chart is drawn from (stage-2 review fix M2: an operation on a plan never swaps its main and side
+    calls). ``seeds``: the :class:`RunCall` list the answer started from (their stored form and record sets are kept;
+    the fresh re-run of a set, and the agent sending a seeded call again, are no calls of their own). A call of the
+    agent's that holds a value the person never gave (:func:`_untyped_value`: not typed in ``terms["text"]`` or
+    ``typed_also``, no date, no schema value of its field) is left out, and its compare labels are code's words.
     ``view``: the catalog view (:class:`PlanView`) that knows the picklist values and record types; without one only
-    typed values, dates and true/false are kept. ``question``: the standalone question, or empty for the plan line."""
+    typed values, dates and true/false are kept. ``today``: the business date; with it a date or a period is kept
+    only when typed or a day of a typed period (stage-2 review fix PE2). ``typed_also``: more of the person's own
+    typed words that count for the screen only (the user turns the bridge sent; stage-2 review fix M3), never stored.
+    ``question``: the standalone question, or empty for the plan line."""
     calls = [e for e in evidence or () if getattr(e, "ok", False) and getattr(e, "kind", "") == "data"
              and getattr(e, "tool", "") in ENFORCED_TOOLS]
     typed = _clean_terms(terms)["text"]
-    built: list[tuple[dict, Any]] = []
+    have = "\n".join(t for t in (typed, str(typed_also or "")) if t)
+    built: list[tuple[dict, Any, Any]] = []
+    screened = False
+    periods = _TypedPeriods(have, today) if today is not None else None
     for seed, e in _match_seeds(calls, seeds or ()):
-        entry = _entry(e, seed, validate, typed)
-        if entry is not None and (seed is not None or not _untyped_value(entry["args"], typed, view)):
-            built.append((entry, e))
+        entry = _entry(e, seed, validate, have)
+        if entry is None:
+            continue
+        if seed is None and _untyped_value(entry["args"], have, view, today, periods):
+            screened = True
+            continue
+        built.append((entry, e, seed))
     last: dict[str, int] = {}
-    for i, (entry, _e) in enumerate(built):
+    for i, (entry, _e, _s) in enumerate(built):
         last[_canon([entry["tool"], entry["args"], entry.get("keys_from")])] = i
     built = [built[i] for i in sorted(last.values())]
     if not built:
-        return None, "no_calls"
+        return None, "screened" if screened else "no_calls"
     if len(built) > max_calls:
         return None, "too_many"
-    main = max((i for i, (_c, e) in enumerate(built) if _chartable_result(e)), default=len(built) - 1)
-    for i, (entry, _e) in enumerate(built):
+    main = max((i for i, (_c, e, _s) in enumerate(built) if _chartable_result(e)), default=len(built) - 1)
+    seeded_main = next((i for i, (_c, _e, s) in enumerate(built) if s is not None
+                        and getattr(s, "role", "") == "main"), None)
+    if seeded_main is not None and not any(s is None and _chartable_result(e) for _c, e, s in built):
+        main = seeded_main
+    for i, (entry, _e, _s) in enumerate(built):
         entry["role"] = "main" if i == main else "side"
     plan = {"question": _cut(question, MAX_QUESTION_CHARS), "terms": _clean_terms(terms),
-            "calls": [entry for entry, _e in built], "show": clean_show(show), "age": 0}
+            "calls": [entry for entry, _e, _s in built], "show": clean_show(show), "age": 0}
     if not plan["question"]:
         plan["question"] = _cut(plan_line(plan, label=label), MAX_QUESTION_CHARS)
     return plan, ""
@@ -725,19 +851,22 @@ def build(kind: str, *, parent: Any = None, evidence: Iterable[Any] = (), questi
           show: Any = None, seeds: Iterable[Any] | None = None, pending: Any = None, kb: str = "",
           made_at: str = "", profile: str | None = None, reason: str = "", op: str | None = None,
           max_calls: int = MAX_CALLS, validate: Callable[[str, dict], dict] | None = None,
-          label: Callable | None = None, view: Any = None) -> dict | None:
+          label: Callable | None = None, view: Any = None, today: dt.date | None = None,
+          typed_also: str = "") -> dict | None:
     """The state after one answer (§9), or None when it is larger than :data:`MAX_STATE_BYTES`.
 
     ``kind`` (:data:`ANSWER_KINDS`): ``records`` (records or merged: the plan of its evidence,
     :func:`plan_from_evidence`; the parent plan one age older when no contract call succeeded; no plan past the call
-    cap), ``about_answer`` (the
+    cap, and none when the value screen left out every call that ran: stage-2 review fix M3), ``about_answer`` (the
     parent plan at age 0: it re-ran, and its breakdown calls are not kept, C6), ``knowledge`` and ``no_query`` (the
     people answer, about_people, search, history, sync, not found: the parent plan one age older), ``clarify`` (the
     parent plan at its age, with ``pending``), ``unclear`` and ``small_talk`` (the parent plan at its age; the
     pending clarification ends) and ``refused`` (no plan). ``parent``: the checked parent state (:func:`check`).
     ``terms``: :func:`next_terms`. ``reason`` and ``op``: the fixed codes the reply gives (``last``). ``view``: the
     catalog view (:class:`PlanView`) the value screen of :func:`plan_from_evidence` reads picklists and record types
-    through; pass it, or a record agent's call with a picklist value it did not see typed is not kept."""
+    through; pass it, or a record agent's call with a picklist value it did not see typed is not kept. ``today`` and
+    ``typed_also``: the business date and more of the person's typed words, for the value screen
+    (:func:`plan_from_evidence`)."""
     kind = _KIND_ALIASES.get(kind, kind)
     if kind not in ANSWER_KINDS:
         raise ValueError(f"unknown answer kind {kind!r}")
@@ -748,7 +877,8 @@ def build(kind: str, *, parent: Any = None, evidence: Iterable[Any] = (), questi
     pend = None
     if kind == "records":
         plan, why = plan_from_evidence(evidence, question=question, terms=terms, show=show, seeds=seeds,
-                                       max_calls=max_calls, validate=validate, label=label, view=view)
+                                       max_calls=max_calls, validate=validate, label=label, view=view,
+                                       today=today, typed_also=typed_also)
         if why == "no_calls":
             plan = _carried(parent_plan, add=1)
     elif kind == "about_answer":
@@ -2021,53 +2151,9 @@ def stale_empty(run: RunCall, evidence: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------------------------------- the plan line
-#: The words of the plan line, one ``key: text`` line each (``<<NAME>>`` filled by code). Kept in this block so they
-#: can move to a prompt file as they are.
-PLAN_LINE_WORDS = """count: number of <<OBJ>>
-distinct: number of different <<FIELD>> in <<OBJ>>
-measure: <<OP>> of <<FIELD>> in <<OBJ>>
-group: <<MEASURE>> per <<GROUP>>
-split: split by <<FIELD>>
-trend: <<MEASURE>> by <<GRAIN>>
-by: by <<GRAIN>>
-rate: share of <<OBJ>> where <<PART>>
-compare: <<MEASURE>>: <<SEGMENTS>>
-versus: vs
-list: <<OBJ>> listed
-sorted: sorted by <<FIELD>> <<ORDER>>
-where: where <<FILTERS>>
-and: and
-any_of: at least one of <<FILTERS>>
-or: or
-with_child: with <<CHILD>> records
-without_child: without <<CHILD>> records
-candidates: candidates as Person Accounts
-all_types: every account type
-segment: part <<N>>
-period: <<PHRASE>> (<<RANGE>>)
-range: <<FROM>> to <<TO>>
-since: since <<FROM>>
-until: until <<TO>>
-top: top <<N>>
-bottom: bottom <<N>>
-limit: <<N>> rows
-min_value: groups of at least <<N>>
-chart: as a chart
-chart_type: as a <<TYPE>> chart
-table: as a table
-also: also <<CALL>>
-set: for the <<SET>> shown before
-set_rank: for number <<N>> of the <<SET>> shown before
-set_top: top <<N>> <<FIELD>>
-set_list: <<OBJ>> listed
-records: <<OBJ>> records
-op_count: number
-op_count_distinct: number of different
-op_sum: total
-op_avg: average
-op_median: median
-op_min: lowest
-op_max: highest"""
+#: The words of the plan line, one ``key: text`` line each (``<<NAME>>`` filled by code): prompts/plan_line_words.md
+#: (moved there as they were, stage-1 review point N1).
+PLAN_LINE_WORDS = _prompt_files.text("plan_line_words")
 _WORDS: dict[str, str] = dict(ln.split(": ", 1) for ln in PLAN_LINE_WORDS.split("\n") if ": " in ln)
 #: How a filter writes each operator (term_contracts ``_OP_TEXT``, the applied texts' own signs).
 _OP_TEXT = {"eq": "=", "ne": "<>", "in": "in", "not_in": "not in", "contains": "contains", "starts_with": "starts with",

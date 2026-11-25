@@ -1,0 +1,350 @@
+{
+ "title": "Clarifying questions and the contact rule (design v2 §16.1 CL01, CL02, CT01)",
+ "chains": [
+  {
+   "id": "CL01",
+   "title": "A clarifying question, then 2: the second reading runs as a question of its own",
+   "design": "design v2 §6.2 step 1 (a digit picks a choice; the person's own words set the terms, F8), §16.1 CL01",
+   "steps": [
+    {
+     "q": "how many interviews by status this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Status__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews by status are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "q": "What about candidates?",
+     "resolve": {
+      "kind": "unclear",
+      "standalone": "How many candidates had interviews this year, by status?",
+      "ops": [
+       {
+        "set_measure": {
+         "measure": "count_distinct",
+         "field": "Candidate__c"
+        }
+       }
+      ]
+     },
+     "expect": {
+      "reason": "clarify",
+      "kind": "none",
+      "model": true,
+      "ran_none": true,
+      "clarify": true,
+      "pending": [
+       "number of different Candidate in Interviews per Interview Status, this year (2026-01-01 to 2026-12-31), candidates as Person Accounts",
+       "How many candidates had interviews this year, by status?",
+       "No, I'll ask in full"
+      ]
+     }
+    },
+    {
+     "q": "2",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Status__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year",
+        "measure": "count_distinct",
+        "measure_field": "Candidate__c"
+       }
+      },
+      "The candidates per status are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "kind": "merged",
+      "model": false,
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "measure": "count_distinct",
+         "measure_field": "Candidate__c"
+        },
+        "term_filters": [
+         "Candidate__c.RecordTypeId = 'Person Account'"
+        ]
+       }
+      ],
+      "answer_starts": "Read as: `How many candidates had interviews this year, by status?`",
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Interview_Status__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year",
+          "measure": "count_distinct",
+          "measure_field": "Candidate__c"
+         }
+        }
+       ],
+       "keys": [
+        "candidates"
+       ],
+       "terms_text": "What about candidates?"
+      },
+      "pending": null
+     }
+    }
+   ]
+  },
+  {
+   "id": "CL02",
+   "title": "A clarifying question, then thanks, then 2: the pending choice has ended",
+   "design": "design v2 §5 (a pending clarification lives one turn, strictly), §6.2 step 0 (small talk drops it), §16.1 CL02",
+   "steps": [
+    {
+     "q": "how many interviews by status this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Status__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews by status are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "q": "What about candidates?",
+     "resolve": {
+      "kind": "unclear",
+      "standalone": "How many candidates had interviews this year, by status?",
+      "ops": [
+       {
+        "set_measure": {
+         "measure": "count_distinct",
+         "field": "Candidate__c"
+        }
+       }
+      ]
+     },
+     "expect": {
+      "reason": "clarify",
+      "kind": "none",
+      "model": true,
+      "ran_none": true,
+      "clarify": true,
+      "pending": [
+       "number of different Candidate in Interviews per Interview Status, this year (2026-01-01 to 2026-12-31), candidates as Person Accounts",
+       "How many candidates had interviews this year, by status?",
+       "No, I'll ask in full"
+      ]
+     }
+    },
+    {
+     "q": "thanks",
+     "expect": {
+      "reason": "small_talk",
+      "model": false,
+      "ran_none": true,
+      "pending": null,
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Interview_Status__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ]
+      }
+     }
+    },
+    {
+     "q": "2",
+     "resolve": {
+      "kind": "unclear",
+      "standalone": "",
+      "ops": []
+     },
+     "note": "no pending any more: 2 is no choice; it goes to the model, which cannot read it, and code asks",
+     "expect": {
+      "reason": "clarify",
+      "kind": "none",
+      "model": true,
+      "record": false,
+      "ran_none": true,
+      "pending": null,
+      "answer": "I could not tell how this goes on from the last query (number of Interviews per Interview Status, this year (2026-01-01 to 2026-12-31)). Please ask the full question.",
+      "answer_not": [
+       "How many candidates had interviews this year, by status?"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "CT01",
+   "title": "A contact ask, then visualize it and top 3: the contact fields stay blocked",
+   "design": "design v2 §5 (the contact flag is never stored or carried), §6.4 contact rule, §16.1 CT01",
+   "steps": [
+    {
+     "q": "list the employees with their email",
+     "record": [
+      {
+       "name": "list_records",
+       "args": {
+        "object": "Recruiter__c",
+        "fields": [
+         "Name",
+         "Email__c"
+        ]
+       }
+      },
+      "The employees are listed.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "list_records",
+        "args": {
+         "object": "Recruiter__c",
+         "fields": [
+          "Name",
+          "Email__c"
+         ]
+        },
+        "result_holds": [
+         "a@example.invalid"
+        ]
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "list_records",
+         "args": {
+          "object": "Recruiter__c",
+          "fields": [
+           "Name",
+           "Email__c"
+          ]
+         }
+        }
+       ]
+      }
+     }
+    },
+    {
+     "q": "visualize it",
+     "record": [
+      "The employees are listed.\nSource: the synthetic warehouse copy."
+     ],
+     "note": "a list draws no chart; it re-runs under this question, which asks for no contact detail",
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "list_records",
+        "args": {
+         "object": "Recruiter__c",
+         "fields": [
+          "Name",
+          "Email__c"
+         ]
+        },
+        "result_not": [
+         "@example.invalid"
+        ]
+       }
+      ],
+      "answer_not": [
+       "@example.invalid"
+      ],
+      "charts": 0
+     }
+    },
+    {
+     "q": "top 3",
+     "record": [
+      "The first 3 employees are listed.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "list_records",
+        "args": {
+         "object": "Recruiter__c",
+         "fields": [
+          "Name",
+          "Email__c"
+         ],
+         "limit": 3
+        },
+        "result_not": [
+         "@example.invalid"
+        ]
+       }
+      ],
+      "answer_not": [
+       "@example.invalid"
+      ]
+     }
+    }
+   ]
+  }
+ ]
+}

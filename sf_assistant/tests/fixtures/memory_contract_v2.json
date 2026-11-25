@@ -1,0 +1,612 @@
+{
+  "about": [
+    "Contract v2 of ask_salesforce, end to end and model-free (Salesforce conversation memory, stage-2 integration, 2026-11-25).",
+    "A made-up three-turn Salesforce chat on the memory fixture of sf_assistant/tests/warehouse_fixture.py: a records question, a follow-up the service answers with a clarifying question (state.pending), then the reply 2.",
+    "Per turn: question (as typed), script (the service's scripted model, read only by sf_assistant/tests/test_memory_contract.py), call (the arguments the platform bridge sent, captured by orchestrator/tests/test_sf_memory_contract.py through /chat with SF_ASSISTANT_MEMORY true, the row of the turn before read back from the test PostgreSQL) and reply (the service's result, written by the sf_assistant test from that call with SFA_MEMORY=on).",
+    "bridge: the limits, texts and codes the bridge uses (written by the orchestrator test); service: the same for the service (written by the sf_assistant test). Each side checks its own block and the other side's.",
+    "Every name and value is made up. request_id is the placeholder req-<turn>; state.made_at is the time the reply was written and is not compared."
+  ],
+  "regenerate": [
+    "Only when the contract changes on purpose, in this order, until both tests pass without the switch:",
+    "1. orchestrator (guarded harness): wo_env m2_x techsara_m2_x_test -- env SF_MEMORY_CONTRACT_WRITE=1 <orchestrator venv python> -m pytest tests/test_sf_memory_contract.py -q -p no:cacheprovider -p wo_netguard_plugin",
+    "2. sf_assistant: SFA_MEMORY_CONTRACT_WRITE=1 PYTHONPATH=src <sf venv python> -m pytest -p no:cacheprovider -q tests/test_memory_contract.py",
+    "Each run writes what it can (a call needs the replies of the turns before it; a reply needs its call): three rounds fill an empty fixture."
+  ],
+  "bridge": {
+    "v1_arguments": [
+      "question",
+      "recent_turns",
+      "request_id"
+    ],
+    "v1_refusal": "the arguments are question, recent_turns and request_id",
+    "statuses": [
+      "answered",
+      "refused",
+      "unclear",
+      "failed",
+      "busy",
+      "timeout",
+      "no_answer"
+    ],
+    "shown_statuses": [
+      "answered",
+      "refused",
+      "unclear"
+    ],
+    "fixed_lines": {
+      "refused": "This field is blocked, so it cannot be shown here.",
+      "unclear": "I could not tell what this refers to. Please ask the full question, with the name or object."
+    },
+    "refused_part_line": "One blocked field was left out.",
+    "max_question": 1000,
+    "v1_turns": 4,
+    "max_turns": 12,
+    "turn_max_chars": 2000,
+    "summary_max_chars": 8000,
+    "max_gap": 6,
+    "contract": 2,
+    "state_max_bytes": 32768,
+    "plan_line_max_chars": 600,
+    "store_summary_max_chars": 8000,
+    "memory_reply_keys": [
+      "contract",
+      "kind",
+      "plan_line",
+      "reason",
+      "state"
+    ],
+    "clarify_reason": "clarify",
+    "code_max_chars": 32
+  },
+  "service": {
+    "arguments": [
+      "access_profile",
+      "contract",
+      "gap",
+      "question",
+      "recent_turns",
+      "request_id",
+      "state",
+      "summary"
+    ],
+    "v1_arguments": [
+      "question",
+      "recent_turns",
+      "request_id"
+    ],
+    "unknown_keys_error": "the arguments are question, recent_turns and request_id",
+    "contracts": [
+      1,
+      2
+    ],
+    "statuses": [
+      "answered",
+      "busy",
+      "failed",
+      "no_answer",
+      "refused",
+      "timeout",
+      "unclear"
+    ],
+    "reasons": [
+      "records",
+      "knowledge",
+      "new",
+      "patch",
+      "shortcut",
+      "about_answer",
+      "clarify",
+      "small_talk",
+      "code_line",
+      "unclear_rewrite",
+      "refused",
+      "failed",
+      "no_answer",
+      "busy",
+      "timeout"
+    ],
+    "kinds": [
+      "knowledge",
+      "merged",
+      "none",
+      "records"
+    ],
+    "result_keys": [
+      "answer",
+      "charts",
+      "contract",
+      "data_ts",
+      "kind",
+      "objects",
+      "plan_line",
+      "reason",
+      "state",
+      "status"
+    ],
+    "v1_result_keys": [
+      "answer",
+      "charts",
+      "data_ts",
+      "kind",
+      "objects",
+      "status"
+    ],
+    "fixed_lines": {
+      "refused": "This field is blocked, so it cannot be shown here.",
+      "unclear": "I could not tell what this refers to. Please ask the full question, with the name or object."
+    },
+    "refused_part_line": "One blocked field was left out.",
+    "max_question": 1000,
+    "max_turns": 12,
+    "max_turn_chars": 2000,
+    "rewrite_turns": 4,
+    "max_summary": 8000,
+    "max_gap": 6,
+    "state_max_bytes": 32768,
+    "plan_line_max_chars": 600
+  },
+  "turns": [
+    {
+      "question": "how many interviews by status this year",
+      "script": {
+        "record": [
+          {
+            "name": "group_records",
+            "args": {
+              "object": "Interview__c",
+              "group_by": "Interview_Status__c",
+              "date_field": "Date_of_Interview__c",
+              "period": "this year"
+            }
+          },
+          "The interviews by status are shown.\nSource: the synthetic warehouse copy."
+        ]
+      },
+      "call": {
+        "question": "how many interviews by status this year",
+        "recent_turns": [],
+        "request_id": "req-1",
+        "contract": 2,
+        "state": null,
+        "gap": 0,
+        "summary": "",
+        "access_profile": null
+      },
+      "reply": {
+        "status": "answered",
+        "answer": "The interviews by status are shown.\n\nCounted: `Interview__c` records grouped by `Interview_Status__c`, with `Date_of_Interview__c` from 2026-01-01 to 2026-12-31 (America/New_York).\n\n- `Interview__c` = client interviews.\n\nSource: the synthetic warehouse copy.",
+        "kind": "merged",
+        "data_ts": "2026-10-13 14:30 UTC",
+        "objects": [
+          "Interview__c"
+        ],
+        "charts": [],
+        "contract": 2,
+        "state": {
+          "v": 1,
+          "made_at": "2026-11-25T14:52:46+05:30",
+          "kb": "kb:a87d416594fa1ead",
+          "profile": null,
+          "plan": {
+            "question": "how many interviews by status this year",
+            "terms": {
+              "keys": [],
+              "text": "how many interviews by status this year"
+            },
+            "calls": [
+              {
+                "role": "main",
+                "tool": "group_records",
+                "args": {
+                  "object": "Interview__c",
+                  "group_by": "Interview_Status__c",
+                  "date_field": "Date_of_Interview__c",
+                  "period": "this year"
+                },
+                "period": {
+                  "phrase": "this year",
+                  "from": "2026-01-01",
+                  "to": "2026-12-31",
+                  "date_field": "Date_of_Interview__c"
+                },
+                "nonempty": true
+              }
+            ],
+            "show": {
+              "chart": false,
+              "type": null,
+              "table": false
+            },
+            "age": 0
+          },
+          "pending": null,
+          "last": {
+            "kind": "records",
+            "reason": "new",
+            "op": null
+          }
+        },
+        "plan_line": "number of Interviews per Interview Status, this year (2026-01-01 to 2026-12-31)",
+        "reason": "new"
+      }
+    },
+    {
+      "question": "What about candidates?",
+      "script": {
+        "resolve": {
+          "kind": "unclear",
+          "standalone": "How many candidates had interviews this year, by status?",
+          "ops": [
+            {
+              "set_measure": {
+                "measure": "count_distinct",
+                "field": "Candidate__c"
+              }
+            }
+          ]
+        },
+        "v1": {
+          "rewrite": "How many candidates had interviews this year, by status?",
+          "record": [
+            {
+              "name": "group_records",
+              "args": {
+                "object": "Interview__c",
+                "group_by": "Interview_Status__c",
+                "date_field": "Date_of_Interview__c",
+                "period": "this year",
+                "measure": "count_distinct",
+                "measure_field": "Candidate__c"
+              }
+            },
+            "The candidates per status are shown.\nSource: the synthetic warehouse copy."
+          ]
+        }
+      },
+      "call": {
+        "question": "What about candidates?",
+        "recent_turns": [
+          {
+            "role": "user",
+            "content": "how many interviews by status this year"
+          },
+          {
+            "role": "assistant",
+            "content": "The interviews by status are shown.\n\nCounted: `Interview__c` records grouped by `Interview_Status__c`, with `Date_of_Interview__c` from 2026-01-01 to 2026-12-31 (America/New_York).\n\n- `Interview__c` = client interviews.\n\nSource: the synthetic warehouse copy."
+          }
+        ],
+        "request_id": "req-2",
+        "contract": 2,
+        "state": {
+          "v": 1,
+          "kb": "kb:a87d416594fa1ead",
+          "last": {
+            "op": null,
+            "kind": "records",
+            "reason": "new"
+          },
+          "plan": {
+            "age": 0,
+            "show": {
+              "type": null,
+              "chart": false,
+              "table": false
+            },
+            "calls": [
+              {
+                "args": {
+                  "object": "Interview__c",
+                  "period": "this year",
+                  "group_by": "Interview_Status__c",
+                  "date_field": "Date_of_Interview__c"
+                },
+                "role": "main",
+                "tool": "group_records",
+                "period": {
+                  "to": "2026-12-31",
+                  "from": "2026-01-01",
+                  "phrase": "this year",
+                  "date_field": "Date_of_Interview__c"
+                },
+                "nonempty": true
+              }
+            ],
+            "terms": {
+              "keys": [],
+              "text": "how many interviews by status this year"
+            },
+            "question": "how many interviews by status this year"
+          },
+          "made_at": "2026-11-25T14:52:46+05:30",
+          "pending": null,
+          "profile": null
+        },
+        "gap": 0,
+        "summary": "",
+        "access_profile": null
+      },
+      "reply": {
+        "status": "answered",
+        "answer": "I could not tell how this goes on from the last query (number of Interviews per Interview Status, this year (2026-01-01 to 2026-12-31)). Which do you mean?\n\n1. number of different Candidate in Interviews per Interview Status, this year (2026-01-01 to 2026-12-31), candidates as Person Accounts\n2. How many candidates had interviews this year, by status?\n3. No, I'll ask in full",
+        "kind": "none",
+        "data_ts": null,
+        "objects": [],
+        "charts": [],
+        "contract": 2,
+        "state": {
+          "v": 1,
+          "made_at": "2026-11-25T14:52:46+05:30",
+          "kb": "kb:a87d416594fa1ead",
+          "profile": null,
+          "plan": {
+            "question": "how many interviews by status this year",
+            "terms": {
+              "keys": [],
+              "text": "how many interviews by status this year"
+            },
+            "calls": [
+              {
+                "role": "main",
+                "tool": "group_records",
+                "args": {
+                  "object": "Interview__c",
+                  "group_by": "Interview_Status__c",
+                  "date_field": "Date_of_Interview__c",
+                  "period": "this year"
+                },
+                "period": {
+                  "phrase": "this year",
+                  "from": "2026-01-01",
+                  "to": "2026-12-31",
+                  "date_field": "Date_of_Interview__c"
+                },
+                "nonempty": true
+              }
+            ],
+            "show": {
+              "chart": false,
+              "type": null,
+              "table": false
+            },
+            "age": 0
+          },
+          "pending": {
+            "asked": "I could not tell how this goes on from the last query (number of Interviews per Interview Status, this year (2026-01-01 to 2026-12-31)). Which do you mean?",
+            "for": "What about candidates?",
+            "choices": [
+              {
+                "n": 1,
+                "label": "number of different Candidate in Interviews per Interview Status, this year (2026-01-01 to 2026-12-31), candidates as Person Accounts",
+                "question": "number of different Candidate in Interviews per Interview Status, this year (2026-01-01 to 2026-12-31), candidates as Person Accounts",
+                "ops": [
+                  {
+                    "set_measure": {
+                      "measure": "count_distinct",
+                      "field": "Candidate__c"
+                    }
+                  }
+                ]
+              },
+              {
+                "n": 2,
+                "label": "How many candidates had interviews this year, by status?",
+                "question": "How many candidates had interviews this year, by status?",
+                "ops": []
+              },
+              {
+                "n": 3,
+                "label": "No, I'll ask in full",
+                "question": "No, I'll ask in full",
+                "ops": []
+              }
+            ]
+          },
+          "last": {
+            "kind": "clarify",
+            "reason": "clarify",
+            "op": null
+          }
+        },
+        "plan_line": "number of Interviews per Interview Status, this year (2026-01-01 to 2026-12-31)",
+        "reason": "clarify"
+      }
+    },
+    {
+      "question": "2",
+      "script": {
+        "record": [
+          {
+            "name": "group_records",
+            "args": {
+              "object": "Interview__c",
+              "group_by": "Interview_Status__c",
+              "date_field": "Date_of_Interview__c",
+              "period": "this year",
+              "measure": "count_distinct",
+              "measure_field": "Candidate__c"
+            }
+          },
+          "The candidates per status are shown.\nSource: the synthetic warehouse copy."
+        ],
+        "v1": {
+          "rewrite": "How many candidates had interviews this year, by status?",
+          "record": [
+            {
+              "name": "group_records",
+              "args": {
+                "object": "Interview__c",
+                "group_by": "Interview_Status__c",
+                "date_field": "Date_of_Interview__c",
+                "period": "this year",
+                "measure": "count_distinct",
+                "measure_field": "Candidate__c"
+              }
+            },
+            "The candidates per status are shown.\nSource: the synthetic warehouse copy."
+          ]
+        }
+      },
+      "call": {
+        "question": "2",
+        "recent_turns": [
+          {
+            "role": "user",
+            "content": "how many interviews by status this year"
+          },
+          {
+            "role": "assistant",
+            "content": "The interviews by status are shown.\n\nCounted: `Interview__c` records grouped by `Interview_Status__c`, with `Date_of_Interview__c` from 2026-01-01 to 2026-12-31 (America/New_York).\n\n- `Interview__c` = client interviews.\n\nSource: the synthetic warehouse copy."
+          },
+          {
+            "role": "user",
+            "content": "What about candidates?"
+          },
+          {
+            "role": "assistant",
+            "content": "I could not tell how this goes on from the last query (number of Interviews per Interview Status, this year (2026-01-01 to 2026-12-31)). Which do you mean?\n\n1. number of different Candidate in Interviews per Interview Status, this year (2026-01-01 to 2026-12-31), candidates as Person Accounts\n2. How many candidates had interviews this year, by status?\n3. No, I'll ask in full"
+          }
+        ],
+        "request_id": "req-3",
+        "contract": 2,
+        "state": {
+          "v": 1,
+          "kb": "kb:a87d416594fa1ead",
+          "last": {
+            "op": null,
+            "kind": "clarify",
+            "reason": "clarify"
+          },
+          "plan": {
+            "age": 0,
+            "show": {
+              "type": null,
+              "chart": false,
+              "table": false
+            },
+            "calls": [
+              {
+                "args": {
+                  "object": "Interview__c",
+                  "period": "this year",
+                  "group_by": "Interview_Status__c",
+                  "date_field": "Date_of_Interview__c"
+                },
+                "role": "main",
+                "tool": "group_records",
+                "period": {
+                  "to": "2026-12-31",
+                  "from": "2026-01-01",
+                  "phrase": "this year",
+                  "date_field": "Date_of_Interview__c"
+                },
+                "nonempty": true
+              }
+            ],
+            "terms": {
+              "keys": [],
+              "text": "how many interviews by status this year"
+            },
+            "question": "how many interviews by status this year"
+          },
+          "made_at": "2026-11-25T14:52:46+05:30",
+          "pending": {
+            "for": "What about candidates?",
+            "asked": "I could not tell how this goes on from the last query (number of Interviews per Interview Status, this year (2026-01-01 to 2026-12-31)). Which do you mean?",
+            "choices": [
+              {
+                "n": 1,
+                "ops": [
+                  {
+                    "set_measure": {
+                      "field": "Candidate__c",
+                      "measure": "count_distinct"
+                    }
+                  }
+                ],
+                "label": "number of different Candidate in Interviews per Interview Status, this year (2026-01-01 to 2026-12-31), candidates as Person Accounts",
+                "question": "number of different Candidate in Interviews per Interview Status, this year (2026-01-01 to 2026-12-31), candidates as Person Accounts"
+              },
+              {
+                "n": 2,
+                "ops": [],
+                "label": "How many candidates had interviews this year, by status?",
+                "question": "How many candidates had interviews this year, by status?"
+              },
+              {
+                "n": 3,
+                "ops": [],
+                "label": "No, I'll ask in full",
+                "question": "No, I'll ask in full"
+              }
+            ]
+          },
+          "profile": null
+        },
+        "gap": 0,
+        "summary": "",
+        "access_profile": null
+      },
+      "reply": {
+        "status": "answered",
+        "answer": "Read as: `How many candidates had interviews this year, by status?`\n\nThe candidates per status are shown.\n\nCandidates counted: Person Accounts only (`Candidate__c.RecordTypeId = 'Person Account'`).\n\n- `Account` = accounts.\n- `Interview__c` = client interviews.\n\nSource: the synthetic warehouse copy.",
+        "kind": "merged",
+        "data_ts": "2026-10-13 14:30 UTC",
+        "objects": [
+          "Interview__c"
+        ],
+        "charts": [],
+        "contract": 2,
+        "state": {
+          "v": 1,
+          "made_at": "2026-11-25T14:52:46+05:30",
+          "kb": "kb:a87d416594fa1ead",
+          "profile": null,
+          "plan": {
+            "question": "How many candidates had interviews this year, by status?",
+            "terms": {
+              "keys": [
+                "candidates"
+              ],
+              "text": "What about candidates?"
+            },
+            "calls": [
+              {
+                "role": "main",
+                "tool": "group_records",
+                "args": {
+                  "object": "Interview__c",
+                  "group_by": "Interview_Status__c",
+                  "measure": "count_distinct",
+                  "measure_field": "Candidate__c",
+                  "date_field": "Date_of_Interview__c",
+                  "period": "this year"
+                },
+                "period": {
+                  "phrase": "this year",
+                  "from": "2026-01-01",
+                  "to": "2026-12-31",
+                  "date_field": "Date_of_Interview__c"
+                },
+                "nonempty": true
+              }
+            ],
+            "show": {
+              "chart": false,
+              "type": null,
+              "table": false
+            },
+            "age": 0
+          },
+          "pending": null,
+          "last": {
+            "kind": "records",
+            "reason": "new",
+            "op": null
+          }
+        },
+        "plan_line": "number of different Candidate in Interviews per Interview Status, this year (2026-01-01 to 2026-12-31), candidates as Person Accounts",
+        "reason": "new"
+      }
+    }
+  ]
+}

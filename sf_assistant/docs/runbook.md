@@ -411,8 +411,10 @@ must log `pipeline ready` in about 10 s and answer `failed` or `no_answer` with 
 
 ### The ask log
 
-**Since 2026-11-25** (option R2 of the conversation-memory design, owner decision D5): the approved retention keeps the
-ask log 90 days, rotated daily. A file bind mount cannot be rotated by a rename (the container keeps writing into the
+**From the release that ships it** (option R2 of the conversation-memory design of 2026-11-25, owner decision D5;
+`web/ask_log.py`, `web/compose.ask.yaml`, `web/run.sh`, `scripts/split_ask_log.py` and the `web/ask_mcp.py` that writes
+through `RotatingAskLog`, in one release and one `restart-ask`): the approved retention keeps the ask log 90 days,
+rotated daily. A file bind mount cannot be rotated by a rename (the container keeps writing into the
 renamed file, as with the token files), so the service now gets a folder and picks the file of each line itself.
 
 | What | How |
@@ -421,7 +423,7 @@ renamed file, as with the token files), so the service now gets a folder and pic
 | Files | `ask_log-YYYY-MM-DD.jsonl`, mode 600, one per business date in **Asia/Kolkata** (`web/ask_log.py`, `RotatingAskLog`). `ts` keeps its old form, the container's local time (UTC) with its offset: `2026-11-25T18:30:00+0000` is 00:00 on 2026-11-26 in Kolkata, so that line is in the file of 2026-11-26 |
 | Lines | the same lines as before (one JSON object per line, `ts` first), each one `O_APPEND` write under the thread lock; a link named like a daily file is never written through |
 | Kept | 90 days: `SFA_ASK_LOG_DAYS` (a whole number from 1 to 3650; empty or unset: 90; any other value keeps 90 and says so once in the container log). At its start and at the first write of each business day the service deletes the files named exactly `ask_log-YYYY-MM-DD.jsonl` whose date is before today minus 90 days: on 2026-11-25 it keeps 2026-08-27 to 2026-11-25, so a line is kept 90 to 91 days while the service writes every day. It runs no timer: a service that writes nothing deletes nothing until its next start or write, so a file is kept **at least** 90 days and is deleted at the first start or write after that. Only names in ASCII digits count. It deletes nothing else (not `ask_log-unknown-date.jsonl`, no other name, no link, no folder). The container log gets the count and the date of a deletion, nothing more. Changing the 90 days is the owner's decision |
-| Container log | `json-file`, at most 3 files of 10 MB (`logging` in `web/compose.ask.yaml`; before 2026-11-25 it had no cap) |
+| Container log | `json-file`, at most 3 files of 10 MB (`logging` in `web/compose.ask.yaml`; before that release it had no cap) |
 | Faults | a line that cannot be written costs that line only, and the container log gets `could not write the log: <class name>`; at its start the service refuses (exit 2) a folder it cannot write to |
 
 Read the days in order (their names sort by date):
@@ -431,7 +433,7 @@ cat .private/ask_logs/ask_log-2*.jsonl | jq -c '{ts, event, status, reason}'   #
 jq -c 'select(.event == "ask")' .private/ask_logs/ask_log-2026-11-25.jsonl     # one day
 ```
 
-**The one-time split of the old file.** Before 2026-11-25 the service wrote one file, `.private/ask_log.jsonl`.
+**The one-time split of the old file.** Before that release the service wrote one file, `.private/ask_log.jsonl`.
 `./run.sh up-ask` and `restart-ask` start nothing while that file is there. Split it once, in the `sf_assistant` folder
 the service runs from (the release folder when it runs from one, never another copy), **with the service stopped**, so
 no line lands in the old file after the split. The new `web/compose.ask.yaml`, `web/run.sh`, `web/ask_log.py`,

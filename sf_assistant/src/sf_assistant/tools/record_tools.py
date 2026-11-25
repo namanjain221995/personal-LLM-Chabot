@@ -33,6 +33,7 @@ from sf_assistant.engine.catalog import (READ_AS, SYSTEM_LOOKUPS, Catalog, Objec
                                          blocked_text, contact_text, norm_name)
 from sf_assistant.engine.contact import asks_for_contact
 from sf_assistant.engine.sql_guard import quote_ident
+from sf_assistant.engine.term_contracts import PERSON_TYPE, Terms   # begin_question(terms=), other_record_types
 from sf_assistant.engine.periods import Period, PeriodError, parse_period, today_in
 from sf_assistant.engine.query_builder import (BuildCtx, Col, FilterOut, Frag, Scope, date_fields_text, filter_frag,
                                                join_frags, name_norm_sql, period_frag, related_frag,
@@ -191,7 +192,8 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
                                                   "parameters": t.input_schema}} for t in self.tools.values()]
 
     def begin_question(self, question: str = "", people: list[dict] | None = None,
-                       values: list[dict] | None = None) -> None:
+                       values: list[dict] | None = None, terms: Terms | None = None,
+                       contact_ok: bool | None = None) -> None:
         """Clear the evidence log, restart query ids at q1, clear the per-question caches (names, links, reference
         scans) and keep ``question`` for the role cues (``cues`` and ``fits`` of lookup checks) and for the contact rule
         (phase 1: :func:`sf_assistant.engine.contact.asks_for_contact`; the contact fields are shown, listed, grouped,
@@ -205,16 +207,36 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
 
         The business-term contracts (2026-11-24): the terms the question names are read here once
         (:meth:`~sf_assistant.tools.term_enforce.TermEnforceMixin._terms_for`); ``call`` enforces them on every record
-        query tool. "" names none, so a call with no question is never changed."""
+        query tool. "" names none, so a call with no question is never changed.
+
+        ``terms`` (Salesforce conversation memory, design v2 §7.1): the terms a follow-up runs with, rebuilt by code
+        from the stored plan's typed words and the person's typed follow-up (``agent.query_state.terms_for``), in
+        place of the terms of ``question``. None (the default) reads them from ``question`` as before, so a job that
+        passes none gets exactly today's terms and never the terms of the job before it (C15). The contact rule is
+        read from ``question`` alone, unless ``contact_ok`` says it: whether the person's typed question asks for
+        contact details, for a follow-up whose ``question`` is code's plan line, which can hold a typed value with a
+        contact word ("Phone Support"; stage-2 review fix PE1). No contact flag is ever carried from a job before."""
         with self._lock:
             self._evidence = []
             self._qn = 0
             self._question = str(question or "")
-            self._contact_ok = asks_for_contact(self._question)
-            self._terms = self._terms_for(self._question)
+            self._contact_ok = asks_for_contact(self._question) if contact_ok is None else bool(contact_ok)
+            self._terms = terms if isinstance(terms, Terms) else self._terms_for(self._question)
             self._given_people = [dict(p) for p in people if isinstance(p, dict)] if people is not None else None
             self._given_values = [dict(v) for v in values if isinstance(v, dict)] if values is not None else None
             self._reset_caches()
+
+    def other_record_types(self) -> tuple[str, ...]:
+        """The Account record type names and developer names other than Person Account: the record-type override
+        words ``engine.term_contracts.detect`` reads, as :meth:`TermEnforceMixin._terms_for
+        <sf_assistant.tools.term_enforce.TermEnforceMixin._terms_for>` reads them (conversation memory rebuilds a
+        follow-up's terms with them, ``agent.query_state.terms_for``)."""
+        acc = self.catalog.objects.get("Account")
+        names: list[str] = []
+        for r in (acc.record_types if acc is not None else []):
+            if r.get("developer_name") != PERSON_TYPE:
+                names += [str(x) for x in (r.get("name"), r.get("developer_name")) if x and x != "(none)"]
+        return tuple(names)
 
     def _reset_caches(self) -> None:
         self._g1_rows: dict[tuple[str, str], list[tuple]] = {}        # (object, norm name or ~pattern) -> rows

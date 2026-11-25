@@ -144,19 +144,16 @@ def _gauge(name: str, **labels):
 
 @pytest.fixture
 def sf_query_state():
-    """The V45 table: the migration's when it exists, else made here from
-    the store's own DDL text (design §2.2; one copy in the tree) and dropped
-    afterwards (the conftest truncation does not know it)."""
+    """The V45 table, as migration V45 made it (the suite's session fixture
+    applies every migration). Nothing is created or dropped here. The rows a
+    test adds are removed afterwards; the conftest truncation of
+    `conversations` and `users` would also reach them through the cascades."""
     with _raw() as con:
         existed = con.execute("SELECT to_regclass('sf_query_state') IS NOT NULL").fetchone()[0]
-        if not existed:
-            con.execute(sf_memory_store.DDL)
+    assert existed, "migration V45 did not create sf_query_state"
     yield
     with _raw() as con:
-        if existed:
-            con.execute("DELETE FROM sf_query_state")
-        else:
-            con.execute("DROP TABLE IF EXISTS sf_query_state")
+        con.execute("DELETE FROM sf_query_state")
 
 
 def _dataset():

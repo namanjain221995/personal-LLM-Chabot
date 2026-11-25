@@ -37,6 +37,59 @@ def _int(name: str, default: int) -> int:
     return int(raw)
 
 
+_FALSY = {"0", "false", "no", "off"}
+
+
+def _strict_bool(name: str, default: bool) -> bool:
+    """A switch whose typo must not choose for the operator: blank is the
+    default, a word of `_TRUTHY` or `_FALSY` is that value, and anything else
+    fails start-up (as `_int` does for a non-number). `_bool` reads every
+    unknown word as false, which would turn CHAT_RETENTION_DRY_RUN=ture into
+    a real delete. The value is not echoed: an operator may have pasted
+    something private into the wrong line."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    word = raw.strip().lower()
+    if word in _TRUTHY:
+        return True
+    if word in _FALSY:
+        return False
+    raise ValueError(f"{name} must be true or false (1/0, yes/no, on/off)")
+
+
+def _strict_int(name: str, default: int) -> int:
+    """`_int` that names the variable when it fails start-up: blank is the
+    default, a whole number (as `int()` reads it) is that number, and
+    anything else raises a `ValueError` naming `name`. The value is not
+    echoed, as in `_strict_bool`."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a whole number") from None
+
+
+def _iso_date(name: str) -> str:
+    """A calendar date written YYYY-MM-DD, or "" when unset; anything else
+    fails start-up. Kept as the text: its reader compares dates itself."""
+    import re
+    from datetime import date
+
+    value = (os.environ.get(name) or "").strip()
+    if not value:
+        return ""
+    try:
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+            raise ValueError
+        date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"{name} must be a date written YYYY-MM-DD, or empty") from None
+    return value
+
+
 def _controller_state_url(value: str) -> str:
     """`http://host:9838` → `http://host:9838/state`; a URL that already names
     a path is kept as given. Blank stays blank (the poller is off)."""
@@ -958,6 +1011,45 @@ class Settings:
             or "/run/sf-assistant-ask/ask.sock"
         )
         self.sf_assistant_token: str = os.environ.get("SF_ASSISTANT_TOKEN", "").strip()
+        # --- Salesforce conversation memory (design 2026-11-25 §15.1) -----
+        # Every switch is off by default, and with all of them at their
+        # defaults the platform behaves exactly as before: v1 calls to
+        # sf_assistant, no read or write of `sf_query_state`, no summary
+        # fold. A garbage value fails start-up, naming the variable
+        # (`_strict_bool`, `_strict_int`, `_iso_date`).
+        # The state lookup before an sf_assistant call, the contract-v2
+        # arguments, and the row written after the answer is stored
+        # (engines/sfk_bridge.py, app/sf_memory.py). Toggle-on turns only:
+        # the toggle-off guard refuses every other mode first.
+        self.sf_assistant_memory: bool = _strict_bool("SF_ASSISTANT_MEMORY", False)
+        # The resolver's window: whole (question, answer) pairs, newest first,
+        # within both caps, and never fewer turns than the v1 call sends.
+        # Contract v2 takes at most 12 recent turns, so the pairs are held to
+        # 1-6. Tokens are counted with context.estimate_tokens; the service
+        # applies its own cap again.
+        self.sf_assistant_memory_pairs: int = min(6, max(1, _strict_int("SF_ASSISTANT_MEMORY_PAIRS", 6)))
+        self.sf_assistant_memory_tokens: int = max(1, _strict_int("SF_ASSISTANT_MEMORY_TOKENS", 6000))
+        # The rolling Salesforce summary, folded in the background when a
+        # Salesforce pair leaves the window (app/sf_summary.py reads this
+        # exact name; anything but a real True leaves it off).
+        self.sf_assistant_summary: bool = _strict_bool("SF_ASSISTANT_SUMMARY", False)
+        # --- Chat retention (design 2026-11-25 §12; docs/retention.md) -------
+        # app/retention.py reads these exact names with getattr and bounds
+        # them itself: a batch setting is held to its range, and a period
+        # shorter than the approved one (180 / 30 days) is raised to it with
+        # a warning. Disabled by default; enabled alone is still a dry run.
+        self.chat_retention_enabled: bool = _strict_bool("CHAT_RETENTION_ENABLED", False)
+        self.chat_retention_dry_run: bool = _strict_bool("CHAT_RETENTION_DRY_RUN", True)
+        self.query_traces_retention_days: int = _strict_int("QUERY_TRACES_RETENTION_DAYS", 180)
+        self.chat_requests_retention_days: int = _strict_int("CHAT_REQUESTS_RETENTION_DAYS", 30)
+        self.chat_retention_batch: int = _strict_int("CHAT_RETENTION_BATCH", 1000)
+        self.chat_retention_max_batches: int = _strict_int("CHAT_RETENTION_MAX_BATCHES", 20)
+        # D9: orphan rows of the older Salesforce route. Not in the approved
+        # list, so off until the owner's word; a dry run counts them anyway.
+        self.chat_retention_old_route_orphans: bool = _strict_bool("CHAT_RETENTION_OLD_ROUTE_ORPHANS", False)
+        # D11: the day the pre-prune backup was taken. While it is more than
+        # 30 days old, each daily run logs a reminder to delete it.
+        self.chat_retention_backup_date: str = _iso_date("CHAT_RETENTION_BACKUP_DATE")
         # MAIN_MODEL_MAX_LEN is the new, explicit spelling and wins when set;
         # MODEL_MAX_CONTEXT remains the historical name so existing .env files
         # keep working. Both describe the SAME number and neither WIDENS the
