@@ -3798,9 +3798,12 @@ def _last_substantial_answer(turns: Sequence[dict]) -> Optional[int]:
 
 def material_from_history(history: Sequence[dict], *, max_chars: int = 24_000) -> str:
     """The conversation as the model should see it: role-tagged, newest last,
-    clipped from the OLD end so the recent turns survive."""
+    clipped from the OLD end so the recent turns survive. A toggle-off
+    placeholder (app/sf_isolation.py) is no material: a file never carries one."""
+    from ..sf_isolation import without_placeholders
+
     lines: List[str] = []
-    turns = list(history)
+    turns = without_placeholders(list(history))
     keep_index = _last_substantial_answer(turns)
     for index, turn in enumerate(turns):
         role = str(turn.get("role") or "user")

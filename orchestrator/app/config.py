@@ -7,7 +7,9 @@ the GPU, or any model runtime.
 from __future__ import annotations
 
 import os
+import re
 import sys
+from typing import Optional
 
 from .core.exports import EXPORT_ROW_CAP, PREVIEW_ROW_CAP
 from .model_capabilities import (
@@ -54,6 +56,27 @@ def _float(name: str, default: float) -> float:
     if raw is None or raw.strip() == "":
         return default
     return float(raw)
+
+
+#: Spellings of "off" for TOGGLE_OFF_DETECTOR_RULES (review R14: "none" read
+#: as rule E, "false" as A and E, "disabled" as A, B, D and E).
+_RULES_OFF = {"", "0", "off", "no", "none", "false", "disabled", "disable"}
+
+
+def _detector_rules(raw: Optional[str]) -> str:
+    """The toggle-off detector rules a value names: the letters A-D it holds,
+    in order, or "" for any spelling of off. E is not a switch (it is always
+    on) and any other character is ignored."""
+    value = (raw or "").strip()
+    if value.lower() in _RULES_OFF:
+        return ""
+    letters = {ch for ch in value.upper() if ch in "ABCD"}
+    return "".join(ch for ch in "ABCD" if ch in letters)
+
+
+def _id_set(raw: Optional[str]) -> frozenset:
+    """Ids listed in one setting, separated by commas or white space."""
+    return frozenset(part for part in re.split(r"[\s,]+", raw or "") if part)
 
 
 #: Settings the no-timeout /v1 design (revision 2, 2026-09-13) retired: each
@@ -1503,6 +1526,51 @@ class Settings:
         # for such questions — the forensic audit found an earlier answer
         # being repeated and cited against sources that did not contain it.
         self.recall_assistant_answers_for_facts: bool = _bool("RECALL_ASSISTANT_ANSWERS_FOR_FACTS", False)
+        # --- Toggle-off isolation (2026-11-25, app/sf_isolation.py) -------
+        # Owner order: with the Salesforce toggle OFF, no Salesforce answer,
+        # no answer written from one and no company people detail may reach
+        # the prompt. Read-time filters only; no stored row is changed. Off:
+        # every toggle-off read path behaves as before (answers made while it
+        # is off carry no `sf_isolation` stamp and count as tainted once it
+        # is back on, which only hides more). Also stops NEW Salesforce-mode
+        # questions and answers from being embedded for cross-chat recall.
+        self.toggle_off_isolation: bool = _bool("TOGGLE_OFF_ISOLATION", True)
+        # The code mask over a toggle-off chat answer and its reasoning: a
+        # phone or e-mail that appears nowhere in the prompt is masked
+        # (core/personal_details.py).
+        self.toggle_off_mask_personal_details: bool = _bool("TOGGLE_OFF_MASK_PERSONAL_DETAILS", True)
+        # Owner decision 1 (2026-11-25), in every mode: another person's
+        # phone, e-mail or address is never saved as a memory fact, and one
+        # already saved is masked before facts reach any prompt (facts.py).
+        # Its own switch since the review (R18): turning the answer mask off
+        # no longer turns this off too.
+        self.facts_block_third_party_contacts: bool = _bool("FACTS_BLOCK_THIRD_PARTY_CONTACTS", True)
+        # The prompt rule against invented personal details in every
+        # assistant-mode answering prompt (core/personal_details.py
+        # PERSONAL_DETAILS_RULE). A switch since the review (R10): the
+        # wording is not model-checked yet, so it can be rolled back without
+        # a deploy. Off = the assistant prompts exactly as before.
+        self.toggle_off_prompt_rule: bool = _bool("TOGGLE_OFF_PROMPT_RULE", True)
+        # Which "needs company records" rules may answer a toggle-off turn
+        # with a fixed reply (sf_isolation.needs_salesforce): A record
+        # lookup, B names the source, C person details by role, D follow-up
+        # on a hidden answer. Empty, "off", "none", "false", "0", "no" or
+        # "disabled" = all four off; any other character is ignored (R14).
+        # A quote of a hidden answer (E) is always answered with a fixed
+        # reply whatever this says (review F2): it is not a heuristic.
+        self.toggle_off_detector_rules: str = _detector_rules(os.environ.get("TOGGLE_OFF_DETECTOR_RULES", "ABCD"))
+        # How long a toggle-off turn waits for the chat's Salesforce state
+        # before it counts the read as failed (review R6). Seconds.
+        self.toggle_off_state_timeout_s: float = _float("TOGGLE_OFF_STATE_TIMEOUT_S", 2.0)
+        # Owner decision (data review F3, 2026-11-25): conversation ids that
+        # count as Salesforce-holding although no stored or server row says
+        # so (pre-guard toggle-off answers that repeat a Salesforce answer).
+        # Their unstamped answers are hidden on toggle-off turns, and cross-
+        # chat recall and new vectors leave them out. Read-time only; no row
+        # changes. The ids are deployment data, never repo data: empty here.
+        self.toggle_off_frozen_holding_chats: frozenset = _id_set(
+            os.environ.get("TOGGLE_OFF_FROZEN_HOLDING_CHATS", "")
+        )
         # The FLOOR on the blended score; the real gate is vector agreement
         # AND lexical overlap together (living_knowledge._topical). Measured
         # 2026-09-02: a true documentation match scores 0.44-0.61 here.

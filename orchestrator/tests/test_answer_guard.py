@@ -34,6 +34,7 @@ from app import main as app_main
 from app.core import answer_guard
 from app.core.answer_guard import AnswerGuard, normalize
 from app.main import _live_generations, app
+from app.config import settings
 
 
 def run_guard(text: str, piece: int = 4) -> Tuple[AnswerGuard, List[str], List[str]]:
@@ -889,8 +890,12 @@ def test_the_chat_engine_streams_an_ordinary_answer_in_the_models_own_pieces(scr
     # One call's budget, so continuation passes deltas straight through (a
     # continuable run re-chunks them at word boundaries — its own contract,
     # tested in test_continuation.py). What is under test is that the guard
-    # adds nothing and holds nothing.
+    # adds nothing and holds nothing. The toggle-off personal-details mask
+    # holds back the trailing word of a delta on purpose (an e-mail's local
+    # part may still be arriving), so it is off here; its own streaming
+    # contract is tests/test_personal_details_guard.py.
     monkeypatch.setattr(continuation, "budget_for", lambda effort: 8000)
+    monkeypatch.setattr(settings, "toggle_off_mask_personal_details", False)
     text = legit_jug_puzzle() + "\n\n" + legit_identical_sub_bullets()
     deltas = pieces(text, 3)
     scripted([(deltas, "stop")], reasoning=["thinking about jugs"])
@@ -974,7 +979,10 @@ def test_a_user_stop_during_a_hold_closes_the_stream_and_keeps_only_what_was_sho
     assert shown.count("Fill the bottle with hot water.") <= 2
 
 
-def test_the_chat_engine_never_guards_the_reasoning_stream(scripted):
+def test_the_chat_engine_never_guards_the_reasoning_stream(scripted, monkeypatch):
+    # The loop guard, that is: the personal-details mask does read reasoning
+    # (and re-chunks it), so it is off for this count.
+    monkeypatch.setattr(settings, "toggle_off_mask_personal_details", False)
     looping_thought = ["I should fill bottle 2 with hot water and pour it into bottle 1. "] * 60
     scripted([(["The ratio needs a reference volume."], "stop")], reasoning=looping_thought)
     answer, events = run_engine("think")

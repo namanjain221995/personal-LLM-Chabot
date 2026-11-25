@@ -90,7 +90,8 @@ _sites("conversation", _DB,
        "get_conversation", "conversation_owner", "create_conversation",
        "update_conversation", "list_conversations", "conversation_title_state",
        "set_generated_title", "delete_conversation", "oldest_user")
-_sites("history", _DB, "list_messages", "get_summary", "save_summary", "clear_summary")
+_sites("history", _DB, "list_messages", "get_summary", "save_summary", "clear_summary",
+       "salesforce_chat_state")
 _sites("message_write", _DB,
        "add_message", "replace_messages", "truncate_messages", "set_message_feedback")
 _sites("message_write", "app.main", "_overwrite_persisted_answer")
@@ -111,7 +112,7 @@ _sites("facts", _DB, "list_user_facts", "trusted_user_facts", "add_user_fact",
        "update_user_fact", "delete_user_fact")
 _sites("recall", _DB,
        "recall_conversations", "search_conversations", "fetch_message_embeddings",
-       "messages_missing_embeddings", "store_message_embeddings")
+       "messages_missing_embeddings", "store_message_embeddings", "salesforce_chat_ids")
 _sites("recall", "app.memory_semantic", "_embeddings_fingerprint")
 _sites("salesforce", _DB,
        "get_sf_conversation_state", "save_sf_conversation_state", "get_sf_intent",

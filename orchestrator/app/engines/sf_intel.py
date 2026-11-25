@@ -170,6 +170,7 @@ async def run(
     clarification_response: Optional[ClarificationResponse] = None,
     source_enabled: bool = True,
     use_planner: bool = True,
+    mode: str = "salesforce",
 ) -> Outcome:
     """Plan and, where possible, answer a Salesforce request.
 
@@ -186,7 +187,13 @@ async def run(
     second, parallel implementation that rendered a different card, could not
     resume, could not survive a reload, and re-asked its own question forever
     when `CLARIFY_MODE=always` was set.
+
+    `mode` is the request's mode, passed by main.py: anything but
+    "salesforce" is handed back untouched, before any state is read
+    (toggle-off isolation, 2026-11-25).
     """
+    if mode != "salesforce":
+        return Outcome(handled=False)
     run_id = uuid.uuid4().hex[:12]
     phase = _Phases(emit, run_id)
     state = await sf_state.load_state(conversation_id)

@@ -50,6 +50,7 @@ from .uploads import router as uploads_router
 from .memory import memory
 from . import metrics as _latency_metrics
 from . import fast_lane
+from . import sf_isolation
 from . import sse as _sse
 from .sse import HEARTBEAT_SECONDS, STREAMED_EVENTS as _STREAMED_EVENTS, sse_comment, sse_event
 
@@ -1817,6 +1818,11 @@ class LiveGeneration:
         self.intent_id: Optional[str] = None
         self.attempt: int = 1
         self.persisted = False
+        # The mode the turn runs in (after the feature gate). Written onto
+        # every assistant row the server stores for it, failure records
+        # included, so a stopped or failed Salesforce answer never depends
+        # on request rows that expire (toggle-off isolation, review F4).
+        self.mode: Optional[str] = None
         # 2026-09-13: the tree position the request asked this answer to be
         # stored under (ChatRequest.answer_branch), written onto the stored
         # row's meta.branch. None = an ordinary send, stored exactly as before.
@@ -2587,13 +2593,16 @@ async def _finalize_generation(conv_key: str, gen: LiveGeneration) -> None:
         # best-effort (a storage failure must not take the process down), but
         # audible.
         try:
+            final_meta = gen.final_meta
+            if getattr(gen, "mode", None) and not (final_meta or {}).get("mode"):
+                final_meta = {**(final_meta or {}), "mode": gen.mode}  # review F4
             stored = await db.run_in_thread(
                 db.add_message,
                 gen.user_id,
                 gen.conversation_id,
                 "assistant",
                 gen.answer,
-                gen.final_meta,
+                final_meta,
             )
             if stored is None:
                 logging.getLogger(__name__).warning(
@@ -2672,7 +2681,11 @@ class ChatRequest(BaseModel):
     image_refs: Optional[List[str]] = Field(default=None, fail_fast=True)
     # --- V2 optional fields (defaults preserve v1 behavior) ---
     conversation_id: Optional[str] = None
-    mode: Literal["salesforce", "assistant"] = "salesforce"
+    # "assistant" since 2026-11-25 (toggle-off isolation G6; was "salesforce",
+    # fail-open). The browser always names the mode it is in; a client that
+    # names none gets the toggle-off assistant, and sf_assistant already read
+    # an unnamed mode as off (engines/sfk_bridge.py).
+    mode: Literal["salesforce", "assistant"] = "assistant"
     model: Literal["smart", "fast"] = "smart"
     effort: Literal[
         "fast", "think", "max", "low", "medium", "high", "extra_high"
@@ -3754,6 +3767,9 @@ async def _store_failure(gen: "LiveGeneration", partial: str, *, resumable: bool
         "generation_id": gen.generation_id,
         "intent_id": gen.intent_id,
         "attempt": gen.attempt,
+        # The turn's mode (review F4): a failed Salesforce answer is a
+        # Salesforce answer by its own meta, not only by request rows.
+        **({"mode": gen.mode} if getattr(gen, "mode", None) else {}),
         # Under the same tree position as the answer a retry will store, so
         # the browser reads the record as that answer's failed attempt, not
         # as a version of its own (frontend/lib/branching.ts buildTree).
@@ -3884,6 +3900,8 @@ async def _store_answer(gen: "LiveGeneration") -> None:
         return
     meta = dict(gen.final_meta or {})
     meta.setdefault("generation_id", gen.generation_id)
+    if getattr(gen, "mode", None):
+        meta.setdefault("mode", gen.mode)  # review F4
     if gen.answer_branch:
         # The request said where this answer belongs in the conversation tree
         # (a "Try again", an edit): store it THERE. Without it the row attaches
@@ -3916,6 +3934,12 @@ async def _store_answer(gen: "LiveGeneration") -> None:
                 meta,
             )
             # An in-place content edit: the fingerprint cannot see it.
+            _invalidate_cross_chat_recall(gen.user_id)
+        elif sf_isolation.enabled() and sf_isolation.meta_says_salesforce(meta):
+            # A Salesforce answer makes its chat Salesforce-holding, which the
+            # toggle-off cross-chat read leaves out whole. The candidate cache
+            # is fingerprinted on vectors only and would keep serving the
+            # chat's rows and title until the next one is written (C22).
             _invalidate_cross_chat_recall(gen.user_id)
     except Exception as exc:  # noqa: BLE001 — best-effort, but never silent
         log.warning(
@@ -4247,6 +4271,12 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         "Analyze the attached image." if (request.image_data or request.image_refs) else ""
     )
 
+    # Toggle-off isolation: whether this turn's answer may carry the
+    # `sf_isolation` stamp. Cleared when the chat's Salesforce state could not
+    # be read and the turn went ahead unredacted (a member without Salesforce,
+    # design C16): such an answer is never counted clean later.
+    isolation_stamp = {"ok": True}
+
     def meta_extras(route: Optional[str]) -> dict:
         """V2 §2: meta gains mode / model (served model id) / effort — merged
         in centrally so the engines keep emitting their v1 shapes untouched.
@@ -4259,6 +4289,12 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         default effort per spec §8.
         """
         extras: dict = {"mode": request.mode}
+        if request.mode == "assistant" and sf_isolation.enabled() and isolation_stamp["ok"]:
+            # Toggle-off isolation (C1): this answer was written under the
+            # guard, from a prompt with no Salesforce content. Only the stamp
+            # tells it from a toggle-off answer written before the guard,
+            # after a Salesforce answer — `created_at` is reset by every PUT.
+            extras["sf_isolation"] = 1
         if route == "vision":
             # 2026-08-28: this used to say "no effort key: N/A", on the
             # belief that the vision model had no effort knob. It does — the
@@ -4326,8 +4362,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     client_intent = request.intent_id is not None
     intent_id = request.intent_id or uuid.uuid4().hex
     snapshot, resumable = _request_snapshot(request)
-    # Did the client SAY which mode? The request model defaults to "salesforce",
-    # and the feature gate below assigns `request.mode`, which puts it in
+    # Did the client SAY which mode? The request model has a default ("assistant"
+    # since 2026-11-25), and the feature gate below assigns `request.mode`, which puts it in
     # `model_fields_set` for every request, so this is the last place to ask.
     mode_sent = "mode" in request.model_fields_set
 
@@ -4465,6 +4501,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
 
     gen = LiveGeneration(request.conversation_id, viewer)
     gen.intent_id = intent_id
+    gen.mode = request.mode
     gen.answer_branch = request.answer_branch
     gen.effort = str(request.effort or "")
     # ONE commit for acceptance (2026-09-14): a NEW intent is written as
@@ -4491,6 +4528,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
     resumed = False
     if row is not None:
         gen.request_status = "running"
+    if request.mode == "salesforce" and request.conversation_id and sf_isolation.enabled():
+        # A Salesforce-mode turn makes its chat Salesforce-holding from now
+        # on, answer stored or not (review F1): the cached set the toggle-off
+        # cross-chat reads leave out is read again.
+        sf_isolation.note_salesforce_chat(viewer, request.conversation_id)
     if row is None:
         known = await db.run_in_thread(db.get_chat_request, intent_id)
         if (
@@ -4679,6 +4721,11 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 "request_id": query_trace.request_id,
                 "intent_id": intent_id,
                 "attempt": gen.attempt,
+                # The browser's copy of an answer stopped before its final
+                # meta is stored with this meta alone: with the mode, a
+                # stopped Salesforce answer says what it is for good
+                # (toggle-off isolation, review F1/F4).
+                "mode": request.mode,
                 **({"test_case_id": request.test_case_id} if request.test_case_id else {}),
             },
         )
@@ -5018,6 +5065,28 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
         # (app/identity.py). An account WITH a name reads nothing extra.
         from . import identity as _identity
 
+        # TOGGLE-OFF ISOLATION (app/sf_isolation.py, owner order 2026-11-25):
+        # the chat's Salesforce state is read, and the history rewritten, in
+        # one worker thread that starts HERE, beside the identity bind and
+        # the trace start, and is awaited where the history is used below
+        # (review R7/R8).
+        sf_guard = request.mode == "assistant" and sf_isolation.enabled()
+        sf_history_in = request.history_messages or memory.history(
+            scoped_session, exclude_salesforce=sf_guard
+        )
+        sf_has_toggle = feature_access.allowed(principal.features, feature_access.Feature.SALESFORCE)
+        sf_prepare_task: Optional[asyncio.Future] = None
+        if sf_guard and request.conversation_id:
+            sf_prepare_task = asyncio.ensure_future(
+                sf_isolation.prepare(
+                    viewer,
+                    request.conversation_id,
+                    sf_history_in,
+                    text,
+                    fail_closed=sf_has_toggle,
+                )
+            )
+            sf_prepare_task.add_done_callback(lambda t: t.cancelled() or t.exception())
         await _identity.bind_identity(
             str(signed_in.get("display_name") or signed_in.get("username") or ""),
             str(signed_in.get("email") or ""),
@@ -5058,7 +5127,35 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # off for this account, and the answer that follows is the
                 # downgraded one. Said once per turn, never as an error.
                 await emit("status", {"text": access_notice})
-            history = request.history_messages or memory.history(scoped_session)
+            # TOGGLE-OFF ISOLATION (app/sf_isolation.py, owner order 2026-11-25):
+            # with the Salesforce toggle off, no Salesforce answer and nothing
+            # written from one reaches this turn. The history is rewritten HERE,
+            # at its single source, so the lane, the pre-passes, search query
+            # rewriting, research, the agent, artifacts and every engine get the
+            # redacted list. Stored rows decide, never the browser.
+            history = sf_history_in
+            sf_state: Optional[sf_isolation.ChatState] = None
+            sf_hidden = sf_isolation.Hidden()
+            # "Ask about this" folds its quote into THIS text: kept out unless
+            # it is clean text of this chat (review F3).
+            sf_quote_hidden = False
+            if sf_prepare_task is not None:
+                prepared = await sf_prepare_task
+                sf_state = prepared.state
+                history, sf_hidden = prepared.history, prepared.hidden
+                sf_quote_hidden = prepared.quote_hidden
+                sf_isolation.record(sf_hidden)
+                if sf_state.read_failed and not sf_state.has_salesforce:
+                    isolation_stamp["ok"] = False
+            # A Salesforce-holding chat on a toggle-off turn: the shared summary,
+            # the folded chunks and compaction are not read or written (G3).
+            sf_holding = bool(sf_state is not None and sf_state.has_salesforce)
+            sf_unchecked = bool(sf_state is not None and sf_state.read_failed)
+            if sf_holding and sf_state.announce:
+                await emit(
+                    "status",
+                    {"text": sf_isolation.STATUS_LINE_UNCHECKED if sf_unchecked else sf_isolation.STATUS_LINE},
+                )
             # What this turn and its earlier user turns PASTED (hotfix 1.2,
             # P6). Scoped to this task like the notifier above, so every
             # engine's web query - however deep - is checked against it in
@@ -5177,12 +5274,97 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             def read_artifacts():
                 from .engines import artifact as _artifact_engine
 
-                return db.run_in_thread(_artifact_engine.adb.list_artifacts, viewer, conv_key)
+                # A toggle-off turn never sees a file a Salesforce-mode job made
+                # (G5). Passed only when set, so the Salesforce-mode call is
+                # exactly the one it always was.
+                return db.run_in_thread(
+                    _artifact_engine.adb.list_artifacts,
+                    viewer,
+                    conv_key,
+                    **({"exclude_salesforce": True} if sf_guard else {}),
+                )
+
+            # "NEEDS COMPANY RECORDS" (toggle-off isolation G7). A toggle-off
+            # turn that asks for records, names Salesforce as its source, asks
+            # for a person's details by company role, follows up on a hidden
+            # answer or quotes one gets a fixed reply. Decided HERE, before any
+            # context read starts and before any model call of the turn: the
+            # reads, every pre-pass, the planner, search, the artifact gate and
+            # compaction are gated on `toggle_off_block is None` below, so a
+            # blocked turn starts no read and no embedding. Only a match of
+            # A, B or C reads the person's own material, once. A small-talk
+            # lane turn is blocked only for a quote of kept-out text (E, F2).
+            toggle_off_block: Optional[sf_isolation.Block] = None
+            if sf_guard and text and (not lane.entered or sf_quote_hidden):
+                toggle_off_block = sf_isolation.needs_salesforce(
+                    text,
+                    hidden=sf_hidden,
+                    last_assistant=next(
+                        (
+                            str(m.get("content") or "")
+                            for m in reversed(history)
+                            if m.get("role") == "assistant"
+                        ),
+                        "",
+                    ),
+                    attachments=bool(
+                        request.pdf_data
+                        or request.pdf_uploads
+                        or request.video_uploads
+                        or request.image_data
+                        or request.image_refs
+                    ),
+                    quote_hidden=sf_quote_hidden,
+                    # No toggle to offer: no records reply (review R5).
+                    has_toggle=sf_has_toggle,
+                    # The rows could not be read: no claim about them (R6).
+                    unchecked=sf_unchecked,
+                )
+                if toggle_off_block is not None and toggle_off_block.rule in ("A", "B", "C"):
+                    # ...unless this chat holds material of the person's own:
+                    # "how many candidates joined in March" about an Excel they
+                    # uploaded two turns ago is the dataset route's (C12). Read
+                    # once: the rows are handed to the reads below (R16).
+                    _own_prefetched: dict = {}
+                    for _own_key, _own_reader in (
+                        ("uploads", read_uploads),
+                        ("documents", read_documents),
+                        ("url_documents", read_url_documents),
+                        ("artifacts", read_artifacts),
+                    ):
+                        try:
+                            _own_rows = await _own_reader()
+                        except Exception:  # noqa: BLE001 — an unreadable store is no material
+                            continue
+                        _own_prefetched[_own_key] = _own_rows
+                        if _own_rows:
+                            toggle_off_block = None
+                            break
+
+                    def _prefetched_reader(key, reader):
+                        def run():
+                            if key in _own_prefetched:
+                                done = asyncio.get_running_loop().create_future()
+                                done.set_result(_own_prefetched.pop(key))
+                                return done
+                            return reader()
+
+                        return run
+
+                    read_uploads = _prefetched_reader("uploads", read_uploads)
+                    read_documents = _prefetched_reader("documents", read_documents)
+                    read_url_documents = _prefetched_reader("url_documents", read_url_documents)
+                    read_artifacts = _prefetched_reader("artifacts", read_artifacts)
+                if toggle_off_block is not None:
+                    sf_isolation.record_block(toggle_off_block)
+                    # A blocked turn writes no saved fact (its quote, if any,
+                    # is kept-out text).
+                    _release_facts(False)
 
             if reads.concurrent and request.text and lane.entered:
                 # The saved facts are the one read a greeting can use.
                 reads.start("facts", read_facts)
-            elif reads.concurrent and request.text:
+            elif reads.concurrent and request.text and toggle_off_block is None:
                 if request.mode == "assistant":
                     reads.start("facts", read_facts)
                     reads.start("cross_chat", read_cross_chat)
@@ -5227,7 +5409,13 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     and feature_access.allowed(principal.features, feature_access.Feature.ARTIFACTS)
                 ):
                     reads.start("artifacts", read_artifacts)
-            if reads.concurrent and request.conversation_id and not lane.entered:
+            if (
+                reads.concurrent
+                and request.conversation_id
+                and not lane.entered
+                and not sf_holding
+                and toggle_off_block is None
+            ):
                 reads.start("recall", read_recall)
                 reads.start("summary", read_summary)
             auto_web_search_allowed = request.mode == "assistant"
@@ -5282,6 +5470,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.pdf_data
                 and not request.image_data
                 and auto_web_search_allowed
+                and toggle_off_block is None
             )
 
             # THE PER-USER SEARCH WINDOW (engines/search.py, 10 a minute).
@@ -5316,6 +5505,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # A small-talk lane turn never searches, so it must not spend
                 # a slot of the per-user search rate limit either.
                 and not lane.entered
+                # Nor does a turn answered with a toggle-off fixed reply.
+                and toggle_off_block is None
             )
             search_room = _search_engine.rate_peek(user_key) if search_gate else True
             search_allowed = search_policy and search_room
@@ -5377,6 +5568,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.agent
                 and not deep_research_on
                 and not lane.entered
+                and toggle_off_block is None
             )
             # THINK AND MAX START THE PRE-PASS BESIDE decide() (2026-09-29).
             # decide() is a router round trip at those efforts — live traces
@@ -5433,6 +5625,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.image_data
                 and not request.video_uploads
                 and not request.agent
+                and toggle_off_block is None
             ):
                 from .engines.orchestrate import allowances as _allowances, decide
 
@@ -5487,7 +5680,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 elif wanted:
                     await _say_search_refused()
 
-            if request.deep_research and not deep_research_on:
+            if request.deep_research and not deep_research_on and toggle_off_block is None:
                 await emit(
                     "status",
                     {"text": "Deep Research is unavailable here — answering normally."},
@@ -5563,7 +5756,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # event is written, so it reads against the 2026-09-13 baseline
             # (MODE_RESOLVED -> CONTEXT_ASSEMBLED, p50 209 ms).
             assembly_started = _perf_counter()
-            if signed_in is not None and request.text:
+            # A fixed-reply turn reads no memory into a prompt nobody will
+            # send, and writes no saved fact.
+            if signed_in is not None and request.text and toggle_off_block is None:
                 user_id = int(signed_in["id"])
                 if request.mode == "assistant":
                     # V10 cross-chat memory — normal chat only, by request:
@@ -5688,6 +5883,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not request.image_data
                 and github_ref is None
                 and not lane.entered
+                # A fixed-reply turn retrieves nothing (the site hits embed).
+                and toggle_off_block is None
             ):
                 from .core.urls import (
                     extract_urls as _extract_for_crawl,
@@ -5900,7 +6097,13 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                         },
                         *history,
                     ]
-                    if not deep_research_on and not request.agent and not github_ref and not url_list:
+                    if (
+                        not deep_research_on
+                        and not request.agent
+                        and not github_ref
+                        and not url_list
+                        and toggle_off_block is None
+                    ):
                         video_followup = await video_engine.is_about_video(
                             request.text, conversation_videos
                         )
@@ -5933,7 +6136,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # along: the V44 store fallback takes only a picture on it, never
             # one on a branch the person edited away.
             image_followup = image_memory.Followup()
-            if conv_key and not lane.entered and not request.images_data:
+            if conv_key and not lane.entered and not request.images_data and toggle_off_block is None:
                 await image_memory.hydrate(
                     conv_key,
                     viewer,
@@ -5955,6 +6158,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and not github_ref
                 and not url_list
                 and not lane.entered
+                and toggle_off_block is None
             ):
                 image_followup = image_memory.followup(
                     conv_key, request.text, viewer
@@ -5999,7 +6203,17 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # A lane turn's prompt is the last two exchanges (engines/chat.py),
             # so there is nothing for compaction to fit; the background
             # compaction after the answer still runs as for every turn.
-            if signed_in is not None and request.conversation_id and not lane.entered:
+            # A toggle-off turn in a Salesforce-holding chat skips the WHOLE
+            # block (G3): `reads.get` would run the recall and summary readers
+            # itself, and the shared summary holds the Salesforce turns.
+            # `context.fit_request` still clips the redacted history.
+            if (
+                signed_in is not None
+                and request.conversation_id
+                and not lane.entered
+                and not sf_holding
+                and toggle_off_block is None
+            ):
                 from . import compaction
 
                 base_url, _key, model_id = llm.resolve_model_choice(request.model)
@@ -6267,6 +6481,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                             clarification_response=answer_to_pending,
                             source_enabled=True,
                             use_planner=settings.salesforce_intelligence_enabled,
+                            mode=request.mode,
                         )
                     # --- NEW SALESFORCE PIPELINE (cutover) END ---
                     # --- AS3 intent-capability BEGIN ---
@@ -6435,6 +6650,8 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 # fast_lane.decide already read the text with the strictest
                 # setting (has_artifacts=True) and found no file request.
                 and not lane.entered
+                # A toggle-off fixed reply: no gate, and no classifier hook.
+                and toggle_off_block is None
             ):
                 from .artifacts import describe as _as3_describe
                 from .artifacts import intent as artifact_intent_rules
@@ -6480,10 +6697,12 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 ))
                 _as3_answer_idx = artifact_intent_rules.substantial_answer_index(history)
                 if _as3_answer_idx is None:
+                    # A toggle-off placeholder is no answer to make a file from.
                     _as3_answer_idx = next(
                         (i for i in range(len(history) - 1, -1, -1)
                          if str(history[i].get("role")) == "assistant" and not artifact_intent_rules.is_artifact_turn(history[i])
-                         and artifact_intent_rules.turn_text(history[i]).strip()),
+                         and artifact_intent_rules.turn_text(history[i]).strip()
+                         and not sf_isolation.is_placeholder(history[i].get("content"))),
                         None,
                     )
                 _as3_last_is_card = artifact_intent_rules.last_turn_is_artifact(history)
@@ -6617,7 +6836,14 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     await emit("status", {"text": "Reading the attached image…"})
                     _as3_image_read = await _as3_img_material.read_images_text(request.images_data, _as3_img_names)
 
-            if sf_outcome is not None and sf_outcome.handled:
+            if toggle_off_block is not None:
+                # TOGGLE-OFF FIXED REPLY (G7): a constant, no model. One token,
+                # one meta, as the visual refusal below; stored as usual with
+                # meta.mode='assistant' and the isolation stamp.
+                answer = toggle_off_block.reply
+                await emit("token", {"text": answer})
+                await emit("meta", toggle_off_block.meta())
+            elif sf_outcome is not None and sf_outcome.handled:
                 # Salesforce Intelligence Mode answered, or asked a question and
                 # is now waiting. Either way it already emitted its tokens and
                 # its single meta; there is nothing left for the chain below.
@@ -7142,7 +7368,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     effort=request.effort,
                     grounding=prepared.grounding,
                 )
-            else:
+            elif request.mode == "salesforce":
                 state = await get_graph().ainvoke(
                     {
                         "message": text,
@@ -7155,6 +7381,24 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                     }
                 )
                 answer = state.get("answer") or ""
+            else:
+                # Defence in depth (G6): only a Salesforce-mode turn may reach
+                # the Salesforce router. Unreachable while `mode` is the
+                # two-value Literal; never raises if that ever changes.
+                from .engines.chat import run_chat_engine
+
+                logging.getLogger(__name__).warning(
+                    "a %r turn reached the Salesforce router; answered in assistant mode",
+                    str(request.mode)[:40],
+                )
+                answer = await run_chat_engine(
+                    text,
+                    history,
+                    emit,
+                    mode="assistant",
+                    model_choice=request.model,
+                    effort=request.effort,
+                )
             if knowledge_task is not None and not knowledge_task.done():
                 # Another engine answered; the speculative lookup is moot.
                 knowledge_task.cancel()
@@ -7171,6 +7415,7 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
                 and settings.artifacts_enabled
                 and request.text
                 and _as3_route in ("chat", "agent", "dataset", "vision")
+                and toggle_off_block is None
                 and not (artifact_intent is not None and artifact_intent.wants_file)
                 and feature_access.allowed(principal.features, feature_access.Feature.ARTIFACTS)
                 and isinstance(answer, str)
@@ -7279,7 +7524,9 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # Not an sf_assistant answer: this memory is read when a client sends
             # no turns, and it holds no stamp for the web block to see.
             if (gen.final_meta or {}).get("engine") != "sf_assistant":
-                memory.add_exchange(scoped_session, text, answer)
+                # With its mode, so a toggle-off turn of a client that sends
+                # no turns never reads a Salesforce exchange back (G2b).
+                memory.add_exchange(scoped_session, text, answer, mode=request.mode)
             # Durable BEFORE `done`: the row says 'completed' only once the
             # answer is in history, so a status poll that follows the
             # terminal event never reads "completed, nothing persisted".
@@ -7329,8 +7576,10 @@ async def chat(request: ChatRequest, http_request: Request) -> StreamingResponse
             # needs a synchronous one. Deliberately NOT awaited — the SSE
             # stream stays open until this worker returns, so awaiting it here
             # would make the user wait for the very thing that is supposed to
-            # be invisible.
-            if signed_in is not None and request.conversation_id:
+            # be invisible. Not from a toggle-off turn in a Salesforce-holding
+            # chat (G3): folding its redacted turns into the shared summary
+            # would take real content out of what Salesforce mode reads.
+            if signed_in is not None and request.conversation_id and not sf_holding:
                 from . import compaction
 
                 base_url, _key, model_id = llm.resolve_model_choice(request.model)

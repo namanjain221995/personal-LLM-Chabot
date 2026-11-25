@@ -269,6 +269,21 @@ def _normalised(content: Optional[str]) -> str:
     return " ".join((content or "").lower().split())
 
 
+def _candidate_key(
+    user_id: int, model_id: str, exclude_conversation_id: Optional[str], limit: int
+) -> tuple:
+    """The cache key of one candidate read. The toggle-off isolation flag
+    decides which rows the read returns (db.fetch_message_embeddings leaves out
+    chats that hold a Salesforce answer), so a flip never serves the other set."""
+    return (
+        user_id,
+        model_id,
+        exclude_conversation_id or "",
+        int(limit),
+        bool(getattr(settings, "toggle_off_isolation", True)),
+    )
+
+
 def _load_candidates(
     user_id: int, model_id: str, exclude_conversation_id: Optional[str], limit: int
 ) -> List[dict]:
@@ -285,7 +300,7 @@ def _load_candidates(
 
     if ttl <= 0:
         return fetch()
-    key = (user_id, model_id, exclude_conversation_id or "", int(limit))
+    key = _candidate_key(user_id, model_id, exclude_conversation_id, limit)
     with _candidate_lock:
         generation = _generation(user_id)
     fingerprint = _embeddings_fingerprint(user_id, model_id, exclude_conversation_id or "")
@@ -345,7 +360,7 @@ def _cached_candidates_nonempty(
     ttl = float(getattr(settings, "cross_chat_embeddings_cache_s", CROSS_CHAT_EMBEDDINGS_CACHE_S))
     if ttl <= 0:
         return False
-    key = (user_id, model_id, exclude_conversation_id or "", int(limit))
+    key = _candidate_key(user_id, model_id, exclude_conversation_id, limit)
     now = time.monotonic()
     with _candidate_lock:
         hit = _candidate_cache.get(key)
@@ -869,6 +884,14 @@ async def cross_chat_block(
         semantic = [h for h in semantic if (h.get("role") or "").lower() != "assistant"]
     keyword: List[dict] = []
     if keywords(query):
+        # This block is the toggle-off (assistant-mode) reader: a chat that
+        # holds a Salesforce answer is left out whole (app/sf_isolation.py).
+        # Passed only when set, as `pairing` above.
+        isolation = (
+            {"exclude_salesforce_chats": True}
+            if getattr(settings, "toggle_off_isolation", True)
+            else {}
+        )
         try:
             keyword = await db.run_in_thread(
                 db.recall_conversations,
@@ -876,6 +899,7 @@ async def cross_chat_block(
                 keywords(query),
                 exclude_conversation_id,
                 keyword_limit,
+                **isolation,
             )
         except Exception:
             log.warning("keyword recall failed", exc_info=True)

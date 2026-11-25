@@ -288,15 +288,32 @@ def get_artifact(artifact_id: str, user_id: int) -> Optional[dict]:
     return _artifact_row(row) if row else None
 
 
-def list_artifacts(user_id: int, conversation_id: Optional[str] = None, limit: int = 100) -> List[dict]:
+def list_artifacts(
+    user_id: int,
+    conversation_id: Optional[str] = None,
+    limit: int = 100,
+    *,
+    exclude_salesforce: bool = False,
+) -> List[dict]:
     """The caller's artifacts, newest first, each with its CURRENT published
     version under `current` (None while the first version is still being
-    made). Filtered to one conversation when given."""
+    made). Filtered to one conversation when given.
+
+    `exclude_salesforce=True` (a toggle-off turn, app/sf_isolation.py) leaves
+    out every artifact any of whose jobs ran in Salesforce mode
+    (`artifact_jobs.mode`, written by the server from the request): every
+    version counts, so a file first made with the toggle off and later edited
+    with it on is left out too."""
     where = "a.user_id = %s"
     params: List[Any] = [int(user_id)]
     if conversation_id is not None:
         where += " AND a.conversation_id = %s"
         params.append(conversation_id)
+    if exclude_salesforce:
+        where += (
+            " AND NOT EXISTS (SELECT 1 FROM artifact_jobs j"
+            " WHERE j.artifact_id = a.id AND j.mode = 'salesforce')"
+        )
     params.append(int(limit))
     with core.connection() as con:
         rows = con.execute(
