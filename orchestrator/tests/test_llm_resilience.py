@@ -716,7 +716,7 @@ def test_an_error_chunk_carrying_vllms_own_4xx_is_malformed_not_engine_death():
 
     chunk_4xx = openai.APIError(
         "prompt exceeds the model's maximum context",
-        request=None,
+        request=_REQ,
         body={"error": {"message": "too long", "type": "BadRequestError", "code": 400}},
     )
     assert resilience.error_chunk_is_client_error(chunk_4xx)
@@ -724,13 +724,13 @@ def test_an_error_chunk_carrying_vllms_own_4xx_is_malformed_not_engine_death():
     assert resilience.failure_reason(chunk_4xx) == "malformed"
 
     dying = openai.APIError(
-        "EngineCore encountered an issue", request=None,
+        "EngineCore encountered an issue", request=_REQ,
         body={"error": {"message": "EngineDeadError", "type": "InternalServerError", "code": 500}},
     )
     assert not resilience.error_chunk_is_client_error(dying)
     assert resilience.is_recoverable(dying)
     assert resilience.failure_reason(dying) in ("engine_dead", "worker_lost")
 
-    bare = openai.APIError("connection lost mid-stream", request=None, body=None)
+    bare = openai.APIError("connection lost mid-stream", request=_REQ, body=None)
     assert not resilience.error_chunk_is_client_error(bare)
     assert resilience.is_recoverable(bare)
