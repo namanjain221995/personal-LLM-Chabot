@@ -82,6 +82,29 @@ stored line break reads as a space in a cell), the contact rule runs on the stor
 ``code_tables`` (counts) and ``table_blocks`` (each table line's rows as they stand in the answer, for the merge call).
 With ``model`` nothing of this runs.
 
+Display words (prerequisite P3 of 2026-11-25, ``agent.display``): the pipeline passes the question without its display
+words (what to fetch) and the :class:`~sf_assistant.agent.display.Display` flags (``display=``) to :meth:`RecordSession.
+route`, :meth:`~RecordSession.triage` and :meth:`~RecordSession.ask`: the chart overrule and the chart note read the
+flags, and a table, detail, summary, breakdown or file flag appends the display note (``display.note``) after the chart
+note. With ``SFA_CHARTS`` on, :meth:`~RecordSession.ask` also gets the typed question (``typed=``): the record agent's
+user message keeps the person's display words ("plot X of last 6 months"; pre-release fix of 2026-11-25), while the
+triage, the tools' ``begin_question``, the hints and the draft checks read the search text. Without ``display`` (any
+other caller) the text is read as before.
+
+Records retry (prerequisite P2 of 2026-11-25): a records-routed (or chart-overruled) question that is no people question
+gets ONE forced round (``tool_choice`` "required", ``RECORDS_TOOLS_FORCED_MESSAGE``) when its first draft ran no record
+tool (at the require-tools nudge, in place of its text) or, at the first draft check, when no tool has run or every
+call failed (``RECORDS_ALL_FAILED_MESSAGE``; never after a not-found, refusal or engine code, :func:`retry_kind`), or
+when only ``describe_fields`` / the sync status ran and the draft states numbers the question does not hold
+(``RECORDS_RUN_QUERY_MESSAGE``). A NO_RECORDS draft is forced only after a RECORDS route and never on a chart question
+(the chart note asks for NO_RECORDS when nothing is named to count). With no tool run, the draft check sends
+``RECORDS_REQUIRE_TOOLS_MESSAGE`` where it sent the final-form message ("from the tool results above" pushed the model
+to answer with no data). Review fixes of 2026-11-25: the forced round counts no draft (the draft after it gets the full
+:meth:`RecordSession.check_draft`), there is no second retry message once it is spent, a forced NO_RECORDS draft whose
+round read no data keeps its NO_RECORDS (the knowledge answer), and numbers that still rest on no data call are no
+answer. The answer then carries ``no_data`` ("no_call" / "all_failed") and ``tool_retry``; the pipeline writes the
+clarifying question from them (``agent.clarify``).
+
 Record data must stay on this machine: a session refuses any endpoint that is not localhost.
 
 Module layout (stage-1 split of okrec/session.py): this module keeps :class:`RecordSession`, ``ROUTE_HERE``,
@@ -113,8 +136,10 @@ from sf_assistant.tools import record_base as _record_base        # MAX_PEOPLE: 
 from sf_assistant.agent.knowledge_agent import AgentResult, answer_question
 from sf_assistant.agent.question import Question
 from sf_assistant.config import LIMITS, charts_settings, tables_settings
+from sf_assistant.agent import display as _display                # the display words (prerequisite P3)
 from sf_assistant.agent.record_prompts import (
-    NAMES_SYSTEM, NO_RECORDS, RECORDS, RECORDS_FINAL_FORM_MESSAGE, RECORDS_FORCE_ANSWER_MESSAGE,
+    NAMES_SYSTEM, NO_RECORDS, RECORDS, RECORDS_ALL_FAILED_MESSAGE, RECORDS_FINAL_FORM_MESSAGE,
+    RECORDS_FORCE_ANSWER_MESSAGE, RECORDS_TOOLS_FORCED_MESSAGE,
     RECORDS_NOT_FOUND_MESSAGE, RECORDS_PEOPLE_REQUIRE_TOOLS_MESSAGE, RECORDS_PERSON_NO_RECORDS_MESSAGE,
     RECORDS_OTHER_PEOPLE_LINE, RECORDS_REQUIRE_TOOLS_MESSAGE, RECORDS_RUN_QUERY_MESSAGE, RECORDS_UNSUPPORTED_MESSAGE,
     RECORDS_VALUE_NO_RECORDS_MESSAGE, ROUTE_SYSTEM, render_records_system)
@@ -125,9 +150,9 @@ from sf_assistant.prompts import fill as _fill
 
 # What the record agent itself uses from the modules the stage-1 split made of okrec/session.py.
 from sf_assistant.agent.checks import (
-    _TextToolCalls, _is_no_records, _is_source_line, audit_numbers, draft_needs_final_form, drop_ref_codes,
-    drop_tool_talk, drop_unsupported, drop_working_sentences, facts_json, reference_codes, strip_reasoning,
-    strip_thinking)
+    ENGINE_CODES, NOT_FOUND_CODES, REFUSAL_CODES, _error_code, _TextToolCalls, _is_no_records, _is_source_line,
+    audit_numbers, draft_needs_final_form, drop_ref_codes, drop_tool_talk, drop_unsupported, drop_working_sentences,
+    facts_json, numbers_in, reference_codes, strip_reasoning, strip_thinking)
 from sf_assistant.agent.results import RecordAnswer
 from sf_assistant.agent.nudges import (
     _counted_objects, _has_name, _name_missing, _no_data_but_not_found, _norm_label, _norm_text, _unsynced_nudges,
@@ -187,13 +212,74 @@ def is_local_endpoint(base_url: str) -> bool:
     return (host or "").lower() in LOCAL_HOSTS
 
 
-def _chart_note(question: str) -> str:
+def _chart_note(question: str, display: Any = None) -> str:
     """The end of the record agent's system prompt for a chart question (``agent.charts.note_for``); "" otherwise, and
-    with ``SFA_CHARTS`` off, which imports nothing."""
+    with ``SFA_CHARTS`` off, which imports nothing. With ``display`` (the question's display flags, prerequisite P3)
+    the flags decide: a chart flag on a question that names something to fetch."""
     if not charts_settings().on:
         return ""
+    if display is not None:
+        if not (getattr(display, "chart", False) and not getattr(display, "empty", False)):
+            return ""
+        from sf_assistant.agent.charts import RECORDS_CHART_NOTE
+        return RECORDS_CHART_NOTE
     from sf_assistant.agent.charts import note_for
     return note_for(question)
+
+
+def _chart_question(question: str, display: Any = None) -> bool:
+    """The question asks for a chart and names something to chart (the flags with ``display``), with the switch on."""
+    if not charts_settings().on:
+        return False
+    if display is not None:
+        return bool(getattr(display, "chart", False) and not getattr(display, "empty", False))
+    from sf_assistant.agent.charts import drawable_ask
+    return drawable_ask(question)
+
+
+def retry_kind(reply: str, evidence: list) -> str | None:
+    """Why a record draft has no data to rest on (prerequisite P2): "no_call" when no record tool has run,
+    "all_failed" when every call failed and none failed for a name, field or object that is not there
+    (``NOT_FOUND_CODES``), for a blocked field or object (``REFUSAL_CODES``) or for a fault of the engine
+    (``ENGINE_CODES``: the time budget, the query guard, DuckDB or I/O, an internal error; review of 2026-11-25: those
+    stay a failure, so the caller's fallback runs); None otherwise. ``reply`` is not read: the caller decides what a
+    NO_RECORDS draft gets (:refusal codes: ``agent.checks.REFUSAL_CODES``, the package's one home)."""
+    ev = list(evidence or [])
+    if not ev:
+        return "no_call"
+    if any(getattr(e, "ok", False) for e in ev):
+        return None
+    if {_error_code(e) for e in ev} & (NOT_FOUND_CODES | REFUSAL_CODES | ENGINE_CODES):
+        return None
+    return "all_failed"
+
+
+def _data_call_ok(evidence: list) -> bool:
+    """A successful call that read record data: a data tool other than the sync status (``describe_fields`` and
+    ``find_objects`` only help pick the object and field; their counts ignore filters and periods)."""
+    return any(getattr(e, "ok", False) and getattr(e, "kind", None) == "data"
+               and getattr(e, "tool", None) != "get_sync_status" for e in evidence or [])
+
+
+def _coded_failure(evidence: list) -> bool:
+    """A failed call with a not-found, refusal or engine code: its own checks answer it (never a forced round)."""
+    return bool({_error_code(e) for e in evidence or [] if not getattr(e, "ok", False)}
+                & (NOT_FOUND_CODES | REFUSAL_CODES | ENGINE_CODES))
+
+
+def _new_numbers(reply: str, question: str) -> list[str]:
+    """The numbers of ``reply``'s answer lines (Source and code lines left out) that the question does not hold, the
+    integers 0-12 included (an orientation call's count is no count of the asked records)."""
+    asked = set(numbers_in(question or ""))
+    return [n for n in numbers_in(answer_text(reply or "")) if n not in asked]
+
+
+def _forcing_off(llm: Any) -> bool:
+    fn = getattr(llm, "forcing_off", None)
+    try:
+        return bool(fn()) if callable(fn) else False
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ------------------------------------------------------------------------------------- session
@@ -235,12 +321,12 @@ class RecordSession:
         except Exception:  # noqa: BLE001 - closing must never fail a run
             pass
 
-    def route(self, question: str) -> bool | None:
+    def route(self, question: str, display: Any = None) -> bool | None:
         """True = the question needs record data, False = design only, None = unclear: :meth:`triage`'s ``routed``
         (True for a question that names people, or a stored record strongly against a NO_RECORDS route, else the route
         call's answer). Never raises; the triage is kept for the next :meth:`ask` of the same question
-        (:meth:`last_triage`)."""
-        return self.triage(question).routed
+        (:meth:`last_triage`). ``display``: the question's display flags (``agent.display``), or None."""
+        return (self.triage(question, display=display) if display is not None else self.triage(question)).routed
 
     def _route_call(self, question: str) -> bool | None:
         """One short model call (``ROUTE_SYSTEM``): True = RECORDS, False = NO_RECORDS, None = unclear or failed."""
@@ -283,7 +369,7 @@ class RecordSession:
             return []
         return [dict(d) for d in res if isinstance(d, dict) and d.get("listed")] if isinstance(res, list) else []
 
-    def triage(self, question: str, route: Any = ROUTE_HERE) -> Triage:
+    def triage(self, question: str, route: Any = ROUTE_HERE, display: Any = None) -> Triage:
         """Who the question names (RECORDS_SPEC §22.3). Never raises.
 
         Code spots stored names in the question (``tools.spot_people``); the route call (unless ``route`` gives its
@@ -315,8 +401,9 @@ class RecordSession:
         as before.
 
         Charts (``SFA_CHARTS=on``): when ``routed`` is still False and the question asks for a chart and names something
-        to chart (``agent.charts.drawable_ask``), ``routed`` is True with ``overruled_by`` "chart". An unclear route
-        stays None and RECORDS needs no overrule. Off, this reads nothing else."""
+        to chart (``agent.charts.drawable_ask``; with ``display``, its chart flag on a question that is not display-only,
+        prerequisite P3), ``routed`` is True with ``overruled_by`` "chart". An unclear route stays None and RECORDS
+        needs no overrule. Off, this reads nothing else."""
         t0 = time.perf_counter()
         spot = self._tools_fn("spot_people")
         resolve = self._tools_fn("resolve_person_name")
@@ -455,10 +542,9 @@ class RecordSession:
             # a stored record the question names strongly (a Name, a code, distinctive short text) overrules a
             # NO_RECORDS route, as a named person does; picklist values and plain words never do
             routed, by, reason = True, "value", value_reason(strong)
-        if routed is False and charts_settings().on:
+        if routed is False and _chart_question(question, display):   # a chart question is a data question
             from sf_assistant.agent import charts as _charts
-            if _charts.drawable_ask(question):   # a chart question is a data question
-                routed, by, reason = True, "chart", _charts.OVERRULE_REASON
+            routed, by, reason = True, "chart", _charts.OVERRULE_REASON
         tri = Triage(routed=routed, route=rt, people=people, hinted=list(people) + hint_only, missing=missing,
                      names=names, seconds=round(time.perf_counter() - t0, 3), values=values, overruled_by=by,
                      overrule_reason=reason)
@@ -467,7 +553,7 @@ class RecordSession:
             self._last_triage = (question, tri)
         return tri
 
-    def _triage_for(self, question: str, routed: Any = ROUTE_HERE) -> Triage:
+    def _triage_for(self, question: str, routed: Any = ROUTE_HERE, display: Any = None) -> Triage:
         """The triage of :meth:`route` for this question when it ran (``ask.py`` routes first), else a new one; a
         ``routed`` given by the caller stands for the route call."""
         with self._lock:
@@ -475,7 +561,8 @@ class RecordSession:
         if cached is not None and cached[0] == question and (routed is ROUTE_HERE or routed in (cached[1].routed,
                                                                                                 cached[1].route)):
             return cached[1]
-        return self.triage(question, route=routed)
+        return self.triage(question, route=routed, display=display) if display is not None else \
+            self.triage(question, route=routed)
 
     def last_triage(self, question: str) -> Triage | None:
         """The triage that :meth:`route` (or :meth:`triage`) kept for ``question``, or None when the last triage was of
@@ -518,13 +605,16 @@ class RecordSession:
         question names (RECORDS_SPEC §22.8).
         """
         reply = strip_reasoning(draft)
+        # no record tool has run: "write the final answer from the tool results above" would push the model to answer
+        # with no data (prerequisite P2, 2026-11-25); it is asked for the record tools instead
+        final_form = RECORDS_FINAL_FORM_MESSAGE if self.tools.evidence else RECORDS_REQUIRE_TOOLS_MESSAGE
         if not reply:
             # a draft that is all reasoning would be shown as nothing: one more round for the answer (2026-11-16)
-            return RECORDS_FINAL_FORM_MESSAGE if str(draft or "").strip() else None
+            return final_form if str(draft or "").strip() else None
         if not _is_no_records(reply) and not answer_text(drop_tool_talk(drop_working_sentences(reply))):
             # the cleaners would leave nothing but the Source line ("empty record answer", page ticket 3 of
             # 2026-11-16): ask for the final answer now, while rounds are left, instead of dropping the reply
-            return RECORDS_FINAL_FORM_MESSAGE
+            return final_form
         if _is_no_records(reply):
             if triage is not None and (triage.people or triage.missing):
                 return RECORDS_PERSON_NO_RECORDS_MESSAGE.replace("<<PEOPLE>>", _quoted(triage.asked()))
@@ -554,7 +644,7 @@ class RecordSession:
         messages += direction or relation_lookup_nudges(reply, evidence, question, self.person_lookups,
                                                         people=triage.people if triage is not None else None)
         if draft_needs_final_form(reply):
-            messages.append(RECORDS_FINAL_FORM_MESSAGE)
+            messages.append(final_form)
         people_data = triage.people_data() if triage is not None else True
         if _no_data_but_not_found(evidence, people_data) and not not_found_reply(reply, evidence, question, status):
             messages.append(RECORDS_NOT_FOUND_MESSAGE)
@@ -777,7 +867,8 @@ class RecordSession:
         except Exception:  # noqa: BLE001 - optional
             return False
 
-    def ask(self, question: str, routed: Any = ROUTE_HERE) -> RecordAnswer:
+    def ask(self, question: str, routed: Any = ROUTE_HERE, display: Any = None,
+            typed: str | None = None) -> RecordAnswer:
         """Answer ``question`` from records, or reply NO_RECORDS. Never raises.
 
         ``routed`` is the route call's result when the caller made it already (``ask.py`` routes first in merged mode
@@ -836,7 +927,20 @@ class RecordSession:
 
         Charts (``SFA_CHARTS``, read at each call): with ``on``, a chart question's system prompt ends with
         ``agent.charts.RECORDS_CHART_NOTE``, after the note on the table lines. The tools and the user message stay as
-        they are, and off the prompt is byte for byte as before.
+        they are (but for a question with display words, whose typed text the pipeline passes as ``typed`` with the
+        switch on only), and off the prompt is byte for byte as before.
+
+        Display words (prerequisite P3): ``question`` is the search text (the pipeline took the display words out) and
+        ``display`` its flags; the chart note and the chart overrule read the flags, and a table, detail, summary,
+        breakdown or file flag appends ``agent.display.note`` after the chart note. None: as before. ``typed``: the
+        question as the person typed it, display words included; the record agent's user message reads it (before
+        the hints) so "plot X of last 6 months" still asks for a trend (pre-release fix of 2026-11-25: with the search
+        text the model listed records). The triage, ``begin_question``, the hints, the draft checks and the answer's
+        ``question`` keep reading ``question``. None or "": ``question``, as before.
+
+        Records retry (prerequisite P2, see the module text): one forced round for a records-routed or chart-overruled
+        question that is no people question, at the require-tools nudge (``tools_first`` of ``answer_question``) or
+        at the first draft check; the answer carries ``no_data`` and ``tool_retry``.
         """
         t0 = time.perf_counter()
         evidence: list[QueryEvidence] = []
@@ -845,7 +949,7 @@ class RecordSession:
             with self._lock:
                 self._n += 1
                 n = self._n
-            tri = self._triage_for(question, routed)
+            tri = self._triage_for(question, routed, display)
             routed = tri.routed
             try:  # C1: clears evidence and caches; the question gives the role cues, the triage its people and values
                 self.tools.begin_question(question, people=tri.hinted, values=tri.values)
@@ -863,7 +967,8 @@ class RecordSession:
             hints = self.tools.object_hints(question, missing=tri.missing) if tri.missing else \
                 self.tools.object_hints(question)
             timeline.add("stage", t_hints, stage="hints", chars=len(hints or ""))   # the hints' size only, never them
-            user_text = question + ("\n\n" + hints if hints else "")
+            # the person's own words (display words kept, pre-release fix of 2026-11-25); the hints read the search text
+            user_text = (typed if typed and str(typed).strip() else question) + ("\n\n" + hints if hints else "")
             q = Question(qid=f"rec-{n:03d}", category="cross_section", question=user_text, expected_facts=[],
                          expected_tools=[], answerable=True, source="records", gold_chunk_ids=[])
             status = self.tools.status()
@@ -874,12 +979,54 @@ class RecordSession:
             kinds: list[str] = []
             drafts = [0]
 
-            def check(draft: str) -> str | None:
+            # prerequisite P2: one forced round for a records-routed or chart-overruled question that names nobody
+            chart_q = _chart_question(question, display)
+            budget = [1 if (tri.route is True or tri.overruled_by == "chart") and not person_q else 0]
+            retry: dict = {}
+            fallbacks = getattr(self.llm, "forced_fallbacks", 0)
+
+            def forced(at: str, why: str, message: str) -> tuple[str, str]:
+                budget[0] = 0
+                retry.update({"at": at, "why": why, "choice": "auto_off" if _forcing_off(self.llm) else "required"})
+                nudges.append(message)
+                kinds.extend(nudge_kinds(message))
+                return message, "required"
+
+            def tools_first(draft: str) -> tuple[str, str | None]:
+                """The require-tools nudge (round 1 called no tool): forced when the budget is left, the draft is no
+                NO_RECORDS reply, or it is one after a RECORDS route on a question that asks for no chart."""
+                no_rec = _is_no_records(strip_reasoning(draft))
+                if budget[0] and (not no_rec or (tri.route is True and not chart_q)):
+                    return forced("tools_first", "no_records" if no_rec else "no_call", RECORDS_TOOLS_FORCED_MESSAGE)
+                return require_msg, None
+
+            def check(draft: str) -> Any:
+                if drafts[0] >= 2:   # a third draft is not checked, as before (the forced round counts no draft)
+                    return None
                 drafts[0] += 1   # the full check on the first draft; the second only for a 0 still leading unfit
-                t_check, msg = time.perf_counter(), None
+                t_check, msg, choice = time.perf_counter(), None, None
+                name = "draft" if drafts[0] == 1 else "redraft"
                 try:
                     x = _tables.expand(strip_reasoning(draft), self.tools.evidence, labels) if tables_on else None
                     seen = x.text if x is not None else draft   # what the user would see: rows in place, no table line
+                    no_rec = _is_no_records(strip_reasoning(seen))
+                    if drafts[0] == 1 and budget[0] and not person_q:   # the one forced round, while it is left
+                        why = retry_kind("", self.tools.evidence)
+                        if why is not None and no_rec and not (tri.route is True and not chart_q):
+                            why = None   # a NO_RECORDS draft passes as before (route not RECORDS, or a chart question)
+                        if why is None and not no_rec and self.tools.evidence and not _data_call_ok(self.tools.evidence) \
+                                and not _coded_failure(self.tools.evidence) and _new_numbers(seen, question):
+                            why = "no_data_call"   # numbers after describe_fields or the sync status only (E-15)
+                        if why is not None:
+                            # review fix E-16: the forced round is no draft, so the draft after it gets the full
+                            # check (check_draft, with the number audit), not the recheck
+                            drafts[0] -= 1
+                            message = {"all_failed": RECORDS_ALL_FAILED_MESSAGE,
+                                       "no_data_call": RECORDS_RUN_QUERY_MESSAGE}.get(why, RECORDS_TOOLS_FORCED_MESSAGE)
+                            msg, choice = forced("check", "no_records" if why == "no_call" and no_rec else why, message)
+                            return msg, choice
+                    # review fix E-17: once the forced round is spent, every draft gets the checks of before (no second
+                    # retry message)
                     msg = (self.check_draft(seen, question, status, routed, tri) if drafts[0] == 1
                            else self.recheck_draft(seen))
                     if x is not None and drafts[0] == 1 and x.blocks and msg:   # code's cells are not the model's words
@@ -889,8 +1036,8 @@ class RecordSession:
                         msg = "\n\n".join(m for m in (msg, _tables.marker_message(x.bad)) if m)
                         nudged[0] = 1
                 finally:
-                    timeline.add("check", t_check, name="draft" if drafts[0] == 1 else "redraft", nudge=bool(msg))
-                if msg:
+                    timeline.add("check", t_check, name=name, nudge=bool(msg))
+                if msg and choice is None:
                     nudges.append(msg)
                     kinds.extend(nudge_kinds(msg))
                 return msg
@@ -900,11 +1047,15 @@ class RecordSession:
             # code mode: the note on the table lines is appended (never prepended, never inside the shared template);
             # so is the note of a chart question
             system = (render_records_system(status) + (_tables.RECORDS_TABLES_NOTE if tables_on else "")
-                      + _chart_note(question))
+                      + _chart_note(question, display) + _display.note(display))
             r = answer_question(q, _TextToolCalls(self.llm), self.tools, self.cfg, system=system,
                                 require_tools=True, require_tools_message=require_msg,
                                 force_answer_message=RECORDS_FORCE_ANSWER_MESSAGE, check_answer=check,
-                                max_checks=2)
+                                # one more check for the forced round, which is no draft (check stops at 2 drafts)
+                                max_checks=3 if budget[0] else 2,
+                                **({"tools_first": tools_first} if budget[0] else {}))
+            if retry and retry.get("choice") == "required" and getattr(self.llm, "forced_fallbacks", 0) > fallbacks:
+                retry["choice"] = "auto_fallback"   # the server did not take the forced call: it went out as "auto"
             t_post = time.perf_counter()   # the code after the record agent: cleaners, audits, the people answer
             evidence = self.tools.evidence
             ok_calls = [e for e in evidence if e.ok]
@@ -923,6 +1074,12 @@ class RecordSession:
             error = r.error
             dropped = found_none = ""
             empty = False   # the reply said nothing but its Source line, before or after the checks (fix 2)
+            no_data = None   # prerequisite P2: "no_call" / "all_failed" when no record call gave data
+            if retry.get("why") == "no_records" and r.error is None and not _data_call_ok(evidence) \
+                    and not _is_no_records(reply):
+                # review fix E-19: the forced round of a NO_RECORDS draft read no record data, so the draft's NO_RECORDS
+                # stands (a design question the route call read as RECORDS keeps its knowledge answer, as before)
+                dropped, reply = reply, NO_RECORDS
             if _is_no_records(reply):
                 no_records, answer = True, ""
                 if _name_missing(evidence) and _no_data_but_not_found(evidence, people_data):
@@ -952,8 +1109,16 @@ class RecordSession:
                     dropped = reply   # kept for the log: a count (0 included) after a not-found error
                     found_none = not_found_answer(evidence)
                     found_none = with_source_line(found_none, evidence, status) if found_none else ""
+            elif retry.get("why") == "no_data_call" and r.error is None and not _data_call_ok(evidence) \
+                    and _new_numbers(reply, question):
+                # review fix E-15: numbers again after the forced round, still with no data call behind them (only
+                # describe_fields or the sync status): no answer, the clarifying question instead
+                no_records, answer, dropped, no_data = True, "", reply, "no_call"
+                error = error or "no successful record query"
             elif not ok_calls:
                 no_records, answer = True, ""
+                if r.error is None and not person_q:   # a model fault stays a failure (the caller's fallback runs)
+                    no_data = retry_kind("", evidence)
                 if error is None:
                     error = ("no successful record query" if r.tool_calls
                              else "the record agent answered without calling a record tool")
@@ -1031,7 +1196,8 @@ class RecordSession:
                                 code_tables=_tables.answer_counts(xt, answer, blocks, nudged[0], cut) if xt is not None
                                 else {},
                                 table_blocks={k: b for k, b in blocks.items() if _tables.holds(answer, b)},
-                                nudge_kinds=kinds, dropped_raw=raw_kept[:4000])
+                                nudge_kinds=kinds, dropped_raw=raw_kept[:4000], no_data=no_data,
+                                tool_retry=dict(retry) if retry else None)
         except Exception as exc:  # noqa: BLE001 - the caller always gets an answer object
             try:
                 evidence = evidence or self.tools.evidence

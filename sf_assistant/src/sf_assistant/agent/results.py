@@ -50,6 +50,14 @@ class RecordAnswer:
     # business-term contracts (2026-11-24): the Person Account / record-type scope claims no applied filter backed,
     # cut from the answer (agent.term_notes.drop_unapplied_scope_claims; also when the guard kept the answer whole)
     dropped_claims: list[str] = field(default_factory=list)
+    # prerequisite P2 (2026-11-25): why the record step has no data, when it ran no record tool ("no_call") or every
+    # call failed with no not-found or refusal code among them ("all_failed"); None otherwise. The pipeline then writes
+    # the clarifying question (agent.clarify) instead of RECORDS_FAILED_ANSWER
+    no_data: str | None = None
+    # the one forced round of P2, when it ran: {"at": "tools_first" | "check", "why": "no_call" | "no_records" |
+    # "all_failed" | "no_data_call" (numbers after describe_fields or the sync status only), "choice": "required" |
+    # "auto_fallback" | "auto_off"}; None otherwise
+    tool_retry: dict | None = None
 
     @property
     def data_queries(self) -> int:

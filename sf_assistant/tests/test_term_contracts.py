@@ -795,9 +795,11 @@ def test_the_prompt_lines_and_the_definitions():
     assert set(TC.TEXTS) == {"candidates_note", "candidates_flag_note", "candidates_unapplied", "candidates_any_of",
                              "candidates_blank", "candidates_reject", "leads_reject", "placement_reject",
                              "support_reject", "support_note", "support_rate_note", "support_blank_outcomes",
-                             "support_rate_unapplied", "placement_status_note", "person_accounts_line"}
+                             "support_rate_unapplied", "placement_status_note", "person_accounts_line",
+                             "placement_date_reject"}
     assert "(IsPersonAccount = true)" not in BT.DEFINITIONS["candidates"] + TC.TEXTS["candidates_reject"]
-    assert P.load("business_terms").version == 3 and P.load("term_contracts").version == 1
+    assert P.load("business_terms").version == 5 and P.load("term_contracts").version == 3
+    assert "always dated by Date_of_Interview__c" in BT.DEFINITIONS["placement"]
     assert {"placement", "candidates", "support_performance"} <= set(BT.DEFINITIONS)
     assert "record type Person Account (a filter IsPersonAccount = true is not that" in BT.DEFINITIONS["candidates"]
     assert "Interview_Support_Person__c" in BT.DEFINITIONS["support_performance"]
@@ -1045,3 +1047,240 @@ def test_review_D7_blank_outcomes_are_counted():
     assert TC.blank_outcomes({"Offer Received": 1, "(blank)": 3, "Ghosted": 1}) == (3, 5)
     assert TC.blank_outcomes(None) == (0, 0)
     assert TC.text("support_blank_outcomes", BLANK=3, TOTAL=5).startswith("3 of the 5 interviews counted")
+
+
+# ------------------------------------------------------------------------------------------------ placement date rule
+# Owner's decision of 2026-11-25 (review finding R2-4, owner item O1): placements are dated and trended by the interview
+# date, Interview__c.Date_of_Interview__c. A placement call dated by another field is refused (T2) with the call to send.
+PLACED_Q = "how many placements in August 2026"
+RATE_Q = "what is the placement rate per month this year"
+DATE_REJECT = "Placements are dated by the interview date"
+AUG_BY = {"date_field": "CreatedDate", "period": "August 2026"}
+AUG = {"date_field": "Date_of_Interview__c", "period": "August 2026"}
+RATE_TREND = {"object": "Interview__c", "grain": "month", "period": "this year", "part_filters": OFFER}
+
+
+@pytest.fixture(params=["tools", "tools_on"])
+def both(request):
+    """The record tools with the spelling help off and on (SFA_RESOLVER): the date rule is the same."""
+    return request.getfixturevalue(request.param)
+
+
+def test_placement_date_period_on_created_date_is_refused(both):
+    args = {"object": "Interview__c", "filters": OFFER, **AUG_BY}
+    err = refused(both, PLACED_Q, "count_records", args, "T2")
+    assert err.startswith(DATE_REJECT) and "This call dates the interviews by date_field CreatedDate." in err
+    assert '"date_field": "Date_of_Interview__c"' in err
+    # what the refusal prevents: by CreatedDate the September offer (created 31 August, New York time) counts too
+    res, _ev = ok(both, "", "count_records", args)
+    assert res["count"] == 2
+    # the record tools' own words for the created date are read as CreatedDate
+    refused(both, PLACED_Q, "count_records", {**args, "date_field": "created"}, "T2")
+
+
+def test_placement_date_condition_in_the_filters_is_refused(both):
+    flt = {"field": "CreatedDate", "op": "gte", "value": "2026-08-01"}
+    err = refused(both, PLACED_Q, "count_records", {"object": "Interview__c", "filters": OFFER + [flt]}, "T2")
+    assert "This call dates the interviews by the filter CreatedDate >= '2026-08-01'." in err
+    # an any_of branch, a percentage's base filter and a compare segment's filter are date conditions too
+    refused(both, PLACED_Q, "count_records", {"object": "Interview__c", "filters": OFFER, "any_of": [
+        flt, {"field": "Interview_Status__c", "op": "eq", "value": "Completed"}]}, "T2")
+    refused(both, RATE_Q, "percentage_of_records", {"object": "Interview__c", "part_filters": OFFER,
+                                                     "base_filters": [flt]}, "T2")
+    # no period: blank checks and a comparison with another field date nothing
+    for other in ({"field": "CreatedDate", "op": "is_not_blank"},
+                  {"field": "CreatedDate", "op": "lte", "other_field": "LastModifiedDate"}):
+        _res, ev = ok(both, PLACED_Q, "count_records", {"object": "Interview__c", "filters": OFFER + [other]})
+        assert ev.enforced_arguments is None
+
+
+def test_placement_monthly_trend_on_created_date_is_refused(both):
+    err = refused(both, RATE_Q, "trend_records", {**RATE_TREND, "date_field": "CreatedDate"}, "T2")
+    assert "date_field CreatedDate" in err and "the same grain and part_filters" in err
+    # a trend of placements among the outcomes (split by the outcome), and one of offers only
+    refused(both, "placements per month", "trend_records", {
+        "object": "Interview__c", "grain": "month", "date_field": "CreatedDate", "period": "this year",
+        "split_by": "Interview_Outcome__c"}, "T2")
+    refused(both, "placements per month", "trend_records", {
+        "object": "Interview__c", "grain": "month", "date_field": "LastModifiedDate", "period": "this year",
+        "filters": OFFER}, "T2")
+    # another way to write the outcome value still names the placement
+    refused(both, "placements per month", "trend_records", {
+        "object": "Interview__c", "grain": "month", "date_field": "CreatedDate", "period": "this year",
+        "filters": [{"field": "Interview_Outcome__c", "op": "contains", "value": "offer"}]}, "T2")
+
+
+def test_placement_rate_by_interview_month_runs_unchanged(both):
+    for date_field in ("Date_of_Interview__c", "interview_date"):   # the API name and the temporal key
+        res, ev = ok(both, RATE_Q, "trend_records", {**RATE_TREND, "date_field": date_field})
+        assert ev.enforced_arguments is None and res["date_field"] == "Date_of_Interview__c"
+        got = {b["bucket"]: (b["part"], b["base"], b["percent"]) for b in res["buckets"]}
+        assert got["2026-08"] == (1, 1, 100.0) and got["2026-09"] == (1, 4, 25.0) and got["2026-10"] == (0, 3, 0.0)
+    res, ev = ok(both, "placement rate in September 2026", "percentage_of_records", {
+        "object": "Interview__c", "part_filters": OFFER, "date_field": "Date_of_Interview__c",
+        "period": "September 2026"})
+    assert ev.enforced_arguments is None and (res["part"], res["base"], res["percent"]) == (1, 4, 25.0)
+    refused(both, "placement rate in September 2026", "percentage_of_records", {
+        "object": "Interview__c", "part_filters": OFFER, "date_field": "CreatedDate", "period": "September 2026"},
+        "T2")
+
+
+def test_placement_count_by_the_interview_date_passes_unchanged(both):
+    res, ev = ok(both, PLACED_Q, "count_records", {"object": "Interview__c", "filters": OFFER, **AUG})
+    assert ev.enforced_arguments is None and res["count"] == 1
+    assert res["applied"]["period"]["date_field"] == "Date_of_Interview__c"
+    flt = {"field": "Date_of_Interview__c", "op": "gte", "value": "2026-09-01"}
+    res, ev = ok(both, PLACED_Q, "count_records", {"object": "Interview__c", "filters": OFFER + [flt]})
+    assert ev.enforced_arguments is None and res["count"] == 1
+    # month on month with the segments' periods on the interview date
+    segs = [{"label": "Aug", "period": "August 2026"}, {"label": "Sep", "period": "September 2026"}]
+    res, _ev = ok(both, "placements in August vs September 2026", "compare_records", {
+        "object": "Interview__c", "filters": OFFER, "date_field": "Date_of_Interview__c", "segments": segs})
+    assert [s["value"] for s in res["segments"]] == [1, 1]
+    refused(both, "placements in August vs September 2026", "compare_records", {
+        "object": "Interview__c", "filters": OFFER, "date_field": "CreatedDate", "segments": segs}, "T2")
+
+
+def test_placement_call_with_no_date_is_unaffected(both):
+    res, ev = ok(both, "how many placements so far", "count_records", {"object": "Interview__c", "filters": OFFER})
+    assert ev.enforced_arguments is None and res["count"] == 2
+    # a date_field with no period dates nothing (list_records only sorts by it)
+    res, ev = ok(both, "list the placements", "list_records", {"object": "Interview__c", "filters": OFFER,
+                                                                 "date_field": "CreatedDate"})
+    assert ev.enforced_arguments is None and res["total_count"] == 2
+
+
+def test_every_dated_interview_call_of_a_placement_question_uses_the_interview_date(both):
+    """The rate's denominator (all client interviews, by interview month) is part of the placement measure: in a
+    question that names placement, every dated Interview__c call is held to Date_of_Interview__c, outcome filter or
+    not. (Changed on purpose 2026-11-25: such a call by CreatedDate ran unchanged in the first cut of the rule.)"""
+    by_created = {"object": "Interview__c", **AUG_BY}
+    err = refused(both, PLACED_Q, "count_records", by_created, "T2")
+    assert "This call dates the interviews by date_field CreatedDate." in err
+    for flt in ({"field": "Interview_Outcome__c", "op": "eq", "value": "Rejected"},
+                {"field": "Interview_Outcome__c", "op": "ne", "value": "Offer Received"}):
+        refused(both, PLACED_Q, "count_records", {**by_created, "filters": [flt]}, "T2")
+    refused(both, RATE_Q, "trend_records", {"object": "Interview__c", "grain": "month", "date_field": "CreatedDate",
+                                            "period": "this year"}, "T2")
+    refused(both, PLACED_Q, "count_records", {"object": "Interview__c", "filters": [
+        {"field": "CreatedDate", "op": "lt", "value": "2026-09-01"}]}, "T2")
+    # by the interview date, or with no date, the denominator runs unchanged
+    res, ev = ok(both, PLACED_Q, "count_records", {"object": "Interview__c", **AUG})
+    assert ev.enforced_arguments is None and res["count"] == 1
+    res, ev = ok(both, RATE_Q, "count_records", {"object": "Interview__c"})
+    assert ev.enforced_arguments is None and res["count"] == FACTS["interviews"]
+    # a date of another linked record (the candidate's) is a condition, not the date of the count
+    ok(both, PLACED_Q, "count_records", {"object": "Interview__c", "filters": [
+        {"field": "Candidate__c.CreatedDate", "op": "gte", "value": "2025-01-01"}]})
+
+
+def test_interview_calls_by_created_date_outside_a_placement_question_are_unchanged(both):
+    by_created = {"object": "Interview__c", **AUG_BY}
+    want, _ev = ok(both, "", "count_records", by_created)
+    res, ev = ok(both, "how many interviews were created in August 2026", "count_records", by_created)
+    assert ev.enforced_arguments is None and res["count"] == want["count"]
+    # a question that names no placement, even with the offer filter: the contract does not run
+    res, ev = ok(both, "how many interviews were created in August 2026 with an offer", "count_records",
+                 {**by_created, "filters": OFFER})
+    assert ev.enforced_arguments is None and res["count"] == 2
+
+
+def test_placement_through_a_lookup_to_the_interview(both):
+    """A placement measured from another object through its lookup to Interview__c (Interview_Participant__c rows of
+    the terms fixture, created on another day than their interview) is dated by Interview__c.Date_of_Interview__c."""
+    offer = [{"field": "Interview__c.Interview_Outcome__c", "op": "eq", "value": "Offer Received"}]
+    args = {"object": "Interview_Participant__c", "filters": offer, **AUG_BY}
+    res, _ev = ok(both, "", "count_records", args)
+    assert res["count"] == 2   # by CreatedDate the September interview's participant counts in August too
+    err = refused(both, PLACED_Q, "count_records", args, "T2")
+    assert "dates the interviews by date_field CreatedDate." in err
+    assert '"date_field": "Interview__c.Date_of_Interview__c"' in err
+    res, ev = ok(both, PLACED_Q, "count_records", {**args, "date_field": "Interview__c.Date_of_Interview__c"})
+    assert ev.enforced_arguments is None and res["count"] == 1
+    # a date condition on the counted object, or on another date of the interview, is refused too
+    refused(both, PLACED_Q, "count_records", {"object": "Interview_Participant__c", "filters": offer + [
+        {"field": "CreatedDate", "op": "gte", "value": "2026-08-01"}]}, "T2")
+    refused(both, PLACED_Q, "count_records", {"object": "Interview_Participant__c", "filters": offer + [
+        {"field": "Interview__c.CreatedDate", "op": "gte", "value": "2026-08-01"}]}, "T2")
+    # the same object measuring no placement, and the question naming none, are unchanged
+    res, ev = ok(both, PLACED_Q, "count_records", {"object": "Interview_Participant__c", **AUG_BY})
+    assert ev.enforced_arguments is None and res["count"] == 2
+    ok(both, "how many participants of offer interviews joined in August 2026", "count_records", args)
+
+
+def test_placement_date_on_a_related_interview_child(both):
+    rel = {"child_object": "Interview__c", "via_field": "Recruiter__c", "exists": True, "filters": OFFER,
+           "period": "September 2026"}
+    q = "how many recruiters made placements in September 2026"
+    err = refused(both, q, "count_records", {"object": "Recruiter__c", "related": [
+        {**rel, "date_field": "CreatedDate"}]}, "T2")
+    assert "date_field CreatedDate of the related Interview__c records" in err
+    res, ev = ok(both, q, "count_records", {"object": "Recruiter__c", "related": [
+        {**rel, "date_field": "Date_of_Interview__c"}]})
+    assert ev.enforced_arguments is None and res["count"] == 1
+    # a related child that measures no placement is unchanged
+    ok(both, q, "count_records", {"object": "Recruiter__c", "related": [
+        {**rel, "filters": [{"field": "Interview_Outcome__c", "op": "eq", "value": "Rejected"}],
+         "date_field": "CreatedDate"}]})
+
+
+def test_placement_date_rule_reads_plain_data():
+    """The engine rule over a plain view (no catalog); a view without date_path applies no date rule."""
+
+    class V:
+        def object(self, name):
+            return name if name in ("Interview__c", "Account") else None
+
+        def path(self, obj, text):
+            if obj != "Interview__c" or text not in ("CreatedDate", "Date_of_Interview__c", "Interview_Outcome__c"):
+                return None
+            return TC.PathInfo(text, (), text)
+
+        def record_type(self, obj, value):
+            return None
+
+        def person_type(self, obj):
+            return None
+
+        def has_field(self, obj, api):
+            return False
+
+    class D(V):
+        def date_path(self, obj, text):
+            return self.path(obj, text) if text != "Interview_Outcome__c" else None
+
+    terms = TC.detect(PLACED_Q)
+    assert TC.plan(terms, "count_records", {"object": "Interview__c", "filters": OFFER, **AUG_BY}, V()).reject is None
+    p = TC.plan(terms, "count_records", {"object": "Interview__c", "filters": OFFER, **AUG_BY}, D())
+    assert p.reject == ("T2", TC.text("placement_date_reject", FIELD="date_field CreatedDate", DATE="Date_of_Interview__c"))
+    assert TC.plan(terms, "count_records", {"object": "Interview__c", "filters": OFFER, **AUG}, D()).reject is None
+    assert TC.plan(TC.detect("how many interviews in August 2026"), "count_records",
+                   {"object": "Interview__c", "filters": OFFER, **AUG_BY}, D()).reject is None
+    flt = {"field": "CreatedDate", "op": "lt", "value": "2026-09-01"}
+    assert TC.plan(terms, "count_records", {"object": "Interview__c", "filters": OFFER + [flt]}, D()).reject == (
+        "T2", TC.text("placement_date_reject", FIELD="the filter CreatedDate < '2026-09-01'",
+                                 DATE="Date_of_Interview__c"))
+    assert TC._offer_value("eq", "offer-received") and TC._offer_value("starts_with", "Off")
+    assert not TC._offer_value("eq", "Offer") and not TC._offer_value("contains", "of")
+
+
+@pytest.mark.parametrize("tables, merge_by, charts", [
+    ("model", "code", "on"), ("code", "code", "on"), ("model", "model", "on"), ("code", "model", "off")])
+def test_placement_date_refusal_then_the_interview_month(world, monkeypatch, tables, merge_by, charts):
+    """Through the record session and the pipeline under each switch (SFA_TABLES, SFA_MERGE, SFA_CHARTS; SFA_RESOLVER
+    off here, on in the tool-level tests): the CreatedDate trend is refused, the interview-month trend runs."""
+    monkeypatch.setenv("SFA_TABLES", tables)
+    monkeypatch.setenv("SFA_MERGE", merge_by)
+    monkeypatch.setenv("SFA_CHARTS", charts)
+    wrong = {"name": "trend_records", "args": {**RATE_TREND, "date_field": "CreatedDate"}}
+    right = {"name": "trend_records", "args": {**RATE_TREND, "date_field": "Date_of_Interview__c"}}
+    draft = "The placement rate per interview month is listed by month.\n" + SOURCE
+    o = answer(world, model := Model(wrong, right, draft, merged=draft), RATE_Q)
+    assert [(e.tool, e.object, e.error_code) for e in o.rec.evidence] == [("trend_records", "Interview__c", "T2"),
+                                                                          ("trend_records", "Interview__c", None)]
+    tool_msg = next(m for m in model.requests["record"][1]["messages"] if m.get("role") == "tool")
+    assert json.loads(tool_msg["content"])["error"].startswith(DATE_REJECT)
+    ran = o.rec.evidence[1]
+    assert ran.enforced_arguments is None and ran.arguments["date_field"] == "Date_of_Interview__c"
+    assert {b["bucket"]: b["part"] for b in ran.model_result["buckets"]}["2026-09"] == 1
+    assert o.final.strip()

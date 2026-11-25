@@ -53,7 +53,9 @@ LIGHT = ["sf_assistant.config", "sf_assistant.engine.types", "sf_assistant.tools
          "sf_assistant.agent.merge", "sf_assistant.agent.tables", "sf_assistant.agent.charts",
          # the business-term contracts (2026-11-24): the engine module, its glue in the tools and the answer's notes
          "sf_assistant.engine.business_terms", "sf_assistant.engine.term_contracts", "sf_assistant.tools.term_enforce",
-         "sf_assistant.agent.term_notes"]
+         "sf_assistant.agent.term_notes",
+         # the prerequisites of 2026-11-25: small talk, the display words and the clarifying question
+         "sf_assistant.agent.small_talk", "sf_assistant.agent.display", "sf_assistant.agent.clarify"]
 
 
 # ------------------------------------------------------------------------------------------------- static import graph

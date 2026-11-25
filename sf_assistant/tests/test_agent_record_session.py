@@ -113,6 +113,7 @@ class ScriptedLLM:
     def __init__(self, script, fail=False, route="RECORDS", names="NONE"):
         self.script, self.fail, self.calls, self.route, self.route_calls = list(script), fail, [], route, []
         self.names, self.names_calls = names, []
+        self.choices: list = []   # the tool_choice of each record agent call (prerequisite P2: one forced round)
 
     def chat(self, messages, tools=None, max_tokens=None, **_):
         if messages[0].get("content") == rprompts.NAMES_SYSTEM:  # the names call (triage), kept apart as well
@@ -126,6 +127,7 @@ class ScriptedLLM:
                 raise self.route
             return {"content": self.route, "tool_calls": [], "usage": {}}
         self.calls.append({"messages": [dict(m) for m in messages], "tools": tools, "max_tokens": max_tokens})
+        self.choices.append(_.get("tool_choice"))
         if self.fail:
             raise RuntimeError("model down")
         n = sum(1 for m in messages if m.get("role") == "tool")
@@ -218,13 +220,26 @@ def test_session_no_records_reply():
     assert first[0]["content"].startswith("You answer questions about Salesforce RECORDS")
     assert "<<" not in first[0]["content"]
     assert first[1]["content"].startswith("What values can Status take?\n\n[Hints from code")
+    # prerequisite P2 (2026-11-25): NO_RECORDS on a RECORDS route gets the one forced round (tool_choice required)
+    assert any(m.get("content") == rprompts.RECORDS_TOOLS_FORCED_MESSAGE for m in llm.calls[-1]["messages"])
+    assert llm.choices == [None, "required"] and rec.tool_retry == {"at": "tools_first", "why": "no_records",
+                                                                   "choice": "required"}
+    # an unclear route keeps the require-tools nudge, unforced
+    tools, llm = StubTools(), ScriptedLLM(["NO_RECORDS"], route="MAYBE")
+    rec = RecordSession(tools, _cfg(), llm=llm, max_steps=4).ask("What values can Status take?")
     assert any(m.get("content") == rprompts.RECORDS_REQUIRE_TOOLS_MESSAGE for m in llm.calls[-1]["messages"])
+    assert "required" not in llm.choices and rec.tool_retry is None
 
 
 def test_session_numbers_without_tools_are_never_used():
-    rec = RecordSession(StubTools(), _cfg(), llm=ScriptedLLM(["There are 37."])).ask("How many offers?")
+    llm = ScriptedLLM(["There are 37."])
+    rec = RecordSession(StubTools(), _cfg(), llm=llm).ask("How many offers?")
     assert rec.no_records and rec.answer == ""
     assert rec.error == "the record agent answered without calling a record tool"
+    # prerequisite P2: one forced round first (the fake ignores it), then the same error, and no_data for the clarifying
+    # question; the draft check asks for the record tools, never for the final form "from the tool results above"
+    assert llm.choices.count("required") == 1 and rec.no_data == "no_call"
+    assert not any(m.get("content") == rprompts.RECORDS_FINAL_FORM_MESSAGE for c in llm.calls for m in c["messages"])
 
 
 def test_session_normal_answer_and_audit():

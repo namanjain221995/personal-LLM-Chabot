@@ -14,6 +14,15 @@ Retries: up to 3 attempts with exponential backoff on connection errors, timeout
 
 Every call adds one model entry (seconds, tokens, finish reason, attempts; no text) to the timeline of the answer
 being made, when one is open (:mod:`sf_assistant.agent.timeline`).
+
+A forced tool call (prerequisite P2 of 2026-11-25): ``chat(..., tool_choice="required")`` sends that choice with the
+tools (without ``tool_choice`` the request is byte for byte as before: ``"auto"`` with tools). A forced attempt the
+server refuses (HTTP 400 or 422 that is not about ``response_format`` or ``temperature``, :func:`_refuses_choice`) is
+sent again at once with ``"auto"``; when that one succeeds, forcing is off for :data:`FORCED_OFF_S` seconds
+(``tool_choice`` is then sent as ``"auto"``), so a server that does not take it costs one failed attempt, not one per
+question. ``forced_fallbacks`` counts those fallbacks. A 5xx, a 429, a timeout or a connection error of a forced call
+takes the normal backoff retries with the forced choice kept, and leaves forcing on (review of 2026-11-25: the shared
+server is often busy, and one busy reply must not turn the forced round into a plain nudge for ten minutes).
 """
 
 from __future__ import annotations
@@ -27,7 +36,10 @@ from typing import Any
 from sf_assistant.agent import timeline
 from sf_assistant.config import Config
 
-__all__ = ["LLM", "parse_json_object", "parse_tool_arguments"]
+__all__ = ["LLM", "parse_json_object", "parse_tool_arguments", "FORCED_OFF_S"]
+
+#: Seconds forcing a tool call stays off after the server refused a forced call and its "auto" retry worked.
+FORCED_OFF_S = 600.0
 
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
@@ -56,6 +68,16 @@ def _is_retryable(exc: BaseException) -> bool:
     if isinstance(status, int):
         return status == 429 or status >= 500
     return any(cls.__name__ in _RETRYABLE_NAMES for cls in type(exc).__mro__)
+
+
+def _refuses_choice(exc: BaseException, kwargs: dict[str, Any]) -> bool:
+    """The server refused the request's forced ``tool_choice``: HTTP 400 or 422, unless the error is about
+    ``response_format`` or ``temperature`` (their own fallbacks below handle those)."""
+    status = getattr(exc, "status_code", None)
+    if status not in (400, 422):
+        return False
+    text = str(exc)
+    return not any(key in kwargs and key in text for key in ("response_format", "temperature"))
 
 
 def _strip_thinking(text: str | None) -> str | None:
@@ -139,6 +161,10 @@ class LLM:
         self._json_mode_supported = True
         # Reasoning models reject a non-default temperature; same treatment.
         self._temperature_supported = True
+        # A forced tool call that failed and worked with "auto": no forcing until then (time.monotonic()).
+        self._forced_off_until = 0.0
+        #: How many forced calls fell back to "auto" (prerequisite P2; a log counter).
+        self.forced_fallbacks = 0
 
     # ------------------------------------------------------------------ client
     @property
@@ -179,6 +205,7 @@ class LLM:
         json_mode: bool = False,
         model: str | None = None,
         max_tokens: int | None = None,
+        tool_choice: str | None = None,
     ) -> dict:
         """Send one chat completion request and return the normalised result dict.
 
@@ -188,6 +215,9 @@ class LLM:
             json_mode: request ``response_format={"type": "json_object"}``.
             model: override ``cfg.model`` (e.g. the judge model).
             max_tokens: override ``cfg.max_tokens``.
+            tool_choice: with tools, the tool choice to send (``"required"`` forces a tool call); None or ``"auto"``
+                sends ``"auto"`` as before. Ignored without tools, and sent as ``"auto"`` while forcing is off after
+                the server refused a forced call (:meth:`forcing_off`).
 
         Raises:
             The last SDK exception when all attempts fail, or immediately for non-retryable
@@ -208,36 +238,70 @@ class LLM:
             kwargs["extra_body"] = {
                 "chat_template_kwargs": {"enable_thinking": bool(self.cfg.enable_thinking)}
             }
+        forced = bool(tools) and tool_choice not in (None, "auto")
+        choice = None
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+            if forced:
+                choice = "auto_off" if self.forcing_off() else "required"
+                if choice == "required":
+                    kwargs["tool_choice"] = tool_choice
         if json_mode and self._json_mode_supported:
             kwargs["response_format"] = {"type": "json_object"}
 
         start = time.perf_counter()
         failed: list[dict] = []
+        state: dict[str, Any] = {}
         try:
-            response = self._create_with_retries(kwargs, failed)
+            response = self._create_with_retries(kwargs, failed, state)
         except Exception as exc:
-            _note_call(start, messages, tools, limit, None, failed, exc)
+            _note_call(start, messages, tools, limit, None, failed, exc, choice=choice)
             raise
         latency = time.perf_counter() - start
-        _note_call(start, messages, tools, limit, response, failed)
-        return self._normalise(response, latency)
+        _note_call(start, messages, tools, limit, response, failed,
+                   choice="auto_fallback" if state.get("fell_back") else choice)
+        out = self._normalise(response, latency)
+        if choice is not None:
+            out["tool_choice"] = "auto_fallback" if state.get("fell_back") else choice
+        return out
 
-    def _create_with_retries(self, kwargs: dict[str, Any], failed: list[dict] | None = None) -> Any:
+    def forcing_off(self) -> bool:
+        """The server refused a forced tool call, which then worked with "auto", less than :data:`FORCED_OFF_S`
+        seconds ago."""
+        return time.monotonic() < self._forced_off_until
+
+    def _create_with_retries(self, kwargs: dict[str, Any], failed: list[dict] | None = None,
+                             state: dict | None = None) -> Any:
         """Call the SDK with exponential backoff on transient failures. ``failed`` (optional) gets one entry per failed
-        attempt for the timeline: the exception class, the HTTP status (or None) and the seconds into the call."""
+        attempt for the timeline: the exception class, the HTTP status (or None) and the seconds into the call.
+
+        A forced tool choice (anything but ``"auto"``) the server refuses (:func:`_refuses_choice`) is sent again at once
+        with ``"auto"`` (``state["fell_back"]`` True); when that attempt works, forcing is off for :data:`FORCED_OFF_S`
+        seconds. Any other failure of a forced call is retried as any call is, with the forced choice kept."""
         last_exc: BaseException | None = None
         t0 = time.perf_counter()
+        fell_back = False
         for attempt in range(1, self.max_attempts + 1):
             try:
-                return self.client.chat.completions.create(**kwargs)
+                response = self.client.chat.completions.create(**kwargs)
+                if fell_back:
+                    with self._lock:
+                        self._forced_off_until = time.monotonic() + FORCED_OFF_S
+                        self.forced_fallbacks += 1
+                return response
             except Exception as exc:  # noqa: BLE001 - classified below
                 status = getattr(exc, "status_code", None)
                 if failed is not None:
                     failed.append({"error": type(exc).__name__, "status": status if isinstance(status, int) else None,
                                    "after_s": round(time.perf_counter() - t0, 3)})
+                # A forced tool call the server refused (400 / 422): once more at once with "auto".
+                if kwargs.get("tool_choice") not in (None, "auto") and not fell_back and _refuses_choice(exc, kwargs):
+                    fell_back = True
+                    if state is not None:
+                        state["fell_back"] = True
+                    kwargs = {**kwargs, "tool_choice": "auto"}
+                    continue
                 # Server does not support JSON mode: drop it once and retry immediately.
                 if status == 400 and "response_format" in kwargs and "response_format" in str(exc):
                     self._json_mode_supported = False
@@ -345,12 +409,13 @@ class LLM:
 
 
 def _note_call(start: float, messages: list, tools: list | None, limit: int | None, response: Any,
-               failed: list[dict], exc: BaseException | None = None) -> None:
+               failed: list[dict], exc: BaseException | None = None, choice: str | None = None) -> None:
     """One model entry on the answer's timeline (:mod:`sf_assistant.agent.timeline`; nothing when none is open):
     ``round`` (1 + the assistant turns sent), ``after`` (what the call answers: ``question``, ``tools`` or ``nudge``),
     ``offered`` (tools offered), ``max`` (max tokens), ``tok_in``, ``tok_out``, ``finish``, ``tries``, ``failed`` (the
-    failed attempts) and ``error`` (the exception class when the call raised). No message text and no error text: an
-    error body can echo the request. Never raises."""
+    failed attempts), ``error`` (the exception class when the call raised) and, for a forced tool call only,
+    ``choice`` (``required``, ``auto_fallback`` when it went out again as "auto", ``auto_off`` while forcing is off).
+    No message text and no error text: an error body can echo the request. Never raises."""
     try:
         roles = [m.get("role") if isinstance(m, dict) else getattr(m, "role", None) for m in messages or []]
         last = roles[-1] if roles else None
@@ -369,6 +434,8 @@ def _note_call(start: float, messages: list, tools: list | None, limit: int | No
             entry["failed"] = [dict(f) for f in failed]
         if exc is not None:
             entry["error"] = type(exc).__name__
+        if choice is not None:
+            entry["choice"] = choice
         timeline.add("model", start, **entry)
     except Exception:  # noqa: BLE001 - logging never fails a call
         pass

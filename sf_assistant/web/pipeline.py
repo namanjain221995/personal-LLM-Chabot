@@ -513,18 +513,20 @@ class Pipeline:
             shutil.rmtree(self.knowledge_dir, ignore_errors=True)
 
     # ---- one question
-    def _run(self, question: str, mode: str) -> tuple[dict, str, Any]:
+    def _run(self, question: str, mode: str, context_objects: Any = ()) -> tuple[dict, str, Any]:
         session = self.session if mode in ("merged", "records") else None
         self._n += 1
+        extra = {"context_objects": tuple(context_objects)} if context_objects else {}   # fakes without it still work
         with self._capture.capture() as buf:
             row = self.ask_mod.ask(question, self.cfg, self.registry, self.system, self.llm, self._n, False, session,
                                    self.max_rows, records_only=mode == "records" and session is not None,
-                                   records_wanted=mode != "knowledge", lean_knowledge=True)
+                                   records_wanted=mode != "knowledge", lean_knowledge=True, **extra)
         return row, buf.getvalue(), session
 
-    def answer(self, question: str, mode: str = "merged") -> dict:
+    def answer(self, question: str, mode: str = "merged", context_objects: Any = ()) -> dict:
         """Answer one question. Returns answer, kind, source_line, data_ts, trace (admin), log (web log) and, with a
-        chart, charts."""
+        chart, charts. ``context_objects``: the objects the last answer named (prerequisite P2b; only the clarifying
+        question of a record step that got no data reads them)."""
         if mode not in MODES:
             raise ValueError(f"unknown mode {mode!r}")
         with self._run_lock:
@@ -544,7 +546,7 @@ class Pipeline:
             failed_reopen = None   # the reopen after a swap error that failed (no retry): {close_s, open_s, s}
             t_run = time.perf_counter()
             try:
-                row, stdout, session = self._run(question, mode)
+                row, stdout, session = self._run(question, mode, context_objects)
             except Exception:
                 swapped = self.session is not None and file_identity(self.rcfg.warehouse) != self.session_identity
                 if not swapped:
@@ -553,7 +555,7 @@ class Pipeline:
                 if not self._open_session("error during a file swap"):
                     raise
                 retry_s = round(time.perf_counter() - t_run, 2)
-                row, stdout, session = self._run(question, mode)
+                row, stdout, session = self._run(question, mode, context_objects)
                 retried = True
             if (not retried and session is not None and _swap_error(row)
                     and file_identity(self.rcfg.warehouse) != self.session_identity):
@@ -561,7 +563,7 @@ class Pipeline:
                 t_swap = time.perf_counter()
                 if self._open_session("query error during a file swap"):
                     retry_s = round(time.perf_counter() - t_run, 2)
-                    row, stdout, session = self._run(question, mode)
+                    row, stdout, session = self._run(question, mode, context_objects)
                     retried = True
                 else:
                     failed_reopen = {**(self._reopen or {}), "s": round(time.perf_counter() - t_swap, 2)}
@@ -578,7 +580,7 @@ class Pipeline:
         refused complete questions on a busy model); ``log["rewrite"]["answered"]`` is then "typed". The model's own
         UNCLEAR stays a refusal. ``log["rewrite"]`` says what the rewrite did (status, reason, ``seconds`` of the
         rewrite call; the question used only when it changed)."""
-        from sf_assistant.agent.followup import FAILED, UNCLEAR, rewrite, usable_turns
+        from sf_assistant.agent.followup import FAILED, UNCLEAR, last_answer_objects, rewrite, usable_turns
 
         if not usable_turns(turns):
             return self.answer(question, mode)
@@ -604,7 +606,8 @@ class Pipeline:
             return {"answer": text, "kind": "none", "source_line": None, "data_ts": None,
                     "trace": {"mode": mode, "rewrite": dict(info), "queries": [], "timings": {}},
                     "log": {"rewrite": info}}
-        out = self.answer(step.question, mode)
+        objects = last_answer_objects(turns)   # P2b: only the clarifying question reads them
+        out = self.answer(step.question, mode, objects) if objects else self.answer(step.question, mode)
         if step.question != question:
             info["question_used"] = step.question
             out["answer"] = read_as_line(step.question) + "\n\n" + str(out.get("answer") or "")
@@ -659,6 +662,9 @@ class Pipeline:
             "status_line": self._status.get("status_line"), "retried_after_swap": retried,
             "transcript": stdout[-TRANSCRIPT_MAX:],
         }
+        for key in ("line_reason", "small_talk", "clarify", "display"):   # the prerequisites of 2026-11-25
+            if jl.get(key):
+                trace[key] = jl[key]
         jl.pop("record_facts", None)  # rows can be large; the queries keep SQL, params and row counts
         jl.pop("charts", None)        # the web log holds no chart; row["charts"] goes to the job reply only
         log = {"summary": {k: row.get(k) for k in ("answer", "records", "rq", "audit", "ktools", "rtools", "error",
