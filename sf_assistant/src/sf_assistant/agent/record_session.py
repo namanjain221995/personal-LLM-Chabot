@@ -86,7 +86,10 @@ Display words (prerequisite P3 of 2026-11-25, ``agent.display``): the pipeline p
 words (what to fetch) and the :class:`~sf_assistant.agent.display.Display` flags (``display=``) to :meth:`RecordSession.
 route`, :meth:`~RecordSession.triage` and :meth:`~RecordSession.ask`: the chart overrule and the chart note read the
 flags, and a table, detail, summary, breakdown or file flag appends the display note (``display.note``) after the chart
-note. Without ``display`` (any other caller) the text is read as before.
+note. With ``SFA_CHARTS`` on, :meth:`~RecordSession.ask` also gets the typed question (``typed=``): the record agent's
+user message keeps the person's display words ("plot X of last 6 months"; pre-release fix of 2026-11-25), while the
+triage, the tools' ``begin_question``, the hints and the draft checks read the search text. Without ``display`` (any
+other caller) the text is read as before.
 
 Records retry (prerequisite P2 of 2026-11-25): a records-routed (or chart-overruled) question that is no people question
 gets ONE forced round (``tool_choice`` "required", ``RECORDS_TOOLS_FORCED_MESSAGE``) when its first draft ran no record
@@ -864,7 +867,8 @@ class RecordSession:
         except Exception:  # noqa: BLE001 - optional
             return False
 
-    def ask(self, question: str, routed: Any = ROUTE_HERE, display: Any = None) -> RecordAnswer:
+    def ask(self, question: str, routed: Any = ROUTE_HERE, display: Any = None,
+            typed: str | None = None) -> RecordAnswer:
         """Answer ``question`` from records, or reply NO_RECORDS. Never raises.
 
         ``routed`` is the route call's result when the caller made it already (``ask.py`` routes first in merged mode
@@ -923,11 +927,16 @@ class RecordSession:
 
         Charts (``SFA_CHARTS``, read at each call): with ``on``, a chart question's system prompt ends with
         ``agent.charts.RECORDS_CHART_NOTE``, after the note on the table lines. The tools and the user message stay as
-        they are, and off the prompt is byte for byte as before.
+        they are (but for a question with display words, whose typed text the pipeline passes as ``typed`` with the
+        switch on only), and off the prompt is byte for byte as before.
 
         Display words (prerequisite P3): ``question`` is the search text (the pipeline took the display words out) and
         ``display`` its flags; the chart note and the chart overrule read the flags, and a table, detail, summary,
-        breakdown or file flag appends ``agent.display.note`` after the chart note. None: as before.
+        breakdown or file flag appends ``agent.display.note`` after the chart note. None: as before. ``typed``: the
+        question as the person typed it, display words included; the record agent's user message reads it (before
+        the hints) so "plot X of last 6 months" still asks for a trend (pre-release fix of 2026-11-25: with the search
+        text the model listed records). The triage, ``begin_question``, the hints, the draft checks and the answer's
+        ``question`` keep reading ``question``. None or "": ``question``, as before.
 
         Records retry (prerequisite P2, see the module text): one forced round for a records-routed or chart-overruled
         question that is no people question, at the require-tools nudge (``tools_first`` of ``answer_question``) or
@@ -958,7 +967,8 @@ class RecordSession:
             hints = self.tools.object_hints(question, missing=tri.missing) if tri.missing else \
                 self.tools.object_hints(question)
             timeline.add("stage", t_hints, stage="hints", chars=len(hints or ""))   # the hints' size only, never them
-            user_text = question + ("\n\n" + hints if hints else "")
+            # the person's own words (display words kept, pre-release fix of 2026-11-25); the hints read the search text
+            user_text = (typed if typed and str(typed).strip() else question) + ("\n\n" + hints if hints else "")
             q = Question(qid=f"rec-{n:03d}", category="cross_section", question=user_text, expected_facts=[],
                          expected_tools=[], answerable=True, source="records", gold_chunk_ids=[])
             status = self.tools.status()

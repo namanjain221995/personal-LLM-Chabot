@@ -4,9 +4,12 @@ Before this, a question's display words reached every search: "artifact" was sea
 graph" went to the route call and the knowledge search, and "can you do visualizations ?" was rewritten into a
 question nobody asked. :func:`split` now takes them out of the question BEFORE the knowledge and record search and
 gives them back as flags (:class:`Display`): the search text feeds the spelling help, the knowledge question, the route
-and names calls, the people and value spots, the record hints, the record agent and ``begin_question``; the flags feed
-the chart note, the chart overrule, the record agent's display note (:data:`RECORDS_DISPLAY_NOTE`, :func:`note`) and
-the file line. The merge, the contact rule, ``charts.make`` and the JSONL keep the typed text.
+and names calls, the people and value spots, the record hints, ``begin_question`` and the record agent's draft checks;
+the flags feed the chart note, the chart overrule, the record agent's display note (:data:`RECORDS_DISPLAY_NOTE`,
+:func:`note`) and the file line. The record agent's user message, the merge, the contact rule, ``charts.make`` and the
+JSONL keep the typed text (the record agent's message since the pre-release check of 2026-11-25, with ``SFA_CHARTS``
+on: read as "show X of last 6 months", "plot X of last 6 months" got a record list instead of a monthly trend with a
+chart; off, it reads the search text as before).
 
 The words (the only list; ``agent/charts.py`` and ``followup._CHART_WORDS`` read theirs from here):
 
@@ -33,9 +36,10 @@ or a field word right before it: "a status breakdown of X"), ``gate`` (a gated w
 (visualization, visually outside the chart grammar's own shapes: "visually impaired", "visualization engineer"),
 ``refused`` (a refusal the chart grammar reads: "hide the pie chart", "stop showing charts", "graph hata do": the
 chart flag is refused and the chart words stay), and with a record session
-(:class:`SessionGuards`): ``value`` (inside a stored record value the question names), ``name`` (inside a stored
-person's name) and ``invariant`` (the search text would change what the contact rule or the business-term contracts
-read, or lose a number or a quoted span: the split is dropped whole, the flags stay).
+(:class:`SessionGuards`): ``value`` (inside a stored record value the question names; a value that is only the file
+word of a file shape, a company named "Excel" in "send X to excel", keeps the word and still sets the file flag),
+``name`` (inside a stored person's name) and ``invariant`` (the search text would change what the contact rule or the
+business-term contracts read, or lose a number or a quoted span: the split is dropped whole, the flags stay).
 
 What is left must read as a sentence: the article and connector of a removed phrase go with it, a removed display verb
 at the head of a clause becomes "show" (Hinglish: "dikhao"), a clause left with filler only goes whole ("..., monthwise.
@@ -748,28 +752,32 @@ def _split(typed: str, guards: Any) -> Display:
     if not ops:
         return Display(search=typed, refused=frozenset(refused_by_stop), kept=tuple(dict.fromkeys(kept)))
     # guards 7-8: a stored record value or a stored person's name that holds a display word keeps it
+    flag_only: list[dict] = []   # kept by a value that is the file word itself: the word stays, its file flag is set
     if guards is not None:
         spans = guards.spans(typed)
         if spans:
             left = []
             for op in ops:
-                hit = next((g for s, e, g in spans if s < op["end"] and op["start"] < e), None)
+                hit = next(((s, e, g) for s, e, g in spans if s < op["end"] and op["start"] < e), None)
                 if hit is None:
                     left.append(op)
                 else:
-                    kept += [(w, hit) for w in op["words"]]
+                    kept += [(w, hit[2]) for w in op["words"]]
+                    if _file_word_value(op, hit, typed):
+                        flag_only.append(op)
             ops = left
             if not ops:
-                return Display(search=typed, kept=tuple(dict.fromkeys(kept)))
+                file = next((v for op in flag_only for k, v in op["flags"] if k == "file"), None)
+                return Display(search=typed, file=file, kept=tuple(dict.fromkeys(kept)))
     ops.sort(key=lambda o: o["start"])
     search, empty = _rebuild(typed, low, ops)
     flags: dict[str, Any] = {}
     refused: set[str] = set()
     words: list[str] = []
     refused |= refused_by_stop
-    for op in ops:
+    for op in ops + flag_only:   # a flag-only op removed no word: its word is in kept
         refused |= set(op.get("refused") or ())
-        words += op["words"]
+        words += [] if any(op is f for f in flag_only) else op["words"]
         for k, v in op["flags"]:
             if k == "detail" and flags.get("detail") == "full":
                 continue
@@ -790,6 +798,17 @@ def _split(typed: str, guards: Any) -> Display:
                    table=bool(flags.get("table")), detail=flags.get("detail"), breakdown=bool(flags.get("breakdown")),
                    file=flags.get("file"), refused=frozenset(refused), empty=empty, capability=capability,
                    words=tuple(dict.fromkeys(words)), kept=tuple(dict.fromkeys(kept)))
+
+
+def _file_word_value(op: dict, span: tuple[int, int, str], typed: str) -> bool:
+    """A stored value spot (``span``) that is the file word of a file shape and nothing more: a company record named
+    "Excel" in "send the interviews to excel" (pre-release check P-R12 of 2026-11-25). The value spot keeps the word in
+    the search text, and the file flag is still set from the typed shape; a chart, table or other word inside a stored
+    value sets no flag (a free word such as "chart" is no shape of its own)."""
+    s, e, guard = span
+    return (guard == "value" and not op.get("refused") and bool(op["flags"])
+            and all(k == "file" for k, _v in op["flags"]) and len(op["words"]) == 1
+            and " ".join(typed[s:e].lower().split()) == op["words"][0])
 
 
 _TABLE_TAIL = re.compile(r"\b(?P<n>" + _N_TABLE + r"|pie|donut|doughnut)(?:\s+(?:please|pls|plz|chahiye|do|dikhao|bhejo))?"

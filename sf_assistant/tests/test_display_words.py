@@ -175,6 +175,43 @@ def test_value_and_name_guards_keep_the_word():
     assert d.search == "interviews of Zorvan Artifact" and d.table and ("artifact", "name") in d.kept
 
 
+@pytest.mark.parametrize("text", [
+    "send the interviews of last month to excel", "export interviews by status to Excel",
+    "interviews by status in excel", "interviews by status as an excel file", "interviews by status excel me bhejo"])
+def test_a_value_that_is_the_file_word_keeps_it_and_the_file_flag(text):
+    """P-R12 follow-up of 2026-11-25: a company record named "Excel" (made-up here) keeps the word in the search text
+    (the value spot keeps the record name) and the file flag is still set from the typed shape."""
+    at = text.lower().rindex("excel")
+    d = _s(text, _Guards([(at, at + len("excel"), "value")]))
+    assert d.search == text and d.file == "excel" and ("excel", "value") in d.kept and d.words == ()
+    assert d.flags() == {"file": "excel"} and d.as_log()["kept"] == [["excel", "value"]]
+    # with another display word: that one goes, the file word stays, both flags are set
+    text2 = "plot interviews of last 6 months to excel"
+    at = text2.rindex("excel")
+    d = _s(text2, _Guards([(at, at + 5, "value")]))
+    assert d.search == "show interviews of last 6 months to excel" and d.chart and d.file == "excel"
+    assert d.words == ("plot",) and ("excel", "value") in d.kept
+
+
+def test_a_longer_value_a_name_or_another_word_sets_no_flag():
+    text = "send the interviews to excel infotech"   # a longer stored value: no file shape of its own
+    at = text.index("excel infotech")
+    d = _s(text, _Guards([(at, len(text), "value")]))
+    assert d.search == text and d.file is None and ("excel", "value") in d.kept
+    text = "send the interviews to Excel"            # a stored person's name: kept as before, no flag
+    at = text.index("Excel")
+    d = _s(text, _Guards([(at, at + 5, "name")]))
+    assert d.search == text and d.file is None and ("excel", "name") in d.kept
+    text = "show interviews of Chart this month"      # a free chart word inside a value: no chart flag
+    at = text.index("Chart")
+    d = _s(text, _Guards([(at, at + 5, "value")]))
+    assert d.search == text and not d.chart and ("chart", "value") in d.kept
+    text = "show interviews as a table"              # a gated table word that is a stored value: no table flag
+    at = text.index("table")
+    d = _s(text, _Guards([(at, at + 5, "value")]))
+    assert d.search == text and not d.table and ("table", "value") in d.kept
+
+
 def test_the_invariant_guard_drops_the_split_and_keeps_the_flags():
     d = _s("show interviews as a table", _Guards(same=False))
     assert d.search == "show interviews as a table" and d.table and ("*", "invariant") in d.kept
