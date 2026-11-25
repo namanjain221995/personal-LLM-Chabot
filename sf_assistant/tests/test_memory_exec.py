@@ -260,9 +260,10 @@ def test_the_chart_comes_from_the_show_flag_and_the_read_as_line_is_the_plan_lin
     assert reply["charts"] and reply["charts"][0]["chart"]
     line = reply["plan_line"]
     assert line.endswith("as a chart") and reply["answer"].startswith(f"Read as: `{line}`")
-    # the record agent's question is the plan line without its display words
+    # the record agent reads the question with its display words (pre-release fix of 2026-11-25: the typed text
+    # keeps "as a chart"); the search inputs still read it without them
     user = w.client.record_messages(-1)[1]["content"]
-    assert user.startswith(line[:-len(", as a chart")]) and "as a chart" not in user.split("\n")[0]
+    assert user.split("\n")[0] == line
 
 
 def test_the_support_offer_rate_comes_back_on_a_follow_up_that_names_no_term(world):
