@@ -50,24 +50,23 @@ plan older than ``max_age`` is not shown to the model: the question is read as t
    ``display.generic_ask``) run as typed too, as with the rewrite today. "Only for North America", "show the top 10"
    and "Why is recruiter A performing lower than recruiter B?" are never decided here when a plan is usable.
 4. **The model** (one call, :func:`build_messages`): the system prompt, the plan (its line and one line per call with
-   its arguments), the summary, the pending choices, up to 6 pairs of turns and the question, within ``max_tokens``
-   (``SFA_MEMORY_TOKENS``, default 12000, whatever the bridge sent; C32): a prompt that cannot be cut to fit is never
-   sent, and step 5 answers (F4). It returns ``{"kind", "standalone", "ops"}``
-   (:func:`parse_reply`; anything else is unclear). Code then checks it: ``new`` and ``about_answer`` need a
-   ``standalone`` that passes the v6 rewrite's own reading of a reply (``followup.rewrite`` on the last 4 turns, the
-   binding checks of ``_unbound`` included: the model gets 12 turns, the checks read 4; after a patch or shortcut
-   answer of the plan, its Read-as line names each period once, when the reading keeps every ``eq`` / ``in`` filter
-   value of the plan, says no period but the plan's (or one the person typed), names no time grain but the plan's
-   (or one the person typed), and the plan keeps all its groups and rows; the person rule then reads the person's
+   its arguments), the field names of the plan's objects (:func:`field_lines`, step-5 fix), the summary, the pending
+   choices, up to 6 pairs of turns and the question, within ``max_tokens`` (``SFA_MEMORY_TOKENS``, default 12000,
+   whatever the bridge sent; C32): a prompt that cannot be cut to fit is never sent, and step 5 answers (F4). It returns
+   ``{"kind", "standalone", "ops"}`` (:func:`parse_reply`; anything else is unclear). Code then checks it: ``new`` and
+   ``about_answer`` need a ``standalone`` that passes the v6 rewrite's own reading of a reply (``followup.rewrite`` on
+   the last 4 turns, the binding checks of ``_unbound`` included: the model gets 12 turns, the checks read 4; after a
+   patch or shortcut answer of the plan, its Read-as line names each period once, when the reading keeps every ``eq`` /
+   ``in`` filter value of the plan, says no period but the plan's (or one the person typed), names no time grain but the
+   plan's (or one the person typed), and the plan keeps all its groups and rows; the person rule then reads the person's
    last turn, never that code-written line, also when the line has no dated period to cut and the reading keeps the
    filters and the groups and rows: ``_Job._read``, stage-2 review finding M5, stage-3 review findings F1, F2, R2-1 to
-   R2-3, owner items 7 and 8). Right after a patch or shortcut answer, a ``new`` reading that goes on from the plan
-   must also keep every filter of the plan, with or without a period, and its grouping and time grain unless the
-   person typed a new one; else it asks (``_Job._drops_from_plan``, owner decision of 2026-11-25, items 7 and 8); a
-   ``patch`` goes through
-   ``query_state.apply`` (fields, typed values, the filter cap, the term contracts with the rebuilt terms, the call
-   cap, contact fields). A failed check asks (a clarify); a value the person did not type becomes a did-you-mean only
-   when it is a picklist value or a record type of its field, never a name or a figure from an answer (F8).
+   R2-3, owner items 7 and 8). Right after a patch or shortcut answer, a ``new`` reading that goes on from the plan must
+   also keep every filter of the plan, with or without a period, and its grouping and time grain unless the person typed
+   a new one; else it asks (``_Job._drops_from_plan``, owner decision of 2026-11-25, items 7 and 8); a ``patch`` goes
+   through ``query_state.apply`` (fields, typed values, the filter cap, the term contracts with the rebuilt terms, the
+   call cap, contact fields). A failed check asks (a clarify); a value the person did not type becomes a did-you-mean
+   only when it is a picklist value or a record type of its field, never a name or a figure from an answer (F8).
 5. **Fallback**: ``unclear`` with a plan is a clarify built from the plan (the model's readings as choices when they
    pass the checks); without a plan it is the caller's unclear line, as today. An ``unclear`` reply may name what is
    missing (``"missing"``, the closed codes of ``followup.MISSING_CODES``; development B of 2026-11-27): it changes no
@@ -110,6 +109,7 @@ from sf_assistant.knowledge.resolver import osa_distance
 
 __all__ = ["FOLLOWUP_RESOLVE_TEXT", "FOLLOWUP_RESOLVE_SYSTEM", "LINES", "RESOLVE_MAX_TOKENS", "MAX_TURNS",
            "MAX_TURN_CHARS", "MAX_SUMMARY_CHARS", "MAX_TOKENS", "PLAN_TOKENS", "SUMMARY_TOKENS", "PAIRS_TOKENS",
+           "FIELDS_TOKENS", "MAX_FIELDS", "field_lines",
            "MAX_AGE", "MAX_CALLS", "MAX_GAP", "ACTIONS", "REASONS", "MODEL_KINDS", "Resolution", "resolve", "shadow",
            "build_messages", "parse_reply", "choice_for", "render_clarify", "pending_from_clarify", "recent_turns",
            "estimate_tokens"]
@@ -130,6 +130,9 @@ MAX_SUMMARY_CHARS = 8000
 #: The prompt cap (``SFA_MEMORY_TOKENS``) and the caps of its parts (§6.3).
 MAX_TOKENS = 12000
 PLAN_TOKENS, SUMMARY_TOKENS, PAIRS_TOKENS = 1000, 600, 6000
+#: The field names of the plan's objects the model may use (step-5 fix, field grounding): at most this many tokens,
+#: and at most :data:`MAX_FIELDS` fields of each object.
+FIELDS_TOKENS, MAX_FIELDS = 500, 40
 #: ``SFA_MEMORY_MAX_AGE`` and ``SFA_MEMORY_MAX_CALLS`` (the state core's defaults).
 MAX_AGE, MAX_CALLS = qs.MAX_AGE, qs.MAX_CALLS
 #: The largest gap the contract sends; an unreadable gap reads as one above it.
@@ -311,9 +314,61 @@ def _plan_lines(plan: dict | None, line: str) -> list[str]:
     return out
 
 
+def field_lines(plan: dict | None, view: Any) -> str:
+    """The FIELDS part of the call (step-5 fix, field grounding): for each object of the plan's calls (the main call's
+    first), its fields a question may name as ``API name: label``, with ``-> <object>`` for a lookup, from the view's
+    ``fields_of`` (schema only: no value of any record, no blocked or contact field), at most :data:`MAX_FIELDS` an
+    object and :data:`FIELDS_TOKENS` in all (cut at a whole field). "" without a plan or a view that lists fields."""
+    reader = getattr(view, "fields_of", None)
+    if not plan or reader is None:
+        return ""
+    objs: list[str] = []
+    calls = [c for c in plan.get("calls") or [] if isinstance(c, dict) and isinstance(c.get("args"), dict)]
+    for c in sorted(calls, key=lambda c: c.get("role") != "main"):
+        try:
+            obj = view.object(c["args"].get("object"))
+        except Exception:  # noqa: BLE001
+            obj = None
+        if obj and obj not in objs:
+            objs.append(obj)
+    target = getattr(view, "target", None)
+    lines: list[str] = []
+    used = 0
+    for obj in objs:
+        try:
+            listed = list(reader(obj) or ())[:MAX_FIELDS]
+        except Exception:  # noqa: BLE001 - no fields of this object
+            listed = []
+        items = []
+        for api, label, kind in listed:
+            text = f"{api}: {label}" if label and _norm(label) != _norm(api) else str(api)
+            if kind == "reference" and target is not None:
+                try:
+                    to = target(obj, api)
+                except Exception:  # noqa: BLE001
+                    to = None
+                text += f" -> {to}" if to else ""
+            items.append(_followup._scrubbed(" ".join(text.split())))
+        head = f"{obj}: "
+        kept: list[str] = []
+        for item in items:
+            line = head + "; ".join(kept + [item])
+            if used + estimate_tokens(line) > FIELDS_TOKENS:
+                break
+            kept.append(item)
+        if not kept:
+            if items:
+                break   # the cap is reached
+            continue
+        line = head + "; ".join(kept)
+        used += estimate_tokens(line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def build_messages(question: str, turns: Any, *, plan: dict | None = None, plan_line: str = "",
                    earlier: bool = False, summary: str = "", pending: dict | None = None,
-                   max_tokens: int = MAX_TOKENS) -> tuple[list[dict], dict]:
+                   max_tokens: int = MAX_TOKENS, fields: str = "") -> tuple[list[dict], dict]:
     """The messages of the resolver call and what went into them (``info``: ``tokens``, the estimated size of the
     whole prompt; ``pairs`` and ``turns`` sent; ``dropped_pairs``; ``summary`` and ``plan`` sent; ``cut_turns`` and
     ``choices_dropped``, the cuts the cap made; ``over`` when it is still above ``max_tokens``).
@@ -325,13 +380,18 @@ def build_messages(question: str, turns: Any, *, plan: dict | None = None, plan_
     kept), then the summary; then the turns that are left are cut, the newest first, and then the pending choices go
     (stage-1 review fix F4). ``over`` is True only when the system prompt, the plan and the question alone are above
     ``max_tokens``: the caller then makes no call. The summary, the choices and the turns go as JSON, so no text in
-    them can end its part, and every part is scrubbed of chat control tokens (the choices too: F7)."""
+    them can end its part, and every part is scrubbed of chat control tokens (the choices too: F7).
+
+    ``fields``: the FIELDS part (:func:`field_lines`), sent after the plan, only with a plan (``info["fields"]``); it
+    goes after the summary and before any turn is cut, when the prompt is above ``max_tokens``."""
     plan_part = _plan_lines(plan, plan_line)
     while len(plan_part) > 2 and estimate_tokens("\n".join(plan_part)) > PLAN_TOKENS:
         plan_part.pop()   # the side calls go first; the main call is the second line
     plan_text = _cut_tokens("\n".join(plan_part), PLAN_TOKENS) if plan_part else ""
     if plan_text and earlier:
         plan_text += "\n" + LINES["plan_earlier"]
+    fields_text = _cut_tokens(str(fields or "").strip(), FIELDS_TOKENS) if plan_text else ""
+    with_fields = bool(fields_text)
     summary_text = _followup._scrubbed(str(summary or "")[:MAX_SUMMARY_CHARS]).strip()
     summary_text = _cut_tokens(summary_text, SUMMARY_TOKENS) if summary_text else ""
     choices = [{"n": c.get("n"), "label": _followup._scrubbed(str(c.get("label") or "")),
@@ -350,6 +410,8 @@ def build_messages(question: str, turns: Any, *, plan: dict | None = None, plan_
         parts = []
         if plan_text:
             parts.append(f"{LINES['head_plan']}\n{plan_text}")
+        if with_fields and fields_text:
+            parts.append(f"{LINES['head_fields']}\n{fields_text}")
         if with_summary and summary_text:
             parts.append(f"{LINES['head_summary']}\n{json.dumps(summary_text, ensure_ascii=False)}")
         if choices:
@@ -364,6 +426,8 @@ def build_messages(question: str, turns: Any, *, plan: dict | None = None, plan_
     while len(chunks) > 1 and size(True) > max_tokens:
         chunks.pop(0)
     with_summary = bool(summary_text) and size(True) <= max_tokens
+    if with_fields and size(with_summary) > max_tokens:
+        with_fields = False
     cut_turns, choices_dropped = 0, False
     if size(with_summary) > max_tokens:
         kept_chunks, kept_choices = chunks, choices
@@ -390,7 +454,8 @@ def build_messages(question: str, turns: Any, *, plan: dict | None = None, plan_
     messages = [{"role": "system", "content": FOLLOWUP_RESOLVE_SYSTEM},
                 {"role": "user", "content": user_message(with_summary)}]
     info = {"tokens": tokens, "pairs": len(chunks), "turns": len(flat()), "dropped_pairs": total_pairs - len(chunks),
-            "summary": with_summary, "plan": bool(plan_text), "pending_choices": len(choices),
+            "summary": with_summary, "plan": bool(plan_text), "fields": with_fields,
+            "pending_choices": len(choices),
             "cut_turns": cut_turns, "choices_dropped": choices_dropped, "over": tokens > max_tokens}
     return messages, info
 
@@ -742,7 +807,7 @@ class _Job:
         #: the model is called (resolve, SFA_MEMORY=on), never in shadow: :meth:`run` sets it
         self.calls_model = False
         self.label = getattr(view, "label", None) if view is not None else None
-        self.line = qs.plan_line(self.plan, today=self.today, label=self.label) if self.plan else ""
+        self.line = qs.plan_line(self.plan, today=self.today, label=self.label, view=view) if self.plan else ""
         self.stored_terms = self.plan["terms"] if self.plan else None
         self.pending = self.checked.pending if self._strict(strict) else None
         self.info: dict[str, Any] = {"gap": self.gap, "age": self.age if self.age is not None else -1,
@@ -1025,7 +1090,7 @@ class _Job:
 
     def _line(self, plan: dict | None, terms: Terms | None = None) -> str:
         """The plan line of a patched plan, with the scope of the terms it runs with (stage-1 review fix M2)."""
-        return qs.plan_line(plan, today=self.today, label=self.label, terms=terms) if plan else ""
+        return qs.plan_line(plan, today=self.today, label=self.label, terms=terms, view=self.view) if plan else ""
 
     def _field_label(self, obj: Any, path: Any) -> str:
         """The words of a field for a choice: its label in the catalog view, else its API name."""
@@ -1290,9 +1355,11 @@ class _Job:
         plan = self.plan if self.plan_ok else None
         messages, info = build_messages(self.question, self.turns, plan=plan, plan_line=self.line,
                                         earlier=bool(plan) and (self.gap > 0 or self.age > 0), summary=self.summary,
-                                        pending=pending, max_tokens=self.max_tokens)
+                                        pending=pending, max_tokens=self.max_tokens,
+                                        fields=field_lines(plan, self.view))
         self.info.update({"pairs": info["pairs"], "dropped_pairs": info["dropped_pairs"],
-                          "summary_sent": info["summary"], "cut_turns": info["cut_turns"], "over": info["over"]})
+                          "summary_sent": info["summary"], "fields_sent": info["fields"],
+                          "cut_turns": info["cut_turns"], "over": info["over"]})
         tokens = info["tokens"]
         if info["over"]:   # SFA_MEMORY_TOKENS holds: no prompt above it reaches the shared server (C32, F4)
             return dataclasses.replace(self._fallback(None, "over_cap"), prompt_tokens=tokens)

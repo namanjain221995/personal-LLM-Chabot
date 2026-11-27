@@ -3150,7 +3150,7 @@ def test_b_the_codes_and_the_prompt_versions_are_pinned():
         "number", "period")
     assert F.missing_codes(7) == () and F.missing_codes(["number", 3]) == () and F.missing_codes("") == ()
     assert P.load("followup_rewrite").version == 7 and P.load("followup_unclear").version == 1
-    assert P.load("followup_resolve").version == 3
+    assert P.load("followup_resolve").version == 4
     text = P.text("followup_rewrite")
     assert "UNCLEAR missing=<codes>" in text and all(f"- {code}: " in text for code in F.MISSING_CODES)
     # the prompt's own example of step 4 reads as it teaches

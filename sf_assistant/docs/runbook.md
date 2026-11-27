@@ -495,7 +495,7 @@ no state, `shadow` answers byte for byte as `off` and also returns the next quer
 | `SFA_MEMORY_PATCH_KNOWLEDGE` | `off` | `off`, `on` (owner decision D4: off) |
 | `SFA_MEMORY_MAX_CALLS` | `3` | a whole number from 1 to 3 |
 | `SFA_MEMORY_MAX_AGE` | `2` | a whole number from 0 to 6 |
-| `SFA_MEMORY_TOKENS` | `12000` | a whole number from the resolver's smallest prompt (`memory_tokens_floor()`, about 5,400) to 100000 |
+| `SFA_MEMORY_TOKENS` | `12000` | a whole number from the resolver's smallest prompt (`memory_tokens_floor()`, about 5,500) to 100000 |
 
 How they reach the service:
 
