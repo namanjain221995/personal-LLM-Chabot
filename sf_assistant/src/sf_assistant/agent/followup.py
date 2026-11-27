@@ -72,6 +72,17 @@ reply to a clarifying question (``agent.clarify.choice_reply``: "2", "the second
 text; the choice comes back, reason ``clarify_choice``). :func:`last_answer_objects` gives the objects the last answer
 named (P2b: only the clarifying question reads them).
 
+An ``UNCLEAR`` reply may name what is missing (development B of 2026-11-27): ``UNCLEAR missing=number,period
+about=the recruiters of marketing team`` (:func:`_coded_unclear`). Every rule above reads such a reply as ``UNCLEAR``
+alone, so it decides exactly what ``UNCLEAR`` decides; only a refusal of rule 2 (reason ``unclear``) keeps the codes
+(``Rewrite.missing``, the closed set :data:`MISSING_CODES`: who, object, number, period; an unknown code drops them
+all) and the reading (``Rewrite.about``), which counts only when it is a run of words of an earlier user turn, as typed
+there, for a pointing word of the typed question, and ``who`` is not among the codes (:func:`_offer`).
+:func:`unclear_text` writes the person's reply from fixed parts (``prompts/followup_unclear.md``) and the person's own
+typed words, then the caller's fixed unclear line, which the platform bridge looks for in the last answer
+(``sfk_bridge.follows_a_stop_line``); with no code it is that line alone, as before. No word of the model reaches the
+person but a code and that checked reading.
+
 A call that raises is status ``failed``, and the typed words are not sent on either way: as a fragment they would be
 answered as a different question. Typed spellings stay: the term resolver reads the question this returns
 (``pipeline.spelling_final``), and a silent correction here would skip its "Read as" line.
@@ -100,9 +111,16 @@ from sf_assistant.engine.contact import asks_for_contact, drop_contact_details
 from sf_assistant.knowledge.resolver import osa_distance
 
 __all__ = ["FOLLOWUP_REWRITE_SYSTEM", "FOLLOWUP_MAX_TOKENS", "MAX_QUESTION_CHARS", "MAX_TURNS", "MAX_TURN_CHARS",
-           "MAX_NAME_WORDS", "OK", "UNCLEAR", "FAILED", "Rewrite", "usable_turns", "rewrite", "last_answer_objects"]
+           "MAX_NAME_WORDS", "OK", "UNCLEAR", "FAILED", "Rewrite", "usable_turns", "rewrite", "last_answer_objects",
+           "FOLLOWUP_UNCLEAR_TEXT", "UNCLEAR_PARTS", "MISSING_CODES", "missing_codes", "unclear_ask", "unclear_text"]
 
 FOLLOWUP_REWRITE_SYSTEM = _prompt_files.text("followup_rewrite")
+#: the parts of the reply to an unclear follow-up (development B of 2026-11-27): key -> text
+FOLLOWUP_UNCLEAR_TEXT = _prompt_files.text("followup_unclear")
+UNCLEAR_PARTS: dict[str, str] = dict(ln.split(": ", 1) for ln in FOLLOWUP_UNCLEAR_TEXT.split("\n") if ": " in ln)
+#: what an unclear follow-up can leave out, in the order the reply asks for them: who or what a pointing word means,
+#: which records, the number of a comparison, the period
+MISSING_CODES = ("who", "object", "number", "period")
 FOLLOWUP_MAX_TOKENS = LIMITS.followup_max_tokens
 MAX_QUESTION_CHARS = 1000    # the page's limit (web/server.py), for the typed question and for the reply
 MAX_TURNS = 4                # the last 2 turns: a question and its answer, twice
@@ -389,6 +407,8 @@ class Rewrite:
     """What :func:`rewrite` decided: ``status`` :data:`OK` with the ``question`` to answer (the typed one, or the
     rewritten one), else :data:`UNCLEAR` or :data:`FAILED` with no question; ``reason`` is a fixed word and ``error`` a
     class name. ``reply`` is the model's text behind a refusal, for the private log only: it never compares or prints.
+    ``missing`` (codes of :data:`MISSING_CODES`) and ``about`` (a checked reading of the person's own words, see
+    :func:`_offer`) only on a refusal of reason ``unclear`` whose reply named them: :func:`unclear_text` reads them.
     """
 
     status: str
@@ -396,6 +416,8 @@ class Rewrite:
     reason: str = ""
     error: str = ""
     reply: str = field(default="", compare=False, repr=False)
+    missing: tuple[str, ...] = ()
+    about: str = ""
 
 
 def _scrubbed(text: str) -> str:
@@ -1240,6 +1262,166 @@ def last_answer_objects(turns: Any) -> tuple[str, ...]:
         return ()
 
 
+# ------------------------------------------------------------------------------------ an unclear reply that says why
+#: ``UNCLEAR missing=number,period about=the recruiters of marketing team``, on one line: the codes, and the words a
+#: pointing word of the typed question means (``about``, optional). A "Reply:" before it is allowed, as for UNCLEAR
+_CODED_UNCLEAR_RE = re.compile(r"[\W_]*(?:(?:reply|answer|output)[\W_]*)?unclear[ \t:;,.\-–—]+missing[ \t]*[=:][ \t]*"
+                               r"(?P<codes>[^\n=]*?)(?:[ \t;,|]+about[ \t]*[=:][ \t]*(?P<about>[^\n=]*?))?[ \t.;]*",
+                               re.IGNORECASE)
+_CODE_SPLIT_RE = re.compile(r"[\s,/&+]+")
+_QUOTES = "\"'“”‘’`"
+_MAX_ABOUT_WORDS = 10
+_MAX_ABOUT_CHARS = 120
+#: a reading is shown as the person typed it: words and single spaces, nothing that could format or link
+_PLAIN_RUN_RE = re.compile(r"[^\W_]+(?: [^\W_]+)*")
+_FEWER_WORDS = frozenset(w.strip() for w in UNCLEAR_PARTS["fewer_words"].split(","))
+_MORE_WORDS = frozenset(w.strip() for w in UNCLEAR_PARTS["more_words"].split(","))
+#: Hinglish comparison words, whose noun may stand before them ("interviews kam")
+_NOUN_BEFORE = frozenset("kam kum zyada jyada zyaada adhik".split())
+#: a period typed with no number to fix it: "last years", "past few months", "recently", "pichle kuch mahine"
+_VAGUE_PERIOD_RE = re.compile(
+    r"(?<![^\W_])(?:(?:last|past|previous|recent)\s+(?:(?:few|several|couple\s+of)\s+)?"
+    r"(?P<unit>days|weeks|months|quarters|years)"
+    r"|(?:(?:pichle|pichhle)\s+)?kuch\s+(?:din|dinon|hafte|hafton|mahine|mahinon|saal|saalon)"
+    r"|recently|lately|earlier)(?![^\W_])", re.IGNORECASE)
+_PERSON_POINTERS = frozenset("he she him his her uska uski uske usne usko woh wo".split())
+_THING_POINTERS = frozenset("it its iska iski iske isko isne ise".split())
+_GROUP_WORDS = _GROUP_POINTERS | {"those", "these"}
+#: words a reading needs more than: it must name something ("all of them" names nothing)
+_SCOPE_WORDS = frozenset("all every each list out".split())
+
+
+def missing_codes(value: Any) -> tuple[str, ...]:
+    """The codes of :data:`MISSING_CODES` that ``value`` names (a text such as "number, period" or a list of codes), in
+    that order and each once; () when it names none or anything else: one unknown code drops them all, so a reply
+    that is not of the closed set never shapes the reply to the person."""
+    if isinstance(value, str):
+        given = [w for w in _CODE_SPLIT_RE.split(value.casefold()) if w and w != "and"]
+    elif isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value):
+        given = [w for v in value for w in _CODE_SPLIT_RE.split(v.casefold()) if w and w != "and"]
+    else:
+        return ()
+    if not given or len(given) > 2 * len(MISSING_CODES) or any(w not in MISSING_CODES for w in given):
+        return ()
+    return tuple(c for c in MISSING_CODES if c in given)
+
+
+def _coded_unclear(text: str) -> tuple[tuple[str, ...], str] | None:
+    """``(codes, about)`` of an ``UNCLEAR missing=...`` reply (:data:`_CODED_UNCLEAR_RE`), None for any other text. The
+    codes are :func:`missing_codes` (() when the reply names an unknown one), ``about`` the raw reading, quotes off."""
+    m = _CODED_UNCLEAR_RE.fullmatch(text)
+    if not m:
+        return None
+    return missing_codes(m.group("codes")), (m.group("about") or "").strip().strip(_QUOTES).strip()
+
+
+def _offer(about: str, question: str, turns: list[dict]) -> str:
+    """The reading ``about`` as the reply may offer it ("Do you mean ...?"), else "". Only words the person typed: a run
+    of the words of one earlier user turn (a "the" before it may be added), as written there, with only single spaces
+    between them, of at most :data:`_MAX_ABOUT_WORDS` words, for a typed question that points back. Never a word of an
+    answer, so never a name or a value from records; never a contact detail."""
+    if not about or len(about) > _MAX_ABOUT_CHARS or not _typed_pointer(question):
+        return ""
+    want = _words(about)
+    if not want or len(want) > _MAX_ABOUT_WORDS or not set(want) - _POINTERS - _FRAME - _SCOPE_WORDS:
+        return ""
+    tries = [(want, "")] + ([(want[1:], "the ")] if want[0] == "the" and len(want) > 1 else [])
+    for turn in reversed(turns):
+        if turn.get("role") != "user":
+            continue
+        text = turn["content"]
+        tokens = list(_WORD_RE.finditer(text))
+        folded = [m.group(0).casefold() for m in tokens]
+        for words, lead in tries:
+            n = len(words)
+            for i in range(len(folded) - n + 1):
+                if folded[i:i + n] != words:
+                    continue
+                span = text[tokens[i].start():tokens[i + n - 1].end()]
+                if not _PLAIN_RUN_RE.fullmatch(span):
+                    continue
+                reading = lead + span
+                if asks_for_contact(reading) or drop_contact_details(reading)[1]:
+                    return ""
+                return reading
+    return ""
+
+
+def _who_part(question: str) -> str:
+    m = _AT_A_PERSON_RE.search(question)
+    if m:
+        return _prompt_files.fill(UNCLEAR_PARTS["who_person"], WORD=" ".join(m.group(0).split()))
+    for t in _WORD_RE.finditer(question):
+        word = t.group(0)
+        low = word.casefold()
+        for words, key in ((_PERSON_POINTERS, "who_person"), (_GROUP_WORDS, "who_group"),
+                           (_THING_POINTERS, "who_thing")):
+            if low in words:
+                return _prompt_files.fill(UNCLEAR_PARTS[key], WORD=word)
+    return UNCLEAR_PARTS["who_plain"]
+
+
+def _noun(word: str) -> bool:
+    return (word.isalpha() and 3 <= len(word) <= 30 and word not in _POINTERS | _FRAME | _PERIOD_WORDS
+            and word not in _FEWER_WORDS | _MORE_WORDS | {"than", "then"})
+
+
+def _number_part(question: str) -> str:
+    words = _words(question)
+    for i, w in enumerate(words):
+        if w not in _FEWER_WORDS | _MORE_WORDS:
+            continue
+        side = "fewer" if w in _FEWER_WORDS else "more"
+        after = words[i + 1] if i + 1 < len(words) else ""
+        before = words[i - 1] if i and w in _NOUN_BEFORE else ""
+        noun = after if _noun(after) else before if _noun(before) else ""
+        if noun:
+            return _prompt_files.fill(UNCLEAR_PARTS[f"number_{side}"], NOUN=noun)
+        return UNCLEAR_PARTS[f"number_{side}_plain"]
+    return UNCLEAR_PARTS["number_plain"]
+
+
+def _period_part(question: str) -> str:
+    m = _VAGUE_PERIOD_RE.search(question)
+    if not m:
+        return UNCLEAR_PARTS["period_plain"]
+    phrase = " ".join(m.group(0).split())
+    if m.group("unit"):
+        return _prompt_files.fill(UNCLEAR_PARTS["period_unit"], UNIT=m.group("unit").casefold(), PHRASE=phrase)
+    return _prompt_files.fill(UNCLEAR_PARTS["period_phrase"], PHRASE=phrase)
+
+
+def unclear_ask(question: Any, missing: Any, about: Any = "") -> str:
+    """The question to the person for an unclear follow-up that names what is missing: one sentence of the parts of
+    ``prompts/followup_unclear.md`` for the ``missing`` codes, filled only with words of the typed ``question``
+    ("Fewer than how many interviews, and which years do you mean by "last years"?"), after "Do you mean <about>?" when
+    ``about`` (a reading :func:`_offer` checked) is given and ``who`` is not missing. "" when no code is given. Never
+    raises."""
+    try:
+        codes = missing_codes(list(missing) if isinstance(missing, (list, tuple)) else missing)
+        if not codes or not isinstance(question, str):
+            return ""
+        makers = {"who": _who_part, "object": lambda q: UNCLEAR_PARTS["object"], "number": _number_part,
+                  "period": _period_part}
+        parts = [makers[c](question) for c in codes]
+        sentence = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + ", and " + parts[-1]
+        sentence = sentence[:1].upper() + sentence[1:] + "?"
+        if isinstance(about, str) and about and "who" not in codes:
+            sentence = _prompt_files.fill(UNCLEAR_PARTS["offer"], READING=about) + " " + sentence
+        return sentence
+    except Exception:  # noqa: BLE001 - the caller's fixed line alone
+        return ""
+
+
+def unclear_text(question: Any, missing: Any, about: Any = "", *, fixed: str) -> str:
+    """What the person reads for an unclear follow-up: :func:`unclear_ask`, a blank line and the caller's ``fixed``
+    unclear line (the platform bridge finds that line in the last answer, so it always stands there in full); ``fixed``
+    alone when the reply named no code. Byte for byte the same text wherever it is called (the page, the ask service
+    in every memory mode)."""
+    ask = unclear_ask(question, missing, about)
+    return f"{ask}\n\n{fixed}" if ask else fixed
+
+
 def rewrite(question: str, turns: Any, llm: Any, *, code_line: bool = False) -> Rewrite:
     """The question to answer for ``question`` after the earlier ``turns`` (see the module text). Never raises.
 
@@ -1278,23 +1460,31 @@ def rewrite(question: str, turns: Any, llm: Any, *, code_line: bool = False) -> 
     def refused(reason: str) -> Rewrite:
         return Rewrite(UNCLEAR, reason=reason, reply=text[:MAX_TURN_CHARS])
 
-    if not cut and text and _words(text) == _words(question):
+    # development B: "UNCLEAR missing=..." is read as UNCLEAR alone by every rule below (the same decision); only the
+    # refusal of rule 2 keeps what it names. A reply cut at the token limit is never read so
+    coded = None if cut else _coded_unclear(text)
+    said = "UNCLEAR" if coded is not None else text
+    if not cut and said and _words(said) == _words(question):
         if _fragment(question) and not _another_subject(question, usable) and not _self_anchored(question):
             return refused("fragment_echo")
         return Rewrite(OK, question)
-    if not cut and text and _respelt(question, text):
+    if not cut and said and _respelt(question, said):
         return Rewrite(OK, question)
-    if not text:
+    if not said:
         return refused("output_rule")
-    if (not cut and _UNCLEAR_RE.fullmatch(text) and _complete(question) and not _fragment(question)
+    if (not cut and _UNCLEAR_RE.fullmatch(said) and _complete(question) and not _fragment(question)
             and (_names_its_own(question) or _ORG_WORDS & set(_words(question)))):
         return Rewrite(OK, question)
-    if not any(ch.isalnum() for ch in text) or _UNCLEAR_RE.fullmatch(text):
-        return refused("unclear")
-    if cut or len(text.splitlines()) > 1 or len(text) > MAX_QUESTION_CHARS:
+    if not any(ch.isalnum() for ch in said) or _UNCLEAR_RE.fullmatch(said):
+        if coded is None or not coded[0]:
+            return refused("unclear")
+        codes, about = coded
+        reading = "" if "who" in codes else _offer(about, question, usable)
+        return Rewrite(UNCLEAR, reason="unclear", reply=text[:MAX_TURN_CHARS], missing=codes, about=reading)
+    if cut or len(said.splitlines()) > 1 or len(said) > MAX_QUESTION_CHARS:
         return refused("output_rule")
-    if asks_for_contact(text) != asks_for_contact(question) or (drop_contact_details(text)[1]
+    if asks_for_contact(said) != asks_for_contact(question) or (drop_contact_details(said)[1]
                                                                 and not drop_contact_details(question)[1]):
         return refused("contact_changed")
-    why = _unbound(question, text, usable, code_line=code_line)
-    return refused(why) if why else Rewrite(OK, text)
+    why = _unbound(question, said, usable, code_line=code_line)
+    return refused(why) if why else Rewrite(OK, said)

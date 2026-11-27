@@ -69,7 +69,11 @@ plan older than ``max_age`` is not shown to the model: the question is read as t
    cap, contact fields). A failed check asks (a clarify); a value the person did not type becomes a did-you-mean only
    when it is a picklist value or a record type of its field, never a name or a figure from an answer (F8).
 5. **Fallback**: ``unclear`` with a plan is a clarify built from the plan (the model's readings as choices when they
-   pass the checks); without a plan it is the caller's unclear line, as today.
+   pass the checks); without a plan it is the caller's unclear line, as today. An ``unclear`` reply may name what is
+   missing (``"missing"``, the closed codes of ``followup.MISSING_CODES``; development B of 2026-11-27): it changes no
+   decision, only the words. ``Resolution.missing`` carries the codes to the caller, which writes its unclear line with
+   ``followup.unclear_text`` (the page and the ask service, the same text as the rewrite's), and the clarify built from
+   the plan with no choices asks for them (line ``unclear_plan_ask``) in place of "Please ask the full question".
 
 The resolver never runs anything: it returns a :class:`Resolution` (what to run, or the reply to give), and the
 caller (lane S3) runs it and builds the next state (``query_state.build``). It never raises: a fault of its own is
@@ -140,7 +144,7 @@ REASONS = ("small_talk", "clarify_choice", "ask_full", "shortcut", "new", "patch
            "unclear_rewrite", "call_failed", "not_local", "resolver_error", "model")
 #: The kinds the model may reply.
 MODEL_KINDS = ("new", "patch", "about_answer", "unclear")
-_REPLY_KEYS = frozenset({"kind", "standalone", "ops"})
+_REPLY_KEYS = frozenset({"kind", "standalone", "ops", "missing"})
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
 #: Ordinals of a reply to a clarifying question: the clarifying question's own (agent/clarify.py), and a fourth.
 _ORDINALS = {**_clarify._ORDINALS, "fourth": 4, "4th": 4, "four": 4, "chautha": 4, "chauthi": 4, "chauthe": 4}
@@ -160,9 +164,9 @@ _RANKING_WORDS = frozenset("""most least top highest lowest best worst maximum m
 _PERIOD_FRAME = frozenset("the for in of during on to a an".split())
 
 
-def _say(key: str, plan: str = "", field: str = "", value: str = "") -> str:
+def _say(key: str, plan: str = "", field: str = "", value: str = "", ask: str = "") -> str:
     """A line of the prompt file, filled (one pass)."""
-    return _prompt_files.fill(LINES[key], PLAN=plan, FIELD=field, VALUE=value)
+    return _prompt_files.fill(LINES[key], PLAN=plan, FIELD=field, VALUE=value, ASK=ask)
 
 
 def _norm(text: Any) -> str:
@@ -193,7 +197,9 @@ class Resolution:
     (``query_state.check``); every kind of answer builds the next state from it (a reply given at a gap holds its plan
     at least one answer old, M8). ``model_called`` and
     ``prompt_tokens`` (the estimated size of the resolver prompt; in shadow, the size it would have) are for the
-    timeline. ``reply`` is the model's text behind a refusal, for the private log only."""
+    timeline. ``reply`` is the model's text behind a refusal, for the private log only. ``missing``: what an unclear
+    reply of the model said is missing (codes of ``followup.MISSING_CODES``), on a reply of status ``unclear`` only;
+    the caller's text reads it (``followup.unclear_text``), no decision does."""
 
     action: str
     reason: str
@@ -219,6 +225,7 @@ class Resolution:
     prompt_tokens: int = 0
     info: dict = field(default_factory=dict, compare=False)
     reply: str = field(default="", compare=False, repr=False)
+    missing: tuple[str, ...] = ()
 
     def log(self) -> dict:
         """The private log entry: fixed codes and numbers only (no question, no turn, no value, no answer text)."""
@@ -230,6 +237,8 @@ class Resolution:
         out.update({k: v for k, v in self.info.items() if isinstance(v, (bool, int, str)) and k not in out})
         if self.error:
             out["error"] = self.error
+        if self.missing:   # what an unclear reply named (development B); "missing" counts the state's lost fields
+            out["missing_parts"] = ",".join(self.missing)
         return out
 
 
@@ -390,8 +399,10 @@ def build_messages(question: str, turns: Any, *, plan: dict | None = None, plan_
 def parse_reply(text: Any) -> dict | None:
     """The model's reply as ``{"kind", "standalone", "ops"}``, or None: one JSON object (a code fence around it is
     allowed, nothing else), with the keys kind (:data:`MODEL_KINDS`), standalone (a string of one line, at most 1,000
-    characters; may be missing) and ops (a list; may be missing), and no other key. The ops are checked later by
-    ``query_state.normalize_ops``."""
+    characters; may be missing) and ops (a list; may be missing), and no other key but ``missing``. The ops are checked
+    later by ``query_state.normalize_ops``. ``missing`` (development B) never makes a reply valid or not: whatever it
+    holds, the reply is read as without it, and only on kind ``unclear`` its codes (``followup.missing_codes``: the
+    closed set, () for anything else) come back under ``"missing"``, when there are any."""
     if not isinstance(text, str) or not text.strip():
         return None
     body = text.strip()
@@ -415,7 +426,11 @@ def parse_reply(text: Any) -> dict | None:
     standalone = standalone.strip()
     if len(standalone) > _followup.MAX_QUESTION_CHARS or "\n" in standalone or "\r" in standalone:
         return None
-    return {"kind": obj["kind"], "standalone": standalone, "ops": ops}
+    out = {"kind": obj["kind"], "standalone": standalone, "ops": ops}
+    missing = _followup.missing_codes(obj.get("missing")) if obj["kind"] == "unclear" else ()
+    if missing:
+        out["missing"] = missing
+    return out
 
 
 class _Echo:
@@ -1178,9 +1193,11 @@ class _Job:
 
     def _fallback(self, reply: dict | None, detail: str) -> Resolution:
         """Step 5: with a plan the model saw, a clarify built from the plan (its readings as choices when they pass
-        the checks); without one, the caller's unclear line."""
+        the checks); without one, the caller's unclear line. What an unclear reply said is missing changes only the
+        words (development B): the codes go with the unclear reply, and the clarify with no choice asks for them."""
+        missing = tuple((reply or {}).get("missing") or ()) if (reply or {}).get("kind") == "unclear" else ()
         if not self.plan_ok:
-            return self._unclear(5, detail)
+            return dataclasses.replace(self._unclear(5, detail), missing=missing)
         choices: list[dict] = []
         if reply and reply.get("ops") and not self.checked.missing:
             canon = qs.normalize_ops(reply["ops"])
@@ -1203,7 +1220,9 @@ class _Job:
         if self.checked.missing:
             return self._clarify(5, _say("field_removed", plan=self.line, field=self.checked.missing[0]),
                                  detail="field_removed")
-        return self._clarify(5, _say("unclear_plan", plan=self.line), detail=detail or "unclear_plan")
+        ask = _followup.unclear_ask(self.question, missing)
+        text = _say("unclear_plan_ask", plan=self.line, ask=ask) if ask else _say("unclear_plan", plan=self.line)
+        return self._clarify(5, text, detail=detail or "unclear_plan")
 
     def _shortcut(self) -> _shortcuts.Shortcut | None:
         """Step 2: the display words read by ``agent/display.py`` (the one list), the rest by the shortcut grammar."""

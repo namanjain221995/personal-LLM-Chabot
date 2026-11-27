@@ -951,3 +951,69 @@ def test_a_clarify_with_the_shape_of_a_link_stays_strict(world):
     assert three["reply"]["reason"] == "patch" and three["reply"]["status"] == "answered", three
     ev = [e for e in w.tools.evidence if e.tool == "group_records"][0]
     assert ev.arguments == {**args, "top": 1}
+
+
+# ------------------------------------------------------------------------ development B: say what is missing
+B_TURNS = [{"role": "user", "content": "list out all the analysts of the audit team"},
+           {"role": "assistant", "content": "The audit team has 4 analysts: Echo One and Delta Person among them."}]
+B_QUESTION = "how many of them have less tickets in last years"
+B_REWRITE = "UNCLEAR missing=number,period about=the analysts of the audit team"
+B_TEXT = ('Do you mean the analysts of the audit team? Fewer than how many tickets, and which years do you mean by '
+          '"last years"?\n\n' + pipeline_mod.UNCLEAR_LINE)
+
+
+def test_b_an_unclear_follow_up_says_what_is_missing_alike_in_off_and_shadow(world):
+    replies = {}
+    for name, memory, v2 in (("off", OFF, False), ("shadow", SHADOW, True), ("shadow_v1", SHADOW, False),
+                             ("on_v1", ON, False)):
+        w = world(memory)
+        w.client.rewrite = [B_REWRITE]
+        out = w.job(B_QUESTION, B_TURNS, state=None, gap=0) if v2 else w.job(B_QUESTION, B_TURNS)
+        replies[name] = out["reply"]
+        assert out["reason"] == "rewrite_unclear" and w.client.requests["record"] == []
+        assert w.client.requests["resolve"] == []
+    six = set(ask_mcp._result("unclear"))
+    assert replies["off"] == {"status": "unclear", "answer": B_TEXT, "kind": "none", "data_ts": None, "objects": [],
+                              "charts": []}
+    assert {k: replies["shadow"][k] for k in six} == replies["off"] == replies["shadow_v1"] == replies["on_v1"]
+    assert replies["shadow"]["reason"] == "unclear_rewrite"
+    # the bridge's stop rule finds the fixed line in the answer (sfk_bridge.follows_a_stop_line reads it with `in`)
+    assert ask_mcp.UNCLEAR_LINE in replies["off"]["answer"]
+
+
+def test_b_with_no_code_off_and_shadow_say_todays_line(world):
+    for memory, v2 in ((OFF, False), (SHADOW, True)):
+        w = world(memory)
+        w.client.rewrite = ["UNCLEAR"]
+        out = w.job(B_QUESTION, B_TURNS, state=None, gap=0) if v2 else w.job(B_QUESTION, B_TURNS)
+        assert out["reply"]["status"] == "unclear" and out["reply"]["answer"] == ask_mcp.UNCLEAR_LINE
+
+
+def test_b_with_memory_on_the_resolvers_unclear_line_uses_the_same_parts(world):
+    outs = {}
+    for name, reply in (("plain", '{"kind": "unclear", "standalone": "", "ops": []}'),
+                        ("coded", '{"kind": "unclear", "standalone": "", "ops": [], "missing": ["number", "period"]}')):
+        w = world(ON)
+        w.client.resolve = [reply]
+        outs[name] = w.job(B_QUESTION, B_TURNS, state=None, gap=0)
+        assert len(w.client.requests["resolve"]) == 1 and w.client.requests["record"] == []
+    plain, coded = outs["plain"], outs["coded"]
+    assert plain["reply"]["answer"] == ask_mcp.UNCLEAR_LINE
+    assert coded["reply"]["answer"] == ('Fewer than how many tickets, and which years do you mean by "last years"?'
+                                        '\n\n' + ask_mcp.UNCLEAR_LINE)
+    # the same decision: status, reason codes and the next state's kind
+    assert {k: v for k, v in coded["reply"].items() if k not in ("answer", "state")} == {
+        k: v for k, v in plain["reply"].items() if k not in ("answer", "state")}
+    assert coded["reason"] == plain["reason"] and coded["reply"]["state"]["last"] == plain["reply"]["state"]["last"]
+
+
+def test_b_the_page_says_what_is_missing_too(world):
+    w = world()
+    w.pipe.memory = None                                                          # the page: the rewrite
+    w.client.rewrite = [B_REWRITE]
+    out = w.pipe.answer_followup(B_QUESTION, B_TURNS)
+    assert out["answer"] == B_TEXT and out["kind"] == "none"
+    assert out["log"]["rewrite"]["missing"] == "number,period" and out["log"]["rewrite"]["offer"] is True
+    w.client.rewrite = ["UNCLEAR"]
+    out = w.pipe.answer_followup(B_QUESTION, B_TURNS)
+    assert out["answer"] == pipeline_mod.UNCLEAR_LINE and "missing" not in out["log"]["rewrite"]

@@ -65,8 +65,9 @@ def test_every_file_parses_and_is_well_formed():
     # code writes) + 2 of its stage 2 (plan_line_words: the plan line's words, moved from agent/query_state.py;
     # memory_exec: the lines of a re-run plan and the note of a question about the last answer) + 2 of development A
     # of 2026-11-27 (records_list_note: the record agent's note on a list question; answer_cut_line: the line of an
-    # answer cut at its token limit); the last 41 are new, so the notebook golden does not cover them
-    assert len(files) == 109
+    # answer cut at its token limit) + 1 of development B of 2026-11-27 (followup_unclear: the parts of the reply to an
+    # unclear follow-up); the last 42 are new, so the notebook golden does not cover them
+    assert len(files) == 110
     for path in files:
         raw = path.read_bytes()
         assert b"\r" not in raw and not raw.startswith(b"\xef\xbb\xbf"), path.name
