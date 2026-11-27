@@ -34,7 +34,8 @@ plan older than ``max_age`` is not shown to the model: the question is read as t
    talk. "No, I'll ask in full" gives the caller's unclear line and keeps the plan. A reply that is a complete
    question of its own goes on; anything else goes to the model with the choices in its context. With no pending in
    the state, a reply to a clarifying question of prerequisite P2 in the last turn is still read by
-   ``agent.clarify.choice_reply``, as the rewrite reads it today.
+   ``agent.clarify.choice_reply``, as the rewrite reads it today, and an answer to the coded clarify of an unclear
+   follow-up by ``followup.clarify_answer`` (the whole question code rebuilds; pre-release fixes of 2026-11-28).
 2. **Code shortcuts** (``engine/followup_shortcuts.py``; a usable plan of age 0, no pending, ``SFA_MEMORY_SHORTCUTS``):
    display (the display words of ``agent/display.py``, stop words included: "without the chart" is ``chart:
    false``, C14), top N, another period, by month; English and Hinglish. Before step 3, since a shortcut leaves only
@@ -1333,6 +1334,12 @@ class _Job:
             chosen = _clarify.choice_reply(q, self.last4)   # P2c: a clarifying question whose choices were not stored
             if chosen is not None:
                 return self._new(1, "clarify_choice", chosen, typed=chosen, detail="p2_choice")
+            # the answer to the coded clarify of an unclear follow-up ("fewer than 3, in 2024 and 2025"): the
+            # question code rebuilds from the person's typed words (pre-release fix of 2026-11-28), never the typed
+            # answer as a question of its own
+            whole = _followup.clarify_answer(q, self.turns)
+            if whole is not None:
+                return self._new(3, "new", whole, typed=whole, detail="clarify_answer")
         if not with_choices:
             if self.shortcuts and self.fresh and self.pending is None:
                 sc = self._shortcut()

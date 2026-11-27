@@ -860,7 +860,8 @@ def _job_v1(pipeline: Any, question: str, turns: Any, mem: _MemoryJob | None, se
     if step.status == FAILED:      # the typed words are not sent on: as a fragment they mean something else
         return _out(mem, _result("failed"), f"rewrite_{step.reason}", error=step.error)
     if step.status == UNCLEAR:
-        text = unclear_text(question, step.missing, step.about, fixed=UNCLEAR_LINE)   # the same in off and shadow
+        # the same in off and shadow; ``asked``: the question a partly answered clarify was about
+        text = unclear_text(step.asked or question, step.missing, step.about, fixed=UNCLEAR_LINE)
         return {**_out(mem, _result("unclear", text), f"rewrite_{step.reason}", v2="unclear_rewrite",
                        kind="unclear"), "rewrite_reply": step.reply}
     used = step.question

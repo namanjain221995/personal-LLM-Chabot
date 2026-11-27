@@ -637,8 +637,8 @@ class Pipeline:
             if step.missing:
                 info["missing"] = ",".join(step.missing)
                 info["offer"] = bool(step.about)
-            text = (unclear_text(question, step.missing, step.about, fixed=UNCLEAR_LINE) if step.status == UNCLEAR
-                    else REWRITE_FAILED_LINE)
+            text = (unclear_text(step.asked or question, step.missing, step.about, fixed=UNCLEAR_LINE)
+                    if step.status == UNCLEAR else REWRITE_FAILED_LINE)
             return {"answer": text, "kind": "none", "source_line": None, "data_ts": None,
                     "trace": {"mode": mode, "rewrite": dict(info), "queries": [], "timings": {}},
                     "log": {"rewrite": info}}

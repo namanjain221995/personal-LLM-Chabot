@@ -149,7 +149,12 @@ one of this machine's) and add the firewall rules again for the new address.
   and no other model call. When the rewrite named what is missing (development B of 2026-11-27: `UNCLEAR
   missing=...`), one line asks for it first ("Fewer than how many interviews, and over which period?"), from the
   fixed parts of `prompts/followup_unclear.md` and the person's typed words only; `detail.rewrite.missing` holds the
-  codes and `offer` whether an earlier question's words were offered back. A question complete on its own is
+  codes and `offer` whether an earlier question's words were offered back. The person's answer to that line
+  ("fewer than 3, in 2024 and 2025") is read by code (pre-release fixes of 2026-11-28): it puts the number and the
+  period into the asked question and runs it with no rewrite call (`detail.rewrite.reason` = `clarify_answer`), asks
+  again only for a part the answer left open, and gives a who or object answer to the model with a `CLARIFY ANSWER`
+  line. With `SFA_MEMORY=on` the resolver reads it the same way (`followup.clarify_answer`). A question complete on
+  its own is
   answered as typed when the rewrite call fails or the model rewords it (`detail.rewrite.answered` = `typed`); the
   model's own UNCLEAR stays a refusal. With no earlier answer the
   question goes to `Pipeline.answer` unchanged. A `recent_turns` of another shape gets 400. The web log's `ask` line

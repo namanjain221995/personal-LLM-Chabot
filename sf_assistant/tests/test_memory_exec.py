@@ -1017,3 +1017,38 @@ def test_b_the_page_says_what_is_missing_too(world):
     w.client.rewrite = ["UNCLEAR"]
     out = w.pipe.answer_followup(B_QUESTION, B_TURNS)
     assert out["answer"] == pipeline_mod.UNCLEAR_LINE and "missing" not in out["log"]["rewrite"]
+
+
+# ------------------------------------------------- pre-release fixes of 2026-11-28: the answer to a coded clarify
+C_TURNS = B_TURNS + [{"role": "user", "content": B_QUESTION}, {"role": "assistant", "content": B_TEXT}]
+C_WHOLE = "how many of the analysts of the audit team have less than 3 tickets in 2024 and 2025"
+C_REST = 'Do you mean the analysts of the audit team? Which years do you mean by "last years"?\n\n'
+
+
+def test_c_the_answer_to_a_coded_clarify_runs_the_whole_question_in_every_mode(world):
+    """RO-C step 3: "fewer than 3, in 2024 and 2025" after the coded clarify runs the whole question (code rebuilds
+    it, no rewrite call) in off and shadow, and with memory on when the resolver reads it so too."""
+    for name, memory, v2 in (("off", OFF, False), ("shadow", SHADOW, True), ("on", ON, True)):
+        w = world(memory)
+        w.client.resolve = [json.dumps({"kind": "new", "standalone": C_WHOLE, "ops": []})]
+        answer = "fewer than 3, in 2024 and 2025"
+        out = w.job(answer, C_TURNS, state=None, gap=0) if v2 else w.job(answer, C_TURNS)
+        reply = out["reply"]
+        assert reply["status"] == "answered" and C_WHOLE in reply["answer"], (name, out)
+        assert w.client.requests["rewrite"] == [] and w.client.requests["record"], name
+        assert C_WHOLE in json.dumps(w.client.record_messages(0)), name
+
+
+def test_c_a_partial_answer_asks_for_the_rest_on_the_service_and_the_page(world):
+    for memory, v2 in ((OFF, False), (SHADOW, True)):
+        w = world(memory)
+        out = w.job("fewer than 3", C_TURNS, state=None, gap=0) if v2 else w.job("fewer than 3", C_TURNS)
+        assert out["reply"]["status"] == "unclear" and out["reply"]["answer"] == C_REST + ask_mcp.UNCLEAR_LINE
+        assert w.client.requests["rewrite"] == [] and w.client.requests["record"] == []
+    w = world()
+    w.pipe.memory = None                                                          # the page: the rewrite
+    out = w.pipe.answer_followup("fewer than 3", C_TURNS)
+    assert out["answer"] == C_REST + pipeline_mod.UNCLEAR_LINE and out["log"]["rewrite"]["missing"] == "period"
+    then = C_TURNS + [{"role": "user", "content": "fewer than 3"}, {"role": "assistant", "content": out["answer"]}]
+    out = w.pipe.answer_followup("in 2024 and 2025", then)
+    assert C_WHOLE in out["answer"] and out["log"]["rewrite"]["reason"] == "clarify_answer"
