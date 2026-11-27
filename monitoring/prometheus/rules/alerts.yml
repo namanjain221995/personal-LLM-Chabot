@@ -904,6 +904,24 @@ groups:
         annotations:
           summary: "PostgreSQL deadlock detected"
 
+      - alert: WebIndexFailing
+        # index_pending and retrieve both swallow their errors by design, so
+        # /health stays green and answers just lose web memory. That hid a
+        # corrupt table for five days from 2026-10-29. One failed pass is a
+        # lock timeout, and stays inside the 30m window for at most 30m, so the
+        # 35m hold lets it pass; only repeated failures hold the expression up.
+        expr: sum(increase(web_index_failures_total[30m])) > 0
+        for: 35m
+        labels: { severity: warning }
+        annotations:
+          summary: "The web index has been failing for over 30 minutes"
+          description: >-
+            Web recall is returning nothing, or new pages are not being indexed.
+            Check the orchestrator log for "web indexing failed" and "web recall
+            unavailable". Crash damage limited to empty manifests repairs itself;
+            this firing means the damage is something else. web_pages holds the
+            source text, so the index can be rebuilt from it.
+
       - alert: WarehouseSnapshotStale
         # The sync worker republishes the atomic read snapshot every cycle
         # (default 30 min). Six hours means it has stopped, and Salesforce
