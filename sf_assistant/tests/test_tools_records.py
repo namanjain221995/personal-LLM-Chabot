@@ -662,7 +662,7 @@ def test_lenient_synonyms_are_mapped_and_noted(tools):
     r = ok(tools, "group_records", {"object": "Interview__c", "group_by": ["Interview_Status__c"], "top": "2"})
     assert len(r["groups"]) == 2
     r = ok(tools, "list_records", {"object": "Interview__c", "limit": 500})
-    assert r["returned"] == 10 and any("clamped to 50" in n for n in r["notes"])
+    assert r["returned"] == 10 and any("clamped to 200" in n for n in r["notes"])   # 50 until development A
     r = ok(tools, "trend_records", {"object": "Interview__c", "grain": "Monthly", "date_field": "Date_of_Interview__c",
                                     "period": "this year"})
     assert r["grain"] == "month"

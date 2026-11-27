@@ -127,15 +127,23 @@ def revert(pid: str, text: str) -> str:
 
 
 def notebook_tools(tools: list[dict]) -> list[dict]:
-    """A copy of tools (a list_tools() or openai_tools() record tool list) with the one deliberate change
-    against the notebook's list taken out: the rate per period of trend_records (placement fixes, 2026-11-16:
-    registry.TREND_RATE_TEXT in its description and the part_filters argument). The golden hashes of
-    tests/golden/tool_lists.json are the notebook's, so they compare with this view."""
+    """A copy of tools (a list_tools() or openai_tools() record tool list) with the deliberate changes against the
+    notebook's list taken out: the rate per period of trend_records (placement fixes, 2026-11-16:
+    registry.TREND_RATE_TEXT in its description and the part_filters argument) and the page of list_records
+    (development A of 2026-11-27: its limit's maximum LIMITS.list_max_rows and its description, the notebook's 50 and
+    "Rows to return (default 10)."). The golden hashes of tests/golden/tool_lists.json are the notebook's, so they
+    compare with this view."""
+    from sf_assistant.config import LIMITS
     from sf_assistant.tools.registry import TREND_RATE_TEXT
 
     out = copy.deepcopy(tools)
     for tool in out:
         fn = tool.get("function", tool)
+        if fn.get("name") == "list_records":
+            limit = fn.get("parameters", fn.get("inputSchema"))["properties"]["limit"]
+            assert limit["maximum"] == LIMITS.list_max_rows
+            limit["maximum"], limit["description"] = 50, "Rows to return (default 10)."
+            continue
         if fn.get("name") != "trend_records":
             continue
         assert fn["description"].count(TREND_RATE_TEXT) == 1

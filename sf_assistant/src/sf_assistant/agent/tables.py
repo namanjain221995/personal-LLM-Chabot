@@ -56,6 +56,7 @@ answer. :func:`restore` puts stored blocks back into a merged text the same way,
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from collections import Counter
@@ -71,7 +72,7 @@ from sf_assistant.agent.nudges import _LABEL_LINE_RE
 __all__ = ["RECORDS_TABLES_NOTE", "COMBINE_TABLES_NOTE", "RECORDS_TABLES_MARKER_MESSAGE", "RECORDS_TABLE_WORDS",
            "TABLE_TOOLS", "TABLE_MAX_ROWS", "MARKER_RE", "LOOSE_RE", "Expansion", "column_labels", "render", "expand",
            "own_lines", "strip_markers", "gap_before_source", "holds", "marked", "restore", "marker_message",
-           "answer_counts", "left_over", "line_count", "put_back"]
+           "answer_counts", "left_over", "line_count", "put_back", "RECORDS_LIST_NOTE", "list_rows"]
 
 #: The record agent's note on the table lines, appended to its system prompt in code mode only (never inside
 #: ``render_records_system``, which the MCP template answer_from_records also serves).
@@ -81,6 +82,9 @@ COMBINE_TABLES_NOTE = _prompt_files.text("combine_tables_note")
 #: The first draft check's message for table lines code cannot fill (``<<QUERY_IDS>>``: :func:`marker_message`).
 RECORDS_TABLES_MARKER_MESSAGE = _prompt_files.text("records_tables_marker_message")
 RECORDS_TABLE_WORDS = _prompt_files.text("records_table_words")   # raw text; _WORDS is its dict
+#: The record agent's note on a list question (development A of 2026-11-27, ``agent.display.asks_list``): appended to
+#: its system prompt in RecordSession.ask whatever ``SFA_TABLES`` says, never inside ``render_records_system``.
+RECORDS_LIST_NOTE = _prompt_files.text("records_list_note")
 _WORDS = dict(ln.split(": ", 1) for ln in RECORDS_TABLE_WORDS.split("\n") if ": " in ln)
 
 #: The tools whose results code writes as rows, and the key of each one's rows (count_records: its breakdown).
@@ -89,8 +93,9 @@ _ROWS_KEY = {"list_records": "rows", "group_records": "groups", "trend_records":
              "compare_records": "segments"}
 _LABEL_KEY = {"group_records": "group", "trend_records": "bucket", "compare_records": "label"}
 #: The most rows code writes for one table line; read at call time. A safety net only: the tools cap their lists
-#: below it (a list at most 50 rows, 50 groups, a trend at most 120 periods, 4 segments, a breakdown 9 values).
-TABLE_MAX_ROWS = 120
+#: at or below it (a list at most ``LIMITS.list_max_rows`` rows, 200 since development A of 2026-11-27; 50 groups, a
+#: trend at most 120 periods, 4 segments, a breakdown 9 values). 120 until development A.
+TABLE_MAX_ROWS = LIMITS.list_max_rows
 #: A table line: ``{{table q3}}``; case, inner spaces, ":" or "=", a bare number and markdown wrappers read too.
 MARKER_RE = re.compile(r"[*_`]{0,3}\{\{\s*table\s*[:=]?\s*q?0*(\d{1,4})\s*\}\}[*_`]{0,3}", re.IGNORECASE)
 #: A span that only looks like a table line (malformed): removed, never filled. One or two braces on each side of a
@@ -410,10 +415,21 @@ def _render(e: Any, labels: Callable[[Any, Any], str], said: Any = ()) -> tuple[
     res = e.model_result
     obj = res.get("object") or getattr(e, "object", None)
     if e.tool == "list_records":
-        return _table(res, obj, labels, said)
+        return _table(_all_rows(e, res), obj, labels, said)
     if e.tool == "count_records":
         return _breakdown(res, obj, labels)
     return _lines(res, e.tool, said)
+
+
+def _all_rows(e: Any, res: dict) -> dict:
+    """A list_records result with every row of its list (development A of 2026-11-27): ``QueryEvidence.full_rows``, the
+    rows before the result cap cut what the model read (the same cells and columns), in place of the cut ``rows``;
+    ``res`` itself when nothing was cut."""
+    full = getattr(e, "full_rows", None)
+    rows = res.get("rows")
+    if isinstance(full, list) and isinstance(rows, list) and len(full) > len(rows) and full[:len(rows)] == rows:
+        return {**res, "rows": full}
+    return res
 
 
 def render(e: Any, labels: Callable[[Any, Any], str] | None = None, said: Any = ()) -> tuple[str, int, str] | None:
@@ -1000,3 +1016,190 @@ def answer_counts(x: Expansion | None, answer: str, blocks: dict[str, str], nudg
         return out
     except Exception:  # noqa: BLE001
         return {}
+
+
+# ------------------------------------------------------------------------------------------------ long lists
+# Development A of 2026-11-27 (the owner's choice): a question that asks to list records gets the whole list written by
+# code from the list_records rows (every row of the call, also those the result cap kept from the model), whatever
+# SFA_TABLES says; the model writes the lead and a table line (RECORDS_LIST_NOTE).
+_TABLE_HEAD_RE = re.compile(r"^\s*\|.*\|\s*$")
+_TABLE_RULE_RE = re.compile(r"^\s*\|[\s:|-]*-[\s:|-]*\|\s*$")
+
+
+def _list_block_ids(x: Expansion) -> set[str]:
+    """The table lines of ``x`` whose blocks are list_records rows (its ``counts["items"]``)."""
+    items = x.counts.get("items") if isinstance(x.counts, dict) else None
+    return {_marker(str(it.get("query_id"))) for it in items or [] if isinstance(it, dict)
+            and it.get("tool") == "list_records"} & set(x.blocks)
+
+
+def _block_lines(lines: list[str], blocks: list[str]) -> set[int]:
+    """The indexes of ``lines`` that belong to one of ``blocks`` (each written whole, as lines of its own)."""
+    inside: set[int] = set()
+    for block in blocks:
+        bl = block.split("\n")
+        for k in range(len(lines) - len(bl) + 1):
+            if lines[k:k + len(bl)] == bl and not inside & set(range(k, k + len(bl))):
+                inside |= set(range(k, k + len(bl)))
+                break
+    return inside
+
+
+def _row_keys(block: str) -> list[str]:
+    """The key of each row of a block (a table row's first cell, a line's label; :func:`_block_rows`), 2 or more
+    characters, no ``(blank)``, longest first."""
+    keys = {k for k, _v, _s in _block_rows(block) if len(k.strip()) >= 2 and k != "(blank)"}
+    return sorted(keys, key=lambda k: (-len(k), k))
+
+
+def _drop_typed_rows(text: str, keep: list[str], lists: list[str]) -> tuple[str, int]:
+    """``text`` without the model's own list-item and table lines (outside the blocks ``keep``) that each name the key
+    of exactly one row of a block of ``lists`` (a name, a record number: code's list holds that row), and without a
+    table header and rule line the dropped rows leave alone. A line that names the keys of several rows, or none,
+    stays. Returns the text and how many lines went."""
+    keys = [k for block in lists for k in _row_keys(block)]
+    if not keys:
+        return text, 0
+    rx = re.compile(f"(?<![{_WORD_CHAR}])(?:" + "|".join(re.escape(k) for k in dict.fromkeys(keys))
+                    + f")(?![{_WORD_CHAR}])", re.IGNORECASE)
+    lines = text.split("\n")
+    inside = _block_lines(lines, keep)
+    gone: set[int] = set()
+    for i, ln in enumerate(lines):
+        if i in inside or not _LIST_ITEM_RE.match(ln):
+            continue
+        found = {m.group(0).lower() for m in rx.finditer(ln)}
+        found = {k for k in found if not any(k != o and k in o for o in found)}   # "Person 1" inside "Person 10"
+        if len(found) == 1:
+            gone.add(i)
+    if not gone:
+        return text, 0
+    n = len(gone)
+    kept = [i for i in range(len(lines)) if i not in gone]
+    for j, i in enumerate(kept):   # a header and rule line of the model's own table whose rows went
+        nxt = kept[j + 1] if j + 1 < len(kept) else None
+        after = kept[j + 2] if j + 2 < len(kept) else None
+        if i in inside or nxt is None or nxt in inside or not _TABLE_HEAD_RE.match(lines[i]) \
+                or not _TABLE_RULE_RE.match(lines[nxt]):
+            continue
+        if after is None or after in inside or not lines[after].lstrip().startswith("|"):
+            gone |= {i, nxt}
+    out = "\n".join(ln for i, ln in enumerate(lines) if i not in gone)
+    return re.sub(r"\n{3,}", "\n\n", out).strip("\n"), n
+
+
+def _after_lead(text: str, block: str) -> str:
+    """``text`` with ``block`` right after its lead (the first paragraph that is no list item, table line or Source
+    line: the lead stays first, as :func:`expand` places rows), else just before a last Source line, else at the end;
+    one blank line before and after it."""
+    lines = text.rstrip("\n").split("\n")
+    lead = next((i for i, ln in enumerate(lines) if ln.strip() and not _LIST_ITEM_RE.match(ln)
+                 and not _is_source_line(ln)), None)
+    if lead is not None:
+        end = lead
+        while end + 1 < len(lines) and lines[end + 1].strip() and not _LIST_ITEM_RE.match(lines[end + 1]) \
+                and not _is_source_line(lines[end + 1]):
+            end += 1
+        at = end + 1
+    else:
+        at = len(lines) - 1 if lines and _is_source_line(lines[-1]) else len(lines)
+    head = "\n".join(lines[:at]).rstrip("\n")
+    tail = "\n".join(lines[at:]).strip("\n")
+    return "\n\n".join(part for part in (head, block, tail) if part.strip())
+
+
+def _whole_list(evidence: Any) -> Any:
+    """The list a list question's answer shows when the model wrote no table line for one: the successful
+    list_records results (each with every row of its call, :func:`_all_rows`) of one object and one column set,
+    joined in call order (pages the model asked for one after another; a row equal to one of an earlier call is left
+    out), the set with the most rows (2 or more; the later one on a tie). A ``QueryEvidence`` of the last call of the
+    set whose result holds the joined rows (``returned``: their number; ``total_count``: the largest of the set), or
+    None."""
+    sets: dict[tuple, list] = {}
+    for e in evidence or []:
+        if getattr(e, "tool", None) != "list_records" or _unfillable(e) is not None:
+            continue
+        res = _all_rows(e, e.model_result)
+        cols = res.get("columns") if isinstance(res.get("columns"), list) else list((res.get("rows") or [{}])[0])
+        sets.setdefault((str(res.get("object") or getattr(e, "object", "")), tuple(map(str, cols))), []).append((e, res))
+    best = None
+    for calls in sets.values():
+        rows: list = []
+        for k, (_e, res) in enumerate(calls):
+            earlier = list(rows)
+            rows += [r for r in res.get("rows") or [] if k == 0 or r not in earlier]
+        if len(rows) >= 2 and (best is None or len(rows) >= len(best[1])):
+            best = (calls, rows)
+    if best is None:
+        return None
+    calls, rows = best
+    last, res = calls[-1]
+    if len(calls) == 1:
+        return last if res is last.model_result else dataclasses.replace(last, model_result=res)
+    totals = [r.get("total_count") for _e, r in calls if _is_number(r.get("total_count"))]
+    joined = {**res, "rows": rows, "returned": len(rows), "shown": len(rows)}
+    if totals:
+        joined["total_count"] = max(max(totals), len(rows))
+    return dataclasses.replace(last, model_result=joined)
+
+
+def list_rows(x: Expansion, evidence: Any, labels: Callable[[Any, Any], str] | None = None,
+              cut: bool = False) -> Expansion:
+    """A list question's answer (development A of 2026-11-27): ``x`` (the reply after :func:`expand`) with the whole
+    list written by code. When no block of ``x`` holds list_records rows (no table line, or the model typed a copy of
+    the rows, which :func:`expand` keeps in place of its block), the rows of the whole list (:func:`_whole_list`: the
+    successful list_records calls of one object and column set, pages joined, the set with the most rows) go right
+    after the lead (:func:`_after_lead`). Then the model's own list-item and table lines that each name one
+    row of a list block go (:func:`_drop_typed_rows`): code's list is the only one. ``cut``: the
+    reply stopped at its token limit; when its last line (outside the blocks) is a list-item or table line, the model
+    was typing rows: that broken line goes first, and with a list block in the answer ``counts["list_cut_rows"]`` is 1
+    (the rows the cut lost are code's; the caller adds no cut line). ``x`` is updated in place (``text``, ``blocks``,
+    ``sources``, ``counts``: ``built``, ``rows``, ``items``, ``list_added``, ``list_dropped``, ``list_cut_rows``) and
+    returned. Never raises: ``x`` as it was on any error."""
+    try:
+        labels = labels or column_labels(None)
+        text, blocks = x.text, dict(x.blocks)
+        ids = _list_block_ids(x)
+        counts = dict(x.counts) if isinstance(x.counts, dict) else _zero()
+        added = tail = 0
+        if cut:   # the line the token limit broke off, when it is a row the model was typing
+            lines = text.rstrip("\n").split("\n")
+            inside = _block_lines(lines, list(blocks.values()))
+            last = max((i for i, ln in enumerate(lines) if ln.strip()), default=None)
+            if last is not None and last not in inside and _LIST_ITEM_RE.match(lines[last]):
+                text, tail = "\n".join(lines[:last]).rstrip("\n"), 1
+        if not ids:
+            best = _whole_list(evidence)
+            if best is None:
+                return x
+            e = best
+            marker = _marker(str(getattr(e, "query_id", "")))
+            if marker in blocks:
+                return x
+            own = marked(text, blocks) if blocks else text
+            said = _count_numbers("\n".join(ln for ln in own.split("\n") if not MARKER_RE.search(ln)))
+            out, rows, form = _render(e, labels, said)
+            block = "\n".join(out)
+            text = _after_lead(text, block)
+            blocks[marker] = block
+            ids = {marker}
+            added = 1
+            counts["built"] = int(counts.get("built", 0)) + 1
+            counts["rows"] = int(counts.get("rows", 0)) + rows
+            counts["items"] = list(counts.get("items") or []) + [
+                {"query_id": str(getattr(e, "query_id", "")), "tool": "list_records", "rows": rows, "form": form}]
+        text, dropped = _drop_typed_rows(text, list(blocks.values()), [blocks[m] for m in ids])
+        if not added and not dropped and not (tail and ids):
+            return x
+        counts["list_added"] = added
+        counts["list_dropped"] = dropped + (1 if tail and ids else 0)
+        if tail and ids:
+            counts["list_cut_rows"] = 1
+        lists = {_marker(str(getattr(e, "query_id", ""))) for e in evidence or []
+                 if getattr(e, "tool", None) == "list_records"}
+        x.text, x.blocks, x.counts = text, blocks, counts
+        x.typed = {m: b for m, b in x.typed.items() if m not in lists}   # code's list stands: no copy comes back
+        x.sources = ["\n\n".join(blocks.values())] if blocks else []
+        return x
+    except Exception:  # noqa: BLE001 - the reply as expand left it
+        return x

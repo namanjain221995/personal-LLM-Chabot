@@ -27,13 +27,15 @@ def test_limits_are_the_notebook_values():
     """The values of okeval/config.py, okeval/agent.py, okrec/config.py, okrec/lean.py, okrec/session.py,
     okrec/tools.py, okrec/prompts.py and ask.py (notebooks/object_knowledge_eval, 2026-10-20), and the component
     tools' budgets (stage 4 of the flow build, 2026-10-24; format review A01, A02, A17), and the ask service's follow-up
-    rewrite (2026-11-04)."""
+    rewrite (2026-11-04); development A of 2026-11-27 (long record lists, the owner's choices) raised the answer caps
+    model_max_tokens 1500 -> 2500 and merge_max_tokens 1600 -> 2500 (under the 120 s call timeout) and added list_max_rows (200, was the registry's
+    50)."""
     assert dataclasses.asdict(C.LIMITS) == {
-        "knowledge_max_steps": 8, "model_max_tokens": 1500, "model_timeout_s": 120.0,
+        "knowledge_max_steps": 8, "model_max_tokens": 2500, "model_timeout_s": 120.0,
         "knowledge_tool_result_chars": 16_000, "lean_max_tool_calls": 3, "lean_max_model_calls": 3,
         "lean_max_tokens": 600, "records_max_steps": 12, "records_statement_timeout_s": 10.0,
         "records_call_budget_s": 20.0, "records_max_age_h": 24.0, "record_result_chars": 12_000,
-        "names_max_tokens": 60, "merge_max_tokens": 1600, "merge_facts_chars": 16_000, "warmup_timeout_s": 120.0,
+        "list_max_rows": 200, "names_max_tokens": 60, "merge_max_tokens": 2500, "merge_facts_chars": 16_000, "warmup_timeout_s": 120.0,
         "max_rows": 20, "component_search_chars": 4_000, "component_summary_chars": 3_500,
         "component_page_chars": 6_000, "component_usage_rows": 40, "component_usage_chars": 9_000,
         "followup_max_tokens": 1000}

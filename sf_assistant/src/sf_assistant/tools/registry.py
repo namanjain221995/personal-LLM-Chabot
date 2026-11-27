@@ -29,6 +29,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from sf_assistant.config import LIMITS   # list_max_rows: the list_records page (development A of 2026-11-27)
+
 __all__ = ["Tool", "ToolDef", "knowledge_tool_defs", "multi_tool_defs", "multi_object_tool", "RECORD_TOOLS",
            "RECORD_HANDLERS", "TOOL_ORDER", "TOOL_ALIASES", "SCHEMAS", "mcp_tool_list", "openai_tool_list",
            "knowledge_tool_list", "multi_tool_list", "record_tool_list", "tools_markdown", "component_tool_defs",
@@ -511,8 +513,8 @@ SCHEMAS: dict[str, tuple[str, dict]] = {
                      "order_by": {"type": "string", "description": "Field to sort by (default: date_field if set, else "
                                                                    "CreatedDate)."},
                      "order": {"type": "string", "enum": ["desc", "asc"], "description": "Default desc."},
-                     "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Rows to return "
-                                                                                              "(default 10)."}},
+                     "limit": {"type": "integer", "minimum": 1, "maximum": LIMITS.list_max_rows,
+                               "description": f"Rows to return (default 10, at most {LIMITS.list_max_rows})."}},
                     ["object"])),
     "search_records": (
         "Find records by name or record number across objects when you do not know the object (a person, a program, "

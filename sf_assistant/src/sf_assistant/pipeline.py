@@ -263,7 +263,8 @@ class Outcome:
     timeline: dict = field(default_factory=dict)   # where the seconds went (agent.timeline; the JSONL "timeline")
     merge_by: str | None = None   # the merge that ran: "code" (merge.code_merge) or "model" (merge.combine); None: none
     merge_switch: str = ""        # why SFA_MERGE could not be read (the code merge was used then); "" when it could
-    tables_by: str | None = None   # "code" when SFA_TABLES=code and records are on
+    tables_by: str | None = None   # "code" when SFA_TABLES=code and records are on; "list": a list question's code rows
+    answer_cut: bool = False       # the answer's model call stopped at its token limit: the cut line was added
     tables_switch: str = ""        # why SFA_TABLES could not be read
     code_tables: dict = field(default_factory=dict)   # rec.code_tables (+ "merge": restore counts)
     charts: list = field(default_factory=list)   # agent.charts items, with the picture
@@ -374,6 +375,8 @@ def _memory_display(show: Any, d: Any, text: str, charts_on: bool) -> tuple[Any,
 READ_AS_KINDS = ("merged", "records", "knowledge")
 #: The answer's lead sentence for a person the record tools read as another stored name (prompts/read_as_person_line.md).
 READ_AS_PERSON_LINE = _prompt_files.text("read_as_person_line")
+#: The line code adds to an answer whose model call stopped at its token limit (development A of 2026-11-27).
+ANSWER_CUT_LINE = _prompt_files.text("answer_cut_line")
 
 
 def question_spelling(text: str, registry: Any, session: Any = None) -> QuestionSpelling | None:
@@ -1067,7 +1070,9 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
         from sf_assistant.agent.nudges import answer_text
         if answer_text(k_answer):   # decision 4: a question the route calls design keeps its design answer
             final, design_kept = k_answer.rstrip() + "\n\n" + final, True
-    if tables_cfg.by == "code" and rec is not None:   # the last resort: a user never sees a table line (body inherits)
+    if rec is not None and (tables_cfg.by == "code" or getattr(rec, "code_tables", None)):
+        # the last resort: a user never sees a table line (body inherits); also for a list question's code rows
+        # (development A of 2026-11-27), which are code rows in model mode too
         from sf_assistant.agent import tables as _tables
         final = _tables.strip_markers(final)
     if rec is not None and final:   # phase 1 (2026-10-26): contact details only when the question asks for them
@@ -1116,6 +1121,13 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
         from sf_assistant.agent.nudges import with_lines
         final = with_lines(final, chart_lines) if final.strip() else "\n".join(chart_lines)
         status_added = status_added + chart_lines
+    answer_cut = False   # development A (2026-11-27): the answer's model call stopped at its token limit
+    if final.strip() and kind in ("merged", "records") and rec is not None and getattr(rec, "cut_off", False):
+        from sf_assistant.agent.nudges import with_lines
+        final = with_lines(final, [ANSWER_CUT_LINE])   # before the Source line; not in body
+        status_added, answer_cut = status_added + [ANSWER_CUT_LINE], True
+    elif final.strip() and kind == "knowledge" and r is not None and getattr(r, "finish", "") == "length":
+        final, answer_cut = final.rstrip() + "\n\n" + ANSWER_CUT_LINE, True   # records off too: no record module
     footed = None
     if spelling is not None:   # after the audits and the footer, in final only (body is what score_records scores)
         footed = final
@@ -1154,7 +1166,9 @@ def answer(text: str, cfg, registry, system, llm, n: int, session=None, records_
                    started_q=started_q, records_only=only, spelling=spelling, footed=footed,
                    status_lines=status_added, timeline=timeline.end(), merge_by=merge_by,
                    merge_switch=merge_cfg.problem,
-                   tables_by="code" if tables_cfg.by == "code" and rec is not None else None,
+                   tables_by="code" if tables_cfg.by == "code" and rec is not None else
+                   "list" if rec is not None and getattr(rec, "list_ask", False) and code_tables else None,
+                   answer_cut=answer_cut,
                    tables_switch=tables_cfg.problem, code_tables=code_tables, charts=chart_items,
                    charts_switch=charts_cfg.problem, charts_error=charts_error, charts_talk=charts_talk,
                    display=d, clarify=clarify)
@@ -1177,7 +1191,9 @@ def result_row(o: Outcome, session=None) -> dict:
     when it has something to say: ``line_reason`` (and ``small_talk``, the kind) for a fixed line code wrote,
     ``display`` (the display flags, the removed display words and the (word, guard) pairs a guard kept), ``clarify``
     (the clarifying question's why, from, objects and choices), ``record_no_data`` and ``record_tool_retry`` (the
-    forced round of the record step).
+    forced round of the record step). Development A of 2026-11-27 adds ``tables_by`` "list" with ``code_tables`` for a
+    list question's code rows in model mode, and ``answer_cut`` (true) when the cut line was added (the answer's model
+    call stopped at its token limit).
     """
     text, r, rec, m, kind, rq = o.text, o.r, o.rec, o.m, o.kind, o.rq
     final, body, k_answer, checks, mode = o.final, o.body, o.k_answer, o.checks, o.mode
@@ -1236,6 +1252,8 @@ def result_row(o: Outcome, session=None) -> dict:
         row["jsonl"]["tables_by"] = o.tables_by
     if o.code_tables:   # the counts of the table lines and code rows: ints, fixed words, query ids, tool names
         row["jsonl"]["code_tables"] = dict(o.code_tables)
+    if o.answer_cut:   # development A (2026-11-27): the cut line was added (finish reason "length")
+        row["jsonl"]["answer_cut"] = True
     if o.tables_switch:   # an invalid SFA_TABLES, read as the default: the problem only, never text from the question
         row["jsonl"]["tables_switch"] = o.tables_switch
     if o.charts:   # the page reads row["charts"]; the sidecar gets no picture

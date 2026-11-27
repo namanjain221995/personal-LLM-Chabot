@@ -536,16 +536,24 @@ def test_file_mode_writes_a_jsonl_sidecar_without_list_rows(monkeypatch, tmp_pat
     assert len(lines) == 1
     rec = json.loads(lines[0])
     assert rec["n"] == 1 and rec["question"] == "List the 3 newest client interviews."
-    # the merged text had no Source line: code adds it (the list query's object and its sync time)
-    assert rec["answer_kind"] == "merged" and rec["answer"] == ("3 of 10 client interviews are shown.\n"
-                                                                "Source: preprod sandbox copy, synced 2026-10-13 14:30 UTC.")
+    # the merged text had no Source line: code adds it (the list query's object and its sync time); a list question
+    # (development A of 2026-11-27): code wrote the rows, and they come back after the merge call, which had none
+    assert rec["answer_kind"] == "merged" and rec["answer"] == (
+        "3 of 10 client interviews are shown.\n\n| Interview Number | Interview Status |\n|---|---|\n"
+        "| I-0007 | Cancelled |\n| I-0004 | Scheduled |\n| I-0003 | Completed |\n\n"
+        "Source: preprod sandbox copy, synced 2026-10-13 14:30 UTC.")
+    assert rec["tables_by"] == "list" and rec["code_tables"]["kept"] == 1
     assert rec["merge_by"] == "model" and "merge_switch" not in rec   # the merge that ran (2026-10-29)
     facts = [f for f in rec["record_facts"] if f["tool"] == "list_records"]
     assert facts and facts[0]["result"]["rows"] == {"rows_omitted": 3}
     assert facts[0]["result"]["total_count"] == 10
     q = rec["queries"][0]
     assert q["tool"] == "list_records" and q["ok"] and q["sql"][0].startswith("SELECT ") and "rows" not in q
-    assert "I-00" not in lines[0]  # no record names in the sidecar
+    # no record names in the sidecar but in the answer texts: a list question's answer holds the rows code wrote
+    # (development A of 2026-11-27), as an answer that typed them always did
+    answers = ("answer", "answer_body", "record_answer")
+    assert all("| I-0007 | Cancelled |" in rec[k] for k in answers)
+    assert "I-00" not in json.dumps({k: v for k, v in rec.items() if k not in answers})
     # latency logging (2026-10-29): the row keeps the answer's timeline, and each query its seconds
     stages = {e["stage"] for e in rec["timeline"]["entries"] if e["kind"] == "stage"}
     assert stages >= {"spelling", "triage", "route", "records", "hints", "post", "merge", "assemble"}

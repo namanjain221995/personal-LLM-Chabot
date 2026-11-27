@@ -65,7 +65,8 @@ from sf_assistant import prompts as _prompt_files
 from sf_assistant.knowledge.resolver import osa_distance
 
 __all__ = ["DISPLAY_WORDS_TEXT", "RECORDS_DISPLAY_NOTE", "LINES", "NOTE_LINES", "CHART_VERBS", "Display", "NO_DISPLAY",
-           "SessionGuards", "split", "note", "line", "bare_key", "capability_key", "generic_ask", "fold", "fires"]
+           "SessionGuards", "split", "note", "line", "bare_key", "capability_key", "generic_ask", "fold", "fires",
+           "asks_list"]
 
 DISPLAY_WORDS_TEXT = _prompt_files.text("display_words")
 #: The record agent's note on how to lay out its answer (one lead line and one line per flag; prompts/records_display_note.md).
@@ -931,3 +932,38 @@ def generic_ask(display: Display) -> bool:
     names nothing of the last answer either. "can you plot", "can you make a pie chart" after an answer ask for a chart
     of that answer, so the follow-up rewrite reads them (review fix R2 of 2026-11-25)."""
     return bool(display.capability and display.words and all(w in _GENERIC for w in display.words))
+
+
+# ------------------------------------------------------------------------------------------------ list questions
+# Development A of 2026-11-27 (long record lists): a question that asks to list records gets its list_records rows
+# written by code (agent.tables.list_rows, prompts/records_list_note.md). The list words are read from the search text
+# (no display word in them: "list" stays in the question). The table flag alone is none: "a table of X by status" is a
+# grouped table, which the record agent writes as before.
+_LIST_ASK = re.compile(
+    # "list out all ...", "please list the ...", "can you list ...": list as the verb of a clause
+    r"(?:^|[.!?;,:]\s*|\b(?:please|pls|plz|kindly|can\s+you|could\s+you|would\s+you|will\s+you|can\s+u|you|u|and|also|"
+    r"then|just|now|me|to)\s+)list(?:\s+(?:out|down|up))?\b"
+    r"(?!\s*(?:views?|prices?|items?|types?|boxes?|ka|ki|ke|kya)\b)(?!\s*$)"
+    # "a list of", "the full list of", "complete list for"
+    r"|\b(?:a|the|full|complete|whole|entire)\s+list\s+(?:of|for|with)\b"
+    # "show all", "give me every", "fetch all the", "name all"
+    r"|\b(?:show|give|display|get|fetch|pull|send|share|tell|name|bring|find)\s+(?:me\s+|us\s+)?(?:all|every)\b"
+    r"|\bnames?\s+of\s+(?:all|every)\b|\b(?:who|which|what)\s+are\s+all\b"
+    # Hinglish: "list do", "sabhi recruiters dikhao", "saare candidates ki list"
+    r"|\blist\s+(?:do|dikhao|batao|bhejo|banao|bana\s+do|chahiye)\b"
+    r"|\b(?:sab|sabhi|saare|sare|saari|sari)\b[^.!?]{0,80}?\b(?:dikhao|batao|bhejo|list)\b",
+    re.IGNORECASE)
+
+
+def asks_list(text: str, display: Display | None = None) -> bool:
+    """The question asks to list or show records one by one (development A of 2026-11-27): the list words of
+    :data:`_LIST_ASK` in ``text`` (the search text: "list out all the X of Y", "show me all X", "a list of X", "sabhi X
+    dikhao"). The table flag of ``display`` alone is no list ask (a grouped table); a display-only ask (``empty``) is
+    none, and so is a list word inside quotes. Never raises (False on any fault)."""
+    try:
+        if display is not None and getattr(display, "empty", False):
+            return False
+        t = _QUOTED.sub(" ", str(text or "").replace("’", "'"))
+        return bool(t.strip()) and len(t) <= _MAX_TEXT and _LIST_ASK.search(t) is not None
+    except Exception:  # noqa: BLE001 - a question never fails on this
+        return False

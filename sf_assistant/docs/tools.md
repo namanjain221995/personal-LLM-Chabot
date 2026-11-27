@@ -3146,8 +3146,8 @@ Input schema:
     "limit": {
       "type": "integer",
       "minimum": 1,
-      "maximum": 50,
-      "description": "Rows to return (default 10)."
+      "maximum": 200,
+      "description": "Rows to return (default 10, at most 200)."
     }
   },
   "required": [

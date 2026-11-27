@@ -58,6 +58,11 @@ class RecordAnswer:
     # "all_failed" | "no_data_call" (numbers after describe_fields or the sync status only), "choice": "required" |
     # "auto_fallback" | "auto_off"}; None otherwise
     tool_retry: dict | None = None
+    # development A of 2026-11-27 (long record lists): the question asks to list records, so code wrote the list rows
+    # (agent.display.asks_list, agent.tables.list_rows); and the record agent's final call stopped at its token limit
+    # (finish reason "length": the pipeline adds the cut line, prompts/answer_cut_line.md)
+    list_ask: bool = False
+    cut_off: bool = False
 
     @property
     def data_queries(self) -> int:

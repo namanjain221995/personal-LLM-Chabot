@@ -132,7 +132,10 @@ class Limits:
 
     # knowledge agent (Config defaults; agent/knowledge_agent.py)
     knowledge_max_steps: int = 8                 # model calls of the knowledge agent (Config.max_tool_steps)
-    model_max_tokens: int = 1500                 # max_tokens of a knowledge agent reply (Config.max_tokens)
+    # max_tokens of a knowledge or record agent reply (Config.max_tokens); 1500 until development A of 2026-11-27
+    # (long record lists: 2,500, so a full reply at about 24 tokens/s on a large prompt, about 104 s, stays under
+    # model_timeout_s; a list question's rows are written by code, agent/tables.py)
+    model_max_tokens: int = 2500
     model_timeout_s: float = 120.0               # one model call attempt (Config.timeout_s)
     knowledge_tool_result_chars: int = 16_000    # a tool result is cut to this before the model sees it
     # lean knowledge step (agent/lean.py, merged mode, RECORDS_SPEC §21.19)
@@ -145,9 +148,12 @@ class Limits:
     records_call_budget_s: float = 20.0          # one tool call, all its statements (RecordsConfig.call_budget_s)
     records_max_age_h: float = 24.0              # snapshot age warning (RecordsConfig.max_age_h)
     record_result_chars: int = 12_000            # a record tool result's JSON (record_base.MAX_RESULT_CHARS)
+    # list_records rows per call (the "limit" maximum of tools/registry.py; 50 until development A of 2026-11-27): the
+    # model reads its result cut to record_result_chars, code writes every row of a list (agent/tables.py)
+    list_max_rows: int = 200
     names_max_tokens: int = 60                   # the names call (record_prompts.NAMES_MAX_TOKENS)
     # merge call (agent/merge.py)
-    merge_max_tokens: int = 1600
+    merge_max_tokens: int = 2500                 # 1600 until development A of 2026-11-27 (under model_timeout_s)
     merge_facts_chars: int = 16_000              # RECORD FACTS block of the merge call
     # cli
     warmup_timeout_s: float = 120.0              # interactive mode: wait for the snapshot to open
@@ -167,7 +173,8 @@ LIMITS = Limits()
 #: The limits the modules bind at import (module constants, see each field's comment): fixed per process. The other
 #: limits are run settings: Config and RecordsConfig defaults (:func:`load_settings`) and the cli's.
 IMPORT_BOUND_LIMITS = ("knowledge_tool_result_chars", "lean_max_tool_calls", "lean_max_model_calls", "lean_max_tokens",
-                       "record_result_chars", "names_max_tokens", "merge_max_tokens", "merge_facts_chars",
+                       "record_result_chars", "list_max_rows", "names_max_tokens", "merge_max_tokens",
+                       "merge_facts_chars",
                        "component_search_chars", "component_summary_chars", "component_page_chars",
                        "component_usage_rows", "component_usage_chars", "followup_max_tokens")
 #: Config attribute -> the Limits field that gives its default.
@@ -198,7 +205,7 @@ class Config:
     model: str = "Qwen/Qwen3.6-35B-A3B-NVFP4"
     judge_model: str | None = None  # None -> same as model
     temperature: float = 0.0
-    max_tokens: int = LIMITS.model_max_tokens          # 1500
+    max_tokens: int = LIMITS.model_max_tokens          # 2500
     timeout_s: float = LIMITS.model_timeout_s          # 120.0
     enable_thinking: bool = False  # sent as extra_body chat_template_kwargs for vLLM/Qwen
     max_tool_steps: int = LIMITS.knowledge_max_steps   # 8

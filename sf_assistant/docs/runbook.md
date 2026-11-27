@@ -1032,9 +1032,17 @@ With `SFA_TABLES=code`:
   trimmed result or a multi-select field; code never adds numbers up). Under a list cut by its limit, the 50-group
   cap or the result cap, a "Showing k of n records." line from the result's own numbers ("Not all records are shown."
   when k is no number the result holds), unless the model's text already gives both numbers.
-- Code cuts nothing the tool returned (the tools already cap: a list at most 50 rows, 50 groups, a trend at most 120
-  periods, 4 segments, a breakdown 8 values and `(other)`). `TABLE_MAX_ROWS = 120` is only a safety net (one
-  number-free `…` row ends the block).
+- Code cuts nothing the tool returned (the tools already cap: a list at most 200 rows since development A of
+  2026-11-27, 50 before; 50 groups, a trend at most 120 periods, 4 segments, a breakdown 8 values and `(other)`).
+  `TABLE_MAX_ROWS` (`LIMITS.list_max_rows`, 200; 120 before) is only a safety net (one number-free `…` row ends the
+  block). A list's rows come from `QueryEvidence.full_rows` when the result cap cut the rows the model read.
+- Long lists (development A of 2026-11-27): a list question (`agent.display.asks_list`) gets these code rows in every
+  `SFA_TABLES` mode: the record agent's prompt ends with `RECORDS_LIST_NOTE` (one list_records call with limit 200, a
+  table line, no typed rows; a call without a limit asks for 200), `agent.tables.list_rows` writes the whole list
+  (pages of one list joined, after the lead) and drops the rows the model typed. The answer caps are 2,500 tokens
+  (`LIMITS.model_max_tokens`, `merge_max_tokens`; a full reply at about 24 tokens/s, about 104 s, stays under the
+  120 s call timeout), and an answer whose model call stopped at its token limit gets
+  `ANSWER_CUT_LINE` (`prompts/answer_cut_line.md`) before its Source line (JSONL `answer_cut`).
 - Placement: a block goes where its table line was; a table line before the first prose line moves after the first
   prose paragraph (the lead stays first), one after the Source line moves before it when that line ends the text (a
   Source line written first stays where it is, below it the lead and then the rows), one inside a sentence leaves the
