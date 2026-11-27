@@ -337,6 +337,81 @@ def test_a_copy_the_model_typed_gives_way_to_codes_list(monkeypatch, marker):
     assert len(_table_rows(rec.answer)) == 3 and rec.answer.count("- Person 00") == 1
 
 
+# The pre-release check of 2026-11-27 (LA2): the model typed its own table after code's, each row also naming the
+# manager and team lead, who are listed people too; the old rule (a line naming exactly one row) kept every row.
+NINE = [{**r, "Notes__c": f"desk {i}"} for i, r in enumerate(ROWS[:9], 1)]   # no contact detail
+NINE_BLOCK = "\n".join(TABLE_HEAD + [f"| {r['Name']} | {TEAM} | {r['Notes__c']} |" for r in NINE])
+
+
+def _boss(i: int) -> str:
+    return PEOPLE[(i + 1) % 9]
+
+
+@pytest.mark.parametrize("form", ["table", "numbered table", "bullets", "bold bullets"])
+def test_typed_rows_that_name_several_listed_people_go(form):
+    """Each typed row leads with a listed person and names one or two more (manager, team lead): the copy goes,
+    whatever its form; the lead, a total, a count by status and the Source line stay."""
+    people = PEOPLE[:8]   # one row missing, as in LA2
+    if form == "table":
+        typed = "| Name | Role | Manager | Team lead |\n|---|---|---|---|\n" + "\n".join(
+            f"| {p} | Recruiter | {_boss(i)} | {PEOPLE[8]} |" for i, p in enumerate(people))
+    elif form == "numbered table":
+        typed = "| # | Name | Manager |\n|---|---|---|\n" + "\n".join(
+            f"| {i + 1} | **{p}** | {_boss(i)} |" for i, p in enumerate(people))
+    elif form == "bullets":
+        typed = "\n".join(f"- {p} \u2014 Recruiter, reports to {_boss(i)}, team lead {PEOPLE[8]}"
+                          for i, p in enumerate(people))
+    else:
+        typed = "\n".join(f"{i + 1}. **{p}** (Recruiter): manager {_boss(i)}" for i, p in enumerate(people))
+    text = (f"{LEAD}\n\n{NINE_BLOCK}\n\nHere they are with their managers:\n\n{typed}\n\n"
+            f"- Total: 9 staff.\n- Active: 7, On leave: 2.\n\n{SOURCE}")
+    out, n = T._drop_typed_rows(text, [NINE_BLOCK], [NINE_BLOCK])
+    assert out == (f"{LEAD}\n\n{NINE_BLOCK}\n\nHere they are with their managers:\n\n"
+                   f"- Total: 9 staff.\n- Active: 7, On leave: 2.\n\n{SOURCE}")
+    assert n == 8
+
+
+def test_a_typed_table_goes_whole_when_most_rows_copy_the_list():
+    """Most rows of the model's table lead with a listed person; a row it misspelt (no first-cell match) but that
+    names a listed manager goes with the table. A row of that table naming nobody stays (nothing to copy)."""
+    rows = [f"| {p} | {_boss(i)} | {PEOPLE[8]} |" for i, p in enumerate(PEOPLE[:5])]
+    rows.append(f"| Persn 006 | {_boss(5)} | {PEOPLE[8]} |")
+    rows.append("| Vacant seat | none | none |")
+    table = "| Name | Manager | Lead |\n|---|---|---|\n" + "\n".join(rows)
+    out, n = T._drop_typed_rows(f"{LEAD}\n\n{NINE_BLOCK}\n\n{table}\n\n{SOURCE}", [NINE_BLOCK], [NINE_BLOCK])
+    assert out == (f"{LEAD}\n\n{NINE_BLOCK}\n\n| Name | Manager | Lead |\n|---|---|---|\n"
+                   f"| Vacant seat | none | none |\n\n{SOURCE}")
+    assert n == 6
+
+
+def test_prose_group_lines_and_lines_naming_several_people_stay():
+    """No copy of a row: prose that names listed people, a bullet naming two without leading with one, a group
+    line (a manager and only the people under them), and a bullet of a table the model did not copy stay."""
+    keep = (f"{PEOPLE[0]} and {PEOPLE[1]} lead the team; {PEOPLE[2]} joined last.\n\n"
+            f"- {PEOPLE[0]} and {PEOPLE[1]} share a desk row.\n"
+            f"- {PEOPLE[2]}: {PEOPLE[3]}, {PEOPLE[4]} and {PEOPLE[5]}\n"
+            f"- **{PEOPLE[6]}** (2): {PEOPLE[7]}, {PEOPLE[8]}\n"
+            f"- Managers with the most reports: 3 people.\n\n"
+            f"| Manager | Reports |\n|---|---|\n| {PEOPLE[0]} | {PEOPLE[1]}, {PEOPLE[2]} |")
+    text = f"{LEAD}\n\n{NINE_BLOCK}\n\n{keep}\n\n{SOURCE}"
+    assert T._drop_typed_rows(text, [NINE_BLOCK], [NINE_BLOCK]) == (text, 0)
+
+
+def test_a_typed_copy_with_manager_columns_gives_way_in_the_session(monkeypatch):
+    """The LA2 shape end to end: the model writes the table line and then types its own 8-row table with manager
+    and team-lead columns; the answer shows code's 9 rows once and no second table."""
+    monkeypatch.delenv("SFA_TABLES", raising=False)
+    res, _full = _list_result(NINE, 9)
+    typed = "| Name | Manager | Team lead |\n|---|---|---|\n" + "\n".join(
+        f"| {p} | {_boss(i)} | {PEOPLE[8]} |" for i, p in enumerate(PEOPLE[:8]))
+    reply = f"There are 9 staff.\n\n{{{{table q1}}}}\n\n{typed}\n\n{SOURCE}"
+    session, _llm = _session(Tools({"list_records": [(res, None)]}), LIST_CALL, reply)
+    rec = session.ask(QUESTION)
+    assert rec.answer == f"There are 9 staff.\n\n{NINE_BLOCK}\n\n{SOURCE}"
+    assert len(_table_rows(rec.answer)) == 9 and "Team lead" not in rec.answer
+    assert rec.code_tables["list_dropped"] == 8
+
+
 def test_a_non_list_question_is_unchanged(monkeypatch):
     monkeypatch.delenv("SFA_TABLES", raising=False)
     group = {"object": OBJ, "grouped_by": "Team__c", "measure": "count", "groups": [{"group": TEAM, "value": 103}],

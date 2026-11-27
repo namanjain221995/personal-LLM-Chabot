@@ -1052,28 +1052,97 @@ def _row_keys(block: str) -> list[str]:
     return sorted(keys, key=lambda k: (-len(k), k))
 
 
+#: Where a typed list item's label ends: the first ":", spaced dash, bracket, comma, semicolon or bar
+#: ("- Person A — Recruiter").
+_LABEL_END_RE = re.compile(r"\s*(?::|\s[\u2014\u2013-]\s|\(|,|;|\|)")
+_MARKUP_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)|[*_`]")
+_ITEM_MARK_RE = re.compile(r"^\s*(?:[-*\u2022+]|\d+[.)])\s+")
+_GROUP_REST_RE = re.compile(r"[\W\d_]+|\b(?:and|or)\b", re.IGNORECASE)
+
+
+def _plain(text: str) -> str:
+    """``text`` without markdown emphasis, code ticks and link targets, single spaces, lower case."""
+    return " ".join(_MARKUP_RE.sub(lambda m: m.group(1) or "", text).split()).lower()
+
+
+def _line_key(line: str) -> str:
+    """The key a typed line leads with, as :func:`_block_rows` keys code's rows: a table row's first cell that is
+    not a bare number (a "#" column), a list item's label (its words up to the first ":", dash, bracket, comma or
+    bar). Plain and lower case (:func:`_plain`); "" when there is none."""
+    s = line.strip()
+    if s.startswith("|"):
+        for cell in s.strip("|").split("|"):
+            c = _plain(cell)
+            if c and not re.fullmatch(r"[\d.#)]+", c):
+                return c
+        return ""
+    s = _ITEM_MARK_RE.sub("", s, count=1)
+    m = re.match(r"\s*(\*\*|__)(.+?)\1", s)   # a bold label: its words, whatever separator follows
+    if m:
+        return _plain(m.group(2))
+    return _plain(_LABEL_END_RE.split(s, maxsplit=1)[0])
+
+
 def _drop_typed_rows(text: str, keep: list[str], lists: list[str]) -> tuple[str, int]:
-    """``text`` without the model's own list-item and table lines (outside the blocks ``keep``) that each name the key
-    of exactly one row of a block of ``lists`` (a name, a record number: code's list holds that row), and without a
-    table header and rule line the dropped rows leave alone. A line that names the keys of several rows, or none,
-    stays. Returns the text and how many lines went."""
+    """``text`` without the model's own copy of a list code wrote: its list-item and table lines (outside the blocks
+    ``keep``) that are a row of a block of ``lists``, and a table header and rule line the dropped rows leave alone.
+    A line is a row when it leads with the key of a row (:func:`_line_key`: a table row's first cell, an item's label;
+    a manager or team-lead column naming other listed rows does not change that) or names the key of exactly one row
+    (a name, a record number: code's list holds that row). A group line stays: one that leads with a key and then
+    names only 2 or more other keys (with numbers and "and"), as "- Person B: Person C, Person D" (in a table row, one
+    cell holds those keys; a row with one name per cell is a copy). When most body rows
+    of one of the model's tables went, its other rows that name a key go too (the copy is the model's whole table).
+    Prose, a line that names no key (a total, a count by status) and a line that names several keys without leading
+    with one stay. Returns the text and how many lines went."""
     keys = [k for block in lists for k in _row_keys(block)]
     if not keys:
         return text, 0
     rx = re.compile(f"(?<![{_WORD_CHAR}])(?:" + "|".join(re.escape(k) for k in dict.fromkeys(keys))
                     + f")(?![{_WORD_CHAR}])", re.IGNORECASE)
+    plain_keys = {_plain(k) for k in keys}
     lines = text.split("\n")
     inside = _block_lines(lines, keep)
+
+    def named(ln: str) -> set[str]:
+        found = {m.group(0).lower() for m in rx.finditer(ln)}
+        return {k for k in found if not any(k != o and k in o for o in found)}   # "Person 1" inside "Person 10"
+
+    def group_line(ln: str, lead: str, found: set[str]) -> bool:
+        others = {k for k in found if _plain(k) != lead}
+        if len(others) < 2:
+            return False
+        if ln.lstrip().startswith("|"):   # a table row: one cell holds the group (two or more names), not one each
+            if not any(len(named(c)) >= 2 for c in ln.strip().strip("|").split("|")[1:]):
+                return False
+        rest = _ITEM_MARK_RE.sub("", ln.strip().strip("|"), count=1)
+        rest = _GROUP_REST_RE.sub(" ", _MARKUP_RE.sub(lambda m: m.group(1) or "", rx.sub(" ", rest)))
+        return not rest.split()
+
     gone: set[int] = set()
     for i, ln in enumerate(lines):
-        if i in inside or not _LIST_ITEM_RE.match(ln):
+        if i in inside or not _LIST_ITEM_RE.match(ln) or _TABLE_RULE_RE.match(ln):
             continue
-        found = {m.group(0).lower() for m in rx.finditer(ln)}
-        found = {k for k in found if not any(k != o and k in o for o in found)}   # "Person 1" inside "Person 10"
-        if len(found) == 1:
+        found = named(ln)
+        lead = _line_key(ln)
+        if (lead in plain_keys and not group_line(ln, lead, found)) or len(found) == 1:
             gone.add(i)
     if not gone:
         return text, 0
+    i = 0
+    while i < len(lines):   # the model's own tables: most body rows went, so the table is a copy of the list
+        if i in inside or not lines[i].lstrip().startswith("|"):
+            i += 1
+            continue
+        run = []
+        while i < len(lines) and i not in inside and lines[i].lstrip().startswith("|"):
+            run.append(i)
+            i += 1
+        body = [j for j in run if not _TABLE_RULE_RE.match(lines[j])]
+        if len(run) >= 2 and _TABLE_RULE_RE.match(lines[run[1]]):
+            body = [j for j in run[2:] if not _TABLE_RULE_RE.match(lines[j])]
+        went = [j for j in body if j in gone]
+        if len(went) >= 2 and 2 * len(went) >= len(body):
+            gone |= {j for j in body if named(lines[j])}
     n = len(gone)
     kept = [i for i in range(len(lines)) if i not in gone]
     for j, i in enumerate(kept):   # a header and rule line of the model's own table whose rows went
