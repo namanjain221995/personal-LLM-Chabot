@@ -8,7 +8,9 @@ new path misbehaves, and one thing to remove if it is ever withdrawn.
 
 It is also the one place the orchestrator asks the sf_assistant service
 (`SF_ASSISTANT_ENABLED`, off by default; see `_try_assistant`). With that switch
-on, `try_answer` takes only that path, so the pipeline above cannot run.
+on, `try_answer` takes only that path, so the pipeline above cannot run. Its
+conversation memory (`SF_ASSISTANT_MEMORY`, off by default; app/sf_memory.py)
+is read here and nowhere else, on a Salesforce-mode turn only.
 
 EXACTLY ONE PIPELINE RUNS PER REQUEST. `try_answer` returns an Outcome when the
 new pipeline answered, and None when it did not. On None the caller proceeds to
@@ -589,6 +591,30 @@ _ASK_AGAIN_LINE = ("I could not tell what the last question referred to, so I "
 #: neither, so the line says only what happened.
 _ASK_READ_FAILED_LINE = ("I could not check this chat just now, so I cannot do "
                          "that yet; please try again in a moment.")
+#: Conversation memory (app/sf_memory.py, SF_ASSISTANT_MEMORY): the bridge's own
+#: lines that read no data, which its walk-back steps over without counting a
+#: gap (design 2026-11-25 C3). The toggle-off guard's fixed replies are added
+#: there. The retry line is not one: its row carries its parent's state.
+_MEMORY_TRANSPARENT_LINES = (_ASK_NOTED_LINE, _ASK_AGAIN_LINE)
+#: The lines whose rows copy their parent's state, so a pending question in it
+#: is not one this turn answers.
+_MEMORY_CARRIED_LINES = (_ASK_RETRY_LINE,)
+#: The service before contract v2 refuses any key it does not know with exactly
+#: this text (web/ask_mcp.py `UNKNOWN_KEYS_ERROR`). Only this refusal of a v2 call
+#: is asked again, once, with the v1 keys (design §4.4, C34).
+_ASK_V1_REFUSAL = "the arguments are question, recent_turns and request_id"
+#: After that refusal the bridge asks with v1 keys for this long, so a service
+#: deployed in the wrong order does not cost every turn two calls.
+_ASK_V1_HOLD_S = 600.0
+#: During that hold, one turn this often is still asked with contract v2 (a
+#: probe). The service answers a v1 call as v1, with no `contract`, so only a
+#: v2 call can bring the `contract: 2` that ends the hold early (design §4.4).
+_ASK_V1_PROBE_S = 60.0
+#: `time.monotonic()` until which the service is taken to speak v1 only; 0 when
+#: it is not. A reply that says `contract: 2` clears it.
+_ask_v1_until = 0.0
+#: `time.monotonic()` before which no probe is sent during the hold.
+_ask_v1_probe_at = 0.0
 #: How long the status stays cleared before a chart's meta (see `_say`). In a real
 #: browser 20 ms was enough and 10 ms was not; the rest is for the network between.
 _ASK_CHART_PAUSE_S = 0.1
@@ -606,16 +632,14 @@ _LONE_VALUE_NOTE = ("No chart: a line this long would not show a value with no "
                     "value on either side of it. The rows are in the Data tab.")
 
 
-async def _assistant_declines(text: str, request: Any,
-                              clarification_response: Any, principal: Any,
-                              conv_key: Optional[str],
-                              mode_sent: bool) -> Optional[str]:
-    """Why this turn is not the service's, decided before it is called."""
+def _cheap_declines(text: str, request: Any, clarification_response: Any,
+                    principal: Any, mode_sent: bool) -> Optional[str]:
+    """The declines read from the request and the settings alone, in the order
+    `_assistant_declines` applies them: no read of the database. Conversation
+    memory looks up its row only for a turn that passes these (design §3.1)."""
     global _ask_no_token_logged
     from ..authn.rbac import Cap
     from ..config import settings
-    from ..core.sf_intel import state as sf_state
-    from .sf_intel import is_conversational
 
     if not settings.sf_assistant_socket or not settings.sf_assistant_token:
         if not _ask_no_token_logged:
@@ -641,7 +665,25 @@ async def _assistant_declines(text: str, request: Any,
         return "the request carries an upload"
     if len(text.strip()) > _ASK_MAX_QUESTION:
         return "the question is too long"
-    if is_conversational(text):
+    return None
+
+
+async def _assistant_declines(text: str, request: Any,
+                              clarification_response: Any, principal: Any,
+                              conv_key: Optional[str],
+                              mode_sent: bool, *, pending: bool = False) -> Optional[str]:
+    """Why this turn is not the service's, decided before it is called.
+
+    `pending` is conversation memory's verdict that this turn replies to the
+    service's own pending clarification (design §3.5): a "yes" or a "2" is then
+    the service's, not the older route's. False whenever memory is off."""
+    from ..core.sf_intel import state as sf_state
+    from .sf_intel import is_conversational
+
+    reason = _cheap_declines(text, request, clarification_response, principal, mode_sent)
+    if reason:
+        return reason
+    if is_conversational(text) and not pending:
         return "a conversational turn"
     # An open question belongs to the engine that asked it. A read that fails
     # may be hiding one, so it counts as open.
@@ -754,27 +796,81 @@ def _strict_json(raw: Any) -> Any:
     return json.loads(raw, parse_constant=refuse)
 
 
+def _envelope_error(reply: Any) -> Optional[str]:
+    """The `error` text of a refusal's envelope, or None. Never raises: it only
+    names a refusal, so a refusal of another shape simply has no text."""
+    try:
+        error = _strict_json(reply["content"][0]["text"]).get("error")
+    except Exception:                                   # noqa: BLE001
+        return None
+    return error if isinstance(error, str) else None
+
+
+def _tool_reply(raw: bytes) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """(the `result` of one JSON-RPC reply, None), or (None, the refusal's error
+    text or None) when the reply says it has none. Raises on a reply of another
+    shape; the caller treats that as no result."""
+    reply = _strict_json(raw)["result"]
+    if reply.get("isError"):
+        return None, _envelope_error(reply)
+    envelope = _strict_json(reply["content"][0]["text"])
+    if envelope.get("ok") is not True or not isinstance(envelope.get("result"), dict):
+        error = envelope.get("error")
+        return None, error if isinstance(error, str) else None
+    return envelope["result"], None
+
+
 def _tool_result(raw: bytes) -> Optional[dict[str, Any]]:
     """The `result` of one JSON-RPC reply, or None when the reply says it has
     none. Raises on a reply of another shape; the caller treats both alike."""
-    reply = _strict_json(raw)["result"]
-    if reply.get("isError"):
-        return None
-    envelope = _strict_json(reply["content"][0]["text"])
-    if envelope.get("ok") is not True or not isinstance(envelope.get("result"), dict):
-        return None
-    return envelope["result"]
+    return _tool_reply(raw)[0]
+
+
+def _speaks_v2(result: Any) -> bool:
+    """Does a reply say it was written under contract v2 (`contract: 2`)?"""
+    return isinstance(result, dict) and type(result.get("contract")) is int and result["contract"] == 2
+
+
+def _service_speaks_v1() -> bool:
+    """Has the service refused a v2 call with the v1 text in the last 10 minutes?"""
+    return time.monotonic() < _ask_v1_until
+
+
+def _claim_v1_probe() -> bool:
+    """During the v1 hold, is this turn the one a minute that is asked with
+    contract v2 again? Claimed with no await in between, so two turns never
+    both probe. A probe the old service refuses again is retried with the v1
+    keys like any v2 call, and starts the hold anew; a reply that says
+    `contract: 2` ends it."""
+    global _ask_v1_probe_at
+    now = time.monotonic()
+    if now < _ask_v1_probe_at:
+        return False
+    _ask_v1_probe_at = now + _ASK_V1_PROBE_S
+    return True
 
 
 async def _ask_service(arguments: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """One `tools/call` of ask_salesforce over the socket: its `result`, or None.
+    """One `tools/call` of ask_salesforce over the socket: its `result`, or None."""
+    return (await _call_service(arguments))[0]
+
+
+async def _call_service(arguments: dict[str, Any]) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """One `tools/call` of ask_salesforce over the socket: (its `result`, None),
+    or (None, the refusal's error text when the service refused the call).
 
     Plain JSON-RPC, with no initialize and no MCP library: the service answers
     that on one connection. Every log line here holds a status and seconds only,
     never the question, the answer or the token, and an exception's text is left
     out for the same reason. A non-200 is a warning, so a lockout shows.
     CancelledError is no Exception, so Stop passes straight through.
+
+    A reply that says `contract: 2` ends any v1 hold (design §4.4): the service
+    in front of this bridge speaks v2 again. Today's service answers a v1 call
+    without `contract`, so during the hold that reply is the probe's
+    (`_claim_v1_probe`).
     """
+    global _ask_v1_until
     import httpx
 
     from ..config import settings
@@ -796,25 +892,111 @@ async def _ask_service(arguments: dict[str, Any]) -> Optional[dict[str, Any]]:
     except Exception as exc:                            # noqa: BLE001
         log.warning("sf_assistant call failed after %.1f s: %s",
                     time.perf_counter() - started, type(exc).__name__)
-        return None
+        return None, None
     seconds = time.perf_counter() - started
     if response.status_code != 200:
         log.warning("sf_assistant replied %d after %.1f s",
                     response.status_code, seconds)
-        return None
+        return None, None
     try:
-        result = _tool_result(response.content)
+        result, error = _tool_reply(response.content)
     except Exception as exc:                            # noqa: BLE001
         log.warning("sf_assistant reply unreadable after %.1f s: %s",
                     seconds, type(exc).__name__)
-        return None
+        return None, None
     if result is None:
         log.warning("sf_assistant refused the call after %.1f s", seconds)
-        return None
+        return None, error
     status = result.get("status")
     log.info("sf_assistant status %s after %.1f s",
              status if status in _ASK_STATUSES else "unknown", seconds)
-    return result
+    if _speaks_v2(result):
+        _ask_v1_until = 0.0
+    return result, None
+
+
+async def _memory_for(text: str, request: Any, clarification_response: Any,
+                      principal: Any, mode_sent: bool, wants_a_file: bool,
+                      query_trace: Any) -> Any:
+    """This turn's conversation memory (app/sf_memory.py), or None.
+
+    None whenever SF_ASSISTANT_MEMORY is off (the bridge then reads and writes
+    nothing and its call is today's v1 call), for a turn one of the cheap
+    declines stops (no read is spent on it, design §3.1), while the service
+    is held to v1 (`_service_speaks_v1`) except for the probe a minute
+    (`_claim_v1_probe`), and when the read fails (§14: v1 for this turn).
+    The lookup runs only here, so only for a Salesforce-mode turn: a turn of
+    any other mode never gets past `try_answer`'s first line.
+
+    The trace event `SF_MEMORY` (§13) holds the lookup's codes and sizes, or
+    the outcome `error` when the read failed.
+    """
+    from .. import sf_memory
+
+    if not sf_memory.enabled():
+        return None
+    if wants_a_file or _cheap_declines(text, request, clarification_response, principal, mode_sent):
+        return None
+    if _service_speaks_v1() and not _claim_v1_probe():
+        return None
+    try:
+        memory = await sf_memory.lookup(principal, request,
+                                        transparent=_MEMORY_TRANSPARENT_LINES,
+                                        carried=_MEMORY_CARRIED_LINES)
+    except Exception as exc:                            # noqa: BLE001 — memory never costs the turn
+        if not isinstance(exc, sf_memory.LookupFailed):  # that one is logged and counted already
+            log.warning("sf_memory lookup failed: %s", type(exc).__name__)
+            sf_memory.count("lookup_error")
+        await _memory_trace(query_trace, {"outcome": "error"})
+        return None
+    if memory is not None:
+        await _memory_trace(query_trace, memory.trace)
+    return memory
+
+
+async def _memory_trace(query_trace: Any, details: Any) -> None:
+    """The `SF_MEMORY` trace event of this turn (codes and sizes only):
+    `details` is the dict, or a function that builds it. A trace never costs
+    the turn, building it included."""
+    event = getattr(query_trace, "event", None)
+    if not callable(event):
+        return
+    try:
+        details = details() if callable(details) else details
+        await event("SF_MEMORY", component="orchestrator.app.sf_memory", details=details)
+    except Exception:                                   # noqa: BLE001 — a trace never costs the turn
+        log.debug("sf_memory trace event not recorded", exc_info=True)
+
+
+def _hold_service_at_v1() -> None:
+    """The service refused a v2 call with the v1 text: ask it with v1 keys for
+    the next 10 minutes, apart from one probe a minute, and count the
+    mismatch (design §4.4)."""
+    global _ask_v1_until, _ask_v1_probe_at
+    from .. import sf_memory
+
+    now = time.monotonic()
+    _ask_v1_until = now + _ASK_V1_HOLD_S
+    _ask_v1_probe_at = now + _ASK_V1_PROBE_S
+    sf_memory.count("contract_mismatch")
+    log.warning("sf_assistant does not speak contract 2: asking with the v1 "
+                "arguments for %.0f s", _ASK_V1_HOLD_S)
+
+
+def _memory_step(step, *args) -> Any:
+    """One memory step that must never cost the turn: its value, or None
+    (logged by the exception's class only, never its text)."""
+    try:
+        return step(*args)
+    except Exception as exc:                            # noqa: BLE001
+        log.warning("sf_memory step %s failed: %s", getattr(step, "__name__", "?"), type(exc).__name__)
+        return None
+
+
+def _memory_reply(result: dict[str, Any]) -> dict[str, Any]:
+    """The reply's memory keys, read BEFORE the fixed-line reset empties
+    `result` (design C2). They go to `Outcome.sf_memory`, never to meta."""
+    return {name: result.get(name) for name in ("contract", "state", "plan_line", "reason", "kind")}
 
 
 async def _try_assistant(text: str, *, emit, request: Any,
@@ -834,14 +1016,28 @@ async def _try_assistant(text: str, *, emit, request: Any,
     unless one of those lines stops this turn (`stop_line_for`). Such a turn never
     returns None, whoever asks, so only a switched-off bridge leaves it to the
     older route. A file is one more turn the service cannot take.
+
+    CONVERSATION MEMORY (SF_ASSISTANT_MEMORY, design 2026-11-25 §3). Off, every
+    line below does what it did before memory existed. On, the row of the answer
+    this turn replies to is looked up after the cheap declines, and the call
+    carries contract v2: the window of recent turns, that row's state, the gap
+    and the summary. ONE COMBINED RULE (§3.5): when that row is the very last
+    answer and its state holds a pending clarification, neither conversational
+    rule (the noted line on a stop-line turn, the decline to the older route)
+    applies, and a "yes" reaches the service. Otherwise both stay as they were.
+    What the reply says for memory is kept before the fixed-line reset (C2) and
+    goes on `Outcome.sf_memory`; meta is built exactly as before.
     """
     from .sf_intel import is_conversational
 
-    if stop_line and is_conversational(text):
+    memory = await _memory_for(text, request, clarification_response, principal,
+                               mode_sent, wants_a_file, query_trace)
+    pending = memory is not None and memory.pending
+    if stop_line and is_conversational(text) and not pending:
         return await _say(_ASK_NOTED_LINE, {}, emit)
     reason = ("a file" if wants_a_file else
               await _assistant_declines(text, request, clarification_response,
-                                        principal, conv_key, mode_sent))
+                                        principal, conv_key, mode_sent, pending=pending))
     if reason:
         log.debug("sf_assistant declined: %s", reason)
         return await _say(stop_line, {}, emit) if stop_line else None
@@ -853,7 +1049,34 @@ async def _try_assistant(text: str, *, emit, request: Any,
     request_id = getattr(query_trace, "request_id", None)
     if isinstance(request_id, str):
         arguments["request_id"] = request_id
-    result = await _ask_service(arguments) or {}
+    # Only a polite word was let through by the pending exception: any other
+    # reply ("2", a choice's label) passes both conversational rules anyway.
+    let_through = pending and is_conversational(text)
+    v2 = None
+    if memory is not None:
+        window = _memory_step(memory.recent_turns)
+        keys = _memory_step(memory.arguments)
+        v2 = {**arguments, "recent_turns": window, **keys} if window is not None and keys else None
+        memory = memory if v2 is not None else None
+        if memory is None and let_through:
+            # The pending exception needs the v2 call; without it, the rule as it was.
+            return await _say(_ASK_NOTED_LINE, {}, emit) if stop_line else None
+    if memory is None:
+        result = await _ask_service(arguments) or {}
+    else:
+        result, refusal = await _call_service(v2)
+        if result is None and refusal == _ASK_V1_REFUSAL:
+            # A service from before contract v2 (deployed in the wrong order):
+            # once with the v1 keys, exactly the call the switch-off bridge makes.
+            _hold_service_at_v1()
+            if let_through:
+                # Only the pending exception brought this turn here, and a v1
+                # service has no pending question: the rule as it was.
+                return await _say(_ASK_NOTED_LINE, {}, emit) if stop_line else None
+            memory = None
+            result = await _ask_service(arguments)
+        result = result or {}
+    reply = _memory_reply(result) if memory is not None else {}
 
     status = result.get("status")
     written = result.get("answer")
@@ -866,8 +1089,17 @@ async def _try_assistant(text: str, *, emit, request: Any,
         # when a refused record answer ends with no text.
         written, result = fixed, {}
     if status not in ("answered", "refused", "unclear") or not written:
-        return await _say(_ASK_RETRY_LINE, {}, emit) if stop_line else None
-    return await _say(written, result, emit)
+        if not stop_line:
+            return None
+        outcome = await _say(_ASK_RETRY_LINE, {}, emit)
+        if memory is not None:
+            # The retry line keeps the plan of the answer it follows (§3.3).
+            outcome.sf_memory = _memory_step(memory.carry)
+        return outcome
+    outcome = await _say(written, result, emit)
+    if memory is not None:
+        outcome.sf_memory = _memory_step(memory.record, reply, written)
+    return outcome
 
 
 async def _say(written: str, result: dict[str, Any], emit) -> Outcome:

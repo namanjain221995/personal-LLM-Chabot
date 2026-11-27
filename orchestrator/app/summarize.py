@@ -9,7 +9,7 @@ Nothing here performs network I/O at import time.
 """
 from __future__ import annotations
 
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 from . import llm
 from .config import settings
@@ -50,10 +50,17 @@ def format_turns(turns: Sequence[dict]) -> str:
     return "\n\n".join(lines)
 
 
-def build_messages(existing: str, turns: Sequence[dict]) -> List[dict]:
-    """The summarization prompt: previous summary + only the new turns."""
+def build_messages(
+    existing: str, turns: Sequence[dict], *, instructions: Optional[str] = None
+) -> List[dict]:
+    """The summarization prompt: previous summary + only the new turns.
+
+    `instructions` replaces `_INSTRUCTIONS` for a caller with its own folding
+    rules (the Salesforce summary, app/sf_summary.py). Omitted or None, the
+    prompt is exactly the assistant-mode one."""
+    rules = _INSTRUCTIONS if instructions is None else instructions
     user = (
-        f"{_INSTRUCTIONS}\n\n"
+        f"{rules}\n\n"
         f"EXISTING SUMMARY:\n{existing.strip() or '(none yet)'}\n\n"
         f"NEW MESSAGES:\n{format_turns(turns)}"
     )
@@ -63,16 +70,19 @@ def build_messages(existing: str, turns: Sequence[dict]) -> List[dict]:
     ]
 
 
-async def summarize(existing: str, turns: Sequence[dict]) -> str:
+async def summarize(
+    existing: str, turns: Sequence[dict], *, instructions: Optional[str] = None
+) -> str:
     """Fold `turns` into `existing`, returning the new summary text.
 
     Raises on model failure; the caller decides what to do (compaction is
     best-effort — a chat must never break because summarizing failed).
+    `instructions`: see `build_messages`; the request is otherwise the same.
     """
     if not format_turns(turns).strip():
         return existing
     text = await llm.chat_completion(
-        build_messages(existing, turns),
+        build_messages(existing, turns, instructions=instructions),
         temperature=0.0,
         max_tokens=settings.summary_max_tokens,
         # Never. Rewriting a transcript into notes is a copying task, not a
@@ -119,6 +129,10 @@ SUMMARY_HEADER = (
 )
 
 
-def summary_block(summary: str) -> dict:
-    """The system message carrying the summary into a prompt."""
-    return {"role": "system", "content": f"{SUMMARY_HEADER}\n{summary.strip()}"}
+def summary_block(summary: str, *, header: Optional[str] = None) -> dict:
+    """The system message carrying the summary into a prompt. `header`
+    replaces SUMMARY_HEADER for a summary that is not "established facts"
+    (the Salesforce summary is context only); omitted or None, the block is
+    exactly the assistant-mode one."""
+    lead = SUMMARY_HEADER if header is None else header
+    return {"role": "system", "content": f"{lead}\n{summary.strip()}"}

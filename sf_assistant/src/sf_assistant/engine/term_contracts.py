@@ -665,7 +665,10 @@ def _date_arg(view: View, obj: str, raw: Any) -> PathInfo | None:
     getter = getattr(view, "date_path", None)
     if getter is None or not isinstance(raw, str) or not raw.strip():
         return None
-    return getter(obj, raw)
+    found = getter(obj, raw)
+    if isinstance(found, str):   # a view whose date_path gives the path text (query_state.PlanView): resolve it
+        return view.path(obj, found)
+    return found
 
 
 def _dated_by(tool: str, args: dict, parts: list, view: View, obj: str, prefix: str = "") -> str | None:

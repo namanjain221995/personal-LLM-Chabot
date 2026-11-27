@@ -1,0 +1,661 @@
+{
+ "title": "Record sets, rankings and questions about the last answer (design v2 §16.1 S01, A01, GR01)",
+ "chains": [
+  {
+   "id": "S01",
+   "title": "A ranked set of candidates, then their interviews after the ranking changed: fresh keys and a line",
+   "design": "design v2 §10 (a ranking re-run fresh, its keys as an in filter, no ids stored; the digest tells a changed set), §16.1 S01",
+   "worlds": {
+    "flip": {
+     "set": [
+      {
+       "table": "Interview__c",
+       "name": "I-0001",
+       "field": "Candidate__c",
+       "value": "001000000000002AAA"
+      },
+      {
+       "table": "Interview__c",
+       "name": "I-0002",
+       "field": "Candidate__c",
+       "value": "001000000000002AAA"
+      }
+     ]
+    }
+   },
+   "steps": [
+    {
+     "q": "top 2 candidates by number of interviews",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Candidate__c",
+        "top": 2,
+        "order": "desc"
+       }
+      },
+      "The top 2 candidates are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Candidate__c",
+         "top": 2,
+         "order": "desc"
+        },
+        "term_filters": [
+         "Candidate__c.RecordTypeId = 'Person Account'"
+        ],
+        "result_has": {
+         "groups": [
+          {
+           "group": "Candidate 1",
+           "value": 5
+          },
+          {
+           "group": "Candidate 2",
+           "value": 4
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Candidate__c",
+          "top": 2,
+          "order": "desc"
+         }
+        }
+       ],
+       "keys": [
+        "candidates"
+       ]
+      }
+     }
+    },
+    {
+     "q": "show their interviews",
+     "world": "flip",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "follow_set": {
+         "object": "Interview__c",
+         "via_field": "Candidate__c"
+        }
+       }
+      ]
+     },
+     "record": [
+      "Their interviews are listed.\nSource: the synthetic warehouse copy."
+     ],
+     "note": "two interviews moved from Candidate 1 to Candidate 2 since the ranking was shown",
+     "expect": {
+      "reason": "patch",
+      "model": true,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Candidate__c",
+         "top": 2,
+         "order": "desc"
+        },
+        "term_filters": [
+         "Candidate__c.RecordTypeId = 'Person Account'"
+        ],
+        "result_has": {
+         "groups": [
+          {
+           "group": "Candidate 2",
+           "value": 6
+          },
+          {
+           "group": "Candidate 1",
+           "value": 3
+          }
+         ]
+        }
+       },
+       {
+        "tool": "list_records",
+        "args": {
+         "object": "Interview__c",
+         "filters": [
+          {
+           "field": "Candidate__c",
+           "op": "in",
+           "values": [
+            "Candidate 2",
+            "Candidate 1"
+           ]
+          }
+         ]
+        },
+        "term_filters": [],
+        "result_has": {
+         "total_count": 9
+        }
+       }
+      ],
+      "answer_has": [
+       "The records of the earlier answer have changed since it was shown; these figures are for the records there now."
+      ],
+      "plan": {
+       "tool": "list_records",
+       "keys_from": {
+        "field": "Candidate__c",
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Candidate__c",
+         "top": 2,
+         "order": "desc"
+        }
+       }
+      },
+      "answer_not": [
+       "001000000000"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "S01B",
+   "title": "A ranked set, then the first one after the ranking changed: it asks and runs nothing more",
+   "design": "design v2 §10 drill {rank} (D3: only when the fresh digest matches), §16.1 S01",
+   "worlds": {
+    "flip": {
+     "set": [
+      {
+       "table": "Interview__c",
+       "name": "I-0001",
+       "field": "Candidate__c",
+       "value": "001000000000002AAA"
+      },
+      {
+       "table": "Interview__c",
+       "name": "I-0002",
+       "field": "Candidate__c",
+       "value": "001000000000002AAA"
+      }
+     ]
+    }
+   },
+   "steps": [
+    {
+     "q": "top 2 candidates by number of interviews",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Candidate__c",
+        "top": 2,
+        "order": "desc"
+       }
+      },
+      "The top 2 candidates are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Candidate__c",
+         "top": 2,
+         "order": "desc"
+        },
+        "term_filters": [
+         "Candidate__c.RecordTypeId = 'Person Account'"
+        ],
+        "result_has": {
+         "groups": [
+          {
+           "group": "Candidate 1",
+           "value": 5
+          },
+          {
+           "group": "Candidate 2",
+           "value": 4
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Candidate__c",
+          "top": 2,
+          "order": "desc"
+         }
+        }
+       ],
+       "keys": [
+        "candidates"
+       ]
+      }
+     }
+    },
+    {
+     "q": "show the first one",
+     "world": "flip",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "drill": {
+         "rank": 1
+        }
+       }
+      ]
+     },
+     "note": "the set re-runs fresh and its first key is another candidate now: a stop line, no record agent call; the ranking stays the plan",
+     "expect": {
+      "reason": "clarify",
+      "kind": "none",
+      "model": true,
+      "record": false,
+      "answer": "Read as: `Interviews listed, for number 1 of the top 2 Candidate shown before, candidates as Person Accounts`\n\nThe ranking has changed since the last answer, so its number 1 is no longer the same record. Please ask for it by name.",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Candidate__c",
+         "top": 2,
+         "order": "desc"
+        },
+        "term_filters": [
+         "Candidate__c.RecordTypeId = 'Person Account'"
+        ]
+       }
+      ],
+      "pending": null,
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Candidate__c",
+          "top": 2,
+          "order": "desc"
+         }
+        }
+       ],
+       "age": 0
+      }
+     }
+    },
+    {
+     "q": "show the interviews of Candidate 2",
+     "world": "flip",
+     "resolve": {
+      "kind": "new",
+      "standalone": "show the interviews of Candidate 2",
+      "ops": []
+     },
+     "record": [
+      {
+       "name": "list_records",
+       "args": {
+        "object": "Interview__c",
+        "filters": [
+         {
+          "field": "Candidate__c",
+          "op": "eq",
+          "value": "Candidate 2"
+         }
+        ]
+       }
+      },
+      "Listed.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "model": true,
+      "ran": [
+       {
+        "tool": "list_records",
+        "args": {
+         "object": "Interview__c",
+         "filters": [
+          {
+           "field": "Candidate__c",
+           "op": "eq",
+           "value": "Candidate 2"
+          }
+         ]
+        },
+        "result_has": {
+         "total_count": 6
+        }
+       }
+      ],
+      "plan": {
+       "tool": "list_records"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "A01",
+   "title": "Why is one lower than the other: the plan re-runs, a breakdown is added, and visualize it draws the ranking",
+   "design": "design v2 §6.7 about_answer (C6: the stored state is the parent plan at age 0), §16.1 A01",
+   "steps": [
+    {
+     "q": "how many interviews per recruiter this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "q": "Why is Recruiter C lower than Recruiter A?",
+     "resolve": {
+      "kind": "about_answer",
+      "standalone": "Why is Recruiter C lower than Recruiter A?",
+      "ops": []
+     },
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "split_by": "Interview_Outcome__c",
+        "filters": [
+         {
+          "field": "Recruiter__c",
+          "op": "in",
+          "values": [
+           "Recruiter C",
+           "Recruiter A"
+          ]
+         }
+        ],
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "Recruiter C had fewer interviews this year; the outcomes are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "about_answer",
+      "kind": "records",
+      "model": true,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       },
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "split_by": "Interview_Outcome__c",
+         "filters": [
+          {
+           "field": "Recruiter__c",
+           "op": "in",
+           "values": [
+            "Recruiter C",
+            "Recruiter A"
+           ]
+          }
+         ],
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "age": 0,
+       "show_chart": false
+      }
+     }
+    },
+    {
+     "q": "visualize it",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "show_chart": true
+      },
+      "charts": 1
+     }
+    }
+   ]
+  },
+  {
+   "id": "GR01",
+   "title": "A top-5 ranking, then by month: the split follows the fresh top 5 through an in filter",
+   "design": "design v2 §6.4 set_grain (C13: top N up to 20 becomes an in filter on the fresh keys), §16.1 GR01",
+   "steps": [
+    {
+     "q": "top 5 interview statuses this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Status__c",
+        "top": 5,
+        "order": "desc",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The top statuses are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "top": 5,
+         "order": "desc",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        },
+        "result_has": {
+         "groups": [
+          {
+           "group": "Completed",
+           "value": 6
+          },
+          {
+           "group": "Offer Received",
+           "value": 2
+          },
+          {
+           "group": "Cancelled",
+           "value": 1
+          },
+          {
+           "group": "Scheduled",
+           "value": 1
+          }
+         ]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "q": "by month",
+     "record": [
+      "By month.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "top": 5,
+         "order": "desc",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       },
+       {
+        "tool": "trend_records",
+        "args": {
+         "object": "Interview__c",
+         "grain": "month",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "split_by": "Interview_Status__c",
+         "filters": [
+          {
+           "field": "Interview_Status__c",
+           "op": "in",
+           "values": [
+            "Completed",
+            "Offer Received",
+            "Cancelled",
+            "Scheduled"
+           ]
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "tool": "trend_records",
+       "keys_from": {
+        "field": "Interview_Status__c",
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "top": 5,
+         "order": "desc",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      }
+     }
+    },
+    {
+     "q": "visualize it",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "plan": {
+       "tool": "trend_records",
+       "show_chart": true
+      },
+      "charts": 1
+     }
+    }
+   ]
+  }
+ ]
+}

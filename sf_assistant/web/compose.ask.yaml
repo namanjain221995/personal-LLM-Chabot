@@ -3,10 +3,11 @@
 # builds and never builds it (the page and the MCP server run on that image). It listens on no TCP port, only on a Unix
 # socket in the named volume sf-local-ai_ask-sock, which the platform's compose creates: only a container with that
 # volume can reach it. It never touches the sf-local-ai stack otherwise: it mounts that stack's data volume READ-ONLY
-# and reaches its vLLM server on localhost:8000 through the host network. Of .private it sees only its two files: the
-# token file read-only, its log writable. Each is a file bind mount, so run.sh creates them first, and new-ask-token
+# and reaches its vLLM server on localhost:8000 through the host network. Of .private it sees only two paths: the
+# token file read-only and its log folder ask_logs writable (web/ask_log.py: one file per business day, deleted after
+# SFA_ASK_LOG_DAYS days, default 90). run.sh creates both first (bind mounts need their source), and new-ask-token
 # rewrites the token file in place (a file bind mount keeps the inode it was created with; the server refuses every
-# token when it sees that the file was replaced).
+# token when it sees that the file was replaced). The container log is capped at 3 files of 10 MB.
 name: sf-assistant-ask
 
 services:
@@ -25,13 +26,27 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    logging:                      # stderr only: start-up lines and class names; at most 3 files of 10 MB
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     command: ["python", "/srv/web/ask_mcp.py"]
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONPATH: /srv/sfa/src
-      SFA_HOME: /srv/sfa                           # prompts/, knowledge/ and the two .private files below it
+      SFA_HOME: /srv/sfa                           # prompts/, knowledge/ and the two .private paths below it
       SFA_WAREHOUSE: /data/warehouse.read.duckdb   # the live read copy; never /data/warehouse.duckdb
       SFA_RESOLVER: "${SFA_RESOLVER:-}"            # the spelling help: off or on; empty = on
+      SFA_ASK_LOG_DAYS: "${SFA_ASK_LOG_DAYS:-}"    # days the ask log keeps its daily files; empty = 90
+      # Conversation memory (src/sf_assistant/config.py memory_settings), read once at the service's start, so a
+      # change needs ./run.sh restart-ask (../docs/runbook.md, "The memory switches"). Empty = the code default.
+      SFA_MEMORY: "${SFA_MEMORY:-}"                                  # off, shadow or on; empty = shadow
+      SFA_MEMORY_SHORTCUTS: "${SFA_MEMORY_SHORTCUTS:-}"              # the code shortcuts: off or on; empty = on
+      SFA_MEMORY_PATCH_KNOWLEDGE: "${SFA_MEMORY_PATCH_KNOWLEDGE:-}"  # knowledge step on a patch: off or on; empty = off
+      SFA_MEMORY_MAX_CALLS: "${SFA_MEMORY_MAX_CALLS:-}"              # calls a stored plan holds, 1-3; empty = 3
+      SFA_MEMORY_MAX_AGE: "${SFA_MEMORY_MAX_AGE:-}"                  # answers a plan stays patchable, 0-6; empty = 2
+      SFA_MEMORY_TOKENS: "${SFA_MEMORY_TOKENS:-}"                    # the resolver's prompt cap; empty = 12000
       OKEVAL_BASE_URL: http://localhost:8000/v1
       OKEVAL_MODEL: Qwen/Qwen3.6-35B-A3B-NVFP4
       OKEVAL_API_KEY: EMPTY
@@ -66,9 +81,9 @@ services:
         read_only: true
         bind:
           create_host_path: false
-      - type: bind                 # the only writable path: the log, appended to
-        source: ../.private/ask_log.jsonl
-        target: /srv/sfa/.private/ask_log.jsonl
+      - type: bind                 # the only writable path: the log folder, one file per business day (mode 700)
+        source: ../.private/ask_logs
+        target: /srv/sfa/.private/ask_logs
         bind:
           create_host_path: false
       - type: volume

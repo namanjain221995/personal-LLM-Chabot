@@ -26,8 +26,11 @@
 #   up-ask        start only the ask service (sf-assistant-ask, its own compose project, compose.ask.yaml), on the image
 #                 the page built: it never builds it, because the page and the MCP server run on that image, and never
 #                 creates the socket's volume sf-local-ai_ask-sock, which the platform's compose owns. It stops when
-#                 either is missing. Creates its two files in ../.private first: ask_log.jsonl, ask_token.json (empty
-#                 until new-ask-token). Stop it with docker stop sf-assistant-ask
+#                 either is missing. Creates in ../.private first its log folder ask_logs/ (mode 700; one file a day,
+#                 kept SFA_ASK_LOG_DAYS days, default 90) and ask_token.json (empty until new-ask-token). It starts
+#                 nothing while the old single-file log ../.private/ask_log.jsonl is there: split it first, service
+#                 stopped (../docs/runbook.md, "The ask log"), nor while ask_mcp.py does not write through
+#                 RotatingAskLog. Stop it with docker stop sf-assistant-ask
 #   restart-ask   recreate only the ask service on the same image, after the same checks as up-ask (after a change to
 #                 src/, prompts/ or knowledge/objects/: it reads them once, at its start)
 #   new-ask-token new bearer token of the ask service, printed once (only its SHA-256 hash is stored in
@@ -121,17 +124,44 @@ ensure_mcp_files() {
   fi
 }
 
-# The ask container mounts two files of .private (file bind mounts: they must exist first): its log (read-write) and
-# the token file (read-only). Nothing else of .private is visible to it.
+# compose.ask.yaml mounts only the log folder ask_logs writable, so the ask service must write through
+# web/ask_log.py (RotatingAskLog). An ask_mcp.py that still opens the single file .private/ask_log.jsonl finds no
+# writable file in its read-only container, exits 2 at its start and restarts in a loop: start nothing then (the
+# writer swap ships with this compose file; docs/runbook.md "The ask log").
+check_ask_writer() {
+  if [ -f "$HERE/ask_mcp.py" ] && ! grep -q 'RotatingAskLog(' "$HERE/ask_mcp.py"; then
+    echo "$HERE/ask_mcp.py still writes the single-file log .private/ask_log.jsonl, which compose.ask.yaml no longer" >&2
+    echo "mounts: the service would stop at its start. Ship the ask_mcp.py that writes through RotatingAskLog" >&2
+    echo "(web/ask_log.py) together with this compose file (docs/runbook.md, \"The ask log\"). Nothing was started" >&2
+    exit 2
+  fi
+}
+
+# The ask container mounts two paths of .private, which must exist first: its log folder ask_logs (read-write;
+# web/ask_log.py writes one file per business day there, mode 600, and deletes only its own daily files older than
+# 90 days) and the token file (read-only, a file bind mount). Nothing else of .private is visible to it. The
+# single-file log of before 2026-11-25 (ask_log.jsonl) is split into the folder first, with the service stopped
+# (../scripts/split_ask_log.py; docs/runbook.md "The ask log"): until then up-ask and restart-ask start nothing.
 ensure_ask_files() {
+  if [ -e "$PRIVATE/ask_log.jsonl" ] || [ -L "$PRIVATE/ask_log.jsonl" ]; then
+    echo "the old single-file ask log $PRIVATE/ask_log.jsonl is still there. With the service stopped" >&2
+    echo "(docker stop sf-assistant-ask), split it first: python3 -I $HERE/../scripts/split_ask_log.py is the dry run," >&2
+    echo "the same with --apply splits (docs/runbook.md, \"The ask log\"). Nothing was started" >&2
+    exit 2
+  fi
   ensure_private
-  local f
-  for f in ask_log.jsonl ask_token.json; do
-    if [ ! -e "$PRIVATE/$f" ]; then
-      (umask 077 && touch "$PRIVATE/$f")
-    fi
-    chmod 600 "$PRIVATE/$f"
-  done
+  if [ -L "$PRIVATE/ask_logs" ]; then
+    echo "$PRIVATE/ask_logs is a symbolic link; the ask log folder must be a real folder. Nothing was started" >&2
+    exit 2
+  fi
+  if [ ! -d "$PRIVATE/ask_logs" ]; then
+    (umask 077 && mkdir "$PRIVATE/ask_logs")
+  fi
+  chmod 700 "$PRIVATE/ask_logs"
+  if [ ! -e "$PRIVATE/ask_token.json" ]; then
+    (umask 077 && touch "$PRIVATE/ask_token.json")
+  fi
+  chmod 600 "$PRIVATE/ask_token.json"
   if [ ! -s "$PRIVATE/ask_token.json" ]; then
     echo "No token yet. Run ./run.sh new-ask-token yourself, in your own terminal; the ask service answers 503 until then." >&2
   fi
@@ -208,6 +238,7 @@ case "${1:-}" in
     ;;
   up-ask)
     check_switch
+    check_ask_writer
     ensure_ask_files
     if ! docker image inspect "$ASK_IMAGE" >/dev/null 2>&1; then
       echo "no image ${ASK_IMAGE}: up-ask never builds it (the page and the MCP server run on it); ./run.sh up does" >&2
@@ -224,6 +255,7 @@ case "${1:-}" in
     ;;
   restart-ask)
     check_switch
+    check_ask_writer
     ensure_ask_files
     if ! docker image inspect "$ASK_IMAGE" >/dev/null 2>&1; then
       echo "no image ${ASK_IMAGE}: restart-ask never builds it (the page and the MCP server run on it); ./run.sh up does" >&2
@@ -240,7 +272,7 @@ case "${1:-}" in
     python3 -I "$HERE/../src/sf_assistant/server/auth.py" new "$PRIVATE/ask_token.json" --name ask --command new-ask-token "${@:2}"
     ;;
   *)
-    sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

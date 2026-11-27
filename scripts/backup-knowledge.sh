@@ -45,6 +45,9 @@
 # Never prints or stores secrets: the manifest carries the database NAME and
 # server version, nothing from the container's environment beyond that.
 set -euo pipefail
+# The dumps hold every conversation: folders 700 and files 600, whatever the
+# caller's umask (review DS-4, 2026-11-25; docs/retention.md "Modes").
+umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT="${TECHSARA_COMPOSE_PROJECT:-sf-local-ai}"

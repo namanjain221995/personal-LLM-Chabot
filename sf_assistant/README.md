@@ -91,7 +91,8 @@ sf_assistant/
   .gitignore                  .private/, .venv/, /knowledge/, /kb_build/, /docs/spec/, /tests/parity/, /web/.env, *.jsonl, *.duckdb, transcripts,
                               reports/ (knowledge evaluation runs)
   .private/                   git-ignored, mode 700: real names and record data (codes.json, web_log.jsonl,
-                              mcp_token.json, mcp_audit_key, mcp_log.jsonl, ask_token.json, ask_log.jsonl, questions/,
+                              mcp_token.json, mcp_audit_key, mcp_log.jsonl, ask_token.json, ask_logs/ (the ask
+                              service's daily log files, kept 90 days), questions/,
                               okeval_run/ (snapshot,
                               lookup and people sets), runs/ (runs/eval/: evaluation runs), parity reports and
                               parity/harness/, rollback_20261020/)

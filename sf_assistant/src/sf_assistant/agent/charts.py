@@ -374,12 +374,14 @@ class _Cleaner:
     ``tables._label``, ``hide_embedded_secrets``, ``drop_contact_details`` unless the question asks for contact details,
     then a 200-character cap with no space left at its end, because a caller that strips a series name would no longer
     find it among the columns. The display cut comes last, so an e-mail at character 190 is still caught. ``keep``: the
-    numbers the results hold as a whole value, as ``RecordSession.ask`` reads them."""
+    numbers the results hold as a whole value, as ``RecordSession.ask`` reads them. ``contact_ok``: whether contact
+    details may stay, when the caller has already decided it (a memory run reads it from the person's typed words, see
+    :func:`make`); None reads it from ``question``, as before."""
 
-    def __init__(self, question: Any, results: Any):
+    def __init__(self, question: Any, results: Any, contact_ok: bool | None = None):
         from sf_assistant.engine.contact import asks_for_contact, result_numbers
         self.question = str(question or "")
-        self.asked = asks_for_contact(self.question)
+        self.asked = asks_for_contact(self.question) if contact_ok is None else bool(contact_ok)
         self.keep = result_numbers(results)
 
     def __call__(self, v: Any) -> str:
@@ -1598,12 +1600,17 @@ def _code_wrote(kind: Any, rec: Any) -> bool:
     return bool(getattr(rec, "code_answer", False)) or (kind == "records" and bool(getattr(rec, "no_records", False)))
 
 
-def make(ask: Any, question: Any, final: Any, kind: Any, mode: Any, rec: Any, catalog: Any, today: Any) -> \
-        tuple[Any, list[dict], list[str], str]:
+def make(ask: Any, question: Any, final: Any, kind: Any, mode: Any, rec: Any, catalog: Any, today: Any, *,
+         contact_ok: bool | None = None) -> tuple[Any, list[dict], list[str], str]:
     """``(final, items, lines, error)`` of a chart question, just before ``pipeline.answer`` sets its body: ``final``
     without chart talk when the text is the record agent's; ``items``, the ``Outcome.charts`` entries with their picture
     (``svg_b64``); at most one reason line; the class name of the first fault it caught, also in a result it did not
-    draw. Runs after the contact rule. Never raises: a fault gives the ``fault`` line and ``final`` otherwise whole."""
+    draw. Runs after the contact rule. Never raises: a fault gives the ``fault`` line and ``final`` otherwise whole.
+
+    ``contact_ok``: the contact rule of the labels when the caller gives one. A conversation-memory run passes
+    ``MemoryRun.contact_ok``, read from the person's typed words, because a patch or a shortcut runs code's plan line,
+    which repeats the typed values of earlier questions ("Phone Support"). None (every other run) reads the rule from
+    ``question``, as before."""
     try:
         if (kind == "records" or (kind == "merged" and mode == "lean")) and not _code_wrote(kind, rec):
             final = drop_talk(final, getattr(rec, "table_blocks", None))
@@ -1614,7 +1621,7 @@ def make(ask: Any, question: Any, final: Any, kind: Any, mode: Any, rec: Any, ca
             return final, [], [_WORDS[word]], ""
         from sf_assistant.agent.tables import holds
         evidence = list(rec.evidence or [])
-        clean = _Cleaner(question, [e.model_result for e in evidence if e.ok])
+        clean = _Cleaner(question, [e.model_result for e in evidence if e.ok], contact_ok)
         labels = _Labels(catalog)
         asked = getattr(ask, "type", None)
         # what ran: the arguments code enforced for a business term (the added filter, the completed split), else the

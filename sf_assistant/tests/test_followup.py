@@ -2977,3 +2977,24 @@ def test_only_the_services_own_read_as_line_opens_its_words():
 
 def test_placement_is_no_name_in_the_place_of_one():
     assert "placements" not in F._slot_words("plot the number of placements each month in 2026")
+
+
+def test_a_plan_line_code_wrote_is_never_the_last_question_of_the_person_rule():
+    """``code_line`` (only the memory resolver passes it, after a patch or shortcut answer; stage-3 review finding
+    F1): the typed words of "chart it" all stand in the code-written plan line, so without it the line is the last
+    question and its field label and value are read as people the reply must keep. With it the person rule reads the
+    user turn, and nothing else changes: the line's own words still count as the question that ran ("month" stands
+    only in the line), and its period is still checked."""
+    line = ("Read as: `number of Interview records by month, where Interview Outcome = 'Offer Received', 2026, as a "
+            "chart`")
+    turns = [{"role": "user", "content": "chart it"}, {"role": "assistant", "content": f"{line}\n\nDrawn."}]
+    ran = line[len("Read as: "):].strip("`")
+    assert F._last_question(turns) == (ran, line)
+    assert F._last_question(turns, code_line=True) == ("chart it", "")
+    reply = "What is the placement rate by month in 2026?"
+    assert F.rewrite("and the placement rate?", turns, FakeLLM(reply=reply)) == F.Rewrite(F.UNCLEAR,
+                                                                                          reason="person_lost")
+    assert F.rewrite("and the placement rate?", turns, FakeLLM(reply=reply), code_line=True) == F.Rewrite(F.OK, reply)
+    out = F.rewrite("and the placement rate?", turns, FakeLLM(reply="What is the placement rate by month?"),
+                    code_line=True)
+    assert out == F.Rewrite(F.UNCLEAR, reason="period_lost")

@@ -618,3 +618,59 @@ def open_people_fixture(tmp_path: Path, **overrides):
     opts = {"warehouse": str(wh), "today": dt.date(2026, 10, 13)}
     opts.update(overrides)
     return open_records(load_records_config(**opts), str(kn))
+
+
+# ------------------------------------------------------------------------------------- conversation memory (2026-11-25)
+# The chains of tests/test_memory_chains.py (design v2 of 2026-11-25 §16.1) run on the terms fixture
+# (tests/terms_fixture.py, which builds on this module) with one more made-up field: Interview__c.Region__c, a picklist
+# of three regions, so the owner's "Only for North America" has a field to filter on. Everything else is the terms
+# fixture as it is; the tables and knowledge lists above are not changed. All names and values are made up.
+MEMORY_REGIONS = ("North America", "Europe", "Asia Pacific")
+#: Interview Name -> its region (the other interviews have none).
+MEMORY_REGION_OF = {"I-0001": "North America", "I-0002": "Europe", "I-0003": "North America",
+                    "I-0004": "North America", "I-0005": "Europe", "I-0007": "Asia Pacific",
+                    "I-0010": "North America", "I-0060": "Europe"}
+#: Counts the chains assert, computed from the rows (today pinned to 2026-10-13).
+MEMORY_FACTS = {"north_america": 4, "europe": 3, "asia_pacific": 1, "no_region": 5}
+
+
+def memory_tables() -> list:
+    """A copy of the terms fixture's tables with ``Interview__c.Region__c`` (:data:`MEMORY_REGION_OF`)."""
+    import copy as _copy
+
+    import terms_fixture   # it imports this module, so it is read only when the memory fixture is built
+
+    t = _copy.deepcopy(terms_fixture.TERMS_TABLES)
+    for i, (name, cols, rows) in enumerate(t):
+        if name == "Interview__c":
+            at = list(cols).index("Name")
+            t[i] = (name, {**cols, "Region__c": None}, [tuple(r) + (MEMORY_REGION_OF.get(r[at]),) for r in rows])
+    return t
+
+
+def memory_knowledge() -> list:
+    """A copy of the terms fixture's knowledge with the ``Region__c`` picklist on ``Interview__c``."""
+    import copy as _copy
+
+    import terms_fixture
+
+    k = _copy.deepcopy(terms_fixture.TERMS_KNOWLEDGE)
+    by = {x["object"]["api_name"]: x for x in k}
+    by["Interview__c"]["fields"].append(
+        _field("Region__c", "Region", "picklist", "Sales region of the client of the interview.",
+               values=list(MEMORY_REGIONS), roles=["categorical_attribute"]))
+    return k
+
+
+def open_memory_fixture(tmp_path: Path, **overrides):
+    """``open_records`` over :func:`memory_tables` and :func:`memory_knowledge` (today pinned to 2026-10-13)."""
+    import datetime as dt
+
+    from sf_assistant.config import load_records_config
+    from sf_assistant.tools.open_records import open_records
+
+    wh = make_warehouse(tmp_path, tables=memory_tables())
+    kn = make_knowledge(tmp_path, knowledge=memory_knowledge())
+    opts = {"warehouse": str(wh), "today": dt.date(2026, 10, 13)}
+    opts.update(overrides)
+    return open_records(load_records_config(**opts), str(kn))

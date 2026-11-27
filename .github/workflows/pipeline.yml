@@ -463,7 +463,7 @@ jobs:
         # this matrix to. The script refuses to run when the two disagree, so
         # editing this list alone fails all shards loudly instead of quietly
         # leaving one shard's files unrun.
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
     env:
       # One database per shard, on that shard's own ephemeral service
       # container. Not a nicety: conftest TRUNCATEs every table before EVERY

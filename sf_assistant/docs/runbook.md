@@ -25,9 +25,13 @@ runner are built and tested), and the stage-2 review fixes are applied.
   A bare `docker compose stop` in the repository root would stop the `sf-local-ai` stack.
 - **Never stop, restart or remove anything of the `sf-local-ai` stack** from here, and never open
   `/data/warehouse.duckdb` (the sync-worker's writer file). `run.sh` has deliberately no `down`.
-- **Never delete, truncate or move** `.private/web_log.jsonl`, `.private/mcp_log.jsonl`, `.private/ask_log.jsonl`,
-  `.private/codes.json`, `.private/mcp_token.json`, `.private/ask_token.json` or `.private/mcp_audit_key`. Nothing rotates the logs
-  ([data_and_privacy.md](data_and_privacy.md#logs-and-kept-files)). They live on the host in `.private/`, which is
+- **Never delete, truncate or move** `.private/web_log.jsonl`, `.private/mcp_log.jsonl`, the folder
+  `.private/ask_logs/` or a file in it, `.private/codes.json`, `.private/mcp_token.json`, `.private/ask_token.json` or
+  `.private/mcp_audit_key`. Nothing rotates the page's and the MCP server's logs; the ask service writes one log file
+  per business day and deletes only its own daily files past 90 days ([The ask log](#the-ask-log),
+  [data_and_privacy.md](data_and_privacy.md#logs-and-kept-files)). The one exception is the one-time split of the old
+  single file `.private/ask_log.jsonl`, with the service stopped, by `scripts/split_ask_log.py` ([The ask
+  log](#the-ask-log)). They live on the host in `.private/`, which is
   bind-mounted, so recreating a container does not touch them. Never replace `mcp_token.json` with another file
   (`mv`, an editor that saves by renaming): the MCP container mounts that one file and would refuse every token
   until `./run.sh restart-mcp`. `new-mcp-token` rewrites it in place. The same holds for `ask_token.json`, which the
@@ -337,7 +341,8 @@ volumes:
 ```
 
 It mounts `src/`, `prompts/`, `knowledge/` and `web/` read-only, the data volume read-only at `/data`, and of `.private/`
-only `ask_token.json` read-only and `ask_log.jsonl` read-write, with `mem_limit: 4g` and `pids_limit: 512`. It reads the
+only `ask_token.json` read-only and the log folder `ask_logs/` read-write ([The ask log](#the-ask-log)), with
+`mem_limit: 4g` and `pids_limit: 512`. Its container log is capped at 3 files of 10 MB. It reads the
 code and the knowledge of the folder it is started from, once, at its start: a change needs a restart, and a copy of
 the folder does not follow the folder it came from.
 
@@ -403,6 +408,181 @@ folder, removed afterwards and never printed. A second throwaway container, shar
 reads `/healthz` and gets 401 with no token: as root with the volume `:ro`, as the orchestrator will, and as uid 10001. It
 must log `pipeline ready` in about 10 s and answer `failed` or `no_answer` with empty answer text. Never run it against
 `localhost:8000`: that is a model call on the shared server.
+
+### The ask log
+
+**From the release that ships it** (option R2 of the conversation-memory design of 2026-11-25, owner decision D5;
+`web/ask_log.py`, `web/compose.ask.yaml`, `web/run.sh`, `scripts/split_ask_log.py` and the `web/ask_mcp.py` that writes
+through `RotatingAskLog`, in one release and one `restart-ask`): the approved retention keeps the ask log 90 days,
+rotated daily. A file bind mount cannot be rotated by a rename (the container keeps writing into the
+renamed file, as with the token files), so the service now gets a folder and picks the file of each line itself.
+
+| What | How |
+|---|---|
+| Folder | `.private/ask_logs/`, mode 700, created by `./run.sh up-ask` and `restart-ask` (a link there is refused); mounted read-write at `/srv/sfa/.private/ask_logs` (`web/compose.ask.yaml`), the container's only writable host path |
+| Files | `ask_log-YYYY-MM-DD.jsonl`, mode 600, one per business date in **Asia/Kolkata** (`web/ask_log.py`, `RotatingAskLog`). `ts` keeps its old form, the container's local time (UTC) with its offset: `2026-11-25T18:30:00+0000` is 00:00 on 2026-11-26 in Kolkata, so that line is in the file of 2026-11-26 |
+| Lines | the same lines as before (one JSON object per line, `ts` first), each one `O_APPEND` write under the thread lock; a link named like a daily file is never written through |
+| Kept | 90 days: `SFA_ASK_LOG_DAYS` (a whole number from 1 to 3650; empty or unset: 90; any other value keeps 90 and says so once in the container log). At its start and at the first write of each business day the service deletes the files named exactly `ask_log-YYYY-MM-DD.jsonl` whose date is before today minus 90 days: on 2026-11-25 it keeps 2026-08-27 to 2026-11-25, so a line is kept 90 to 91 days while the service writes every day. It runs no timer: a service that writes nothing deletes nothing until its next start or write, so a file is kept **at least** 90 days and is deleted at the first start or write after that. Only names in ASCII digits count. It deletes nothing else (not `ask_log-unknown-date.jsonl`, no other name, no link, no folder). The container log gets the count and the date of a deletion, nothing more. Changing the 90 days is the owner's decision |
+| Container log | `json-file`, at most 3 files of 10 MB (`logging` in `web/compose.ask.yaml`; before that release it had no cap) |
+| Faults | a line that cannot be written costs that line only, and the container log gets `could not write the log: <class name>`; at its start the service refuses (exit 2) a folder it cannot write to |
+
+Read the days in order (their names sort by date):
+
+```bash
+cat .private/ask_logs/ask_log-2*.jsonl | jq -c '{ts, event, status, reason}'   # every day; not the unknown-date file
+jq -c 'select(.event == "ask")' .private/ask_logs/ask_log-2026-11-25.jsonl     # one day
+```
+
+**The one-time split of the old file.** Before that release the service wrote one file, `.private/ask_log.jsonl`.
+`./run.sh up-ask` and `restart-ask` start nothing while that file is there. Split it once, in the `sf_assistant` folder
+the service runs from (the release folder when it runs from one, never another copy), **with the service stopped**, so
+no line lands in the old file after the split. The new `web/compose.ask.yaml`, `web/run.sh`, `web/ask_log.py`,
+`scripts/split_ask_log.py` and the `web/ask_mcp.py` that writes through `RotatingAskLog` go to that folder together: an
+older `ask_mcp.py` finds no writable log file in the new container (its root is read-only) and exits 2 at its start, and
+the new one finds no folder under the old compose file. `./run.sh up-ask` and `restart-ask` check the first half: they
+start nothing (exit 2) while the `web/ask_mcp.py` next to them does not write through `RotatingAskLog`.
+
+```bash
+cd <the sf_assistant folder the service runs from>
+docker stop sf-assistant-ask                              # 1. stop: nothing writes the old file any more
+python3 -I scripts/split_ask_log.py                       # 2. dry run: lines per business day; writes nothing
+python3 -I scripts/split_ask_log.py --apply               # 3. the split; the old file becomes the backup
+ls -la .private/ask_logs .private/ask_log.legacy.jsonl    # 4. drwx------ and -rw------- only; no .private/ask_log.jsonl
+(cd web && ./run.sh restart-ask)                          # 5. start on the folder mount
+```
+
+What the split does (`scripts/split_ask_log.py`; its docstring has the details):
+
+- Each line goes, in its order, to the daily file of its `ts`'s business date. A line with no readable `ts` (a blank
+  line, a line cut before its `ts` ended, a `ts` with no time zone) goes to `ask_log-unknown-date.jsonl`. No line is
+  dropped or changed; a last line with no newline gets one.
+- When every file reads back as written, the old file becomes the backup `.private/ask_log.legacy.jsonl` (mode 600: a
+  hard link, then the old name is removed). The service never sees the backup and never deletes it. The split prints
+  the day from which the backup, and `ask_log-unknown-date.jsonl` if it made one, may be deleted: the day the 90-day
+  rule deletes the daily file of the backup's newest line (that date plus 91 days). Delete them by hand from that day:
+  `rm .private/ask_log.legacy.jsonl .private/ask_logs/ask_log-unknown-date.jsonl`.
+- Daily files dated before the 90 days are written too; the service deletes them at its start, and the dry run counts
+  them.
+- **A folder that already holds log files** (a daily file or the unknown-date file, for instance because the new service
+  ran before the split) is refused: exit 2, nothing written. With `--append` each day's lines are added at the end of
+  that day's file with `O_APPEND` and nothing there is rewritten, so no line already there is lost; that day's split
+  lines then follow its newer lines, and every line keeps its own `ts`. A backup name that exists is never replaced:
+  name another with `--legacy`.
+- Without `--append` the daily files are created new. On any fault, or when the old file changed during the split (the
+  service still running), the files this run made are removed, the old file stays as it was, and the exit code is 1.
+- It prints names, dates, counts and sizes, never a line's text.
+
+**Rollback:** stop the service, put back the earlier `web/compose.ask.yaml`, `web/run.sh` and
+`web/ask_mcp.py`, and run `./run.sh restart-ask`: the earlier `run.sh` creates an empty `.private/ask_log.jsonl` and lines
+go there again. The daily files stay readable, and nothing deletes them while rolled back. To go forward again: stop,
+`python3 -I scripts/split_ask_log.py --apply --append --legacy .private/ask_log.legacy-2.jsonl`, restart.
+
+### The memory switches
+
+Salesforce conversation memory (design v2 of 2026-11-25, §15) has six switches in the ask service. What each mode does
+is in [architecture.md](architecture.md#configuration) ("Contract v2"); in short, `off` is today's contract v1 with
+no state, `shadow` answers byte for byte as `off` and also returns the next query state to a contract-v2 caller, and
+`on` runs the follow-up resolver and the stored plan.
+
+| Switch | Unset or empty | Accepted values |
+|---|---|---|
+| `SFA_MEMORY` | `shadow` | `off`, `shadow`, `on` |
+| `SFA_MEMORY_SHORTCUTS` | `on` | `off`, `on` (used with `SFA_MEMORY=on` only) |
+| `SFA_MEMORY_PATCH_KNOWLEDGE` | `off` | `off`, `on` (owner decision D4: off) |
+| `SFA_MEMORY_MAX_CALLS` | `3` | a whole number from 1 to 3 |
+| `SFA_MEMORY_MAX_AGE` | `2` | a whole number from 0 to 6 |
+| `SFA_MEMORY_TOKENS` | `12000` | a whole number from the resolver's smallest prompt (`memory_tokens_floor()`, about 5,400) to 100000 |
+
+How they reach the service:
+
+- `web/compose.ask.yaml` passes each one as `"${NAME:-}"`, as it passes `SFA_RESOLVER` and `SFA_ASK_LOG_DAYS`: the
+  value comes from the shell that runs `./run.sh` (exported, or typed in front of the command), or else from the
+  git-ignored `web/.env` (a value in the shell wins over it). Unset or empty is the code default in the table
+  (`src/sf_assistant/config.py`, `memory_settings`).
+- The service reads them once, at its start. `./run.sh restart-ask` recreates the container and takes the values of
+  that moment; `docker restart` and a reboot keep the values the container was created with.
+- **A value typed in front of the command lasts for that one start.** The next `restart-ask` or `up-ask` without it
+  (after a code, prompt or knowledge change, for instance) starts on the defaults again, so `on` would quietly become
+  `shadow`. A setting that must stay goes in `web/.env`. `web/compose.yaml` (the page and the MCP server) passes none
+  of these names, so a line there changes the ask service only.
+- A value the code cannot read never stops the service: `SFA_MEMORY` is then `off` (contract v1), any other switch
+  keeps its default, and the container log gets one line that names the switch and what it must be (never the value).
+  Unlike `SFA_RESOLVER`, `run.sh` does not check these values first.
+- They live in `web/compose.ask.yaml`: putting back a compose file older than the one that passes them (for instance
+  for the ask log's rollback above) drops them, and the service runs the defaults (`shadow`) whatever the shell holds.
+
+Which mode the service started in is in the start-up line of the ask log (fixed words, no question text). The service
+writes that line once, at its start, into the daily file of that day, so the check reads every daily file and keeps the
+last start-up line:
+
+```bash
+cd <the sf_assistant folder the service runs from>/web
+awk 1 ../.private/ask_logs/ask_log-2*.jsonl \
+  | jq -cR 'fromjson? | select(type == "object" and .event == "startup") | {ts, ok, memory, memory_problem}' | tail -n 1
+docker logs --tail=50 sf-assistant-ask       # one line here when a switch was refused
+```
+
+- `memory` is the mode of that start, and `ts` is its time in UTC (the container's clock).
+- `"ok":false` (with `"memory":null`) means the start failed, and the service is not answering.
+- A line cut by a crash does not hide a later start: `awk 1` ends a file's cut last line, so it is not joined to the
+  next file's first line, and `jq -R` with `fromjson?` skips a line that is not whole JSON instead of stopping at it.
+- Nothing printed means the service has not started since the daily files began, or the file of its start day is
+  older than `SFA_ASK_LOG_DAYS` and was deleted. A restart writes a new line.
+
+The rollout steps that touch the ask service (design §15.2), each on the owner's word only. Each step sets the switch,
+checks that no value in the shell would win over the file, restarts, and then reads the new start-up line. The line
+comes once the pipeline is built, which takes about 10 s and at most a minute. Until then the check still shows the
+previous start (an older `ts`), so run it again.
+
+Step 1, the release: none of the six switches in `.env` or in the shell, so every switch has its default (`shadow`).
+
+```bash
+cd <the sf_assistant folder the service runs from>/web
+grep '^SFA_MEMORY' .env; env | grep '^SFA_MEMORY'   # both print nothing
+./run.sh restart-ask
+sleep 15                                            # the start-up line comes once the pipeline is built
+awk 1 ../.private/ask_logs/ask_log-2*.jsonl \
+  | jq -cR 'fromjson? | select(type == "object" and .event == "startup") | {ts, ok, memory, memory_problem}' | tail -n 1
+# expect "ok":true and "memory":"shadow", with the ts of this start
+```
+
+Step 5, only after the model evaluation of the chains that the owner asks for: `on`, kept across later restarts. The
+first line changes an `SFA_MEMORY=` line of the git-ignored `.env`, or adds one on a line of its own when there is
+none. The `\n` in front ends a last line that has no final newline. A plain `echo ... >> .env` would join the switch to
+that line, so the service would stay in `shadow` and the setting on that line (for example `SFA_BIND`) would break.
+
+```bash
+cd <the sf_assistant folder the service runs from>/web
+grep -qs '^SFA_MEMORY=' .env && sed -i 's/^SFA_MEMORY=.*/SFA_MEMORY=on/' .env || printf '\nSFA_MEMORY=on\n' >> .env
+grep '^SFA_MEMORY=' .env; env | grep '^SFA_MEMORY'   # SFA_MEMORY=on, once; then nothing: a shell value would win
+./run.sh restart-ask
+sleep 15                                            # the start-up line comes once the pipeline is built
+awk 1 ../.private/ask_logs/ask_log-2*.jsonl \
+  | jq -cR 'fromjson? | select(type == "object" and .event == "startup") | {ts, ok, memory, memory_problem}' | tail -n 1
+# expect "ok":true and "memory":"on", with the ts of this start
+```
+
+The rollback (design §15.3): `SFA_MEMORY=off` with `restart-ask` gives today's behaviour, contract v1 for every call
+and no state. The platform's bridge then gets v1 replies and stores no row of its own for them. One exception: with
+`SF_ASSISTANT_MEMORY=true`, a failed turn that directly follows a stored row still copies that row (the retry line
+keeps its plan), and the service ignores that state while it is off. `SFA_MEMORY=off ./run.sh restart-ask` works
+at once, but the next `restart-ask` reads `web/.env` again, so change the line there too. If `env` prints an
+`SFA_MEMORY` line, that value wins over the file: `unset` it in this shell first.
+
+```bash
+cd <the sf_assistant folder the service runs from>/web
+grep -qs '^SFA_MEMORY=' .env && sed -i 's/^SFA_MEMORY=.*/SFA_MEMORY=off/' .env || printf '\nSFA_MEMORY=off\n' >> .env
+grep '^SFA_MEMORY=' .env; env | grep '^SFA_MEMORY'   # SFA_MEMORY=off, once; then nothing: a shell value would win
+./run.sh restart-ask
+sleep 15                                            # the start-up line comes once the pipeline is built
+awk 1 ../.private/ask_logs/ask_log-2*.jsonl \
+  | jq -cR 'fromjson? | select(type == "object" and .event == "startup") | {ts, ok, memory, memory_problem}' | tail -n 1
+# expect "ok":true and "memory":"off", with the ts of this start
+```
+
+Back to `shadow`: the same first line with `shadow` in place of `off`, then the same checks, expecting
+`"memory":"shadow"`. The platform's own switches (`SF_ASSISTANT_MEMORY`, `SF_ASSISTANT_SUMMARY`) are separate: they
+are orchestrator settings (`docs/CONFIG.md` at the repository root) and need an orchestrator restart.
 
 ## Firewall
 

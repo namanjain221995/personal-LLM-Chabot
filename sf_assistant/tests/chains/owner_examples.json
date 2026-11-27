@@ -1,0 +1,1093 @@
+{
+ "title": "The owner spec's follow-up examples (design v2 §16.1 C01-C08)",
+ "chains": [
+  {
+   "id": "C01",
+   "title": "Only for North America adds a region filter and keeps the rest",
+   "design": "owner spec §3 example 1; design v2 §6.4 add_filter (a value typed by the person), §16.1 C01",
+   "steps": [
+    {
+     "q": "how many interviews per recruiter this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "status": "answered",
+      "reason": "new",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "age": 0,
+       "show_chart": false,
+       "keys": []
+      },
+      "read_as": null
+     }
+    },
+    {
+     "q": "Only for North America",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "How many interviews per recruiter this year in North America?",
+      "ops": [
+       {
+        "add_filter": {
+         "field": "Region__c",
+         "op": "eq",
+         "value": "North America"
+        }
+       }
+      ]
+     },
+     "record": [
+      "The North America interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "status": "answered",
+      "kind": "records",
+      "reason": "patch",
+      "model": true,
+      "rewrite": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          }
+         ]
+        },
+        "result_has": {
+         "groups": [
+          {
+           "group": "Recruiter A",
+           "value": 2
+          },
+          {
+           "group": "Recruiter B (#1)",
+           "value": 2
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year",
+          "filters": [
+           {
+            "field": "Region__c",
+            "op": "eq",
+            "value": "North America"
+           }
+          ]
+         }
+        }
+       ],
+       "age": 0,
+       "terms_text": "how many interviews per recruiter this year\nOnly for North America"
+      },
+      "read_as": "plan_line",
+      "plan_line_has": [
+       "per Recruiter",
+       "Region = 'North America'",
+       "this year (2026-01-01 to 2026-12-31)"
+      ]
+     }
+    },
+    {
+     "q": "visualize it",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year",
+          "filters": [
+           {
+            "field": "Region__c",
+            "op": "eq",
+            "value": "North America"
+           }
+          ]
+         }
+        }
+       ],
+       "show_chart": true
+      },
+      "charts": 1,
+      "plan_line_has": [
+       "Region = 'North America'",
+       "as a chart"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "C02",
+   "title": "Top 10 sets the ranking and keeps the grouping and the period",
+   "design": "owner spec §3 example 2; design v2 §6.2 shortcut grammar (top N), §6.4 set_top, §16.1 C02",
+   "steps": [
+    {
+     "q": "how many interviews per recruiter this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "status": "answered",
+      "reason": "new",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "age": 0,
+       "show_chart": false,
+       "keys": []
+      },
+      "read_as": null
+     }
+    },
+    {
+     "q": "Top 10",
+     "record": [
+      "The top recruiters are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "top": 10,
+         "order": "desc"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year",
+          "top": 10,
+          "order": "desc"
+         }
+        }
+       ]
+      },
+      "plan_line_has": [
+       "top 10"
+      ],
+      "read_as": "plan_line"
+     }
+    },
+    {
+     "q": "only top 3",
+     "record": [
+      "The top 3 recruiters are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "top": 3,
+         "order": "desc"
+        }
+       }
+      ],
+      "plan_line_has": [
+       "top 3"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "C03",
+   "title": "Same for last month changes only the period",
+   "design": "owner spec §3 example 3; design v2 §6.2 shortcut grammar (same for <period>), §16.1 C03",
+   "steps": [
+    {
+     "q": "how many interviews per recruiter this month",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this month"
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this month"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this month"
+         }
+        }
+       ],
+       "period": {
+        "from": "2026-10-01",
+        "to": "2026-10-31"
+       }
+      }
+     }
+    },
+    {
+     "q": "Same for last month",
+     "record": [
+      "Last month is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "last month"
+        },
+        "result_has": {
+         "groups": [
+          {
+           "group": "Recruiter A",
+           "value": 4
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "last month"
+         }
+        }
+       ],
+       "period": {
+        "phrase": "last month",
+        "from": "2026-09-01",
+        "to": "2026-09-30"
+       }
+      },
+      "plan_line_has": [
+       "last month (2026-09-01 to 2026-09-30)"
+      ]
+     }
+    },
+    {
+     "q": "same for last year",
+     "record": [
+      "Last year is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "last year"
+        }
+       }
+      ],
+      "plan": {
+       "period": {
+        "from": "2025-01-01",
+        "to": "2025-12-31"
+       },
+       "nonempty": false
+      }
+     }
+    }
+   ]
+  },
+  {
+   "id": "C04",
+   "title": "Group by department instead changes only the grouping",
+   "design": "owner spec §3 example 4; design v2 §6.4 set_group (a lookup path), §16.1 C04",
+   "steps": [
+    {
+     "q": "how many interviews per recruiter this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "status": "answered",
+      "reason": "new",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "age": 0,
+       "show_chart": false,
+       "keys": []
+      },
+      "read_as": null
+     }
+    },
+    {
+     "q": "Group by department instead",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "How many interviews per department this year?",
+      "ops": [
+       {
+        "set_group": {
+         "field": "Recruiter__c.Department__c"
+        }
+       }
+      ]
+     },
+     "record": [
+      "The interviews per department are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "model": true,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c.Department__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c.Department__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ]
+      },
+      "plan_line_has": [
+       "per Department",
+       "this year"
+      ],
+      "read_as": "plan_line"
+     }
+    }
+   ]
+  },
+  {
+   "id": "C05",
+   "title": "Remove the North America filter drops that filter only",
+   "design": "owner spec §3 example 5; design v2 §6.4 remove_filter, §16.1 C05",
+   "steps": [
+    {
+     "q": "how many interviews in North America per recruiter this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year",
+        "filters": [
+         {
+          "field": "Region__c",
+          "op": "eq",
+          "value": "North America"
+         }
+        ]
+       }
+      },
+      "Shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year",
+          "filters": [
+           {
+            "field": "Region__c",
+            "op": "eq",
+            "value": "North America"
+           }
+          ]
+         }
+        }
+       ]
+      },
+      "plan_line_has": [
+       "Region = 'North America'"
+      ]
+     }
+    },
+    {
+     "q": "Remove the North America filter",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "How many interviews per recruiter this year?",
+      "ops": [
+       {
+        "remove_filter": {
+         "field": "Region__c"
+        }
+       }
+      ]
+     },
+     "record": [
+      "All regions are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "model": true,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ]
+      },
+      "read_as": "plan_line"
+     }
+    },
+    {
+     "q": "Only for Europe",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "How many interviews per recruiter this year in Europe?",
+      "ops": [
+       {
+        "add_filter": {
+         "field": "Region__c",
+         "op": "eq",
+         "value": "Europe"
+        }
+       }
+      ]
+     },
+     "record": [
+      "Europe is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "Europe"
+          }
+         ]
+        }
+       }
+      ],
+      "plan_line_has": [
+       "Region = 'Europe'"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "C06",
+   "title": "Visualize it re-runs the same query fresh and draws it",
+   "design": "owner spec §3 example 6; design v2 §6.2 shortcut (display words), §6.4 set_show, C14 stop words, §16.1 C06",
+   "steps": [
+    {
+     "q": "how many interviews per recruiter this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "status": "answered",
+      "reason": "new",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "age": 0,
+       "show_chart": false,
+       "keys": []
+      },
+      "read_as": null
+     }
+    },
+    {
+     "q": "Visualize it",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "kind": "records",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Recruiter__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "show_chart": true,
+       "age": 0
+      },
+      "charts": 1,
+      "read_as": "plan_line",
+      "plan_line_has": [
+       "as a chart"
+      ]
+     }
+    },
+    {
+     "q": "without the chart",
+     "record": [
+      "The figures are listed.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan": {
+       "show_chart": false
+      },
+      "charts": 0
+     }
+    }
+   ]
+  },
+  {
+   "id": "C07",
+   "title": "Compare with previous month adds the second period beside the first",
+   "design": "owner spec §3 example 7; design v2 §6.4 compare_period (count to compare_records), §16.1 C07",
+   "steps": [
+    {
+     "q": "how many interviews this month",
+     "record": [
+      {
+       "name": "count_records",
+       "args": {
+        "object": "Interview__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this month"
+       }
+      },
+      "There are 3 interviews this month.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "count_records",
+        "args": {
+         "object": "Interview__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this month"
+        },
+        "result_has": {
+         "count": 3
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "count_records",
+         "args": {
+          "object": "Interview__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this month"
+         }
+        }
+       ]
+      }
+     }
+    },
+    {
+     "q": "Compare with previous month",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "compare_period": {
+         "phrase": "previous month"
+        }
+       }
+      ]
+     },
+     "record": [
+      "This month and the previous month are compared.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "model": true,
+      "ran": [
+       {
+        "tool": "compare_records",
+        "args": {
+         "object": "Interview__c",
+         "segments": [
+          {
+           "label": "this month",
+           "period": "this month"
+          },
+          {
+           "label": "previous month",
+           "period": "previous month"
+          }
+         ],
+         "date_field": "Date_of_Interview__c"
+        }
+       }
+      ],
+      "plan": {
+       "tool": "compare_records"
+      },
+      "plan_line_has": [
+       "this month (2026-10-01 to 2026-10-31) vs previous month (2026-09-01 to 2026-09-30)"
+      ]
+     }
+    },
+    {
+     "q": "visualize it",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "plan": {
+       "tool": "compare_records",
+       "show_chart": true
+      },
+      "charts": 1
+     }
+    }
+   ]
+  },
+  {
+   "id": "C08",
+   "title": "What about candidates? asks which reading is meant, and the choice runs with the candidates scope",
+   "design": "owner spec §3 example 8; design v2 §6.5 (the model offers both readings, code asks), §6.6, §7.1 terms, §16.1 C08",
+   "steps": [
+    {
+     "q": "how many interviews by status this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Interview_Status__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews by status are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "q": "What about candidates?",
+     "resolve": {
+      "kind": "unclear",
+      "standalone": "How many candidates had interviews this year, by status?",
+      "ops": [
+       {
+        "set_measure": {
+         "measure": "count_distinct",
+         "field": "Candidate__c"
+        }
+       }
+      ]
+     },
+     "expect": {
+      "status": "answered",
+      "kind": "none",
+      "reason": "clarify",
+      "model": true,
+      "record": false,
+      "ran_none": true,
+      "clarify": true,
+      "answer": "I could not tell how this goes on from the last query (number of Interviews per Interview Status, this year (2026-01-01 to 2026-12-31)). Which do you mean?\n\n1. number of different Candidate in Interviews per Interview Status, this year (2026-01-01 to 2026-12-31), candidates as Person Accounts\n2. How many candidates had interviews this year, by status?\n3. No, I'll ask in full",
+      "pending": [
+       "number of different Candidate in Interviews per Interview Status, this year (2026-01-01 to 2026-12-31), candidates as Person Accounts",
+       "How many candidates had interviews this year, by status?",
+       "No, I'll ask in full"
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Interview_Status__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year"
+         }
+        }
+       ],
+       "age": 0
+      }
+     }
+    },
+    {
+     "q": "1",
+     "record": [
+      "The candidates per status are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "kind": "records",
+      "model": false,
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Interview_Status__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "measure": "count_distinct",
+         "measure_field": "Candidate__c"
+        },
+        "term_filters": [
+         "Candidate__c.RecordTypeId = 'Person Account'"
+        ],
+        "enforced_has": {
+         "filters": [
+          {
+           "field": "Candidate__c.RecordTypeId",
+           "op": "eq",
+           "value": "PersonAccount"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Interview__c",
+          "group_by": "Interview_Status__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this year",
+          "measure": "count_distinct",
+          "measure_field": "Candidate__c"
+         }
+        }
+       ],
+       "keys": [
+        "candidates"
+       ],
+       "terms_text": "how many interviews by status this year\nWhat about candidates?"
+      },
+      "answer_has": [
+       "Candidates counted: Person Accounts only"
+      ],
+      "pending": null
+     }
+    }
+   ]
+  }
+ ]
+}

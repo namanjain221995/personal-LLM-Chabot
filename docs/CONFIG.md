@@ -318,3 +318,49 @@ ROLLBACK;
 Other metrics: `toggle_off_hidden_turns_total{kind=sf|tainted|quote}` and
 `toggle_off_state_read_failed_total{closed}`. A change needs an orchestrator
 restart, like every flag here.
+
+## Salesforce conversation memory (2026-11-25)
+
+On a toggle-on sf_assistant turn, the bridge finds the stored plan of the
+answer the person is replying to, sends it to sf_assistant with the recent
+turns (contract v2), and stores the plan sf_assistant returns for the next
+turn (Salesforce memory design of 2026-11-25, §2-§4, §11, §15). The plans
+live in the table `sf_query_state` (migration V45), one row per answer, and
+are deleted with their chat and their user. Nothing of it reaches the
+browser, and a toggle-off turn never reads, writes or folds it. Every switch
+is off by default: with all of them at their defaults the platform behaves
+as before (v1 calls, no row read or written, no summary fold). A value other
+than `true`/`false` (`1`/`0`, `yes`/`no`, `on`/`off`), or a non-number for a
+number, stops the orchestrator at start-up with a message that names the
+variable.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `SF_ASSISTANT_MEMORY` | `false` | The state lookup before an sf_assistant call, the contract-v2 arguments (parent `state`, `gap`, `summary`, up to 12 recent turns) and the row written after the answer is stored. `false`: v1 calls exactly as before, and the bridge never reads or writes `sf_query_state` (the retention sweep, when `CHAT_RETENTION_ENABLED` is on, still counts expired rows, and removes them once `CHAT_RETENTION_DRY_RUN` is `false`). While a service from before contract v2 refuses the call, the bridge asks with the v1 arguments for 10 minutes, apart from one turn a minute that tries contract v2 again. |
+| `SF_ASSISTANT_MEMORY_PAIRS` | `6` | Whole (question, answer) pairs the bridge sends, newest first; a question no answer followed (a send that failed) is sent with the pair after it, or last. Held to 1-6: contract v2 takes at most 12 turns. Never fewer turns than the v1 call sends (the last 4), whatever this and the token budget say. |
+| `SF_ASSISTANT_MEMORY_TOKENS` | `6000` | Token budget of those pairs (`context.estimate_tokens`); whole pairs are dropped from the oldest end, down to the pairs that hold the last 4 turns. sf_assistant applies its own cap (`SFA_MEMORY_TOKENS`) again. Minimum 1. |
+| `SF_ASSISTANT_SUMMARY` | `false` | Folds each Salesforce pair that leaves the window into a short summary stored on the answer's row, in the background, with the platform's local main model only (`app/sf_summary.py`). Built from the person's own questions and code-written plan lines, never from answer text; only sf_assistant's follow-up resolver reads it. |
+
+## Chat retention (2026-11-25)
+
+One sweep on the maintenance loop, real work once a business day under an
+advisory lock (`orchestrator/app/retention.py`; the approved periods, the
+dry run, the backup before the first real run and the rollback are in
+[`docs/retention.md`](retention.md)). Off by default. Turned on, it is a dry
+run that only counts and logs until `CHAT_RETENTION_DRY_RUN=false`. The same
+start-up rule applies to these values.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `CHAT_RETENTION_ENABLED` | `false` | Runs the sweep. `false`: it touches nothing, not even a count. |
+| `CHAT_RETENTION_DRY_RUN` | `true` | Counts what each rule would delete (log line `retention dry-run: …`, gauge `retention_candidates{table}`) and deletes nothing. `false` deletes, after the backup in `docs/retention.md`. |
+| `QUERY_TRACES_RETENTION_DAYS` | `180` | `query_traces` (and their events) older than this, plus traces over a day old whose chat is gone (a bare-API key's traces and test-case traces are spared). A value below 180 is raised to 180 with a warning: a shorter period needs the owner's word and a code change. |
+| `CHAT_REQUESTS_RETENTION_DAYS` | `30` | `chat_requests` older than this in a finished status (completed, failed, cancelled), plus finished requests over a day old whose chat is gone (bare-API keys are spared). A resumable request is counted and logged, never deleted. A value below 30 is raised to 30. |
+| `CHAT_RETENTION_BATCH` | `1000` | Rows per delete statement (held to 1-10,000); one transaction per batch. |
+| `CHAT_RETENTION_MAX_BATCHES` | `20` | Batches per rule per run (held to 1-1,000). A run that stops at the cap leaves the day open, and the next tick goes on. |
+| `CHAT_RETENTION_OLD_ROUTE_ORPHANS` | `false` | Owner decision D9, on the owner's word: also delete rows of the older Salesforce route (`sf_conversation_state`, `sf_intents`, `sf_clarifications`) whose chat is gone. A dry run counts them either way. |
+| `CHAT_RETENTION_BACKUP_DATE` | empty | The day (`YYYY-MM-DD`) the pre-prune backup was taken. While it is more than 30 days old, every daily run logs a reminder to delete that backup (D11). |
+
+Metrics: `retention_candidates{table}`, `retention_deleted_total{table}` and
+`retention_runs_total{result}`. Log lines carry counts only, never content.
+A change needs an orchestrator restart, like every flag here.

@@ -19,7 +19,7 @@ PATH_VARS = ("SFA_HOME", "SFA_KNOWLEDGE_DIR", "SFA_COMPONENTS_DIR", "SFA_PROMPTS
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     for name in (*C.ENV_VARS.values(), *C.RECORDS_ENV_VARS.values(), *C.ENV_ALIASES.values(),
-                 *C.RESOLVER_ENV_VARS.values()):
+                 *C.RESOLVER_ENV_VARS.values(), *C.MEMORY_ENV_VARS.values()):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -107,7 +107,8 @@ def test_env_doc_lists_every_environment_variable_with_its_default():
     names = [n for n, _, _ in C.ENV_DOC]
     assert len(names) == len(set(names))
     assert set(names) == {*C.ENV_VARS.values(), *C.RECORDS_ENV_VARS.values(), *PATH_VARS,
-                          *C.RESOLVER_ENV_VARS.values(), C.MERGE_ENV_VAR, C.TABLES_ENV_VAR, C.CHARTS_ENV_VAR}
+                          *C.RESOLVER_ENV_VARS.values(), C.MERGE_ENV_VAR, C.TABLES_ENV_VAR, C.CHARTS_ENV_VAR,
+                          *C.MEMORY_ENV_VARS.values(), C.ASK_LOG_DAYS_ENV_VAR}
     doc = {n: d for n, d, _ in C.ENV_DOC}
     assert doc["SFA_RESOLVER"] == "on" and "/usr/share/dict/american-english" in doc["SFA_LEXICON"]
     assert doc["SFA_MERGE"] == "code" == C.MergeConfig().by   # the merge switch (2026-10-29): code by default
@@ -117,6 +118,11 @@ def test_env_doc_lists_every_environment_variable_with_its_default():
     # the chart switch (2026-11-03): its default is the one constant CHARTS_DEFAULT, as above
     assert doc["SFA_CHARTS"] == C.CHARTS_DEFAULT == C.ChartsConfig().mode and C.CHARTS_DEFAULT in C.CHARTS_MODES
     assert C.CHARTS_DEFAULT == "on"   # the owner's go-live of 2026-11-04: going back is the owner's word, here as well
+    # conversation memory (design v2 of 2026-11-25 §15.1): shadow after the deploy; "on" is the owner's word
+    assert doc["SFA_MEMORY"] == C.MEMORY_DEFAULT == C.MemoryConfig().mode == "shadow"
+    assert (doc["SFA_MEMORY_SHORTCUTS"], doc["SFA_MEMORY_PATCH_KNOWLEDGE"], doc["SFA_MEMORY_MAX_CALLS"],
+            doc["SFA_MEMORY_MAX_AGE"], doc["SFA_MEMORY_TOKENS"], doc["SFA_ASK_LOG_DAYS"]) == (
+        "on", "off", "3", "2", "12000", "90")
     assert doc["OKEVAL_BASE_URL"] == C.Config.base_url and doc["OKEVAL_MODEL"] == C.Config.model
     assert doc["OKEVAL_RECORDS_MAX_STEPS"] == "12" and doc["OKEVAL_RECORDS_TIMEOUT_S"] == "10.0"
     assert set(C.ENV_ALIASES) == {*C.ENV_VARS.values(), *C.RECORDS_ENV_VARS.values()}

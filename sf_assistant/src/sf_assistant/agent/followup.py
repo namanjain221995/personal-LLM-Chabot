@@ -788,15 +788,19 @@ def _last_answer(turns: list[dict]) -> int:
     return max((i for i, t in enumerate(turns) if t["role"] == "assistant"), default=len(turns))
 
 
-def _last_question(turns: list[dict]) -> tuple[str, str]:
+def _last_question(turns: list[dict], *, code_line: bool = False) -> tuple[str, str]:
     """The question the last answer answers, and its ``Read as:`` line when the service wrote that line. It is the user
     turn just before that answer (a user turn with no answer after it asked nothing that answer could offer a name for),
     or the question of the line. The service writes the line only for a rewrite, which keeps every typed word of that
-    user turn (:func:`_unbound`): a line without them is stored text at the start of an answer."""
+    user turn (:func:`_unbound`): a line without them is stored text at the start of an answer.
+
+    ``code_line``: the line is a plan line that code wrote, not a rewrite of the person's question (only the memory
+    resolver passes it, after a patch or shortcut answer; :func:`rewrite`). It is then never the question asked, and
+    the user turn is."""
     read_as = _lead(turns)[0]
     user = next((t["content"] for t in reversed(turns[:_last_answer(turns)]) if t["role"] == "user"), "")
     ran = read_as[len(_READ_AS):].strip(" `")
-    if read_as and not {w for w in _words(user) if w not in _POINTERS} - set(_words(ran)):
+    if read_as and not code_line and not {w for w in _words(user) if w not in _POINTERS} - set(_words(ran)):
         return ran, read_as
     return user, ""
 
@@ -1093,7 +1097,7 @@ def _asked_people(asked: str, sentence: str, question: str, reply: str) -> list[
     return people
 
 
-def _person_lost(question: str, reply: str, added: list[str], turns: list[dict]) -> bool:
+def _person_lost(question: str, reply: str, added: list[str], turns: list[dict], *, code_line: bool = False) -> bool:
     """A rewrite that goes on from a last question about a person or a record and leaves that out: "aur kitne reject
     hue?" after "Echo One ne March mein kitne offers diye?", rewritten to "March mein kitne offers reject hue?". It
     would pass every other rule and count over everybody. Typed words that name their own subject
@@ -1102,7 +1106,12 @@ def _person_lost(question: str, reply: str, added: list[str], turns: list[dict])
     lead that :func:`_not_the_result` let in, or that a typed pointer means, is who the rewrite means now. A typed
     pointer at one person needs one of the people the question named, since code cannot tell which; anything else needs
     them all ("how many did they cancel?", "aur kitne reject hue?"). A typed "his" with nobody to mean is no field of
-    nobody either."""
+    nobody either.
+
+    ``code_line`` (:func:`rewrite`): the ``Read as:`` line is a plan line code wrote, so the last question read here is
+    the user turn (:func:`_last_question`), never that line: its field labels and values ("Interview Outcome = 'Offer
+    Received'") are no people, and the resolver that passes it has checked that the reply keeps every filter value of
+    that plan."""
     if _names_its_own(question, reply) or _widens(question) or _another_subject(question, turns):
         return False
     if {w.casefold() for w in added if not w.isdigit()} - _NO_NAME:
@@ -1110,7 +1119,7 @@ def _person_lost(question: str, reply: str, added: list[str], turns: list[dict])
     out = set(_words(reply))
     if any(name <= out for name in _pointed_result(question, turns)):
         return False
-    asked, sentence = _last_question(turns)[0], _lead(turns)[1]
+    asked, sentence = _last_question(turns, code_line=code_line)[0], _lead(turns)[1]
     if _typed_pointer(question) and (_ASKS_WHO_RE.search(asked) or _ASKS_SHOW_RE.search(asked)):
         # "that recruiter" after "Show INT-0001": the words of "Recruiter A" are typed, so no name was added
         for _, _, capitals in _capital_runs(_out_of_brackets(sentence)):
@@ -1144,14 +1153,15 @@ def _past_forms(word: str) -> set[str]:
     return {f"{word}ed"}
 
 
-def _unbound(question: str, reply: str, turns: list[dict]) -> str:
+def _unbound(question: str, reply: str, turns: list[dict], *, code_line: bool = False) -> str:
     """Why ``reply`` may not stand for the typed ``question``, as a fixed word; "" when it may. The typed question and
     the user turns are trusted; an assistant turn holds record text, so at most one capitalised name of it may enter,
     as written in the lead of the last answer, and not when that lead holds several new names and nothing typed says
     which. The service's own ``Read as:`` line of the last answer (:func:`_last_question`: it holds every typed word of
     its user turn) is the question that ran, so its words but its capitalised ones count as typed by the user: "same for
     2025" after "and the placement rate?", read as "what is the placement rate each month in 2026?", keeps "each
-    month". A name of that line still enters only as one name of the lead."""
+    month". A name of that line still enters only as one name of the lead. ``code_line`` goes to the person rule only
+    (:func:`_person_lost`)."""
     user = _user_text(turns)
     ran, own_line = _last_question(turns)
     if own_line:
@@ -1215,7 +1225,7 @@ def _unbound(question: str, reply: str, turns: list[dict]) -> str:
     why = _not_the_result(question, reply, added, turns)
     if why:
         return why
-    return "person_lost" if _person_lost(question, reply, added, turns) else ""
+    return "person_lost" if _person_lost(question, reply, added, turns, code_line=code_line) else ""
 
 
 def last_answer_objects(turns: Any) -> tuple[str, ...]:
@@ -1230,8 +1240,13 @@ def last_answer_objects(turns: Any) -> tuple[str, ...]:
         return ()
 
 
-def rewrite(question: str, turns: Any, llm: Any) -> Rewrite:
-    """The question to answer for ``question`` after the earlier ``turns`` (see the module text). Never raises."""
+def rewrite(question: str, turns: Any, llm: Any, *, code_line: bool = False) -> Rewrite:
+    """The question to answer for ``question`` after the earlier ``turns`` (see the module text). Never raises.
+
+    ``code_line``: the ``Read as:`` line of the last answer is a plan line code wrote, which the person rule never reads
+    as the last question (:func:`_person_lost`). Only the memory resolver passes it (``agent/resolver.py``
+    ``_Job._read``, ``SFA_MEMORY=on``, stage-3 review finding F1); the ask service's rewrite never does, so its reading
+    is the same as without the argument."""
     from sf_assistant.agent.small_talk import small_talk
 
     usable = usable_turns(turns)
@@ -1281,5 +1296,5 @@ def rewrite(question: str, turns: Any, llm: Any) -> Rewrite:
     if asks_for_contact(text) != asks_for_contact(question) or (drop_contact_details(text)[1]
                                                                 and not drop_contact_details(question)[1]):
         return refused("contact_changed")
-    why = _unbound(question, text, usable)
+    why = _unbound(question, text, usable, code_line=code_line)
     return refused(why) if why else Rewrite(OK, text)

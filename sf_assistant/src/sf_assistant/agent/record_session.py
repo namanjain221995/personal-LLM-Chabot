@@ -105,6 +105,13 @@ round read no data keeps its NO_RECORDS (the knowledge answer), and numbers that
 answer. The answer then carries ``no_data`` ("no_call" / "all_failed") and ``tool_retry``; the pipeline writes the
 clarifying question from them (``agent.clarify``).
 
+Salesforce conversation memory (design v2 of 2026-11-25 §7, §10; the ask service with ``SFA_MEMORY=on``):
+:meth:`RecordSession.ask` takes the job's rebuilt terms (``terms``), a :class:`SeedRun` of the stored or patched plan
+(``seed``: its calls run through the record tools right after ``begin_question`` and the record agent starts from their
+results), the last answer for a question about it (``earlier``) and ``triage=False`` for a display-only patch. The lines
+a re-run plan adds (kept dates, no rows now, a changed record set) and the agent's note for a question about the last
+answer are prompts/memory_exec.md (:data:`MEMORY_LINES`). Without them nothing of this runs.
+
 Record data must stay on this machine: a session refuses any endpoint that is not localhost.
 
 Module layout (stage-1 split of okrec/session.py): this module keeps :class:`RecordSession`, ``ROUTE_HERE``,
@@ -121,6 +128,7 @@ module exports OLD ``okrec/session.py``'s ``__all__`` (the same objects as in th
 from __future__ import annotations
 
 import dataclasses
+import json
 import re
 import threading
 import time
@@ -128,6 +136,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TYPE_CHECKING
 from urllib.parse import urlparse
 
+from sf_assistant import prompts as _prompt_files                 # prompts/memory_exec.md
 from sf_assistant.agent import record_prompts as _record_prompts   # NAMES_MAX_TOKENS: read (and patched) there
 from sf_assistant.agent import tables as _tables                  # the code-built rows (latency plan step 3)
 from sf_assistant.agent import timeline                          # the answer's timeline (latency logging)
@@ -280,6 +289,120 @@ def _forcing_off(llm: Any) -> bool:
         return bool(fn()) if callable(fn) else False
     except Exception:  # noqa: BLE001
         return False
+
+
+# ------------------------------------------------------------------------------------- seeded calls
+#: The lines code writes when a stored query plan runs again as seeded calls, and the record agent's note for a
+#: question about the last answer (prompts/memory_exec.md; Salesforce conversation memory, design v2 §6.7, §7.4, §10).
+MEMORY_EXEC_TEXT = _prompt_files.text("memory_exec")
+MEMORY_LINES: dict[str, str] = dict(ln.split(": ", 1) for ln in MEMORY_EXEC_TEXT.split("\n") if ": " in ln)
+#: Why the seeded calls stopped before the main call (:attr:`SeedRun.stop`): each has a ``stop_<code>`` line.
+SEED_STOPS = ("rank_changed", "namesakes", "empty", "set_failed")
+
+
+@dataclasses.dataclass
+class SeedRun:
+    """The seeded calls of a stored or patched query plan (Salesforce conversation memory, design v2 §7.1, §7.4, §10).
+
+    :meth:`RecordSession.ask` runs them with :meth:`run` right after ``begin_question``, so each goes through
+    ``RecordTools.call`` like a call of the record agent: validated, enforced with the job's terms (never the stored
+    ``enforced_arguments``), grounded and logged as evidence. The record agent then starts from their results.
+
+    ``calls``: the ``agent.query_state.RunCall`` list (``query_state.run_calls``), in plan order; they are sent side
+    calls first and the main call last, in plan order otherwise; ``today`` and
+    ``label``: the business date and the catalog's display words, for the plan line of the "no rows now" line. A call
+    with ``keys_from`` (a stored record set, §10) first runs the set's call fresh and filters on its keys
+    (``query_state.keys_filter``); the keys live only for this run. After :meth:`run`:
+
+    - ``ran``: the RunCall of each plan call sent, in the order sent (``query_state.build(seeds=...)``);
+    - ``pairs``: ``(tool, arguments, payload)`` of every call sent, the fresh run of a set included
+      (``answer_question(seed=...)``);
+    - ``lines``: the code lines for the answer: the stored dates kept (D1), no rows now where the stored call found
+      some (C7), a record set that changed since it was shown;
+    - ``stop``: ``""``, or why a record set cannot become a filter (:data:`SEED_STOPS`): the main call is not sent,
+      no model call follows and the answer is :meth:`stop_text`; ``stop_rank`` is the rank of an ordinal drill.
+    """
+
+    calls: list = dataclasses.field(default_factory=list)
+    today: Any = None
+    label: Any = None
+    ran: list = dataclasses.field(default_factory=list)
+    pairs: list = dataclasses.field(default_factory=list)
+    lines: list = dataclasses.field(default_factory=list)
+    stop: str = ""
+    stop_rank: int | None = None
+
+    def _line(self, key: str, **fill: Any) -> None:
+        text = _fill(MEMORY_LINES[key], **{k: str(v) for k, v in fill.items()})
+        if text not in self.lines:
+            self.lines.append(text)
+
+    def run(self, tools: Any) -> list[tuple[str, dict, dict]]:
+        """Send the calls through ``tools.call`` (evidence logged as for any call); the ``pairs``. Never raises a
+        fault of a call: a failed call is its payload, as for the record agent."""
+        from sf_assistant.agent import query_state as qs
+
+        self.ran, self.pairs, self.lines, self.stop, self.stop_rank = [], [], [], "", None
+        # the main call last (stage-2 review fix M2): the chart is drawn from the last chartable result and the next
+        # plan's main call is the last chartable call, so both stay the plan's main call after an operation that
+        # added a side call (compare_period on a grouping or a trend)
+        for rc in sorted(self.calls, key=lambda c: getattr(c, "role", "") == "main"):
+            args = rc.args
+            if rc.keys_from:
+                tool = str(rc.keys_from.get("tool") or "")
+                got, evs = self._send(tools, tool, rc.set_args)
+                if not got.get("ok") or not evs:
+                    self.stop = "set_failed"
+                    break
+                item, status = qs.keys_filter(rc.keys_from, qs.set_keys(evs[-1]))
+                if item is None:
+                    self.stop = status if status in SEED_STOPS else "set_failed"
+                    self.stop_rank = rc.keys_from.get("rank")
+                    break
+                if status == "changed":
+                    self._line("set_changed")
+                if rc.set_kept_dates:
+                    self._kept(rc.set_args)
+                args = qs.with_item(rc.tool, rc.args, item)
+            _got, evs = self._send(tools, rc.tool, args)
+            self.ran.append(rc)
+            if rc.kept_dates:
+                self._kept(args)
+            if evs and qs.stale_empty(rc, evs[-1]):
+                line = qs.plan_line({"calls": [dict(rc.entry, role="main")]}, today=self.today, label=self.label)
+                self._line("no_rows_now", PLAN=line)
+        return list(self.pairs)
+
+    def _send(self, tools: Any, tool: str, args: dict) -> tuple[dict, list]:
+        before = len(tools.evidence)
+        got = tools.call(tool, args)
+        got = got if isinstance(got, dict) else {"ok": False, "result": None, "error": "no result", "chunk_ids": []}
+        self.pairs.append((tool, args, got))
+        return got, list(tools.evidence)[before:]
+
+    def _kept(self, args: dict) -> None:
+        """The D1 note: the stored dates, as the call sends them (an absolute range)."""
+        periods = [args["period"]] if isinstance(args.get("period"), str) else [
+            s.get("period") for s in args.get("segments") or [] if isinstance(s, dict) and isinstance(s.get("period"), str)]
+        if periods:
+            self._line("kept_dates", PERIOD=" and ".join(periods))
+
+    def stop_text(self) -> str:
+        """The clarifying line of :attr:`stop` ("" when the calls did not stop)."""
+        if not self.stop:
+            return ""
+        return _fill(MEMORY_LINES[f"stop_{self.stop}"], N=str(self.stop_rank or ""))
+
+
+def earlier_block(earlier: str) -> str:
+    """The record agent's note and the earlier answer for a question about the last answer (design v2 §6.7): the
+    note, then the heading and the answer as one JSON string (at most 2,000 characters), so no text in it can end its
+    part. "" for no earlier answer."""
+    text = str(earlier or "").strip()[:2000]
+    if not text:
+        return ""
+    return (MEMORY_LINES["earlier_note"] + "\n\n" + MEMORY_LINES["earlier_head"] + "\n"
+            + json.dumps(text, ensure_ascii=False))
 
 
 # ------------------------------------------------------------------------------------- session
@@ -868,7 +991,9 @@ class RecordSession:
             return False
 
     def ask(self, question: str, routed: Any = ROUTE_HERE, display: Any = None,
-            typed: str | None = None) -> RecordAnswer:
+            typed: str | None = None, *, seed: SeedRun | None = None,
+            terms: Any = None, earlier: str = "", triage: bool = True,
+            contact_ok: bool | None = None) -> RecordAnswer:
         """Answer ``question`` from records, or reply NO_RECORDS. Never raises.
 
         ``routed`` is the route call's result when the caller made it already (``ask.py`` routes first in merged mode
@@ -941,6 +1066,26 @@ class RecordSession:
         Records retry (prerequisite P2, see the module text): one forced round for a records-routed or chart-overruled
         question that is no people question, at the require-tools nudge (``tools_first`` of ``answer_question``) or
         at the first draft check; the answer carries ``no_data`` and ``tool_retry``.
+
+        Salesforce conversation memory (design v2 §6.7, §7.1, §7.2; all five keyword arguments are unset for every
+        other caller, and then nothing of this runs):
+
+        - ``terms``: the terms the record tools enforce for this job (``begin_question(terms=...)``, rebuilt by code
+          from the stored plan and the typed follow-up); None: today's terms of ``question``.
+        - ``seed``: a :class:`SeedRun` of the stored or patched plan. It runs right after ``begin_question``, so its
+          calls are validated, enforced with ``terms`` and logged like the record agent's own, and the agent starts
+          from their results (``answer_question(seed=...)``). The seeds count as tool calls that ran: no require-tools
+          nudge and no forced round on them (C35), and the draft check reads their evidence. A record set that cannot
+          become a filter (:attr:`SeedRun.stop`) ends the answer there with no model call (``no_records``, ``error``
+          "memory: <code>"); the caller writes :meth:`SeedRun.stop_text`.
+        - ``earlier``: the last answer's text for a question about it (§6.7): the agent's user message ends with the
+          note and the answer as data (:func:`earlier_block`).
+        - ``triage`` False (a patch that only changes how the plan is shown): no triage call; the question goes to
+          the record agent as a RECORDS route with no people and no values.
+        - ``contact_ok``: whether the person's typed question asks for contact details, read by the caller
+          (stage-2 review fix PE1): the tools' contact flag (``begin_question(contact_ok=...)``) and the last drop of
+          e-mail addresses and phone numbers use it instead of reading ``question``, which for a patch or a shortcut
+          is the plan line (code's words around the typed values of earlier questions). None: read from ``question``.
         """
         t0 = time.perf_counter()
         evidence: list[QueryEvidence] = []
@@ -949,26 +1094,46 @@ class RecordSession:
             with self._lock:
                 self._n += 1
                 n = self._n
-            tri = self._triage_for(question, routed, display)
+            if seed is not None:
+                routed = True   # a stored plan runs: the route is records (no route call), whatever a route said
+            tri = (self._triage_for(question, routed, display) if triage
+                   else Triage(routed=True, route=True))   # a display-only patch: no triage call (§7.2)
             routed = tri.routed
-            try:  # C1: clears evidence and caches; the question gives the role cues, the triage its people and values
-                self.tools.begin_question(question, people=tri.hinted, values=tri.values)
-            except TypeError:   # tools without the values argument (value spots, 2026-10-28), or without people
-                try:
-                    self.tools.begin_question(question, people=tri.hinted)
-                except TypeError:   # tools without the people argument
-                    self.tools.begin_question(question)
+            contact_q = asks_for_contact(question) if contact_ok is None else bool(contact_ok)
+            if terms is not None or contact_ok is not None:   # conversation memory: never a fallback without them
+                mem = {k: v for k, v in (("terms", terms), ("contact_ok", contact_ok)) if v is not None}
+                self.tools.begin_question(question, people=tri.hinted, values=tri.values, **mem)
+            else:
+                try:  # C1: clears evidence and caches; the question gives the role cues, the triage its people and values
+                    self.tools.begin_question(question, people=tri.hinted, values=tri.values)
+                except TypeError:   # tools without the values argument (value spots, 2026-10-28), or without people
+                    try:
+                        self.tools.begin_question(question, people=tri.hinted)
+                    except TypeError:   # tools without the people argument
+                        self.tools.begin_question(question)
             person_q = bool(tri.people or tri.missing)
             asked = tri.asked()
             if routed is False:
                 return RecordAnswer(question=question, answer="", no_records=True, used_data=False, routed_out=True,
                                     seconds=round(time.perf_counter() - t0, 3), triage=tri.as_dict())
+            seeded: list = []
+            if seed is not None:   # the stored plan's calls, before the record agent (conversation memory, §7.1)
+                t_seed = time.perf_counter()
+                seeded = seed.run(self.tools)
+                timeline.add("stage", t_seed, stage="seed", calls=len(seeded))
+                if seed.stop:   # a record set that cannot become a filter: the caller asks (stop_text), no model call
+                    return RecordAnswer(question=question, answer="", no_records=True, used_data=False,
+                                        evidence=self.tools.evidence, error=f"memory: {seed.stop}",
+                                        seconds=round(time.perf_counter() - t0, 3), triage=tri.as_dict())
             t_hints = time.perf_counter()
             hints = self.tools.object_hints(question, missing=tri.missing) if tri.missing else \
                 self.tools.object_hints(question)
             timeline.add("stage", t_hints, stage="hints", chars=len(hints or ""))   # the hints' size only, never them
             # the person's own words (display words kept, pre-release fix of 2026-11-25); the hints read the search text
             user_text = (typed if typed and str(typed).strip() else question) + ("\n\n" + hints if hints else "")
+            if earlier:   # a question about the last answer (§6.7): its text as data, after the hints
+                block = earlier_block(earlier)
+                user_text += ("\n\n" + block) if block else ""
             q = Question(qid=f"rec-{n:03d}", category="cross_section", question=user_text, expected_facts=[],
                          expected_tools=[], answerable=True, source="records", gold_chunk_ids=[])
             status = self.tools.status()
@@ -1053,7 +1218,8 @@ class RecordSession:
                                 force_answer_message=RECORDS_FORCE_ANSWER_MESSAGE, check_answer=check,
                                 # one more check for the forced round, which is no draft (check stops at 2 drafts)
                                 max_checks=3 if budget[0] else 2,
-                                **({"tools_first": tools_first} if budget[0] else {}))
+                                **({"tools_first": tools_first} if budget[0] else {}),
+                                **({"seed": seeded} if seeded else {}))
             if retry and retry.get("choice") == "required" and getattr(self.llm, "forced_fallbacks", 0) > fallbacks:
                 retry["choice"] = "auto_fallback"   # the server did not take the forced call: it went out as "auto"
             t_post = time.perf_counter()   # the code after the record agent: cleaners, audits, the people answer
@@ -1175,14 +1341,14 @@ class RecordSession:
                     error = error or ("about_people failed: " + " ".join(str(failed[-1].error or "").split())[:200]
                                       if failed else "no record data about the named people")
             blocks = dict(xt.blocks) if xt is not None else {}   # code mode: the code rows, as the answer holds them
-            if not asks_for_contact(question):   # phase 1: no e-mail address or phone number that was not asked for
+            if not contact_q:   # phase 1: no e-mail address or phone number that was not asked for
                 keep = result_numbers(getattr(e, "model_result", None) for e in evidence if getattr(e, "ok", False))
                 answer, dropped = drop_contact_details(answer, keep)[0], drop_contact_details(dropped, keep)[0]
                 blocks = {k: drop_contact_details(b, keep)[0] for k, b in blocks.items()}   # equal to their text in it
             unsupported = audit_numbers(answer, [facts_json(evidence, 10**9), question, status.line()]
                                         + (xt.sources if xt is not None else [])) if answer else []
             raw_kept = str(r.answer or "") if empty else ""   # an empty answer's raw text, for the private log only
-            if raw_kept and not asks_for_contact(question):
+            if raw_kept and not contact_q:
                 raw_kept = drop_contact_details(raw_kept, result_numbers(
                     getattr(e, "model_result", None) for e in evidence if getattr(e, "ok", False)))[0]
             timeline.add("stage", t_post, stage="post")

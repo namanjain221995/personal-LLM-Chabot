@@ -53,6 +53,16 @@ and ``.ask`` per call, the MCP server once at start, because its listing is buil
 off, and the answer's JSONL says so (``charts_switch``). ``web/compose.yaml`` passes no
 ``SFA_CHARTS``, so the page and the MCP server run :data:`CHARTS_DEFAULT`.
 
+The memory switches (:class:`MemoryConfig`, :func:`memory_settings`; Salesforce conversation memory, design v2 of
+2026-11-25 §15.1): ``SFA_MEMORY`` is ``off`` (the ask service is today's contract v1), ``shadow`` (the default: every
+answer as with ``off``; a contract-v2 call also gets the next query state, and the resolver's code steps are logged)
+or ``on`` (the follow-up resolver and the seeded plan); ``SFA_MEMORY_SHORTCUTS`` (on), ``SFA_MEMORY_PATCH_KNOWLEDGE``
+(off), ``SFA_MEMORY_MAX_CALLS`` (3), ``SFA_MEMORY_MAX_AGE`` (2) and ``SFA_MEMORY_TOKENS`` (12000; a value below
+:func:`memory_tokens_floor`, the smallest prompt that holds a full plan and a question, is refused). Read once when the
+ask service starts (``restart-ask``) and by :func:`load_settings` (``Settings.memory``); an invalid value never stops
+it: ``SFA_MEMORY`` is then ``off``, any other switch its default, and ``problem`` says which (never the value).
+``SFA_ASK_LOG_DAYS`` (90) is the ask log's retention, read by ``web/ask_log.py`` in the ask service.
+
 Paths (all git-ignored data lives under :data:`PRIVATE_DIR`):
 
 * :data:`HOME` - the ``sf_assistant`` folder (``SFA_HOME``; default: two levels above ``src/sf_assistant``, which
@@ -95,6 +105,9 @@ __all__ = ["Settings", "load_settings", "Limits", "LIMITS", "IMPORT_BOUND_LIMITS
            "RESOLVER_ENV_VARS", "MergeConfig", "merge_settings", "MERGE_ENV_VAR", "MERGE_MODES",
            "TablesConfig", "tables_settings", "TABLES_ENV_VAR", "TABLES_MODES", "TABLES_DEFAULT",
            "ChartsConfig", "charts_settings", "CHARTS_ENV_VAR", "CHARTS_MODES", "CHARTS_DEFAULT",
+           "MemoryConfig", "memory_settings", "memory_prompt_tokens", "memory_tokens_floor", "MEMORY_ENV_VARS",
+           "MEMORY_MODES",
+           "MEMORY_DEFAULT", "ASK_LOG_DAYS_ENV_VAR", "ASK_LOG_DAYS_DEFAULT",
            "ENV_ALIASES", "HOME", "PRIVATE_DIR", "KNOWLEDGE_DIR", "COMPONENTS_DIR", "PROMPTS_DIR", "QUESTIONS_DIR",
            "TRANSCRIPT_DIRS"]
 
@@ -571,6 +584,154 @@ def charts_settings() -> ChartsConfig:
     return ChartsConfig(mode=raw)
 
 
+# ------------------------------------------------------------------------------------------------ memory switches
+# (Salesforce conversation memory, design v2 of 2026-11-25 §15.1; docs/architecture.md, "Contract v2")
+
+#: The memory switches' environment variables: sf_assistant's own names (no OKEVAL_* name, so no alias).
+MEMORY_ENV_VARS: dict[str, str] = {"mode": "SFA_MEMORY", "shortcuts": "SFA_MEMORY_SHORTCUTS",
+                                   "patch_knowledge": "SFA_MEMORY_PATCH_KNOWLEDGE", "max_calls": "SFA_MEMORY_MAX_CALLS",
+                                   "max_age": "SFA_MEMORY_MAX_AGE", "tokens": "SFA_MEMORY_TOKENS"}
+#: ``SFA_MEMORY``: off (contract v1, no state), shadow (answers as off; the state is built and returned) or on.
+MEMORY_MODES = ("off", "shadow", "on")
+#: The default (unset or empty) after the deploy that ships it (§15.2 step 1): shadow. ``on`` is the owner's word.
+MEMORY_DEFAULT = "shadow"
+#: The ranges a value must lie in (the plan cap of 3 is the design's, D2; at most 6 answers, the contract's gap).
+_MEMORY_RANGES = {"max_calls": (1, 3), "max_age": (0, 6), "tokens": (1, 100_000)}
+#: The ask log's retention switch, read by web/ask_log.py (the ask service only); listed here for ENV_DOC.
+ASK_LOG_DAYS_ENV_VAR = "SFA_ASK_LOG_DAYS"
+ASK_LOG_DAYS_DEFAULT = 90
+#: The resolver's prompt file and the line that ends its system prompt (agent/resolver.py splits it there).
+_RESOLVE_PROMPT_ID = "followup_resolve"
+_RESOLVE_MARK = "\n==== lines code writes, never sent to the model ====\n"
+#: The parts of the smallest prompt the floor of ``SFA_MEMORY_TOKENS`` holds besides the system prompt: the plan part
+#: at its cap (``agent.resolver.PLAN_TOKENS``) and a question at the ask service's and the page's limit (characters).
+_RESOLVE_PLAN_TOKENS = 1000
+_RESOLVE_QUESTION_CHARS = 1000
+
+
+@dataclass(frozen=True)
+class MemoryConfig:
+    """The conversation-memory switches of the ask service (``web/ask_mcp.py``; design v2 §15.1).
+
+    ``mode``: ``off``, ``shadow`` (:data:`MEMORY_DEFAULT`) or ``on``. ``shortcuts`` (the code shortcuts of the
+    resolver, only with on), ``patch_knowledge`` (the knowledge step on a patched follow-up, D4: off), ``max_calls``
+    (the plan cap, D2: 3), ``max_age`` (the answers a plan may be patched after, 2) and ``tokens`` (the resolver's
+    prompt cap, 12000, applied by the service whatever the bridge sent, C32). ``problem``: which switch could not be
+    read (:func:`memory_settings`), in fixed words."""
+
+    mode: str = MEMORY_DEFAULT
+    shortcuts: bool = True
+    patch_knowledge: bool = False
+    max_calls: int = 3
+    max_age: int = 2
+    tokens: int = 12000
+    problem: str = ""
+
+    @property
+    def off(self) -> bool:
+        return self.mode == "off"
+
+    @property
+    def shadow(self) -> bool:
+        return self.mode == "shadow"
+
+    @property
+    def on(self) -> bool:
+        return self.mode == "on"
+
+
+def _estimate_tokens(text: str) -> int:
+    """The token estimate the resolver caps its prompt with (``agent.resolver.estimate_tokens``, the platform's
+    ``context.estimate_tokens``): 3 characters a token for ASCII text, 2 bytes a token for the rest, plus one."""
+    if text.isascii():
+        return int(len(text) / 3.0) + 1
+    ascii_chars = len(text.encode("ascii", "ignore"))
+    other = len(text.encode("utf-8", "surrogatepass")) - ascii_chars
+    return int(ascii_chars / 3.0 + other / 2.0) + 1
+
+
+def memory_prompt_tokens() -> int:
+    """The estimated size of the follow-up resolver's system prompt (``prompts/followup_resolve.md`` up to its marker
+    line), in tokens: the part of :func:`memory_tokens_floor` that never changes with the question (a cap at it alone
+    would still never let the resolver call the model). 0 when the file cannot be read."""
+    try:
+        from sf_assistant import prompts
+
+        return _estimate_tokens(prompts.text(_RESOLVE_PROMPT_ID).split(_RESOLVE_MARK, 1)[0])
+    except Exception:  # noqa: BLE001 - no floor known; the range still holds
+        return 0
+
+
+def memory_tokens_floor() -> int:
+    """The lowest ``SFA_MEMORY_TOKENS`` accepted (stage-2 review fix N2): the resolver's system prompt
+    (:func:`memory_prompt_tokens`) and the smallest user message that holds a plan part at its cap (1,000 tokens) with
+    the line that it answered an earlier question, an empty list of turns and a question of 1,000 characters, with
+    their headings (the lines of ``prompts/followup_resolve.md`` after its marker). At it, the resolver can send any
+    such question with any plan: the turns, the summary and the choices are cut first. 0 when the file cannot be
+    read."""
+    base = memory_prompt_tokens()
+    if not base:
+        return 0
+    try:
+        from sf_assistant import prompts
+
+        lines = dict(ln.split(": ", 1) for ln in prompts.text(_RESOLVE_PROMPT_ID).split(_RESOLVE_MARK, 1)[1]
+                     .split("\n") if ": " in ln)
+        plan = "x" * (3 * _RESOLVE_PLAN_TOKENS) + "\n" + lines["plan_earlier"]
+        user = "\n\n".join([f"{lines['head_plan']}\n{plan}", f"{lines['head_turns']}\n[]",
+                             f"{lines['head_question']}\n" + "x" * _RESOLVE_QUESTION_CHARS])
+        return base + _estimate_tokens(user) + 8   # the estimate of the parts can differ by a token or two
+    except Exception:  # noqa: BLE001 - the system prompt alone, as the floor
+        return base
+
+
+def _switch(raw: str, default: bool, name: str, problems: list[str]) -> bool:
+    if not raw:
+        return default
+    if raw in ("on", "off"):
+        return raw == "on"
+    problems.append(f"{name} must be off or on")
+    return default
+
+
+def _whole(raw: str, default: int, name: str, low: int, high: int, problems: list[str], why: str = "") -> int:
+    if not raw:
+        return default
+    if raw.isascii() and raw.isdigit() and low <= int(raw) <= high:
+        return int(raw)
+    problems.append(f"{name} must be a whole number from {low} to {high}{why}")
+    return default
+
+
+def memory_settings(environ: Any = None) -> MemoryConfig:
+    """The memory switches now (``environ``: a mapping in place of ``os.environ``). Unset or empty: the default of
+    each. An invalid value never stops the service: ``SFA_MEMORY`` is then off (the safe reading: today's v1), any other
+    switch its default, and ``problem`` names the switch and what it must be (the value itself is not repeated).
+    ``SFA_MEMORY_TOKENS`` below :func:`memory_tokens_floor` (the smallest prompt with a full plan and a question) is
+    refused too."""
+    env = os.environ if environ is None else environ
+    names, problems = MEMORY_ENV_VARS, []
+
+    def raw(key: str) -> str:
+        return str(env.get(names[key]) or "").strip().lower()
+
+    mode = raw("mode") or MEMORY_DEFAULT
+    if mode not in MEMORY_MODES:
+        problems.append(f"{names['mode']} must be {', '.join(MEMORY_MODES[:-1])} or {MEMORY_MODES[-1]}")
+        mode = "off"
+    shortcuts = _switch(raw("shortcuts"), True, names["shortcuts"], problems)
+    patch_knowledge = _switch(raw("patch_knowledge"), False, names["patch_knowledge"], problems)
+    max_calls = _whole(raw("max_calls"), 3, names["max_calls"], *_MEMORY_RANGES["max_calls"], problems)
+    max_age = _whole(raw("max_age"), 2, names["max_age"], *_MEMORY_RANGES["max_age"], problems)
+    tokens = 12000
+    if raw("tokens"):   # the floor is read only for a value that was set (the default is far above it)
+        floor = max(_MEMORY_RANGES["tokens"][0], memory_tokens_floor())
+        tokens = _whole(raw("tokens"), 12000, names["tokens"], floor, _MEMORY_RANGES["tokens"][1], problems,
+                        " (the resolver's smallest prompt with a plan and a question is about that size)")
+    return MemoryConfig(mode=mode, shortcuts=shortcuts, patch_knowledge=patch_knowledge, max_calls=max_calls,
+                        max_age=max_age, tokens=tokens, problem="; ".join(problems))
+
+
 # ------------------------------------------------------------------------------------------------ SFA_* aliases
 
 #: OKEVAL_* name -> its SFA_* alias (read only when the OKEVAL_* name is unset or blank).
@@ -610,7 +771,8 @@ class Settings:
     * ``limits``: the defaults :func:`load_settings` gives :class:`Config` and :class:`RecordsConfig` (the run reads
       ``model`` / ``records``), the cli's ``max_rows`` (--max-rows default) and ``warmup_timeout_s``;
     * ``resolver``: the spelling help (:class:`ResolverConfig`): :func:`sf_assistant.pipeline.build` builds the
-      knowledge resolver and ``pipeline.open_record_session`` the full one only when ``resolver.enabled``.
+      knowledge resolver and ``pipeline.open_record_session`` the full one only when ``resolver.enabled``;
+    * ``memory``: the conversation-memory switches (:class:`MemoryConfig`), which the ask service reads.
 
     Bound at import, so fixed per process and checked here (a Settings that changes one raises ValueError):
     ``home``, ``private_dir`` and ``prompts_dir`` (``SFA_HOME``, ``SFA_PROMPTS_DIR``; the prompt texts, the
@@ -628,6 +790,7 @@ class Settings:
     transcript_dirs: tuple[str, ...] = TRANSCRIPT_DIRS
     limits: Limits = LIMITS
     resolver: ResolverConfig = ResolverConfig()      # the spelling help: on unless SFA_RESOLVER=off
+    memory: MemoryConfig = MemoryConfig()            # conversation memory: SFA_MEMORY (shadow) and the rest
 
     def __post_init__(self) -> None:
         for name, bound in (("home", HOME), ("private_dir", PRIVATE_DIR), ("prompts_dir", PROMPTS_DIR)):
@@ -649,7 +812,8 @@ class Settings:
                 "transcript_dirs": list(self.transcript_dirs), "limits": dataclasses.asdict(self.limits),
                 "resolver": {"enabled": self.resolver.enabled,
                              "lexicon": list(self.resolver.lexicon) if self.resolver.lexicon is not None else None,
-                             **({"problem": self.resolver.problem} if self.resolver.problem else {})}}
+                             **({"problem": self.resolver.problem} if self.resolver.problem else {})},
+                "memory": dataclasses.asdict(self.memory)}
 
 
 def load_settings(*, records: bool = True, warehouse: str | None = None, tz: str | None = None,
@@ -668,7 +832,8 @@ def load_settings(*, records: bool = True, warehouse: str | None = None, tz: str
     (None: :data:`LIMITS`) gives the defaults of the Config and RecordsConfig settings it holds (an ``OKEVAL_*``
     variable, a flag or a model override still wins) and the cli's; with the default limits the result is exactly the one of the configs' own defaults. ``resolver``
     comes from ``SFA_RESOLVER`` / ``SFA_LEXICON`` (:func:`resolver_settings`), read last; an invalid
-    ``SFA_RESOLVER`` leaves it off with ``resolver.problem`` set (never an error).
+    ``SFA_RESOLVER`` leaves it off with ``resolver.problem`` set (never an error). ``memory`` comes from ``SFA_MEMORY``
+    and the other memory switches (:func:`memory_settings`; an invalid value is never an error either).
 
     Raises:
         ValueError: a record setting is invalid (the message names the env var or flag), or ``limits`` changes one
@@ -692,7 +857,7 @@ def load_settings(*, records: bool = True, warehouse: str | None = None, tz: str
                     components_dir=COMPONENTS_DIR if components_dir is None else Path(components_dir),
                     questions_dir=QUESTIONS_DIR if questions_dir is None else Path(questions_dir),
                     transcript_dirs=TRANSCRIPT_DIRS if transcript_dirs is None else tuple(transcript_dirs),
-                    limits=lim, resolver=resolver_settings())
+                    limits=lim, resolver=resolver_settings(), memory=memory_settings())
 
 
 #: Every environment variable: ``(name, default, what it sets)``. Each ``OKEVAL_*`` name also reads its ``SFA_*``
@@ -728,4 +893,21 @@ ENV_DOC: tuple[tuple[str, str, str], ...] = (
     (CHARTS_ENV_VAR, ChartsConfig.mode, "a chart for a question that asks for one, drawn by code from the record "
                                         "results: off (no chart, as before 2026-11-03) or on; another value: off, and "
                                         "the JSONL says charts_switch"),
+    (MEMORY_ENV_VARS["mode"], MemoryConfig.mode, "conversation memory of the ask service: off (contract v1, no "
+                                                 "state), shadow (answers as off; a v2 call also gets the next query "
+                                                 "state) or on (the follow-up resolver and the seeded plan); another "
+                                                 "value: off, with a start-up line"),
+    (MEMORY_ENV_VARS["shortcuts"], "on", "the resolver's code shortcuts (visualize it, top N, same for <period>, by "
+                                         "month), with SFA_MEMORY=on only: off or on"),
+    (MEMORY_ENV_VARS["patch_knowledge"], "off", "the knowledge step on a patched follow-up: off (the record agent "
+                                                "alone) or on"),
+    (MEMORY_ENV_VARS["max_calls"], str(MemoryConfig.max_calls), "the most record calls a stored plan holds, 1-3 (an "
+                                                                "answer with more stores no plan)"),
+    (MEMORY_ENV_VARS["max_age"], str(MemoryConfig.max_age), "the most answers after its own a plan may still be "
+                                                            "patched after (with a confirm), 0-6"),
+    (MEMORY_ENV_VARS["tokens"], str(MemoryConfig.tokens), "the resolver's prompt cap in tokens, from the size of its "
+                                                          "smallest prompt with a full plan and a question (about "
+                                                          "5400) to 100000"),
+    (ASK_LOG_DAYS_ENV_VAR, str(ASK_LOG_DAYS_DEFAULT), "days the ask service keeps its daily log files "
+                                                      "(.private/ask_logs), 1-3650; read by web/ask_log.py"),
 )
