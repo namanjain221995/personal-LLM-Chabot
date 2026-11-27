@@ -650,10 +650,12 @@ def test_the_prompt_drops_whole_pairs_from_the_oldest_end():
     sent = json.loads(_msgs[1]["content"].split(MR.LINES["head_turns"] + "\n", 1)[1].split("\n\n", 1)[0])
     assert sent[-1]["content"].startswith("answer 5") and sent[0]["role"] == "user"
     assert MR.estimate_tokens(json.dumps(sent, ensure_ascii=False, indent=0)) <= MR.PAIRS_TOKENS
-    _msgs, small = MR.build_messages("and for them?", turns, summary="s " * 3000, max_tokens=4000)
+    # a cap just above the system prompt (33 tokens of room, as 4000 left before the prompt's v3 grew it)
+    cap = MR._SYSTEM_TOKENS + 33
+    _msgs, small = MR.build_messages("and for them?", turns, summary="s " * 3000, max_tokens=cap)
     # one pair is kept, the summary goes, and the turns are cut until the cap holds (F4)
     assert small["summary"] is False and small["cut_turns"] >= 1 and not small["over"]
-    assert small["tokens"] <= 4000
+    assert small["tokens"] <= cap
     msgs, info = MR.build_messages("q", turns[-2:], summary="note " * 2000)
     body = msgs[1]["content"].split(MR.LINES["head_summary"] + "\n", 1)[1].split("\n\n", 1)[0]
     assert MR.estimate_tokens(json.loads(body)) <= MR.SUMMARY_TOKENS and info["tokens"] <= MR.MAX_TOKENS

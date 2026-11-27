@@ -1104,7 +1104,10 @@ def test_plan_line_holds_no_figure_but_dates_limits_and_typed_values():
     assert figures <= {"5", "50"}, (figures, line)
     assert "2026-10-01 to 2026-10-31" in line and "as a horizontal bar chart" in line
     assert "Person Alpha" not in line and "Person 77" not in line and len(line) <= Q.MAX_PLAN_LINE
-    assert line == st["plan"]["question"]
+    # the stored question is the line written with the view: no candidates scope on a call the contract does not
+    # scope (step-5 fix W2); without the view the terms alone still write it
+    assert Q.plan_line(st, label=lambda obj, path=None: None, view=VIEW) == st["plan"]["question"]
+    assert "candidates as Person Accounts" in line and "Person Accounts" not in st["plan"]["question"]
 
 
 def test_plan_line_words_labels_and_empty():

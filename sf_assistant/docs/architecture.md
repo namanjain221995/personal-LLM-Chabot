@@ -555,7 +555,7 @@ The switches (`src/sf_assistant/config.py`, `MemoryConfig`; read once at the ser
 | `SFA_MEMORY_PATCH_KNOWLEDGE` | `off` | the knowledge step on a patched follow-up (off: the record agent alone) |
 | `SFA_MEMORY_MAX_CALLS` | `3` | the most record calls a stored plan holds (1-3); an answer with more stores no plan |
 | `SFA_MEMORY_MAX_AGE` | `2` | the most answers after its own a plan may still be patched after, with a confirm (0-6) |
-| `SFA_MEMORY_TOKENS` | `12000` | the resolver's prompt cap; a value below its smallest prompt with a full plan and a question (`memory_tokens_floor()`, about 5,400) is refused |
+| `SFA_MEMORY_TOKENS` | `12000` | the resolver's prompt cap; a value below its smallest prompt with a full plan and a question (`memory_tokens_floor()`, about 5,500) is refused |
 | `SFA_ASK_LOG_DAYS` | `90` | days the daily log files are kept (`web/ask_log.py`) |
 
 The page (`web/pipeline.py`) has no store: with `SFA_MEMORY=on` its follow-ups go through the resolver with no state;
@@ -578,6 +578,21 @@ What the service assumes of its caller and its switches:
 - **Seeded calls run side calls first and the main call last**, so the chart (drawn from the last chartable result)
   and the next plan's main call stay the plan's main call after an operation that added a side call; a seeded main
   call stays the main call unless the record agent added a chartable call of its own.
+- **The fixes of the real-model evaluation (step 5, 2026-11-27; on only, off and shadow answer as before):**
+  - an answer of several counts and no chartable call keeps as its main call the count whose object the question
+    names alone; a compare covers every count of the same period, and another operation of the main call alone asks
+    which query is meant when the question named none (`which_call`);
+  - a candidates scope the record agent wrote itself (a Person Account filter in the stored arguments) goes when the
+    person's typed words relax the contract (every account type; other types beside another type's filter);
+  - with the catalog view, the plan line writes "candidates as Person Accounts" or "every account type" from the
+    filters the main call runs with (a record set's own call counts), and a lookup's name reads as the lookup
+    ("where Department = 'Dept One'");
+  - the resolver's prompt has a FIELDS part (the plan objects' field names and labels, no values, at most 500
+    tokens, dropped before any turn is cut), and a field name that does not resolve is matched to the one field of
+    the main object (or one lookup away, a lookup the plan already uses first) whose label words hold it and whose
+    kind the values fit; with none or several it asks as before;
+  - a zero-row call of the record agent's that a later call of the same tool, object and period with other filter
+    fields replaced is not stored.
 - **The log** of an on-mode call that the resolver could not read holds its codes and the reply's length, never the
   reply.
 

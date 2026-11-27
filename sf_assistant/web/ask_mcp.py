@@ -712,7 +712,7 @@ class _MemoryJob:
             state = None
         self.out_state = state
         try:
-            line = self.qs.plan_line(state, today=self.today, label=self.label) if state else ""
+            line = self.qs.plan_line(state, today=self.today, label=self.label, view=self.view) if state else ""
         except Exception:  # noqa: BLE001 - no line rather than no answer
             line = ""
         return {"state": state, "plan_line": line, "reason": reason}
