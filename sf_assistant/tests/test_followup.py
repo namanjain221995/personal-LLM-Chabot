@@ -412,8 +412,10 @@ def test_the_prompts_examples_pass_the_rules_they_teach():
     for user, assistant, new, reply in blocks:
         turns = [{"role": "user", "content": user}, {"role": "assistant", "content": assistant}]
         out = F.rewrite(new, turns, FakeLLM(reply=reply))
-        assert out.status == (F.UNCLEAR if reply == "UNCLEAR" else F.OK), (new, out)
-    assert P.load("followup_rewrite").version == 6
+        assert out.status == (F.UNCLEAR if reply.startswith("UNCLEAR") else F.OK), (new, out)
+        if reply.startswith("UNCLEAR"):   # v7 (development B): every UNCLEAR example names what is missing
+            assert out.reason == "unclear" and out.missing == F.missing_codes(reply.split("missing=", 1)[1]), new
+    assert P.load("followup_rewrite").version == 7
 
 
 def test_no_example_guesses_a_person_when_two_are_named():
@@ -422,7 +424,7 @@ def test_no_example_guesses_a_person_when_two_are_named():
     for user, assistant, new, reply in blocks:
         pointer = re.search(r"\b(his|her|him|he|she)\b", new.lower())
         two_named = "Delta Person" in assistant and "Echo One" in assistant
-        assert not (pointer and two_named and reply != "UNCLEAR"), (new, reply)
+        assert not (pointer and two_named and not reply.startswith("UNCLEAR")), (new, reply)
 
 
 # ------------------------------------------------------------------------------------ the reviewers' lists
@@ -2998,3 +3000,173 @@ def test_a_plan_line_code_wrote_is_never_the_last_question_of_the_person_rule():
     out = F.rewrite("and the placement rate?", turns, FakeLLM(reply="What is the placement rate by month?"),
                     code_line=True)
     assert out == F.Rewrite(F.UNCLEAR, reason="period_lost")
+
+
+# ------------------------------------------------------------------------ development B: say what is missing
+# An UNCLEAR reply may name the missing part with a closed code (prompts/followup_rewrite.md v7, step 4); the person
+# gets fixed parts (prompts/followup_unclear.md) filled with their own typed words, then the fixed unclear line.
+FIXED = "I could not tell what this refers to. Please ask the full question, with the name or object."
+B_LIST = _turns("list out all the analysts of the audit team",
+                "The audit team has 4 analysts: Echo One, Delta Person, Golf Person and Foxtrot Person.")
+B_SHAPE = "how many of them have less tickets in last years"
+
+
+def test_b_the_real_shape_number_and_period_missing_with_the_group_offered():
+    reply = "UNCLEAR missing=number,period about=the analysts of the audit team"
+    out = F.rewrite(B_SHAPE, B_LIST, FakeLLM(reply=reply))
+    assert out == F.Rewrite(F.UNCLEAR, reason="unclear", missing=("number", "period"),
+                            about="the analysts of the audit team")
+    assert out.reply == reply                                       # the model's words: the private log only
+    text = F.unclear_text(B_SHAPE, out.missing, out.about, fixed=FIXED)
+    assert text == ('Do you mean the analysts of the audit team? Fewer than how many tickets, and which years do you '
+                    'mean by "last years"?\n\n' + FIXED)
+    # with no reading, the same question without the offer; the fixed line always stands in full at the end
+    out = F.rewrite(B_SHAPE, B_LIST, FakeLLM(reply="Reply: UNCLEAR missing=number, period."))
+    assert (out.missing, out.about) == (("number", "period"), "")
+    assert F.unclear_text(B_SHAPE, out.missing, fixed=FIXED) == (
+        'Fewer than how many tickets, and which years do you mean by "last years"?\n\n' + FIXED)
+
+
+def test_b_them_with_no_earlier_list_asks_who_and_offers_nothing():
+    turns = _turns("what is the leave policy?", "The leave policy gives 18 days a year.")
+    question = "how many of them took leave last month"
+    for reply in ("UNCLEAR missing=who", "UNCLEAR missing=who about=the leave policy"):
+        out = F.rewrite(question, turns, FakeLLM(reply=reply))
+        assert (out.status, out.reason, out.missing, out.about) == (F.UNCLEAR, "unclear", ("who",), "")
+        assert F.unclear_text(question, out.missing, out.about, fixed=FIXED) == (
+            'Which ones do you mean by "them"?\n\n' + FIXED)
+
+
+def test_b_it_after_a_knowledge_answer_asks_what_it_means():
+    turns = _turns("what does the Stage field of Application mean?",
+                   "Stage shows where an application stands in the hiring process.")
+    question = "when was it last changed?"
+    out = F.rewrite(question, turns, FakeLLM(reply="UNCLEAR missing=who"))
+    assert (out.status, out.missing) == (F.UNCLEAR, ("who",))
+    assert F.unclear_text(question, out.missing, fixed=FIXED) == 'What do you mean by "it"?\n\n' + FIXED
+    # a person pointer and a typed "that person" ask who
+    assert F.unclear_ask("when did he join?", ["who"]) == 'Who do you mean by "he"?'
+    assert F.unclear_ask("what is the email of that person?", ["who"]) == 'Who do you mean by "that person"?'
+    assert F.unclear_ask("and the status?", ["who"]) == "Who or what is this about?"
+
+
+def test_b_an_object_missing_asks_which_records():
+    question = "how many were rejected last week?"
+    out = F.rewrite(question, M_M, FakeLLM(reply="UNCLEAR missing=object"))
+    assert (out.status, out.missing) == (F.UNCLEAR, ("object",))
+    assert F.unclear_text(question, out.missing, fixed=FIXED) == "Which records do you mean?\n\n" + FIXED
+    # the parts in their fixed order, whatever order the model gave
+    assert F.unclear_ask("how many of them were above in recently", "period, object, who") == (
+        'Which ones do you mean by "them", which records do you mean, and which period do you mean by "recently"?')
+
+
+@pytest.mark.parametrize("reply,finish", [
+    ("UNCLEAR", "stop"),                                          # no code: today's line
+    ("UNCLEAR missing=", "stop"),
+    ("UNCLEAR missing=number,colour", "stop"),                    # one unknown code drops them all
+    ("UNCLEAR missing=the threshold", "stop"),
+    ("UNCLEAR missing=number,period", "length"),                  # cut at the token limit: never read
+    ("UNCLEAR missing=number\nabout=the analysts", "stop"),       # two lines: the output rule, as before
+    ("UNCLEAR because the number is missing", "stop"),            # free text after UNCLEAR is no code
+])
+def test_b_no_code_falls_back_to_todays_line(reply, finish):
+    out = F.rewrite(B_SHAPE, B_LIST, FakeLLM(reply=reply, finish=finish))
+    assert out.status == F.UNCLEAR and out.missing == () and out.about == ""
+    assert F.unclear_text(B_SHAPE, out.missing, out.about, fixed=FIXED) == FIXED
+
+
+def test_b_a_coded_unclear_decides_exactly_what_unclear_decides():
+    """The codes change no decision: every case reads a coded reply as the one word UNCLEAR (status, question and
+    reason the same), also the complete question that runs as typed on a model's UNCLEAR."""
+    cases = [("what is the leave policy?", M_J), ("Jonas Wicket ka mobile number?", M_J),
+             ("what is his status?", _turns("Who are the recruiters on INT-0001?", "Recruiter A and Delta Person.")),
+             ("and his joining date?", M_J), ("how many last week?", M_C), (B_SHAPE, B_LIST), ("unclear", M_J),
+             ("How many candidates joined this quarter?", M_J), ("who is the manager?", M_C)]
+    for question, turns in cases:
+        plain = F.rewrite(question, turns, FakeLLM(reply="UNCLEAR"))
+        coded = F.rewrite(question, turns, FakeLLM(reply="UNCLEAR missing=who,number"))
+        assert (coded.status, coded.question, coded.reason) == (plain.status, plain.question, plain.reason), question
+        if plain.status == F.OK:
+            assert coded == plain
+    # a question that resolves comes back as before, with nothing missing
+    reply = "Who is the manager of Echo One?"
+    assert F.rewrite("and his manager?", M_J, FakeLLM(reply=reply)) == F.Rewrite(F.OK, reply)
+
+
+@pytest.mark.parametrize("about", [
+    "Echo One and Delta Person",                 # names of the answer, never typed
+    "the analysts of audit team",                # not as typed (a word left out)
+    "the audit analysts",                        # words of the turn, not in their order
+    "all of them",                               # names nothing
+    "[the analysts](https://example.invalid)",   # markup
+    "the analysts of the audit team " * 4,        # too long
+])
+def test_b_a_reading_that_is_not_the_persons_own_words_is_never_offered(about):
+    out = F.rewrite(B_SHAPE, B_LIST, FakeLLM(reply=f"UNCLEAR missing=number,period about={about}"))
+    assert out.missing == ("number", "period") and out.about == ""
+
+
+def test_b_a_reading_takes_only_words_the_person_typed_with_a_lead_the_at_most():
+    turns = _turns("list the trainers of sales team", "The sales team has 6 trainers.")
+    q = "how many of them took fewer sessions in recent months"
+    out = F.rewrite(q, turns, FakeLLM(reply='UNCLEAR missing=number,period about="the trainers of sales team"'))
+    assert out.about == "the trainers of sales team"
+    out = F.rewrite(q, turns, FakeLLM(reply="UNCLEAR missing=number,period about=trainers of sales team"))
+    assert out.about == "trainers of sales team"
+    # a contact detail the person typed earlier is never offered back
+    turns = _turns("list the callers of 9876543210", "Two callers.")
+    out = F.rewrite("how many of them called less in last years", turns,
+                    FakeLLM(reply="UNCLEAR missing=number,period about=the callers of 9876543210"))
+    assert out.about == ""
+    # no pointing word typed: nothing to offer a reading for
+    out = F.rewrite("how many have less tickets in last years", B_LIST,
+                    FakeLLM(reply="UNCLEAR missing=number,period about=the analysts of the audit team"))
+    assert out.about == ""
+
+
+def test_b_the_parts_use_only_typed_words_and_fixed_text():
+    assert F.unclear_ask("kitne recruiters ke interviews kam hain", ["number"]) == "Fewer than how many interviews?"
+    assert F.unclear_ask("which of them had more offers", ["number"]) == "More than how many offers?"
+    assert F.unclear_ask("which of them had more than", ["number"]) == "More than how many?"
+    assert F.unclear_ask("who is above the target", ["number"]) == "More than how many?"
+    assert F.unclear_ask("how many of them", ["number"]) == "Which number do you mean?"
+    assert F.unclear_ask("how many joined in the past few months", ["period"]) == (
+        'Which months do you mean by "past few months"?')
+    assert F.unclear_ask("pichle kuch mahine mein kitne", ["period"]) == (
+        'Which period do you mean by "pichle kuch mahine"?')
+    assert F.unclear_ask("how many joined", ["period"]) == "Over which period?"
+    assert F.unclear_ask("how many joined", []) == "" and F.unclear_ask("how many joined", None) == ""
+    assert F.unclear_text("how many joined", "", fixed=FIXED) == FIXED
+    # an offer goes with a part only, and never with who
+    assert F.unclear_ask("how many of them joined", ["period"], "the analysts") == (
+        "Do you mean the analysts? Over which period?")
+    assert F.unclear_ask("how many of them joined", ["who", "period"], "the analysts") == (
+        'Which ones do you mean by "them", and over which period?')
+
+
+def test_b_the_codes_and_the_prompt_versions_are_pinned():
+    assert F.MISSING_CODES == ("who", "object", "number", "period")
+    assert F.missing_codes(["period", "who"]) == ("who", "period") and F.missing_codes("number and period") == (
+        "number", "period")
+    assert F.missing_codes(7) == () and F.missing_codes(["number", 3]) == () and F.missing_codes("") == ()
+    assert P.load("followup_rewrite").version == 7 and P.load("followup_unclear").version == 1
+    assert P.load("followup_resolve").version == 3
+    text = P.text("followup_rewrite")
+    assert "UNCLEAR missing=<codes>" in text and all(f"- {code}: " in text for code in F.MISSING_CODES)
+    # the prompt's own example of step 4 reads as it teaches
+    example = re.search(r'For example, "(.*?)" after the user asked "(.*?)": (UNCLEAR missing=\S+ about=[^.]+)\.',
+                        text)
+    question, earlier, reply = example.groups()
+    out = F.rewrite(question, _turns(earlier, "The sales team has 6 trainers."), FakeLLM(reply=reply))
+    assert (out.missing, out.about) == (("number", "period"), "the trainers of the sales team")
+    # every part key the code reads is in the file, and no part holds a token code does not fill
+    for key in ("who_person", "who_thing", "who_group", "who_plain", "object", "number_fewer", "number_more",
+                "number_fewer_plain", "number_more_plain", "number_plain", "period_unit", "period_phrase",
+                "period_plain", "offer", "fewer_words", "more_words"):
+        assert key in F.UNCLEAR_PARTS, key
+
+
+def test_b_words_that_are_no_comparison_or_no_pointer_are_not_read_as_one():
+    # "over" and "under" are often no comparison ("over the last years"); "use" is English as often as Hinglish
+    assert F.unclear_ask("how many interviews over the last years", ["number"]) == "Which number do you mean?"
+    assert F.unclear_ask("can you use it", ["who"]) == 'What do you mean by "it"?'

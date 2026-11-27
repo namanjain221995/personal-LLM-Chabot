@@ -55,7 +55,10 @@ import unicodedata
 from typing import Any, Callable
 
 MODES = ("merged", "records", "knowledge")
-#: The follow-up rewrite (``agent/followup.py``) read the question as unclear: the page and the ask service say this.
+#: The follow-up rewrite (``agent/followup.py``) read the question as unclear: the page and the ask service say this,
+#: after what is missing when the rewrite named it (``followup.unclear_text``, development B of 2026-11-27). The
+#: platform bridge finds this line in the last answer (``sfk_bridge.follows_a_stop_line``), so it stands there word for
+#: word.
 UNCLEAR_LINE = "I could not tell what this refers to. Please ask the full question, with the name or object."
 #: The follow-up rewrite failed (its model call raised): the typed words are not answered as a fragment.
 REWRITE_FAILED_LINE = ("The question could not be read together with the earlier questions this time. Please ask the "
@@ -592,7 +595,8 @@ class Pipeline:
         """:meth:`answer` after the follow-up rewrite of the ask service (``agent.followup.rewrite``, the same rules):
         with no usable earlier turn the typed question goes to :meth:`answer` unchanged and nothing else differs. A
         rewritten question is answered and the answer starts with its Read-as line (:func:`read_as_line`); an unclear
-        one gets :data:`UNCLEAR_LINE` and a failed rewrite :data:`REWRITE_FAILED_LINE`, kind none, with no other model
+        one gets :data:`UNCLEAR_LINE`, after what is missing when the rewrite named it (``followup.unclear_text``), and a
+        failed rewrite :data:`REWRITE_FAILED_LINE`, kind none, with no other model
         call. A question complete on its own (:func:`_typed_may_run`) is answered as typed when the rewrite call failed
         or the model reworded it (``standalone_changed``): only it could have come back (review of 2026-11-16: the page
         refused complete questions on a busy model); ``log["rewrite"]["answered"]`` is then "typed". The model's own
@@ -603,7 +607,8 @@ class Pipeline:
         place of the rewrite (:meth:`_followup_memory`; design v2 §6.1): the page has no store, so it runs with no state
         and can only answer a reply or run a question of its own. A fault of the resolver itself falls back to the
         rewrite below."""
-        from sf_assistant.agent.followup import FAILED, UNCLEAR, last_answer_objects, rewrite, usable_turns
+        from sf_assistant.agent.followup import (FAILED, UNCLEAR, last_answer_objects, rewrite, unclear_text,
+                                                 usable_turns)
 
         if not usable_turns(turns):
             return self.answer(question, mode)
@@ -629,7 +634,11 @@ class Pipeline:
                 info["reply"] = step.reply
             if step.error:
                 info["error"] = step.error
-            text = UNCLEAR_LINE if step.status == UNCLEAR else REWRITE_FAILED_LINE
+            if step.missing:
+                info["missing"] = ",".join(step.missing)
+                info["offer"] = bool(step.about)
+            text = (unclear_text(question, step.missing, step.about, fixed=UNCLEAR_LINE) if step.status == UNCLEAR
+                    else REWRITE_FAILED_LINE)
             return {"answer": text, "kind": "none", "source_line": None, "data_ts": None,
                     "trace": {"mode": mode, "rewrite": dict(info), "queries": [], "timings": {}},
                     "log": {"rewrite": info}}
@@ -649,7 +658,7 @@ class Pipeline:
         and with a Read-as line when it changed. None when the resolver itself failed (the rewrite then answers)."""
         from sf_assistant.agent import query_state as qs
         from sf_assistant.agent import resolver
-        from sf_assistant.agent.followup import last_answer_objects
+        from sf_assistant.agent.followup import last_answer_objects, unclear_text
         from sf_assistant.config import charts_settings
         from sf_assistant.pipeline import MemoryRun
 
@@ -676,7 +685,8 @@ class Pipeline:
                 out = self.answer(question, mode, memory=run)
                 out.setdefault("log", {})["rewrite"] = {**info, "answered": "typed"}
                 return out
-            text = {"answered": res.text, "unclear": UNCLEAR_LINE}.get(res.status, REWRITE_FAILED_LINE)
+            text = {"answered": res.text, "unclear": unclear_text(question, res.missing, fixed=UNCLEAR_LINE)}.get(
+                res.status, REWRITE_FAILED_LINE)
             return {"answer": text, "kind": "none", "source_line": None, "data_ts": None,
                     "trace": {"mode": mode, "rewrite": dict(info), "queries": [], "timings": {}},
                     "log": {"rewrite": info}}

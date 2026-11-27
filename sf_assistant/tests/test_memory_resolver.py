@@ -650,10 +650,12 @@ def test_the_prompt_drops_whole_pairs_from_the_oldest_end():
     sent = json.loads(_msgs[1]["content"].split(MR.LINES["head_turns"] + "\n", 1)[1].split("\n\n", 1)[0])
     assert sent[-1]["content"].startswith("answer 5") and sent[0]["role"] == "user"
     assert MR.estimate_tokens(json.dumps(sent, ensure_ascii=False, indent=0)) <= MR.PAIRS_TOKENS
-    _msgs, small = MR.build_messages("and for them?", turns, summary="s " * 3000, max_tokens=4000)
+    # a cap just above the system prompt: 4000 at the 3,967 tokens of prompt v2 (v3, development B, is longer)
+    cap = MR.estimate_tokens(MR.FOLLOWUP_RESOLVE_SYSTEM) + 33
+    _msgs, small = MR.build_messages("and for them?", turns, summary="s " * 3000, max_tokens=cap)
     # one pair is kept, the summary goes, and the turns are cut until the cap holds (F4)
     assert small["summary"] is False and small["cut_turns"] >= 1 and not small["over"]
-    assert small["tokens"] <= 4000
+    assert small["tokens"] <= cap
     msgs, info = MR.build_messages("q", turns[-2:], summary="note " * 2000)
     body = msgs[1]["content"].split(MR.LINES["head_summary"] + "\n", 1)[1].split("\n\n", 1)[0]
     assert MR.estimate_tokens(json.loads(body)) <= MR.SUMMARY_TOKENS and info["tokens"] <= MR.MAX_TOKENS
@@ -1841,3 +1843,72 @@ def test_items_7_8_a_typed_grouping(text, grouping):
 def test_items_7_8_the_words_that_name_a_grouping_field(path, words):
     state, turns = _per_recruiter()
     assert _job(_DONE, state, turns)._group_words("Interview__c", path) == words
+
+
+# ------------------------------------------------------------------------ development B: say what is missing
+# An unclear reply may name what is missing ("missing", the closed codes of followup.MISSING_CODES): it changes no
+# decision, only the words (prompts/followup_resolve.md v3).
+def _coded(kind, standalone="", ops=(), missing=None):
+    body = {"kind": kind, "standalone": standalone, "ops": list(ops)}
+    if missing is not None:
+        body["missing"] = missing
+    return json.dumps(body)
+
+
+def test_b_parse_reply_reads_missing_codes_on_an_unclear_reply_only():
+    assert MR.parse_reply(_coded("unclear", missing=["period", "number"])) == {
+        "kind": "unclear", "standalone": "", "ops": [], "missing": ("number", "period")}
+    # any other kind, or codes not of the closed set: the reply reads as without the key
+    for kind, missing in (("new", ["number"]), ("unclear", ["colour"]), ("unclear", 5), ("unclear", None),
+                          ("unclear", []), ("patch", "period")):
+        assert MR.parse_reply(_coded(kind, "q?", missing=missing)) == MR.parse_reply(_coded(kind, "q?")), (kind,
+                                                                                                         missing)
+
+
+def _decision(res):
+    return (res.action, res.reason, res.step, res.status, res.detail, res.state_kind, res.question, res.pending,
+            res.ops, res.plan_line)
+
+
+@pytest.mark.parametrize("question,state", [("how many of them have less interviews in last years", None),
+                                            ("and his leave balance?", None)])
+def test_b_with_no_plan_the_unclear_reply_carries_the_codes_and_decides_the_same(question, state):
+    plain, _ = _mr(question, state=state, reply=_coded("unclear"))
+    coded, _ = _mr(question, state=state, reply=_coded("unclear", missing=["number", "period"]))
+    assert _decision(coded) == _decision(plain) and (coded.status, coded.reason) == ("unclear", "unclear_rewrite")
+    assert plain.missing == () and coded.missing == ("number", "period")
+    assert coded.log()["missing_parts"] == "number,period" and "missing_parts" not in plain.log()
+    assert {k: v for k, v in coded.log().items() if k != "missing_parts"} == plain.log()
+
+
+def test_b_with_a_plan_the_clarify_asks_for_what_is_missing_in_place_of_the_full_question():
+    question = "and for them in last years?"
+    plain, _ = _mr(question, reply=_coded("unclear"))
+    coded, _ = _mr(question, reply=_coded("unclear", missing=["period"]))
+    assert _decision(coded) == _decision(plain) and plain.reason == "clarify" and plain.pending is None
+    assert plain.text == MR._say("unclear_plan", plan=plain.plan_line)
+    assert coded.text == MR._say("unclear_plan_ask", plan=plain.plan_line, ask=_F.unclear_ask(question, ["period"]))
+    assert coded.text == (f"I could not tell how this goes on from the last query ({plain.plan_line}). Which years "
+                          f'do you mean by "last years"? Or ask the full question.')
+    # readings offered as choices: the choices decide, the codes change nothing
+    reading = _coded("unclear", "How many candidates were there this month?",
+                     [{"set_measure": {"measure": "count_distinct", "field": "Candidate__c"}}])
+    with_codes = json.dumps({**json.loads(reading), "missing": ["object"]})
+    a, _ = _mr("What about candidates?", reply=reading)
+    b, _ = _mr("What about candidates?", reply=with_codes)
+    assert _decision(a) == _decision(b) and a.text == b.text
+
+
+def test_b_codes_on_another_kind_change_nothing():
+    reply = _coded("new", "What is the leave balance of Echo One?")
+    coded = json.dumps({**json.loads(reply), "missing": ["who"]})
+    turns = [{"role": "user", "content": "How many leaves did Echo One take?"},
+             {"role": "assistant", "content": "Echo One took 4 leaves."}]
+    a, _ = _mr("and his leave balance?", state=None, reply=reply, turns=turns)
+    b, _ = _mr("and his leave balance?", state=None, reply=coded, turns=turns)
+    assert _decision(a) == _decision(b) and b.missing == ()
+
+
+def test_b_shadow_never_has_codes():
+    got = _shadow("how many of them have less interviews in last years")
+    assert got.missing == () and "missing_parts" not in got.log()

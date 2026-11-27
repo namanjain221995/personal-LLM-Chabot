@@ -37,7 +37,9 @@ The tool's contract, which the orchestrator's bridge is built against (docs/arch
   "can you tell me one thing"; reason ``small_talk``), before ``ensure_fresh`` and also with records off; ``failed`` with
   no model call when the record session is None after ``ensure_fresh`` (the knowledge side has no local-endpoint guard);
   ``failed`` when the rewrite call raised; ``unclear`` when the rewrite says so or its reply fails a rule
-  (``agent/followup.py``), with :data:`UNCLEAR_LINE`; ``failed`` when ``Pipeline.answer`` raised; then :func:`decide` on
+  (``agent/followup.py``), with :data:`UNCLEAR_LINE`, after what is missing when the rewrite named it
+  (``followup.unclear_text``: fixed parts and the person's own words; development B of 2026-11-27); ``failed`` when
+  ``Pipeline.answer`` raised; then :func:`decide` on
   the finished answer. ``busy`` after :data:`QUEUE_WAIT_S` in line, ``timeout`` after :data:`TIMEOUT_S` of running.
   A clarifying question code writes when the record step got no data (``agent/clarify.py``: 2-3 numbered choices) is
   ``answered`` with kind ``none`` and reason ``clarify``; a reply "2" (or "the second one", or the choice's text) to it is
@@ -839,7 +841,7 @@ def _job_v1(pipeline: Any, question: str, turns: Any, mem: _MemoryJob | None, se
     resolver's fault) the answer runs under a ``MemoryRun`` with nothing set, which changes nothing in it and reads
     what ran, and the reply gets the next state. ``seen``: the job's holder of the question used, which the log line
     of a fault reads (stage-2 review fix L1: as before the job moved)."""
-    from sf_assistant.agent.followup import FAILED, UNCLEAR, last_answer_objects, rewrite
+    from sf_assistant.agent.followup import FAILED, UNCLEAR, last_answer_objects, rewrite, unclear_text
     from sf_assistant.agent.small_talk import line as talk_line, small_talk
 
     short = _rewrite_turns(turns)
@@ -858,7 +860,8 @@ def _job_v1(pipeline: Any, question: str, turns: Any, mem: _MemoryJob | None, se
     if step.status == FAILED:      # the typed words are not sent on: as a fragment they mean something else
         return _out(mem, _result("failed"), f"rewrite_{step.reason}", error=step.error)
     if step.status == UNCLEAR:
-        return {**_out(mem, _result("unclear", UNCLEAR_LINE), f"rewrite_{step.reason}", v2="unclear_rewrite",
+        text = unclear_text(question, step.missing, step.about, fixed=UNCLEAR_LINE)   # the same in off and shadow
+        return {**_out(mem, _result("unclear", text), f"rewrite_{step.reason}", v2="unclear_rewrite",
                        kind="unclear"), "rewrite_reply": step.reply}
     used = step.question
     if seen is not None:
@@ -878,7 +881,7 @@ def _job_on(pipeline: Any, question: str, turns: Any, mem: _MemoryJob, seen: dic
     """The job of a v2 call with ``SFA_MEMORY=on`` (design v2 §6-§9): the resolver decides, then a reply is sent
     as the resolver wrote it, or a question, a patched plan or a question about the last answer runs. ``seen``: as
     for :func:`_job_v1`."""
-    from sf_assistant.agent.followup import last_answer_objects
+    from sf_assistant.agent.followup import last_answer_objects, unclear_text
     from sf_assistant.agent.small_talk import line as talk_line, small_talk
 
     talk = small_talk(question)
@@ -902,7 +905,8 @@ def _job_on(pipeline: Any, question: str, turns: Any, mem: _MemoryJob, seen: dic
         if res.status == "unclear":
             # no rewrite_reply (stage-2 review fix L3): the resolver's prompt held the summary, the plan and 12 turns,
             # and the log never holds them; the memory entry has the resolver's codes and the reply's size
-            return _out(mem, _result("unclear", UNCLEAR_LINE), f"resolver_{res.detail or res.reason}",
+            text = unclear_text(question, res.missing, fixed=UNCLEAR_LINE)   # the rewrite's parts (development B)
+            return _out(mem, _result("unclear", text), f"resolver_{res.detail or res.reason}",
                         v2="unclear_rewrite", kind="unclear")
         if res.reason == "resolver_error":   # a fault of the resolver itself: today's rewrite answers
             return _job_v1(pipeline, question, turns, mem, seen)

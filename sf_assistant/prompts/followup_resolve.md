@@ -1,10 +1,10 @@
 ---
 id: followup_resolve
-version: 2
+version: 3
 name: FOLLOWUP_RESOLVE_TEXT
 module: sf_assistant.agent.resolver
-source: "the follow-up resolver of the Salesforce conversation memory (design v2 of 2026-11-25, section 6, lane S2): the system prompt of its one model call (the v6 follow-up rewrite rules and the patch grammar), then the lines code writes; v2 (stage-1 review fixes of 2026-11-25): the yes, acknowledgement and courtesy words a reply to a confirm is read with, and the line for the bottom N of a list"
-placeholders: "<<FIELD>> <<PLAN>> <<VALUE>>"
+source: "the follow-up resolver of the Salesforce conversation memory (design v2 of 2026-11-25, section 6, lane S2): the system prompt of its one model call (the v6 follow-up rewrite rules and the patch grammar), then the lines code writes; v2 (stage-1 review fixes of 2026-11-25): the yes, acknowledgement and courtesy words a reply to a confirm is read with, and the line for the bottom N of a list; v3 (development B of 2026-11-27): an unclear reply may name what is missing (\"missing\": the codes who, object, number, period), which only shapes the words of the reply, and the line of a clarify built from the plan that asks for it"
+placeholders: "<<ASK>> <<FIELD>> <<PLAN>> <<VALUE>>"
 fill: "the text up to the line '==== lines code writes, never sent to the model ====' is the system prompt of the call; after it, one key: text line per part (the headings of the call's parts, the confirm and the clarifying questions, the word lists a reply to a confirm is read with), read into a dict by agent.resolver and filled with prompts.fill"
 ---
 You read the next message in a chat about a Salesforce org and decide how it goes on from the query that answered the person's last records question. Reply with one JSON object and nothing else:
@@ -22,6 +22,7 @@ Step 1. Choose "kind".
 - "about_answer": the NEW QUESTION asks why or how the results of the last answer came out, or compares rows of it ("Why is recruiter A performing lower than recruiter B?", "why is March so low?"), and asks for nothing else to be fetched. Only with a PLAN that answered the last answer.
 - "new": the NEW QUESTION asks something else, about its own subject: other records, a person, a policy or a process ("what is the leave policy?", "how many candidates joined this quarter?"). A complete question about the same records with its own filters, measure and grouping is "new" too.
 - "unclear": you cannot tell which it is, or what it points at. When two readings both fit, give both: the patch in "ops" and the new question in "standalone" ("What about candidates?" after a count of interviews: the number of different candidates of the same interviews, or a new question about candidates).
+- With "unclear" you may add "missing", a list of what the NEW QUESTION leaves out, in these codes only: "who" (what them, it or his points at), "object" (which records), "number" (the number of a comparison: less, more), "period" (an inexact period: "last years"). Only codes you are sure of; it never changes the kind.
 
 Step 2. Write "standalone": the question the person means, on one line, standing on its own.
 - A complete NEW QUESTION, one that names everyone and everything it is about and says what it asks, comes back exactly as typed, letter for letter, in its own language, also on another subject than the earlier turns. A word that points inside the question itself ("their" in "How many candidates updated their status?", "it" in "How long does it take?") needs nothing. A question about how the org works (a policy, a process, a flow, an object, a field) is complete too, in Hinglish as in English ("leave policy kya hai?").
@@ -95,10 +96,10 @@ Reply: {"kind": "new", "standalone": "What is the leave balance of Echo One?", "
 
 No PLAN. EARLIER TURNS: "Who took the interviews at Acme Foods?" / "Foxtrot Person and Delta Person took them."
 NEW QUESTION: when did he join?
-Reply: {"kind": "unclear", "standalone": "", "ops": []}
+Reply: {"kind": "unclear", "standalone": "", "ops": [], "missing": ["who"]}
 
 Last check before you reply:
-- One JSON object with the keys kind, standalone and ops, and no text around it.
+- One JSON object with the keys kind, standalone and ops (and, only with "unclear", missing), and no text around it.
 - "ops" holds only operations of the list above, at most three, and is [] for "new" and "about_answer".
 - Every value in "ops" is typed in the NEW QUESTION.
 - A complete NEW QUESTION comes back in "standalone" letter for letter, in its own language.
@@ -119,6 +120,7 @@ courtesy_words: please, pls, plz, kindly
 no_words: no, nope, nahi, nahin, na, ji nahi
 unclear_choices: I could not tell how this goes on from the last query (<<PLAN>>). Which do you mean?
 unclear_plan: I could not tell how this goes on from the last query (<<PLAN>>). Please ask the full question.
+unclear_plan_ask: I could not tell how this goes on from the last query (<<PLAN>>). <<ASK>> Or ask the full question.
 field_removed: The last query (<<PLAN>>) uses <<FIELD>>, which is no longer in the data, so it cannot be changed. Please ask the full question.
 clarify_bad_ops: I could not apply that change to the last query (<<PLAN>>). Please ask the full question.
 clarify_too_many_ops: That is more than three changes at once to the last query (<<PLAN>>). Please ask one change at a time, or the full question.

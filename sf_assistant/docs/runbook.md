@@ -146,8 +146,12 @@ one of this machine's) and add the firewall rules again for the new address.
   (each cut to 1,500 characters, the oldest pair dropped while the request would pass 15,000 bytes). The worker then
   runs `Pipeline.answer_followup`: the ask service's rewrite (`agent/followup.py`, the same rules), the answer to the
   rewritten question with its `Read as:` line first, or the unclear line (`I could not tell what this refers to...`)
-  and no other model call. A question complete on its own is answered as typed when the rewrite call fails or the model
-  rewords it (`detail.rewrite.answered` = `typed`); the model's own UNCLEAR stays a refusal. With no earlier answer the
+  and no other model call. When the rewrite named what is missing (development B of 2026-11-27: `UNCLEAR
+  missing=...`), one line asks for it first ("Fewer than how many interviews, and over which period?"), from the
+  fixed parts of `prompts/followup_unclear.md` and the person's typed words only; `detail.rewrite.missing` holds the
+  codes and `offer` whether an earlier question's words were offered back. A question complete on its own is
+  answered as typed when the rewrite call fails or the model rewords it (`detail.rewrite.answered` = `typed`); the
+  model's own UNCLEAR stays a refusal. With no earlier answer the
   question goes to `Pipeline.answer` unchanged. A `recent_turns` of another shape gets 400. The web log's `ask` line
   says how many turns came (`turns`) and its `detail.rewrite` what the rewrite did and how long its call took
   (`seconds`).
@@ -368,9 +372,9 @@ removes the socket only if the path still holds its own.
 it says so and stops; `./run.sh up` builds it. A new `web/requirements.lock` therefore reaches this service only after
 the page's project has rebuilt the image, and then through `./run.sh up-ask` (a plain restart keeps the old image).
 
-**Copy `agent/followup.py` and `prompts/followup_rewrite.md` together, always.** The page and the service import every
-module of `sf_assistant.agent` at their start, and that module reads its prompt file at import. `followup.py` without its
-prompt file (the page's folder, a hand copy) stops the page at its next start.
+**Copy `agent/followup.py`, `prompts/followup_rewrite.md` and `prompts/followup_unclear.md` together, always.** The
+page and the service import every module of `sf_assistant.agent` at their start, and that module reads its prompt files
+at import. `followup.py` without them (the page's folder, a hand copy) stops the page at its next start.
 
 How it behaves:
 
