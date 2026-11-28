@@ -68,8 +68,9 @@ def test_registry_surface(tools):
     assert all(set(t) == {"name", "description", "inputSchema"} for t in mcp)
     oa = tools.openai_tools()
     assert all(t["type"] == "function" and set(t["function"]) == {"name", "description", "parameters"} for t in oa)
-    # the §9.1 fragments inlined in 14 schemas: about 41k characters, 42.6k with trend_records part_filters (2026-11-16)
-    assert len(json.dumps(oa)) < 43_000
+    # the §9.1 fragments inlined in 14 schemas: about 41k characters, 42.6k with trend_records part_filters (2026-11-16),
+    # 44.1k with the at-most count of a related condition (round 2 of the pre-release fixes, 2026-11-28)
+    assert len(json.dumps(oa)) < 44_500
     assert "$ref" not in json.dumps(oa)
 
 
@@ -2460,3 +2461,34 @@ def test_status_field_text_rules(ptools):
         assert ptools._status_field(s).api == "Status__c"
     finally:
         values.pop(("Zeta_Thing__c", "Status__c"), None)
+
+
+def test_members_with_fewer_than_n_related_records_include_those_with_none(tools):
+    """Round 2 of the pre-release fixes (D1 shape: "how many of these recruiters have fewer than 3 interviews in 2024
+    and 2025"): one count of the members with ``max_count``, those with no interview in the period included. Dept One
+    holds Recruiter A (3 client interviews dated in 2026, none before) and Recruiter B #2 (1 in 2026)."""
+    def members(period, most, least=None):
+        rel = {"child_object": "Interview__c", "via_field": "Recruiter__c", "exists": True, "max_count": most,
+               "date_field": "Date_of_Interview__c", "period": period}
+        if least is not None:
+            rel["min_count"] = least
+        r = ok(tools, "count_records", {"object": "Recruiter__c", "related": [rel],
+                                        "filters": [{"field": "Department__c", "op": "eq", "value": "Dept One"}]})
+        return r["count"], r
+    assert members("2024-01-01 to 2025-12-31", 2)[0] == 2        # both members have none in those years: both count
+    assert members("2026", 2)[0] == 1                            # Recruiter A has 3: only Recruiter B #2
+    assert members("2026", 3)[0] == 2
+    assert members("2026", 0)[0] == 0                            # at most 0 is "none", as exists=false says
+    count, r = members("2026", 3, least=2)
+    assert count == 1 and any("has 2 to 3 Interview__c" in t for t in r["applied"]["related"])
+    _c, r = members("2025", 2)
+    assert any("at most 2 Interview__c" in t and "none included" in t for t in r["applied"]["related"])
+    # the same through a grouping of the children leaves out the members with none: the shape the agent got wrong
+    grouped = ok(tools, "group_records", {"object": "Interview__c", "group_by": "Recruiter__c",
+                                          "filters": [{"field": "Recruiter__c.Department__c", "op": "eq",
+                                                       "value": "Dept One"}],
+                                          "date_field": "Date_of_Interview__c", "period": "2024-01-01 to 2025-12-31"})
+    assert grouped["groups"] == []
+    e = err(tools, "count_records", {"object": "Recruiter__c", "related": [
+        {"child_object": "Interview__c", "via_field": "Recruiter__c", "exists": True, "max_count": -1}]})
+    assert "max_count" in e and "at least 0" in e

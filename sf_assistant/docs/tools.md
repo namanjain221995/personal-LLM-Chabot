@@ -1368,7 +1368,7 @@ Input schema:
     "related": {
       "type": "array",
       "maxItems": 2,
-      "description": "Conditions on child records that point to this record. exists=false keeps records with NO such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at least that many.",
+      "description": "Conditions on child records that point to this record. exists=false keeps records with NO such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at least that many. max_count: at most that many, records with none included ('fewer than 3' = max_count 2).",
       "items": {
         "type": "object",
         "properties": {
@@ -1382,6 +1382,11 @@ Input schema:
             "type": "integer",
             "minimum": 1,
             "description": "With exists=true: at least this many matching children (1 = exists)."
+          },
+          "max_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "With exists=true: at most this many (0 kept)."
           },
           "via_field": {
             "type": "string",
@@ -1631,7 +1636,7 @@ Input schema:
     "related": {
       "type": "array",
       "maxItems": 2,
-      "description": "Conditions on child records that point to this record. exists=false keeps records with NO such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at least that many.",
+      "description": "Conditions on child records that point to this record. exists=false keeps records with NO such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at least that many. max_count: at most that many, records with none included ('fewer than 3' = max_count 2).",
       "items": {
         "type": "object",
         "properties": {
@@ -1645,6 +1650,11 @@ Input schema:
             "type": "integer",
             "minimum": 1,
             "description": "With exists=true: at least this many matching children (1 = exists)."
+          },
+          "max_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "With exists=true: at most this many (0 kept)."
           },
           "via_field": {
             "type": "string",
@@ -1903,7 +1913,7 @@ Input schema:
     "related": {
       "type": "array",
       "maxItems": 2,
-      "description": "Conditions on child records that point to this record. exists=false keeps records with NO such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at least that many.",
+      "description": "Conditions on child records that point to this record. exists=false keeps records with NO such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at least that many. max_count: at most that many, records with none included ('fewer than 3' = max_count 2).",
       "items": {
         "type": "object",
         "properties": {
@@ -1917,6 +1927,11 @@ Input schema:
             "type": "integer",
             "minimum": 1,
             "description": "With exists=true: at least this many matching children (1 = exists)."
+          },
+          "max_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "With exists=true: at most this many (0 kept)."
           },
           "via_field": {
             "type": "string",
@@ -2198,7 +2213,7 @@ Input schema:
     "related": {
       "type": "array",
       "maxItems": 2,
-      "description": "Conditions on child records that point to this record. exists=false keeps records with NO such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at least that many.",
+      "description": "Conditions on child records that point to this record. exists=false keeps records with NO such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at least that many. max_count: at most that many, records with none included ('fewer than 3' = max_count 2).",
       "items": {
         "type": "object",
         "properties": {
@@ -2212,6 +2227,11 @@ Input schema:
             "type": "integer",
             "minimum": 1,
             "description": "With exists=true: at least this many matching children (1 = exists)."
+          },
+          "max_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "With exists=true: at most this many (0 kept)."
           },
           "via_field": {
             "type": "string",
@@ -2536,7 +2556,7 @@ Input schema:
     "related": {
       "type": "array",
       "maxItems": 2,
-      "description": "Conditions on child records that point to this record. exists=false keeps records with NO such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at least that many.",
+      "description": "Conditions on child records that point to this record. exists=false keeps records with NO such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at least that many. max_count: at most that many, records with none included ('fewer than 3' = max_count 2).",
       "items": {
         "type": "object",
         "properties": {
@@ -2550,6 +2570,11 @@ Input schema:
             "type": "integer",
             "minimum": 1,
             "description": "With exists=true: at least this many matching children (1 = exists)."
+          },
+          "max_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "With exists=true: at most this many (0 kept)."
           },
           "via_field": {
             "type": "string",
@@ -2786,7 +2811,7 @@ Input schema:
     "related": {
       "type": "array",
       "maxItems": 2,
-      "description": "Conditions on child records that point to this record. exists=false keeps records with NO such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at least that many.",
+      "description": "Conditions on child records that point to this record. exists=false keeps records with NO such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at least that many. max_count: at most that many, records with none included ('fewer than 3' = max_count 2).",
       "items": {
         "type": "object",
         "properties": {
@@ -2800,6 +2825,11 @@ Input schema:
             "type": "integer",
             "minimum": 1,
             "description": "With exists=true: at least this many matching children (1 = exists)."
+          },
+          "max_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "With exists=true: at most this many (0 kept)."
           },
           "via_field": {
             "type": "string",
@@ -3041,7 +3071,7 @@ Input schema:
     "related": {
       "type": "array",
       "maxItems": 2,
-      "description": "Conditions on child records that point to this record. exists=false keeps records with NO such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at least that many.",
+      "description": "Conditions on child records that point to this record. exists=false keeps records with NO such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at least that many. max_count: at most that many, records with none included ('fewer than 3' = max_count 2).",
       "items": {
         "type": "object",
         "properties": {
@@ -3055,6 +3085,11 @@ Input schema:
             "type": "integer",
             "minimum": 1,
             "description": "With exists=true: at least this many matching children (1 = exists)."
+          },
+          "max_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "With exists=true: at most this many (0 kept)."
           },
           "via_field": {
             "type": "string",

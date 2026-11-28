@@ -14,7 +14,7 @@ import copy
 PROMPT_CHANGES: dict[str, dict] = {
     "records_agent_system": {
         "name": "RECORDS_AGENT_SYSTEM",
-        "version": 6,
+        "version": 7,
         "why": "Group B people fixes (docs/people.md): items 10 (a profile lookup is read from the person's own "
                "record: answer the direction asked and name the field), 11 (say how many records are in each "
                "status) and 7g (a role or purpose split is no filter; review fixes 2026-10-21); version 4, the "
@@ -23,7 +23,9 @@ PROMPT_CHANGES: dict[str, dict] = {
                "(step 1, Named records); version 5, the placement fixes (2026-11-16): a business term the hints "
                "list is the owner's definition (step 1), a rate per period is one trend_records call with "
                "part_filters (step 3), and two examples of the placement term; version 6 (review of "
-               "2026-11-16): a third example, candidates placed count different candidates",
+               "2026-11-16): a third example, candidates placed count different candidates; version 7 (round 2 "
+               "of the pre-release fixes, 2026-11-28, D1 shape): how many of a group have fewer than N child "
+               "records (max_count, those with none included), and its example",
         "edits": [
             ("     show: a record that is not finished is assigned, not done), not only the first. Call each\n"
              "     relation by its lookup's own role or label (a reporting line is not a manager). With no link,\n",
@@ -78,6 +80,11 @@ PROMPT_CHANGES: dict[str, dict] = {
              "\"Interview__c\",\"grain\":\"month\",\"date_field\":\"Date_of_Interview__c\",\"period\":"
              "\"this year\",\"filters\":[{\"field\":\"Interview_Outcome__c\",\"op\":\"eq\",\"value\":"
              "\"Offer Received\"}],\"measure\":\"count_distinct\",\"measure_field\":\"Candidate__c\"}\n"),
+            # version 7 (round 2 of the pre-release fixes, 2026-11-28): fewer than N child records, none included
+            ('   without child records: related=[{"child_object": "...", "exists": false}].\n',
+             '   without child records: related=[{"child_object": "...", "exists": false}]. How many of a group\n   have fewer than N child records in a period (those with none count too): count the group\'s own\n   object once, with related=[{..., "exists": true, "max_count": N-1, "date_field", "period"}];\n   never piece it together from a grouping of the children, which leaves out those with none.\n'),
+            ('"related":[{"child_object":"Session__c","exists":true,"min_count":5}]}\n',
+             '"related":[{"child_object":"Session__c","exists":true,"min_count":5}]}\n- Recruiters of a department with fewer than 3 client interviews in 2025, those with none included -> count_records {"object":"Recruiter__c","filters":[{"field":"Department__c","op":"eq","value":"<department>"}],"related":[{"child_object":"Interview__c","via_field":"Recruiter__c","exists":true,"max_count":2,"date_field":"Date_of_Interview__c","period":"2025"}]}\n'),
         ],
     },
     "records_unsupported_message": {
@@ -131,14 +138,22 @@ def notebook_tools(tools: list[dict]) -> list[dict]:
     notebook's list taken out: the rate per period of trend_records (placement fixes, 2026-11-16:
     registry.TREND_RATE_TEXT in its description and the part_filters argument) and the page of list_records
     (development A of 2026-11-27: its limit's maximum LIMITS.list_max_rows and its description, the notebook's 50 and
-    "Rows to return (default 10)."). The golden hashes of tests/golden/tool_lists.json are the notebook's, so they
-    compare with this view."""
+    "Rows to return (default 10)."), and the at-most count of a related condition (round 2 of the pre-release fixes
+    of 2026-11-28: registry.RELATED_MAX_TEXT in its description and the max_count argument). The golden hashes of
+    tests/golden/tool_lists.json are the notebook's, so they compare with this view."""
     from sf_assistant.config import LIMITS
-    from sf_assistant.tools.registry import TREND_RATE_TEXT
+    from sf_assistant.tools.registry import RELATED_MAX_TEXT, TREND_RATE_TEXT
 
     out = copy.deepcopy(tools)
+    seen: set[int] = set()   # one RELATED fragment may be shared by several schemas (deepcopy keeps that)
     for tool in out:
         fn = tool.get("function", tool)
+        related = fn.get("parameters", fn.get("inputSchema", {})).get("properties", {}).get("related")
+        if related is not None and id(related) not in seen:
+            seen.add(id(related))
+            assert related["description"].count(RELATED_MAX_TEXT) == 1
+            related["description"] = related["description"].replace(RELATED_MAX_TEXT, "", 1)
+            del related["items"]["properties"]["max_count"]
         if fn.get("name") == "list_records":
             limit = fn.get("parameters", fn.get("inputSchema"))["properties"]["limit"]
             assert limit["maximum"] == LIMITS.list_max_rows

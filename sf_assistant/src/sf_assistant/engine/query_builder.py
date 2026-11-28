@@ -884,6 +884,10 @@ def related_frag(scope: Scope, item: dict, n: int, ctx: BuildCtx,
     path = f"(via {child.api}.{via.api})"
     exists = item.get("exists", True)
     min_count = item.get("min_count")
+    max_count = item.get("max_count")
+    if max_count is not None:
+        frag, text = _count_range(body, child, cond_txt, path, exists, min_count, max_count)
+        return frag, text, notes, outs
     if min_count is not None and not exists:
         raise RecordError("min_count needs exists=true (at least N matching child records).", "E11d")
     if min_count is not None and int(min_count) <= 1:
@@ -899,6 +903,33 @@ def related_frag(scope: Scope, item: dict, n: int, ctx: BuildCtx,
         return Frag(f"EXISTS (SELECT 1 {body.sql})", body.params), f"has a {child.api}{cond_txt} {path}", notes, outs
     return (Frag(f"NOT EXISTS (SELECT 1 {body.sql})", body.params), f"has no {child.api}{cond_txt} {path}", notes,
             outs)
+
+
+def _count_range(body: Frag, child: Any, cond_txt: str, path: str, exists: Any, min_count: Any,
+                 max_count: Any) -> tuple[Frag, str]:
+    """The condition "at most ``max_count`` matching child records" (with ``min_count``: between the two), counted by
+    a correlated COUNT(*), so a record with no such child counts as 0 and is kept: "recruiters with fewer than 3
+    interviews in 2025" is ``max_count`` 2 and holds the recruiters with none (round 2 of the pre-release fixes of
+    2026-11-28, D1 shape: the record agent pieced such counts together by hand and missed the members with none)."""
+    hi = int(max_count)
+    if hi < 0:
+        raise RecordError("max_count must be 0 or more ('fewer than 3' is max_count 2; 'none' is exists=false).",
+                          "E11d")
+    if not exists:
+        raise RecordError("max_count goes with exists=true: it keeps the records with at most that many matching "
+                          "children, those with none included. For 'has none' use exists=false without max_count.",
+                          "E11d")
+    count = f"(SELECT COUNT(*) {body.sql})"
+    if min_count is None:
+        return (Frag(f"{count} <= ?", body.params + (hi,)),
+                f"has at most {hi} {child.api}{cond_txt} {path} (records with none included)")
+    lo = int(min_count)
+    if lo < 1:
+        raise RecordError("min_count must be at least 1. For 'has at least one' omit min_count (exists=true); for "
+                          "'has none' use exists=false.", "E11d")
+    if lo > hi:
+        raise RecordError(f"min_count {lo} is above max_count {hi}: no record can have both.", "E11d")
+    return Frag(f"{count} BETWEEN ? AND ?", body.params + (lo, hi)), f"has {lo} to {hi} {child.api}{cond_txt} {path}"
 
 
 # ------------------------------------------------------------------------------------- statements

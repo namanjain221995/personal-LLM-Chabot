@@ -2629,8 +2629,12 @@ def _call_text(call: dict, today: dt.date | None, label: Callable | None) -> str
     if _items(a.get("any_of")):
         parts.append(_w("any_of", FILTERS=_items_text(_items(a["any_of"]), obj, label, "or")))
     for r in _items(a.get("related")):
-        parts.append(_w("with_child" if r.get("exists", True) else "without_child",
-                        CHILD=_obj_word(r.get("child_object"), label)))
+        child = _obj_word(r.get("child_object"), label)
+        if r.get("max_count") is not None and r.get("exists", True):   # at most N, none included (round 2 fixes)
+            parts.append(_w("child_between", FROM=r["min_count"], TO=r["max_count"], CHILD=child)
+                         if r.get("min_count") is not None else _w("child_at_most", N=r["max_count"], CHILD=child))
+            continue
+        parts.append(_w("with_child" if r.get("exists", True) else "without_child", CHILD=child))
     when = _period_text(a.get("period"), call.get("period"), today,
                         a.get("grain") if tool == "trend_records" else None)
     if when:

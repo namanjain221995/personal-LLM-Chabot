@@ -127,7 +127,8 @@ _ENUM_SYNONYMS = {"monthly": "month", "daily": "day", "weekly": "week", "quarter
                   "descending": "desc", "ascending": "asc"}
 
 #: Integer arguments that are part of the question's meaning: below the minimum they are refused, not clamped.
-_NO_CLAMP = {"min_count": "For 'has at least one' omit min_count (exists=true); for 'has none' use exists=false."}
+_NO_CLAMP = {"min_count": "For 'has at least one' omit min_count (exists=true); for 'has none' use exists=false.",
+             "max_count": "'fewer than 3' is max_count 2, 'none' is exists=false."}
 #: What the "also stored in" overlap of a filter is counted against, by default (see ``_also_notes``).
 RESULT_CONDS = "all conditions of this query"
 
