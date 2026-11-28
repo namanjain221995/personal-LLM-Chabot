@@ -359,7 +359,9 @@ def test_row_3_a_non_local_model_address_is_failed_with_no_call(make):
 def test_row_4_unclear_or_a_broken_rule_gives_the_fixed_line(make, reply, reason):
     s = make(llm=FakeLLM(reply=reply))
     result = s.ask("and his joining date?", TURNS)
-    assert result == {"status": "unclear", "answer": ask_mcp.UNCLEAR_LINE, "kind": "none", "data_ts": None,
+    # prompt v9 (round 2 of the pre-release fixes): after the one word UNCLEAR code names the missing part ("his")
+    ask = 'Who do you mean by "his"?\n\n' if reply == "UNCLEAR" else ""
+    assert result == {"status": "unclear", "answer": ask + ask_mcp.UNCLEAR_LINE, "kind": "none", "data_ts": None,
                       "objects": [], "charts": []}
     assert s.ask_mod.calls == []                                                  # never answered
     assert s.asks()[-1]["reason"] == reason
@@ -698,7 +700,8 @@ def test_real_a_reply_that_is_no_question_starts_no_agent(world, reply):
              {"role": "assistant", "content": "Recruiter A and Delta Person."}]
     w = world(Model(COUNT, "There are 10.\n" + REAL_SOURCE, rewrite=reply))
     out = w.job("what is his status?", turns)["result"]
-    assert out["status"] == "unclear" and out["answer"] == ask_mcp.UNCLEAR_LINE
+    ask = 'Who do you mean by "his"?\n\n' if "unclear" in reply.casefold() else ""   # v9: code names it
+    assert out["status"] == "unclear" and out["answer"] == ask + ask_mcp.UNCLEAR_LINE
     assert {k for k, v in w.model.requests.items() if v} == {"rewrite"}
 
 

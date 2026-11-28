@@ -703,8 +703,9 @@ def test_the_page_with_memory_on_runs_a_complete_follow_up_as_typed_with_no_mode
     assert w.client.requests["rewrite"] == [] and w.client.requests["resolve"] == []
     assert out["log"]["rewrite"]["memory"]["action"] == "new"
     w.pipe.memory = None                                                          # the page as before: the rewrite
-    w.client.rewrite = ["UNCLEAR"]
-    assert w.pipe.answer_followup("and his?", TURNS)["answer"] == pipeline_mod.UNCLEAR_LINE
+    w.client.rewrite = ["UNCLEAR"]   # v9: the model decides, code names the missing part ("his": who)
+    assert w.pipe.answer_followup("and his?", TURNS)["answer"] == ('Who do you mean by "his"?\n\n'
+                                                                 + pipeline_mod.UNCLEAR_LINE)
     assert len(w.client.requests["rewrite"]) == 1
 
 
@@ -981,12 +982,19 @@ def test_b_an_unclear_follow_up_says_what_is_missing_alike_in_off_and_shadow(wor
     assert ask_mcp.UNCLEAR_LINE in replies["off"]["answer"]
 
 
-def test_b_with_no_code_off_and_shadow_say_todays_line(world):
+def test_b_with_the_one_word_unclear_code_names_the_parts_alike_in_off_and_shadow(world):
+    """Round 2 of the pre-release fixes (prompt v9): the model replies the one word UNCLEAR and code names the
+    missing parts and the reading from the typed words, so the person reads the same specific clarify as with v8."""
     for memory, v2 in ((OFF, False), (SHADOW, True)):
         w = world(memory)
         w.client.rewrite = ["UNCLEAR"]
         out = w.job(B_QUESTION, B_TURNS, state=None, gap=0) if v2 else w.job(B_QUESTION, B_TURNS)
-        assert out["reply"]["status"] == "unclear" and out["reply"]["answer"] == ask_mcp.UNCLEAR_LINE
+        assert out["reply"]["status"] == "unclear" and out["reply"]["answer"] == B_TEXT
+    # nothing code can name (no comparison, no vague period, no word that points back): today's line alone
+    w = world(OFF)
+    w.client.rewrite = ["UNCLEAR"]
+    out = w.job("how many joined", B_TURNS)
+    assert out["reply"]["status"] == "unclear" and out["reply"]["answer"] == ask_mcp.UNCLEAR_LINE
 
 
 def test_b_with_memory_on_the_resolvers_unclear_line_uses_the_same_parts(world):
@@ -998,9 +1006,9 @@ def test_b_with_memory_on_the_resolvers_unclear_line_uses_the_same_parts(world):
         outs[name] = w.job(B_QUESTION, B_TURNS, state=None, gap=0)
         assert len(w.client.requests["resolve"]) == 1 and w.client.requests["record"] == []
     plain, coded = outs["plain"], outs["coded"]
-    assert plain["reply"]["answer"] == ask_mcp.UNCLEAR_LINE
-    assert coded["reply"]["answer"] == ('Fewer than how many tickets, and which years do you mean by "last years"?'
-                                        '\n\n' + ask_mcp.UNCLEAR_LINE)
+    # round 2 of the pre-release fixes: with no code from the model, code names the parts and the reading
+    assert plain["reply"]["answer"] == B_TEXT
+    assert coded["reply"]["answer"] == B_TEXT   # the model's codes, with the person's list question as the reading
     # the same decision: status, reason codes and the next state's kind
     assert {k: v for k, v in coded["reply"].items() if k not in ("answer", "state")} == {
         k: v for k, v in plain["reply"].items() if k not in ("answer", "state")}
@@ -1014,8 +1022,10 @@ def test_b_the_page_says_what_is_missing_too(world):
     out = w.pipe.answer_followup(B_QUESTION, B_TURNS)
     assert out["answer"] == B_TEXT and out["kind"] == "none"
     assert out["log"]["rewrite"]["missing"] == "number,period" and out["log"]["rewrite"]["offer"] is True
-    w.client.rewrite = ["UNCLEAR"]
+    w.client.rewrite = ["UNCLEAR"]   # v9: code names the parts after the one word
     out = w.pipe.answer_followup(B_QUESTION, B_TURNS)
+    assert out["answer"] == B_TEXT and out["log"]["rewrite"]["missing"] == "number,period"
+    out = w.pipe.answer_followup("how many joined", B_TURNS[:1] + B_TURNS[1:])
     assert out["answer"] == pipeline_mod.UNCLEAR_LINE and "missing" not in out["log"]["rewrite"]
 
 
@@ -1052,3 +1062,5 @@ def test_c_a_partial_answer_asks_for_the_rest_on_the_service_and_the_page(world)
     then = C_TURNS + [{"role": "user", "content": "fewer than 3"}, {"role": "assistant", "content": out["answer"]}]
     out = w.pipe.answer_followup("in 2024 and 2025", then)
     assert C_WHOLE in out["answer"] and out["log"]["rewrite"]["reason"] == "clarify_answer"
+
+

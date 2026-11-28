@@ -146,10 +146,13 @@ one of this machine's) and add the firewall rules again for the new address.
   (each cut to 1,500 characters, the oldest pair dropped while the request would pass 15,000 bytes). The worker then
   runs `Pipeline.answer_followup`: the ask service's rewrite (`agent/followup.py`, the same rules), the answer to the
   rewritten question with its `Read as:` line first, or the unclear line (`I could not tell what this refers to...`)
-  and no other model call. When the rewrite named what is missing (development B of 2026-11-27: `UNCLEAR
-  missing=...`), one line asks for it first ("Fewer than how many interviews, and over which period?"), from the
-  fixed parts of `prompts/followup_unclear.md` and the person's typed words only; `detail.rewrite.missing` holds the
-  codes and `offer` whether an earlier question's words were offered back. The person's answer to that line
+  and no other model call. When something is missing (development B of 2026-11-27), one line asks for it first
+  ("Fewer than how many interviews, and over which period?"), from the fixed parts of `prompts/followup_unclear.md`
+  and the person's typed words only; `detail.rewrite.missing` holds the codes and `offer` whether an earlier
+  question's words were offered back. Since prompt v9 (round 2 of the pre-release fixes, 2026-11-28) the model only
+  decides (the question, or the one word UNCLEAR, as in v6) and code names the missing parts after an UNCLEAR
+  (`followup._code_parts`: a comparison with no number, a period that is not exact, the person's earlier list
+  question as the reading, else who for a word that points back). The person's answer to that line
   ("fewer than 3, in 2024 and 2025") is read by code (pre-release fixes of 2026-11-28): it puts the number and the
   period into the asked question and runs it with no rewrite call (`detail.rewrite.reason` = `clarify_answer`), asks
   again only for a part the answer left open, and gives a who or object answer to the model with a `CLARIFY ANSWER`

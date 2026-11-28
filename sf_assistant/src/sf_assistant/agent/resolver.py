@@ -203,7 +203,8 @@ class Resolution:
     ``prompt_tokens`` (the estimated size of the resolver prompt; in shadow, the size it would have) are for the
     timeline. ``reply`` is the model's text behind a refusal, for the private log only. ``missing``: what an unclear
     reply of the model said is missing (codes of ``followup.MISSING_CODES``), on a reply of status ``unclear`` only;
-    the caller's text reads it (``followup.unclear_text``), no decision does."""
+    the caller's text reads it (``followup.unclear_text``), no decision does. ``about``: the reading code offers with
+    those codes (``followup._code_parts``: the person's last list question, for a group word), or ""."""
 
     action: str
     reason: str
@@ -230,6 +231,7 @@ class Resolution:
     info: dict = field(default_factory=dict, compare=False)
     reply: str = field(default="", compare=False, repr=False)
     missing: tuple[str, ...] = ()
+    about: str = ""
 
     def log(self) -> dict:
         """The private log entry: fixed codes and numbers only (no question, no turn, no value, no answer text)."""
@@ -1243,7 +1245,9 @@ class _Job:
             if lost:
                 return self._fallback(None, f"rewrite_{lost}")
             return self._new(step, "new", got.question, detail=detail)
-        return self._fallback(None, f"rewrite_{got.reason}")
+        # a reading the rewrite refused as a vague count keeps what it found missing (round 2)
+        said = {"kind": "unclear", "standalone": "", "ops": [], "missing": got.missing} if got.missing else None
+        return self._fallback(said, f"rewrite_{got.reason}")
 
     def _choice(self, choice: dict) -> Resolution:
         if _is_no(choice):
@@ -1262,8 +1266,16 @@ class _Job:
         the checks); without one, the caller's unclear line. What an unclear reply said is missing changes only the
         words (development B): the codes go with the unclear reply, and the clarify with no choice asks for them."""
         missing = tuple((reply or {}).get("missing") or ()) if (reply or {}).get("kind") == "unclear" else ()
+        about = ""
+        if (reply or {}).get("kind") == "unclear":
+            # round 2 of the pre-release fixes: as after the rewrite's plain UNCLEAR, code names what the typed words
+            # leave open, and the person's list question as the reading (the words only: the decision is the model's)
+            if not missing:
+                missing, about = _followup._code_parts(self.question, self.last4)
+            elif "who" not in missing:
+                about = _followup._group_reading(self.question, self.last4)
         if not self.plan_ok:
-            return dataclasses.replace(self._unclear(5, detail), missing=missing)
+            return dataclasses.replace(self._unclear(5, detail), missing=missing, about=about)
         choices: list[dict] = []
         if reply and reply.get("ops") and not self.checked.missing:
             canon = qs.normalize_ops(reply["ops"])
@@ -1286,7 +1298,7 @@ class _Job:
         if self.checked.missing:
             return self._clarify(5, _say("field_removed", plan=self.line, field=self.checked.missing[0]),
                                  detail="field_removed")
-        ask = _followup.unclear_ask(self.question, missing)
+        ask = _followup.unclear_ask(self.question, missing, about)
         text = _say("unclear_plan_ask", plan=self.line, ask=ask) if ask else _say("unclear_plan", plan=self.line)
         return self._clarify(5, text, detail=detail or "unclear_plan")
 

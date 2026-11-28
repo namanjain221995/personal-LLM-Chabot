@@ -906,7 +906,7 @@ def _job_on(pipeline: Any, question: str, turns: Any, mem: _MemoryJob, seen: dic
         if res.status == "unclear":
             # no rewrite_reply (stage-2 review fix L3): the resolver's prompt held the summary, the plan and 12 turns,
             # and the log never holds them; the memory entry has the resolver's codes and the reply's size
-            text = unclear_text(question, res.missing, fixed=UNCLEAR_LINE)   # the rewrite's parts (development B)
+            text = unclear_text(question, res.missing, res.about, fixed=UNCLEAR_LINE)   # the rewrite's parts (dev B)
             return _out(mem, _result("unclear", text), f"resolver_{res.detail or res.reason}",
                         v2="unclear_rewrite", kind="unclear")
         if res.reason == "resolver_error":   # a fault of the resolver itself: today's rewrite answers

@@ -81,7 +81,11 @@ there, for a pointing word of the typed question, and ``who`` is not among the c
 :func:`unclear_text` writes the person's reply from fixed parts (``prompts/followup_unclear.md``) and the person's own
 typed words, then the caller's fixed unclear line, which the platform bridge looks for in the last answer
 (``sfk_bridge.follows_a_stop_line``); with no code it is that line alone, as before. No word of the model reaches the
-person but a code and that checked reading.
+person but a code and that checked reading. Since prompt v9 (round 2 of the pre-release fixes, 2026-11-28) the model
+replies only the question or the one word UNCLEAR, as in v6 (the codes in the prompt pulled pointer chains to
+UNCLEAR), and code names the parts after that word (:func:`_code_parts`: a comparison with no number, a period that is
+not exact, the person's earlier list question as the reading of a group word, else ``who`` for a word that points
+back); a reply that still carries codes is read as above.
 
 The person's answer to such a clarify (pre-release fixes of 2026-11-28): when the last answer is exactly code's own
 coded clarify of an earlier user turn (:func:`_clarified`: :func:`unclear_ask` of that turn gives the same text back,
@@ -1455,6 +1459,105 @@ def unclear_text(question: Any, missing: Any, about: Any = "", *, fixed: str) ->
     return f"{ask}\n\n{fixed}" if ask else fixed
 
 
+# ------------------------------------------------------------------------------- what is missing, named by code
+# Round 2 of the pre-release fixes (2026-11-28, set_r8 bar 1b): with the codes in the rewrite prompt (v7, v8) the model
+# also decided UNCLEAR more often on pointer chains that it rewrote in v6. The prompt is v6 again (v9): the model only
+# decides, and code names what is missing from the person's typed words after a plain UNCLEAR.
+#: words after "more" or "less" that make no comparison of a count ("tell me more about them", "more details")
+_NOT_COMPARED = frozenset("""about info information detail details data records record""".split())
+
+
+def _needs_number(question: str) -> bool:
+    """The typed question compares with no number: a comparison word (:data:`_FEWER_WORDS`, :data:`_MORE_WORDS`)
+    before "than" or a noun ("less interviews", "more than offers"), or a Hinglish one after its noun ("interviews
+    kam"), with no number in the three words after it (or before it, for the Hinglish "3 se kam"). A number elsewhere
+    ("Dept One", "in the last 3 months") is no number of the comparison."""
+    words = _words(_PERIOD_RE.sub(" ", question))
+
+    def number(ws: list[str]) -> bool:
+        return any(w in _NUMBER_WORDS or (w.isdigit() and len(w) <= 3) for w in ws)
+
+    for i, w in enumerate(words):
+        if w not in _FEWER_WORDS | _MORE_WORDS:
+            continue
+        after = words[i + 1] if i + 1 < len(words) else ""
+        before = words[i - 1] if i else ""
+        compares = (after == "than" or (_noun(after) and after not in _NOT_COMPARED)
+                    or (w in _NOUN_BEFORE and _noun(before)))
+        if compares and not number(words[i + 1:i + 4]) and not (w in _NOUN_BEFORE and number(words[max(0, i - 3):i])):
+            return True
+    return False
+
+
+def _needs_period(question: str) -> bool:
+    """The typed question says a period that is not exact ("last years", "recently", :data:`_VAGUE_PERIOD_RE`) and no
+    exact one."""
+    if not _VAGUE_PERIOD_RE.search(question):
+        return False
+    return not any(not _VAGUE_PERIOD_RE.fullmatch(m.group(0)) for m in _PERIOD_RE.finditer(question))
+
+
+def _group_reading(question: str, turns: list[dict]) -> str:
+    """The reading code offers for the one group word of ``question`` ("them", "those"): the person's last question
+    before it, when that asked for a list of a group ("list out all recruiters of the D1 department": "the recruiters
+    of the D1 department"), checked as :func:`_offer` checks a reading; "" for anything else (no such question, a
+    person or a thing pointed at too, punctuation inside the question)."""
+    words = set(_words(question))
+    if not words & _GROUP_WORDS or words & (_PERSON_POINTERS | _THING_POINTERS) or _AT_A_PERSON_RE.search(question):
+        return ""
+    last = next((t["content"] for t in reversed(turns) if t.get("role") == "user"), "")
+    tokens = list(_WORD_RE.finditer(last))
+    if not tokens:
+        return ""
+    span = last[tokens[0].start():tokens[-1].end()]
+    if not _PLAIN_RUN_RE.fullmatch(span) or _short_reading(span) == span:
+        return ""
+    return _offer(span, question, turns)
+
+
+#: pointing words that often point inside the question itself ("How long does it take", "candidates updated their
+#: status"): alone they name no missing ``who``
+_INSIDE_POINTERS = frozenset({"it", "its", "their"})
+
+
+def _points_back(question: str) -> bool:
+    """:func:`_typed_pointer` without the words that often point inside the question itself (:data:`_INSIDE_POINTERS`):
+    "his", "them", "those", "uska", "that person"."""
+    words = set(_words(question)) & (_POINTING | _GROUP_POINTERS | _SAME_RECORDS)
+    return bool(words - _INSIDE_POINTERS) or bool(_POINTED_RE.search(question))
+
+
+#: the words of a count ("how many", Hinglish "kitne", "count")
+_COUNT_ASK_RE = re.compile(r"(?<![^\W_])(?:how\s+many|kitn[aie]|count)(?![^\W_])", re.IGNORECASE)
+
+
+def _vague_count(question: str, reply: str) -> tuple[str, ...]:
+    """The parts a count still lacks after a rewrite: the typed question counts ("how many", "kitne") with a
+    comparison that has no number or a period that is not exact ("how many of them have less interviews in last
+    years"), and the rewritten question still lacks the same (the model put nothing in). () otherwise. A comparison
+    of named records ("who hosted more interviews, A or B?") counts nothing and is never one. Round 2 of the
+    pre-release fixes: with the v6 decision the model rewrote such a count and the record agent guessed."""
+    if not _COUNT_ASK_RE.search(question):
+        return ()
+    return tuple(c for c, needs in (("number", _needs_number), ("period", _needs_period))
+                 if needs(question) and needs(reply))
+
+
+def _code_parts(question: str, turns: list[dict]) -> tuple[tuple[str, ...], str]:
+    """``(codes, about)`` code names for a follow-up the model found UNCLEAR, from the typed words only: ``number``
+    (:func:`_needs_number`) and ``period`` (:func:`_needs_period`), with the reading of a group word when the person's
+    last question listed that group (:func:`_group_reading`); with neither, ``who`` when a word points back
+    (:func:`_points_back`). ((), "") otherwise: the caller's fixed line alone. Only the words; the decision is the
+    model's. Never raises."""
+    try:
+        codes = tuple(c for c, needs in (("number", _needs_number), ("period", _needs_period)) if needs(question))
+        if codes:
+            return codes, _group_reading(question, turns)
+        return (("who",), "") if _points_back(question) else ((), "")
+    except Exception:  # noqa: BLE001 - no code: the fixed line alone
+        return (), ""
+
+
 # ------------------------------------------------------------------------------- the answer to a coded clarify
 # Pre-release check of 2026-11-27 (RO-C step 3): after the coded clarify of an unclear follow-up ("Do you mean the
 # recruiters of the D1 department? Fewer than how many interviews, and which years do you mean by "last years"?"), the
@@ -1856,6 +1959,13 @@ def rewrite(question: str, turns: Any, llm: Any, *, code_line: bool = False) -> 
             and (_names_its_own(question) or _ORG_WORDS & set(_words(question)))):
         return Rewrite(OK, question)
     if not any(ch.isalnum() for ch in said) or _UNCLEAR_RE.fullmatch(said):
+        if coded is None and not cut and _UNCLEAR_RE.fullmatch(said):
+            # v9: the model decides, code names what is missing (round 2 of the pre-release fixes)
+            codes, reading = _code_parts(asked or question, usable)
+            if not codes:
+                return refused("unclear")
+            return Rewrite(UNCLEAR, reason="unclear", reply=text[:MAX_TURN_CHARS], missing=codes, about=reading,
+                           asked=asked)
         if coded is None or not coded[0]:
             return refused("unclear")
         codes, about = coded
@@ -1868,4 +1978,10 @@ def rewrite(question: str, turns: Any, llm: Any, *, code_line: bool = False) -> 
                                                                 and not drop_contact_details(question)[1]):
         return refused("contact_changed")
     why = _unbound(question, said, usable, code_line=code_line)
-    return refused(why) if why else Rewrite(OK, said)
+    if why:
+        return refused(why)
+    vague = _vague_count(question, said)
+    if vague:   # v6 rewrote such a count and the record agent guessed the number or the period (RO step 2)
+        return Rewrite(UNCLEAR, reason="unclear", reply=text[:MAX_TURN_CHARS], missing=vague,
+                       about=_group_reading(question, usable), asked=asked)
+    return Rewrite(OK, said)

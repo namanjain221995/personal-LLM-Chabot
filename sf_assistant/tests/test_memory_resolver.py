@@ -1870,15 +1870,19 @@ def _decision(res):
             res.ops, res.plan_line)
 
 
-@pytest.mark.parametrize("question,state", [("how many of them have less interviews in last years", None),
-                                            ("and his leave balance?", None)])
-def test_b_with_no_plan_the_unclear_reply_carries_the_codes_and_decides_the_same(question, state):
+@pytest.mark.parametrize("question,state,named", [
+    ("how many of them have less interviews in last years", None, ("number", "period")),
+    ("and his leave balance?", None, ("who",)), ("how many joined", None, ())])
+def test_b_with_no_plan_the_unclear_reply_carries_the_codes_and_decides_the_same(question, state, named):
     plain, _ = _mr(question, state=state, reply=_coded("unclear"))
     coded, _ = _mr(question, state=state, reply=_coded("unclear", missing=["number", "period"]))
     assert _decision(coded) == _decision(plain) and (coded.status, coded.reason) == ("unclear", "unclear_rewrite")
-    assert plain.missing == () and coded.missing == ("number", "period")
-    assert coded.log()["missing_parts"] == "number,period" and "missing_parts" not in plain.log()
-    assert {k: v for k, v in coded.log().items() if k != "missing_parts"} == plain.log()
+    # round 2 of the pre-release fixes: with no code from the model, code names them from the typed words
+    assert plain.missing == named and coded.missing == ("number", "period")
+    assert coded.log()["missing_parts"] == "number,period"
+    assert plain.log().get("missing_parts", "") == ",".join(named)
+    assert {k: v for k, v in coded.log().items() if k != "missing_parts"} == {
+        k: v for k, v in plain.log().items() if k != "missing_parts"}
 
 
 def test_b_with_a_plan_the_clarify_asks_for_what_is_missing_in_place_of_the_full_question():
@@ -1886,7 +1890,11 @@ def test_b_with_a_plan_the_clarify_asks_for_what_is_missing_in_place_of_the_full
     plain, _ = _mr(question, reply=_coded("unclear"))
     coded, _ = _mr(question, reply=_coded("unclear", missing=["period"]))
     assert _decision(coded) == _decision(plain) and plain.reason == "clarify" and plain.pending is None
-    assert plain.text == MR._say("unclear_plan", plan=plain.plan_line)
+    # round 2: with no code from the model, code names the vague period from the typed words: the same text
+    assert plain.text == coded.text
+    nothing, _ = _mr("and for them?", reply=_coded("unclear"))
+    assert nothing.text == MR._say("unclear_plan_ask", plan=nothing.plan_line,
+                                   ask=_F.unclear_ask("and for them?", ["who"]))
     assert coded.text == MR._say("unclear_plan_ask", plan=plain.plan_line, ask=_F.unclear_ask(question, ["period"]))
     assert coded.text == (f"I could not tell how this goes on from the last query ({plain.plan_line}). Which years "
                           f'do you mean by "last years"? Or ask the full question.')
@@ -1912,3 +1920,5 @@ def test_b_codes_on_another_kind_change_nothing():
 def test_b_shadow_never_has_codes():
     got = _shadow("how many of them have less interviews in last years")
     assert got.missing == () and "missing_parts" not in got.log()
+
+

@@ -3,6 +3,7 @@ names)."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import subprocess
@@ -120,12 +121,20 @@ def test_thinking_is_not_part_of_the_reply():
 
 
 # ------------------------------------------------------------------------------------ unclear and the output rule
+def _decision(out):
+    """``out`` without what code names as missing after a model UNCLEAR (v9: words only, never the decision)."""
+    return dataclasses.replace(out, missing=(), about="") if out.reason == "unclear" else out
+
+
 @pytest.mark.parametrize("reply", ["UNCLEAR", "UNCLEAR.", " UNCLEAR\n", "**UNCLEAR**", '"UNCLEAR"', "unclear",
                                    "Unclear", "Unclear.", "**Unclear**", "UNCLEAR?", "Reply: UNCLEAR", "Reply: unclear",
                                    "Answer: UNCLEAR", "Output: UNCLEAR", "</think>UNCLEAR", "\u200bUNCLEAR",
                                    "?", ".", "-", "..."])
 def test_unclear_in_any_dress(reply):
-    assert F.rewrite("what is his status?", TURNS, FakeLLM(reply=reply)) == F.Rewrite(F.UNCLEAR, reason="unclear")
+    # v9 (round 2 of the pre-release fixes): the model decides; after the word UNCLEAR code names what is missing from
+    # the typed words ("his": who), and a reply with no letter names nothing
+    out = F.rewrite("what is his status?", TURNS, FakeLLM(reply=reply))
+    assert out == F.Rewrite(F.UNCLEAR, reason="unclear", missing=("who",) if "unclear" in reply.casefold() else ())
 
 
 @pytest.mark.parametrize("reply", ["UNCLEAR: it could be two people", "UNCLEAR\nit could be two people",
@@ -408,15 +417,14 @@ def test_a_date_is_no_long_number():
 def test_the_prompts_examples_pass_the_rules_they_teach():
     """Each example of prompts/followup_rewrite.md, read from the file, through the code."""
     blocks = re.findall(r'Earlier: "(.*?)" / "(.*?)"\nNew: (.*?)\nReply: (.*?)(?:\n|$)', P.text("followup_rewrite"))
-    assert len(blocks) == 57
+    assert len(blocks) == 54
     for user, assistant, new, reply in blocks:
         turns = [{"role": "user", "content": user}, {"role": "assistant", "content": assistant}]
         out = F.rewrite(new, turns, FakeLLM(reply=reply))
         assert out.status == (F.UNCLEAR if reply.startswith("UNCLEAR") else F.OK), (new, out)
-        if reply.startswith("UNCLEAR"):   # v7 (development B): every UNCLEAR example names what is missing
-            codes = reply.split("missing=", 1)[1].split(" about=", 1)[0]
-            assert out.reason == "unclear" and out.missing == F.missing_codes(codes), new
-    assert P.load("followup_rewrite").version == 8
+        if reply.startswith("UNCLEAR"):   # v9: the one word, as in v6; code names what is missing
+            assert reply == "UNCLEAR" and out.reason == "unclear", new
+    assert P.load("followup_rewrite").version == 9
 
 
 def test_no_example_guesses_a_person_when_two_are_named():
@@ -1091,7 +1099,7 @@ def test_a_question_with_no_pointer_is_not_self_anchored(typed):
 
 def test_a_model_unclear_to_such_a_question_stays_refused():
     # it names no subject of its own, so a model UNCLEAR stays a refusal (see the module text, step 1)
-    assert F.rewrite(SELF_ANCHORED[0], M_C, FakeLLM(reply="UNCLEAR")) == F.Rewrite(F.UNCLEAR, reason="unclear")
+    assert _decision(F.rewrite(SELF_ANCHORED[0], M_C, FakeLLM(reply="UNCLEAR"))) == F.Rewrite(F.UNCLEAR, reason="unclear")
 
 
 def test_a_fragment_with_no_turn_goes_on_as_typed_with_no_call():
@@ -1820,7 +1828,7 @@ def test_unclear_from_the_model_on_a_question_with_its_own_subject_runs_the_type
     "list the leads that came from referrals last week",
 ])
 def test_unclear_from_the_model_stays_unclear_on_a_question_that_needs_the_turns(typed):
-    assert F.rewrite(typed, T4, FakeLLM(reply="UNCLEAR")) == F.Rewrite(F.UNCLEAR, reason="unclear")
+    assert _decision(F.rewrite(typed, T4, FakeLLM(reply="UNCLEAR"))) == F.Rewrite(F.UNCLEAR, reason="unclear")
 
 
 def test_only_unclear_itself_runs_a_complete_question_as_typed():
@@ -2363,7 +2371,7 @@ _R_REQ = _turns("How many offers are on REQ-0042?", "REQ-0042 has 5 offers.")
 
 
 def _refused(typed, turns, reply, reason):
-    assert F.rewrite(typed, turns, FakeLLM(reply=reply)) == F.Rewrite(F.UNCLEAR, reason=reason)
+    assert _decision(F.rewrite(typed, turns, FakeLLM(reply=reply))) == F.Rewrite(F.UNCLEAR, reason=reason)
 
 
 def _passes(typed, turns, reply):
@@ -3062,7 +3070,6 @@ def test_b_an_object_missing_asks_which_records():
 
 
 @pytest.mark.parametrize("reply,finish", [
-    ("UNCLEAR", "stop"),                                          # no code: today's line
     ("UNCLEAR missing=", "stop"),
     ("UNCLEAR missing=number,colour", "stop"),                    # one unknown code drops them all
     ("UNCLEAR missing=the threshold", "stop"),
@@ -3150,15 +3157,11 @@ def test_b_the_codes_and_the_prompt_versions_are_pinned():
     assert F.missing_codes(["period", "who"]) == ("who", "period") and F.missing_codes("number and period") == (
         "number", "period")
     assert F.missing_codes(7) == () and F.missing_codes(["number", 3]) == () and F.missing_codes("") == ()
-    assert P.load("followup_rewrite").version == 8 and P.load("followup_unclear").version == 1
+    assert P.load("followup_rewrite").version == 9 and P.load("followup_unclear").version == 1
     assert P.load("followup_resolve").version == 4
-    text = P.text("followup_rewrite")
-    assert "UNCLEAR missing=<codes>" in text and all(f"- {code}: " in text for code in F.MISSING_CODES)
-    # the prompt's own example of step 4 reads as it teaches
-    example = re.search(r'For example, "(.*?)" after the user asked "(.*?)": (UNCLEAR missing=\S+ about=[^.]+)\.',
-                        text)
-    question, earlier, reply = example.groups()
-    out = F.rewrite(question, _turns(earlier, "The sales team has 6 trainers."), FakeLLM(reply=reply))
+    # v8's own example of step 4, now with the one word UNCLEAR: code names the same parts and the same reading
+    question, earlier = "how many of them took fewer sessions in recent months", "list the trainers of the sales team"
+    out = F.rewrite(question, _turns(earlier, "The sales team has 6 trainers."), FakeLLM(reply="UNCLEAR"))
     assert (out.missing, out.about) == (("number", "period"), "the trainers of the sales team")
     # every part key the code reads is in the file, and no part holds a token code does not fill
     for key in ("who_person", "who_thing", "who_group", "who_plain", "object", "number_fewer", "number_more",
@@ -3319,20 +3322,76 @@ def test_c_the_number_and_the_period_go_in_as_typed():
 
 
 # ------------------------------------------------------------- pre-release fixes of 2026-11-28: rewrite v8
-def test_c_v8_decides_before_the_codes_and_its_examples_do_not_all_say_who():
-    """20 of 29 new refusals on set_r8 were UNCLEAR missing=who on pointers that resolved before, with all 5 UNCLEAR
-    examples of v7 coded who. v8: the decision first, a pointer one person or group fits is never missing, the codes
-    of the examples vary, and pointer examples resolve on the same kind of turns."""
+def test_v9_is_the_v6_decision_and_code_names_what_is_missing():
+    """Round 2 of the pre-release fixes (2026-11-28, set_r8 bar 1b): v8 still pulled pointer chains to UNCLEAR
+    missing=who (P63, P75, H122 in both runs). v9 is the v6 text again: the model replies the question or the one word
+    UNCLEAR, with no codes, and code names what is missing (``followup._code_parts``)."""
     text = P.text("followup_rewrite")
-    assert "Step 4. First decide with steps 1 to 3 alone" in text
-    assert "never missing: write the full question (step 3), never UNCLEAR" in text
+    assert "missing=" not in text and "about=" not in text and "Step 4." not in text and "CLARIFY ANSWER" not in text
+    assert "Reply with one line and nothing else: the question, or the one word UNCLEAR." in text
     blocks = re.findall(r'Earlier: "(.*?)" / "(.*?)"\nNew: (.*?)\nReply: (.*?)(?:\n|$)', text)
-    unclear = [r for _u, _a, _n, r in blocks if r.startswith("UNCLEAR")]
-    assert len(unclear) == 6 and sum(r == "UNCLEAR missing=who" for r in unclear) == 5
-    assert any("missing=number,period about=" in r for r in unclear)
-    resolved = {(u, n): r for u, _a, n, r in blocks if not r.startswith("UNCLEAR")}
-    assert resolved[("Who hosted INT-0003?", "what is his status?")] == "What is the status of Foxtrot Person?"
-    assert resolved[("list the analysts of the audit team", "how many of them joined in 2025?")] == (
-        "how many of the analysts of the audit team joined in 2025?")
-    # the clarify answer example of step 2 reads as it teaches, with the CLARIFY ANSWER line code adds
-    assert 'the NEW QUESTION "Delta Person" gives: when did Delta Person join?' in text
+    assert [r for _u, _a, _n, r in blocks if r.startswith("UNCLEAR")] == ["UNCLEAR"] * 5
+
+
+# ---------------------------------------------- round 2 of the pre-release fixes (2026-11-28): code names the parts
+# set_r8 bar 1b: with the codes in the prompt (v7, v8) the model refused pointer chains it rewrote in v6 (P63, P75,
+# H122 as UNCLEAR missing=who in both runs; C11, P29, F43, H79 through other rules). v9 is the v6 decision; code names
+# what is missing after the one word UNCLEAR, from the typed words only.
+@pytest.mark.parametrize("question,turns,codes,about", [
+    (B_SHAPE, B_LIST, ("number", "period"), "the analysts of the audit team"),
+    ("how many of them have less tickets in 2025", B_LIST, ("number",), "the analysts of the audit team"),
+    ("how many of them have less than 3 tickets in last years", B_LIST, ("period",), "the analysts of the audit team"),
+    ("how many of them have fewer than 3 tickets in the last 3 months", B_LIST, ("who",), ""),
+    ("interviews kam wale kitne hain recently", B_LIST, ("number", "period"), ""),
+    ("which of them closed more tickets in the past few months", B_LIST, ("number", "period"),
+     "the analysts of the audit team"),
+    # the reading only after a list of a group the person asked for, never a question or an answer's words
+    (B_SHAPE, _turns("how many analysts are in the audit team?", "4."), ("number", "period"), ""),
+    (B_SHAPE, _turns("list out all the analysts, of the audit team", "4."), ("number", "period"), ""),
+    # a person pointer with a vague period: no reading, the parts only
+    ("did he take fewer leaves recently", M_J, ("number", "period"), ""),
+    # nothing but a pointer: who; a pointer that points inside the question alone, or none: nothing
+    ("what is his status?", M_M, ("who",), ""),
+    ("tell me more about them", B_LIST, ("who",), ""),
+    ("How long does it take for a candidate to join?", M_J, (), ""),
+    ("how many joined", M_J, (), ""),
+])
+def test_r2_code_names_the_missing_parts_after_the_one_word_unclear(question, turns, codes, about):
+    out = F.rewrite(question, turns, FakeLLM(reply="UNCLEAR"))
+    assert (out.status, out.reason, out.missing, out.about) == (F.UNCLEAR, "unclear", codes, about)
+    assert F._code_parts(question, turns) == (codes, about)
+
+
+def test_r2_the_parts_never_change_the_decision_and_the_model_codes_still_read():
+    # a rewrite the model writes is read by the rules as before; the code's parts follow only the one word UNCLEAR
+    out = F.rewrite("how many of them joined in 2025", B_LIST,
+                    FakeLLM(reply="how many of the analysts of the audit team joined in 2025"))
+    assert out == F.Rewrite(F.OK, "how many of the analysts of the audit team joined in 2025")
+    # a model that still sends codes (an older prompt) is read as before
+    out = F.rewrite(B_SHAPE, B_LIST, FakeLLM(reply="UNCLEAR missing=period"))
+    assert out.missing == ("period",)
+    # a reply cut at the token limit, or with no letter: no parts
+    assert F.rewrite(B_SHAPE, B_LIST, FakeLLM(reply="UNCLEAR", finish="length")).missing == ()
+    assert F.rewrite(B_SHAPE, B_LIST, FakeLLM(reply="?")).missing == ()
+    # the specific clarify of development B is the same text as v8 gave
+    out = F.rewrite(B_SHAPE, B_LIST, FakeLLM(reply="UNCLEAR"))
+    assert F.unclear_text(B_SHAPE, out.missing, out.about, fixed=FIXED) == (
+        'Do you mean the analysts of the audit team? Fewer than how many tickets, and which years do you mean by '
+        '"last years"?\n\n' + FIXED)
+
+
+def test_r2_a_rewritten_count_that_still_lacks_its_number_or_period_asks():
+    """RO step 2 on live (v6): the model rewrote "how many of them have less interviews in last years" in full, and the
+    record agent guessed the number. A count that still lacks what the typed words leave open asks, with the parts."""
+    reply = "how many of the analysts of the audit team have less tickets in last years"
+    out = F.rewrite(B_SHAPE, B_LIST, FakeLLM(reply=reply))
+    assert (out.status, out.reason, out.missing, out.about) == (F.UNCLEAR, "unclear", ("number", "period"),
+                                                                "the analysts of the audit team")
+    # a count whose number and period the person typed runs as before
+    whole = "how many of the analysts of the audit team have less than 3 tickets in 2025"
+    out = F.rewrite("how many of them have less than 3 tickets in 2025", B_LIST, FakeLLM(reply=whole))
+    assert out == F.Rewrite(F.OK, whole)
+    # a comparison of named records counts nothing: never asked so (S53 of set_r8)
+    typed = "Who hosted more interviews, Echo One or Delta Person?"
+    assert F._vague_count(typed, typed) == ()
+    assert F._vague_count("how many hosted more than 3 interviews last years", "x last years") == ("period",)

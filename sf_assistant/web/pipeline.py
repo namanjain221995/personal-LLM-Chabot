@@ -685,7 +685,8 @@ class Pipeline:
                 out = self.answer(question, mode, memory=run)
                 out.setdefault("log", {})["rewrite"] = {**info, "answered": "typed"}
                 return out
-            text = {"answered": res.text, "unclear": unclear_text(question, res.missing, fixed=UNCLEAR_LINE)}.get(
+            text = {"answered": res.text,
+                    "unclear": unclear_text(question, res.missing, res.about, fixed=UNCLEAR_LINE)}.get(
                 res.status, REWRITE_FAILED_LINE)
             return {"answer": text, "kind": "none", "source_line": None, "data_ts": None,
                     "trace": {"mode": mode, "rewrite": dict(info), "queries": [], "timings": {}},
