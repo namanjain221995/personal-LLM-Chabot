@@ -1,0 +1,801 @@
+{
+ "chains": [
+  {
+   "id": "S5-W3",
+   "title": "Every account type drops the Person Account filter the record agent wrote itself; only candidates brings it back as code's",
+   "design": "step-5 model evaluation of 2026-11-27 (step5_model_eval.md), the real model's reply replayed; W3 (T04 step 2): a contract filter in the stored args is relaxed as the term rules relax it",
+   "steps": [
+    {
+     "q": "how many candidates by status",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Account",
+        "group_by": "Candidate_Status__c",
+        "filters": [
+         {
+          "field": "RecordTypeId",
+          "op": "eq",
+          "value": "PersonAccount"
+         }
+        ]
+       }
+      },
+      "The candidates by status are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Account",
+         "group_by": "Candidate_Status__c",
+         "filters": [
+          {
+           "field": "RecordTypeId",
+           "op": "eq",
+           "value": "PersonAccount"
+          }
+         ]
+        },
+        "term_filters": []
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Account",
+          "group_by": "Candidate_Status__c",
+          "filters": [
+           {
+            "field": "RecordTypeId",
+            "op": "eq",
+            "value": "PersonAccount"
+           }
+          ]
+         }
+        }
+       ],
+       "keys": [
+        "candidates"
+       ]
+      }
+     }
+    },
+    {
+     "q": "show the top 2 of all account types",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "set_top": {
+         "n": 2,
+         "order": "desc"
+        }
+       }
+      ]
+     },
+     "record": [
+      "All account types are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "note": "the real model's reply; the stored filter goes, so what runs is what the line says",
+     "expect": {
+      "reason": "patch",
+      "model": true,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Account",
+         "group_by": "Candidate_Status__c",
+         "top": 2,
+         "order": "desc"
+        },
+        "term_filters": []
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "group_records",
+         "args": {
+          "object": "Account",
+          "group_by": "Candidate_Status__c",
+          "top": 2,
+          "order": "desc"
+         }
+        }
+       ]
+      },
+      "plan_line_has": [
+       "top 2, every account type"
+      ],
+      "answer_not": [
+       "RecordTypeId",
+       "Person Accounts"
+      ],
+      "read_as": "plan_line"
+     }
+    },
+    {
+     "q": "only candidates, top 3",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "set_top": {
+         "n": 3,
+         "order": "desc"
+        }
+       }
+      ]
+     },
+     "record": [
+      "The candidates are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "model": true,
+      "contracts": [
+       "candidates"
+      ],
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Account",
+         "group_by": "Candidate_Status__c",
+         "top": 3,
+         "order": "desc"
+        },
+        "term_filters": [
+         "RecordTypeId = 'Person Account'"
+        ]
+       }
+      ],
+      "plan_line_has": [
+       "top 3, candidates as Person Accounts"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "S5-W1",
+   "title": "Compare with previous month after an answer of two counts compares both, the named one as the main call",
+   "design": "step-5 model evaluation of 2026-11-27 (step5_model_eval.md), the real model's reply replayed; W1 (C07 step 2): the main call is the count the question names, and the comparison covers what the answer showed",
+   "steps": [
+    {
+     "q": "how many interviews this month",
+     "record": [
+      {
+       "name": "count_records",
+       "args": {
+        "object": "Interview__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this month"
+       }
+      },
+      {
+       "name": "count_records",
+       "args": {
+        "object": "Internal_Interview__c",
+        "date_field": "CreatedDate",
+        "period": "this month"
+       }
+      },
+      "There are 3 client and 3 internal interviews this month.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "count_records",
+        "args": {
+         "object": "Interview__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this month"
+        }
+       },
+       {
+        "tool": "count_records",
+        "args": {
+         "object": "Internal_Interview__c",
+         "date_field": "CreatedDate",
+         "period": "this month"
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "count_records",
+         "args": {
+          "object": "Interview__c",
+          "date_field": "Date_of_Interview__c",
+          "period": "this month"
+         }
+        },
+        {
+         "tool": "count_records",
+         "args": {
+          "object": "Internal_Interview__c",
+          "date_field": "CreatedDate",
+          "period": "this month"
+         }
+        }
+       ],
+       "tool": "count_records",
+       "period": {
+        "date_field": "Date_of_Interview__c"
+       }
+      }
+     }
+    },
+    {
+     "q": "Compare with previous month",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "compare_period": {
+         "phrase": "previous month"
+        }
+       }
+      ]
+     },
+     "record": [
+      "This month and the previous month are compared.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "model": true,
+      "ran": [
+       {
+        "tool": "compare_records",
+        "args": {
+         "object": "Internal_Interview__c",
+         "date_field": "CreatedDate",
+         "segments": [
+          {
+           "label": "this month",
+           "period": "this month"
+          },
+          {
+           "label": "previous month",
+           "period": "previous month"
+          }
+         ]
+        }
+       },
+       {
+        "tool": "compare_records",
+        "args": {
+         "object": "Interview__c",
+         "date_field": "Date_of_Interview__c",
+         "segments": [
+          {
+           "label": "this month",
+           "period": "this month"
+          },
+          {
+           "label": "previous month",
+           "period": "previous month"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "tool": "compare_records"
+      },
+      "plan_line_has": [
+       "number of Interviews: this month (2026-10-01 to 2026-10-31) vs previous month (2026-09-01 to 2026-09-30)",
+       "also number of Internal Interviews: this month (2026-10-01 to 2026-10-31) vs previous month"
+      ],
+      "read_as": "plan_line"
+     }
+    }
+   ]
+  },
+  {
+   "id": "S5-W2",
+   "title": "A Hinglish candidates question the record agent answered from trainings: the Read-as line claims no Person Account scope",
+   "design": "step-5 model evaluation of 2026-11-27 (step5_model_eval.md), the real model's reply replayed; W2 (H03 step 2): the plan line's scope words come from the filters that run",
+   "steps": [
+    {
+     "q": "status wise kitne candidates hain",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Candidate_Training__c",
+        "group_by": "Status__c"
+       }
+      },
+      "The trainings by status are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Candidate_Training__c",
+         "group_by": "Status__c"
+        },
+        "term_filters": []
+       }
+      ],
+      "plan": {
+       "keys": [
+        "candidates"
+       ]
+      }
+     }
+    },
+    {
+     "q": "top 2 dikhao",
+     "record": [
+      "The top 2 are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Candidate_Training__c",
+         "group_by": "Status__c",
+         "top": 2,
+         "order": "desc"
+        },
+        "term_filters": []
+       }
+      ],
+      "plan_line_has": [
+       "top 2"
+      ],
+      "answer_not": [
+       "Person Accounts"
+      ],
+      "read_as": "plan_line"
+     }
+    }
+   ]
+  },
+  {
+   "id": "S5-F1",
+   "title": "Group by department with the field name the model guessed groups by the recruiter's department",
+   "design": "step-5 model evaluation of 2026-11-27 (step5_model_eval.md), the real model's reply replayed; field grounding (C04 step 2: Department__c is not on Interview__c; the plan groups by Recruiter__c)",
+   "steps": [
+    {
+     "q": "how many interviews per recruiter this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "q": "Group by department instead",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "How many interviews per department this year?",
+      "ops": [
+       {
+        "set_group": {
+         "field": "Department__c"
+        }
+       }
+      ]
+     },
+     "record": [
+      "The interviews per department are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "model": true,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c.Department__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ],
+      "plan_line_has": [
+       "per Department",
+       "this year"
+      ],
+      "read_as": "plan_line"
+     }
+    }
+   ]
+  },
+  {
+   "id": "S5-F2",
+   "title": "Narrow that down to a client with the field name the model guessed filters on the client lookup",
+   "design": "step-5 model evaluation of 2026-11-27 (step5_model_eval.md), the real model's reply replayed; field grounding (U12 step 5: Client__c for Client_Account__c; the bill rate holds no name)",
+   "steps": [
+    {
+     "q": "how many interviews per recruiter this year",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "date_field": "Date_of_Interview__c",
+        "period": "this year"
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year"
+        }
+       }
+      ]
+     }
+    },
+    {
+     "q": "narrow that down to Client Co",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "add_filter": {
+         "field": "Client__c",
+         "op": "eq",
+         "value": "Client Co"
+        }
+       }
+      ]
+     },
+     "record": [
+      "Client Co is shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "model": true,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "date_field": "Date_of_Interview__c",
+         "period": "this year",
+         "filters": [
+          {
+           "field": "Client_Account__c",
+           "op": "eq",
+           "value": "Client Co"
+          }
+         ]
+        }
+       }
+      ],
+      "plan_line_has": [
+       "Client Co"
+      ],
+      "read_as": "plan_line"
+     }
+    }
+   ]
+  },
+  {
+   "id": "S5-F3",
+   "title": "And how many were completed, with the field name the model guessed, keeps the region and the grouping",
+   "design": "step-5 model evaluation of 2026-11-27 (step5_model_eval.md), the real model's reply replayed; field grounding (K-filter-kept, K-filter-dropped, K-grouping-dropped step 3: Status__c for Interview_Status__c)",
+   "steps": [
+    {
+     "q": "how many interviews per recruiter in North America",
+     "record": [
+      {
+       "name": "group_records",
+       "args": {
+        "object": "Interview__c",
+        "group_by": "Recruiter__c",
+        "filters": [
+         {
+          "field": "Region__c",
+          "op": "eq",
+          "value": "North America"
+         }
+        ]
+       }
+      },
+      "The interviews per recruiter are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          }
+         ]
+        }
+       }
+      ]
+     }
+    },
+    {
+     "q": "plot it",
+     "rewrite": "plot interviews per recruiter in North America",
+     "record": [
+      "The chart is drawn.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "show_chart": true
+      }
+     }
+    },
+    {
+     "q": "and how many were completed?",
+     "resolve": {
+      "kind": "patch",
+      "standalone": "",
+      "ops": [
+       {
+        "add_filter": {
+         "field": "Status__c",
+         "op": "eq",
+         "value": "completed"
+        }
+       }
+      ]
+     },
+     "record": [
+      "The completed interviews are shown.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "patch",
+      "model": true,
+      "ran": [
+       {
+        "tool": "group_records",
+        "args": {
+         "object": "Interview__c",
+         "group_by": "Recruiter__c",
+         "filters": [
+          {
+           "field": "Region__c",
+           "op": "eq",
+           "value": "North America"
+          },
+          {
+           "field": "Interview_Status__c",
+           "op": "eq",
+           "value": "completed"
+          }
+         ]
+        }
+       }
+      ],
+      "plan_line_has": [
+       "per Recruiter",
+       "Region = 'North America'",
+       "Interview Status = 'completed'"
+      ],
+      "read_as": "plan_line"
+     }
+    }
+   ]
+  },
+  {
+   "id": "S5-RRM",
+   "title": "A list the record agent found after a dead end stores the list alone, and its Read-as line names the lookup",
+   "design": "step-5 model evaluation of 2026-11-27 (step5_model_eval.md), the real model's reply replayed; RR-M (a zero-row exploratory call stored as a side call) and the Read-as words of Department__c.Name",
+   "steps": [
+    {
+     "q": "list the recruiters of Dept One",
+     "record": [
+      {
+       "name": "list_records",
+       "args": {
+        "object": "Recruiter__c",
+        "fields": [
+         "Name"
+        ],
+        "filters": [
+         {
+          "field": "Team__c.Name",
+          "op": "eq",
+          "value": "Dept One"
+         }
+        ]
+       }
+      },
+      {
+       "name": "list_records",
+       "args": {
+        "object": "Recruiter__c",
+        "fields": [
+         "Name"
+        ],
+        "filters": [
+         {
+          "field": "Department__c.Name",
+          "op": "eq",
+          "value": "Dept One"
+         }
+        ]
+       }
+      },
+      "The recruiters of Dept One are listed.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "new",
+      "ran": [
+       {
+        "tool": "list_records",
+        "args": {
+         "object": "Recruiter__c",
+         "fields": [
+          "Name"
+         ],
+         "filters": [
+          {
+           "field": "Team__c.Name",
+           "op": "eq",
+           "value": "Dept One"
+          }
+         ]
+        },
+        "result_has": {
+         "total_count": 0
+        }
+       },
+       {
+        "tool": "list_records",
+        "args": {
+         "object": "Recruiter__c",
+         "fields": [
+          "Name"
+         ],
+         "filters": [
+          {
+           "field": "Department__c.Name",
+           "op": "eq",
+           "value": "Dept One"
+          }
+         ]
+        }
+       }
+      ],
+      "plan": {
+       "calls": [
+        {
+         "tool": "list_records",
+         "args": {
+          "object": "Recruiter__c",
+          "fields": [
+           "Name"
+          ],
+          "filters": [
+           {
+            "field": "Department__c.Name",
+            "op": "eq",
+            "value": "Dept One"
+           }
+          ]
+         }
+        }
+       ],
+       "nonempty": true
+      }
+     }
+    },
+    {
+     "q": "top 2",
+     "record": [
+      "The first 2 are listed.\nSource: the synthetic warehouse copy."
+     ],
+     "expect": {
+      "reason": "shortcut",
+      "model": false,
+      "ran": [
+       {
+        "tool": "list_records",
+        "args": {
+         "object": "Recruiter__c",
+         "fields": [
+          "Name"
+         ],
+         "filters": [
+          {
+           "field": "Department__c.Name",
+           "op": "eq",
+           "value": "Dept One"
+          }
+         ],
+         "limit": 2
+        }
+       }
+      ],
+      "plan_line_has": [
+       "where Department = 'Dept One', 2 rows"
+      ],
+      "answer_not": [
+       "Team"
+      ],
+      "read_as": "plan_line"
+     }
+    }
+   ]
+  }
+ ]
+}

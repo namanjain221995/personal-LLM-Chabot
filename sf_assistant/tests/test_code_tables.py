@@ -464,7 +464,7 @@ def test_the_safety_cap_is_read_at_call_time(monkeypatch):
     grp = _evidence("q2", "group_records", {"measure": "count", "groups": [{"group": f"G{i}", "value": i}
                                                                            for i in range(1, 6)],
                                             "total_across_groups": 15})
-    assert T.TABLE_MAX_ROWS == 120 and "…" not in _block(lst) + _block(grp)
+    assert T.TABLE_MAX_ROWS == 200 and "…" not in _block(lst) + _block(grp)
     monkeypatch.setattr(T, "TABLE_MAX_ROWS", 3)
     assert _block(lst).split("\n")[-1] == "| … | … |" and len(_block(lst).split("\n")) == 6
     assert _block(grp).split("\n") == ["- G1: 1", "- G2: 2", "- G3: 3", "- …"]   # number-free, no Total

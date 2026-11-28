@@ -85,6 +85,18 @@ class AgentResult:
         """Plain-dict form (JSON-serialisable) for export."""
         return asdict(self)
 
+    # Development A of 2026-11-27 (long record lists): not a dataclass field, so ``to_dict`` and every export stay
+    # field for field what they were.
+    @property
+    def finish(self) -> str:
+        """The finish reason of the model call that wrote ``answer`` ("stop", "length" when it stopped at its token
+        limit, "" when unknown or no call wrote it)."""
+        return str(self.__dict__.get("_finish") or "")
+
+    @finish.setter
+    def finish(self, value: str) -> None:
+        self.__dict__["_finish"] = str(value or "")
+
 
 # --------------------------------------------------------------------------------------
 # helpers
@@ -119,6 +131,18 @@ def _add_usage(total: dict, usage: dict | None) -> None:
             total[key] = int(total.get(key, 0) or 0) + int(usage.get(key) or 0)
         except (TypeError, ValueError):
             pass
+
+
+def _finish_reason(resp: Any) -> str:
+    """The finish reason of a chat result: its ``finish_reason`` key, else the raw response's first choice's; ""
+    when neither says. Never raises."""
+    try:
+        reason = resp.get("finish_reason") if isinstance(resp, dict) else None
+        if not reason and isinstance(resp, dict) and resp.get("raw") is not None:
+            reason = resp["raw"].choices[0].finish_reason
+        return str(reason or "")
+    except Exception:  # noqa: BLE001 - optional
+        return ""
 
 
 def _to_json(obj: Any) -> str:
@@ -372,6 +396,7 @@ def answer_question(
 
             if not tool_calls:
                 result.answer = _strip_thinking(content)
+                result.finish = _finish_reason(resp)
                 answered = True
                 break
 
@@ -396,6 +421,7 @@ def answer_question(
             result.steps += 1
             _add_usage(result.usage, resp.get("usage"))
             result.answer = _strip_thinking(resp.get("content"))
+            result.finish = _finish_reason(resp)
             if not (result.answer or "").strip() and resp.get("tool_calls"):
                 # The model ignored tools=None and asked for tools again: retry the forced
                 # call once before giving up, so a single stray tool call is not a failure.
@@ -404,6 +430,7 @@ def answer_question(
                 result.steps += 1
                 _add_usage(result.usage, resp.get("usage"))
                 result.answer = _strip_thinking(resp.get("content"))
+                result.finish = _finish_reason(resp)
                 if not (result.answer or "").strip() and resp.get("tool_calls"):
                     result.error = "model requested tools after the tool budget was exhausted"
 

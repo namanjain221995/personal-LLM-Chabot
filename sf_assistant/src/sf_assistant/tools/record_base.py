@@ -147,6 +147,9 @@ class _Call:
         self.term_plan: Any = None
         self.enforced: dict[str, Any] | None = None
         self.terms_dropped = False
+        # list_records (development A of 2026-11-27): every row of the list when the result cap cut the rows the model
+        # reads (QueryEvidence.full_rows); None otherwise
+        self.full_rows: list[dict[str, Any]] | None = None
 
     def note(self, text: str) -> None:
         if text and text not in self.notes:

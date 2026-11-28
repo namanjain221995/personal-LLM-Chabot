@@ -31,7 +31,9 @@ The parts:
   and a narrowing follow-up ends it for the rest of the chain. :func:`next_terms` gives the next state's ``terms``.
 - **Building** (§7.3, §8, §9): :func:`build` writes the next state from the answer kind and, for a records answer,
   the evidence (:func:`plan_from_evidence`: the successful calls of the 7 contract tools; main picked as
-  ``charts._pick`` picks, a seeded main call kept as the main call; more than 3 calls store no plan; a call of the
+  ``charts._pick`` picks, a seeded main call kept as the main call, and of several counts the one whose object the
+  question names alone (step-5 fix W1); a zero-row call the record agent replaced is no call (step-5 fix RR-M);
+  more than 3 calls store no plan; a call of the
   record agent's with a value the person never gave, a name, a figure or a date it took from a result, is left out,
   and its compare labels are code's words; when every call is left out so, no plan). Answers that ran no query carry
   the parent plan, one age older; a clarify, an unclear reply or small talk carry it at the same age.
@@ -40,7 +42,9 @@ The parts:
   catalog, names the fields that no longer resolve or are blocked.
 - **Patching** (§6.4, §10): :func:`apply` applies at most 3 closed operations to a copy of the plan and checks the
   result (fields, blocked fields, typed values, the 8-filter cap, the schema, the term contracts, the call cap,
-  contact fields). A
+  contact fields). A field name that does not resolve is first matched to the one field it names
+  (:func:`_ground_field`), and a candidates scope the record agent wrote itself goes when the typed words relax the
+  contract (:func:`_relax_scope`; step-5 fixes). A
   check that fails gives a :class:`Clarify` (a fixed code and the field or value it is about), never a silent run.
 - **Running** (§7.4, §10): :func:`run_calls` gives the calls to send, with the stored dates kept for an unchanged
   relative period (D1); :func:`keys_filter`, :func:`set_keys` and :func:`keys_digest` turn a stored record set into an
@@ -72,6 +76,7 @@ from typing import Any, Callable, Iterable
 from sf_assistant import prompts as _prompt_files   # the plan line's words (prompts/plan_line_words.md) and fill
 from sf_assistant.engine import followup_shortcuts as _shortcuts   # the period grammar of the typed words
 from sf_assistant.engine.catalog import SYSTEM_LOOKUPS, RecordError
+from sf_assistant.engine import term_contracts as _tc   # the candidates contract's own readers of a type filter
 from sf_assistant.engine.contact import asks_for_contact
 from sf_assistant.engine.periods import PeriodError, bucket_end, parse_period
 from sf_assistant.engine.term_contracts import CONTRACTS, ENFORCED_TOOLS, NO_TERMS, Terms, detect
@@ -86,8 +91,8 @@ __all__ = ["STATE_VERSION", "MAX_STATE_BYTES", "MAX_CALLS", "MAX_AGE", "MAX_OPS"
            "PLAN_LINE_WORDS", "schema_value", "terms_for", "next_terms", "terms_text", "model_args", "nonempty",
            "set_keys", "keys_digest",
            "plan_from_evidence", "build", "state_bytes", "fit", "Checked", "check", "usable", "clean_show",
-           "make_pending", "normalize_ops", "typed_value", "Clarify", "Patched", "apply", "RunCall", "run_calls",
-           "keys_filter", "with_item", "stale_empty", "plan_line", "PlanView"]
+           "make_pending", "normalize_ops", "typed_value", "Clarify", "Patched", "apply", "share_ready", "RunCall",
+           "run_calls", "keys_filter", "with_item", "stale_empty", "plan_line", "PlanView"]
 
 # ------------------------------------------------------------------------------------------------------ the limits
 STATE_VERSION = 1
@@ -153,6 +158,8 @@ CLARIFY_CODES = (
     "rank_not_shown",      # drill by rank past the ranking shown, or on a grouping with no top N
     "compare_not_for",     # compare_period on a call it cannot compare (``detail``: why)
     "call_cap",            # the patched plan would need more than MAX_CALLS calls
+    "which_call",          # an operation on the main call of a plan whose answer ran several counts, and the main
+    #                        call is not the one its question names (step-5 fix W1): which query is meant
     "no_link",             # follow_set: no lookup from the object to the set's records
     "which_link",          # follow_set: several lookups (``choices``)
     "set_not_supported",   # follow_set on a set that cannot become a filter (``detail``: why)
@@ -755,6 +762,106 @@ def _entry(e: Any, seed: Any, validate: Callable | None, typed: str = "") -> dic
     return out
 
 
+def _filter_fields(args: dict, tool: str) -> frozenset[str]:
+    """The fields of a call's AND filters and any-of items, case aside."""
+    return frozenset(str(it.get("field") or "").casefold() for key in (_filter_key(tool), "any_of")
+                     for it in _items(args.get(key)))
+
+
+def _dead_end(item: tuple[dict, Any, Any], later: list[tuple[dict, Any, Any]]) -> bool:
+    """A call of the record agent's that found no row while it looked for the records (step-5 fix RR-M): a later call
+    of its own with the same tool, object and period found rows with the same filter values on other fields (a list
+    filtered on a team by the department's name, then on the department). It was a dead end, not a part of the
+    answer, so it is no side call (a later patch would re-run it). A seeded call, a call with no filter value, and a
+    call whose later twin filters other values (a count for each of two typed regions, a count of a region and one of
+    a status) stay."""
+    entry, _e, seed = item
+    if seed is not None or entry.get("nonempty"):
+        return False
+    args, tool = entry["args"], entry["tool"]
+    keep = {k: args.get(k) for k in ("object", "date_field", "period")}
+    fields, values = _filter_fields(args, tool), _filter_values(args)
+    return bool(values) and any(
+        s is None and c.get("nonempty") and c["tool"] == tool and {k: c["args"].get(k) for k in keep} == keep
+        and _filter_fields(c["args"], tool) != fields and values <= _filter_values(c["args"])
+        for c, _x, s in later)
+
+
+#: What makes two lists list the same records (their columns, order and size aside).
+_LIST_SET = ("object", "filters", "any_of", "related", "date_field", "period")
+
+
+def _same_list_later(item: tuple[dict, Any, Any], later: list[tuple[dict, Any, Any]]) -> bool:
+    """A list of the record agent's that a later list of its own repeats for the same records (the same object,
+    filters, record conditions and period; other columns, order or size): the agent was still looking, and the later
+    list is the one it showed (step-5 fix RR-M: a first page beside the sorted list made a plan line of two lists of
+    the same records)."""
+    entry, _e, seed = item
+    if seed is not None or entry["tool"] != "list_records":
+        return False
+    key = _canon({k: entry["args"].get(k) for k in _LIST_SET})
+    return any(s is None and c["tool"] == "list_records" and _canon({k: c["args"].get(k) for k in _LIST_SET}) == key
+               for c, _x, s in later)
+
+
+def _filter_values(args: dict) -> frozenset[str]:
+    """The filter values of a call in words (:func:`_value_items`; true and false left out)."""
+    return frozenset(" ".join(_tokens(v)) for _o, _f, v in _value_items(args) if not isinstance(v, bool))
+
+
+def _stem(word: str) -> str:
+    """A word without a plural ending ("interviews" -> "interview", "entries" -> "entry")."""
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 3 and word.endswith("s") and not word.endswith(("ss", "us", "is")):
+        return word[:-1]
+    return word
+
+
+def _stems(text: Any) -> frozenset[str]:
+    return frozenset(_stem(w) for w in _tokens(text))
+
+
+def _named_calls(calls: list[dict], question: Any, label: Callable | None) -> list[int]:
+    """The indexes of ``calls`` whose object ``question`` names: every word of the object's label (or of its API name
+    in words) is a word of the question, plurals aside. "how many interviews this month" names Interview__c
+    ("Interviews") and not Internal_Interview__c ("Internal Interviews")."""
+    have = _stems(question)
+    if not have:
+        return []
+    out = []
+    for i, c in enumerate(calls):
+        obj = (c.get("args") or {}).get("object")
+        names = [n for n in (_label(label, obj), _pretty(obj)) if n]
+        if any(_stems(n) and _stems(n) <= have for n in names):
+            out.append(i)
+    return out
+
+
+def _named_sides(built: list[tuple[dict, Any, Any]], newest: str,
+                 label: Callable | None) -> list[tuple[dict, Any, Any]]:
+    """Round 2 of the pre-release fixes (P-B, T02): after a patch ran, a side call that the patch did not ask for (the
+    record agent's own call, or the patched main call the agent's own chartable call replaced) stays in the plan only
+    when the person's newest typed words name it: its object (:func:`_named_calls`) or a field it measures or groups by
+    (every word of the field's label or API name). Otherwise the next follow-up would re-run it ("same for 2025" stated
+    the average of a bill rate nobody asked for)."""
+    have = _stems(newest)
+    out = []
+    for entry, e, seed in built:
+        asked = seed is not None and getattr(seed, "role", "") == "side"
+        if entry["role"] == "main" or asked or _named_calls([entry], newest, label):
+            out.append((entry, e, seed))
+            continue
+        a = entry.get("args") or {}
+        obj = a.get("object")
+        fields = [f for f in (a.get("measure_field"), a.get("group_by"), a.get("count_distinct"),
+                              a.get("field") if a.get("op") else None) if isinstance(f, str)]
+        if any(any(_stems(n) and _stems(n) <= have for n in (_label(label, obj, f), _pretty(f.split(".")[-1])) if n)
+               for f in fields):
+            out.append((entry, e, seed))
+    return out
+
+
 def _chartable_result(e: Any) -> bool:
     """A result a chart is drawn from (agent/charts.py ``_pick``): group, trend, compare, a count with a breakdown."""
     tool = getattr(e, "tool", "")
@@ -784,6 +891,7 @@ def plan_from_evidence(evidence: Iterable[Any], *, question: str = "", terms: An
     ``question``: the standalone question, or empty for the plan line."""
     calls = [e for e in evidence or () if getattr(e, "ok", False) and getattr(e, "kind", "") == "data"
              and getattr(e, "tool", "") in ENFORCED_TOOLS]
+    seeds = list(seeds) if seeds is not None else None
     typed = _clean_terms(terms)["text"]
     have = "\n".join(t for t in (typed, str(typed_also or "")) if t)
     built: list[tuple[dict, Any, Any]] = []
@@ -801,6 +909,7 @@ def plan_from_evidence(evidence: Iterable[Any], *, question: str = "", terms: An
     for i, (entry, _e, _s) in enumerate(built):
         last[_canon([entry["tool"], entry["args"], entry.get("keys_from")])] = i
     built = [built[i] for i in sorted(last.values())]
+    built = [b for i, b in enumerate(built) if not (_dead_end(b, built[i + 1:]) or _same_list_later(b, built[i + 1:]))]
     if not built:
         return None, "screened" if screened else "no_calls"
     if len(built) > max_calls:
@@ -810,12 +919,18 @@ def plan_from_evidence(evidence: Iterable[Any], *, question: str = "", terms: An
                         and getattr(s, "role", "") == "main"), None)
     if seeded_main is not None and not any(s is None and _chartable_result(e) for _c, e, s in built):
         main = seeded_main
+    elif seeded_main is None and not any(_chartable_result(e) for _c, e, _s in built):
+        named = _named_calls([c for c, _e, _s in built], question or typed.rsplit("\n", 1)[-1], label)
+        if len(named) == 1:   # several counts: the one whose object the question names answered it (fix W1)
+            main = named[0]
     for i, (entry, _e, _s) in enumerate(built):
         entry["role"] = "main" if i == main else "side"
+    if seeds:   # a patch or a shortcut ran (round 2 of the pre-release fixes)
+        built = _named_sides(built, typed.rsplit("\n", 1)[-1], label)
     plan = {"question": _cut(question, MAX_QUESTION_CHARS), "terms": _clean_terms(terms),
             "calls": [entry for entry, _e, _s in built], "show": clean_show(show), "age": 0}
     if not plan["question"]:
-        plan["question"] = _cut(plan_line(plan, label=label), MAX_QUESTION_CHARS)
+        plan["question"] = _cut(plan_line(plan, label=label, view=view), MAX_QUESTION_CHARS)
     return plan, ""
 
 
@@ -1788,6 +1903,53 @@ def _op_drill(work: _Work, p: dict) -> Clarify | None:
     return None
 
 
+_COUNTS = ("count_records", "aggregate_records")
+
+
+def _twins(work: _Work) -> list[dict]:
+    """The other counts of a plan whose main call is a count or an aggregate (step-5 fix W1): side calls of those
+    tools that are not the same query for another period. An answer that ran two counts ("how many interviews this
+    month": the client and the internal interviews) showed both, and the main call is only the one picked."""
+    main = work.main()
+    if main["tool"] not in _COUNTS:
+        return []
+    shape = {k: v for k, v in main["args"].items() if k not in _NOT_SHAPE}
+    return [c for c in work.calls if c is not main and c["tool"] in _COUNTS
+            and {k: v for k, v in c["args"].items() if k not in _NOT_SHAPE} != shape]
+
+
+def _unsure_main(work: _Work, question: Any) -> bool:
+    """The plan's main call may not be the query the person means (step-5 fix W1): the answer ran other counts as
+    well (:func:`_twins`), and the plan's question does not name the main call's object alone
+    (:func:`_named_calls`). An operation of the main call alone then asks which query is meant."""
+    if not _twins(work):
+        return False
+    main = work.main()
+    named = _named_calls(work.calls, question, getattr(work.view, "label", None))
+    return [work.calls[i] for i in named] != [main]
+
+
+def _compare_of(call: dict, phrase: str) -> tuple[dict | None, Clarify | None]:
+    """The compare_records call of a count or an aggregate with a period: its period beside ``phrase`` (§6.4)."""
+    a = call["args"]
+    if a.get("any_of"):
+        return None, Clarify("compare_not_for", detail="any_of")
+    measure, mfield = _measured(a)
+    if measure not in MEASURES:
+        return None, Clarify("measure_not_for", value=measure)
+    new = _carry(a, "object", "date_field", "filters", "related")
+    new["segments"] = [{"label": _cut(a["period"], 80), "period": a["period"]},
+                       {"label": _cut(phrase, 80), "period": phrase}]
+    new.update(_measure_args(measure, mfield))
+    out = _new_call("compare_records", new, call, keep_period=False)
+    if isinstance(call.get("period"), dict):
+        info = call["period"]
+        out["segments"] = [{"label": new["segments"][0]["label"], "phrase": info.get("phrase"),
+                            "from": info.get("from"), "to": info.get("to")},
+                           {"label": new["segments"][1]["label"]}]
+    return out, None
+
+
 def _op_compare_period(work: _Work, p: dict) -> Clarify | None:
     main = work.main()
     a, tool = main["args"], main["tool"]
@@ -1808,21 +1970,19 @@ def _op_compare_period(work: _Work, p: dict) -> Clarify | None:
     if _tokens(phrase) == _tokens(a["period"]) or _dates(phrase, work.today) == current:
         return Clarify("same_period", value=phrase)   # also a typed period that now means the kept dates (D1)
     if tool in ("count_records", "aggregate_records"):
-        if a.get("any_of"):
-            return Clarify("compare_not_for", detail="any_of")
-        measure, mfield = _measured(a)
-        if measure not in MEASURES:
-            return Clarify("measure_not_for", value=measure)
-        new = _carry(a, "object", "date_field", "filters", "related")
-        new["segments"] = [{"label": _cut(a["period"], 80), "period": a["period"]},
-                           {"label": _cut(phrase, 80), "period": phrase}]
-        new.update(_measure_args(measure, mfield))
-        call = _new_call("compare_records", new, main, keep_period=False)
-        if isinstance(main.get("period"), dict):
-            info = main["period"]
-            call["segments"] = [{"label": new["segments"][0]["label"], "phrase": info.get("phrase"),
-                                 "from": info.get("from"), "to": info.get("to")},
-                                {"label": new["segments"][1]["label"]}]
+        call, err = _compare_of(main, phrase)
+        if err is not None:
+            return err
+        # the other counts the answer showed for the same period are compared too (step-5 fix W1: "how many
+        # interviews this month" ran the client and the internal interviews; "compare with previous month" compares
+        # what the answer showed, never only one of them)
+        twins = {id(c) for c in _twins(work)}
+        for i, twin in enumerate(list(work.calls)):
+            if id(twin) in twins and twin["args"].get("period") == a["period"] and twin["args"].get("date_field"):
+                other, bad = _compare_of(twin, phrase)
+                if bad is None:
+                    work.calls[i] = other
+                    work.touch(other)
         work.replace_main(call)
         return None
     if len(work.calls) + 1 > work.max_calls:
@@ -1854,6 +2014,16 @@ def _set_object(work: _Work, call: dict) -> tuple[str | None, Clarify | None]:
     return (target, None) if target else (None, Clarify("set_not_supported", detail="group_by"))
 
 
+def _own_link(work: _Work, main: dict, new_obj: str, links: list[str]) -> str:
+    """The one link of ``links`` that a ranking of ``new_obj`` records grouped by: the ranked set's own lookup, when the
+    records followed are of the object the ranking counted; "" otherwise."""
+    a = main["args"]
+    if main["tool"] != "group_records" or work.obj(main) != new_obj or not isinstance(a.get("group_by"), str):
+        return ""
+    hit = [x for x in links if _same_field(work, new_obj, x, a["group_by"])]
+    return hit[0] if len(hit) == 1 else ""
+
+
 def _op_follow_set(work: _Work, p: dict) -> Clarify | None:
     main = work.main()
     a, tool = main["args"], main["tool"]
@@ -1880,6 +2050,10 @@ def _op_follow_set(work: _Work, p: dict) -> Clarify | None:
         via_text = via.text
     elif len(links) == 1:
         via_text = links[0]
+    elif links and _own_link(work, main, new_obj, links):
+        # S01 of the re-check: "show their interviews" after the top candidates by interviews follows the lookup the
+        # ranking grouped by, on the same object (Candidate__c), never asks Candidate or Client Account (round 2)
+        via_text = _own_link(work, main, new_obj, links)
     elif links:
         return Clarify("which_link", choices=tuple({"label": x, "ops": [{"follow_set": {"object": new_obj,
                                                                                        "via_field": x}}]}
@@ -1926,8 +2100,312 @@ _OP_FUNCS: dict[str, Callable[[_Work, dict], Clarify | None]] = {
 }
 
 
+#: The operations that change the main call alone into another query (a compare covers the other counts itself).
+_MAIN_ONLY = frozenset({"set_group", "set_grain", "set_measure", "follow_set"})
+#: Words of a field name that say nothing of the field.
+_NAME_FILLER = frozenset({"c", "r", "the", "of", "field"})
+
+
+def _name_words(text: Any) -> frozenset[str]:
+    """The words of a field's API name or label, plurals aside ("Status__c" -> {"status"}; "Client_Account__c" ->
+    {"client", "account"})."""
+    return frozenset(_stem(w) for w in _tokens(_pretty(text)) if w not in _NAME_FILLER)
+
+
+def _value_fits(work: _Work, obj: str, api: str, kind: str | None, values: list) -> bool:
+    """The filter values could be stored in the field ``obj.api``: a picklist that lists them, a number field for
+    numbers, a date field for dates, a true/false field for true/false, any other field for a text."""
+    for v in values:
+        if isinstance(v, bool):
+            if kind != "boolean":
+                return False
+        elif isinstance(v, (int, float)):
+            if kind not in _NUMBER_KINDS:
+                return False
+        elif kind in ("picklist", "multipicklist"):
+            if not schema_value(work.view, obj, api, str(v)):
+                return False
+        elif kind in _NUMBER_KINDS or kind == "boolean" or (
+                kind in _DATE_KINDS and not _DATE_VALUE_RE.fullmatch(str(v).strip())):
+            return False
+    return True
+
+
+def _field_matches(work: _Work, obj: str, raw: str, values: list | None, want: str) -> list[str]:
+    """The fields of ``obj`` (``view.fields_of``: API name, label, kind; blocked and contact fields left out) whose
+    label or API name holds every word of ``raw``; those whose label or name is just those words first; then only
+    those the values fit (:func:`_value_fits`), or of the kind ``want`` needs ("number" for sum and avg)."""
+    reader = getattr(work.view, "fields_of", None)
+    words = _name_words(raw)
+    if reader is None or not words:
+        return []
+    try:
+        listed = list(reader(obj) or ())
+    except Exception:  # noqa: BLE001 - no field list: nothing is matched
+        return []
+    hits = [(api, kind, words == _name_words(label) or words == _name_words(api)) for api, label, kind in listed
+            if words <= _name_words(label) or words <= _name_words(api)]
+    if values:
+        hits = [h for h in hits if _value_fits(work, obj, h[0], h[1], values)]
+    if want == "number":
+        hits = [h for h in hits if h[1] in _NUMBER_KINDS]
+    exact = [h for h in hits if h[2]]
+    return [h[0] for h in (exact or hits)]
+
+
+def _plan_lookups(work: _Work) -> set[str]:
+    """The first lookup of every field path the plan's calls group, split or filter by (a hop the plan already took)."""
+    out: set[str] = set()
+    for c in work.calls:
+        a = c["args"]
+        for raw in [a.get("group_by"), a.get("split_by")] + [it.get("field") for key in ("filters", "base_filters")
+                                                              for it in _items(a.get(key))]:
+            if isinstance(raw, str) and raw.strip():
+                out.add(raw.split(".")[0].casefold())
+    return out
+
+
+def _ground_field(work: _Work, raw: Any, values: list | None = None, want: str = "") -> str | None:
+    """The path a field name the model guessed means on the main call's object, when it does not resolve as it is
+    (step-5 fix, field grounding: "Status__c" for Interview_Status__c, "Client__c" for Client_Account__c,
+    "Department__c" for Recruiter__c.Department__c): the one field of the object whose label or API name holds its
+    words and that the values fit (:func:`_field_matches`); with none on the object, the one such field of an object
+    a lookup of it points to (a lookup the plan already groups or filters by first). None when no field or more than
+    one fits: the check then asks which field, as before. Never matches a value: only names and labels of the schema."""
+    main = work.main()
+    obj = work.obj(main)
+    if obj is None or not isinstance(raw, str) or not raw.strip() or "." in raw:
+        return None
+    if _name_words(raw) <= _name_words(obj) | _name_words(_label(getattr(work.view, "label", None), obj) or ""):
+        return None   # the object's own name ("Interview__c" on interviews) names no field of it
+    own = _field_matches(work, obj, raw, values, want)
+    if own:
+        return own[0] if len(own) == 1 else None
+    reader = getattr(work.view, "fields_of", None)
+    hops: list[str] = []
+    try:
+        for api, _words, kind in list(reader(obj) or ()) if reader is not None else []:
+            if kind != "reference" or api in SYSTEM_LOOKUPS:
+                continue
+            target = getattr(work.view, "target", lambda *_a: None)(obj, api)
+            if not target or target == obj:
+                continue
+            hops += [f"{api}.{f}" for f in _field_matches(work, target, raw, values, want)]
+    except Exception:  # noqa: BLE001 - no hop read: nothing is matched
+        return None
+    taken = _plan_lookups(work)
+    near = [h for h in hops if h.split(".")[0].casefold() in taken]
+    pick = near or hops
+    return pick[0] if len(pick) == 1 else None
+
+
+def _grounded(work: _Work, op: dict) -> dict:
+    """``op`` with a field name that does not resolve on the main call's object replaced by the path it means
+    (:func:`_ground_field`), for add_filter, remove_filter (the plan's own filter fields first), set_group and
+    set_measure; anything else as it is."""
+    name, p = next(iter(op.items()))
+    field_name = p.get("field") if isinstance(p, dict) else None
+    if name not in ("add_filter", "remove_filter", "set_group", "set_measure") or not isinstance(field_name, str):
+        return op
+    try:
+        obj = work.obj(work.main())
+        if obj is None or work.view.path(obj, field_name) is not None:
+            return op   # a field that resolves (a blocked one too: its own check refuses it) is never replaced
+        if name == "remove_filter":
+            words = _name_words(field_name)
+            have = [it.get("field") for c in work.calls for key in ("filters", "base_filters")
+                    for it in _items(c["args"].get(key)) if isinstance(it.get("field"), str)]
+            label = getattr(work.view, "label", None)
+            hit = sorted({f for f in have if words and (words <= _name_words(f.split(".")[-1])
+                                                        or words <= _name_words(_label(label, obj, f) or ""))})
+            got = hit[0] if len(hit) == 1 else None
+        else:
+            values = p.get("values") if name == "add_filter" and isinstance(p.get("values"), list) else (
+                [p["value"]] if name == "add_filter" and "value" in p else None)
+            want = "number" if name == "set_measure" and p.get("measure") in ("sum", "avg") else ""
+            got = _ground_field(work, field_name, values, want)
+    except Exception:  # noqa: BLE001 - not grounded: the check asks as before
+        return op
+    return {name: dict(p, field=got)} if got else op
+
+
+def _scope_items(view: Any, obj: str | None, items: list[dict]) -> list[tuple[int, str, str]]:
+    """(index, candidate prefix, state) of the record-type and person-account filters among a call's AND filter
+    ``items`` that keep only candidates ("present") or other accounts ("conflict"), read as the candidates contract
+    reads them (``term_contracts._own_state``)."""
+    out = []
+    for i, it in enumerate(items):
+        try:
+            p = view.path(obj, it.get("field")) if obj else None
+        except Exception:  # noqa: BLE001
+            p = None
+        if p is None:
+            continue
+        prefixes = ([""] if obj == "Account" else []) + [x for x in [_tc._candidate_prefix(p)] if x]
+        for pre in prefixes:
+            rest = _tc._rest(p, pre)
+            use = _tc._type_use(rest)
+            if use not in ("rt", "flag"):
+                continue
+            try:
+                state = _tc._own_state(it, rest, view)
+            except Exception:  # noqa: BLE001
+                state = None
+            if use == "flag" and it.get("op") == "eq" and _tc._bool(it.get("value")) is True:
+                state = "present"   # it keeps person accounts only, whichever record type code would add
+            if state in ("present", "conflict"):
+                out.append((i, pre, state))
+    return out
+
+
+def _relax_scope(work: _Work) -> None:
+    """Step-5 fix W3: a stored call whose own filters keep only candidates (a record type or person-account filter the
+    record agent wrote itself) runs without that filter when this run's terms relax the candidates contract, as the
+    term rules relax it: the person asked for every account type (``all_types``), or named other account types and
+    the call also keeps another type (``other_accounts``, a "conflict" filter). Code's own candidate filter is never
+    stored, so the Read-as line ("every account type") and what runs agree. Typed words only relax (§7.1)."""
+    t = work.terms
+    if "candidates" not in t.keys or not (t.all_types or t.other_accounts) or work.view is None:
+        return
+    for c in work.calls:
+        key = _filter_key(c["tool"])
+        items = _items(c["args"].get(key))
+        found = _scope_items(work.view, work.obj(c), items)
+        if t.all_types:
+            drop = {i for i, _pre, state in found if state == "present"}
+        else:
+            other = {pre for _i, pre, state in found if state == "conflict"}
+            drop = {i for i, pre, state in found if state == "present" and pre in other}
+        if not drop:
+            continue
+        kept = [it for i, it in enumerate(items) if i not in drop]
+        if kept:
+            c["args"][key] = kept
+        else:
+            c["args"].pop(key, None)
+        work.touch(c)
+
+
+# ---------------------------------------------------------------------- the placement share (round 2 of 2026-11-28)
+# P-B of the pre-release re-check: "and the placement rate?" on a plan of placements per month was patched by the
+# model to the average of Client_Bill_Rate__c ("rate"), and P-B-grain-dropped asked for a made-up Placement_Rate__c.
+# The placement rate is the owner's share: placements (Interview_Outcome__c = Offer Received) of all client interviews
+# (term contracts). Code turns the plan's placement call into that share; the model's measure never runs.
+_SHARE_TOOLS = ("trend_records", "count_records", "percentage_of_records")
+
+
+def _offer_item(obj: str | None, item: dict) -> bool:
+    """``item`` is the placement contract's own filter: Interview_Outcome__c of a client interview is 'Offer
+    Received' (eq, or in with that one value)."""
+    if obj != _tc.INTERVIEW or str(item.get("field") or "").split(".")[-1] != _tc.OUTCOME or "." in str(
+            item.get("field") or ""):
+        return False
+    values = item.get("values") if item.get("op") == "in" else [item.get("value")] if item.get("op") == "eq" else []
+    return isinstance(values, list) and len(values) == 1 and _canon_text(values[0]) == _canon_text(_tc.OFFER)
+
+
+def _canon_text(value: Any) -> str:
+    return " ".join(str(value or "").casefold().replace("-", " ").replace("_", " ").split())
+
+
+def _share_call(call: dict, obj: str | None) -> dict | None:
+    """The placement share of a placement call (:func:`_offer_item` among its filters): a trend becomes the rate per
+    period (``part_filters``), a count becomes ``percentage_of_records``; the other filters, the period and the child
+    conditions stay as the base. The call itself when it already is the share; None when it is no placement call or
+    cannot take a share (a grouping, a split, an OR group, a distinct count)."""
+    tool, a = call["tool"], call["args"]
+    if tool == "percentage_of_records" or (tool == "trend_records" and a.get("part_filters")):
+        parts = _items(a.get("part_filters"))
+        return call if any(_offer_item(obj, it) for it in parts) else None
+    if tool not in _SHARE_TOOLS or a.get("any_of") or a.get("split_by") or a.get("count_distinct"):
+        return None
+    if tool == "trend_records" and a.get("measure") not in (None, "count"):
+        return None
+    items = _items(a.get("filters"))
+    part = [it for it in items if _offer_item(obj, it)]
+    if not part:
+        return None
+    rest = [it for it in items if not _offer_item(obj, it)]
+    if tool == "trend_records":
+        args = dict(_carry(a, "object", "grain", "date_field", "period", "related"), part_filters=part[:1])
+        if rest:
+            args["filters"] = rest
+        return _new_call("trend_records", args, call)
+    args = dict(_carry(a, "object", "date_field", "period", "related"), part_filters=part[:1])
+    if rest:
+        args["base_filters"] = rest
+    return _new_call("percentage_of_records", args, call)
+
+
+def share_ready(plan: Any, view: Any) -> bool:
+    """The main call of ``plan`` is a placement call that can become the placement share (:func:`_share_call`)."""
+    plan = _plan_of(plan)
+    main = next((c for c in (plan or {}).get("calls") or [] if isinstance(c, dict) and c.get("role") == "main"), None)
+    if main is None or not isinstance(main.get("args"), dict):
+        return False
+    try:
+        obj = view.object(main["args"].get("object")) if view is not None else main["args"].get("object")
+    except Exception:  # noqa: BLE001
+        return False
+    return _share_call(main, obj) is not None
+
+
+def _to_share(work: _Work) -> Clarify | None:
+    main = work.main()
+    got = _share_call(main, work.obj(main))
+    if got is None:
+        return Clarify("measure_not_for", detail=main["tool"])
+    if got is not main:
+        work.replace_main(got)
+    return None
+
+
+def _placement_plan(plan: dict, view: Any) -> bool:
+    """Every call of ``plan`` on client interviews keeps the placement filter, and there is one: a plan of placements
+    (or of the placement share)."""
+    found = False
+    for c in plan.get("calls") or []:
+        if not isinstance(c, dict) or not isinstance(c.get("args"), dict):
+            continue
+        try:
+            obj = view.object(c["args"].get("object")) if view is not None else c["args"].get("object")
+        except Exception:  # noqa: BLE001
+            obj = None
+        if obj != _tc.INTERVIEW:
+            continue
+        a = c["args"]
+        if not any(_offer_item(obj, it) for key in ("filters", "part_filters")
+                   for it in _items(a.get(key))):
+            return False
+        found = True
+    return found
+
+
+#: typed words that move a plan of placements to all client interviews: no placement filter is then required
+_ALL_INTERVIEWS_RE = re.compile(r"(?<![^\W_])(?:outcomes?|all|every|any|total|overall|sab|sabhi|saare)"
+                                r"(?![^\W_])", re.IGNORECASE)
+
+
+def _placement_kept(work: _Work, before: dict) -> Clarify | None:
+    """Round 2 of the pre-release fixes (T02): a patch of a plan of placements never leaves a call on client
+    interviews without the placement contract's filter (Interview_Outcome__c = Offer Received, in its filters or its
+    part), unless the typed words widen it ("all interviews", "every outcome", "total"). Such a call counts
+    interviews, while the answer would still read as placements: the term reject T2 asks instead."""
+    if not _placement_plan(before, work.view) or any(_ALL_INTERVIEWS_RE.search(t) for t in work.texts[:1]):
+        return None
+    for c in work.calls:
+        if work.obj(c) != _tc.INTERVIEW:
+            continue
+        a = c["args"]
+        if not any(_offer_item(_tc.INTERVIEW, it) for key in ("filters", "part_filters")
+                   for it in _items(a.get(key))):
+            return Clarify("term_reject", value="T2", detail="placement_filter_dropped")
+    return None
+
+
 def apply(plan: Any, ops: Any, *, typed: str, view: Any, today: dt.date, terms: Terms = NO_TERMS,
-          pending_text: str = "", contact_ok: bool | None = None, max_calls: int = MAX_CALLS) -> Patched:
+          pending_text: str = "", contact_ok: bool | None = None, max_calls: int = MAX_CALLS,
+          share: bool = False) -> Patched:
     """Apply at most :data:`MAX_OPS` operations (§6.4) to a copy of ``plan`` and check every call of the result.
 
     ``typed``: the person's typed question (filter and drill values must appear in it, or in ``pending_text``, the
@@ -1935,7 +2413,8 @@ def apply(plan: Any, ops: Any, *, typed: str, view: Any, today: dt.date, terms: 
     the run (:func:`terms_for`), checked on every call (a T1, T2 or T3 refusal asks); ``contact_ok``: whether this
     question asks for contact details (default: read from ``typed``; never carried); ``max_calls``: the call cap
     (``SFA_MEMORY_MAX_CALLS``). Operations apply in order, the first failing check gives the clarify.
-    ``new_question`` drops the plan."""
+    ``new_question`` drops the plan. ``share``: the main call becomes the placement share first (:func:`_to_share`;
+    the resolver asks for it when the typed words ask for the placement rate), and ``ops`` may then be empty."""
     canon = normalize_ops(ops)
     if canon is None:
         return Patched(None, Clarify("too_many_ops" if isinstance(ops, list) and len(ops) > MAX_OPS else "bad_ops"))
@@ -1943,17 +2422,25 @@ def apply(plan: Any, ops: Any, *, typed: str, view: Any, today: dt.date, terms: 
     if "new_question" in names:
         return Patched(None, new_question=True, ops=tuple(canon))
     plan = _plan_of(plan)
-    if not canon:
+    if not canon and not share:
         return Patched(None, Clarify("bad_ops"))
     if not plan or not any(isinstance(c, dict) and c.get("role") == "main" for c in plan.get("calls") or []):
         return Patched(None, Clarify("no_plan"), ops=tuple(canon))
     work = _Work(plan, view, (str(typed or ""), str(pending_text or "")), today, terms, max_calls)
+    canon = [_grounded(work, one) for one in canon]
+    if share:
+        got = _to_share(work)
+        if got is not None:
+            return Patched(None, got, ops=tuple(canon))
     for one in canon:
         name, params = next(iter(one.items()))
+        if name in _MAIN_ONLY and _unsure_main(work, plan.get("question")):
+            return Patched(None, Clarify("which_call"), ops=tuple(canon))
         got = _OP_FUNCS[name](work, params)
         if got is not None:
             return Patched(None, got, ops=tuple(canon))
-    err = _final_checks(work)
+    _relax_scope(work)
+    err = _final_checks(work) or _placement_kept(work, plan)
     if err is not None:
         return Patched(None, err, ops=tuple(canon))
     ok = asks_for_contact(typed) if contact_ok is None else bool(contact_ok)
@@ -1961,7 +2448,8 @@ def apply(plan: Any, ops: Any, *, typed: str, view: Any, today: dt.date, terms: 
     new_plan = {"question": "", "terms": _clean_terms(plan.get("terms")), "calls": work.calls, "show": work.show,
                 "age": 0}
     touched = frozenset(i for i, c in enumerate(work.calls) if id(c) in work.touched)
-    return Patched(new_plan, touched=touched, display_only=all(n == "set_show" for n in names),
+    return Patched(new_plan, touched=touched, display_only=bool(names) and not share and all(
+                       n == "set_show" for n in names),
                    not_chartable=work.not_chartable, contact_blocked=blocked, ops=tuple(canon))
 
 
@@ -2190,6 +2678,14 @@ def _obj_word(obj: Any, label: Callable | None) -> str:
 
 
 def _field_word(obj: Any, path: Any, label: Callable | None) -> str:
+    """A field path in words: its last field's label; the name or Id of a linked record reads as the lookup that
+    links it ("Department__c.Name" is "Department", step-5 fix: never a bare "Name")."""
+    parts = str(path or "").split(".")
+    if len(parts) > 1 and parts[-1].casefold() in ("name", "id"):
+        head = ".".join(parts[:-1])
+        got = _label(label, obj, head)
+        # a lookup with no label of its own (its API name, "RecordTypeId") reads as the path in words ("Record Type")
+        return got if got and (" " in got or _pretty(got) == got) else _pretty(head)
     return _label(label, obj, path) or _pretty(path)
 
 
@@ -2298,8 +2794,12 @@ def _call_text(call: dict, today: dt.date | None, label: Callable | None) -> str
     if _items(a.get("any_of")):
         parts.append(_w("any_of", FILTERS=_items_text(_items(a["any_of"]), obj, label, "or")))
     for r in _items(a.get("related")):
-        parts.append(_w("with_child" if r.get("exists", True) else "without_child",
-                        CHILD=_obj_word(r.get("child_object"), label)))
+        child = _obj_word(r.get("child_object"), label)
+        if r.get("max_count") is not None and r.get("exists", True):   # at most N, none included (round 2 fixes)
+            parts.append(_w("child_between", FROM=r["min_count"], TO=r["max_count"], CHILD=child)
+                         if r.get("min_count") is not None else _w("child_at_most", N=r["max_count"], CHILD=child))
+            continue
+        parts.append(_w("with_child" if r.get("exists", True) else "without_child", CHILD=child))
     when = _period_text(a.get("period"), call.get("period"), today,
                         a.get("grain") if tool == "trend_records" else None)
     if when:
@@ -2335,8 +2835,43 @@ def _type_filtered(call: dict) -> bool:
     return False
 
 
+def _adds_candidates(scope: Terms, call: dict, view: Any) -> bool:
+    """The candidates contract adds its filter to ``call`` under ``scope`` (``term_contracts.plan``, pure: what code
+    adds when the call runs)."""
+    got = _term_plan(scope, call["tool"], call["args"], view)
+    return any(str(item.get("field") or "").split(".")[-1] in ("RecordTypeId", "IsPersonAccount")
+               for _key, item in got.add)
+
+
+def _scope_word(scope: Terms, main: dict, view: Any) -> str | None:
+    """The scope words of the main call from the filters that run (step-5 fix W2), or None when the view cannot read
+    them (the scope is then read from the terms alone, as before). "candidates as Person Accounts" only when the call
+    keeps only candidates (code adds the candidate filter, or the call's own filter keeps only Person Accounts);
+    "every account type" only when the person widened a call the contract would scope; nothing for a call the
+    candidates contract does not touch (a count of trainings in a question that says "candidates")."""
+    try:
+        narrow = dataclasses.replace(scope, all_types=False, other_accounts=False)
+        kf = main.get("keys_from") if isinstance(main.get("keys_from"), dict) else None
+        # a call that runs on a record set of an earlier answer is scoped as the set's own call is (its fresh re-run)
+        calls = [main] + ([{"tool": kf.get("tool"), "args": kf.get("args")}] if kf and isinstance(kf.get("args"), dict)
+                          else [])
+        for call in calls:
+            own = [state for _i, _pre, state in _scope_items(view, view.object(call["args"].get("object")),
+                                                              _items(call["args"].get(_filter_key(call["tool"]))))]
+            if not (_adds_candidates(narrow, call, view) or "present" in own):
+                continue
+            if scope.all_types:
+                return _w("all_types") if "present" not in own else ""
+            if _adds_candidates(scope, call, view) or ("present" in own and "conflict" not in own):
+                return _w("candidates")
+            return ""
+        return ""
+    except Exception:  # noqa: BLE001 - a view that cannot read it: the terms decide
+        return None
+
+
 def plan_line(state_or_plan: Any, *, today: dt.date | None = None, label: Callable | None = None,
-              terms: Terms | None = None) -> str:
+              terms: Terms | None = None, view: Any = None) -> str:
     """The plan in code-written words (C20), at most :data:`MAX_PLAN_LINE` characters; "" without a plan. The main
     call first, then the term scope and the display, then each side call ("also ..."). ``today``: the dates of period
     words that have not run yet; ``label(object, path)``: display words for objects and fields (the API names in
@@ -2346,7 +2881,11 @@ def plan_line(state_or_plan: Any, *, today: dt.date | None = None, label: Callab
     states the scope that ran). Without them the scope is read from the plan's own stored terms. The candidates scope
     is written only when the run keeps it: "every account type" when the person asked for every account type, and
     nothing when they named other account types and the call filters on the record type itself (stage-1 review fix
-    M2)."""
+    M2).
+
+    ``view``: the catalog view (:class:`PlanView`); with it the scope is written from the filters the call runs with
+    (:func:`_scope_word`, step-5 fix W2), so a plan the contract does not scope never reads "candidates as Person
+    Accounts"."""
     plan = _plan_of(state_or_plan)
     calls = [c for c in (plan or {}).get("calls") or [] if isinstance(c, dict) and isinstance(c.get("args"), dict)]
     if not calls:
@@ -2354,7 +2893,10 @@ def plan_line(state_or_plan: Any, *, today: dt.date | None = None, label: Callab
     main = next((c for c in calls if c.get("role") == "main"), calls[0])
     parts = [_call_text(main, today, label)]
     scope = terms if isinstance(terms, Terms) else terms_for(plan.get("terms"), "", "", "patch")
-    if "candidates" in scope.keys:
+    word = _scope_word(scope, main, view) if view is not None and "candidates" in scope.keys else None
+    if word is not None:
+        parts.append(word)
+    elif "candidates" in scope.keys:
         if scope.all_types:
             parts.append(_w("all_types"))
         elif not (scope.other_accounts and _type_filtered(main)):
@@ -2440,6 +2982,22 @@ class PlanView(_CatalogView):
     def target(self, obj: str, path_text: Any) -> str | None:
         ref = self._ref(obj, path_text)
         return self.cat.target_of(ref.field) if ref is not None and ref.field.kind == "reference" else None
+
+    def fields_of(self, obj: Any) -> list[tuple[str, str, str]]:
+        """(API name, label, kind) of the fields of ``obj`` a question may name (step-5 fix, field grounding): no
+        blocked or contact field and no legacy or deprecated one; the most useful kinds to filter and group by first
+        (picklists, true/false, lookups, dates, numbers), then fields with data, then by API name. Schema only: no
+        value of any record."""
+        name = self.object(obj)
+        spec = self.cat.objects.get(name) if name else None
+        if spec is None:
+            return []
+        order = {"picklist": 0, "multipicklist": 0, "boolean": 1, "reference": 2, "date": 3, "datetime": 3}
+        keep = [f for f in spec.fields.values()
+                if f.sensitivity not in ("blocked", "contact") and not f.legacy and not f.deprecated]
+        keep.sort(key=lambda f: (order.get(f.kind, 5 if f.kind in _NUMBER_KINDS else 6), not f.has_data,
+                                 not f.documented, f.api))
+        return [(f.api, f.label or f.api, f.kind) for f in keep]
 
     def label(self, obj: Any, path_text: Any = None) -> str | None:
         """The plural label of an object, or the label of a field path's last field."""

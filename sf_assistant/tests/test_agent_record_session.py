@@ -371,7 +371,7 @@ def test_combine_accepted():
     assert isinstance(m, MergeResult) and m.merged and m.error is None and m.rejected_numbers == []
     assert m.text.startswith("37 interviews")
     call = llm.calls[0]
-    assert call["max_tokens"] == MERGE_MAX_TOKENS == 1600 and call["tools"] is None
+    assert call["max_tokens"] == MERGE_MAX_TOKENS == 2500 and call["tools"] is None   # 1600 until development A
     assert call["messages"][0]["content"] == rprompts.COMBINE_SYSTEM
     user = call["messages"][1]["content"]
     assert user.startswith("QUESTION:\nHow many interviews ended with an offer?\n\nKNOWLEDGE ANSWER:\n")

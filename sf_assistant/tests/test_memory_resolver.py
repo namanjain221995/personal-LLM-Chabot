@@ -650,10 +650,12 @@ def test_the_prompt_drops_whole_pairs_from_the_oldest_end():
     sent = json.loads(_msgs[1]["content"].split(MR.LINES["head_turns"] + "\n", 1)[1].split("\n\n", 1)[0])
     assert sent[-1]["content"].startswith("answer 5") and sent[0]["role"] == "user"
     assert MR.estimate_tokens(json.dumps(sent, ensure_ascii=False, indent=0)) <= MR.PAIRS_TOKENS
-    _msgs, small = MR.build_messages("and for them?", turns, summary="s " * 3000, max_tokens=4000)
+    # a cap just above the system prompt (33 tokens of room, as 4000 left at the 3,967 tokens of prompt v2)
+    cap = MR._SYSTEM_TOKENS + 33
+    _msgs, small = MR.build_messages("and for them?", turns, summary="s " * 3000, max_tokens=cap)
     # one pair is kept, the summary goes, and the turns are cut until the cap holds (F4)
     assert small["summary"] is False and small["cut_turns"] >= 1 and not small["over"]
-    assert small["tokens"] <= 4000
+    assert small["tokens"] <= cap
     msgs, info = MR.build_messages("q", turns[-2:], summary="note " * 2000)
     body = msgs[1]["content"].split(MR.LINES["head_summary"] + "\n", 1)[1].split("\n\n", 1)[0]
     assert MR.estimate_tokens(json.loads(body)) <= MR.SUMMARY_TOKENS and info["tokens"] <= MR.MAX_TOKENS
@@ -1841,3 +1843,256 @@ def test_items_7_8_a_typed_grouping(text, grouping):
 def test_items_7_8_the_words_that_name_a_grouping_field(path, words):
     state, turns = _per_recruiter()
     assert _job(_DONE, state, turns)._group_words("Interview__c", path) == words
+
+
+# ------------------------------------------------------------------------ development B: say what is missing
+# An unclear reply may name what is missing ("missing", the closed codes of followup.MISSING_CODES): it changes no
+# decision, only the words (prompts/followup_resolve.md v3).
+def _coded(kind, standalone="", ops=(), missing=None):
+    body = {"kind": kind, "standalone": standalone, "ops": list(ops)}
+    if missing is not None:
+        body["missing"] = missing
+    return json.dumps(body)
+
+
+def test_b_parse_reply_reads_missing_codes_on_an_unclear_reply_only():
+    assert MR.parse_reply(_coded("unclear", missing=["period", "number"])) == {
+        "kind": "unclear", "standalone": "", "ops": [], "missing": ("number", "period")}
+    # any other kind, or codes not of the closed set: the reply reads as without the key
+    for kind, missing in (("new", ["number"]), ("unclear", ["colour"]), ("unclear", 5), ("unclear", None),
+                          ("unclear", []), ("patch", "period")):
+        assert MR.parse_reply(_coded(kind, "q?", missing=missing)) == MR.parse_reply(_coded(kind, "q?")), (kind,
+                                                                                                         missing)
+
+
+def _decision(res):
+    return (res.action, res.reason, res.step, res.status, res.detail, res.state_kind, res.question, res.pending,
+            res.ops, res.plan_line)
+
+
+@pytest.mark.parametrize("question,state,named", [
+    ("how many of them have less interviews in last years", None, ("number", "period")),
+    ("and his leave balance?", None, ("who",)), ("how many joined", None, ())])
+def test_b_with_no_plan_the_unclear_reply_carries_the_codes_and_decides_the_same(question, state, named):
+    plain, _ = _mr(question, state=state, reply=_coded("unclear"))
+    coded, _ = _mr(question, state=state, reply=_coded("unclear", missing=["number", "period"]))
+    assert _decision(coded) == _decision(plain) and (coded.status, coded.reason) == ("unclear", "unclear_rewrite")
+    # round 2 of the pre-release fixes: with no code from the model, code names them from the typed words
+    assert plain.missing == named and coded.missing == ("number", "period")
+    assert coded.log()["missing_parts"] == "number,period"
+    assert plain.log().get("missing_parts", "") == ",".join(named)
+    assert {k: v for k, v in coded.log().items() if k != "missing_parts"} == {
+        k: v for k, v in plain.log().items() if k != "missing_parts"}
+
+
+def test_b_with_a_plan_the_clarify_asks_for_what_is_missing_in_place_of_the_full_question():
+    question = "and for them in last years?"
+    plain, _ = _mr(question, reply=_coded("unclear"))
+    coded, _ = _mr(question, reply=_coded("unclear", missing=["period"]))
+    assert _decision(coded) == _decision(plain) and plain.reason == "clarify" and plain.pending is None
+    # round 2: with no code from the model, code names the vague period from the typed words: the same text
+    assert plain.text == coded.text
+    nothing, _ = _mr("and for them?", reply=_coded("unclear"))
+    assert nothing.text == MR._say("unclear_plan_ask", plan=nothing.plan_line,
+                                   ask=_F.unclear_ask("and for them?", ["who"]))
+    assert coded.text == MR._say("unclear_plan_ask", plan=plain.plan_line, ask=_F.unclear_ask(question, ["period"]))
+    assert coded.text == (f"I could not tell how this goes on from the last query ({plain.plan_line}). Which years "
+                          f'do you mean by "last years"? Or ask the full question.')
+    # readings offered as choices: the choices decide, the codes change nothing
+    reading = _coded("unclear", "How many candidates were there this month?",
+                     [{"set_measure": {"measure": "count_distinct", "field": "Candidate__c"}}])
+    with_codes = json.dumps({**json.loads(reading), "missing": ["object"]})
+    a, _ = _mr("What about candidates?", reply=reading)
+    b, _ = _mr("What about candidates?", reply=with_codes)
+    assert _decision(a) == _decision(b) and a.text == b.text
+
+
+def test_b_codes_on_another_kind_change_nothing():
+    reply = _coded("new", "What is the leave balance of Echo One?")
+    coded = json.dumps({**json.loads(reply), "missing": ["who"]})
+    turns = [{"role": "user", "content": "How many leaves did Echo One take?"},
+             {"role": "assistant", "content": "Echo One took 4 leaves."}]
+    a, _ = _mr("and his leave balance?", state=None, reply=reply, turns=turns)
+    b, _ = _mr("and his leave balance?", state=None, reply=coded, turns=turns)
+    assert _decision(a) == _decision(b) and b.missing == ()
+
+
+def test_b_shadow_never_has_codes():
+    got = _shadow("how many of them have less interviews in last years")
+    assert got.missing == () and "missing_parts" not in got.log()
+
+
+# ------------------------------------------------- round 2 of the pre-release fixes (2026-11-28): memory on, lists
+# Bars 2a, 2b and 3c of the real-model re-check: after a list of a group, the vague count, its clarify and the
+# person's answer were read by the resolver's model, which ended in a plan clarify, a made-up field or bad
+# operations; memory off rewrote the question and answered it. Made-up names only.
+_LIST_CALL = None
+_LIST_ASK = "list out all recruiters of the Zeta department"
+_LIST_TURNS = [{"role": "user", "content": _LIST_ASK},
+               {"role": "assistant", "content": "The Zeta department has 4 recruiters: Echo One, Delta Person and two "
+                                                "more."}]
+_VAGUE = "how many of them have less interviews in last years"
+
+
+def _list_state():
+    call = {"tool": "list_records", "args": {"object": "Recruiter__c", "filters": [
+        {"field": "Department__c", "op": "eq", "value": "Zeta"}]}}
+    return _mr_state([call])
+
+
+def test_r2_a_count_of_the_listed_set_goes_to_the_rewrite_with_no_model_call():
+    for question in (_VAGUE, "how many of them have fewer than 3 interviews in 2025", "unme se kitne active hain?"):
+        res, llm = _mr(question, state=_list_state(), turns=_LIST_TURNS)
+        assert (res.action, res.reason, res.status, res.detail) == ("reply", "use_rewrite", "unclear", "list_count")
+        assert llm.calls == [], question
+        assert res.checked.plan is not None                       # the list plan is carried to the next state
+    # a count on a plan that is no list goes to the model as before
+    res, llm = _mr("how many of them were completed?", reply=_reply("unclear"), turns=_LIST_TURNS)
+    assert res.reason != "use_rewrite" and len(llm.calls) == 1
+    # shadow logs the same decision, with no model call
+    assert _shadow(_VAGUE, state=_list_state(), turns=_LIST_TURNS).reason == "use_rewrite"
+    assert "use_rewrite" in MR.REASONS
+
+
+@pytest.mark.parametrize("reply,detail", [
+    (_coded("patch", "", []), "bad_ops"),
+    (_coded("unclear"), "model_unclear"),
+    (_coded("unclear", missing=["number"]), "model_unclear"),
+    (_coded("patch", "x", [{"add_filter": {"field": "Placement_Count__c", "op": "lt", "value": 3}}]),
+     "check_unknown_field"),
+    (_coded("patch", "x", [{"set_measure": {"measure": "count"}}]), "check_measure_not_for"),
+])
+def test_r2_the_model_ending_in_a_clarify_on_a_list_plan_goes_to_the_rewrite(reply, detail):
+    res, llm = _mr("and which ones are below three?", state=_list_state(), reply=reply, turns=_LIST_TURNS)
+    assert (res.reason, res.status, res.detail) == ("use_rewrite", "unclear", detail) and len(llm.calls) == 1
+    # on a plan that is no list the same replies never go to the rewrite (they ask, or a count patch runs)
+    res, _ = _mr("and which ones are below three?", reply=reply, turns=_LIST_TURNS)
+    assert res.reason in ("clarify", "patch")
+
+
+def _after_clarify(text):
+    return _LIST_TURNS + [{"role": "user", "content": _VAGUE}, {"role": "assistant", "content": text}]
+
+
+def test_r2_the_answer_to_a_coded_clarify_runs_whole_or_goes_to_the_rewrite():
+    fixed = "I could not tell what this refers to. Please ask the full question, with the name or object."
+    reading = "the recruiters of the Zeta department"
+    clarify = _F.unclear_text(_VAGUE, ("number", "period"), reading, fixed=fixed)
+    whole = "how many of the recruiters of the Zeta department have less than 3 interviews in 2024 and 2025"
+    res, llm = _mr("fewer than 3, in 2024 and 2025", state=_list_state(), turns=_after_clarify(clarify))
+    assert (res.action, res.question, res.detail) == ("new", whole, "clarify_answer") and llm.calls == []
+    # a partial answer: the rewrite asks for the rest (memory off's path), no resolver model call
+    res, llm = _mr("fewer than 3", state=_list_state(), turns=_after_clarify(clarify))
+    assert (res.reason, res.detail) == ("use_rewrite", "clarify_answer") and llm.calls == []
+    # a question of its own after the clarify is no answer to it
+    res, _ = _mr("what is the leave policy?", state=_list_state(), reply=_coded("new", "what is the leave policy?"),
+                 turns=_after_clarify(clarify))
+    assert res.reason != "use_rewrite"
+
+
+def test_r2_the_resolvers_own_plan_clarify_is_read_as_a_coded_clarify():
+    """With memory on the vague step was answered by the plan clarify (unclear_plan_ask); the person's answer to it was
+    lost. Code now reads that clarify too, offers the person's list question as the reading, and the full answer runs
+    the whole question; an answer code cannot finish (no reading) goes to the rewrite."""
+    plain, _ = _mr(_VAGUE, reply=_coded("unclear", missing=["number", "period"]), turns=_LIST_TURNS)
+    assert plain.reason == "clarify" and plain.text.startswith("I could not tell how this goes on from the last query (")
+    turns = _LIST_TURNS + [{"role": "user", "content": _VAGUE}, {"role": "assistant", "content": plain.text}]
+    got = _F._clarified(turns)
+    assert got is not None and got.asked == _VAGUE and got.codes == ("number", "period")
+    assert got.reading == "the recruiters of the Zeta department"
+    assert got.ask == ('Do you mean the recruiters of the Zeta department? Fewer than how many interviews, and which '
+                       'years do you mean by "last years"?')
+    assert _F.answers_clarify("fewer than 3, in 2024 and 2025", turns)
+    assert not _F.answers_clarify("How many interviews did Echo One host in 2025?", turns)
+    res, llm = _mr("fewer than 3, in 2024 and 2025", turns=turns)
+    assert (res.action, res.detail) == ("new", "clarify_answer") and llm.calls == []
+    assert res.question == "how many of the recruiters of the Zeta department have less than 3 interviews in 2024 and 2025"
+    # with no list question before it there is no reading: the rebuilt question still says "them", the rewrite reads it
+    bare, _ = _mr(_VAGUE, reply=_coded("unclear", missing=["number", "period"]))
+    assert "Do you mean" not in bare.text
+    turns = _TURNS + [{"role": "user", "content": _VAGUE}, {"role": "assistant", "content": bare.text}]
+    res, llm = _mr("fewer than 3, in 2024 and 2025", turns=turns)
+    assert (res.reason, res.detail) == ("use_rewrite", "clarify_answer") and llm.calls == []
+    # a plan line in brackets that holds the middle's own characters is still read; another lead or tail is not
+    tricky = plain.text.replace("(", "(a). b, ", 1)
+    assert _F._clarify_ask(tricky) is not None
+    assert _F._clarify_ask(plain.text.replace(" Or ask the full question.", "")) is None
+    assert _F._clarify_ask(plain.text.replace("Fewer than how many", "How many")) is None
+
+
+# ------------------------------------------------- round 2 (2026-11-28): the placement rate is the placement share
+_PLACE_TREND = None
+
+
+def _placements_state(tool="trend_records"):
+    offer = [{"field": "Interview_Outcome__c", "op": "eq", "value": "Offer Received"}]
+    if tool == "trend_records":
+        args = {"object": "Interview__c", "grain": "month", "date_field": "Date_of_Interview__c", "period": "2026",
+                "filters": offer}
+    elif tool == "count_records":
+        args = {"object": "Interview__c", "date_field": "Date_of_Interview__c", "period": "2026",
+                "filters": offer + [{"field": "Region__c", "op": "eq", "value": "North America"}]}
+    else:
+        args = {"object": "Interview__c", "group_by": "Recruiter__c", "date_field": "Date_of_Interview__c",
+                "period": "this year", "filters": offer}
+    return _mr_state([{"tool": tool, "args": args}], terms={"keys": ["placement"], "text": "placements in 2026"})
+
+
+@pytest.mark.parametrize("ops", [
+    [{"set_measure": {"measure": "avg", "field": "Client_Bill_Rate__c"}}],   # P-B: "rate" read as the bill rate
+    [{"set_measure": {"measure": "avg", "field": "Placement_Rate__c"}}],     # P-B-grain-dropped run 1: made up
+    [{"set_measure": {"measure": "count_distinct", "field": "Interview_Outcome__c"}}],   # run 2
+    [],
+])
+def test_r2_and_the_placement_rate_runs_the_placement_share_whatever_the_model_patched(ops):
+    for kind in ("patch", "unclear"):
+        res, _ = _mr("and the placement rate?", state=_placements_state(), reply=_coded(kind, "", ops),
+                     turns=_TURNS)
+        assert (res.action, res.detail) == ("patch", "placement_share"), (kind, ops, res)
+        main = res.plan["calls"][0]
+        assert main["tool"] == "trend_records" and main["args"]["part_filters"] == [
+            {"field": "Interview_Outcome__c", "op": "eq", "value": "Offer Received"}]
+        assert "filters" not in main["args"] and main["args"]["grain"] == "month"
+        assert len(res.plan["calls"]) == 1 and "Bill" not in res.plan_line and res.plan_line.startswith("share of")
+
+
+def test_r2_the_placement_share_of_a_count_keeps_the_other_filters_as_its_base():
+    res, _ = _mr("what is the placement rate?", state=_placements_state("count_records"),
+                 reply=_coded("patch", "", [{"set_measure": {"measure": "avg", "field": "Client_Bill_Rate__c"}}]))
+    main = res.plan["calls"][0]
+    assert (res.action, main["tool"]) == ("patch", "percentage_of_records")
+    assert main["args"]["base_filters"] == [{"field": "Region__c", "op": "eq", "value": "North America"}]
+    # a model's period goes with the share; its measure never runs
+    res, _ = _mr("and the placement rate for 2025?", state=_placements_state(),
+                 reply=_coded("patch", "", [{"set_period": {"phrase": "2025"}},
+                                            {"set_measure": {"measure": "avg", "field": "Client_Bill_Rate__c"}}]))
+    assert res.action == "patch" and res.plan["calls"][0]["args"]["period"] == "2025"
+    assert "part_filters" in res.plan["calls"][0]["args"]
+
+
+def test_r2_no_share_for_another_rate_or_a_plan_that_cannot_take_it():
+    # "the bill rate" names no placement: the model's patch runs as before
+    res, _ = _mr("what about the bill rate?", state=_placements_state(),
+                 reply=_coded("patch", "", [{"set_measure": {"measure": "avg", "field": "Client_Bill_Rate__c"}}]))
+    assert res.action == "patch" and res.detail == "model_patch"
+    # a grouping of placements has no share tool: the model's reading decides as before (no share patch)
+    res, _ = _mr("and the placement rate?", state=_placements_state("group_records"),
+                 reply=_coded("unclear"))
+    assert res.detail != "placement_share"
+
+
+def test_r2_a_patch_of_placements_never_drops_the_placement_filter():
+    """T02: "only the placed ones" got a patch that ran every interview per recruiter, read as placements."""
+    for ops in ([{"remove_filter": {"field": "Interview_Outcome__c"}}],
+                [{"remove_filter": {"field": "Outcome"}}, {"set_top": {"n": 3, "order": "desc"}}]):
+        res, _ = _mr("only the placed ones", state=_placements_state("group_records"), reply=_coded("patch", "", ops))
+        assert (res.reason, res.detail) == ("clarify", "check_term_reject") and "placement" in res.text, ops
+    # the person moving to all interviews may drop it
+    res, _ = _mr("and all interviews?", state=_placements_state("group_records"),
+                 reply=_coded("patch", "", [{"remove_filter": {"field": "Interview_Outcome__c"}}]))
+    assert res.action == "patch"
+    # a filter added beside it keeps it
+    res, _ = _mr("only the completed ones", state=_placements_state("group_records"),
+                 reply=_coded("patch", "", [{"add_filter": {"field": "Interview_Status__c", "op": "eq",
+                                                            "value": "completed"}}]))
+    assert res.action == "patch"

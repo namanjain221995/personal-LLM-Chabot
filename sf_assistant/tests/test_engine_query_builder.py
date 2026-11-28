@@ -270,3 +270,20 @@ def test_a_base_name_filter_is_normalised_and_checked(cat, ctx):
     assert chk.field is None and chk.target == "Recruiter__c" and out.text == "Name = 'Delta Person'"
     out = filter_frag(sc, {"field": "Name", "op": "contains", "value": "Delta"}, ctx)
     assert not out.checks
+
+
+def test_max_count_counts_the_records_with_none_too(cat, ctx):
+    """Round 2 of the pre-release fixes (D1 shape): "fewer than 3" is a correlated count, so a record with no matching
+    child counts as 0 and is kept; with min_count it is a range; the wrong shapes say how to fix them."""
+    sc = Scope(cat, cat.objects["Candidate_Training__c"])
+    rf, text, _, _o = related_frag(sc, {"child_object": "Session__c", "exists": True, "max_count": 2}, 1, ctx)
+    assert rf.sql == '(SELECT COUNT(*) FROM main."Session__c" AS c1 WHERE c1."Candidate_Training__c" = t0."Id") <= ?'
+    assert rf.params == (2,) and text.startswith("has at most 2 Session__c") and "none included" in text
+    rf, text, _, _o = related_frag(sc, {"child_object": "Session__c", "exists": True, "min_count": 1, "max_count": 2},
+                                   1, ctx)
+    assert rf.sql.endswith(") BETWEEN ? AND ?") and rf.params == (1, 2) and text.startswith("has 1 to 2 Session__c")
+    for bad, words in (({"exists": False, "max_count": 2}, "exists=true"), ({"exists": True, "max_count": -1}, "0 or"),
+                       ({"exists": True, "min_count": 3, "max_count": 2}, "above max_count")):
+        with pytest.raises(RecordError) as exc:
+            related_frag(sc, {"child_object": "Session__c", **bad}, 1, ctx)
+        assert exc.value.code == "E11d" and words in str(exc.value), bad

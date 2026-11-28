@@ -146,8 +146,23 @@ one of this machine's) and add the firewall rules again for the new address.
   (each cut to 1,500 characters, the oldest pair dropped while the request would pass 15,000 bytes). The worker then
   runs `Pipeline.answer_followup`: the ask service's rewrite (`agent/followup.py`, the same rules), the answer to the
   rewritten question with its `Read as:` line first, or the unclear line (`I could not tell what this refers to...`)
-  and no other model call. A question complete on its own is answered as typed when the rewrite call fails or the model
-  rewords it (`detail.rewrite.answered` = `typed`); the model's own UNCLEAR stays a refusal. With no earlier answer the
+  and no other model call. When something is missing (development B of 2026-11-27), one line asks for it first
+  ("Fewer than how many interviews, and over which period?"), from the fixed parts of `prompts/followup_unclear.md`
+  and the person's typed words only; `detail.rewrite.missing` holds the codes and `offer` whether an earlier
+  question's words were offered back. Since prompt v9 (round 2 of the pre-release fixes, 2026-11-28) the model only
+  decides (the question, or the one word UNCLEAR, as in v6) and code names the missing parts after an UNCLEAR
+  (`followup._code_parts`: a comparison with no number, a period that is not exact, the person's earlier list
+  question as the reading, else who for a word that points back). The person's answer to that line
+  ("fewer than 3, in 2024 and 2025") is read by code (pre-release fixes of 2026-11-28): it puts the number and the
+  period into the asked question and runs it with no rewrite call (`detail.rewrite.reason` = `clarify_answer`), asks
+  again only for a part the answer left open, and gives a who or object answer to the model with a `CLARIFY ANSWER`
+  line. With `SFA_MEMORY=on` the resolver reads it the same way (`followup.clarify_answer`), also after its own
+  clarify built from a plan, and hands a partial answer, a count of a listed group ("how many of them ...") and a
+  list follow-up its model could not patch to that same rewrite path (reason `use_rewrite`; the ask log's
+  `memory.resolver.detail` says which: `clarify_answer`, `list_count`, `bad_ops`, `model_unclear`, `check_...`). A
+  question complete on its own is
+  answered as typed when the rewrite call fails or the model rewords it (`detail.rewrite.answered` = `typed`); the
+  model's own UNCLEAR stays a refusal. With no earlier answer the
   question goes to `Pipeline.answer` unchanged. A `recent_turns` of another shape gets 400. The web log's `ask` line
   says how many turns came (`turns`) and its `detail.rewrite` what the rewrite did and how long its call took
   (`seconds`).
@@ -368,9 +383,9 @@ removes the socket only if the path still holds its own.
 it says so and stops; `./run.sh up` builds it. A new `web/requirements.lock` therefore reaches this service only after
 the page's project has rebuilt the image, and then through `./run.sh up-ask` (a plain restart keeps the old image).
 
-**Copy `agent/followup.py` and `prompts/followup_rewrite.md` together, always.** The page and the service import every
-module of `sf_assistant.agent` at their start, and that module reads its prompt file at import. `followup.py` without its
-prompt file (the page's folder, a hand copy) stops the page at its next start.
+**Copy `agent/followup.py`, `prompts/followup_rewrite.md` and `prompts/followup_unclear.md` together, always.** The
+page and the service import every module of `sf_assistant.agent` at their start, and that module reads its prompt files
+at import. `followup.py` without them (the page's folder, a hand copy) stops the page at its next start.
 
 How it behaves:
 
@@ -491,7 +506,7 @@ no state, `shadow` answers byte for byte as `off` and also returns the next quer
 | `SFA_MEMORY_PATCH_KNOWLEDGE` | `off` | `off`, `on` (owner decision D4: off) |
 | `SFA_MEMORY_MAX_CALLS` | `3` | a whole number from 1 to 3 |
 | `SFA_MEMORY_MAX_AGE` | `2` | a whole number from 0 to 6 |
-| `SFA_MEMORY_TOKENS` | `12000` | a whole number from the resolver's smallest prompt (`memory_tokens_floor()`, about 5,400) to 100000 |
+| `SFA_MEMORY_TOKENS` | `12000` | a whole number from the resolver's smallest prompt (`memory_tokens_floor()`, about 5,500) to 100000 |
 
 How they reach the service:
 
@@ -1032,9 +1047,17 @@ With `SFA_TABLES=code`:
   trimmed result or a multi-select field; code never adds numbers up). Under a list cut by its limit, the 50-group
   cap or the result cap, a "Showing k of n records." line from the result's own numbers ("Not all records are shown."
   when k is no number the result holds), unless the model's text already gives both numbers.
-- Code cuts nothing the tool returned (the tools already cap: a list at most 50 rows, 50 groups, a trend at most 120
-  periods, 4 segments, a breakdown 8 values and `(other)`). `TABLE_MAX_ROWS = 120` is only a safety net (one
-  number-free `…` row ends the block).
+- Code cuts nothing the tool returned (the tools already cap: a list at most 200 rows since development A of
+  2026-11-27, 50 before; 50 groups, a trend at most 120 periods, 4 segments, a breakdown 8 values and `(other)`).
+  `TABLE_MAX_ROWS` (`LIMITS.list_max_rows`, 200; 120 before) is only a safety net (one number-free `…` row ends the
+  block). A list's rows come from `QueryEvidence.full_rows` when the result cap cut the rows the model read.
+- Long lists (development A of 2026-11-27): a list question (`agent.display.asks_list`) gets these code rows in every
+  `SFA_TABLES` mode: the record agent's prompt ends with `RECORDS_LIST_NOTE` (one list_records call with limit 200, a
+  table line, no typed rows; a call without a limit asks for 200), `agent.tables.list_rows` writes the whole list
+  (pages of one list joined, after the lead) and drops the rows the model typed. The answer caps are 2,500 tokens
+  (`LIMITS.model_max_tokens`, `merge_max_tokens`; a full reply at about 24 tokens/s, about 104 s, stays under the
+  120 s call timeout), and an answer whose model call stopped at its token limit gets
+  `ANSWER_CUT_LINE` (`prompts/answer_cut_line.md`) before its Source line (JSONL `answer_cut`).
 - Placement: a block goes where its table line was; a table line before the first prose line moves after the first
   prose paragraph (the lead stays first), one after the Source line moves before it when that line ends the text (a
   Source line written first stays where it is, below it the lead and then the rows), one inside a sentence leaves the

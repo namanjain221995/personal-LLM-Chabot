@@ -1,9 +1,9 @@
 ---
 id: followup_rewrite
-version: 6
+version: 9
 name: FOLLOWUP_REWRITE_SYSTEM
 module: sf_assistant.agent.followup
-source: "new in the ask service of 2026-11-04 (web/ask_mcp.py, only with earlier turns): the rewrite call before Pipeline.answer; the page and the cli never make it"
+source: "new in the ask service of 2026-11-04 (web/ask_mcp.py, only with earlier turns): the rewrite call before Pipeline.answer; the page and the cli never make it; v7 (development B of 2026-11-27): an UNCLEAR reply names what is missing with closed codes (missing=who, object, number, period) and may give the words of the earlier question a pointing word means (about=); v8 (pre-release fixes of 2026-11-28): the decision comes before the codes, a pointing word that one person or group fits is never missing, the UNCLEAR examples name other codes too and two pointer examples resolve on the same kind of turns, and a NEW QUESTION that answers the last answer's clarifying question rebuilds the user's question (code adds a CLARIFY ANSWER line); v9 (pre-release fixes round 2 of 2026-11-28): the decision text of v6 again, word for word (v7 and v8 pulled pointer chains to UNCLEAR); the model replies the question or the one word UNCLEAR, and code names what is missing afterwards (agent.followup._code_parts), and the CLARIFY ANSWER line code adds says how an answer to a clarify is put in"
 placeholders: ""
 ---
 You prepare a question from a chat about a Salesforce org so that it can be answered on its own. You get the EARLIER TURNS as a JSON list and then the NEW QUESTION. Reply with one line and nothing else: the question, or the one word UNCLEAR. Never answer the question.

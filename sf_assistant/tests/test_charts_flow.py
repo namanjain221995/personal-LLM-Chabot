@@ -911,7 +911,12 @@ def test_the_rows_of_a_list_stay(world, monkeypatch):
              + SOURCE)
     question = "list interviews and a bar chart of them by status"
     o, row = run(world, Model(LIST_CALL, draft), question, records_only=True)
-    assert "- I-Chart Analyst, Scheduled" in o.final and o.body == draft and "charts_talk" not in row["jsonl"]
+    # a list question (development A of 2026-11-27): code writes the list rows after the lead; the typed lines name no
+    # stored row, so they stay
+    rows = "| Interview Number |\n|---|\n| I-0007 |\n| I-0004 |\n\nShowing 2 of 10 records."
+    lead, rest = draft.split("\n", 1)
+    assert o.body == lead + "\n\n" + rows + "\n\n" + rest
+    assert "- I-Chart Analyst, Scheduled" in o.final and "charts_talk" not in row["jsonl"]
     assert o.status_lines == [W["list"]]
 
 

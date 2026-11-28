@@ -159,7 +159,7 @@ Never sent: the trace, the log record, SQL, parameters, the model address, raw e
 | 1a | small talk (`agent/small_talk.py`: a greeting, thanks, "are you there", "can you tell me one thing"; new 2026-11-25, P6), before `ensure_fresh()` and also with records off: no model call, reason `small_talk` | `answered` | the fixed line |
 | 2 | `pipeline.session` is None after `ensure_fresh()`: no model call | `failed` | empty |
 | 3 | the rewrite call raised, or the endpoint is not local: the typed words are not sent on | `failed` | empty |
-| 4 | the rewrite says UNCLEAR to a question that is not complete or has no subject of its own, or echoes a fragment, or fails the output rule, or `asks_for_contact(rewritten) != asks_for_contact(raw)`, or adds a phone number, or is not bound to the typed question (`agent/followup.py`) | `unclear` | `I could not tell what this refers to. Please ask the full question, with the name or object.` |
+| 4 | the rewrite says UNCLEAR to a question that is not complete or has no subject of its own, or echoes a fragment, or fails the output rule, or `asks_for_contact(rewritten) != asks_for_contact(raw)`, or adds a phone number, or is not bound to the typed question (`agent/followup.py`) | `unclear` | `I could not tell what this refers to. Please ask the full question, with the name or object.` When the model's UNCLEAR named what is missing (`UNCLEAR missing=number,period about=...`, the codes who, object, number, period; development B of 2026-11-27), that line comes after one line built from `prompts/followup_unclear.md` and the person's own typed words, e.g. `Fewer than how many interviews, and which years do you mean by "last years"?`, with `Do you mean <words of the earlier question>?` first when the reading is a run of an earlier user turn as typed (`followup.unclear_text`). The fixed line always stands in full: the platform bridge looks for it (`sfk_bridge.follows_a_stop_line`). The same text in off, shadow and on (the resolver's `"missing"`) |
 | 5 | `Pipeline.answer` raised, or any other fault in the service, or a reply JSON cannot hold (a NaN, a key that is no string) | `failed` | empty |
 | 6 | any `trace.queries[].error_code` is `E2c` or `E1d` | `refused` | kind `merged` or `records`: the real text, joined, then `One blocked field was left out.` Any other kind, or no text: `This field is blocked, so it cannot be shown here.` alone |
 | 7 | kind `merged` or `records` | `answered` | joined |
@@ -431,7 +431,7 @@ folder, which stay out of this repository, name the old paths.
 | 4 | `agent/small_talk.py` | Small talk answered by code (new 2026-11-25, P6): `small_talk` (a full match of a word table: greeting, thanks, ack, bye, presence, empty ask, help; English, Hinglish, typos, a self-introduction after a greeting) and `line` (`prompts/small_talk.md`); standard library, the prompts and `knowledge.resolver.osa_distance` only |
 | 4 | `agent/display.py` | The display words (new 2026-11-25, P3): `split` (the search text and the `Display` flags, with the guards; `SessionGuards` for the stored values, names and the invariant check, which imports the engine inside its methods), `note` (`prompts/records_display_note.md`), `line` (`prompts/display_words.md`), `CHART_VERBS`; and the chart ask grammar moved from `agent/charts.py` (`fold`, `fires`, `_ASK`, `_STOP`, `_ABOUT`, `_NOT_A_CHART`, `_FILLER` ...), which charts imports back. No engine module, no charts import |
 | 4 | `agent/clarify.py` | The clarifying question of a record step that got no data (new 2026-11-25, P2): `build` (lead, 2-3 choices from the terms, the question's objects, the failed calls, the last answer or examples; `prompts/records_clarify.md`) and `choice_reply` (P2c: "2", "the second one" or the choice's text read by code) |
-| 4 | `agent/followup.py` | The follow-up rewrite of the ask service (new 2026-11-04): one short model call that turns a follow-up into a question that stands on its own; `rewrite` (no earlier turn: no call), the output rule, the contact rule's check and the check that the reply is bound to the typed question. Copy it with `prompts/followup_rewrite.md`: the page imports it at start |
+| 4 | `agent/followup.py` | The follow-up rewrite of the ask service (new 2026-11-04): one short model call that turns a follow-up into a question that stands on its own; `rewrite` (no earlier turn: no call), the output rule, the contact rule's check and the check that the reply is bound to the typed question; `unclear_text` writes the reply to an unclear one from `prompts/followup_unclear.md`. Copy it with `prompts/followup_rewrite.md` and `prompts/followup_unclear.md`: the page imports it at start |
 | 4 | `agent/term_notes.py` | The record answer's scope claims kept true to what ran (new 2026-11-24): `drop_unapplied_scope_claims` (for a question about candidates or a call with a record-type filter: a Person Account or record-type claim no applied filter backs loses its clause, never its number), `with_term_line` (the code line "Candidates counted: Person Accounts only (...)" before the Source line), `without_term_line` (the merge's Counted line reads the record answer's own words); no duckdb, never raises |
 | 4 | `agent/record_prompts.py`, `agent/render.py` | Record and merge prompt texts (`render_records_system`); the RECORDS block and trace lines |
 | 5 | `evaluation/questions.py`, `grading.py`, `report.py`, `score_records.py` | Question generation, grading (fact checks and an optional judge), reports, and scoring of an `ask.sh --file` run (`okeval/*`, `score_records.py`) |
@@ -555,7 +555,7 @@ The switches (`src/sf_assistant/config.py`, `MemoryConfig`; read once at the ser
 | `SFA_MEMORY_PATCH_KNOWLEDGE` | `off` | the knowledge step on a patched follow-up (off: the record agent alone) |
 | `SFA_MEMORY_MAX_CALLS` | `3` | the most record calls a stored plan holds (1-3); an answer with more stores no plan |
 | `SFA_MEMORY_MAX_AGE` | `2` | the most answers after its own a plan may still be patched after, with a confirm (0-6) |
-| `SFA_MEMORY_TOKENS` | `12000` | the resolver's prompt cap; a value below its smallest prompt with a full plan and a question (`memory_tokens_floor()`, about 5,400) is refused |
+| `SFA_MEMORY_TOKENS` | `12000` | the resolver's prompt cap; a value below its smallest prompt with a full plan and a question (`memory_tokens_floor()`, about 5,500) is refused |
 | `SFA_ASK_LOG_DAYS` | `90` | days the daily log files are kept (`web/ask_log.py`) |
 
 The page (`web/pipeline.py`) has no store: with `SFA_MEMORY=on` its follow-ups go through the resolver with no state;
@@ -578,6 +578,21 @@ What the service assumes of its caller and its switches:
 - **Seeded calls run side calls first and the main call last**, so the chart (drawn from the last chartable result)
   and the next plan's main call stay the plan's main call after an operation that added a side call; a seeded main
   call stays the main call unless the record agent added a chartable call of its own.
+- **The fixes of the real-model evaluation (step 5, 2026-11-27; on only, off and shadow answer as before):**
+  - an answer of several counts and no chartable call keeps as its main call the count whose object the question
+    names alone; a compare covers every count of the same period, and another operation of the main call alone asks
+    which query is meant when the question named none (`which_call`);
+  - a candidates scope the record agent wrote itself (a Person Account filter in the stored arguments) goes when the
+    person's typed words relax the contract (every account type; other types beside another type's filter);
+  - with the catalog view, the plan line writes "candidates as Person Accounts" or "every account type" from the
+    filters the main call runs with (a record set's own call counts), and a lookup's name reads as the lookup
+    ("where Department = 'Dept One'");
+  - the resolver's prompt has a FIELDS part (the plan objects' field names and labels, no values, at most 500
+    tokens, dropped before any turn is cut), and a field name that does not resolve is matched to the one field of
+    the main object (or one lookup away, a lookup the plan already uses first) whose label words hold it and whose
+    kind the values fit; with none or several it asks as before;
+  - a zero-row call of the record agent's that a later call of the same tool, object and period with other filter
+    fields replaced is not stored.
 - **The log** of an on-mode call that the resolver could not read holds its codes and the reply's length, never the
   reply.
 

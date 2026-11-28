@@ -37,7 +37,9 @@ The tool's contract, which the orchestrator's bridge is built against (docs/arch
   "can you tell me one thing"; reason ``small_talk``), before ``ensure_fresh`` and also with records off; ``failed`` with
   no model call when the record session is None after ``ensure_fresh`` (the knowledge side has no local-endpoint guard);
   ``failed`` when the rewrite call raised; ``unclear`` when the rewrite says so or its reply fails a rule
-  (``agent/followup.py``), with :data:`UNCLEAR_LINE`; ``failed`` when ``Pipeline.answer`` raised; then :func:`decide` on
+  (``agent/followup.py``), with :data:`UNCLEAR_LINE`, after what is missing when the rewrite named it
+  (``followup.unclear_text``: fixed parts and the person's own words; development B of 2026-11-27); ``failed`` when
+  ``Pipeline.answer`` raised; then :func:`decide` on
   the finished answer. ``busy`` after :data:`QUEUE_WAIT_S` in line, ``timeout`` after :data:`TIMEOUT_S` of running.
   A clarifying question code writes when the record step got no data (``agent/clarify.py``: 2-3 numbered choices) is
   ``answered`` with kind ``none`` and reason ``clarify``; a reply "2" (or "the second one", or the choice's text) to it is
@@ -54,7 +56,10 @@ The memory modes (``SFA_MEMORY``, :class:`sf_assistant.config.MemoryConfig`, rea
   about the last answer runs the stored plan as seeded calls through the record tools with the terms rebuilt from the
   person's typed words (``sf_assistant.pipeline.MemoryRun``), and the "Read as:" line of a patch is its plan line. The
   resolver's clarifying text is sent as it is written, so the next turn finds it. A fault of the resolver itself falls
-  back to the rewrite. A v1 call is answered as with ``off``.
+  back to the rewrite, and so does its ``use_rewrite`` (a follow-up of a list the patch grammar cannot express, or an
+  answer to a coded clarify: round 2 of the pre-release fixes), with every turn sent so code finds its own clarify.
+  A patch whose main call the record agent's own call replaced reads as the plan that ran. A v1 call is answered as
+  with ``off``.
 
 In ``answer``, ``Read as:`` is a code span, so nothing in it links, and the body and the Source line lose the syntax of
 a Markdown link, image or reference (:func:`_no_links`): a link planted in a record cannot hide where it goes. A refusal
@@ -701,6 +706,27 @@ class _MemoryJob:
         except Exception:  # noqa: BLE001 - no state: the bridge stores none, and the next turn reads text only
             return None
 
+    def ran_line(self, run: Any, used: str | None, patched: Any) -> str:
+        """The plan line of what a patch ran, when the record agent's own call answered in place of the patched main
+        call (the next state's main call is another one; ``query_state.plan_from_evidence``): the Read-as line then
+        names the call the body shows (round 2 of the pre-release fixes, P-B). "" when the main call is the patched
+        one, or on any fault (the patch's own plan line is used)."""
+        try:
+            state = self._next("records", run, used, "")
+            ran, want = (next((c for c in (p or {}).get("calls") or [] if c.get("role") == "main"), None)
+                         for p in ((state or {}).get("plan"), patched))
+            if ran is None or want is None or (self.qs._canon([ran["tool"], ran["args"]])
+                                               == self.qs._canon([want["tool"], want["args"]])):
+                return ""
+            # only when the patched call itself ran (a stale record set, for one, runs nothing of the patch)
+            if not any(getattr(e, "ok", False) and getattr(e, "tool", "") == want["tool"]
+                       and self.qs._canon(getattr(e, "arguments", None)) == self.qs._canon(want["args"])
+                       for e in getattr(run, "evidence", None) or ()):
+                return ""
+            return self.qs.plan_line(state, today=self.today, label=self.label, view=self.view)
+        except Exception:  # noqa: BLE001 - the patch's own line
+            return ""
+
     def finish(self, reason: str, kind: str | None, *, run: Any = None, used: str | None = None,
                text: str = "") -> dict:
         """The v2 part of the reply (``state``, ``plan_line``, ``reason``). ``kind``: the answer kind the next state
@@ -712,7 +738,7 @@ class _MemoryJob:
             state = None
         self.out_state = state
         try:
-            line = self.qs.plan_line(state, today=self.today, label=self.label) if state else ""
+            line = self.qs.plan_line(state, today=self.today, label=self.label, view=self.view) if state else ""
         except Exception:  # noqa: BLE001 - no line rather than no answer
             line = ""
         return {"state": state, "plan_line": line, "reason": reason}
@@ -833,13 +859,16 @@ def _small_talk_read(mem: _MemoryJob | None, pipeline: Any) -> None:
     except Exception:  # noqa: BLE001 - the plan line then has no catalog words
         pass
 
-def _job_v1(pipeline: Any, question: str, turns: Any, mem: _MemoryJob | None, seen: dict | None = None) -> dict:
+def _job_v1(pipeline: Any, question: str, turns: Any, mem: _MemoryJob | None, seen: dict | None = None, *,
+            all_turns: bool = False) -> dict:
     """Today's job (``SFA_MEMORY`` off, a v1 call, shadow, or the on job after a fault of the resolver): the
     rewrite on the last :data:`REWRITE_TURNS` turns (C31), then ``Pipeline.answer``. With ``mem`` (shadow, or the
     resolver's fault) the answer runs under a ``MemoryRun`` with nothing set, which changes nothing in it and reads
     what ran, and the reply gets the next state. ``seen``: the job's holder of the question used, which the log line
-    of a fault reads (stage-2 review fix L1: as before the job moved)."""
-    from sf_assistant.agent.followup import FAILED, UNCLEAR, last_answer_objects, rewrite
+    of a fault reads (stage-2 review fix L1: as before the job moved). ``all_turns``: the rewrite gets every turn
+    sent (the on job when the resolver said ``use_rewrite``): its model still reads the last 4, and code finds its own
+    clarify of a question further back (``followup._clarified``, up to 12)."""
+    from sf_assistant.agent.followup import FAILED, UNCLEAR, last_answer_objects, rewrite, unclear_text
     from sf_assistant.agent.small_talk import line as talk_line, small_talk
 
     short = _rewrite_turns(turns)
@@ -854,11 +883,13 @@ def _job_v1(pipeline: Any, question: str, turns: Any, mem: _MemoryJob | None, se
     if mem is not None and mem.res is None:   # shadow: the code steps on the full input, no model call
         mem.read(pipeline)
         mem.shadow()
-    step = rewrite(question, short, pipeline.llm)
+    step = rewrite(question, turns if all_turns else short, pipeline.llm)
     if step.status == FAILED:      # the typed words are not sent on: as a fragment they mean something else
         return _out(mem, _result("failed"), f"rewrite_{step.reason}", error=step.error)
     if step.status == UNCLEAR:
-        return {**_out(mem, _result("unclear", UNCLEAR_LINE), f"rewrite_{step.reason}", v2="unclear_rewrite",
+        # the same in off and shadow; ``asked``: the question a partly answered clarify was about
+        text = unclear_text(step.asked or question, step.missing, step.about, fixed=UNCLEAR_LINE)
+        return {**_out(mem, _result("unclear", text), f"rewrite_{step.reason}", v2="unclear_rewrite",
                        kind="unclear"), "rewrite_reply": step.reply}
     used = step.question
     if seen is not None:
@@ -878,7 +909,7 @@ def _job_on(pipeline: Any, question: str, turns: Any, mem: _MemoryJob, seen: dic
     """The job of a v2 call with ``SFA_MEMORY=on`` (design v2 §6-§9): the resolver decides, then a reply is sent
     as the resolver wrote it, or a question, a patched plan or a question about the last answer runs. ``seen``: as
     for :func:`_job_v1`."""
-    from sf_assistant.agent.followup import last_answer_objects
+    from sf_assistant.agent.followup import last_answer_objects, unclear_text
     from sf_assistant.agent.small_talk import line as talk_line, small_talk
 
     talk = small_talk(question)
@@ -891,6 +922,8 @@ def _job_on(pipeline: Any, question: str, turns: Any, mem: _MemoryJob, seen: dic
         return _out(mem, _result("failed"), "records_off", error=str(pipeline.records_error or ""))
     mem.read(pipeline)
     res = mem.resolve(pipeline.llm)
+    if res.reason == "use_rewrite":   # a follow-up the patch grammar cannot express: answered as with memory off
+        return _job_v1(pipeline, question, turns, mem, seen, all_turns=True)
     if res.action == "reply":
         if res.status == "answered":
             # small talk or a clarifying question: its text as the resolver wrote it, so the next turn finds the
@@ -902,7 +935,8 @@ def _job_on(pipeline: Any, question: str, turns: Any, mem: _MemoryJob, seen: dic
         if res.status == "unclear":
             # no rewrite_reply (stage-2 review fix L3): the resolver's prompt held the summary, the plan and 12 turns,
             # and the log never holds them; the memory entry has the resolver's codes and the reply's size
-            return _out(mem, _result("unclear", UNCLEAR_LINE), f"resolver_{res.detail or res.reason}",
+            text = unclear_text(question, res.missing, res.about, fixed=UNCLEAR_LINE)   # the rewrite's parts (dev B)
+            return _out(mem, _result("unclear", text), f"resolver_{res.detail or res.reason}",
                         v2="unclear_rewrite", kind="unclear")
         if res.reason == "resolver_error":   # a fault of the resolver itself: today's rewrite answers
             return _job_v1(pipeline, question, turns, mem, seen)
@@ -915,7 +949,8 @@ def _job_on(pipeline: Any, question: str, turns: Any, mem: _MemoryJob, seen: dic
     shaped = (pipeline.answer(used, "merged", context_objects=objects, memory=run) if objects
               else pipeline.answer(used, "merged", memory=run))
     if res.action == "patch":
-        read_as = res.plan_line or None   # a patch or a shortcut reads as its plan line (§7.2)
+        # a patch or a shortcut reads as its plan line (§7.2), from the main call that answered (round 2, P-B)
+        read_as = mem.ran_line(run, used, res.plan) or res.plan_line or None
     else:
         read_as = used if used != question else None
     return _answered(mem, shaped, question, used, read_as, run=run, decided=_resolver_reason(res))

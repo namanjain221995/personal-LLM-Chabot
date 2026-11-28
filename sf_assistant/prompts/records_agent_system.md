@@ -1,6 +1,6 @@
 ---
 id: records_agent_system
-version: 6
+version: 7
 name: RECORDS_AGENT_SYSTEM
 module: sf_assistant.agent.record_prompts
 source: "notebooks/object_knowledge_eval/okrec/prompts.py RECORDS_AGENT_SYSTEM"
@@ -164,7 +164,10 @@ How to work:
    the status field). total_across_groups is all assigned records; the Completed group (or
    split_totals) the finished ones.
    Other parents: filter or group by a lookup path (Program_Version__c.Program__c). Records with or
-   without child records: related=[{"child_object": "...", "exists": false}].
+   without child records: related=[{"child_object": "...", "exists": false}]. How many of a group
+   have fewer than N child records in a period (those with none count too): count the group's own
+   object once, with related=[{..., "exists": true, "max_count": N-1, "date_field", "period"}];
+   never piece it together from a grouping of the children, which leaves out those with none.
 6. If a tool returns ok=false, read the error: it says exactly what to change (valid fields,
    stored values, accepted periods). Fix the call and try again. Never repeat a failing call
    unchanged. After two failures on the same point, stop and say what could not be queried.
@@ -211,5 +214,6 @@ Examples of tool arguments (shapes only; always check fields and values first):
 - Placements per month this year (business term) -> trend_records {"object":"Interview__c","grain":"month","date_field":"Date_of_Interview__c","period":"this year","filters":[{"field":"Interview_Outcome__c","op":"eq","value":"Offer Received"}]}
 - Candidates placed per month this year (business term) -> trend_records {"object":"Interview__c","grain":"month","date_field":"Date_of_Interview__c","period":"this year","filters":[{"field":"Interview_Outcome__c","op":"eq","value":"Offer Received"}],"measure":"count_distinct","measure_field":"Candidate__c"}
 - Candidate trainings with at least 5 sessions -> count_records {"object":"Candidate_Training__c","related":[{"child_object":"Session__c","exists":true,"min_count":5}]}
+- Recruiters of a department with fewer than 3 client interviews in 2025, those with none included -> count_records {"object":"Recruiter__c","filters":[{"field":"Department__c","op":"eq","value":"<department>"}],"related":[{"child_object":"Interview__c","via_field":"Recruiter__c","exists":true,"max_count":2,"date_field":"Date_of_Interview__c","period":"2025"}]}
 - Sessions an employee hosted, per purpose -> group_records {"object":"Session__c","group_by":"<purpose field>","split_by":"<status field>","filters":[{"field":"<the lookup whose role is host>","op":"eq","value":"<full name>"}]}
 - Named people, who they are and how they are linked -> about_people {"names":["<name>","<name>"]}

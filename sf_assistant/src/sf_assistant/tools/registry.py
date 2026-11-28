@@ -29,6 +29,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from sf_assistant.config import LIMITS   # list_max_rows: the list_records page (development A of 2026-11-27)
+
 __all__ = ["Tool", "ToolDef", "knowledge_tool_defs", "multi_tool_defs", "multi_object_tool", "RECORD_TOOLS",
            "RECORD_HANDLERS", "TOOL_ORDER", "TOOL_ALIASES", "SCHEMAS", "mcp_tool_list", "openai_tool_list",
            "knowledge_tool_list", "multi_tool_list", "record_tool_list", "tools_markdown", "component_tool_defs",
@@ -375,15 +377,21 @@ PERIOD = {"type": "string", "description": "Time window in words, resolved by co
                                            "2026 | Q2 2026 | May 2026 | 2026-05 | 2026-05-03 | since 2026-08-01 | after "
                                            "2026-06-30 | before 2026-01-01 | until 2026-03-31 | 2026-06-01 to 2026-06-30 "
                                            "| upcoming | past. Add 'so far' to stop at today. Leave it out for all time."}
+#: Members with fewer (or at most N) related records, those with none included (round 2 of the pre-release fixes of
+#: 2026-11-28, D1 shape: "how many of these recruiters have fewer than 3 interviews in 2024 and 2025"); a deliberate
+#: change of the notebook's tool list (tests/prompt_changes.py ``notebook_tools`` takes it out to compare).
+RELATED_MAX_TEXT = " max_count: at most that many, records with none included ('fewer than 3' = max_count 2)."
+RELATED_MAX_COUNT = {"type": "integer", "minimum": 0, "description": "With exists=true: at most this many (0 kept)."}
 RELATED = {"type": "array", "maxItems": 2,
            "description": "Conditions on child records that point to this record. exists=false keeps records with NO "
                           "such child (e.g. trainings with no sessions); exists=true with min_count keeps records with at "
-                          "least that many.",
+                          "least that many." + RELATED_MAX_TEXT,
            "items": {"type": "object", "properties": {
                "child_object": {"type": "string"},
                "exists": {"type": "boolean"},
                "min_count": {"type": "integer", "minimum": 1, "description": "With exists=true: at least this many "
                                                                              "matching children (1 = exists)."},
+               "max_count": RELATED_MAX_COUNT,
                "via_field": {"type": "string", "description": "Lookup on the child that points here; only needed when "
                                                               "the child has more than one."},
                "filters": {"type": "array", "maxItems": 5, "items": FILTER_ITEM_BRIEF},
@@ -511,8 +519,8 @@ SCHEMAS: dict[str, tuple[str, dict]] = {
                      "order_by": {"type": "string", "description": "Field to sort by (default: date_field if set, else "
                                                                    "CreatedDate)."},
                      "order": {"type": "string", "enum": ["desc", "asc"], "description": "Default desc."},
-                     "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Rows to return "
-                                                                                              "(default 10)."}},
+                     "limit": {"type": "integer", "minimum": 1, "maximum": LIMITS.list_max_rows,
+                               "description": f"Rows to return (default 10, at most {LIMITS.list_max_rows})."}},
                     ["object"])),
     "search_records": (
         "Find records by name or record number across objects when you do not know the object (a person, a program, "

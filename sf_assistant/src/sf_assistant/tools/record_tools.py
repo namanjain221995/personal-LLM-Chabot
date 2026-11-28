@@ -127,7 +127,8 @@ _ENUM_SYNONYMS = {"monthly": "month", "daily": "day", "weekly": "week", "quarter
                   "descending": "desc", "ascending": "asc"}
 
 #: Integer arguments that are part of the question's meaning: below the minimum they are refused, not clamped.
-_NO_CLAMP = {"min_count": "For 'has at least one' omit min_count (exists=true); for 'has none' use exists=false."}
+_NO_CLAMP = {"min_count": "For 'has at least one' omit min_count (exists=true); for 'has none' use exists=false.",
+             "max_count": "'fewer than 3' is max_count 2, 'none' is exists=false."}
 #: What the "also stored in" overlap of a filter is counted against, by default (see ``_also_notes``).
 RESULT_CONDS = "all conditions of this query"
 
@@ -224,6 +225,7 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
             self._terms = terms if isinstance(terms, Terms) else self._terms_for(self._question)
             self._given_people = [dict(p) for p in people if isinstance(p, dict)] if people is not None else None
             self._given_values = [dict(v) for v in values if isinstance(v, dict)] if values is not None else None
+            self.list_limit = None
             self._reset_caches()
 
     def other_record_types(self) -> tuple[str, ...]:
@@ -340,6 +342,10 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
 
     _spelling_cache: tuple[str, list] | None = None   # (question, its spans) of _spelling_spans
     _contact_ok: bool = False   # the current question asks for contact details (begin_question; phase 1)
+    #: development A (2026-11-27): the rows a list_records call without a ``limit`` returns in this question; None (the
+    #: default, and after begin_question) keeps the tool's default of 10. The record session sets it for a list
+    #: question; the call's ``arguments`` (evidence, stored plans) stay what the model sent.
+    list_limit: int | None = None
 
     @property
     def evidence(self) -> list[QueryEvidence]:
@@ -414,6 +420,8 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
             call = _Call(self, name)
             call.read_as = sink
             args, lenient = self._validate(tool, arguments)
+            if name == "list_records" and self.list_limit and "limit" not in args:   # a list question (development A)
+                args = {**args, "limit": int(self.list_limit)}
             for n in lenient:
                 call.note(n)
             run_args = self._enforce_terms(call, name, args)
@@ -452,7 +460,12 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
             if read_as:
                 result["read_as"] = read_as
             result["source"] = self._source(call)
+            # development A (2026-11-27): the rows of a list before the size cut; code writes every one of them under
+            # the answer (agent/tables.py), while the model reads the cut result
+            listed = result.get("rows") if name == "list_records" and isinstance(result.get("rows"), list) else None
             result = self._fit(result, call.max_chars)
+            if listed is not None and isinstance(result.get("rows"), list) and len(result["rows"]) < len(listed):
+                call.full_rows = list(listed)
             json.dumps(result)
             out = {"ok": True, "result": result, "error": None, "chunk_ids": self._chunk_ids(call)}
         except RecordError as exc:
@@ -526,6 +539,8 @@ class RecordTools(DiscoveryMixin, RecordQueryMixin, PeopleMixin, NamesMixin, Loo
             ev.did_you_mean = [dict(x) for x in call.did_you_mean] if not ok else []
         if call is not None and call.enforced is not None:   # the business-term contracts: what the handler ran with
             ev.enforced_arguments = copy.deepcopy(call.enforced)
+        if ok and call is not None and call.full_rows is not None:   # development A: the rows the size cut left out
+            ev.full_rows = call.full_rows
         with self._lock:
             self._evidence.append(ev)
 

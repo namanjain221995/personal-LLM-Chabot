@@ -116,6 +116,18 @@ class QueryEvidence:
     def enforced_arguments(self, value: dict[str, Any] | None) -> None:
         self.__dict__["_enforced_arguments"] = value
 
+    # Long lists (development A of 2026-11-27): not a dataclass field either, for the same reason.
+    @property
+    def full_rows(self) -> list[dict[str, Any]] | None:
+        """Every row of a list_records result whose rows the result cap cut (``model_result`` holds the rows the
+        model read, ``shown`` of ``returned``): the same cells, columns and privacy rules, before the cut. None when
+        nothing was cut and for every other tool. Code writes a list question's rows from it (``agent.tables``)."""
+        return self.__dict__.get("_full_rows")
+
+    @full_rows.setter
+    def full_rows(self, value: list[dict[str, Any]] | None) -> None:
+        self.__dict__["_full_rows"] = list(value) if value is not None else None
+
 
 @dataclass
 class RecordsStatus:

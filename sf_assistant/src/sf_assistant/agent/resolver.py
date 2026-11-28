@@ -34,7 +34,10 @@ plan older than ``max_age`` is not shown to the model: the question is read as t
    talk. "No, I'll ask in full" gives the caller's unclear line and keeps the plan. A reply that is a complete
    question of its own goes on; anything else goes to the model with the choices in its context. With no pending in
    the state, a reply to a clarifying question of prerequisite P2 in the last turn is still read by
-   ``agent.clarify.choice_reply``, as the rewrite reads it today.
+   ``agent.clarify.choice_reply``, as the rewrite reads it today, and an answer to the coded clarify of an unclear
+   follow-up by ``followup.clarify_answer`` (the whole question code rebuilds; pre-release fixes of 2026-11-28). An
+   answer to such a clarify (or to this resolver's own clarify built from a plan) that code cannot finish alone goes
+   to the v1 rewrite (reason ``use_rewrite``, detail ``clarify_answer``: round 2 of the pre-release fixes).
 2. **Code shortcuts** (``engine/followup_shortcuts.py``; a usable plan of age 0, no pending, ``SFA_MEMORY_SHORTCUTS``):
    display (the display words of ``agent/display.py``, stop words included: "without the chart" is ``chart:
    false``, C14), top N, another period, by month; English and Hinglish. Before step 3, since a shortcut leaves only
@@ -48,28 +51,39 @@ plan older than ``max_age`` is not shown to the model: the question is read as t
    and age rules can confirm (M6). A
    first message (no turn, no plan) and an ask about what the answers can show ("can you do visualizations ?",
    ``display.generic_ask``) run as typed too, as with the rewrite today. "Only for North America", "show the top 10"
-   and "Why is recruiter A performing lower than recruiter B?" are never decided here when a plan is usable.
+   and "Why is recruiter A performing lower than recruiter B?" are never decided here when a plan is usable. A
+   count of the records a list plan showed ("how many of them have fewer than 3 interviews in 2025") goes to the v1
+   rewrite (``use_rewrite``, detail ``list_count``): no patch counts a listed set (round 2 of the pre-release fixes).
 4. **The model** (one call, :func:`build_messages`): the system prompt, the plan (its line and one line per call with
-   its arguments), the summary, the pending choices, up to 6 pairs of turns and the question, within ``max_tokens``
-   (``SFA_MEMORY_TOKENS``, default 12000, whatever the bridge sent; C32): a prompt that cannot be cut to fit is never
-   sent, and step 5 answers (F4). It returns ``{"kind", "standalone", "ops"}``
-   (:func:`parse_reply`; anything else is unclear). Code then checks it: ``new`` and ``about_answer`` need a
-   ``standalone`` that passes the v6 rewrite's own reading of a reply (``followup.rewrite`` on the last 4 turns, the
-   binding checks of ``_unbound`` included: the model gets 12 turns, the checks read 4; after a patch or shortcut
-   answer of the plan, its Read-as line names each period once, when the reading keeps every ``eq`` / ``in`` filter
-   value of the plan, says no period but the plan's (or one the person typed), names no time grain but the plan's
-   (or one the person typed), and the plan keeps all its groups and rows; the person rule then reads the person's
+   its arguments), the field names of the plan's objects (:func:`field_lines`, step-5 fix), the summary, the pending
+   choices, up to 6 pairs of turns and the question, within ``max_tokens`` (``SFA_MEMORY_TOKENS``, default 12000,
+   whatever the bridge sent; C32): a prompt that cannot be cut to fit is never sent, and step 5 answers (F4). It returns
+   ``{"kind", "standalone", "ops"}`` (:func:`parse_reply`; anything else is unclear). Code then checks it: ``new`` and
+   ``about_answer`` need a ``standalone`` that passes the v6 rewrite's own reading of a reply (``followup.rewrite`` on
+   the last 4 turns, the binding checks of ``_unbound`` included: the model gets 12 turns, the checks read 4; after a
+   patch or shortcut answer of the plan, its Read-as line names each period once, when the reading keeps every ``eq`` /
+   ``in`` filter value of the plan, says no period but the plan's (or one the person typed), names no time grain but the
+   plan's (or one the person typed), and the plan keeps all its groups and rows; the person rule then reads the person's
    last turn, never that code-written line, also when the line has no dated period to cut and the reading keeps the
    filters and the groups and rows: ``_Job._read``, stage-2 review finding M5, stage-3 review findings F1, F2, R2-1 to
-   R2-3, owner items 7 and 8). Right after a patch or shortcut answer, a ``new`` reading that goes on from the plan
-   must also keep every filter of the plan, with or without a period, and its grouping and time grain unless the
-   person typed a new one; else it asks (``_Job._drops_from_plan``, owner decision of 2026-11-25, items 7 and 8); a
-   ``patch`` goes through
-   ``query_state.apply`` (fields, typed values, the filter cap, the term contracts with the rebuilt terms, the call
-   cap, contact fields). A failed check asks (a clarify); a value the person did not type becomes a did-you-mean only
-   when it is a picklist value or a record type of its field, never a name or a figure from an answer (F8).
+   R2-3, owner items 7 and 8). Right after a patch or shortcut answer, a ``new`` reading that goes on from the plan must
+   also keep every filter of the plan, with or without a period, and its grouping and time grain unless the person typed
+   a new one; else it asks (``_Job._drops_from_plan``, owner decision of 2026-11-25, items 7 and 8); a ``patch`` goes
+   through ``query_state.apply`` (fields, typed values, the filter cap, the term contracts with the rebuilt terms, the
+   call cap, contact fields). A failed check asks (a clarify); a value the person did not type becomes a did-you-mean
+   only when it is a picklist value or a record type of its field, never a name or a figure from an answer (F8).
 5. **Fallback**: ``unclear`` with a plan is a clarify built from the plan (the model's readings as choices when they
-   pass the checks); without a plan it is the caller's unclear line, as today.
+   pass the checks); without a plan it is the caller's unclear line, as today. An ``unclear`` reply may name what is
+   missing (``"missing"``, the closed codes of ``followup.MISSING_CODES``; development B of 2026-11-27): it changes no
+   decision, only the words. ``Resolution.missing`` carries the codes to the caller, which writes its unclear line with
+   ``followup.unclear_text`` (the page and the ask service, the same text as the rewrite's), and the clarify built from
+   the plan with no choices asks for them (line ``unclear_plan_ask``) in place of "Please ask the full question".
+   With no code from the model, code names them from the typed words (``followup._code_parts``, with ``about``). On
+   a list plan, the model's ``bad_ops``, unclear reply, refused reading (``rewrite_fragment_echo``,
+   ``rewrite_unclear``), made-up field or a measure the list cannot take go to the v1 rewrite instead
+   (``use_rewrite``, :data:`_REWRITE_DETAILS`). "and the placement rate?" on a placement plan runs the placement share
+   of its main call by code, whatever measure the model patched (detail ``placement_share``), and a patch of a
+   placement plan that leaves a client-interview call without the placement filter asks (T2).
 
 The resolver never runs anything: it returns a :class:`Resolution` (what to run, or the reply to give), and the
 caller (lane S3) runs it and builds the next state (``query_state.build``). It never raises: a fault of its own is
@@ -106,6 +120,7 @@ from sf_assistant.knowledge.resolver import osa_distance
 
 __all__ = ["FOLLOWUP_RESOLVE_TEXT", "FOLLOWUP_RESOLVE_SYSTEM", "LINES", "RESOLVE_MAX_TOKENS", "MAX_TURNS",
            "MAX_TURN_CHARS", "MAX_SUMMARY_CHARS", "MAX_TOKENS", "PLAN_TOKENS", "SUMMARY_TOKENS", "PAIRS_TOKENS",
+           "FIELDS_TOKENS", "MAX_FIELDS", "field_lines",
            "MAX_AGE", "MAX_CALLS", "MAX_GAP", "ACTIONS", "REASONS", "MODEL_KINDS", "Resolution", "resolve", "shadow",
            "build_messages", "parse_reply", "choice_for", "render_clarify", "pending_from_clarify", "recent_turns",
            "estimate_tokens"]
@@ -126,6 +141,9 @@ MAX_SUMMARY_CHARS = 8000
 #: The prompt cap (``SFA_MEMORY_TOKENS``) and the caps of its parts (§6.3).
 MAX_TOKENS = 12000
 PLAN_TOKENS, SUMMARY_TOKENS, PAIRS_TOKENS = 1000, 600, 6000
+#: The field names of the plan's objects the model may use (step-5 fix, field grounding): at most this many tokens,
+#: and at most :data:`MAX_FIELDS` fields of each object.
+FIELDS_TOKENS, MAX_FIELDS = 500, 40
 #: ``SFA_MEMORY_MAX_AGE`` and ``SFA_MEMORY_MAX_CALLS`` (the state core's defaults).
 MAX_AGE, MAX_CALLS = qs.MAX_AGE, qs.MAX_CALLS
 #: The largest gap the contract sends; an unreadable gap reads as one above it.
@@ -137,10 +155,16 @@ MAX_GAP = 6
 ACTIONS = ("reply", "new", "patch", "about_answer", "model")
 #: Fixed codes of what decided (never free text).
 REASONS = ("small_talk", "clarify_choice", "ask_full", "shortcut", "new", "patch", "about_answer", "clarify",
-           "unclear_rewrite", "call_failed", "not_local", "resolver_error", "model")
+           "unclear_rewrite", "call_failed", "not_local", "resolver_error", "model", "use_rewrite")
+#: Where the resolver hands a follow-up of a list plan to the v1 rewrite (reason ``use_rewrite``; round 2 of the
+#: pre-release fixes, 2026-11-28, bars 2a and 3c): the patch grammar has no way to count the members of a listed set
+#: by their related records ("how many of them have fewer than 3 interviews in 2025"), and the model's patch, its
+#: unclear reply or a field it made up ended in a clarify, where memory off rewrites the question and answers it.
+_REWRITE_DETAILS = frozenset({"bad_ops", "rewrite_fragment_echo", "rewrite_unclear", "model_unclear",
+                              "check_unknown_field", "check_measure_not_for"})
 #: The kinds the model may reply.
 MODEL_KINDS = ("new", "patch", "about_answer", "unclear")
-_REPLY_KEYS = frozenset({"kind", "standalone", "ops"})
+_REPLY_KEYS = frozenset({"kind", "standalone", "ops", "missing"})
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
 #: Ordinals of a reply to a clarifying question: the clarifying question's own (agent/clarify.py), and a fourth.
 _ORDINALS = {**_clarify._ORDINALS, "fourth": 4, "4th": 4, "four": 4, "chautha": 4, "chauthi": 4, "chauthe": 4}
@@ -160,9 +184,29 @@ _RANKING_WORDS = frozenset("""most least top highest lowest best worst maximum m
 _PERIOD_FRAME = frozenset("the for in of during on to a an".split())
 
 
-def _say(key: str, plan: str = "", field: str = "", value: str = "") -> str:
+#: A count over the listed records ("how many of them", "unme se kitne"): the count words and the group words.
+_COUNT_WORDS = frozenset("count kitne kitna kitni".split())
+_SET_WORDS = frozenset("""them those these they unme inme unmein inmein unke inke unka inka unki inki inmese
+unmese""".split())
+
+
+def _counts_members(text: Any) -> bool:
+    """The typed words count the records a list showed: "how many" (or "count", Hinglish "kitne") and a
+    group word that points back ("them", "those", "unme")."""
+    words = _followup._words(str(text or ""))
+    have = set(words)
+    asks = ("how", "many") in set(zip(words, words[1:])) or bool(have & _COUNT_WORDS)
+    return asks and bool(have & _SET_WORDS)
+
+
+#: Rate words of the placement share, and the operations of a model's patch that go with the share.
+_SHARE_WORDS = frozenset("rate rates ratio percentage percent share conversion".split())
+_SHARE_KEEPS = frozenset({"set_period", "compare_period", "set_show", "set_grain"})
+
+
+def _say(key: str, plan: str = "", field: str = "", value: str = "", ask: str = "") -> str:
     """A line of the prompt file, filled (one pass)."""
-    return _prompt_files.fill(LINES[key], PLAN=plan, FIELD=field, VALUE=value)
+    return _prompt_files.fill(LINES[key], PLAN=plan, FIELD=field, VALUE=value, ASK=ask)
 
 
 def _norm(text: Any) -> str:
@@ -193,7 +237,10 @@ class Resolution:
     (``query_state.check``); every kind of answer builds the next state from it (a reply given at a gap holds its plan
     at least one answer old, M8). ``model_called`` and
     ``prompt_tokens`` (the estimated size of the resolver prompt; in shadow, the size it would have) are for the
-    timeline. ``reply`` is the model's text behind a refusal, for the private log only."""
+    timeline. ``reply`` is the model's text behind a refusal, for the private log only. ``missing``: what an unclear
+    reply of the model said is missing (codes of ``followup.MISSING_CODES``), on a reply of status ``unclear`` only;
+    the caller's text reads it (``followup.unclear_text``), no decision does. ``about``: the reading code offers with
+    those codes (``followup._code_parts``: the person's last list question, for a group word), or ""."""
 
     action: str
     reason: str
@@ -219,6 +266,8 @@ class Resolution:
     prompt_tokens: int = 0
     info: dict = field(default_factory=dict, compare=False)
     reply: str = field(default="", compare=False, repr=False)
+    missing: tuple[str, ...] = ()
+    about: str = ""
 
     def log(self) -> dict:
         """The private log entry: fixed codes and numbers only (no question, no turn, no value, no answer text)."""
@@ -230,6 +279,8 @@ class Resolution:
         out.update({k: v for k, v in self.info.items() if isinstance(v, (bool, int, str)) and k not in out})
         if self.error:
             out["error"] = self.error
+        if self.missing:   # what an unclear reply named (development B); "missing" counts the state's lost fields
+            out["missing_parts"] = ",".join(self.missing)
         return out
 
 
@@ -302,9 +353,61 @@ def _plan_lines(plan: dict | None, line: str) -> list[str]:
     return out
 
 
+def field_lines(plan: dict | None, view: Any) -> str:
+    """The FIELDS part of the call (step-5 fix, field grounding): for each object of the plan's calls (the main call's
+    first), its fields a question may name as ``API name: label``, with ``-> <object>`` for a lookup, from the view's
+    ``fields_of`` (schema only: no value of any record, no blocked or contact field), at most :data:`MAX_FIELDS` an
+    object and :data:`FIELDS_TOKENS` in all (cut at a whole field). "" without a plan or a view that lists fields."""
+    reader = getattr(view, "fields_of", None)
+    if not plan or reader is None:
+        return ""
+    objs: list[str] = []
+    calls = [c for c in plan.get("calls") or [] if isinstance(c, dict) and isinstance(c.get("args"), dict)]
+    for c in sorted(calls, key=lambda c: c.get("role") != "main"):
+        try:
+            obj = view.object(c["args"].get("object"))
+        except Exception:  # noqa: BLE001
+            obj = None
+        if obj and obj not in objs:
+            objs.append(obj)
+    target = getattr(view, "target", None)
+    lines: list[str] = []
+    used = 0
+    for obj in objs:
+        try:
+            listed = list(reader(obj) or ())[:MAX_FIELDS]
+        except Exception:  # noqa: BLE001 - no fields of this object
+            listed = []
+        items = []
+        for api, label, kind in listed:
+            text = f"{api}: {label}" if label and _norm(label) != _norm(api) else str(api)
+            if kind == "reference" and target is not None:
+                try:
+                    to = target(obj, api)
+                except Exception:  # noqa: BLE001
+                    to = None
+                text += f" -> {to}" if to else ""
+            items.append(_followup._scrubbed(" ".join(text.split())))
+        head = f"{obj}: "
+        kept: list[str] = []
+        for item in items:
+            line = head + "; ".join(kept + [item])
+            if used + estimate_tokens(line) > FIELDS_TOKENS:
+                break
+            kept.append(item)
+        if not kept:
+            if items:
+                break   # the cap is reached
+            continue
+        line = head + "; ".join(kept)
+        used += estimate_tokens(line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def build_messages(question: str, turns: Any, *, plan: dict | None = None, plan_line: str = "",
                    earlier: bool = False, summary: str = "", pending: dict | None = None,
-                   max_tokens: int = MAX_TOKENS) -> tuple[list[dict], dict]:
+                   max_tokens: int = MAX_TOKENS, fields: str = "") -> tuple[list[dict], dict]:
     """The messages of the resolver call and what went into them (``info``: ``tokens``, the estimated size of the
     whole prompt; ``pairs`` and ``turns`` sent; ``dropped_pairs``; ``summary`` and ``plan`` sent; ``cut_turns`` and
     ``choices_dropped``, the cuts the cap made; ``over`` when it is still above ``max_tokens``).
@@ -316,13 +419,18 @@ def build_messages(question: str, turns: Any, *, plan: dict | None = None, plan_
     kept), then the summary; then the turns that are left are cut, the newest first, and then the pending choices go
     (stage-1 review fix F4). ``over`` is True only when the system prompt, the plan and the question alone are above
     ``max_tokens``: the caller then makes no call. The summary, the choices and the turns go as JSON, so no text in
-    them can end its part, and every part is scrubbed of chat control tokens (the choices too: F7)."""
+    them can end its part, and every part is scrubbed of chat control tokens (the choices too: F7).
+
+    ``fields``: the FIELDS part (:func:`field_lines`), sent after the plan, only with a plan (``info["fields"]``); it
+    goes after the summary and before any turn is cut, when the prompt is above ``max_tokens``."""
     plan_part = _plan_lines(plan, plan_line)
     while len(plan_part) > 2 and estimate_tokens("\n".join(plan_part)) > PLAN_TOKENS:
         plan_part.pop()   # the side calls go first; the main call is the second line
     plan_text = _cut_tokens("\n".join(plan_part), PLAN_TOKENS) if plan_part else ""
     if plan_text and earlier:
         plan_text += "\n" + LINES["plan_earlier"]
+    fields_text = _cut_tokens(str(fields or "").strip(), FIELDS_TOKENS) if plan_text else ""
+    with_fields = bool(fields_text)
     summary_text = _followup._scrubbed(str(summary or "")[:MAX_SUMMARY_CHARS]).strip()
     summary_text = _cut_tokens(summary_text, SUMMARY_TOKENS) if summary_text else ""
     choices = [{"n": c.get("n"), "label": _followup._scrubbed(str(c.get("label") or "")),
@@ -341,6 +449,8 @@ def build_messages(question: str, turns: Any, *, plan: dict | None = None, plan_
         parts = []
         if plan_text:
             parts.append(f"{LINES['head_plan']}\n{plan_text}")
+        if with_fields and fields_text:
+            parts.append(f"{LINES['head_fields']}\n{fields_text}")
         if with_summary and summary_text:
             parts.append(f"{LINES['head_summary']}\n{json.dumps(summary_text, ensure_ascii=False)}")
         if choices:
@@ -355,6 +465,8 @@ def build_messages(question: str, turns: Any, *, plan: dict | None = None, plan_
     while len(chunks) > 1 and size(True) > max_tokens:
         chunks.pop(0)
     with_summary = bool(summary_text) and size(True) <= max_tokens
+    if with_fields and size(with_summary) > max_tokens:
+        with_fields = False
     cut_turns, choices_dropped = 0, False
     if size(with_summary) > max_tokens:
         kept_chunks, kept_choices = chunks, choices
@@ -381,7 +493,8 @@ def build_messages(question: str, turns: Any, *, plan: dict | None = None, plan_
     messages = [{"role": "system", "content": FOLLOWUP_RESOLVE_SYSTEM},
                 {"role": "user", "content": user_message(with_summary)}]
     info = {"tokens": tokens, "pairs": len(chunks), "turns": len(flat()), "dropped_pairs": total_pairs - len(chunks),
-            "summary": with_summary, "plan": bool(plan_text), "pending_choices": len(choices),
+            "summary": with_summary, "plan": bool(plan_text), "fields": with_fields,
+            "pending_choices": len(choices),
             "cut_turns": cut_turns, "choices_dropped": choices_dropped, "over": tokens > max_tokens}
     return messages, info
 
@@ -390,8 +503,10 @@ def build_messages(question: str, turns: Any, *, plan: dict | None = None, plan_
 def parse_reply(text: Any) -> dict | None:
     """The model's reply as ``{"kind", "standalone", "ops"}``, or None: one JSON object (a code fence around it is
     allowed, nothing else), with the keys kind (:data:`MODEL_KINDS`), standalone (a string of one line, at most 1,000
-    characters; may be missing) and ops (a list; may be missing), and no other key. The ops are checked later by
-    ``query_state.normalize_ops``."""
+    characters; may be missing) and ops (a list; may be missing), and no other key but ``missing``. The ops are checked
+    later by ``query_state.normalize_ops``. ``missing`` (development B) never makes a reply valid or not: whatever it
+    holds, the reply is read as without it, and only on kind ``unclear`` its codes (``followup.missing_codes``: the
+    closed set, () for anything else) come back under ``"missing"``, when there are any."""
     if not isinstance(text, str) or not text.strip():
         return None
     body = text.strip()
@@ -415,7 +530,11 @@ def parse_reply(text: Any) -> dict | None:
     standalone = standalone.strip()
     if len(standalone) > _followup.MAX_QUESTION_CHARS or "\n" in standalone or "\r" in standalone:
         return None
-    return {"kind": obj["kind"], "standalone": standalone, "ops": ops}
+    out = {"kind": obj["kind"], "standalone": standalone, "ops": ops}
+    missing = _followup.missing_codes(obj.get("missing")) if obj["kind"] == "unclear" else ()
+    if missing:
+        out["missing"] = missing
+    return out
 
 
 class _Echo:
@@ -727,7 +846,7 @@ class _Job:
         #: the model is called (resolve, SFA_MEMORY=on), never in shadow: :meth:`run` sets it
         self.calls_model = False
         self.label = getattr(view, "label", None) if view is not None else None
-        self.line = qs.plan_line(self.plan, today=self.today, label=self.label) if self.plan else ""
+        self.line = qs.plan_line(self.plan, today=self.today, label=self.label, view=view) if self.plan else ""
         self.stored_terms = self.plan["terms"] if self.plan else None
         self.pending = self.checked.pending if self._strict(strict) else None
         self.info: dict[str, Any] = {"gap": self.gap, "age": self.age if self.age is not None else -1,
@@ -1010,7 +1129,7 @@ class _Job:
 
     def _line(self, plan: dict | None, terms: Terms | None = None) -> str:
         """The plan line of a patched plan, with the scope of the terms it runs with (stage-1 review fix M2)."""
-        return qs.plan_line(plan, today=self.today, label=self.label, terms=terms) if plan else ""
+        return qs.plan_line(plan, today=self.today, label=self.label, terms=terms, view=self.view) if plan else ""
 
     def _field_label(self, obj: Any, path: Any) -> str:
         """The words of a field for a choice: its label in the catalog view, else its API name."""
@@ -1048,6 +1167,16 @@ class _Job:
         return dataclasses.replace(self._reply(step, "clarify", text=_numbered(asked, pending), state_kind="clarify",
                                                pending=pending, detail=detail), ops=tuple(ops))
 
+    def _list_plan(self) -> bool:
+        """The plan the model may patch lists records (its main call is ``list_records``)."""
+        main = next((c for c in (self.plan or {}).get("calls") or [] if c.get("role") == "main"), None)
+        return bool(self.plan_ok and main is not None and main.get("tool") == "list_records")
+
+    def _use_rewrite(self, step: int, detail: str) -> Resolution:
+        """The caller answers this turn as with memory off (the v1 rewrite on the turns, then the pipeline), and keeps
+        the state: reason ``use_rewrite``, status ``unclear`` (a caller that does not know it gives its unclear line)."""
+        return self._reply(step, "use_rewrite", status="unclear", state_kind="unclear", detail=detail)
+
     def _unclear(self, step: int, detail: str) -> Resolution:
         return self._reply(step, "unclear_rewrite", status="unclear", state_kind="unclear", detail=detail)
 
@@ -1068,11 +1197,12 @@ class _Job:
 
     def _patch(self, step: int, reason: str, ops: Any, *, standalone: str = "", typed: str | None = None,
                pending_text: str = "", contact_ok: bool | None = None, confirm: str | None = None,
-               model: bool = False, detail: str = "") -> Resolution:
-        """A patch of the plan: ``query_state.apply`` and its checks; ``confirm`` (the confirm's detail) asks first."""
+               model: bool = False, detail: str = "", share: bool = False) -> Resolution:
+        """A patch of the plan: ``query_state.apply`` and its checks; ``confirm`` (the confirm's detail) asks first.
+        ``share``: the plan's placement call becomes the placement share first (``query_state.apply``)."""
         typed = self.question if typed is None else typed
         canon = qs.normalize_ops(list(ops) if isinstance(ops, (list, tuple)) else ops)
-        if not canon:
+        if not canon and not (share and canon is not None):   # the share alone needs no operation
             return self._fallback(None, "bad_ops") if model else self._clarify(
                 step, render_clarify(qs.Clarify("bad_ops"), self.line), detail="check_bad_ops")
         if any("new_question" in o for o in canon):
@@ -1082,7 +1212,7 @@ class _Job:
                                  detail="field_removed")
         terms = self._terms(typed, standalone, "patch")
         patched = qs.apply(self.plan, canon, typed=typed, view=self.view, today=self.today, terms=terms,
-                           pending_text=pending_text, contact_ok=contact_ok, max_calls=self.max_calls)
+                           pending_text=pending_text, contact_ok=contact_ok, max_calls=self.max_calls, share=share)
         if patched.clarify is not None:
             return self._failed_check(step, patched.clarify, canon, typed, pending_text, terms, model)
         line = self._line(patched.plan, terms)
@@ -1096,12 +1226,15 @@ class _Job:
         question = ok.question if whole else line
         return self._out("patch", reason, step, question=question, typed=typed, terms=terms, terms_kind="patch",
                          patched=patched, plan=patched.plan, plan_line=line, ops=tuple(canon),
-                         op=next(iter(canon[0])), detail=detail)
+                         op=next(iter(canon[0])) if canon else "set_measure", detail=detail)
 
     def _failed_check(self, step: int, c: qs.Clarify, canon: list[dict], typed: str, pending_text: str,
                       terms: Terms, model: bool) -> Resolution:
         """A check of a patch failed: a did-you-mean for a value the model chose and the person did not type, the
-        links to choose from for ``which_link``, else the code's clarifying line."""
+        links to choose from for ``which_link``, else the code's clarifying line. A model's patch of a list plan that
+        names a field it made up or a measure a list cannot take goes to the v1 rewrite (:data:`_REWRITE_DETAILS`)."""
+        if model and self.calls_model and f"check_{c.code}" in _REWRITE_DETAILS and self._list_plan():
+            return self._use_rewrite(step, f"check_{c.code}")
         if c.code == "value_not_typed" and model and self._schema_values(canon, typed, pending_text):
             values = [str(v) for o in canon for p in o.values() for v in (
                 p.get("values") or ([p["value"]] if "value" in p else []))]
@@ -1162,7 +1295,9 @@ class _Job:
             if lost:
                 return self._fallback(None, f"rewrite_{lost}")
             return self._new(step, "new", got.question, detail=detail)
-        return self._fallback(None, f"rewrite_{got.reason}")
+        # a reading the rewrite refused as a vague count keeps what it found missing (round 2)
+        said = {"kind": "unclear", "standalone": "", "ops": [], "missing": got.missing} if got.missing else None
+        return self._fallback(said, f"rewrite_{got.reason}")
 
     def _choice(self, choice: dict) -> Resolution:
         if _is_no(choice):
@@ -1178,9 +1313,21 @@ class _Job:
 
     def _fallback(self, reply: dict | None, detail: str) -> Resolution:
         """Step 5: with a plan the model saw, a clarify built from the plan (its readings as choices when they pass
-        the checks); without one, the caller's unclear line."""
+        the checks); without one, the caller's unclear line. What an unclear reply said is missing changes only the
+        words (development B): the codes go with the unclear reply, and the clarify with no choice asks for them."""
+        if self.calls_model and detail in _REWRITE_DETAILS and self._list_plan():
+            return self._use_rewrite(5, detail)   # a follow-up of a list the grammar cannot patch: as memory off
+        missing = tuple((reply or {}).get("missing") or ()) if (reply or {}).get("kind") == "unclear" else ()
+        about = ""
+        if (reply or {}).get("kind") == "unclear":
+            # round 2 of the pre-release fixes: as after the rewrite's plain UNCLEAR, code names what the typed words
+            # leave open, and the person's list question as the reading (the words only: the decision is the model's)
+            if not missing:
+                missing, about = _followup._code_parts(self.question, self.last4)
+            elif "who" not in missing:
+                about = _followup._group_reading(self.question, self.last4)
         if not self.plan_ok:
-            return self._unclear(5, detail)
+            return dataclasses.replace(self._unclear(5, detail), missing=missing, about=about)
         choices: list[dict] = []
         if reply and reply.get("ops") and not self.checked.missing:
             canon = qs.normalize_ops(reply["ops"])
@@ -1203,7 +1350,9 @@ class _Job:
         if self.checked.missing:
             return self._clarify(5, _say("field_removed", plan=self.line, field=self.checked.missing[0]),
                                  detail="field_removed")
-        return self._clarify(5, _say("unclear_plan", plan=self.line), detail=detail or "unclear_plan")
+        ask = _followup.unclear_ask(self.question, missing, about)
+        text = _say("unclear_plan_ask", plan=self.line, ask=ask) if ask else _say("unclear_plan", plan=self.line)
+        return self._clarify(5, text, detail=detail or "unclear_plan")
 
     def _shortcut(self) -> _shortcuts.Shortcut | None:
         """Step 2: the display words read by ``agent/display.py`` (the one list), the rest by the shortcut grammar."""
@@ -1249,6 +1398,16 @@ class _Job:
             chosen = _clarify.choice_reply(q, self.last4)   # P2c: a clarifying question whose choices were not stored
             if chosen is not None:
                 return self._new(1, "clarify_choice", chosen, typed=chosen, detail="p2_choice")
+            # the answer to the coded clarify of an unclear follow-up ("fewer than 3, in 2024 and 2025"): the
+            # question code rebuilds from the person's typed words (pre-release fix of 2026-11-28), never the typed
+            # answer as a question of its own
+            whole = _followup.clarify_answer(q, self.turns)
+            if whole is not None:
+                return self._new(3, "new", whole, typed=whole, detail="clarify_answer")
+            # a partial answer, or one the rewrite must finish (a pointer left, a who): the v1 rewrite reads it, as
+            # with memory off (round 2 of the pre-release fixes; also after the resolver's own plan clarify)
+            if _followup.answers_clarify(q, self.turns):
+                return self._use_rewrite(1, "clarify_answer")
         if not with_choices:
             if self.shortcuts and self.fresh and self.pending is None:
                 sc = self._shortcut()
@@ -1265,15 +1424,21 @@ class _Job:
                 return self._new(3, "new", q, detail="complete")
             if self.plan_ok and self._another_subject(q):
                 return self._new(3, "new", q, detail="another_subject")
+            if self.fresh and self._list_plan() and _counts_members(q):
+                # "how many of them have fewer than 3 interviews in 2025" after a list: no patch counts a listed set,
+                # so the v1 rewrite writes the question (round 2 of the pre-release fixes, bar 3c)
+                return self._use_rewrite(3, "list_count")
         return self._model(llm, call, self.pending if with_choices else None)
 
     def _model(self, llm: Any, call: bool, pending: dict | None) -> Resolution:
         plan = self.plan if self.plan_ok else None
         messages, info = build_messages(self.question, self.turns, plan=plan, plan_line=self.line,
                                         earlier=bool(plan) and (self.gap > 0 or self.age > 0), summary=self.summary,
-                                        pending=pending, max_tokens=self.max_tokens)
+                                        pending=pending, max_tokens=self.max_tokens,
+                                        fields=field_lines(plan, self.view))
         self.info.update({"pairs": info["pairs"], "dropped_pairs": info["dropped_pairs"],
-                          "summary_sent": info["summary"], "cut_turns": info["cut_turns"], "over": info["over"]})
+                          "summary_sent": info["summary"], "fields_sent": info["fields"],
+                          "cut_turns": info["cut_turns"], "over": info["over"]})
         tokens = info["tokens"]
         if info["over"]:   # SFA_MEMORY_TOKENS holds: no prompt above it reaches the shared server (C32, F4)
             return dataclasses.replace(self._fallback(None, "over_cap"), prompt_tokens=tokens)
@@ -1311,6 +1476,17 @@ class _Job:
             return self._out("about_answer", "about_answer", 4, question=got.question, typed=self.question,
                              terms=self._terms(self.question, got.question, "patch"), terms_kind="patch",
                              plan=self.plan, earlier_answer=self._last_answer(), detail="model_about")
+        if kind in ("patch", "unclear") and self.plan_ok and self._asks_share():
+            # "and the placement rate?": the owner's share of the placement call, whatever measure or field the model
+            # chose (P-B: the average of Client_Bill_Rate__c; P-B-grain-dropped: a made-up Placement_Rate__c). Only
+            # the model's period, chart and time-grain operations go with it (round 2 of the pre-release fixes)
+            kept = [o for o in qs.normalize_ops(ops if isinstance(ops, list) else []) or []
+                    if next(iter(o)) in _SHARE_KEEPS]
+            confirm = ("confirm_gap" if self.gap > 0 else "confirm_age" if self.age > 0
+                       else "confirm_period" if self._untyped_period(kept) else None)
+            # the record agent reads the plan line code writes for the share, never the model's standalone (which may
+            # name the measure the model chose)
+            return self._patch(4, "patch", kept, confirm=confirm, model=True, detail="placement_share", share=True)
         if kind == "patch":
             if not self.plan_ok:
                 return self._fallback(reply, "patch_without_plan")
@@ -1321,6 +1497,15 @@ class _Job:
             return self._patch(4, "patch", ops, standalone=standalone, confirm=confirm, model=True,
                                detail="model_patch")
         return self._fallback(reply, "model_unclear")
+
+    def _asks_share(self) -> bool:
+        """The typed words ask for the placement rate ("and the placement rate?", "placements ka rate": the placement
+        term and a rate word) and the plan's main call is a placement call that can become the share
+        (``query_state.share_ready``)."""
+        words = set(_followup._words(self.question))
+        if not words & _SHARE_WORDS or "placement" not in TC.detect(self.question, self.other_record_types).keys:
+            return False
+        return qs.share_ready(self.plan, self.view)
 
     def _untyped_period(self, ops: Any) -> bool:
         """A model's set_period or compare_period whose phrase the typed question does not say: it shares no word

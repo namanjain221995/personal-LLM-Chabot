@@ -703,8 +703,9 @@ def test_the_page_with_memory_on_runs_a_complete_follow_up_as_typed_with_no_mode
     assert w.client.requests["rewrite"] == [] and w.client.requests["resolve"] == []
     assert out["log"]["rewrite"]["memory"]["action"] == "new"
     w.pipe.memory = None                                                          # the page as before: the rewrite
-    w.client.rewrite = ["UNCLEAR"]
-    assert w.pipe.answer_followup("and his?", TURNS)["answer"] == pipeline_mod.UNCLEAR_LINE
+    w.client.rewrite = ["UNCLEAR"]   # v9: the model decides, code names the missing part ("his": who)
+    assert w.pipe.answer_followup("and his?", TURNS)["answer"] == ('Who do you mean by "his"?\n\n'
+                                                                 + pipeline_mod.UNCLEAR_LINE)
     assert len(w.client.requests["rewrite"]) == 1
 
 
@@ -951,3 +952,260 @@ def test_a_clarify_with_the_shape_of_a_link_stays_strict(world):
     assert three["reply"]["reason"] == "patch" and three["reply"]["status"] == "answered", three
     ev = [e for e in w.tools.evidence if e.tool == "group_records"][0]
     assert ev.arguments == {**args, "top": 1}
+
+
+# ------------------------------------------------------------------------ development B: say what is missing
+B_TURNS = [{"role": "user", "content": "list out all the analysts of the audit team"},
+           {"role": "assistant", "content": "The audit team has 4 analysts: Echo One and Delta Person among them."}]
+B_QUESTION = "how many of them have less tickets in last years"
+B_REWRITE = "UNCLEAR missing=number,period about=the analysts of the audit team"
+B_TEXT = ('Do you mean the analysts of the audit team? Fewer than how many tickets, and which years do you mean by '
+          '"last years"?\n\n' + pipeline_mod.UNCLEAR_LINE)
+
+
+def test_b_an_unclear_follow_up_says_what_is_missing_alike_in_off_and_shadow(world):
+    replies = {}
+    for name, memory, v2 in (("off", OFF, False), ("shadow", SHADOW, True), ("shadow_v1", SHADOW, False),
+                             ("on_v1", ON, False)):
+        w = world(memory)
+        w.client.rewrite = [B_REWRITE]
+        out = w.job(B_QUESTION, B_TURNS, state=None, gap=0) if v2 else w.job(B_QUESTION, B_TURNS)
+        replies[name] = out["reply"]
+        assert out["reason"] == "rewrite_unclear" and w.client.requests["record"] == []
+        assert w.client.requests["resolve"] == []
+    six = set(ask_mcp._result("unclear"))
+    assert replies["off"] == {"status": "unclear", "answer": B_TEXT, "kind": "none", "data_ts": None, "objects": [],
+                              "charts": []}
+    assert {k: replies["shadow"][k] for k in six} == replies["off"] == replies["shadow_v1"] == replies["on_v1"]
+    assert replies["shadow"]["reason"] == "unclear_rewrite"
+    # the bridge's stop rule finds the fixed line in the answer (sfk_bridge.follows_a_stop_line reads it with `in`)
+    assert ask_mcp.UNCLEAR_LINE in replies["off"]["answer"]
+
+
+def test_b_with_the_one_word_unclear_code_names_the_parts_alike_in_off_and_shadow(world):
+    """Round 2 of the pre-release fixes (prompt v9): the model replies the one word UNCLEAR and code names the
+    missing parts and the reading from the typed words, so the person reads the same specific clarify as with v8."""
+    for memory, v2 in ((OFF, False), (SHADOW, True)):
+        w = world(memory)
+        w.client.rewrite = ["UNCLEAR"]
+        out = w.job(B_QUESTION, B_TURNS, state=None, gap=0) if v2 else w.job(B_QUESTION, B_TURNS)
+        assert out["reply"]["status"] == "unclear" and out["reply"]["answer"] == B_TEXT
+    # nothing code can name (no comparison, no vague period, no word that points back): today's line alone
+    w = world(OFF)
+    w.client.rewrite = ["UNCLEAR"]
+    out = w.job("how many joined", B_TURNS)
+    assert out["reply"]["status"] == "unclear" and out["reply"]["answer"] == ask_mcp.UNCLEAR_LINE
+
+
+def test_b_with_memory_on_the_resolvers_unclear_line_uses_the_same_parts(world):
+    outs = {}
+    for name, reply in (("plain", '{"kind": "unclear", "standalone": "", "ops": []}'),
+                        ("coded", '{"kind": "unclear", "standalone": "", "ops": [], "missing": ["number", "period"]}')):
+        w = world(ON)
+        w.client.resolve = [reply]
+        outs[name] = w.job(B_QUESTION, B_TURNS, state=None, gap=0)
+        assert len(w.client.requests["resolve"]) == 1 and w.client.requests["record"] == []
+    plain, coded = outs["plain"], outs["coded"]
+    # round 2 of the pre-release fixes: with no code from the model, code names the parts and the reading
+    assert plain["reply"]["answer"] == B_TEXT
+    assert coded["reply"]["answer"] == B_TEXT   # the model's codes, with the person's list question as the reading
+    # the same decision: status, reason codes and the next state's kind
+    assert {k: v for k, v in coded["reply"].items() if k not in ("answer", "state")} == {
+        k: v for k, v in plain["reply"].items() if k not in ("answer", "state")}
+    assert coded["reason"] == plain["reason"] and coded["reply"]["state"]["last"] == plain["reply"]["state"]["last"]
+
+
+def test_b_the_page_says_what_is_missing_too(world):
+    w = world()
+    w.pipe.memory = None                                                          # the page: the rewrite
+    w.client.rewrite = [B_REWRITE]
+    out = w.pipe.answer_followup(B_QUESTION, B_TURNS)
+    assert out["answer"] == B_TEXT and out["kind"] == "none"
+    assert out["log"]["rewrite"]["missing"] == "number,period" and out["log"]["rewrite"]["offer"] is True
+    w.client.rewrite = ["UNCLEAR"]   # v9: code names the parts after the one word
+    out = w.pipe.answer_followup(B_QUESTION, B_TURNS)
+    assert out["answer"] == B_TEXT and out["log"]["rewrite"]["missing"] == "number,period"
+    out = w.pipe.answer_followup("how many joined", B_TURNS[:1] + B_TURNS[1:])
+    assert out["answer"] == pipeline_mod.UNCLEAR_LINE and "missing" not in out["log"]["rewrite"]
+
+
+# ------------------------------------------------- pre-release fixes of 2026-11-28: the answer to a coded clarify
+C_TURNS = B_TURNS + [{"role": "user", "content": B_QUESTION}, {"role": "assistant", "content": B_TEXT}]
+C_WHOLE = "how many of the analysts of the audit team have less than 3 tickets in 2024 and 2025"
+C_REST = 'Do you mean the analysts of the audit team? Which years do you mean by "last years"?\n\n'
+
+
+def test_c_the_answer_to_a_coded_clarify_runs_the_whole_question_in_every_mode(world):
+    """RO-C step 3: "fewer than 3, in 2024 and 2025" after the coded clarify runs the whole question (code rebuilds
+    it, no rewrite call) in off and shadow, and with memory on when the resolver reads it so too."""
+    for name, memory, v2 in (("off", OFF, False), ("shadow", SHADOW, True), ("on", ON, True)):
+        w = world(memory)
+        w.client.resolve = [json.dumps({"kind": "new", "standalone": C_WHOLE, "ops": []})]
+        answer = "fewer than 3, in 2024 and 2025"
+        out = w.job(answer, C_TURNS, state=None, gap=0) if v2 else w.job(answer, C_TURNS)
+        reply = out["reply"]
+        assert reply["status"] == "answered" and C_WHOLE in reply["answer"], (name, out)
+        assert w.client.requests["rewrite"] == [] and w.client.requests["record"], name
+        assert C_WHOLE in json.dumps(w.client.record_messages(0)), name
+
+
+def test_c_a_partial_answer_asks_for_the_rest_on_the_service_and_the_page(world):
+    for memory, v2 in ((OFF, False), (SHADOW, True)):
+        w = world(memory)
+        out = w.job("fewer than 3", C_TURNS, state=None, gap=0) if v2 else w.job("fewer than 3", C_TURNS)
+        assert out["reply"]["status"] == "unclear" and out["reply"]["answer"] == C_REST + ask_mcp.UNCLEAR_LINE
+        assert w.client.requests["rewrite"] == [] and w.client.requests["record"] == []
+    w = world()
+    w.pipe.memory = None                                                          # the page: the rewrite
+    out = w.pipe.answer_followup("fewer than 3", C_TURNS)
+    assert out["answer"] == C_REST + pipeline_mod.UNCLEAR_LINE and out["log"]["rewrite"]["missing"] == "period"
+    then = C_TURNS + [{"role": "user", "content": "fewer than 3"}, {"role": "assistant", "content": out["answer"]}]
+    out = w.pipe.answer_followup("in 2024 and 2025", then)
+    assert C_WHOLE in out["answer"] and out["log"]["rewrite"]["reason"] == "clarify_answer"
+
+
+# ------------------------------------------------- round 2 of the pre-release fixes (2026-11-28): lists, memory on
+# RO-M, RO-C, RO-CP and the recruiter chains RC1-RC3, RR-C, RR-M of the real-model re-check: with memory on, the
+# count of a listed group, its clarify and the person's answer never reached the v1 path that answers them with memory
+# off. Made-up names (the fixture's Dept One); every step through the real job and record tools.
+R2_LIST = "list out all recruiters of the Dept One department"
+R2_LIST_ARGS = {"object": "Recruiter__c", "filters": [{"field": "Department__c", "op": "eq", "value": "Dept One"}]}
+R2_VAGUE = "how many of them have less interviews in last years"
+R2_READING = "the recruiters of the Dept One department"
+R2_WHOLE = "how many of the recruiters of the Dept One department have less than 3 interviews in 2024 and 2025"
+R2_COUNT = {"object": "Recruiter__c", "filters": R2_LIST_ARGS["filters"], "related": [
+    {"child_object": "Interview__c", "via_field": "Recruiter__c", "exists": True, "max_count": 2,
+     "date_field": "Date_of_Interview__c", "period": "2024-01-01 to 2025-12-31"}]}
+
+
+def _r2_listed(w, v2=True):
+    w.client.record = [{"name": "list_records", "args": R2_LIST_ARGS}, "Dept One has 4 recruiters.\n" + SOURCE]
+    one = w.job(R2_LIST, state=None, gap=0) if v2 else w.job(R2_LIST)
+    assert one["reply"]["status"] == "answered"
+    if not v2:
+        return None, turns_after(R2_LIST, one)
+    assert one["reply"]["state"]["plan"]["calls"][0]["tool"] == "list_records"
+    return one["reply"]["state"], turns_after(R2_LIST, one)
+
+
+def _r2_next(w, question, state, turns):
+    out = w.job(question, turns, state=stored(state), gap=0)
+    return out, out["reply"].get("state") or state, turns + turns_after(question, out)
+
+
+def test_r2_memory_on_lists_then_the_vague_count_its_clarify_and_the_answer(world):
+    """RO-C: list, the vague count (the specific clarify with the reading, from the rewrite's one word UNCLEAR and
+    code's parts), then the full answer runs the whole question with no rewrite or resolver call."""
+    w = world(ON)
+    state, turns = _r2_listed(w)
+    w.client.requests = {k: [] for k in Client.ROLES}
+    w.client.rewrite = ["UNCLEAR"]
+    two, state, turns = _r2_next(w, R2_VAGUE, state, turns)
+    assert two["reply"]["status"] == "unclear", two
+    assert two["reply"]["answer"] == (f'Do you mean {R2_READING}? Fewer than how many interviews, and which years do '
+                                      f'you mean by "last years"?\n\n' + ask_mcp.UNCLEAR_LINE)
+    assert w.client.requests["resolve"] == [] and len(w.client.requests["rewrite"]) == 1
+    assert two["reply"]["state"]["plan"]["calls"][0]["tool"] == "list_records"   # the list plan is kept
+    w.client.requests = {k: [] for k in Client.ROLES}
+    w.client.record = [{"name": "count_records", "args": R2_COUNT}, "All 4 have fewer than 3.\n" + SOURCE]
+    three, _state, _turns = _r2_next(w, "fewer than 3, in 2024 and 2025", state, turns)
+    assert three["reply"]["status"] == "answered" and R2_WHOLE in three["reply"]["answer"], three
+    assert w.client.requests["resolve"] == [] and w.client.requests["rewrite"] == []
+    assert R2_WHOLE in json.dumps(w.client.record_messages(0))
+    ev = [e for e in w.tools.evidence if e.tool == "count_records"][-1]
+    # the 4 members of Dept One in the terms fixture: none has an interview in those years, 2 have none at all
+    assert ev.model_result["count"] == 4
+
+
+def test_r2_memory_on_a_partial_answer_asks_only_for_the_rest(world):
+    """RO-CP: "fewer than 3" asks only for the years (about the asked question), then "in 2024 and 2025" completes
+    it."""
+    w = world(ON)
+    state, turns = _r2_listed(w)
+    w.client.rewrite = ["UNCLEAR"]
+    _two, state, turns = _r2_next(w, R2_VAGUE, state, turns)
+    w.client.requests = {k: [] for k in Client.ROLES}
+    three, state, turns = _r2_next(w, "fewer than 3", state, turns)
+    assert three["reply"]["status"] == "unclear"
+    assert three["reply"]["answer"] == (f'Do you mean {R2_READING}? Which years do you mean by "last years"?\n\n'
+                                        + ask_mcp.UNCLEAR_LINE)
+    assert w.client.requests["resolve"] == [] and w.client.requests["rewrite"] == []
+    w.client.record = [{"name": "count_records", "args": R2_COUNT}, "Both.\n" + SOURCE]
+    four, _s, _t = _r2_next(w, "in 2024 and 2025", state, turns)
+    assert four["reply"]["status"] == "answered" and R2_WHOLE in four["reply"]["answer"], four
+    assert w.client.requests["resolve"] == [] and w.client.requests["rewrite"] == []
+
+
+def test_r2_memory_on_a_complete_count_of_the_list_is_rewritten_and_answered(world):
+    """RC1, RC2, RR-C: "how many of them have fewer than 3 interviews in 2025" after the list ran into bad operations
+    or a measure the list cannot take; it is now the v1 rewrite's question, answered by the record agent, as off."""
+    question = "how many of them have fewer than 3 interviews in 2025"
+    full = "how many of the recruiters of the Dept One department have fewer than 3 interviews in 2025"
+    for memory, v2 in ((ON, True), (OFF, False)):
+        w = world(memory)
+        state, turns = _r2_listed(w, v2)
+        w.client.requests = {k: [] for k in Client.ROLES}
+        w.client.rewrite = [full]
+        count = dict(R2_COUNT, related=[dict(R2_COUNT["related"][0], period="2025")])
+        w.client.record = [{"name": "count_records", "args": count}, "4 of them.\n" + SOURCE]
+        out = w.job(question, turns, state=stored(state), gap=0) if v2 else w.job(question, turns)
+        assert out["reply"]["status"] == "answered" and f"Read as: `{full}`" in out["reply"]["answer"], out
+        assert w.client.requests["resolve"] == [] and len(w.client.requests["rewrite"]) == 1
+        assert [e for e in w.tools.evidence if e.tool == "count_records"][-1].model_result["count"] == 4
+
+
+def test_r2_memory_on_the_model_ending_in_a_clarify_on_a_list_goes_to_the_rewrite(world):
+    """A follow-up of a list the code step does not route (no count words) that the model cannot patch."""
+    w = world(ON)
+    state, turns = _r2_listed(w)
+    w.client.requests = {k: [] for k in Client.ROLES}
+    w.client.resolve = [json.dumps({"kind": "patch", "standalone": "", "ops": [
+        {"add_filter": {"field": "Interview_Total__c", "op": "lt", "value": 3}}]})]
+    w.client.rewrite = ["UNCLEAR"]
+    out, _s, _t = _r2_next(w, "and which ones are below 3 interviews?", state, turns)
+    assert len(w.client.requests["resolve"]) == 1 and len(w.client.requests["rewrite"]) == 1
+    assert out["reply"]["status"] == "unclear" and "I could not tell how this goes on" not in out["reply"]["answer"]
+
+
+def test_r2_the_vague_count_asks_in_every_mode_also_when_the_model_rewrites_it(world):
+    """RO step 2 on live: v6 rewrote the vague count in full and the record agent guessed (3 of 3 runs). In off,
+    shadow and on, the rewrite's reading of it, or the one word UNCLEAR, gives the same specific clarify and runs
+    no record call."""
+    clarify = (f'Do you mean {R2_READING}? Fewer than how many interviews, and which years do you mean by "last '
+               f'years"?\n\n' + ask_mcp.UNCLEAR_LINE)
+    for memory, v2 in ((OFF, False), (SHADOW, True), (ON, True)):
+        for reply in ("UNCLEAR", "how many of the recruiters of the Dept One department have less interviews in last "
+                                 "years"):
+            w = world(memory)
+            state, turns = _r2_listed(w, v2)
+            w.client.requests = {k: [] for k in Client.ROLES}
+            w.client.rewrite = [reply]
+            out = w.job(R2_VAGUE, turns, state=stored(state), gap=0) if v2 else w.job(R2_VAGUE, turns)
+            assert out["reply"]["status"] == "unclear" and out["reply"]["answer"] == clarify, (memory.mode, reply)
+            assert w.client.requests["record"] == [] and w.client.requests["resolve"] == []
+
+
+def test_r2_a_patch_reads_as_the_main_call_that_answered(world):
+    """P-B: the Read-as line named the patched call while the record agent's own call answered (it became the main
+    call of the next state). The line now names the call that answered, and the patched call the person did not ask
+    for is not kept to re-run."""
+    w = world(ON)
+    one = first_turn(w)
+    state = one["reply"]["state"]
+    own = {"object": "Account", "group_by": "Candidate_Status__c"}
+    w.client.resolve = [json.dumps({"kind": "patch", "standalone": "", "ops": [{"set_top": {"n": 1, "order": "desc"}}]})]
+    w.client.record = [{"name": "group_records", "args": own}, "Shown.\n" + SOURCE]
+    out = w.job("and the biggest one, please", turns_after(FIRST, one), state=stored(state), gap=0)
+    reply = out["reply"]
+    assert reply["reason"] in ("patch", "shortcut"), out.get("memory")
+    calls = reply["state"]["plan"]["calls"]
+    assert [c["args"] for c in calls] == [own] and calls[0]["role"] == "main"
+    assert reply["answer"].startswith(f"Read as: `{reply['plan_line']}`") and "top 1" not in reply["plan_line"]
+    # a patch whose own call answered keeps its plan line as before
+    w2 = world(ON)
+    one = first_turn(w2)
+    w2.client.resolve = [json.dumps({"kind": "patch", "standalone": "", "ops": [{"set_top": {"n": 1, "order": "desc"}}]})]
+    w2.client.record = ["Shown.\n" + SOURCE]
+    out = w2.job("and the biggest one, please", turns_after(FIRST, one), state=stored(one["reply"]["state"]), gap=0)
+    assert "top 1" in out["reply"]["plan_line"] and out["reply"]["answer"].startswith(
+        f"Read as: `{out['reply']['plan_line']}`")

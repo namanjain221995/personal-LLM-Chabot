@@ -112,6 +112,15 @@ results), the last answer for a question about it (``earlier``) and ``triage=Fal
 a re-run plan adds (kept dates, no rows now, a changed record set) and the agent's note for a question about the last
 answer are prompts/memory_exec.md (:data:`MEMORY_LINES`). Without them nothing of this runs.
 
+Long lists (development A of 2026-11-27, the owner's choices): a question that asks to list records
+(``agent.display.asks_list``: "list out all X of Y", "show me all X", "a list of X") gets the code-built
+rows of ``agent.tables`` whatever ``SFA_TABLES`` says: the system prompt ends with ``agent.tables.RECORDS_LIST_NOTE``
+(after the code-tables note in code mode; the display note then has no table line), a list_records call without a
+``limit`` returns ``LIMITS.list_max_rows`` rows (``RecordTools.list_limit``; its arguments stay the model's), the final reply is expanded as in code mode and
+``agent.tables.list_rows`` writes the whole list (every row of the call, also those the result cap kept from the model;
+pages of one list joined) and drops the rows the model typed. A record answer whose final model call stopped at its
+token limit has ``cut_off`` (unless the cut fell inside rows code wrote anyway); the pipeline adds the cut line.
+
 Record data must stay on this machine: a session refuses any endpoint that is not localhost.
 
 Module layout (stage-1 split of okrec/session.py): this module keeps :class:`RecordSession`, ``ROUTE_HERE``,
@@ -1137,7 +1146,10 @@ class RecordSession:
             q = Question(qid=f"rec-{n:03d}", category="cross_section", question=user_text, expected_facts=[],
                          expected_tools=[], answerable=True, source="records", gold_chunk_ids=[])
             status = self.tools.status()
-            tables_on = tables_settings().by == "code"   # latency plan step 3 (SFA_TABLES): code writes the result rows
+            code_mode = tables_settings().by == "code"   # latency plan step 3 (SFA_TABLES): code writes the result rows
+            # development A (2026-11-27): a list question gets its list rows from code in every mode
+            list_q = _display.asks_list(question, display)
+            tables_on = code_mode or list_q
             labels = _tables.column_labels(getattr(self.tools, "catalog", None)) if tables_on else None
             nudged = [0]
             nudges: list[str] = []
@@ -1210,9 +1222,18 @@ class RecordSession:
             require_msg = (RECORDS_PEOPLE_REQUIRE_TOOLS_MESSAGE.replace("<<PEOPLE>>", _quoted(asked)) if person_q
                            else RECORDS_REQUIRE_TOOLS_MESSAGE)
             # code mode: the note on the table lines is appended (never prepended, never inside the shared template);
-            # so is the note of a chart question
-            system = (render_records_system(status) + (_tables.RECORDS_TABLES_NOTE if tables_on else "")
-                      + _chart_note(question, display) + _display.note(display))
+            # so are the note of a list question (development A), the note of a chart question and the display note
+            # (a list question's table flag adds no line: code writes its rows)
+            shown = dataclasses.replace(display, table=False) if list_q and getattr(display, "table", False) \
+                else display
+            system = (render_records_system(status) + (_tables.RECORDS_TABLES_NOTE if code_mode else "")
+                      + (_tables.RECORDS_LIST_NOTE if list_q else "")
+                      + _chart_note(question, display) + _display.note(shown))
+            if list_q:   # a list_records call without a limit gets the whole page (the call's arguments stay)
+                try:
+                    self.tools.list_limit = LIMITS.list_max_rows
+                except Exception:  # noqa: BLE001 - tools that take no attribute: the tool's default
+                    pass
             r = answer_question(q, _TextToolCalls(self.llm), self.tools, self.cfg, system=system,
                                 require_tools=True, require_tools_message=require_msg,
                                 force_answer_message=RECORDS_FORCE_ANSWER_MESSAGE, check_answer=check,
@@ -1235,6 +1256,9 @@ class RecordSession:
             reply = fix_any_role_scope(drop_ref_codes(drop_tool_talk(drop_working_sentences(raw)),
                                                       reference_codes(evidence)), evidence)
             xt = _tables.expand(reply, evidence, labels) if tables_on else None
+            if xt is not None and list_q and not _is_no_records(reply) and answer_text(reply):
+                # development A: the whole list by code, also with no table line, and no row the model typed itself
+                xt = _tables.list_rows(xt, evidence, labels, cut=getattr(r, "finish", "") == "length")
             if xt is not None:   # each table line becomes its result's rows (after the cleaners, which rewrite cells)
                 reply = xt.text
             error = r.error
@@ -1363,7 +1387,9 @@ class RecordSession:
                                 else {},
                                 table_blocks={k: b for k, b in blocks.items() if _tables.holds(answer, b)},
                                 nudge_kinds=kinds, dropped_raw=raw_kept[:4000], no_data=no_data,
-                                tool_retry=dict(retry) if retry else None)
+                                tool_retry=dict(retry) if retry else None, list_ask=list_q,
+                                cut_off=bool(answer) and not code_answer and getattr(r, "finish", "") == "length"
+                                and not (xt is not None and xt.counts.get("list_cut_rows")))
         except Exception as exc:  # noqa: BLE001 - the caller always gets an answer object
             try:
                 evidence = evidence or self.tools.evidence
