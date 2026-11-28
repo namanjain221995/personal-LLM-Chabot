@@ -94,6 +94,8 @@ the number and the period the answer types into that question (:func:`_rebuild`)
 with the offered reading in place of "them" (:func:`_done`, reason ``clarify_answer``, no call); part of it given: the
 rest is asked again about that question (``Rewrite.asked``, no call); a who or an object, or words code cannot place:
 the model reads the rebuilt question with a ``CLARIFY ANSWER`` line, and the rules below read it as the typed question.
+The memory resolver's clarify built from a plan (``unclear_plan_ask``, the same ask inside one paragraph) is read as
+one too, and :func:`answers_clarify` tells the resolver when to hand the answer to this rewrite.
 
 A call that raises is status ``failed``, and the typed words are not sent on either way: as a fragment they would be
 answered as a different question. Typed spellings stay: the term resolver reads the question this returns
@@ -125,7 +127,7 @@ from sf_assistant.knowledge.resolver import osa_distance
 __all__ = ["FOLLOWUP_REWRITE_SYSTEM", "FOLLOWUP_MAX_TOKENS", "MAX_QUESTION_CHARS", "MAX_TURNS", "MAX_TURN_CHARS",
            "MAX_NAME_WORDS", "OK", "UNCLEAR", "FAILED", "Rewrite", "usable_turns", "rewrite", "last_answer_objects",
            "FOLLOWUP_UNCLEAR_TEXT", "UNCLEAR_PARTS", "MISSING_CODES", "missing_codes", "unclear_ask", "unclear_text",
-           "clarify_answer"]
+           "clarify_answer", "answers_clarify"]
 
 FOLLOWUP_REWRITE_SYSTEM = _prompt_files.text("followup_rewrite")
 #: the parts of the reply to an unclear follow-up (development B of 2026-11-27): key -> text
@@ -1598,7 +1600,8 @@ class _Clarified:
     """What the turns say when the last answer is code's own coded clarify (:func:`_clarified`): ``asked`` (the user
     turn the clarify asked about, as typed), ``reading`` (the checked "Do you mean ...?" words it offered, or ""),
     ``codes`` (what it asked for), ``answers`` (the user turns after ``asked`` that answered an earlier clarify of it),
-    ``before`` (the usable turns before ``asked``) and ``all_codes`` (what every clarify of the chain asked for)."""
+    ``before`` (the usable turns before ``asked``), ``all_codes`` (what every clarify of the chain asked for) and ``ask``
+    (the newest clarify's ask as written: the turn's first paragraph, or the ask inside the resolver's plan clarify)."""
 
     asked: str
     reading: str
@@ -1606,16 +1609,16 @@ class _Clarified:
     answers: tuple[str, ...]
     before: list[dict]
     all_codes: tuple[str, ...] = ()
+    ask: str = ""
 
 
-def _clarify_ask(text: str) -> tuple[str, tuple[str, ...]] | None:
-    """``(reading, codes)`` of an assistant turn that is exactly a reply of :func:`unclear_text`: an optional offer,
-    one sentence of the parts of ``prompts/followup_unclear.md`` and one more paragraph (the caller's fixed line, which
-    this module does not know). None for anything else, so no stored record text is read as a clarify."""
-    paras = [p.strip() for p in text.strip().split("\n\n")]
-    if len(paras) != 2 or "\n" in paras[0] or "\n" in paras[1] or not paras[1]:
+def _parse_ask(ask: str) -> tuple[str, tuple[str, ...]] | None:
+    """``(reading, codes)`` of the ask of a coded clarify, exactly as :func:`unclear_ask` writes it: an optional offer
+    ("Do you mean <reading>?") and one sentence of the parts of ``prompts/followup_unclear.md``. None for anything
+    else."""
+    reading = ""
+    if "\n" in ask:
         return None
-    ask, reading = paras[0], ""
     if ask.startswith(_OFFER_HEAD) and _OFFER_TAIL:
         reading, sep, rest = ask[len(_OFFER_HEAD):].partition(_OFFER_TAIL + " ")
         if (not sep or not _PLAIN_RUN_RE.fullmatch(reading) or len(reading.split()) > _MAX_ABOUT_WORDS + 1
@@ -1644,6 +1647,58 @@ def _clarify_ask(text: str) -> tuple[str, tuple[str, ...]] | None:
     return reading, found
 
 
+_PLAN_ASK_PARTS: tuple[str, str, str] | None = None
+
+
+def _plan_ask_parts() -> tuple[str, str, str]:
+    """(head, middle, tail) of the memory resolver's clarify built from a plan (``unclear_plan_ask`` of
+    ``prompts/followup_resolve.md``: "I could not tell how this goes on from the last query (<<PLAN>>). <<ASK>> Or ask
+    the full question."), read from the prompt file once; ("", "", "") when the line is not there or has another
+    shape (no turn is then read as one)."""
+    global _PLAN_ASK_PARTS
+    if _PLAN_ASK_PARTS is None:
+        try:
+            lines = _prompt_files.text("followup_resolve").split(_RESOLVE_MARK, 1)[1]
+            line = next(ln.split(": ", 1)[1] for ln in lines.split("\n") if ln.startswith("unclear_plan_ask: "))
+            head, _, rest = line.partition("<<PLAN>>")
+            middle, _, tail = rest.partition("<<ASK>>")
+            ok = head and middle.strip() and tail.strip() and "<<" not in head + middle + tail
+            _PLAN_ASK_PARTS = (head, middle, tail) if ok else ("", "", "")
+        except Exception:  # noqa: BLE001 - no such line: no plan clarify is read
+            _PLAN_ASK_PARTS = ("", "", "")
+    return _PLAN_ASK_PARTS
+
+
+#: the line of prompts/followup_resolve.md after which the lines code writes stand (agent/resolver.py ``_MARK``)
+_RESOLVE_MARK = "\n==== lines code writes, never sent to the model ====\n"
+
+
+def _clarify_ask(text: str) -> tuple[str, tuple[str, ...], str] | None:
+    """``(reading, codes, ask)`` of an assistant turn that is exactly one of code's coded clarifies: a reply of
+    :func:`unclear_text` (the ask of :func:`unclear_ask`, then one more paragraph: the caller's fixed line, which this
+    module does not know), or the memory resolver's clarify built from a plan (round 2 of the pre-release fixes,
+    2026-11-28: ``unclear_plan_ask``, one paragraph, the plan line in brackets and the same ask inside it). ``ask`` is
+    the ask as written. None for anything else, so no stored record text is read as a clarify."""
+    text = text.strip()
+    paras = [p.strip() for p in text.split("\n\n")]
+    if len(paras) == 2 and "\n" not in paras[0] and "\n" not in paras[1] and paras[1]:
+        got = _parse_ask(paras[0])
+        if got is not None:
+            return got[0], got[1], paras[0]
+    head, middle, tail = _plan_ask_parts()
+    if not head or "\n" in text or not text.startswith(head) or not text.endswith(tail):
+        return None
+    body = text[len(head):len(text) - len(tail)]
+    at = body.rfind(middle)
+    while at > 0:   # the plan line may hold the middle's own characters: the ask is the part after one of them
+        ask = body[at + len(middle):]
+        got = _parse_ask(ask)
+        if got is not None:
+            return got[0], got[1], ask
+        at = body.rfind(middle, 0, at)
+    return None
+
+
 def _clarified(turns: Any) -> _Clarified | None:
     """The clarify the last answer is, when it is one of code's own (:func:`_clarify_ask`) and a user turn before it
     gives back exactly that text (:func:`unclear_ask` of that turn, its codes and its reading: so it is the question it
@@ -1663,8 +1718,7 @@ def _clarified(turns: Any) -> _Clarified | None:
         got = _clarify_ask(kept[-1]["content"])
         if got is None:
             return None
-        reading, codes = got
-        ask = kept[-1]["content"].strip().split("\n\n")[0].strip()
+        reading, codes, ask = got
         seen = set(codes)
         for j in range(len(kept) - 2, -1, -1):
             turn = kept[j]
@@ -1677,7 +1731,7 @@ def _clarified(turns: Any) -> _Clarified | None:
             if unclear_ask(turn["content"], codes, reading) == ask:
                 answers = tuple(t["content"] for t in kept[j + 1:] if t["role"] == "user")
                 return _Clarified(turn["content"], reading, codes, answers, kept[:j][-MAX_TURNS:],
-                                  tuple(c for c in MISSING_CODES if c in seen))
+                                  tuple(c for c in MISSING_CODES if c in seen), ask)
         return None
     except Exception:  # noqa: BLE001 - no clarify: the rewrite as before
         return None
@@ -1870,6 +1924,18 @@ def clarify_answer(question: Any, turns: Any) -> str | None:
         return None
 
 
+def answers_clarify(question: Any, turns: Any) -> bool:
+    """``question`` answers the coded clarify the last of ``turns`` is (:func:`_clarified`: code's own clarify of an
+    unclear follow-up, or the memory resolver's clarify built from a plan with the same ask) and is no question of its
+    own (:func:`_own_question`). The memory resolver then hands the turn to the rewrite (round 2 of the pre-release
+    fixes, 2026-11-28: with memory on, a partial answer or one with a pointer left was read by the resolver's model as
+    a question of its own). Never raises."""
+    try:
+        return isinstance(question, str) and not _own_question(question) and _clarified(turns) is not None
+    except Exception:  # noqa: BLE001 - no clarify: the resolver's own steps
+        return False
+
+
 def _clarify_note(c: _Clarified, rebuilt: _Rebuilt) -> str:
     """The line the model reads after the turns when it must put in what code could not (a who or an object, a number
     with no comparison word): what was asked about and what the newest turn answers."""
@@ -1921,7 +1987,7 @@ def rewrite(question: str, turns: Any, llm: Any, *, code_line: bool = False) -> 
                 usable = sent = clar.before or usable
             else:   # a who or an object, or a number code could not put in: the model puts the answer in
                 note = _clarify_note(clar, rebuilt)
-                ask_only = dict(usable[-1], content=usable[-1]["content"].strip().split("\n\n")[0])
+                ask_only = dict(usable[-1], content=clar.ask or usable[-1]["content"].strip().split("\n\n")[0])
                 sent = clar.before[-(MAX_TURNS - 2):] + [{"role": "user", "content": rebuilt.question}, ask_only] \
                     if clar.before else usable[:-1] + [ask_only]
                 question, asked = f"{rebuilt.question.rstrip()} {typed.strip()}", rebuilt.question

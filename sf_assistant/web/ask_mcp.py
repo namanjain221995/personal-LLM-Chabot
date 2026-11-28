@@ -835,12 +835,15 @@ def _small_talk_read(mem: _MemoryJob | None, pipeline: Any) -> None:
     except Exception:  # noqa: BLE001 - the plan line then has no catalog words
         pass
 
-def _job_v1(pipeline: Any, question: str, turns: Any, mem: _MemoryJob | None, seen: dict | None = None) -> dict:
+def _job_v1(pipeline: Any, question: str, turns: Any, mem: _MemoryJob | None, seen: dict | None = None, *,
+            all_turns: bool = False) -> dict:
     """Today's job (``SFA_MEMORY`` off, a v1 call, shadow, or the on job after a fault of the resolver): the
     rewrite on the last :data:`REWRITE_TURNS` turns (C31), then ``Pipeline.answer``. With ``mem`` (shadow, or the
     resolver's fault) the answer runs under a ``MemoryRun`` with nothing set, which changes nothing in it and reads
     what ran, and the reply gets the next state. ``seen``: the job's holder of the question used, which the log line
-    of a fault reads (stage-2 review fix L1: as before the job moved)."""
+    of a fault reads (stage-2 review fix L1: as before the job moved). ``all_turns``: the rewrite gets every turn
+    sent (the on job when the resolver said ``use_rewrite``): its model still reads the last 4, and code finds its own
+    clarify of a question further back (``followup._clarified``, up to 12)."""
     from sf_assistant.agent.followup import FAILED, UNCLEAR, last_answer_objects, rewrite, unclear_text
     from sf_assistant.agent.small_talk import line as talk_line, small_talk
 
@@ -856,7 +859,7 @@ def _job_v1(pipeline: Any, question: str, turns: Any, mem: _MemoryJob | None, se
     if mem is not None and mem.res is None:   # shadow: the code steps on the full input, no model call
         mem.read(pipeline)
         mem.shadow()
-    step = rewrite(question, short, pipeline.llm)
+    step = rewrite(question, turns if all_turns else short, pipeline.llm)
     if step.status == FAILED:      # the typed words are not sent on: as a fragment they mean something else
         return _out(mem, _result("failed"), f"rewrite_{step.reason}", error=step.error)
     if step.status == UNCLEAR:
@@ -895,6 +898,8 @@ def _job_on(pipeline: Any, question: str, turns: Any, mem: _MemoryJob, seen: dic
         return _out(mem, _result("failed"), "records_off", error=str(pipeline.records_error or ""))
     mem.read(pipeline)
     res = mem.resolve(pipeline.llm)
+    if res.reason == "use_rewrite":   # a follow-up the patch grammar cannot express: answered as with memory off
+        return _job_v1(pipeline, question, turns, mem, seen, all_turns=True)
     if res.action == "reply":
         if res.status == "answered":
             # small talk or a clarifying question: its text as the resolver wrote it, so the next turn finds the

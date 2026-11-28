@@ -156,8 +156,11 @@ one of this machine's) and add the firewall rules again for the new address.
   ("fewer than 3, in 2024 and 2025") is read by code (pre-release fixes of 2026-11-28): it puts the number and the
   period into the asked question and runs it with no rewrite call (`detail.rewrite.reason` = `clarify_answer`), asks
   again only for a part the answer left open, and gives a who or object answer to the model with a `CLARIFY ANSWER`
-  line. With `SFA_MEMORY=on` the resolver reads it the same way (`followup.clarify_answer`). A question complete on
-  its own is
+  line. With `SFA_MEMORY=on` the resolver reads it the same way (`followup.clarify_answer`), also after its own
+  clarify built from a plan, and hands a partial answer, a count of a listed group ("how many of them ...") and a
+  list follow-up its model could not patch to that same rewrite path (reason `use_rewrite`; the ask log's
+  `memory.resolver.detail` says which: `clarify_answer`, `list_count`, `bad_ops`, `model_unclear`, `check_...`). A
+  question complete on its own is
   answered as typed when the rewrite call fails or the model rewords it (`detail.rewrite.answered` = `typed`); the
   model's own UNCLEAR stays a refusal. With no earlier answer the
   question goes to `Pipeline.answer` unchanged. A `recent_turns` of another shape gets 400. The web log's `ask` line

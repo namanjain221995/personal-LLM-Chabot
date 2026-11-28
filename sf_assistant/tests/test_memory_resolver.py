@@ -1922,3 +1922,101 @@ def test_b_shadow_never_has_codes():
     assert got.missing == () and "missing_parts" not in got.log()
 
 
+# ------------------------------------------------- round 2 of the pre-release fixes (2026-11-28): memory on, lists
+# Bars 2a, 2b and 3c of the real-model re-check: after a list of a group, the vague count, its clarify and the
+# person's answer were read by the resolver's model, which ended in a plan clarify, a made-up field or bad
+# operations; memory off rewrote the question and answered it. Made-up names only.
+_LIST_CALL = None
+_LIST_ASK = "list out all recruiters of the Zeta department"
+_LIST_TURNS = [{"role": "user", "content": _LIST_ASK},
+               {"role": "assistant", "content": "The Zeta department has 4 recruiters: Echo One, Delta Person and two "
+                                                "more."}]
+_VAGUE = "how many of them have less interviews in last years"
+
+
+def _list_state():
+    call = {"tool": "list_records", "args": {"object": "Recruiter__c", "filters": [
+        {"field": "Department__c", "op": "eq", "value": "Zeta"}]}}
+    return _mr_state([call])
+
+
+def test_r2_a_count_of_the_listed_set_goes_to_the_rewrite_with_no_model_call():
+    for question in (_VAGUE, "how many of them have fewer than 3 interviews in 2025", "unme se kitne active hain?"):
+        res, llm = _mr(question, state=_list_state(), turns=_LIST_TURNS)
+        assert (res.action, res.reason, res.status, res.detail) == ("reply", "use_rewrite", "unclear", "list_count")
+        assert llm.calls == [], question
+        assert res.checked.plan is not None                       # the list plan is carried to the next state
+    # a count on a plan that is no list goes to the model as before
+    res, llm = _mr("how many of them were completed?", reply=_reply("unclear"), turns=_LIST_TURNS)
+    assert res.reason != "use_rewrite" and len(llm.calls) == 1
+    # shadow logs the same decision, with no model call
+    assert _shadow(_VAGUE, state=_list_state(), turns=_LIST_TURNS).reason == "use_rewrite"
+    assert "use_rewrite" in MR.REASONS
+
+
+@pytest.mark.parametrize("reply,detail", [
+    (_coded("patch", "", []), "bad_ops"),
+    (_coded("unclear"), "model_unclear"),
+    (_coded("unclear", missing=["number"]), "model_unclear"),
+    (_coded("patch", "x", [{"add_filter": {"field": "Placement_Count__c", "op": "lt", "value": 3}}]),
+     "check_unknown_field"),
+    (_coded("patch", "x", [{"set_measure": {"measure": "count"}}]), "check_measure_not_for"),
+])
+def test_r2_the_model_ending_in_a_clarify_on_a_list_plan_goes_to_the_rewrite(reply, detail):
+    res, llm = _mr("and which ones are below three?", state=_list_state(), reply=reply, turns=_LIST_TURNS)
+    assert (res.reason, res.status, res.detail) == ("use_rewrite", "unclear", detail) and len(llm.calls) == 1
+    # on a plan that is no list the same replies never go to the rewrite (they ask, or a count patch runs)
+    res, _ = _mr("and which ones are below three?", reply=reply, turns=_LIST_TURNS)
+    assert res.reason in ("clarify", "patch")
+
+
+def _after_clarify(text):
+    return _LIST_TURNS + [{"role": "user", "content": _VAGUE}, {"role": "assistant", "content": text}]
+
+
+def test_r2_the_answer_to_a_coded_clarify_runs_whole_or_goes_to_the_rewrite():
+    fixed = "I could not tell what this refers to. Please ask the full question, with the name or object."
+    reading = "the recruiters of the Zeta department"
+    clarify = _F.unclear_text(_VAGUE, ("number", "period"), reading, fixed=fixed)
+    whole = "how many of the recruiters of the Zeta department have less than 3 interviews in 2024 and 2025"
+    res, llm = _mr("fewer than 3, in 2024 and 2025", state=_list_state(), turns=_after_clarify(clarify))
+    assert (res.action, res.question, res.detail) == ("new", whole, "clarify_answer") and llm.calls == []
+    # a partial answer: the rewrite asks for the rest (memory off's path), no resolver model call
+    res, llm = _mr("fewer than 3", state=_list_state(), turns=_after_clarify(clarify))
+    assert (res.reason, res.detail) == ("use_rewrite", "clarify_answer") and llm.calls == []
+    # a question of its own after the clarify is no answer to it
+    res, _ = _mr("what is the leave policy?", state=_list_state(), reply=_coded("new", "what is the leave policy?"),
+                 turns=_after_clarify(clarify))
+    assert res.reason != "use_rewrite"
+
+
+def test_r2_the_resolvers_own_plan_clarify_is_read_as_a_coded_clarify():
+    """With memory on the vague step was answered by the plan clarify (unclear_plan_ask); the person's answer to it was
+    lost. Code now reads that clarify too, offers the person's list question as the reading, and the full answer runs
+    the whole question; an answer code cannot finish (no reading) goes to the rewrite."""
+    plain, _ = _mr(_VAGUE, reply=_coded("unclear", missing=["number", "period"]), turns=_LIST_TURNS)
+    assert plain.reason == "clarify" and plain.text.startswith("I could not tell how this goes on from the last query (")
+    turns = _LIST_TURNS + [{"role": "user", "content": _VAGUE}, {"role": "assistant", "content": plain.text}]
+    got = _F._clarified(turns)
+    assert got is not None and got.asked == _VAGUE and got.codes == ("number", "period")
+    assert got.reading == "the recruiters of the Zeta department"
+    assert got.ask == ('Do you mean the recruiters of the Zeta department? Fewer than how many interviews, and which '
+                       'years do you mean by "last years"?')
+    assert _F.answers_clarify("fewer than 3, in 2024 and 2025", turns)
+    assert not _F.answers_clarify("How many interviews did Echo One host in 2025?", turns)
+    res, llm = _mr("fewer than 3, in 2024 and 2025", turns=turns)
+    assert (res.action, res.detail) == ("new", "clarify_answer") and llm.calls == []
+    assert res.question == "how many of the recruiters of the Zeta department have less than 3 interviews in 2024 and 2025"
+    # with no list question before it there is no reading: the rebuilt question still says "them", the rewrite reads it
+    bare, _ = _mr(_VAGUE, reply=_coded("unclear", missing=["number", "period"]))
+    assert "Do you mean" not in bare.text
+    turns = _TURNS + [{"role": "user", "content": _VAGUE}, {"role": "assistant", "content": bare.text}]
+    res, llm = _mr("fewer than 3, in 2024 and 2025", turns=turns)
+    assert (res.reason, res.detail) == ("use_rewrite", "clarify_answer") and llm.calls == []
+    # a plan line in brackets that holds the middle's own characters is still read; another lead or tail is not
+    tricky = plain.text.replace("(", "(a). b, ", 1)
+    assert _F._clarify_ask(tricky) is not None
+    assert _F._clarify_ask(plain.text.replace(" Or ask the full question.", "")) is None
+    assert _F._clarify_ask(plain.text.replace("Fewer than how many", "How many")) is None
+
+

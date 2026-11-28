@@ -35,7 +35,9 @@ plan older than ``max_age`` is not shown to the model: the question is read as t
    question of its own goes on; anything else goes to the model with the choices in its context. With no pending in
    the state, a reply to a clarifying question of prerequisite P2 in the last turn is still read by
    ``agent.clarify.choice_reply``, as the rewrite reads it today, and an answer to the coded clarify of an unclear
-   follow-up by ``followup.clarify_answer`` (the whole question code rebuilds; pre-release fixes of 2026-11-28).
+   follow-up by ``followup.clarify_answer`` (the whole question code rebuilds; pre-release fixes of 2026-11-28). An
+   answer to such a clarify (or to this resolver's own clarify built from a plan) that code cannot finish alone goes
+   to the v1 rewrite (reason ``use_rewrite``, detail ``clarify_answer``: round 2 of the pre-release fixes).
 2. **Code shortcuts** (``engine/followup_shortcuts.py``; a usable plan of age 0, no pending, ``SFA_MEMORY_SHORTCUTS``):
    display (the display words of ``agent/display.py``, stop words included: "without the chart" is ``chart:
    false``, C14), top N, another period, by month; English and Hinglish. Before step 3, since a shortcut leaves only
@@ -49,7 +51,9 @@ plan older than ``max_age`` is not shown to the model: the question is read as t
    and age rules can confirm (M6). A
    first message (no turn, no plan) and an ask about what the answers can show ("can you do visualizations ?",
    ``display.generic_ask``) run as typed too, as with the rewrite today. "Only for North America", "show the top 10"
-   and "Why is recruiter A performing lower than recruiter B?" are never decided here when a plan is usable.
+   and "Why is recruiter A performing lower than recruiter B?" are never decided here when a plan is usable. A
+   count of the records a list plan showed ("how many of them have fewer than 3 interviews in 2025") goes to the v1
+   rewrite (``use_rewrite``, detail ``list_count``): no patch counts a listed set (round 2 of the pre-release fixes).
 4. **The model** (one call, :func:`build_messages`): the system prompt, the plan (its line and one line per call with
    its arguments), the field names of the plan's objects (:func:`field_lines`, step-5 fix), the summary, the pending
    choices, up to 6 pairs of turns and the question, within ``max_tokens`` (``SFA_MEMORY_TOKENS``, default 12000,
@@ -145,7 +149,13 @@ MAX_GAP = 6
 ACTIONS = ("reply", "new", "patch", "about_answer", "model")
 #: Fixed codes of what decided (never free text).
 REASONS = ("small_talk", "clarify_choice", "ask_full", "shortcut", "new", "patch", "about_answer", "clarify",
-           "unclear_rewrite", "call_failed", "not_local", "resolver_error", "model")
+           "unclear_rewrite", "call_failed", "not_local", "resolver_error", "model", "use_rewrite")
+#: Where the resolver hands a follow-up of a list plan to the v1 rewrite (reason ``use_rewrite``; round 2 of the
+#: pre-release fixes, 2026-11-28, bars 2a and 3c): the patch grammar has no way to count the members of a listed set
+#: by their related records ("how many of them have fewer than 3 interviews in 2025"), and the model's patch, its
+#: unclear reply or a field it made up ended in a clarify, where memory off rewrites the question and answers it.
+_REWRITE_DETAILS = frozenset({"bad_ops", "rewrite_fragment_echo", "rewrite_unclear", "model_unclear",
+                              "check_unknown_field", "check_measure_not_for"})
 #: The kinds the model may reply.
 MODEL_KINDS = ("new", "patch", "about_answer", "unclear")
 _REPLY_KEYS = frozenset({"kind", "standalone", "ops", "missing"})
@@ -166,6 +176,24 @@ _COURTESY = frozenset(w.strip() for w in LINES["courtesy_words"].split(","))
 _RANKING_WORDS = frozenset("""most least top highest lowest best worst maximum minimum fewest sabse""".split())
 #: Words of a period phrase that say nothing of which period it is (the L5 check of a model's period).
 _PERIOD_FRAME = frozenset("the for in of during on to a an".split())
+
+
+#: A count over the listed records ("how many of them", "unme se kitne"): the count words and the group words.
+_COUNT_WORDS = frozenset("count kitne kitna kitni".split())
+_SET_WORDS = frozenset("""them those these they unme inme unmein inmein unke inke unka inka unki inki inmese
+unmese""".split())
+
+
+def _counts_members(text: Any) -> bool:
+    """The typed words count the records a list showed: "how many" (or "count", Hinglish "kitne") and a
+    group word that points back ("them", "those", "unme")."""
+    words = _followup._words(str(text or ""))
+    have = set(words)
+    asks = ("how", "many") in set(zip(words, words[1:])) or bool(have & _COUNT_WORDS)
+    return asks and bool(have & _SET_WORDS)
+
+
+#: Rate words of the placement share, and the operations of a model's patch that go with the share.
 
 
 def _say(key: str, plan: str = "", field: str = "", value: str = "", ask: str = "") -> str:
@@ -1131,6 +1159,16 @@ class _Job:
         return dataclasses.replace(self._reply(step, "clarify", text=_numbered(asked, pending), state_kind="clarify",
                                                pending=pending, detail=detail), ops=tuple(ops))
 
+    def _list_plan(self) -> bool:
+        """The plan the model may patch lists records (its main call is ``list_records``)."""
+        main = next((c for c in (self.plan or {}).get("calls") or [] if c.get("role") == "main"), None)
+        return bool(self.plan_ok and main is not None and main.get("tool") == "list_records")
+
+    def _use_rewrite(self, step: int, detail: str) -> Resolution:
+        """The caller answers this turn as with memory off (the v1 rewrite on the turns, then the pipeline), and keeps
+        the state: reason ``use_rewrite``, status ``unclear`` (a caller that does not know it gives its unclear line)."""
+        return self._reply(step, "use_rewrite", status="unclear", state_kind="unclear", detail=detail)
+
     def _unclear(self, step: int, detail: str) -> Resolution:
         return self._reply(step, "unclear_rewrite", status="unclear", state_kind="unclear", detail=detail)
 
@@ -1184,7 +1222,10 @@ class _Job:
     def _failed_check(self, step: int, c: qs.Clarify, canon: list[dict], typed: str, pending_text: str,
                       terms: Terms, model: bool) -> Resolution:
         """A check of a patch failed: a did-you-mean for a value the model chose and the person did not type, the
-        links to choose from for ``which_link``, else the code's clarifying line."""
+        links to choose from for ``which_link``, else the code's clarifying line. A model's patch of a list plan that
+        names a field it made up or a measure a list cannot take goes to the v1 rewrite (:data:`_REWRITE_DETAILS`)."""
+        if model and self.calls_model and f"check_{c.code}" in _REWRITE_DETAILS and self._list_plan():
+            return self._use_rewrite(step, f"check_{c.code}")
         if c.code == "value_not_typed" and model and self._schema_values(canon, typed, pending_text):
             values = [str(v) for o in canon for p in o.values() for v in (
                 p.get("values") or ([p["value"]] if "value" in p else []))]
@@ -1265,6 +1306,8 @@ class _Job:
         """Step 5: with a plan the model saw, a clarify built from the plan (its readings as choices when they pass
         the checks); without one, the caller's unclear line. What an unclear reply said is missing changes only the
         words (development B): the codes go with the unclear reply, and the clarify with no choice asks for them."""
+        if self.calls_model and detail in _REWRITE_DETAILS and self._list_plan():
+            return self._use_rewrite(5, detail)   # a follow-up of a list the grammar cannot patch: as memory off
         missing = tuple((reply or {}).get("missing") or ()) if (reply or {}).get("kind") == "unclear" else ()
         about = ""
         if (reply or {}).get("kind") == "unclear":
@@ -1352,6 +1395,10 @@ class _Job:
             whole = _followup.clarify_answer(q, self.turns)
             if whole is not None:
                 return self._new(3, "new", whole, typed=whole, detail="clarify_answer")
+            # a partial answer, or one the rewrite must finish (a pointer left, a who): the v1 rewrite reads it, as
+            # with memory off (round 2 of the pre-release fixes; also after the resolver's own plan clarify)
+            if _followup.answers_clarify(q, self.turns):
+                return self._use_rewrite(1, "clarify_answer")
         if not with_choices:
             if self.shortcuts and self.fresh and self.pending is None:
                 sc = self._shortcut()
@@ -1368,6 +1415,10 @@ class _Job:
                 return self._new(3, "new", q, detail="complete")
             if self.plan_ok and self._another_subject(q):
                 return self._new(3, "new", q, detail="another_subject")
+            if self.fresh and self._list_plan() and _counts_members(q):
+                # "how many of them have fewer than 3 interviews in 2025" after a list: no patch counts a listed set,
+                # so the v1 rewrite writes the question (round 2 of the pre-release fixes, bar 3c)
+                return self._use_rewrite(3, "list_count")
         return self._model(llm, call, self.pending if with_choices else None)
 
     def _model(self, llm: Any, call: bool, pending: dict | None) -> Resolution:

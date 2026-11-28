@@ -678,7 +678,7 @@ class Pipeline:
                                charts_on=charts_settings().on, other_record_types=names)
         info = {"memory": res.log(), "seconds": round(time.perf_counter() - t0, 2)}
         if res.action == "reply":
-            if res.reason == "resolver_error":
+            if res.reason in ("resolver_error", "use_rewrite"):   # use_rewrite: the v1 path reads it (round 2 fixes)
                 return None
             if res.status == "failed" and _typed_may_run(question):   # as the rewrite: a complete question runs
                 run = MemoryRun(terms=None)
