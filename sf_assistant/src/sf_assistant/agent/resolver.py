@@ -78,6 +78,12 @@ plan older than ``max_age`` is not shown to the model: the question is read as t
    decision, only the words. ``Resolution.missing`` carries the codes to the caller, which writes its unclear line with
    ``followup.unclear_text`` (the page and the ask service, the same text as the rewrite's), and the clarify built from
    the plan with no choices asks for them (line ``unclear_plan_ask``) in place of "Please ask the full question".
+   With no code from the model, code names them from the typed words (``followup._code_parts``, with ``about``). On
+   a list plan, the model's ``bad_ops``, unclear reply, refused reading (``rewrite_fragment_echo``,
+   ``rewrite_unclear``), made-up field or a measure the list cannot take go to the v1 rewrite instead
+   (``use_rewrite``, :data:`_REWRITE_DETAILS`). "and the placement rate?" on a placement plan runs the placement share
+   of its main call by code, whatever measure the model patched (detail ``placement_share``), and a patch of a
+   placement plan that leaves a client-interview call without the placement filter asks (T2).
 
 The resolver never runs anything: it returns a :class:`Resolution` (what to run, or the reply to give), and the
 caller (lane S3) runs it and builds the next state (``query_state.build``). It never raises: a fault of its own is
@@ -194,6 +200,8 @@ def _counts_members(text: Any) -> bool:
 
 
 #: Rate words of the placement share, and the operations of a model's patch that go with the share.
+_SHARE_WORDS = frozenset("rate rates ratio percentage percent share conversion".split())
+_SHARE_KEEPS = frozenset({"set_period", "compare_period", "set_show", "set_grain"})
 
 
 def _say(key: str, plan: str = "", field: str = "", value: str = "", ask: str = "") -> str:
@@ -1189,11 +1197,12 @@ class _Job:
 
     def _patch(self, step: int, reason: str, ops: Any, *, standalone: str = "", typed: str | None = None,
                pending_text: str = "", contact_ok: bool | None = None, confirm: str | None = None,
-               model: bool = False, detail: str = "") -> Resolution:
-        """A patch of the plan: ``query_state.apply`` and its checks; ``confirm`` (the confirm's detail) asks first."""
+               model: bool = False, detail: str = "", share: bool = False) -> Resolution:
+        """A patch of the plan: ``query_state.apply`` and its checks; ``confirm`` (the confirm's detail) asks first.
+        ``share``: the plan's placement call becomes the placement share first (``query_state.apply``)."""
         typed = self.question if typed is None else typed
         canon = qs.normalize_ops(list(ops) if isinstance(ops, (list, tuple)) else ops)
-        if not canon:
+        if not canon and not (share and canon is not None):   # the share alone needs no operation
             return self._fallback(None, "bad_ops") if model else self._clarify(
                 step, render_clarify(qs.Clarify("bad_ops"), self.line), detail="check_bad_ops")
         if any("new_question" in o for o in canon):
@@ -1203,7 +1212,7 @@ class _Job:
                                  detail="field_removed")
         terms = self._terms(typed, standalone, "patch")
         patched = qs.apply(self.plan, canon, typed=typed, view=self.view, today=self.today, terms=terms,
-                           pending_text=pending_text, contact_ok=contact_ok, max_calls=self.max_calls)
+                           pending_text=pending_text, contact_ok=contact_ok, max_calls=self.max_calls, share=share)
         if patched.clarify is not None:
             return self._failed_check(step, patched.clarify, canon, typed, pending_text, terms, model)
         line = self._line(patched.plan, terms)
@@ -1217,7 +1226,7 @@ class _Job:
         question = ok.question if whole else line
         return self._out("patch", reason, step, question=question, typed=typed, terms=terms, terms_kind="patch",
                          patched=patched, plan=patched.plan, plan_line=line, ops=tuple(canon),
-                         op=next(iter(canon[0])), detail=detail)
+                         op=next(iter(canon[0])) if canon else "set_measure", detail=detail)
 
     def _failed_check(self, step: int, c: qs.Clarify, canon: list[dict], typed: str, pending_text: str,
                       terms: Terms, model: bool) -> Resolution:
@@ -1467,6 +1476,17 @@ class _Job:
             return self._out("about_answer", "about_answer", 4, question=got.question, typed=self.question,
                              terms=self._terms(self.question, got.question, "patch"), terms_kind="patch",
                              plan=self.plan, earlier_answer=self._last_answer(), detail="model_about")
+        if kind in ("patch", "unclear") and self.plan_ok and self._asks_share():
+            # "and the placement rate?": the owner's share of the placement call, whatever measure or field the model
+            # chose (P-B: the average of Client_Bill_Rate__c; P-B-grain-dropped: a made-up Placement_Rate__c). Only
+            # the model's period, chart and time-grain operations go with it (round 2 of the pre-release fixes)
+            kept = [o for o in qs.normalize_ops(ops if isinstance(ops, list) else []) or []
+                    if next(iter(o)) in _SHARE_KEEPS]
+            confirm = ("confirm_gap" if self.gap > 0 else "confirm_age" if self.age > 0
+                       else "confirm_period" if self._untyped_period(kept) else None)
+            # the record agent reads the plan line code writes for the share, never the model's standalone (which may
+            # name the measure the model chose)
+            return self._patch(4, "patch", kept, confirm=confirm, model=True, detail="placement_share", share=True)
         if kind == "patch":
             if not self.plan_ok:
                 return self._fallback(reply, "patch_without_plan")
@@ -1477,6 +1497,15 @@ class _Job:
             return self._patch(4, "patch", ops, standalone=standalone, confirm=confirm, model=True,
                                detail="model_patch")
         return self._fallback(reply, "model_unclear")
+
+    def _asks_share(self) -> bool:
+        """The typed words ask for the placement rate ("and the placement rate?", "placements ka rate": the placement
+        term and a rate word) and the plan's main call is a placement call that can become the share
+        (``query_state.share_ready``)."""
+        words = set(_followup._words(self.question))
+        if not words & _SHARE_WORDS or "placement" not in TC.detect(self.question, self.other_record_types).keys:
+            return False
+        return qs.share_ready(self.plan, self.view)
 
     def _untyped_period(self, ops: Any) -> bool:
         """A model's set_period or compare_period whose phrase the typed question does not say: it shares no word

@@ -56,7 +56,10 @@ The memory modes (``SFA_MEMORY``, :class:`sf_assistant.config.MemoryConfig`, rea
   about the last answer runs the stored plan as seeded calls through the record tools with the terms rebuilt from the
   person's typed words (``sf_assistant.pipeline.MemoryRun``), and the "Read as:" line of a patch is its plan line. The
   resolver's clarifying text is sent as it is written, so the next turn finds it. A fault of the resolver itself falls
-  back to the rewrite. A v1 call is answered as with ``off``.
+  back to the rewrite, and so does its ``use_rewrite`` (a follow-up of a list the patch grammar cannot express, or an
+  answer to a coded clarify: round 2 of the pre-release fixes), with every turn sent so code finds its own clarify.
+  A patch whose main call the record agent's own call replaced reads as the plan that ran. A v1 call is answered as
+  with ``off``.
 
 In ``answer``, ``Read as:`` is a code span, so nothing in it links, and the body and the Source line lose the syntax of
 a Markdown link, image or reference (:func:`_no_links`): a link planted in a record cannot hide where it goes. A refusal
@@ -703,6 +706,27 @@ class _MemoryJob:
         except Exception:  # noqa: BLE001 - no state: the bridge stores none, and the next turn reads text only
             return None
 
+    def ran_line(self, run: Any, used: str | None, patched: Any) -> str:
+        """The plan line of what a patch ran, when the record agent's own call answered in place of the patched main
+        call (the next state's main call is another one; ``query_state.plan_from_evidence``): the Read-as line then
+        names the call the body shows (round 2 of the pre-release fixes, P-B). "" when the main call is the patched
+        one, or on any fault (the patch's own plan line is used)."""
+        try:
+            state = self._next("records", run, used, "")
+            ran, want = (next((c for c in (p or {}).get("calls") or [] if c.get("role") == "main"), None)
+                         for p in ((state or {}).get("plan"), patched))
+            if ran is None or want is None or (self.qs._canon([ran["tool"], ran["args"]])
+                                               == self.qs._canon([want["tool"], want["args"]])):
+                return ""
+            # only when the patched call itself ran (a stale record set, for one, runs nothing of the patch)
+            if not any(getattr(e, "ok", False) and getattr(e, "tool", "") == want["tool"]
+                       and self.qs._canon(getattr(e, "arguments", None)) == self.qs._canon(want["args"])
+                       for e in getattr(run, "evidence", None) or ()):
+                return ""
+            return self.qs.plan_line(state, today=self.today, label=self.label, view=self.view)
+        except Exception:  # noqa: BLE001 - the patch's own line
+            return ""
+
     def finish(self, reason: str, kind: str | None, *, run: Any = None, used: str | None = None,
                text: str = "") -> dict:
         """The v2 part of the reply (``state``, ``plan_line``, ``reason``). ``kind``: the answer kind the next state
@@ -925,7 +949,8 @@ def _job_on(pipeline: Any, question: str, turns: Any, mem: _MemoryJob, seen: dic
     shaped = (pipeline.answer(used, "merged", context_objects=objects, memory=run) if objects
               else pipeline.answer(used, "merged", memory=run))
     if res.action == "patch":
-        read_as = res.plan_line or None   # a patch or a shortcut reads as its plan line (§7.2)
+        # a patch or a shortcut reads as its plan line (§7.2), from the main call that answered (round 2, P-B)
+        read_as = mem.ran_line(run, used, res.plan) or res.plan_line or None
     else:
         read_as = used if used != question else None
     return _answered(mem, shaped, question, used, read_as, run=run, decided=_resolver_reason(res))

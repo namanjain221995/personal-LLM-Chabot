@@ -2020,3 +2020,79 @@ def test_r2_the_resolvers_own_plan_clarify_is_read_as_a_coded_clarify():
     assert _F._clarify_ask(plain.text.replace("Fewer than how many", "How many")) is None
 
 
+# ------------------------------------------------- round 2 (2026-11-28): the placement rate is the placement share
+_PLACE_TREND = None
+
+
+def _placements_state(tool="trend_records"):
+    offer = [{"field": "Interview_Outcome__c", "op": "eq", "value": "Offer Received"}]
+    if tool == "trend_records":
+        args = {"object": "Interview__c", "grain": "month", "date_field": "Date_of_Interview__c", "period": "2026",
+                "filters": offer}
+    elif tool == "count_records":
+        args = {"object": "Interview__c", "date_field": "Date_of_Interview__c", "period": "2026",
+                "filters": offer + [{"field": "Region__c", "op": "eq", "value": "North America"}]}
+    else:
+        args = {"object": "Interview__c", "group_by": "Recruiter__c", "date_field": "Date_of_Interview__c",
+                "period": "this year", "filters": offer}
+    return _mr_state([{"tool": tool, "args": args}], terms={"keys": ["placement"], "text": "placements in 2026"})
+
+
+@pytest.mark.parametrize("ops", [
+    [{"set_measure": {"measure": "avg", "field": "Client_Bill_Rate__c"}}],   # P-B: "rate" read as the bill rate
+    [{"set_measure": {"measure": "avg", "field": "Placement_Rate__c"}}],     # P-B-grain-dropped run 1: made up
+    [{"set_measure": {"measure": "count_distinct", "field": "Interview_Outcome__c"}}],   # run 2
+    [],
+])
+def test_r2_and_the_placement_rate_runs_the_placement_share_whatever_the_model_patched(ops):
+    for kind in ("patch", "unclear"):
+        res, _ = _mr("and the placement rate?", state=_placements_state(), reply=_coded(kind, "", ops),
+                     turns=_TURNS)
+        assert (res.action, res.detail) == ("patch", "placement_share"), (kind, ops, res)
+        main = res.plan["calls"][0]
+        assert main["tool"] == "trend_records" and main["args"]["part_filters"] == [
+            {"field": "Interview_Outcome__c", "op": "eq", "value": "Offer Received"}]
+        assert "filters" not in main["args"] and main["args"]["grain"] == "month"
+        assert len(res.plan["calls"]) == 1 and "Bill" not in res.plan_line and res.plan_line.startswith("share of")
+
+
+def test_r2_the_placement_share_of_a_count_keeps_the_other_filters_as_its_base():
+    res, _ = _mr("what is the placement rate?", state=_placements_state("count_records"),
+                 reply=_coded("patch", "", [{"set_measure": {"measure": "avg", "field": "Client_Bill_Rate__c"}}]))
+    main = res.plan["calls"][0]
+    assert (res.action, main["tool"]) == ("patch", "percentage_of_records")
+    assert main["args"]["base_filters"] == [{"field": "Region__c", "op": "eq", "value": "North America"}]
+    # a model's period goes with the share; its measure never runs
+    res, _ = _mr("and the placement rate for 2025?", state=_placements_state(),
+                 reply=_coded("patch", "", [{"set_period": {"phrase": "2025"}},
+                                            {"set_measure": {"measure": "avg", "field": "Client_Bill_Rate__c"}}]))
+    assert res.action == "patch" and res.plan["calls"][0]["args"]["period"] == "2025"
+    assert "part_filters" in res.plan["calls"][0]["args"]
+
+
+def test_r2_no_share_for_another_rate_or_a_plan_that_cannot_take_it():
+    # "the bill rate" names no placement: the model's patch runs as before
+    res, _ = _mr("what about the bill rate?", state=_placements_state(),
+                 reply=_coded("patch", "", [{"set_measure": {"measure": "avg", "field": "Client_Bill_Rate__c"}}]))
+    assert res.action == "patch" and res.detail == "model_patch"
+    # a grouping of placements has no share tool: the model's reading decides as before (no share patch)
+    res, _ = _mr("and the placement rate?", state=_placements_state("group_records"),
+                 reply=_coded("unclear"))
+    assert res.detail != "placement_share"
+
+
+def test_r2_a_patch_of_placements_never_drops_the_placement_filter():
+    """T02: "only the placed ones" got a patch that ran every interview per recruiter, read as placements."""
+    for ops in ([{"remove_filter": {"field": "Interview_Outcome__c"}}],
+                [{"remove_filter": {"field": "Outcome"}}, {"set_top": {"n": 3, "order": "desc"}}]):
+        res, _ = _mr("only the placed ones", state=_placements_state("group_records"), reply=_coded("patch", "", ops))
+        assert (res.reason, res.detail) == ("clarify", "check_term_reject") and "placement" in res.text, ops
+    # the person moving to all interviews may drop it
+    res, _ = _mr("and all interviews?", state=_placements_state("group_records"),
+                 reply=_coded("patch", "", [{"remove_filter": {"field": "Interview_Outcome__c"}}]))
+    assert res.action == "patch"
+    # a filter added beside it keeps it
+    res, _ = _mr("only the completed ones", state=_placements_state("group_records"),
+                 reply=_coded("patch", "", [{"add_filter": {"field": "Interview_Status__c", "op": "eq",
+                                                            "value": "completed"}}]))
+    assert res.action == "patch"

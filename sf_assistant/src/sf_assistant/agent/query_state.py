@@ -91,8 +91,8 @@ __all__ = ["STATE_VERSION", "MAX_STATE_BYTES", "MAX_CALLS", "MAX_AGE", "MAX_OPS"
            "PLAN_LINE_WORDS", "schema_value", "terms_for", "next_terms", "terms_text", "model_args", "nonempty",
            "set_keys", "keys_digest",
            "plan_from_evidence", "build", "state_bytes", "fit", "Checked", "check", "usable", "clean_show",
-           "make_pending", "normalize_ops", "typed_value", "Clarify", "Patched", "apply", "RunCall", "run_calls",
-           "keys_filter", "with_item", "stale_empty", "plan_line", "PlanView"]
+           "make_pending", "normalize_ops", "typed_value", "Clarify", "Patched", "apply", "share_ready", "RunCall",
+           "run_calls", "keys_filter", "with_item", "stale_empty", "plan_line", "PlanView"]
 
 # ------------------------------------------------------------------------------------------------------ the limits
 STATE_VERSION = 1
@@ -838,6 +838,30 @@ def _named_calls(calls: list[dict], question: Any, label: Callable | None) -> li
     return out
 
 
+def _named_sides(built: list[tuple[dict, Any, Any]], newest: str,
+                 label: Callable | None) -> list[tuple[dict, Any, Any]]:
+    """Round 2 of the pre-release fixes (P-B, T02): after a patch ran, a side call that the patch did not ask for (the
+    record agent's own call, or the patched main call the agent's own chartable call replaced) stays in the plan only
+    when the person's newest typed words name it: its object (:func:`_named_calls`) or a field it measures or groups by
+    (every word of the field's label or API name). Otherwise the next follow-up would re-run it ("same for 2025" stated
+    the average of a bill rate nobody asked for)."""
+    have = _stems(newest)
+    out = []
+    for entry, e, seed in built:
+        asked = seed is not None and getattr(seed, "role", "") == "side"
+        if entry["role"] == "main" or asked or _named_calls([entry], newest, label):
+            out.append((entry, e, seed))
+            continue
+        a = entry.get("args") or {}
+        obj = a.get("object")
+        fields = [f for f in (a.get("measure_field"), a.get("group_by"), a.get("count_distinct"),
+                              a.get("field") if a.get("op") else None) if isinstance(f, str)]
+        if any(any(_stems(n) and _stems(n) <= have for n in (_label(label, obj, f), _pretty(f.split(".")[-1])) if n)
+               for f in fields):
+            out.append((entry, e, seed))
+    return out
+
+
 def _chartable_result(e: Any) -> bool:
     """A result a chart is drawn from (agent/charts.py ``_pick``): group, trend, compare, a count with a breakdown."""
     tool = getattr(e, "tool", "")
@@ -867,6 +891,7 @@ def plan_from_evidence(evidence: Iterable[Any], *, question: str = "", terms: An
     ``question``: the standalone question, or empty for the plan line."""
     calls = [e for e in evidence or () if getattr(e, "ok", False) and getattr(e, "kind", "") == "data"
              and getattr(e, "tool", "") in ENFORCED_TOOLS]
+    seeds = list(seeds) if seeds is not None else None
     typed = _clean_terms(terms)["text"]
     have = "\n".join(t for t in (typed, str(typed_also or "")) if t)
     built: list[tuple[dict, Any, Any]] = []
@@ -900,6 +925,8 @@ def plan_from_evidence(evidence: Iterable[Any], *, question: str = "", terms: An
             main = named[0]
     for i, (entry, _e, _s) in enumerate(built):
         entry["role"] = "main" if i == main else "side"
+    if seeds:   # a patch or a shortcut ran (round 2 of the pre-release fixes)
+        built = _named_sides(built, typed.rsplit("\n", 1)[-1], label)
     plan = {"question": _cut(question, MAX_QUESTION_CHARS), "terms": _clean_terms(terms),
             "calls": [entry for entry, _e, _s in built], "show": clean_show(show), "age": 0}
     if not plan["question"]:
@@ -1987,6 +2014,16 @@ def _set_object(work: _Work, call: dict) -> tuple[str | None, Clarify | None]:
     return (target, None) if target else (None, Clarify("set_not_supported", detail="group_by"))
 
 
+def _own_link(work: _Work, main: dict, new_obj: str, links: list[str]) -> str:
+    """The one link of ``links`` that a ranking of ``new_obj`` records grouped by: the ranked set's own lookup, when the
+    records followed are of the object the ranking counted; "" otherwise."""
+    a = main["args"]
+    if main["tool"] != "group_records" or work.obj(main) != new_obj or not isinstance(a.get("group_by"), str):
+        return ""
+    hit = [x for x in links if _same_field(work, new_obj, x, a["group_by"])]
+    return hit[0] if len(hit) == 1 else ""
+
+
 def _op_follow_set(work: _Work, p: dict) -> Clarify | None:
     main = work.main()
     a, tool = main["args"], main["tool"]
@@ -2013,6 +2050,10 @@ def _op_follow_set(work: _Work, p: dict) -> Clarify | None:
         via_text = via.text
     elif len(links) == 1:
         via_text = links[0]
+    elif links and _own_link(work, main, new_obj, links):
+        # S01 of the re-check: "show their interviews" after the top candidates by interviews follows the lookup the
+        # ranking grouped by, on the same object (Candidate__c), never asks Candidate or Client Account (round 2)
+        via_text = _own_link(work, main, new_obj, links)
     elif links:
         return Clarify("which_link", choices=tuple({"label": x, "ops": [{"follow_set": {"object": new_obj,
                                                                                        "via_field": x}}]}
@@ -2245,8 +2286,126 @@ def _relax_scope(work: _Work) -> None:
         work.touch(c)
 
 
+# ---------------------------------------------------------------------- the placement share (round 2 of 2026-11-28)
+# P-B of the pre-release re-check: "and the placement rate?" on a plan of placements per month was patched by the
+# model to the average of Client_Bill_Rate__c ("rate"), and P-B-grain-dropped asked for a made-up Placement_Rate__c.
+# The placement rate is the owner's share: placements (Interview_Outcome__c = Offer Received) of all client interviews
+# (term contracts). Code turns the plan's placement call into that share; the model's measure never runs.
+_SHARE_TOOLS = ("trend_records", "count_records", "percentage_of_records")
+
+
+def _offer_item(obj: str | None, item: dict) -> bool:
+    """``item`` is the placement contract's own filter: Interview_Outcome__c of a client interview is 'Offer
+    Received' (eq, or in with that one value)."""
+    if obj != _tc.INTERVIEW or str(item.get("field") or "").split(".")[-1] != _tc.OUTCOME or "." in str(
+            item.get("field") or ""):
+        return False
+    values = item.get("values") if item.get("op") == "in" else [item.get("value")] if item.get("op") == "eq" else []
+    return isinstance(values, list) and len(values) == 1 and _canon_text(values[0]) == _canon_text(_tc.OFFER)
+
+
+def _canon_text(value: Any) -> str:
+    return " ".join(str(value or "").casefold().replace("-", " ").replace("_", " ").split())
+
+
+def _share_call(call: dict, obj: str | None) -> dict | None:
+    """The placement share of a placement call (:func:`_offer_item` among its filters): a trend becomes the rate per
+    period (``part_filters``), a count becomes ``percentage_of_records``; the other filters, the period and the child
+    conditions stay as the base. The call itself when it already is the share; None when it is no placement call or
+    cannot take a share (a grouping, a split, an OR group, a distinct count)."""
+    tool, a = call["tool"], call["args"]
+    if tool == "percentage_of_records" or (tool == "trend_records" and a.get("part_filters")):
+        parts = _items(a.get("part_filters"))
+        return call if any(_offer_item(obj, it) for it in parts) else None
+    if tool not in _SHARE_TOOLS or a.get("any_of") or a.get("split_by") or a.get("count_distinct"):
+        return None
+    if tool == "trend_records" and a.get("measure") not in (None, "count"):
+        return None
+    items = _items(a.get("filters"))
+    part = [it for it in items if _offer_item(obj, it)]
+    if not part:
+        return None
+    rest = [it for it in items if not _offer_item(obj, it)]
+    if tool == "trend_records":
+        args = dict(_carry(a, "object", "grain", "date_field", "period", "related"), part_filters=part[:1])
+        if rest:
+            args["filters"] = rest
+        return _new_call("trend_records", args, call)
+    args = dict(_carry(a, "object", "date_field", "period", "related"), part_filters=part[:1])
+    if rest:
+        args["base_filters"] = rest
+    return _new_call("percentage_of_records", args, call)
+
+
+def share_ready(plan: Any, view: Any) -> bool:
+    """The main call of ``plan`` is a placement call that can become the placement share (:func:`_share_call`)."""
+    plan = _plan_of(plan)
+    main = next((c for c in (plan or {}).get("calls") or [] if isinstance(c, dict) and c.get("role") == "main"), None)
+    if main is None or not isinstance(main.get("args"), dict):
+        return False
+    try:
+        obj = view.object(main["args"].get("object")) if view is not None else main["args"].get("object")
+    except Exception:  # noqa: BLE001
+        return False
+    return _share_call(main, obj) is not None
+
+
+def _to_share(work: _Work) -> Clarify | None:
+    main = work.main()
+    got = _share_call(main, work.obj(main))
+    if got is None:
+        return Clarify("measure_not_for", detail=main["tool"])
+    if got is not main:
+        work.replace_main(got)
+    return None
+
+
+def _placement_plan(plan: dict, view: Any) -> bool:
+    """Every call of ``plan`` on client interviews keeps the placement filter, and there is one: a plan of placements
+    (or of the placement share)."""
+    found = False
+    for c in plan.get("calls") or []:
+        if not isinstance(c, dict) or not isinstance(c.get("args"), dict):
+            continue
+        try:
+            obj = view.object(c["args"].get("object")) if view is not None else c["args"].get("object")
+        except Exception:  # noqa: BLE001
+            obj = None
+        if obj != _tc.INTERVIEW:
+            continue
+        a = c["args"]
+        if not any(_offer_item(obj, it) for key in ("filters", "part_filters")
+                   for it in _items(a.get(key))):
+            return False
+        found = True
+    return found
+
+
+#: typed words that move a plan of placements to all client interviews: no placement filter is then required
+_ALL_INTERVIEWS_RE = re.compile(r"(?<![^\W_])(?:outcomes?|all|every|any|total|overall|sab|sabhi|saare)"
+                                r"(?![^\W_])", re.IGNORECASE)
+
+
+def _placement_kept(work: _Work, before: dict) -> Clarify | None:
+    """Round 2 of the pre-release fixes (T02): a patch of a plan of placements never leaves a call on client
+    interviews without the placement contract's filter (Interview_Outcome__c = Offer Received, in its filters or its
+    part), unless the typed words widen it ("all interviews", "every outcome", "total"). Such a call counts
+    interviews, while the answer would still read as placements: the term reject T2 asks instead."""
+    if not _placement_plan(before, work.view) or any(_ALL_INTERVIEWS_RE.search(t) for t in work.texts[:1]):
+        return None
+    for c in work.calls:
+        if work.obj(c) != _tc.INTERVIEW:
+            continue
+        a = c["args"]
+        if not any(_offer_item(_tc.INTERVIEW, it) for key in ("filters", "part_filters")
+                   for it in _items(a.get(key))):
+            return Clarify("term_reject", value="T2", detail="placement_filter_dropped")
+    return None
+
+
 def apply(plan: Any, ops: Any, *, typed: str, view: Any, today: dt.date, terms: Terms = NO_TERMS,
-          pending_text: str = "", contact_ok: bool | None = None, max_calls: int = MAX_CALLS) -> Patched:
+          pending_text: str = "", contact_ok: bool | None = None, max_calls: int = MAX_CALLS,
+          share: bool = False) -> Patched:
     """Apply at most :data:`MAX_OPS` operations (§6.4) to a copy of ``plan`` and check every call of the result.
 
     ``typed``: the person's typed question (filter and drill values must appear in it, or in ``pending_text``, the
@@ -2254,7 +2413,8 @@ def apply(plan: Any, ops: Any, *, typed: str, view: Any, today: dt.date, terms: 
     the run (:func:`terms_for`), checked on every call (a T1, T2 or T3 refusal asks); ``contact_ok``: whether this
     question asks for contact details (default: read from ``typed``; never carried); ``max_calls``: the call cap
     (``SFA_MEMORY_MAX_CALLS``). Operations apply in order, the first failing check gives the clarify.
-    ``new_question`` drops the plan."""
+    ``new_question`` drops the plan. ``share``: the main call becomes the placement share first (:func:`_to_share`;
+    the resolver asks for it when the typed words ask for the placement rate), and ``ops`` may then be empty."""
     canon = normalize_ops(ops)
     if canon is None:
         return Patched(None, Clarify("too_many_ops" if isinstance(ops, list) and len(ops) > MAX_OPS else "bad_ops"))
@@ -2262,12 +2422,16 @@ def apply(plan: Any, ops: Any, *, typed: str, view: Any, today: dt.date, terms: 
     if "new_question" in names:
         return Patched(None, new_question=True, ops=tuple(canon))
     plan = _plan_of(plan)
-    if not canon:
+    if not canon and not share:
         return Patched(None, Clarify("bad_ops"))
     if not plan or not any(isinstance(c, dict) and c.get("role") == "main" for c in plan.get("calls") or []):
         return Patched(None, Clarify("no_plan"), ops=tuple(canon))
     work = _Work(plan, view, (str(typed or ""), str(pending_text or "")), today, terms, max_calls)
     canon = [_grounded(work, one) for one in canon]
+    if share:
+        got = _to_share(work)
+        if got is not None:
+            return Patched(None, got, ops=tuple(canon))
     for one in canon:
         name, params = next(iter(one.items()))
         if name in _MAIN_ONLY and _unsure_main(work, plan.get("question")):
@@ -2276,7 +2440,7 @@ def apply(plan: Any, ops: Any, *, typed: str, view: Any, today: dt.date, terms: 
         if got is not None:
             return Patched(None, got, ops=tuple(canon))
     _relax_scope(work)
-    err = _final_checks(work)
+    err = _final_checks(work) or _placement_kept(work, plan)
     if err is not None:
         return Patched(None, err, ops=tuple(canon))
     ok = asks_for_contact(typed) if contact_ok is None else bool(contact_ok)
@@ -2284,7 +2448,8 @@ def apply(plan: Any, ops: Any, *, typed: str, view: Any, today: dt.date, terms: 
     new_plan = {"question": "", "terms": _clean_terms(plan.get("terms")), "calls": work.calls, "show": work.show,
                 "age": 0}
     touched = frozenset(i for i, c in enumerate(work.calls) if id(c) in work.touched)
-    return Patched(new_plan, touched=touched, display_only=all(n == "set_show" for n in names),
+    return Patched(new_plan, touched=touched, display_only=bool(names) and not share and all(
+                       n == "set_show" for n in names),
                    not_chartable=work.not_chartable, contact_blocked=blocked, ops=tuple(canon))
 
 

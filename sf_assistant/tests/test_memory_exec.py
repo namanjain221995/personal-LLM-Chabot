@@ -1185,3 +1185,27 @@ def test_r2_the_vague_count_asks_in_every_mode_also_when_the_model_rewrites_it(w
             assert w.client.requests["record"] == [] and w.client.requests["resolve"] == []
 
 
+def test_r2_a_patch_reads_as_the_main_call_that_answered(world):
+    """P-B: the Read-as line named the patched call while the record agent's own call answered (it became the main
+    call of the next state). The line now names the call that answered, and the patched call the person did not ask
+    for is not kept to re-run."""
+    w = world(ON)
+    one = first_turn(w)
+    state = one["reply"]["state"]
+    own = {"object": "Account", "group_by": "Candidate_Status__c"}
+    w.client.resolve = [json.dumps({"kind": "patch", "standalone": "", "ops": [{"set_top": {"n": 1, "order": "desc"}}]})]
+    w.client.record = [{"name": "group_records", "args": own}, "Shown.\n" + SOURCE]
+    out = w.job("and the biggest one, please", turns_after(FIRST, one), state=stored(state), gap=0)
+    reply = out["reply"]
+    assert reply["reason"] in ("patch", "shortcut"), out.get("memory")
+    calls = reply["state"]["plan"]["calls"]
+    assert [c["args"] for c in calls] == [own] and calls[0]["role"] == "main"
+    assert reply["answer"].startswith(f"Read as: `{reply['plan_line']}`") and "top 1" not in reply["plan_line"]
+    # a patch whose own call answered keeps its plan line as before
+    w2 = world(ON)
+    one = first_turn(w2)
+    w2.client.resolve = [json.dumps({"kind": "patch", "standalone": "", "ops": [{"set_top": {"n": 1, "order": "desc"}}]})]
+    w2.client.record = ["Shown.\n" + SOURCE]
+    out = w2.job("and the biggest one, please", turns_after(FIRST, one), state=stored(one["reply"]["state"]), gap=0)
+    assert "top 1" in out["reply"]["plan_line"] and out["reply"]["answer"].startswith(
+        f"Read as: `{out['reply']['plan_line']}`")

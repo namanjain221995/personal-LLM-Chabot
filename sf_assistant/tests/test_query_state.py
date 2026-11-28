@@ -929,12 +929,17 @@ def test_follow_set_ranked_sets_resolve_fresh_and_checks():
     got = patch(grp, [{"follow_set": {"object": "Candidate_Training__c"}}], "their trainings")
     assert got.plan["calls"][0]["keys_from"]["field"] == "Candidate__c"
     two = plan_of([{"tool": "group_records", "args": GROUP_ARGS}])
-    which = patch(two, [{"follow_set": {"object": "Interview__c"}}], "their interviews").clarify
+    # round 2 of the pre-release fixes (S01): the interviews of a ranking of interviews follow the lookup it grouped by
+    own = patch(two, [{"follow_set": {"object": "Interview__c"}}], "their interviews")
+    assert own.clarify is None and own.plan["calls"][0]["keys_from"]["field"] == "Interview_Support_Person__c"
+    # a set of another object with several links to it still asks which one
+    staff = plan_of([{"tool": "list_records", "args": {"object": "Recruiter__c", "limit": 5}}])
+    which = patch(staff, [{"follow_set": {"object": "Interview__c"}}], "their interviews").clarify
     assert which.code == "which_link" and [c["label"] for c in which.choices] == [
         "Interview_Support_Person__c", "Preferred_Support_Person__c", "Recruiter__c"]
     assert Q.normalize_ops(which.choices[0]["ops"]) == which.choices[0]["ops"]
-    picked = patch(two, which.choices[0]["ops"], "their interviews")
-    assert picked.plan["calls"][0]["keys_from"]["field"] == "Interview_Support_Person__c"
+    picked = patch(staff, which.choices[1]["ops"], "their interviews")
+    assert picked.plan["calls"][0]["keys_from"]["field"] == "Preferred_Support_Person__c"
     assert patch(two, [{"follow_set": {"object": "Department__c"}}]).clarify.code == "no_link"
     assert patch(two, [{"follow_set": {"object": "Nothing__c"}}]).clarify.code == "unknown_object"
     nontop = plan_of([{"tool": "group_records", "args": {"object": "Interview__c", "group_by": "Candidate__c"}}])
@@ -1051,7 +1056,12 @@ def test_build_after_a_seeded_run_keeps_the_stored_form_and_drops_the_set_rerun(
     extra = ev("count_records", {"object": "Interview__c"}, {"count": 9})
     st = Q.build("records", evidence=[set_ev, trend_ev, extra], seeds=[run], terms={"keys": [], "text": "by month"})
     calls = st["plan"]["calls"]
-    assert [c["tool"] for c in calls] == ["trend_records", "count_records"]
+    # round 2 of the pre-release fixes: the agent's own count is no call the person asked for ("by month" names no
+    # interviews), so the plan keeps only what the patch ran; typed words that name it keep it
+    assert [c["tool"] for c in calls] == ["trend_records"]
+    named = Q.build("records", evidence=[set_ev, trend_ev, extra], seeds=[run],
+                    terms={"keys": [], "text": "by month, and the interviews in total"})
+    assert [c["tool"] for c in named["plan"]["calls"]] == ["trend_records", "count_records"]
     assert calls[0]["args"] == patched.plan["calls"][0]["args"]   # "this month", no in filter
     assert calls[0]["keys_from"] == patched.plan["calls"][0]["keys_from"]
     assert calls[0]["period"]["from"] == "2026-11-01" and calls[0]["nonempty"] is True
@@ -1356,3 +1366,29 @@ def test_a_blocked_field_is_refused_at_patch_time_and_named_by_check():
                                {"groups": [{"group": "x", "value": 1}], "group_count": 1})])
     got = Q.check(stored, view=view)
     assert got.missing == ("Interview__c.Interviewer_Name__c",) and not Q.usable(got)
+
+
+def test_r2_a_patch_run_keeps_no_side_call_the_person_did_not_ask_for():
+    """P-B of the pre-release re-check: the patched main call (an average of the bill rate) was replaced as the main
+    call by the record agent's own share call, and stayed in the plan as a side call; "same for 2025" then stated the
+    bill-rate average again. A side call that no seed asked for and the newest typed words do not name goes."""
+    trend = {"object": "Interview__c", "grain": "month", "date_field": "Date_of_Interview__c", "period": "this month",
+             "filters": [{"field": "Interview_Outcome__c", "op": "eq", "value": "Offer Received"}]}
+    grp = plan_of([{"tool": "trend_records", "args": trend, "period": NOV["period"]}])
+    patched = patch(grp, [{"set_measure": {"measure": "avg", "field": "Client_Bill_Rate__c"}}], "and the rate?")
+    run = Q.run_calls(patched, TODAY)[0]
+    avg = ev("trend_records", run.args, {"buckets": [{"bucket": "2026-11", "value": 90.0}]}, NOV)
+    share_args = {k: v for k, v in trend.items() if k != "filters"}
+    share_args["part_filters"] = trend["filters"]
+    share = ev("trend_records", share_args, {"buckets": [{"bucket": "2026-11", "part": 1, "base": 4}]}, NOV)
+    st = Q.build("records", evidence=[avg, share], seeds=[run], terms={"keys": ["placement"],
+                                                                         "text": "placements, offer received\nand the rate?"})
+    calls = st["plan"]["calls"]
+    assert [(c["role"], bool(c["args"].get("part_filters"))) for c in calls] == [("main", True)]
+    # the person naming the bill rate keeps it
+    st = Q.build("records", evidence=[avg, share], seeds=[run],
+                 terms={"keys": ["placement"], "text": "placements, offer received\nthe rate and the client bill rate"})
+    assert len(st["plan"]["calls"]) == 2
+    # with no seeds (a new question) nothing is screened so
+    st = Q.build("records", evidence=[avg, share], terms={"keys": ["placement"], "text": "offer received rate"})
+    assert len(st["plan"]["calls"]) == 2
